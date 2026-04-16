@@ -1,0 +1,14 @@
+[package]
+name = "psx-trace"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Trace record format emitted by both the emulator and the PCSX-Redux oracle for parity diffing."
+
+# Trace records are host-only tooling, so std is fine. If the SDK ever
+# needs to read traces, we'll revisit with alloc-compatible serde.
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

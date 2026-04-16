@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/psx-hw",
+    "crates/psx-iso",
+    "crates/psx-trace",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/EBonura/PSoXide"
+
+[workspace.dependencies]
+bitflags   = { version = "2.6", default-features = false }
+serde      = { version = "1.0", default-features = false }
+serde_json = { version = "1.0" }

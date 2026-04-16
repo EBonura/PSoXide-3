@@ -1,0 +1,19 @@
+/target
+**/target
+Cargo.lock.orig
+*.swp
+*.swo
+.DS_Store
+.vscode/
+.idea/
+
+# Local bios/game files — never commit
+bios/
+roms/
+discs/
+
+# Run artifacts
+run/
+traces/
+goldens/*.bin
+goldens/*.raw

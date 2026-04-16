@@ -1,0 +1,7 @@
+# Intentionally empty.
+#
+# Shared crates at the repo root must compile cleanly for both the host
+# (emulator, tools) and the PS1 target (SDK). Any config setting here would
+# leak into one of those consumers and break the other. SDK-specific config
+# lives in sdk/.cargo/config.toml; host-specific config lives in
+# emu/.cargo/config.toml.

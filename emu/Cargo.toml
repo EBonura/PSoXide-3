@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/emulator-core",
+    "crates/parity-oracle",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/EBonura/PSoXide"
+
+[workspace.dependencies]
+# Shared-crate path deps. Three levels up: emu/crates/emulator-core/ → repo root → crates/.
+psx-hw    = { path = "../crates/psx-hw" }
+psx-iso   = { path = "../crates/psx-iso" }
+psx-trace = { path = "../crates/psx-trace" }
+
+# Host-workspace-internal deps (one crate depends on another here).
+parity-oracle = { path = "crates/parity-oracle" }
+
+thiserror  = "1.0"
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile   = "3.10"

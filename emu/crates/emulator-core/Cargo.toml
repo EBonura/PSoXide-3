@@ -1,0 +1,16 @@
+[package]
+name = "emulator-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PSoXide emulator core: CPU, bus, and peripherals. No UI, no window — pure state machine."
+
+[dependencies]
+psx-hw    = { workspace = true }
+psx-trace = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+parity-oracle = { workspace = true }
