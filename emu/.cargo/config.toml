@@ -1,0 +1,6 @@
+# Host-side workspace config.
+#
+# Intentionally empty for now. Will grow to hold host-specific build
+# flags (e.g. debug info level, link flags) once the emulator-frontend
+# crate is added. Kept separate from the repo-root config so SDK config
+# cannot leak here and vice versa.

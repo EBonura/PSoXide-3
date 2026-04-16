@@ -1,0 +1,10 @@
+[package]
+name = "psx-iso"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "BIN/CUE and ISO9660 parsing for PS1 disc images. Shared by emulator, SDK, and disc-builder."
+
+[dependencies]

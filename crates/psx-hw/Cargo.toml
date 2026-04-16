@@ -1,0 +1,17 @@
+[package]
+name = "psx-hw"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PlayStation 1 hardware model: register addresses, bitfield layouts, and command packet formats. Shared by emulator and SDK."
+
+[dependencies]
+bitflags = { workspace = true }
+
+[features]
+default = []
+# When enabled, Debug/Display impls are provided for bitflag types.
+# Adds ~nothing at runtime but pulls in core::fmt machinery.
+std-fmt = []
