@@ -76,14 +76,37 @@ fn main() {
             "first 10 colors  = {:?}",
             colors.iter().take(10).map(|c| format!("0x{c:04X}")).collect::<Vec<_>>()
         );
-        'outer: for y in 0..512u16 {
-            for x in 0..1024u16 {
-                let p = vram.get_pixel(x, y);
-                if p != 0 {
-                    println!("first nz px      = ({x},{y}) = 0x{p:04x}");
-                    break 'outer;
+
+        // Pixel density heatmap: which 64×64 blocks of VRAM have
+        // non-zero content? Gives a rough shape of what's been drawn.
+        println!("\n=== VRAM density map (1 char = 64×64 block, # = >10% filled) ===");
+        println!("(X runs 0..1024 left→right; Y runs 0..512 top→bottom)");
+        for by in 0..8u16 {
+            let mut line = String::new();
+            for bx in 0..16u16 {
+                let mut block_nz = 0u32;
+                for dy in 0..64u16 {
+                    for dx in 0..64u16 {
+                        if vram.get_pixel(bx * 64 + dx, by * 64 + dy) != 0 {
+                            block_nz += 1;
+                        }
+                    }
                 }
+                // 4096 pixels per block; threshold at 10% / 50% / 90%.
+                let c = if block_nz > 64 * 64 * 9 / 10 {
+                    '#'
+                } else if block_nz > 64 * 64 / 2 {
+                    '@'
+                } else if block_nz > 64 * 64 / 10 {
+                    '.'
+                } else if block_nz > 0 {
+                    ','
+                } else {
+                    ' '
+                };
+                line.push(c);
             }
+            println!("{line}");
         }
     }
 }
