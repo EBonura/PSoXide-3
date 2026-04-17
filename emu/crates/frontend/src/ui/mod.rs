@@ -7,11 +7,17 @@
 
 pub mod registers;
 pub mod vram;
+pub mod menu;
 
 use crate::app::AppState;
 
 /// Paint every panel for this frame, in layering order.
-pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::TextureId) {
+pub fn draw_layout(
+    ctx: &egui::Context,
+    state: &mut AppState,
+    vram_tex: egui::TextureId,
+    dt: f32,
+) {
     if state.panels.registers {
         registers::draw(ctx, &state.cpu);
     }
@@ -21,23 +27,54 @@ pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::Te
 
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.heading("PSoXide");
-        ui.label("Phase 1c — VRAM viewer live. Central area hosts the framebuffer once GPU lands.");
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Panels:");
-            ui.checkbox(&mut state.panels.registers, "Registers");
-            ui.checkbox(&mut state.panels.vram, "VRAM");
-            ui.checkbox(&mut state.panels.hud, "HUD");
-        });
-        ui.add_space(8.0);
-        ui.label("VRAM poke test:");
-        if ui.button("Fill with test pattern").clicked() {
-            fill_vram_test_pattern(&mut state.vram);
-        }
-        if ui.button("Clear VRAM").clicked() {
-            state.vram.clear();
-        }
+        ui.label("Central area hosts the framebuffer once GPU lands.");
+        ui.label(format!(
+            "Menu: {} — press Esc to toggle.",
+            if state.menu.open { "open" } else { "closed" }
+        ));
     });
+
+    state.menu.draw(ctx, dt);
+}
+
+pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> MenuOutcome {
+    use menu::MenuAction::*;
+    match action {
+        StepOne => {
+            if let Some(bus) = state.bus.as_mut() {
+                let _ = state.cpu.step(bus);
+            }
+            MenuOutcome::None
+        }
+        Reset => {
+            state.cpu = emulator_core::Cpu::new();
+            MenuOutcome::None
+        }
+        FillVramTestPattern => {
+            fill_vram_test_pattern(&mut state.vram);
+            MenuOutcome::None
+        }
+        ToggleRegisters => {
+            state.panels.registers = !state.panels.registers;
+            MenuOutcome::None
+        }
+        ToggleVram => {
+            state.panels.vram = !state.panels.vram;
+            MenuOutcome::None
+        }
+        ToggleHud => {
+            state.panels.hud = !state.panels.hud;
+            MenuOutcome::None
+        }
+        Quit => MenuOutcome::Quit,
+    }
+}
+
+/// What the shell needs to do after an Menu action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuOutcome {
+    None,
+    Quit,
 }
 
 fn fill_vram_test_pattern(vram: &mut emulator_core::Vram) {

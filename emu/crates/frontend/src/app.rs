@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use emulator_core::{Bus, Cpu, Vram};
 
 use crate::ui;
+use crate::ui::menu::MenuState;
 
 /// Default BIOS location. Matches the parity-test default so both
 /// tooling converges on the same image in a fresh checkout.
@@ -40,9 +41,9 @@ pub struct AppState {
     /// development. If absent, register panels show the reset-state CPU
     /// but no instruction stepping is possible. Unused until the step
     /// button lands alongside the Menu.
-    #[allow(dead_code)]
     pub bus: Option<Bus>,
     pub vram: Vram,
+    pub menu: MenuState,
 }
 
 impl Default for AppState {
@@ -52,6 +53,7 @@ impl Default for AppState {
             cpu: Cpu::new(),
             bus: load_bus(),
             vram: Vram::new(),
+            menu: MenuState::new(),
         }
     }
 }
@@ -76,7 +78,7 @@ fn load_bus() -> Option<Bus> {
 }
 
 /// Build all panels/overlays for one frame. Called from `gfx::Graphics::render`
-/// inside the egui context.
-pub fn build_ui(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::TextureId) {
-    ui::draw_layout(ctx, state, vram_tex);
+/// inside the egui context. `dt` drives Menu animations.
+pub fn build_ui(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::TextureId, dt: f32) {
+    ui::draw_layout(ctx, state, vram_tex, dt);
 }

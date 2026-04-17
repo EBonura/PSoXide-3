@@ -16,14 +16,17 @@ mod theme;
 mod ui;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::app::AppState;
 use crate::gfx::Graphics;
+use crate::ui::{menu::MenuInput, MenuOutcome};
 
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 800;
@@ -36,10 +39,22 @@ fn main() {
     event_loop.run_app(&mut app).expect("event loop");
 }
 
-#[derive(Default)]
 struct Shell {
     graphics: Option<Graphics>,
     state: AppState,
+    pending_input: MenuInput,
+    last_frame: Instant,
+}
+
+impl Default for Shell {
+    fn default() -> Self {
+        Self {
+            graphics: None,
+            state: AppState::default(),
+            pending_input: MenuInput::default(),
+            last_frame: Instant::now(),
+        }
+    }
 }
 
 impl ApplicationHandler for Shell {
@@ -74,11 +89,36 @@ impl ApplicationHandler for Shell {
                 gfx.resize(size);
                 gfx.window.request_redraw();
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key,
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                self.pending_input = merge_key(self.pending_input, &logical_key);
+                gfx.window.request_redraw();
+            }
             WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+                self.last_frame = now;
+
+                let input = std::mem::take(&mut self.pending_input);
+                if let Some(action) = self.state.menu.update(&input) {
+                    if ui::apply_menu_action(&mut self.state, action) == MenuOutcome::Quit {
+                        event_loop.exit();
+                        return;
+                    }
+                }
+
                 let state = &mut self.state;
                 gfx.prepare_vram(&state.vram);
                 let vram_tex = gfx.vram_texture_id();
-                gfx.render(|ctx| app::build_ui(ctx, state, vram_tex));
+                gfx.render(|ctx| app::build_ui(ctx, state, vram_tex, dt));
             }
             _ => {
                 if !consumed {
@@ -93,4 +133,23 @@ impl ApplicationHandler for Shell {
             gfx.window.request_redraw();
         }
     }
+}
+
+/// OR a keypress into the next-frame Menu input. `Escape` both toggles
+/// the overlay and acts as back when navigating; the combined semantics
+/// are handled inside `MenuState::update`.
+fn merge_key(mut input: MenuInput, key: &Key) -> MenuInput {
+    match key {
+        Key::Named(NamedKey::ArrowUp) => input.up = true,
+        Key::Named(NamedKey::ArrowDown) => input.down = true,
+        Key::Named(NamedKey::ArrowLeft) => input.left = true,
+        Key::Named(NamedKey::ArrowRight) => input.right = true,
+        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => input.confirm = true,
+        Key::Named(NamedKey::Escape) => {
+            input.toggle_open = true;
+            input.back = true;
+        }
+        _ => {}
+    }
+    input
 }
