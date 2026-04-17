@@ -229,6 +229,25 @@ impl Bus {
         &self.irq
     }
 
+    /// Copy a PSX-EXE payload into RAM at its declared load address.
+    ///
+    /// The caller is expected to also seed the CPU (see
+    /// [`crate::Cpu::seed_from_exe`]) so execution begins at the
+    /// EXE's entry point. `load_addr` must point inside the 2 MiB
+    /// RAM window; addresses outside panic.
+    ///
+    /// Used by `PSOXIDE_EXE` side-loading in the frontend / smoke
+    /// harness to bypass the BIOS entirely and run homebrew directly.
+    pub fn load_exe_payload(&mut self, load_addr: u32, payload: &[u8]) {
+        let base = load_addr & 0x001F_FFFF; // KSEG/KUSEG -> physical RAM
+        assert!(
+            (base as usize) + payload.len() <= self.ram.len(),
+            "EXE payload overflows RAM: load_addr={load_addr:#010x} len={}",
+            payload.len()
+        );
+        self.ram[base as usize..base as usize + payload.len()].copy_from_slice(payload);
+    }
+
     /// Run any DMA channels whose start bit was just set.
     /// - Channel 6 (OTC) fills the ordering table in RAM.
     /// - Channel 2 (GPU) ships command words from RAM to the GPU's GP0 port.

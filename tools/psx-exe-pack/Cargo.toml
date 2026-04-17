@@ -1,0 +1,13 @@
+[package]
+name    = "psx-exe-pack"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+psx-iso = { path = "../../crates/psx-iso" }
+
+[[bin]]
+name = "psx-exe-info"
+path = "src/main.rs"

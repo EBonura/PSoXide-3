@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/psx-io",
+    "crates/psx-rt",
+    "crates/psx-gpu",
+    "crates/psx-sdk",
+]
+
+# The examples are built against the MIPS target via a separate
+# nightly toolchain — keep them out of the main workspace so
+# `cargo check` in the default (host) target doesn't try to compile
+# bare-metal binaries on the wrong target.
+exclude = ["examples"]
+
+[workspace.package]
+edition    = "2021"
+license    = "GPL-2.0-or-later"
+repository = "https://github.com/EBonura/PSoXide"
+
+[workspace.dependencies]
+psx-hw  = { path = "../crates/psx-hw" }
+psx-io  = { path = "crates/psx-io" }
+psx-rt  = { path = "crates/psx-rt" }
+psx-gpu = { path = "crates/psx-gpu" }
+psx-sdk = { path = "crates/psx-sdk" }

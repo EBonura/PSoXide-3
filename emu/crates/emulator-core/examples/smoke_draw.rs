@@ -19,6 +19,22 @@ fn main() {
     let mut bus = Bus::new(bios).expect("bus");
     let mut cpu = Cpu::new();
 
+    // PSOXIDE_EXE=path.exe — side-load a PSX-EXE, seeding the CPU
+    // to jump straight into the homebrew. BIOS stays resident in ROM
+    // so the homebrew's B(44h) FlushCache + BIOS syscalls still work.
+    if let Ok(exe_path) = std::env::var("PSOXIDE_EXE") {
+        let raw = std::fs::read(&exe_path).expect("read PSOXIDE_EXE");
+        let exe = psx_iso::Exe::parse(&raw).expect("parse PSX-EXE");
+        bus.load_exe_payload(exe.load_addr, &exe.payload);
+        cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
+        eprintln!(
+            "[smoke_draw] side-loaded {exe_path}: entry=0x{:08x} sp={:?} payload={}B",
+            exe.initial_pc,
+            exe.initial_sp(),
+            exe.payload.len()
+        );
+    }
+
     // Sample the last ~1% of the run for a PC histogram — tells us
     // whether BIOS is in a tight loop or executing broadly.
     let sample_start = n.saturating_sub(n / 100);

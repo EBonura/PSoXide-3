@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use emulator_core::{Bus, Cpu};
-use psx_iso::{Disc, SECTOR_BYTES};
+use psx_iso::{Disc, Exe, SECTOR_BYTES};
 use psx_trace::InstructionRecord;
 
 use crate::ui;
@@ -80,10 +80,28 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
+        let mut cpu = Cpu::new();
+        let bus = load_bus().map(|mut bus| {
+            // PSOXIDE_EXE side-loading. Copies the payload into RAM
+            // and seeds the CPU to jump straight into the homebrew,
+            // bypassing the BIOS reset vector. BIOS ROM stays
+            // resident so SDK calls (FlushCache, putchar, …) keep
+            // working.
+            if let Some(exe) = load_exe() {
+                bus.load_exe_payload(exe.load_addr, &exe.payload);
+                cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
+                eprintln!(
+                    "[frontend] side-loaded EXE: entry=0x{:08x} payload={}B",
+                    exe.initial_pc,
+                    exe.payload.len()
+                );
+            }
+            bus
+        });
         Self {
             panels: PanelVisibility::default(),
-            cpu: Cpu::new(),
-            bus: load_bus(),
+            cpu,
+            bus,
             menu: MenuState::new(),
             hud: HudState::default(),
             memory_view: MemoryView::default(),
@@ -137,6 +155,27 @@ fn load_bus() -> Option<Bus> {
     }
 
     Some(bus)
+}
+
+/// Read `PSOXIDE_EXE` → PSX-EXE file → parsed `Exe`. Logs and returns
+/// `None` on any trouble so a misconfigured path doesn't wedge boot.
+fn load_exe() -> Option<Exe> {
+    let var = std::env::var("PSOXIDE_EXE").ok()?;
+    let path = PathBuf::from(&var);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[frontend] PSOXIDE_EXE={} unreadable: {e}", path.display());
+            return None;
+        }
+    };
+    match Exe::parse(&bytes) {
+        Ok(exe) => Some(exe),
+        Err(e) => {
+            eprintln!("[frontend] PSOXIDE_EXE={} malformed: {e:?}", path.display());
+            None
+        }
+    }
 }
 
 /// Read `PSOXIDE_DISC` → BIN file → `Disc`. Logs and returns `None` on

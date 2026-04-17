@@ -139,6 +139,27 @@ impl Cpu {
         self.should_take_interrupt_steps
     }
 
+    /// Seed CPU state from a PSX-EXE header so the next `step()`
+    /// enters the homebrew at its entry point. Used for
+    /// `PSOXIDE_EXE` side-loading that bypasses the BIOS.
+    ///
+    /// The corresponding payload must already have been copied into
+    /// RAM by [`crate::Bus::load_exe_payload`].
+    pub fn seed_from_exe(&mut self, initial_pc: u32, initial_gp: u32, initial_sp: Option<u32>) {
+        self.pc = initial_pc;
+        self.pending_pc = None;
+        self.pending_load = None;
+        self.committing_load = None;
+        self.pending_exception_pc = None;
+        self.set_gpr(28, initial_gp);
+        if let Some(sp) = initial_sp {
+            self.set_gpr(29, sp);
+            // Frame pointer tracks SP on bare-metal boot so backtraces
+            // look sane before main() sets up its own frame.
+            self.set_gpr(30, sp);
+        }
+    }
+
     /// Current program counter.
     #[inline]
     pub fn pc(&self) -> u32 {
