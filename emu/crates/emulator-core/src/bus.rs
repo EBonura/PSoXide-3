@@ -12,6 +12,7 @@ use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::irq::{Irq, IrqSource};
 use crate::mmio_trace::{MmioKind, MmioTrace};
+use crate::sio::Sio0;
 use crate::spu::Spu;
 use crate::timers::Timers;
 
@@ -59,6 +60,9 @@ pub struct Bus {
     /// SPU — phase 3a scope: just `SPUCNT` + `SPUSTAT`. Everything
     /// else SPU-related still round-trips through the echo buffer.
     spu: Spu,
+    /// SIO0 — controller / memory-card port. Currently models a cold
+    /// port with nothing connected; enough to satisfy BIOS init polls.
+    sio0: Sio0,
     /// CD-ROM controller — byte-granular MMIO at 0x1F80_1800..=0x1803.
     /// Exposed public so diagnostics can inspect FIFO / command state.
     pub cdrom: CdRom,
@@ -128,6 +132,7 @@ impl Bus {
             dma: Dma::new(),
             gpu: Gpu::new(),
             spu: Spu::new(),
+            sio0: Sio0::new(),
             cdrom: CdRom::new(),
             cycles: 0,
             next_vblank_cycle: FIRST_VBLANK_CYCLE,
@@ -445,6 +450,9 @@ impl Bus {
         {
             return 0xFF;
         }
+        if Sio0::contains(phys) {
+            return self.sio0.read8(phys).unwrap_or(0);
+        }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             return self.io[(phys - memory::io::BASE) as usize];
         }
@@ -503,6 +511,9 @@ impl Bus {
         }
         if Spu::contains(phys) {
             return self.spu.read16(phys);
+        }
+        if Sio0::contains(phys) {
+            return self.sio0.read16(phys).unwrap_or(0);
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             let off = (phys - memory::io::BASE) as usize;
@@ -570,6 +581,9 @@ impl Bus {
         if Spu::contains(phys) {
             return self.spu.read32(phys);
         }
+        if Sio0::contains(phys) {
+            return self.sio0.read32(phys).unwrap_or(0);
+        }
         if CdRom::contains(phys) {
             // CD-ROM regs are 8-bit; word access composites them.
             let b0 = self.cdrom.read8(phys) as u32;
@@ -632,6 +646,10 @@ impl Bus {
         }
         if Spu::contains(phys) {
             self.spu.write32(phys, value);
+            return;
+        }
+        if Sio0::contains(phys) {
+            self.sio0.write32(phys, value);
             return;
         }
 
@@ -700,6 +718,10 @@ impl Bus {
             self.cdrom.write8(phys, value);
             return;
         }
+        if Sio0::contains(phys) {
+            self.sio0.write8(phys, value);
+            return;
+        }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             self.io[(phys - memory::io::BASE) as usize] = value;
             return;
@@ -752,6 +774,10 @@ impl Bus {
         }
         if Spu::contains(phys) {
             self.spu.write16(phys, value);
+            return;
+        }
+        if Sio0::contains(phys) {
+            self.sio0.write16(phys, value);
             return;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
