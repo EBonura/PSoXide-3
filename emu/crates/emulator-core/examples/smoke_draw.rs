@@ -247,20 +247,31 @@ fn main() {
         println!("{arrow} {addr:08x}: {word:08x}");
     }
 
-    // Dump the full hot-region: pick the single hottest PC and walk
-    // ±0x40 bytes either side so we can read the loop body + entry
-    // + exit in one glance. Hits marked with '•'.
-    if let Some(&(hot_pc, _)) = top.first() {
-        let hot_min = hot_pc.wrapping_sub(0x40);
-        let hot_max = hot_pc.wrapping_add(0x80);
-        println!("\n=== ±0x40 around hottest PC {hot_pc:08x} ===");
-        let mut a = hot_min;
-        while a <= hot_max {
-            let word = read32(&bus, a).unwrap_or(0);
-            let hit = pc_hits.get(&a).copied().unwrap_or(0);
-            let mark = if hit > 0 { "•" } else { " " };
-            println!("  {mark} {a:08x}: {word:08x}  ({hit} hits)");
-            a = a.wrapping_add(4);
+    // Dump every distinct hot region. Group PCs whose gap < 0x100 into
+    // one region so the outer/caller + inner/callee of a tight
+    // call loop both show up.
+    if !top.is_empty() {
+        let mut hot_pcs: Vec<u32> = top.iter().take(30).map(|(pc, _)| *pc).collect();
+        hot_pcs.sort_unstable();
+        let mut regions: Vec<(u32, u32)> = Vec::new();
+        for pc in hot_pcs {
+            match regions.last_mut() {
+                Some((_lo, hi)) if pc.wrapping_sub(*hi) < 0x100 => *hi = pc,
+                _ => regions.push((pc, pc)),
+            }
+        }
+        for (lo, hi) in regions {
+            let start = lo.wrapping_sub(0x10);
+            let end = hi.wrapping_add(0x30);
+            println!("\n=== hot region {start:08x}..={end:08x} ===");
+            let mut a = start;
+            while a <= end {
+                let word = read32(&bus, a).unwrap_or(0);
+                let hit = pc_hits.get(&a).copied().unwrap_or(0);
+                let mark = if hit > 0 { "•" } else { " " };
+                println!("  {mark} {a:08x}: {word:08x}  ({hit} hits)");
+                a = a.wrapping_add(4);
+            }
         }
     }
 

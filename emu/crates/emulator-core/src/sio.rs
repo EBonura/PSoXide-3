@@ -44,7 +44,8 @@ mod offset {
 }
 
 /// SIO0 state. Register-level accuracy for the "nothing plugged in"
-/// path; no IRQ generation, no shift-clock simulation.
+/// path; no shift-clock simulation, but every byte-write pulses an
+/// IRQ7 so the BIOS's pad-poll handler advances its descriptors.
 pub struct Sio0 {
     mode: u16,
     ctrl: u16,
@@ -53,6 +54,11 @@ pub struct Sio0 {
     /// only reads one response per TX so a single slot is enough.
     /// `None` means RX empty (`STAT.RX_NOT_EMPTY` clears).
     rx: Option<u8>,
+    /// Set by `write_data`, consumed by [`Sio0::take_pending_irq`].
+    /// The Bus raises `IrqSource::Controller` when true. Hardware does
+    /// this via /ACK low-to-high; with no device we approximate via
+    /// "always IRQ after TX", which matches the DSR-timeout outcome.
+    pending_irq: bool,
 }
 
 impl Sio0 {
@@ -68,7 +74,16 @@ impl Sio0 {
             ctrl: 0,
             baud: 0,
             rx: None,
+            pending_irq: false,
         }
+    }
+
+    /// Returns true and clears the flag when a DATA write has armed
+    /// IRQ7. The Bus calls this after dispatching a write.
+    pub fn take_pending_irq(&mut self) -> bool {
+        let p = self.pending_irq;
+        self.pending_irq = false;
+        p
     }
 
     /// `true` when `phys` falls within the SIO0 register window.
@@ -131,10 +146,12 @@ impl Sio0 {
 
     /// TX clocks a byte out on the (empty) port. Full-duplex: the
     /// shifter simultaneously reads in a byte, and with nothing
-    /// driving MISO the line floats to 0xFF. The RX slot fills so
-    /// the BIOS's wait-for-response loop can clear.
+    /// driving MISO the line floats to 0xFF. RX slot fills and an
+    /// IRQ7 is armed so the BIOS's pad handler runs and advances
+    /// its per-port descriptor counter.
     fn write_data(&mut self, _value: u8) {
         self.rx = Some(0xFF);
+        self.pending_irq = true;
     }
 
     fn write_ctrl(&mut self, value: u16) {

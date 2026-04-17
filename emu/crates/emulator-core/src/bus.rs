@@ -650,6 +650,9 @@ impl Bus {
         }
         if Sio0::contains(phys) {
             self.sio0.write32(phys, value);
+            if self.sio0.take_pending_irq() {
+                self.irq.raise(IrqSource::Controller);
+            }
             return;
         }
 
@@ -720,6 +723,9 @@ impl Bus {
         }
         if Sio0::contains(phys) {
             self.sio0.write8(phys, value);
+            if self.sio0.take_pending_irq() {
+                self.irq.raise(IrqSource::Controller);
+            }
             return;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
@@ -778,6 +784,9 @@ impl Bus {
         }
         if Sio0::contains(phys) {
             self.sio0.write16(phys, value);
+            if self.sio0.take_pending_irq() {
+                self.irq.raise(IrqSource::Controller);
+            }
             return;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
