@@ -234,20 +234,21 @@ fn first_million_steps_match_redux() {
     assert_parity_for_steps(1_000_000);
 }
 
-/// Highest currently-passing count: exercises SYSCALL (first hit near
-/// 2.7M) and the MMIO echo buffer (SPUCNT write/read roundtrip). Next
-/// blocker is SPUSTAT at step 2,735,076 — a read-only register whose
-/// value tracks SPUCNT, not its own writes.
+/// Highest currently-passing count. Crosses the former SPUSTAT
+/// blocker (~2.735M) and runs comfortably into the post-Sony-intro
+/// region where the BIOS first pokes the CDROM (~99M lands the next
+/// stall, beyond this milestone).
 #[test]
 #[ignore = "requires PCSX-Redux binary; run via `make parity`"]
-fn first_two_point_seven_million_steps_match_redux() {
-    assert_parity_for_steps(2_735_000);
+fn first_ten_million_steps_match_redux() {
+    assert_parity_for_steps(10_000_000);
 }
 
-/// Probe past the former SPUSTAT divergence — temporary probe that
-/// tells us the next blocker. Remove once absorbed into the ladder.
+/// Probe past the next expected blocker — the BIOS reaches state 25
+/// of the CDROM-init state machine around step 99M. Use this to find
+/// what diverges next, then absorb into the ladder.
 #[test]
 #[ignore = "probe — move to named milestone once the next finding is in"]
-fn probe_next_divergence_after_spu() {
+fn probe_next_divergence_at_cdrom_init() {
     assert_parity_for_steps(50_000_000);
 }
