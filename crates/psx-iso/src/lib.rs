@@ -28,6 +28,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+pub mod exe;
+pub use exe::{Exe, ExeError, EXE_HEADER_BYTES};
+
 /// One raw CD-ROM sector — always 2352 bytes on a PS1 disc regardless
 /// of track mode.
 pub const SECTOR_BYTES: usize = 2352;
