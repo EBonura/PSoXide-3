@@ -179,9 +179,17 @@ impl Bus {
     /// - Channel 6 (OTC) fills the ordering table in RAM.
     /// - Channel 2 (GPU) ships command words from RAM to the GPU's GP0 port.
     /// - Other channels need their consumer subsystems online first.
+    ///
+    /// After any transfer completes, `IrqSource::Dma` is raised — the
+    /// BIOS's DMA-wait event handlers need this to see completion.
+    /// DICR per-channel / master enable filtering isn't modeled yet;
+    /// the interrupt controller's `I_MASK` is the only gate.
     fn maybe_run_dma(&mut self) {
-        self.dma.run_otc(&mut self.ram[..]);
-        self.run_dma_gpu();
+        let otc_ran = self.dma.run_otc(&mut self.ram[..]);
+        let gpu_ran = self.run_dma_gpu();
+        if otc_ran || gpu_ran {
+            self.irq.raise(IrqSource::Dma);
+        }
     }
 
     /// Execute DMA channel 2 → GPU (GP0). Supports the two sync modes
@@ -198,10 +206,10 @@ impl Bus {
     ///
     /// Both variants clear `CHCR.start` + `busy` bits on completion
     /// so BIOS polling sees "done".
-    fn run_dma_gpu(&mut self) {
+    fn run_dma_gpu(&mut self) -> bool {
         let ch = &self.dma.channels[2];
         if (ch.channel_control >> 24) & 1 == 0 {
-            return;
+            return false;
         }
         let sync_mode = (ch.channel_control >> 9) & 0x3;
         match sync_mode {
@@ -214,6 +222,7 @@ impl Bus {
         }
         let ch = &mut self.dma.channels[2];
         ch.channel_control &= !((1 << 24) | (1 << 28));
+        true
     }
 
     fn dma_gpu_block(&mut self) {
