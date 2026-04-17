@@ -162,8 +162,9 @@ impl Cpu {
 
     /// Fetch the 32-bit instruction word at the current PC without
     /// advancing it. Exposed for diagnostic tools; `step` uses it
-    /// internally too.
-    pub fn fetch(&self, bus: &Bus) -> u32 {
+    /// internally too. `&mut Bus` because some peripheral reads
+    /// (CD-ROM, future DMA) mutate.
+    pub fn fetch(&self, bus: &mut Bus) -> u32 {
         bus.read32(self.pc)
     }
 
@@ -1160,9 +1161,9 @@ mod tests {
     fn fetch_returns_first_bios_word() {
         // Real stock BIOSes (SCPH1001 / 5500 / 5501 / 5502) all begin with
         // `lui $t0, 0x0013` = 0x3C08_0013 as part of cache-control init.
-        let bus = Bus::new(synthetic_bios_with_first_word(0x3C08_0013)).unwrap();
+        let mut bus = Bus::new(synthetic_bios_with_first_word(0x3C08_0013)).unwrap();
         let cpu = Cpu::new();
-        assert_eq!(cpu.fetch(&bus), 0x3C08_0013);
+        assert_eq!(cpu.fetch(&mut bus), 0x3C08_0013);
     }
 
     #[test]
@@ -1191,14 +1192,14 @@ mod tests {
 
     #[test]
     fn unimplemented_opcode_returns_structured_error() {
-        // opcode 0x22 = LWL (Load Word Left); genuine R3000 opcode we
-        // haven't decoded yet. Encoding: 0x88000000 = (0x22 << 26) | 0.
-        let mut bus = Bus::new(synthetic_bios_with_first_word(0x8800_0000)).unwrap();
+        // opcode 0x12 = COP2 (GTE); genuine R3000 opcode we haven't
+        // decoded yet. Encoding: 0x48000000 = (0x12 << 26) | 0.
+        let mut bus = Bus::new(synthetic_bios_with_first_word(0x4800_0000)).unwrap();
         let mut cpu = Cpu::new();
         let err = cpu.step(&mut bus).unwrap_err();
         assert!(matches!(
             err,
-            ExecutionError::Unimplemented { opcode: 0x22, .. }
+            ExecutionError::Unimplemented { opcode: 0x12, .. }
         ));
     }
 

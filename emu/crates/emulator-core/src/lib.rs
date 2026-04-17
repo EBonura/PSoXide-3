@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod bus;
+pub mod cdrom;
 pub mod cpu;
 pub mod dma;
 pub mod gpu;
@@ -18,6 +19,7 @@ pub mod timers;
 pub mod vram;
 
 pub use bus::{Bus, BusError};
+pub use cdrom::CdRom;
 pub use cpu::{Cpu, ExecutionError};
 pub use dma::{Dma, DmaChannel};
 pub use gpu::Gpu;

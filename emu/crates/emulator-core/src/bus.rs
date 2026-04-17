@@ -7,6 +7,7 @@
 use psx_hw::memory::{self, to_physical};
 use thiserror::Error;
 
+use crate::cdrom::CdRom;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::irq::{Irq, IrqSource};
@@ -57,6 +58,9 @@ pub struct Bus {
     /// SPU — phase 3a scope: just `SPUCNT` + `SPUSTAT`. Everything
     /// else SPU-related still round-trips through the echo buffer.
     spu: Spu,
+    /// CD-ROM controller — byte-granular MMIO at 0x1F80_1800..=0x1803.
+    /// Exposed public so diagnostics can inspect FIFO / command state.
+    pub cdrom: CdRom,
     /// Cumulative CPU cycles retired since reset. Fed by `Cpu::step`
     /// via [`Bus::tick`]. Peripherals read this to schedule events
     /// (VBlank, timer ticks, DMA completion). Phase 4a just counts;
@@ -119,6 +123,7 @@ impl Bus {
             dma: Dma::new(),
             gpu: Gpu::new(),
             spu: Spu::new(),
+            cdrom: CdRom::new(),
             cycles: 0,
             next_vblank_cycle: FIRST_VBLANK_CYCLE,
         })
@@ -308,10 +313,16 @@ impl Bus {
     /// Panics on any address that does not resolve to a currently-mapped
     /// region. This is intentional — unmapped reads during development
     /// should surface immediately, not return silent zeros.
-    pub fn read8(&self, virt: u32) -> u8 {
+    ///
+    /// `&mut self` because some peripherals (notably CD-ROM) mutate on
+    /// read — popping response FIFOs, advancing data-transfer state.
+    pub fn read8(&mut self, virt: u32) -> u8 {
         let phys = to_physical(virt);
         if phys < memory::ram::MIRROR_END {
             return self.ram[(phys as usize) % memory::ram::SIZE];
+        }
+        if CdRom::contains(phys) {
+            return self.cdrom.read8(phys);
         }
         if (memory::scratchpad::BASE..memory::scratchpad::BASE + memory::scratchpad::SIZE as u32)
             .contains(&phys)
@@ -342,11 +353,17 @@ impl Bus {
     /// Read a 16-bit little-endian half-word from a virtual address.
     /// Unmapped regions behave identically to [`Bus::read8`] (see the
     /// region-by-region notes there).
-    pub fn read16(&self, virt: u32) -> u16 {
+    ///
+    /// `&mut self` for the same reason as `read8` — peripheral-side
+    /// effects.
+    pub fn read16(&mut self, virt: u32) -> u16 {
         let phys = to_physical(virt);
         if phys < memory::ram::MIRROR_END {
             let off = (phys as usize) % memory::ram::SIZE;
             return u16::from_le_bytes([self.ram[off], self.ram[off + 1]]);
+        }
+        if CdRom::contains(phys) {
+            return self.cdrom.read8(phys) as u16;
         }
         if (memory::scratchpad::BASE..memory::scratchpad::BASE + memory::scratchpad::SIZE as u32)
             .contains(&phys)
@@ -382,7 +399,10 @@ impl Bus {
 
     /// Read a 32-bit little-endian word from a virtual address. This is
     /// the instruction-fetch path.
-    pub fn read32(&self, virt: u32) -> u32 {
+    ///
+    /// `&mut self` because CD-ROM byte reads (composited into a u32 for
+    /// the rare case software word-accesses that range) mutate.
+    pub fn read32(&mut self, virt: u32) -> u32 {
         let phys = to_physical(virt);
 
         if phys < memory::ram::MIRROR_END {
@@ -426,6 +446,14 @@ impl Bus {
         }
         if Spu::contains(phys) {
             return self.spu.read32(phys);
+        }
+        if CdRom::contains(phys) {
+            // CD-ROM regs are 8-bit; word access composites them.
+            let b0 = self.cdrom.read8(phys) as u32;
+            let b1 = self.cdrom.read8(phys + 1) as u32;
+            let b2 = self.cdrom.read8(phys + 2) as u32;
+            let b3 = self.cdrom.read8(phys + 3) as u32;
+            return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
         }
 
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
@@ -632,21 +660,21 @@ mod tests {
 
     #[test]
     fn reads_first_bios_word_via_kseg1_reset_vector() {
-        let bus = Bus::new(synthetic_bios()).unwrap();
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
         assert_eq!(bus.read32(memory::bios::RESET_VECTOR), 0xDEAD_BEEF);
     }
 
     #[test]
     fn reads_first_bios_word_via_kseg0_and_kuseg() {
         // BIOS physical base mapped into KSEG0 (cached) and KUSEG.
-        let bus = Bus::new(synthetic_bios()).unwrap();
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
         assert_eq!(bus.read32(0x9FC0_0000), 0xDEAD_BEEF); // KSEG0
         assert_eq!(bus.read32(0x1FC0_0000), 0xDEAD_BEEF); // KUSEG physical alias
     }
 
     #[test]
     fn ram_starts_zeroed() {
-        let bus = Bus::new(synthetic_bios()).unwrap();
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
         assert_eq!(bus.read32(0x0000_0000), 0);
         assert_eq!(bus.read32(0x8000_0000), 0); // KSEG0 RAM
     }
