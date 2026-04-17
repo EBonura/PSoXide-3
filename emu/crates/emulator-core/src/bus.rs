@@ -237,7 +237,21 @@ impl Bus {
         let otc_ran = self.dma.run_otc(&mut self.ram[..]);
         let gpu_ran = self.run_dma_gpu();
         let cdrom_ran = self.run_dma_cdrom();
-        if otc_ran || gpu_ran || cdrom_ran {
+        // Each channel that completed updates DICR. The IRQ controller
+        // only sees a `Dma` raise on the 0→1 master-flag edge, so the
+        // BIOS handler can identify exactly which channel(s) fired by
+        // reading DICR bits 24..30 and ack them via W1C.
+        let mut master_edge = false;
+        if otc_ran && self.dma.notify_channel_done(6) {
+            master_edge = true;
+        }
+        if gpu_ran && self.dma.notify_channel_done(2) {
+            master_edge = true;
+        }
+        if cdrom_ran && self.dma.notify_channel_done(3) {
+            master_edge = true;
+        }
+        if master_edge {
             self.irq.raise(IrqSource::Dma);
         }
     }

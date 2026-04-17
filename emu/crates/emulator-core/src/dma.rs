@@ -98,7 +98,7 @@ impl Dma {
         let offset = phys - Self::BASE;
         match offset {
             Self::DPCR_OFFSET => self.dpcr,
-            Self::DICR_OFFSET => self.dicr,
+            Self::DICR_OFFSET => self.dicr_with_master_flag(),
             _ => {
                 let (ch, field) = decode(phys);
                 if ch >= NUM_CHANNELS {
@@ -123,7 +123,7 @@ impl Dma {
         let offset = phys - Self::BASE;
         match offset {
             Self::DPCR_OFFSET => self.dpcr = value,
-            Self::DICR_OFFSET => self.dicr = value,
+            Self::DICR_OFFSET => self.write_dicr(value),
             _ => {
                 let (ch, field) = decode(phys);
                 if ch >= NUM_CHANNELS {
@@ -149,6 +149,62 @@ impl Dma {
 impl Default for Dma {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// --- DICR semantics ---
+//
+// Layout (Nocash):
+//   bits  0..5  : Unknown (R/W)
+//   bits  6..14 : Reserved (always 0)
+//   bit   15    : Bus-error flag (R, W1C)
+//   bits 16..22 : Per-channel IRQ enable (R/W) — DMA0..DMA6
+//   bit   23    : IRQ master enable (R/W)
+//   bits 24..30 : Per-channel IRQ flag (R, W1C) — DMA0..DMA6
+//   bit   31    : IRQ master flag (R) — derived:
+//                 (bit15) | (bit23 & ((bits16..22) & (bits24..30) != 0))
+//
+// The R/W bits are stored verbatim. The W1C bits (15, 24..30) are
+// cleared by writing a `1` (and preserved by writing `0`), which is the
+// inverse of the natural u32 store. Bit 31 is read-only and computed.
+impl Dma {
+    const DICR_RW_MASK: u32 = 0x00FF_003F;
+    const DICR_W1C_MASK: u32 = 0x7F00_8000;
+    const DICR_MASTER_ENABLE: u32 = 1 << 23;
+    const DICR_BUS_ERROR: u32 = 1 << 15;
+
+    fn write_dicr(&mut self, value: u32) {
+        let prev = self.dicr;
+        let rw = value & Self::DICR_RW_MASK;
+        let preserved_flags = prev & Self::DICR_W1C_MASK & !value;
+        self.dicr = rw | preserved_flags;
+    }
+
+    fn dicr_with_master_flag(&self) -> u32 {
+        let enabled = (self.dicr >> 16) & 0x7F;
+        let pending = (self.dicr >> 24) & 0x7F;
+        let any_irq = self.dicr & Self::DICR_MASTER_ENABLE != 0 && (enabled & pending) != 0;
+        let master_flag = self.dicr & Self::DICR_BUS_ERROR != 0 || any_irq;
+        (self.dicr & 0x7FFF_FFFF) | ((master_flag as u32) << 31)
+    }
+
+    /// Notify the DICR that DMA channel `ch` has completed. Sets the
+    /// channel's IRQ flag (bit `24+ch`) when the matching enable bit
+    /// (`16+ch`) is set, and returns `true` when the master IRQ flag
+    /// transitions from clear to set as a result — that's the edge the
+    /// main IRQ controller should treat as a `Dma` raise.
+    pub fn notify_channel_done(&mut self, ch: usize) -> bool {
+        if ch >= NUM_CHANNELS {
+            return false;
+        }
+        let enable_bit = 1 << (16 + ch);
+        if self.dicr & enable_bit == 0 {
+            return false;
+        }
+        let prev_master = self.dicr_with_master_flag() >> 31;
+        self.dicr |= 1 << (24 + ch);
+        let new_master = self.dicr_with_master_flag() >> 31;
+        prev_master == 0 && new_master == 1
     }
 }
 
@@ -236,12 +292,57 @@ mod tests {
     }
 
     #[test]
-    fn dpcr_and_dicr_roundtrip() {
+    fn dpcr_roundtrips_verbatim() {
         let mut dma = Dma::new();
         dma.write32(0x1F80_10F0, 0x0765_4321);
-        dma.write32(0x1F80_10F4, 0x1234_5678);
         assert_eq!(dma.read32(0x1F80_10F0), 0x0765_4321);
-        assert_eq!(dma.read32(0x1F80_10F4), 0x1234_5678);
+    }
+
+    #[test]
+    fn dicr_rw_bits_roundtrip_w1c_bits_dont() {
+        // Configure all enables + master, leave flags clear. R/W bits
+        // round-trip; W1C bits (15, 24..30) ignore writes-of-zero.
+        let mut dma = Dma::new();
+        dma.write32(0x1F80_10F4, 0x00FF_0000); // enables 16..23
+        // Read-back includes the computed master flag in bit 31 — clear
+        // here because no per-channel flag is set.
+        assert_eq!(dma.read32(0x1F80_10F4), 0x00FF_0000);
+    }
+
+    #[test]
+    fn dicr_channel_done_sets_pending_when_enabled() {
+        let mut dma = Dma::new();
+        // Enable channel 6 + master.
+        dma.write32(0x1F80_10F4, (1 << (16 + 6)) | (1 << 23));
+        let edge = dma.notify_channel_done(6);
+        assert!(edge, "0->1 master flag transition expected");
+        let dicr = dma.read32(0x1F80_10F4);
+        assert!(dicr & (1 << (24 + 6)) != 0, "channel-6 flag set");
+        assert!(dicr & (1 << 31) != 0, "master flag set");
+    }
+
+    #[test]
+    fn dicr_channel_done_ignored_when_disabled() {
+        let mut dma = Dma::new();
+        // Master enable on but channel 2 enable off.
+        dma.write32(0x1F80_10F4, 1 << 23);
+        let edge = dma.notify_channel_done(2);
+        assert!(!edge);
+        assert_eq!(dma.read32(0x1F80_10F4) & (1 << (24 + 2)), 0);
+    }
+
+    #[test]
+    fn dicr_w1c_clears_pending_flag() {
+        let mut dma = Dma::new();
+        dma.write32(0x1F80_10F4, (1 << (16 + 0)) | (1 << 23));
+        dma.notify_channel_done(0);
+        assert!(dma.read32(0x1F80_10F4) & (1 << 24) != 0);
+        // BIOS acks by writing 1 to the flag bit (along with re-asserting
+        // the R/W enables, which the BIOS has been managing all along).
+        dma.write32(0x1F80_10F4, (1 << (16 + 0)) | (1 << 23) | (1 << 24));
+        let dicr = dma.read32(0x1F80_10F4);
+        assert_eq!(dicr & (1 << 24), 0, "flag cleared by W1C");
+        assert_eq!(dicr & (1 << 31), 0, "master flag follows");
     }
 
     #[test]
