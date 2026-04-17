@@ -10,7 +10,8 @@
 # .cargo/config.toml for the mipsel-sony-psx target.
 
 .PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke parity run \
-        examples hello-tri hello-input hello-ot run-tri run-input run-ot
+        examples hello-tri hello-input hello-ot hello-tex \
+        run-tri run-input run-ot run-tex
 
 help:
 	@echo "PSoXide targets:"
@@ -31,9 +32,11 @@ help:
 	@echo "    make hello-tri    - build the direct-GP0 triangle demo"
 	@echo "    make hello-input  - build the pad-poll demo"
 	@echo "    make hello-ot     - build the DMA linked-list demo"
+	@echo "    make hello-tex    - build the textured-sprite demo"
 	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
 	@echo "    make run-input    - build + side-load hello-input into the frontend"
 	@echo "    make run-ot       - build + side-load hello-ot into the frontend"
+	@echo "    make run-tex      - build + side-load hello-tex into the frontend"
 
 run:
 	cd emu && cargo run -p frontend --release
@@ -88,7 +91,10 @@ hello-input:
 hello-ot:
 	cd sdk/examples/hello-ot && cargo build --release
 
-examples: hello-tri hello-input hello-ot
+hello-tex:
+	cd sdk/examples/hello-tex && cargo build --release
+
+examples: hello-tri hello-input hello-ot hello-tex
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -105,3 +111,6 @@ run-input: hello-input
 
 run-ot: hello-ot
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/hello-ot.exe cargo run -p frontend --release
+
+run-tex: hello-tex
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/hello-tex.exe cargo run -p frontend --release

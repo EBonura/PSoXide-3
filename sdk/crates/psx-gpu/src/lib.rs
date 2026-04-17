@@ -165,6 +165,55 @@ pub fn draw_quad_flat(verts: [(i16, i16); 4], r: u8, g: u8, b: u8) {
     write_gp0(pack_vertex(verts[3].0, verts[3].1));
 }
 
+/// Upload raw 16bpp pixels from CPU memory into a VRAM rectangle.
+/// Used for font glyphs, sprites, and CLUTs — the standard
+/// "CPU→VRAM transfer" pipe (GP0 0xA0 + pixel words).
+///
+/// Length of `pixels` must equal `w * h / 2` words (two 16bpp
+/// pixels packed per word). Alignment of `pixels` doesn't matter
+/// here because we push one word at a time via the FIFO; games
+/// doing DMA uploads get an order-of-magnitude speedup but need
+/// extra care with addresses, which we skip for this simple path.
+pub fn upload_rect_raw(x: u16, y: u16, w: u16, h: u16, pixels: &[u32]) {
+    wait_cmd_ready();
+    write_gp0(gp0::COPY_CPU_TO_VRAM);
+    write_gp0(pack_xy(x, y));
+    write_gp0(pack_xy(w, h));
+    for word in pixels {
+        wait_cmd_ready();
+        write_gp0(*word);
+    }
+}
+
+/// Set the texture page + CLUT + color depth used by subsequent
+/// textured primitives. Textured-rect commands (0x64..=0x7F) read
+/// the texpage from the last GP0(E1h); textured polygons embed
+/// the texpage in one of their UV words. Setting it via E1h is
+/// a good default for sprites.
+pub fn set_texture_page(tpage_x: u16, tpage_y: u16, depth: TextureDepth) {
+    wait_cmd_ready();
+    write_gp0(gp0::draw_mode(
+        (tpage_x / 64) as u32,
+        (tpage_y / 256) as u32,
+        0,
+        depth as u32,
+        false,
+        true,
+    ));
+}
+
+/// Texture color depth passed to [`set_texture_page`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TextureDepth {
+    /// 4-bit CLUT-indexed.
+    Bit4 = 0,
+    /// 8-bit CLUT-indexed.
+    Bit8 = 1,
+    /// 15-bit direct color.
+    Bit15 = 2,
+}
+
 /// Submit a linked-list chain starting at `head` to GPU GP0 via
 /// DMA channel 2 in linked-list mode. Blocks until the walker hits
 /// the `0x00FFFFFF` terminator.
