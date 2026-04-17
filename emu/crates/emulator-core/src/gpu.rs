@@ -121,6 +121,14 @@ impl Gpu {
         }
     }
 
+    /// Toggle GPUSTAT bit 31 (interlace / even-odd line flag). Called
+    /// once per VBlank by `Bus::run_vblank_scheduler`. BIOS-side code
+    /// often polls this bit to tell that a new frame has started,
+    /// independent of the VBlank IRQ.
+    pub fn toggle_vblank_field(&mut self) {
+        self.status.toggle_field();
+    }
+
     /// Dispatch an MMIO write inside the GPU window. Returns `true` if
     /// the address belonged to the GPU.
     pub fn write32(&mut self, phys: u32, value: u32) -> bool {
@@ -896,6 +904,10 @@ impl GpuStatus {
     /// GP1 command dispatch. GP1 commands are simple enough to inline
     /// here; GP0 is more elaborate (packet assembly, texture upload,
     /// primitives) and gets a dedicated module when we actually render.
+    fn toggle_field(&mut self) {
+        self.raw ^= 0x8000_0000;
+    }
+
     fn gp1_write(&mut self, value: u32) {
         let cmd = (value >> 24) & 0xFF;
         match cmd {
