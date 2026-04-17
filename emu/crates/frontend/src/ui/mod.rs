@@ -66,7 +66,13 @@ pub fn draw_layout(
     state.menu.draw(ctx, dt);
 
     if state.panels.hud {
-        hud::draw(ctx, &state.hud, &state.cpu, state.running);
+        hud::draw(
+            ctx,
+            &state.hud,
+            &state.cpu,
+            state.bus.as_ref(),
+            state.running,
+        );
     }
 }
 

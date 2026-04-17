@@ -15,7 +15,7 @@
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Vec2};
 
-use emulator_core::Cpu;
+use emulator_core::{Bus, Cpu};
 
 const HUD_HEIGHT: f32 = 34.0;
 const BG: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 102);
@@ -88,7 +88,7 @@ impl HudState {
 }
 
 /// Paint the HUD bar.
-pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu, running: bool) {
+pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu, bus: Option<&Bus>, running: bool) {
     let screen = ctx.screen_rect();
     let rect = Rect::from_min_size(
         Pos2::new(screen.left(), screen.bottom() - HUD_HEIGHT),
@@ -131,10 +131,22 @@ pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu, running: bool) {
         FontId::proportional(12.0),
         TEXT,
     );
+    // Second line: frame timing + instruction tick + (when a Bus is
+    // present) the bus cycle counter. In phase 4a cycles == tick; when
+    // per-opcode cycle costs land they'll start to diverge, and this
+    // line is where that shows up.
+    let tail = match bus {
+        Some(b) => format!(
+            "dt {dt_ms:5.2} ms   tick {}   cyc {}",
+            cpu.tick(),
+            b.cycles()
+        ),
+        None => format!("dt {dt_ms:5.2} ms   tick {}", cpu.tick()),
+    };
     painter.text(
         Pos2::new(right, line2_y),
         Align2::RIGHT_CENTER,
-        format!("dt {dt_ms:5.2} ms   tick {}", cpu.tick()),
+        tail,
         FontId::proportional(11.0),
         TEXT,
     );
