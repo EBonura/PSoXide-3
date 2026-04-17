@@ -81,8 +81,7 @@ impl Graphics {
             None,
             None,
         );
-        let mut egui_renderer =
-            egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+        let mut egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
 
         let vram_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("psoxide3-vram"),

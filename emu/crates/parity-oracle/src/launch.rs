@@ -205,12 +205,11 @@ impl ReduxProcess {
         let mut records = Vec::with_capacity(n as usize);
         for _ in 0..n {
             let line = self.wait_for_response(per_step_timeout)?;
-            let record = InstructionRecord::from_json_line(&line).map_err(|e| {
-                OracleError::Protocol {
+            let record =
+                InstructionRecord::from_json_line(&line).map_err(|e| OracleError::Protocol {
                     expected: "InstructionRecord JSON".to_string(),
                     got: format!("{line} (parse error: {e})"),
-                }
-            })?;
+                })?;
             records.push(record);
         }
         Ok(records)

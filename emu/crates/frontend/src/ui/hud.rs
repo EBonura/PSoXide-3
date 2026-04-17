@@ -95,8 +95,10 @@ pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu, bus: Option<&Bus>, r
         Vec2::new(screen.width(), HUD_HEIGHT),
     );
 
-    let painter =
-        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("hud")));
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("hud"),
+    ));
 
     painter.rect_filled(rect, 0.0, BG);
 

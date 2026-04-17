@@ -36,7 +36,9 @@ fn pipe_protocol_handshake_and_quit() {
 
     let mut process = ReduxProcess::launch(&config).expect("Redux launches");
 
-    process.handshake(RESPONSE_TIMEOUT).expect("handshake succeeds");
+    process
+        .handshake(RESPONSE_TIMEOUT)
+        .expect("handshake succeeds");
 
     process.send_command("quit").expect("send quit");
     let bye = process
@@ -58,7 +60,9 @@ fn unknown_command_returns_error_response() {
     let config = OracleConfig::new(bios_path(), lua).expect("Redux binary resolves");
 
     let mut process = ReduxProcess::launch(&config).expect("Redux launches");
-    process.handshake(RESPONSE_TIMEOUT).expect("handshake succeeds");
+    process
+        .handshake(RESPONSE_TIMEOUT)
+        .expect("handshake succeeds");
 
     process.send_command("frobnicate").expect("send");
     let resp = process

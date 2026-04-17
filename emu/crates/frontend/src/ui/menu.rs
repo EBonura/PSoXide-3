@@ -229,8 +229,10 @@ impl MenuState {
         let sw = screen.width();
         let sh = screen.height();
 
-        let painter =
-            ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("menu")));
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("menu"),
+        ));
 
         painter.rect_filled(screen, 0.0, theme::MENU_BACKDROP);
 
@@ -297,7 +299,8 @@ impl MenuState {
             } else {
                 theme::MENU_ITEM_BG
             };
-            let rect = Rect::from_min_size(Pos2::new(items_x, y), Vec2::new(ITEM_WIDTH, ITEM_HEIGHT));
+            let rect =
+                Rect::from_min_size(Pos2::new(items_x, y), Vec2::new(ITEM_WIDTH, ITEM_HEIGHT));
             painter.rect_filled(rect, 0.0, bg);
 
             if is_selected {

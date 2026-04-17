@@ -323,7 +323,11 @@ impl Cpu {
             0x01 => self.op_bgez(instr, pc),
             0x10 => self.op_bltzal(instr, pc),
             0x11 => self.op_bgezal(instr, pc),
-            _ => Err(ExecutionError::Unimplemented { opcode: 0x01, pc, instr }),
+            _ => Err(ExecutionError::Unimplemented {
+                opcode: 0x01,
+                pc,
+                instr,
+            }),
         }
     }
 
