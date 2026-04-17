@@ -141,6 +141,16 @@ impl Bus {
     pub fn tick(&mut self, n: u32) {
         self.cycles = self.cycles.wrapping_add(n as u64);
         self.run_vblank_scheduler();
+        let fired = self.timers.tick(n as u64, HSYNC_CYCLES_NTSC);
+        if fired & 1 != 0 {
+            self.irq.raise(IrqSource::Timer0);
+        }
+        if fired & 2 != 0 {
+            self.irq.raise(IrqSource::Timer1);
+        }
+        if fired & 4 != 0 {
+            self.irq.raise(IrqSource::Timer2);
+        }
         if self.cdrom.tick(self.cycles) {
             self.irq.raise(IrqSource::Cdrom);
         }

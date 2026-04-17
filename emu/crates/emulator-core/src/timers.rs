@@ -24,7 +24,28 @@ pub struct Timer {
     pub mode: u32,
     /// Target value the counter compares against.
     pub target: u32,
+    /// Sub-tick accumulator in fractional clock-source units. When a
+    /// timer's clock source ticks slower than the system clock (HBlank
+    /// on T1, /8 on T2), the residual cycles accumulate here until
+    /// they cross the source period.
+    accum: u64,
 }
+
+// Mode-register bit layout (nocash PSX-SPX, section "Timers").
+/// bit 3: reset counter when reaching target (0 = reset at 0xFFFF).
+const MODE_RESET_AT_TARGET: u32 = 1 << 3;
+/// bit 4: raise IRQ when target reached.
+const MODE_IRQ_ON_TARGET: u32 = 1 << 4;
+/// bit 5: raise IRQ when counter wraps at 0xFFFF.
+const MODE_IRQ_ON_WRAP: u32 = 1 << 5;
+/// bit 6: IRQ repeat mode (0 = one-shot until mode-write).
+const MODE_IRQ_REPEAT: u32 = 1 << 6;
+/// bit 10: IRQ status — active-low flag; cleared on fire.
+const MODE_IRQ_ACTIVE_LOW: u32 = 1 << 10;
+/// bit 11: "reached target" sticky flag.
+const MODE_REACHED_TARGET: u32 = 1 << 11;
+/// bit 12: "reached 0xFFFF" sticky flag.
+const MODE_REACHED_WRAP: u32 = 1 << 12;
 
 /// The full three-timer bank.
 #[derive(Default)]
@@ -71,14 +92,120 @@ impl Timers {
         match off {
             0x0 => t.counter = v16,
             0x4 => {
-                t.mode = value;
-                // A real timer resets the counter to 0 on every mode
-                // write; we'll model that once ticking is wired up.
+                // Mode write resets counter + re-arms IRQ (bit 10 set).
+                t.mode = (value & !MODE_IRQ_ACTIVE_LOW) | MODE_IRQ_ACTIVE_LOW;
                 t.counter = 0;
+                t.accum = 0;
             }
             0x8 => t.target = v16,
             _ => {}
         }
+    }
+
+    /// Advance all three timers by `cycles` system-clock ticks. Each
+    /// timer converts that to its own clock source first (HBlank for
+    /// T1, /8 for T2, system clock elsewhere — dot-clock for T0 would
+    /// need GPU scan-out to land first; treat as system clock for now).
+    ///
+    /// Returns a 3-bit mask of timers that fired an IRQ this tick.
+    /// The caller (Bus) uses it to call `Irq::raise(IrqSource::Timer0/1/2)`.
+    pub fn tick(&mut self, cycles: u64, hsync_period: u64) -> u8 {
+        let mut fired: u8 = 0;
+        for i in 0..3 {
+            if self.advance_timer(i, cycles, hsync_period) {
+                fired |= 1 << i;
+            }
+        }
+        fired
+    }
+
+    fn advance_timer(&mut self, idx: usize, cycles: u64, hsync_period: u64) -> bool {
+        let t = &mut self.timers[idx];
+        let source = (t.mode >> 8) & 0x3;
+
+        // Convert `cycles` system clocks into source clocks.
+        let ticks = match (idx, source) {
+            // Timer 0: dot clock (1) uses GPU scan-out — not modelled,
+            // fall back to system clock.
+            // Timer 1 source 1 = HBlank: one tick per HSync period.
+            (1, 1) | (1, 3) => {
+                t.accum += cycles;
+                let n = t.accum / hsync_period;
+                t.accum %= hsync_period;
+                n
+            }
+            // Timer 2 source 2/3 = system clock / 8.
+            (2, 2) | (2, 3) => {
+                t.accum += cycles;
+                let n = t.accum / 8;
+                t.accum %= 8;
+                n
+            }
+            // Everything else is 1:1 system clock.
+            _ => cycles,
+        };
+
+        if ticks == 0 {
+            return false;
+        }
+
+        // Pre-tick position.
+        let old = t.counter;
+        let target = t.target & 0xFFFF;
+        let mut new_val = (old as u64) + ticks;
+
+        let mut fired = false;
+        let mut reached_target = false;
+        let mut reached_wrap = false;
+
+        // Target-reset mode: when counter crosses the target, reset to 0.
+        if t.mode & MODE_RESET_AT_TARGET != 0 && target != 0 {
+            if new_val > target as u64 {
+                reached_target = true;
+                new_val %= (target as u64) + 1;
+            } else if new_val == target as u64 {
+                reached_target = true;
+            }
+        }
+
+        if new_val > 0xFFFF {
+            reached_wrap = true;
+            new_val &= 0xFFFF;
+        }
+
+        // Detect target pass for non-reset-mode too.
+        if t.mode & MODE_RESET_AT_TARGET == 0
+            && (old as u64) < (target as u64)
+            && new_val >= (target as u64)
+        {
+            reached_target = true;
+        }
+
+        if reached_target {
+            t.mode |= MODE_REACHED_TARGET;
+            if t.mode & MODE_IRQ_ON_TARGET != 0 && t.mode & MODE_IRQ_ACTIVE_LOW != 0 {
+                // Fire: clear bit 10 (active-low).
+                t.mode &= !MODE_IRQ_ACTIVE_LOW;
+                fired = true;
+                if t.mode & MODE_IRQ_REPEAT != 0 {
+                    // Re-arm for repeat mode.
+                    t.mode |= MODE_IRQ_ACTIVE_LOW;
+                }
+            }
+        }
+        if reached_wrap {
+            t.mode |= MODE_REACHED_WRAP;
+            if t.mode & MODE_IRQ_ON_WRAP != 0 && t.mode & MODE_IRQ_ACTIVE_LOW != 0 {
+                t.mode &= !MODE_IRQ_ACTIVE_LOW;
+                fired = true;
+                if t.mode & MODE_IRQ_REPEAT != 0 {
+                    t.mode |= MODE_IRQ_ACTIVE_LOW;
+                }
+            }
+        }
+
+        t.counter = new_val as u32;
+        fired
     }
 }
 
