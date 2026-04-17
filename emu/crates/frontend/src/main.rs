@@ -29,6 +29,8 @@ use crate::app::AppState;
 use crate::gfx::Graphics;
 use crate::ui::{xmb::XmbInput, MenuOutcome};
 
+use emulator_core::button;
+
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 800;
 
@@ -45,6 +47,11 @@ struct Shell {
     state: AppState,
     pending_input: XmbInput,
     last_frame: Instant,
+    /// Live port-1 pad mask. Key press/release events toggle bits
+    /// here; the shell flushes it into `bus.set_port1_buttons` each
+    /// frame before running CPU steps so the guest always sees the
+    /// latest state.
+    pad1_mask: u16,
 }
 
 impl Default for Shell {
@@ -54,7 +61,39 @@ impl Default for Shell {
             state: AppState::default(),
             pending_input: XmbInput::default(),
             last_frame: Instant::now(),
+            pad1_mask: 0,
         }
+    }
+}
+
+/// Map a winit logical key to a PSX digital-pad bitmask. Returns
+/// `None` for keys that aren't bound.
+///
+/// Bindings: arrows = D-pad, Z = Cross, X = Circle, A = Square,
+/// S = Triangle, Enter = Start, Shift = Select, Q/W = L1/R1,
+/// E/R = L2/R2. Lowercase vs. uppercase doesn't matter — winit
+/// gives us the logical key post-modifier, we compare on the
+/// character directly.
+fn key_to_pad_button(key: &Key) -> Option<u16> {
+    match key {
+        Key::Named(NamedKey::ArrowUp) => Some(button::UP),
+        Key::Named(NamedKey::ArrowDown) => Some(button::DOWN),
+        Key::Named(NamedKey::ArrowLeft) => Some(button::LEFT),
+        Key::Named(NamedKey::ArrowRight) => Some(button::RIGHT),
+        Key::Named(NamedKey::Enter) => Some(button::START),
+        Key::Named(NamedKey::Shift) => Some(button::SELECT),
+        Key::Character(s) => match s.as_str() {
+            "z" | "Z" => Some(button::CROSS),
+            "x" | "X" => Some(button::CIRCLE),
+            "a" | "A" => Some(button::SQUARE),
+            "s" | "S" => Some(button::TRIANGLE),
+            "q" | "Q" => Some(button::L1),
+            "w" | "W" => Some(button::R1),
+            "e" | "E" => Some(button::L2),
+            "r" | "R" => Some(button::R2),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -94,13 +133,28 @@ impl ApplicationHandler for Shell {
                 event:
                     KeyEvent {
                         logical_key,
-                        state: ElementState::Pressed,
-                        repeat: false,
+                        state,
+                        repeat,
                         ..
                     },
                 ..
             } => {
-                self.pending_input = merge_key(self.pending_input, &logical_key);
+                // Pad state tracks both press AND release continuously
+                // so held buttons keep polling as "pressed". Auto-repeat
+                // events are ignored — the key is already down, and the
+                // BIOS polls every frame anyway.
+                if !repeat {
+                    if let Some(mask) = key_to_pad_button(&logical_key) {
+                        match state {
+                            ElementState::Pressed => self.pad1_mask |= mask,
+                            ElementState::Released => self.pad1_mask &= !mask,
+                        }
+                    }
+                }
+                // The XMB only reacts to presses, not releases.
+                if state == ElementState::Pressed && !repeat {
+                    self.pending_input = merge_key(self.pending_input, &logical_key);
+                }
                 gfx.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -122,6 +176,14 @@ impl ApplicationHandler for Shell {
                 // captures only the tail via `push_history`'s ring-buffer
                 // semantics, so a 100k-instruction frame doesn't allocate.
                 if self.state.running {
+                    // Flush the current keyboard-derived pad mask into
+                    // the guest just before stepping, so the game/
+                    // homebrew sees fresh input this frame.
+                    if let Some(bus) = self.state.bus.as_mut() {
+                        bus.set_port1_buttons(emulator_core::ButtonState::from_bits(
+                            self.pad1_mask,
+                        ));
+                    }
                     run_frame(&mut self.state);
                 }
 
