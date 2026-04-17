@@ -10,6 +10,7 @@ use psx_trace::InstructionRecord;
 use thiserror::Error;
 
 use crate::bus::Bus;
+use crate::gte::Gte;
 
 /// Errors raised during instruction execution.
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -83,6 +84,9 @@ pub struct Cpu {
     /// true — answers "did we reach the threshold that enters an IRQ
     /// exception?".
     should_take_interrupt_steps: u64,
+    /// COP2 — Geometry Transformation Engine. Holds 32 data + 32
+    /// control registers and dispatches the GTE function set.
+    cop2: Gte,
 }
 
 impl Cpu {
@@ -106,7 +110,15 @@ impl Cpu {
             exception_counts: [0; 32],
             irq_line_high_steps: 0,
             should_take_interrupt_steps: 0,
+            cop2: Gte::new(),
         }
+    }
+
+    /// COP2 (GTE) state. Diagnostics / UI surfaces only — opcode
+    /// dispatch goes through the inherent methods directly.
+    #[inline]
+    pub fn cop2(&self) -> &Gte {
+        &self.cop2
     }
 
     /// Cumulative exception counts, keyed by CAUSE.ExcCode. Diagnostic.
@@ -316,6 +328,7 @@ impl Cpu {
             0x0E => self.op_xori(instr),
             0x0F => self.op_lui(instr),
             0x10 => self.dispatch_cop0(instr, pc),
+            0x12 => self.dispatch_cop2(instr, pc),
             0x20 => self.op_lb(instr, bus),
             0x21 => self.op_lh(instr, bus),
             0x22 => self.op_lwl(instr, bus),
@@ -328,6 +341,8 @@ impl Cpu {
             0x2A => self.op_swl(instr, bus),
             0x2B => self.op_sw(instr, bus),
             0x2E => self.op_swr(instr, bus),
+            0x32 => self.op_lwc2(instr, bus),
+            0x3A => self.op_swc2(instr, bus),
             _ => Err(ExecutionError::Unimplemented { opcode, pc, instr }),
         }
     }
@@ -346,6 +361,95 @@ impl Cpu {
                 instr,
             }),
         }
+    }
+
+    /// Dispatch table for COP2 (GTE) instructions (primary opcode
+    /// `0x12`). Bit 25 selects: when clear, the upper 5 bits of bits
+    /// 25..=21 pick MFC2/CFC2/MTC2/CTC2; when set, the bottom 25 bits
+    /// encode a GTE function (RTPS, NCLIP, MVMVA, …).
+    fn dispatch_cop2(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        if instr & (1 << 25) != 0 {
+            self.cop2.execute(instr);
+            return Ok(());
+        }
+        let cop_op = ((instr >> 21) & 0x1F) as u8;
+        match cop_op {
+            0x00 => self.op_mfc2(instr),
+            0x02 => self.op_cfc2(instr),
+            0x04 => self.op_mtc2(instr),
+            0x06 => self.op_ctc2(instr),
+            _ => Err(ExecutionError::Unimplemented {
+                opcode: 0x12,
+                pc,
+                instr,
+            }),
+        }
+    }
+
+    /// `MFC2 rt, rd` — move from COP2 data register `rd` into GPR
+    /// `rt`. Like LW, this respects the one-slot load delay so the
+    /// next instruction sees the *old* register value.
+    fn op_mfc2(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        let value = self.cop2.read_data(rd);
+        if rt != 0 {
+            self.pending_load = Some((rt, value));
+        }
+        Ok(())
+    }
+
+    /// `CFC2 rt, rd` — same as MFC2 but reads a control register.
+    fn op_cfc2(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        let value = self.cop2.read_control(rd);
+        if rt != 0 {
+            self.pending_load = Some((rt, value));
+        }
+        Ok(())
+    }
+
+    /// `MTC2 rt, rd` — move from GPR `rt` to COP2 data register `rd`.
+    /// Coprocessor writes commit immediately (no delay slot).
+    fn op_mtc2(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.cop2.write_data(rd, self.gpr(rt));
+        Ok(())
+    }
+
+    /// `CTC2 rt, rd` — same as MTC2 but writes a control register.
+    fn op_ctc2(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.cop2.write_control(rd, self.gpr(rt));
+        Ok(())
+    }
+
+    /// `LWC2 rt, offset(rs)` — load 32-bit word from memory into COP2
+    /// data register `rt`. No GPR is touched, so no load-delay slot.
+    fn op_lwc2(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        let value = bus.read32(addr);
+        self.cop2.write_data(rt, value);
+        Ok(())
+    }
+
+    /// `SWC2 rt, offset(rs)` — store COP2 data register `rt` to memory.
+    fn op_swc2(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        bus.write32(addr, self.cop2.read_data(rt));
+        Ok(())
     }
 
     fn dispatch_regimm(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
@@ -1231,14 +1335,15 @@ mod tests {
 
     #[test]
     fn unimplemented_opcode_returns_structured_error() {
-        // opcode 0x12 = COP2 (GTE); genuine R3000 opcode we haven't
-        // decoded yet. Encoding: 0x48000000 = (0x12 << 26) | 0.
-        let mut bus = Bus::new(synthetic_bios_with_first_word(0x4800_0000)).unwrap();
+        // opcode 0x11 = COP1 (FPU); the PS1 has no FPU and the BIOS
+        // never issues this, so we leave it unimplemented as a
+        // sentinel. Encoding: 0x44000000 = (0x11 << 26) | 0.
+        let mut bus = Bus::new(synthetic_bios_with_first_word(0x4400_0000)).unwrap();
         let mut cpu = Cpu::new();
         let err = cpu.step(&mut bus).unwrap_err();
         assert!(matches!(
             err,
-            ExecutionError::Unimplemented { opcode: 0x12, .. }
+            ExecutionError::Unimplemented { opcode: 0x11, .. }
         ));
     }
 
