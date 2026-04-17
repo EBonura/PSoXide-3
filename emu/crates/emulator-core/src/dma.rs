@@ -142,6 +142,52 @@ impl Default for Dma {
     }
 }
 
+// --- Transfer execution ---
+
+impl Dma {
+    /// Run the OTC (channel 6) transfer if its start bit is set.
+    ///
+    /// OTC fills an ordering table from high address downwards: each
+    /// word becomes the address of the word one step "previous" in
+    /// the list (i.e. `addr + 4`), except the first (highest) word,
+    /// which becomes the linked-list terminator `0x00FF_FFFF`. After
+    /// the transfer the start bit (24) and busy bit (28) in CHCR are
+    /// cleared so BIOS polling sees completion.
+    ///
+    /// Returns `true` if a transfer actually ran (start bit was set).
+    /// Called by [`crate::Bus`] after every CHCR write.
+    pub fn run_otc(&mut self, ram: &mut [u8]) -> bool {
+        let ch = &self.channels[6];
+        if (ch.channel_control >> 24) & 1 == 0 {
+            return false;
+        }
+
+        let base = ch.base & 0x001F_FFFC;
+        let count = match ch.block_control & 0xFFFF {
+            0 => 0x1_0000, // hardware: 0 means 65536
+            n => n,
+        };
+
+        let mut addr = base;
+        for i in 0..count {
+            let value: u32 = if i == 0 {
+                0x00FF_FFFF
+            } else {
+                addr.wrapping_add(4) & 0x001F_FFFF
+            };
+            let offset = (addr & 0x001F_FFFF) as usize;
+            if offset + 4 <= ram.len() {
+                ram[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            addr = addr.wrapping_sub(4);
+        }
+
+        let ch = &mut self.channels[6];
+        ch.channel_control &= !((1 << 24) | (1 << 28));
+        true
+    }
+}
+
 fn decode(phys: u32) -> (usize, u32) {
     let rel = phys - Dma::BASE;
     let ch = (rel / Dma::STRIDE) as usize;
@@ -196,5 +242,58 @@ mod tests {
             dma.write32(addr, ch * 0x1000);
             assert_eq!(dma.read32(addr), ch * 0x1000);
         }
+    }
+
+    fn set_otc(dma: &mut Dma, base: u32, count: u32) {
+        // CH6: base, block count, start (bit 24) + busy (bit 28)
+        dma.write32(0x1F80_10E0, base);
+        dma.write32(0x1F80_10E4, count);
+        dma.write32(0x1F80_10E8, (1 << 24) | (1 << 28));
+    }
+
+    #[test]
+    fn otc_writes_terminator_at_base_and_chain_below() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 2 * 1024 * 1024];
+        // 4-entry OT anchored at word 0x400.
+        set_otc(&mut dma, 0x0000_0400, 4);
+        assert!(dma.run_otc(&mut ram));
+
+        // Base word = terminator 0x00FFFFFF.
+        assert_eq!(read_u32(&ram, 0x400), 0x00FF_FFFF);
+        // base - 4 points to base.
+        assert_eq!(read_u32(&ram, 0x3FC), 0x0000_0400);
+        // base - 8 points to base - 4.
+        assert_eq!(read_u32(&ram, 0x3F8), 0x0000_03FC);
+        // base - 12 points to base - 8.
+        assert_eq!(read_u32(&ram, 0x3F4), 0x0000_03F8);
+    }
+
+    #[test]
+    fn otc_clears_start_and_busy_bits() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 2 * 1024 * 1024];
+        set_otc(&mut dma, 0x0000_0100, 1);
+        assert!(dma.run_otc(&mut ram));
+
+        let chcr = dma.channels[6].channel_control;
+        assert_eq!(chcr & (1 << 24), 0);
+        assert_eq!(chcr & (1 << 28), 0);
+    }
+
+    #[test]
+    fn otc_is_noop_when_start_bit_not_set() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 2 * 1024 * 1024];
+        // Write base/count but not start bit.
+        dma.write32(0x1F80_10E0, 0x0000_0100);
+        dma.write32(0x1F80_10E4, 1);
+        assert!(!dma.run_otc(&mut ram));
+        assert_eq!(read_u32(&ram, 0x100), 0);
+    }
+
+    fn read_u32(ram: &[u8], offset: u32) -> u32 {
+        let o = offset as usize;
+        u32::from_le_bytes([ram[o], ram[o + 1], ram[o + 2], ram[o + 3]])
     }
 }

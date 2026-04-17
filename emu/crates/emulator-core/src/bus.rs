@@ -101,6 +101,14 @@ impl Bus {
         self.irq.pending()
     }
 
+    /// Run any DMA channels whose start bit was just set. Only OTC
+    /// (channel 6) transfers self-contained right now; GPU, SPU,
+    /// CD-ROM, and MDEC channels need their consumer subsystems to
+    /// come online first.
+    fn maybe_run_dma(&mut self) {
+        self.dma.run_otc(&mut self.ram[..]);
+    }
+
     /// Non-panicking byte read. Returns `None` for addresses outside
     /// any currently-mapped region. Diagnostic UIs (memory viewer,
     /// disassembler) use this to browse arbitrary ranges without
@@ -304,6 +312,9 @@ impl Bus {
         }
         if Dma::contains(phys) {
             self.dma.write32(phys, value);
+            // A CHCR write can request a transfer; run whatever we
+            // can self-contain right now (OTC only, so far).
+            self.maybe_run_dma();
             return;
         }
         if self.gpu.write32(phys, value) {
