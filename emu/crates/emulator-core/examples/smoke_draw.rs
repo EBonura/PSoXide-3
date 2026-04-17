@@ -31,8 +31,9 @@ fn main() {
         // that skipped the real BIOS boot. Parity tests never load
         // an EXE, so this is always off there.
         bus.enable_hle_bios();
+        bus.attach_digital_pad_port1();
         eprintln!(
-            "[smoke_draw] side-loaded {exe_path}: entry=0x{:08x} sp={:?} payload={}B (hle-bios on)",
+            "[smoke_draw] side-loaded {exe_path}: entry=0x{:08x} sp={:?} payload={}B (hle-bios + pad)",
             exe.initial_pc,
             exe.initial_sp(),
             exe.payload.len()

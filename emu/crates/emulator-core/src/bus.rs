@@ -161,6 +161,20 @@ impl Bus {
         self.hle_bios_enabled = true;
     }
 
+    /// Plug a digital controller into port 1 so homebrew / commercial
+    /// games can poll for button state. Convenience: most single-player
+    /// games use port 1 only.
+    pub fn attach_digital_pad_port1(&mut self) {
+        self.sio0
+            .attach_port1(crate::pad::PortDevice::DigitalPad(crate::pad::DigitalPad::new()));
+    }
+
+    /// Update the buttons currently held on the port-1 controller.
+    /// Called by the frontend each frame from the keyboard state.
+    pub fn set_port1_buttons(&mut self, buttons: crate::pad::ButtonState) {
+        self.sio0.set_port1_buttons(buttons);
+    }
+
     /// Internal: log one HLE BIOS call. Called from the HLE dispatcher.
     pub(crate) fn hle_bios_log_call(&mut self, table: crate::hle_bios::Table, func: u8) {
         let idx = match table {

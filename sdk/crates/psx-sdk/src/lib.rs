@@ -23,4 +23,5 @@
 pub use psx_gpu as gpu;
 pub use psx_hw as hw;
 pub use psx_io as io;
+pub use psx_pad as pad;
 pub use psx_rt as rt;

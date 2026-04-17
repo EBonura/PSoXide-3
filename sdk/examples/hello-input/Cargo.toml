@@ -1,0 +1,20 @@
+[package]
+name    = "hello-input"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "hello-input"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[dependencies]
+psx-gpu = { path = "../../crates/psx-gpu" }
+psx-pad = { path = "../../crates/psx-pad" }
+psx-rt  = { path = "../../crates/psx-rt" }

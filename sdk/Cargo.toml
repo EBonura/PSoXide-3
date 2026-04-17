@@ -4,6 +4,7 @@ members = [
     "crates/psx-io",
     "crates/psx-rt",
     "crates/psx-gpu",
+    "crates/psx-pad",
     "crates/psx-sdk",
 ]
 
@@ -23,4 +24,5 @@ psx-hw  = { path = "../crates/psx-hw" }
 psx-io  = { path = "crates/psx-io" }
 psx-rt  = { path = "crates/psx-rt" }
 psx-gpu = { path = "crates/psx-gpu" }
+psx-pad = { path = "crates/psx-pad" }
 psx-sdk = { path = "crates/psx-sdk" }

@@ -26,10 +26,16 @@ mod stat_bit {
 }
 
 mod ctrl_bit {
+    /// bit 1 — drive `/JOYN` output. Transitioning high-to-low is how
+    /// the CPU "selects" the device at the start of a transfer; going
+    /// low-to-high deselects and resets the device state machine.
+    pub const JOYN_OUTPUT: u16 = 1 << 1;
     /// Write-1 to acknowledge pending IRQ bits in STAT.
     pub const ACK: u16 = 1 << 4;
     /// Write-1 to soft-reset the port.
     pub const RESET: u16 = 1 << 6;
+    /// bit 13 — port / slot select (0 = JOY1, 1 = JOY2).
+    pub const SLOT: u16 = 1 << 13;
 }
 
 mod offset {
@@ -55,10 +61,18 @@ pub struct Sio0 {
     /// `None` means RX empty (`STAT.RX_NOT_EMPTY` clears).
     rx: Option<u8>,
     /// Set by `write_data`, consumed by [`Sio0::take_pending_irq`].
-    /// The Bus raises `IrqSource::Controller` when true. Hardware does
-    /// this via /ACK low-to-high; with no device we approximate via
-    /// "always IRQ after TX", which matches the DSR-timeout outcome.
+    /// The Bus raises `IrqSource::Controller` when true. Mirrors how
+    /// real hardware pulses IRQ7 when `/DSR` ACKs a transfer (or
+    /// DSR-timeout fires if nothing answers).
     pending_irq: bool,
+    /// Device on port 1 (controller slot 1 + memory card 1).
+    port1: crate::pad::PortDevice,
+    /// Device on port 2 (controller slot 2 + memory card 2).
+    port2: crate::pad::PortDevice,
+    /// Last observed JOYN-output level. We use high-to-low
+    /// transitions (deselect → select) to reset device state
+    /// machines, matching hardware.
+    last_joyn: bool,
 }
 
 impl Sio0 {
@@ -67,7 +81,7 @@ impl Sio0 {
     /// Size of the register window (`DATA..=BAUD` plus padding).
     pub const SIZE: u32 = 0x10;
 
-    /// All registers zero — matches a cold power-on port.
+    /// All registers zero, both ports empty. Matches cold power-on.
     pub fn new() -> Self {
         Self {
             mode: 0,
@@ -75,7 +89,30 @@ impl Sio0 {
             baud: 0,
             rx: None,
             pending_irq: false,
+            port1: crate::pad::PortDevice::None,
+            port2: crate::pad::PortDevice::None,
+            last_joyn: false,
         }
+    }
+
+    /// Plug a device into port 1 (typical for "player 1" games).
+    pub fn attach_port1(&mut self, device: crate::pad::PortDevice) {
+        self.port1 = device;
+    }
+
+    /// Plug a device into port 2.
+    pub fn attach_port2(&mut self, device: crate::pad::PortDevice) {
+        self.port2 = device;
+    }
+
+    /// Update the button state held on port 1.
+    pub fn set_port1_buttons(&mut self, buttons: crate::pad::ButtonState) {
+        self.port1.set_buttons(buttons);
+    }
+
+    /// Update the button state held on port 2.
+    pub fn set_port2_buttons(&mut self, buttons: crate::pad::ButtonState) {
+        self.port2.set_buttons(buttons);
     }
 
     /// Returns true and clears the flag when a DATA write has armed
@@ -144,14 +181,22 @@ impl Sio0 {
         }
     }
 
-    /// TX clocks a byte out on the (empty) port. Full-duplex: the
-    /// shifter simultaneously reads in a byte, and with nothing
-    /// driving MISO the line floats to 0xFF. RX slot fills and an
-    /// IRQ7 is armed so the BIOS's pad handler runs and advances
-    /// its per-port descriptor counter.
-    fn write_data(&mut self, _value: u8) {
-        self.rx = Some(0xFF);
-        self.pending_irq = true;
+    /// TX clocks one byte across the active port's serial link. The
+    /// selected device (if any) returns its RX byte and whether it
+    /// wants another round (pulls `/DSR` low → IRQ7 armed).
+    fn write_data(&mut self, value: u8) {
+        let (rx, ack) = self.active_port().exchange(value);
+        self.rx = Some(rx);
+        self.pending_irq = ack;
+    }
+
+    /// Device selected by the current `CTRL.SLOT` bit.
+    fn active_port(&mut self) -> &mut crate::pad::PortDevice {
+        if self.ctrl & ctrl_bit::SLOT == 0 {
+            &mut self.port1
+        } else {
+            &mut self.port2
+        }
     }
 
     fn write_ctrl(&mut self, value: u16) {
@@ -159,11 +204,25 @@ impl Sio0 {
             self.mode = 0;
             self.ctrl = 0;
             self.baud = 0;
+            self.port1.deselect();
+            self.port2.deselect();
+            self.last_joyn = false;
             return;
         }
         // ACK bit is write-1-to-clear of STAT.IRQ9; we never set that,
         // so we strip the bit and store the rest.
-        self.ctrl = value & !ctrl_bit::ACK;
+        let new_ctrl = value & !ctrl_bit::ACK;
+        // Edge-detect JOYN: the high-to-low transition starts a new
+        // transfer; the low-to-high transition deselects and the
+        // device state machine resets.
+        let old_joyn = self.last_joyn;
+        let new_joyn = new_ctrl & ctrl_bit::JOYN_OUTPUT != 0;
+        if old_joyn && !new_joyn {
+            self.port1.deselect();
+            self.port2.deselect();
+        }
+        self.last_joyn = new_joyn;
+        self.ctrl = new_ctrl;
     }
 
     /// 32-bit write dispatch. STAT is 32-bit on hardware but the
@@ -278,5 +337,53 @@ mod tests {
         }
         assert!(!Sio0::contains(Sio0::BASE - 1));
         assert!(!Sio0::contains(Sio0::BASE + Sio0::SIZE));
+    }
+
+    #[test]
+    fn digital_pad_full_poll_via_mmio() {
+        use crate::pad::{button, ButtonState, DigitalPad, PortDevice};
+
+        let mut sio = Sio0::new();
+        sio.attach_port1(PortDevice::DigitalPad(DigitalPad::new()));
+        // Hold Cross + Start.
+        sio.set_port1_buttons(ButtonState::from_bits(button::START | button::CROSS));
+
+        // Simulate the BIOS pad-poll sequence on port 1 (SLOT bit clear).
+        sio.write16(Sio0::BASE + 0xA, ctrl_bit::JOYN_OUTPUT); // assert JOYN
+
+        // TX 0x01 → RX 0x41
+        sio.write8(Sio0::BASE, 0x01);
+        assert_eq!(sio.pop_rx(), 0x41);
+
+        // TX 0x42 → RX 0x5A
+        sio.write8(Sio0::BASE, 0x42);
+        assert_eq!(sio.pop_rx(), 0x5A);
+
+        // TX 0x00 → RX buttons1 (START = bit 3 pressed → wire 0xF7)
+        sio.write8(Sio0::BASE, 0x00);
+        assert_eq!(sio.pop_rx(), 0xF7);
+
+        // TX 0x00 → RX buttons2 (CROSS = bit 14 pressed → wire 0xBF)
+        sio.write8(Sio0::BASE, 0x00);
+        assert_eq!(sio.pop_rx(), 0xBF);
+    }
+
+    #[test]
+    fn slot_bit_switches_ports() {
+        use crate::pad::{DigitalPad, PortDevice};
+
+        let mut sio = Sio0::new();
+        sio.attach_port1(PortDevice::DigitalPad(DigitalPad::new()));
+        // Port 2 stays empty.
+
+        // CTRL.SLOT = 1 → port 2 (empty).
+        sio.write16(Sio0::BASE + 0xA, ctrl_bit::SLOT | ctrl_bit::JOYN_OUTPUT);
+        sio.write8(Sio0::BASE, 0x01);
+        assert_eq!(sio.pop_rx(), 0xFF, "empty port 2 returns 0xFF");
+
+        // CTRL.SLOT = 0 → port 1 (has pad).
+        sio.write16(Sio0::BASE + 0xA, ctrl_bit::JOYN_OUTPUT);
+        sio.write8(Sio0::BASE, 0x01);
+        assert_eq!(sio.pop_rx(), 0x41, "port 1 pad responds");
     }
 }

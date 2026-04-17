@@ -91,8 +91,13 @@ impl Default for AppState {
                 bus.load_exe_payload(exe.load_addr, &exe.payload);
                 cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
                 bus.enable_hle_bios();
+                // Plug a digital pad into port 1 so the guest can
+                // poll for input. The frontend's keyboard handler
+                // pushes the live mask into bus.set_port1_buttons()
+                // each frame — see main.rs.
+                bus.attach_digital_pad_port1();
                 eprintln!(
-                    "[frontend] side-loaded EXE: entry=0x{:08x} payload={}B (hle-bios on)",
+                    "[frontend] side-loaded EXE: entry=0x{:08x} payload={}B (hle-bios + pad1)",
                     exe.initial_pc,
                     exe.payload.len()
                 );
