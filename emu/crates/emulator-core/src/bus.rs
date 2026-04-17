@@ -169,6 +169,11 @@ impl Bus {
     pub fn run_vblank_scheduler(&mut self) {
         while self.cycles >= self.next_vblank_cycle {
             self.irq.raise(IrqSource::VBlank);
+            // Toggle GPUSTAT bit 31 (interlace/field flag) — some BIOS
+            // and game code polls this instead of (or in addition to)
+            // the VBlank IRQ to detect frame boundaries. Matches
+            // Redux's `SoftGPU::vblank` which does the same.
+            self.gpu.toggle_vblank_field();
             self.next_vblank_cycle =
                 self.next_vblank_cycle.wrapping_add(VBLANK_PERIOD_CYCLES);
         }

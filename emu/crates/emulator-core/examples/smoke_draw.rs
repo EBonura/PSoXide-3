@@ -19,8 +19,17 @@ fn main() {
     let mut bus = Bus::new(bios).expect("bus");
     let mut cpu = Cpu::new();
 
+    // Sample the last ~1% of the run for a PC histogram — tells us
+    // whether BIOS is in a tight loop or executing broadly.
+    let sample_start = n.saturating_sub(n / 100);
+    let mut pc_hits: std::collections::BTreeMap<u32, u32> =
+        std::collections::BTreeMap::new();
+
     let mut stopped_at: Option<(u64, emulator_core::ExecutionError)> = None;
     for i in 0..n {
+        if i >= sample_start {
+            *pc_hits.entry(cpu.pc()).or_insert(0) += 1;
+        }
         if let Err(e) = cpu.step(&mut bus) {
             stopped_at = Some((i, e));
             break;
@@ -68,6 +77,15 @@ fn main() {
     };
     println!("I_STAT           = 0x{i_stat:08x}");
     println!("I_MASK           = 0x{i_mask:08x}");
+
+    // Top 10 PCs in the sampled window.
+    println!("\n=== top PCs in last 1% of run ===");
+    let mut top: Vec<(u32, u32)> = pc_hits.iter().map(|(k, v)| (*k, *v)).collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    for (pc, count) in top.iter().take(10) {
+        println!("  {pc:08x}: {count:>8} hits");
+    }
+    println!("  (unique PCs in sample: {})", pc_hits.len());
     println!(
         "DMA start triggers per channel (0=MDECin 1=MDECout 2=GPU 3=CDROM 4=SPU 5=PIO 6=OTC):"
     );
