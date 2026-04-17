@@ -33,6 +33,41 @@ fn main() {
     println!("cpu.pc           = 0x{:08x}", cpu.pc());
     println!("next_vblank_cyc  = {}", bus.next_vblank_cycle());
     println!("gp0_write_count  = {}", bus.gpu.gp0_write_count());
+    println!("cdrom commands   = {}", bus.cdrom.commands_dispatched());
+    let hist = bus.cdrom.command_histogram();
+    let nonzero: Vec<(u8, u32)> = hist
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &c)| if c > 0 { Some((i as u8, c)) } else { None })
+        .collect();
+    if !nonzero.is_empty() {
+        println!(
+            "cdrom cmd histogram (op: count):  {:?}",
+            nonzero
+                .iter()
+                .map(|(op, c)| format!("0x{op:02X}:{c}"))
+                .collect::<Vec<_>>()
+        );
+    }
+    println!("cdrom irq_flag   = 0x{:02X}", bus.cdrom.irq_flag());
+    // Need a safe peek at IRQ controller state — reading through the bus
+    // would need &mut. Read raw IRQ register via the MMIO path.
+    let i_stat = {
+        let b0 = bus.try_read8(0xBF80_1070).unwrap_or(0) as u32;
+        let b1 = bus.try_read8(0xBF80_1071).unwrap_or(0) as u32;
+        let b2 = bus.try_read8(0xBF80_1072).unwrap_or(0) as u32;
+        let b3 = bus.try_read8(0xBF80_1073).unwrap_or(0) as u32;
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    };
+    let i_mask = {
+        let b0 = bus.try_read8(0xBF80_1074).unwrap_or(0) as u32;
+        let b1 = bus.try_read8(0xBF80_1075).unwrap_or(0) as u32;
+        let b2 = bus.try_read8(0xBF80_1076).unwrap_or(0) as u32;
+        let b3 = bus.try_read8(0xBF80_1077).unwrap_or(0) as u32;
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    };
+    println!("I_STAT           = 0x{i_stat:08x}");
+    println!("I_MASK           = 0x{i_mask:08x}");
     println!(
         "DMA start triggers per channel (0=MDECin 1=MDECout 2=GPU 3=CDROM 4=SPU 5=PIO 6=OTC):"
     );

@@ -122,6 +122,24 @@ pub mod drive_status_bit {
 const PARAM_FIFO_DEPTH: usize = 16;
 const RESPONSE_FIFO_DEPTH: usize = 16;
 
+/// Canonical cycle delays for command responses, matching the
+/// ballpark Redux uses. Real hardware values depend on motor speed,
+/// seek distance, head position, etc.; these are fine for "emulates
+/// enough to boot" use.
+const FIRST_RESPONSE_CYCLES: u64 = 50_000;
+const INIT_SECOND_RESPONSE_CYCLES: u64 = 900_000;
+const GETID_SECOND_RESPONSE_CYCLES: u64 = 33_000;
+const SEEK_SECOND_RESPONSE_CYCLES: u64 = 500_000;
+
+/// A deferred response: when `bus.cycles` passes `deadline`, the
+/// event's bytes land in the response FIFO and its IRQ type fires.
+#[derive(Debug, Clone)]
+struct PendingEvent {
+    deadline: u64,
+    irq: IrqType,
+    bytes: Vec<u8>,
+}
+
 /// CD-ROM controller state.
 pub struct CdRom {
     /// Index register low 2 bits — selects the register visible at
@@ -143,8 +161,26 @@ pub struct CdRom {
     /// Currently-raised IRQ type; cleared by writing 1s to the low
     /// 3 bits of `0x1F80_1803 idx=1`.
     irq_flag: u8,
+    /// Scheduled events waiting for their cycle deadlines. Processed
+    /// in order by [`CdRom::tick`].
+    pending: VecDeque<PendingEvent>,
+    /// `true` once the BIOS has sent an `Init` command and the
+    /// motor has completed spinning up. Gates commands that need the
+    /// motor (Seek, Read, Play).
+    motor_on: bool,
+    /// Whether a disc is currently inserted. For "no-disc" boots
+    /// this stays `false`, and commands that expect a disc (GetID,
+    /// ReadN) return error responses.
+    disc_present: bool,
+    /// Most-recent SetLoc BCD target (minute, second, frame). Used
+    /// by SeekL / ReadN to know where to go.
+    setloc_msf: (u8, u8, u8),
     /// Total commands dispatched since reset — diagnostic counter.
     commands_dispatched: u64,
+    /// Diagnostic histogram of each command byte seen — `[0x00..=0x1F]`
+    /// is enough to capture every BIOS command. Exposed via
+    /// [`CdRom::command_histogram`] for `smoke_draw`.
+    command_hist: [u32; 32],
 }
 
 impl CdRom {
@@ -154,15 +190,21 @@ impl CdRom {
     pub fn new() -> Self {
         Self {
             index: 0,
-            // Cold boot: shell "open" per hardware convention when no
-            // disc has been seated yet. Motor off. Everything else
-            // clear. The BIOS will see this via its first GetStat.
-            drive_status: drive_status_bit::SHELL_OPEN,
+            // Cold boot: on a closed shell with no disc seated, we
+            // want the BIOS to reach the "Please insert disc" shell —
+            // that needs SHELL_OPEN clear (lid closed) so the Init
+            // command spins the motor up without erroring.
+            drive_status: 0,
             params: VecDeque::with_capacity(PARAM_FIFO_DEPTH),
             responses: VecDeque::with_capacity(RESPONSE_FIFO_DEPTH),
             irq_mask: 0,
             irq_flag: 0,
+            pending: VecDeque::new(),
+            motor_on: false,
+            disc_present: false,
+            setloc_msf: (0, 0, 0),
             commands_dispatched: 0,
+            command_hist: [0; 32],
         }
     }
 
@@ -262,23 +304,269 @@ impl CdRom {
         }
     }
 
-    /// Placeholder command-dispatch hook — Phase 6b wires commands to
-    /// actual behaviour. Recording dispatches so the smoke-test can
-    /// see what the BIOS is trying to do.
+    /// Execute a command received on the command port. The command's
+    /// handler synthesises its first (and optional second) response
+    /// and schedules them into the pending-events queue.
+    ///
+    /// A handful of commands use the parameter FIFO for arguments
+    /// (SetLoc MSF, SetMode, Test sub-op). The parameters are drained
+    /// inline by the handler.
     fn queue_command(&mut self, command: u8) {
         self.commands_dispatched += 1;
-        let _ = command;
-        // Phase 6b: schedule 1st response at +50_000 cycles,
-        // 2nd response (if any) at +1_000_000 cycles, etc.
-        // For 6a we just drop the command and keep status-FIFO hygiene.
+        if (command as usize) < self.command_hist.len() {
+            self.command_hist[command as usize] += 1;
+        }
+
+        // Drain parameters into a local vec — handlers need them and
+        // pop-order matches push-order.
+        let params: Vec<u8> = self.params.drain(..).collect();
+
+        match command {
+            // Sync / NOP — acts as GetStat.
+            0x00 | 0x01 => self.cmd_getstat(),
+            // SetLoc: 3 BCD bytes (minute, second, frame).
+            0x02 => self.cmd_setloc(&params),
+            // Play (CD-DA): 1 optional byte (track). Treat as no-disc
+            // error if no disc; otherwise we'd need audio plumbing.
+            0x03 => self.cmd_simple_stat_or_nodisc(),
+            // ReadN (read with auto-retry). Without a disc, error.
+            0x06 => self.cmd_read(),
+            // Stop: halt motor.
+            0x08 => self.cmd_stop(),
+            // Pause: halt reads but keep motor on.
+            0x09 => self.cmd_pause(),
+            // Init: reset drive + spin motor + clear mode.
+            0x0A => self.cmd_init(),
+            // Mute / Demute.
+            0x0B | 0x0C => self.cmd_getstat(),
+            // SetMode: 1 byte (speed, CD-DA enable, filter, etc.).
+            // We accept and store; full behaviour in 6d.
+            0x0E => self.cmd_setmode(&params),
+            // SeekL: seek to last-SetLoc position (logical sectors).
+            0x15 => self.cmd_seek(),
+            // Test: sub-op in param[0]. Most common: 0x20 = get
+            // drive version / BIOS date (6-byte response).
+            0x19 => self.cmd_test(&params),
+            // GetID: "what kind of disc is this?"
+            0x1A => self.cmd_getid(),
+            _ => self.cmd_getstat(),
+        }
     }
 
-    /// Diagnostic: total commands received.
+    // --- Command handlers ---
+
+    /// Schedule a first-response IRQ containing the given bytes, at
+    /// now + `FIRST_RESPONSE_CYCLES`. Used by almost every command's
+    /// acknowledge path.
+    fn schedule_first_response(&mut self, bytes: Vec<u8>) {
+        self.pending.push_back(PendingEvent {
+            deadline: 0, // filled in by `tick_at` when we know `now`
+            irq: IrqType::Acknowledge,
+            bytes,
+        });
+    }
+
+    fn schedule_second_response(&mut self, bytes: Vec<u8>, delay: u64) {
+        // We use deadline=1 as a marker for "relative delay"; `tick_at`
+        // translates both 0 and non-zero markers correctly.
+        let _ = delay;
+        self.pending.push_back(PendingEvent {
+            deadline: delay,
+            irq: IrqType::Complete,
+            bytes,
+        });
+    }
+
+    fn schedule_error_response(&mut self, bytes: Vec<u8>) {
+        self.pending.push_back(PendingEvent {
+            deadline: 0,
+            irq: IrqType::Error,
+            bytes,
+        });
+    }
+
+    fn stat_byte(&self) -> u8 {
+        let mut s = self.drive_status;
+        if self.motor_on {
+            s |= drive_status_bit::MOTOR_ON;
+        }
+        s
+    }
+
+    fn cmd_getstat(&mut self) {
+        let stat = self.stat_byte();
+        self.schedule_first_response(vec![stat]);
+    }
+
+    fn cmd_setloc(&mut self, params: &[u8]) {
+        if params.len() >= 3 {
+            self.setloc_msf = (params[0], params[1], params[2]);
+        }
+        let stat = self.stat_byte();
+        self.schedule_first_response(vec![stat]);
+    }
+
+    fn cmd_setmode(&mut self, _params: &[u8]) {
+        let stat = self.stat_byte();
+        self.schedule_first_response(vec![stat]);
+    }
+
+    fn cmd_stop(&mut self) {
+        self.motor_on = false;
+        self.schedule_first_response(vec![self.stat_byte()]);
+        let stat = self.stat_byte();
+        self.schedule_second_response(vec![stat], SEEK_SECOND_RESPONSE_CYCLES);
+    }
+
+    fn cmd_pause(&mut self) {
+        self.schedule_first_response(vec![self.stat_byte()]);
+        let stat = self.stat_byte();
+        self.schedule_second_response(vec![stat], SEEK_SECOND_RESPONSE_CYCLES);
+    }
+
+    fn cmd_init(&mut self) {
+        // 1st response: current (pre-spin) stat.
+        self.schedule_first_response(vec![self.stat_byte()]);
+        // Spin up and post-init stat.
+        self.motor_on = true;
+        let stat = self.stat_byte();
+        self.schedule_second_response(vec![stat], INIT_SECOND_RESPONSE_CYCLES);
+    }
+
+    fn cmd_seek(&mut self) {
+        // Need a disc / motor. Without disc we still "seek" but it
+        // succeeds immediately on the real drive — BIOS rarely calls
+        // SeekL without a disc.
+        self.schedule_first_response(vec![self.stat_byte()]);
+        let stat = self.stat_byte() | drive_status_bit::SEEKING;
+        self.schedule_second_response(vec![stat], SEEK_SECOND_RESPONSE_CYCLES);
+    }
+
+    fn cmd_read(&mut self) {
+        if self.disc_present {
+            // Sector streaming lands in 6d; for now we ack but never
+            // deliver data.
+            self.schedule_first_response(vec![
+                self.stat_byte() | drive_status_bit::READING
+            ]);
+        } else {
+            // Error: stat | (1<<0 error) + error code 0x10 (no disc).
+            let stat = self.stat_byte() | drive_status_bit::ERROR;
+            self.schedule_error_response(vec![stat, 0x10]);
+        }
+    }
+
+    fn cmd_simple_stat_or_nodisc(&mut self) {
+        if self.disc_present {
+            self.schedule_first_response(vec![self.stat_byte()]);
+        } else {
+            let stat = self.stat_byte() | drive_status_bit::ERROR;
+            self.schedule_error_response(vec![stat, 0x80]);
+        }
+    }
+
+    fn cmd_test(&mut self, params: &[u8]) {
+        // Only Test 0x20 (drive version / BIOS date) is commonly used
+        // by the BIOS. Return the PSX SCPH-5502 canonical 6-byte
+        // response; real responses vary by firmware but the BIOS
+        // doesn't check.
+        match params.first().copied() {
+            Some(0x20) => {
+                // 6-byte: YY MM DD VER
+                self.schedule_first_response(vec![0x94, 0x09, 0x19, 0xC0]);
+            }
+            _ => self.cmd_getstat(),
+        }
+    }
+
+    fn cmd_getid(&mut self) {
+        if self.disc_present {
+            // Licensed PS1 PAL disc placeholder. 8 bytes:
+            //   stat, flags, disc_type, 00, 'S','C','E','A'
+            let stat = self.stat_byte();
+            self.schedule_first_response(vec![stat]);
+            self.schedule_second_response(
+                vec![0x02, 0x00, 0x20, 0x00, b'S', b'C', b'E', b'A'],
+                GETID_SECOND_RESPONSE_CYCLES,
+            );
+        } else {
+            // No disc: 1st response stat, 2nd response error.
+            // Stat/Flags/Type/Region/ZeroZeroZeroZero pattern for
+            // "no disc": BIOS recognises this and shows the shell.
+            self.schedule_first_response(vec![self.stat_byte()]);
+            self.schedule_second_response(
+                vec![0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                GETID_SECOND_RESPONSE_CYCLES,
+            );
+        }
+    }
+
+    /// Advance pending events by `cycles_now` (absolute bus cycle
+    /// count). Events whose deadlines are in the past deliver their
+    /// bytes into the response FIFO and raise their IRQ type (stored
+    /// in `irq_flag`; actual CPU-facing wake-up happens via the IRQ
+    /// controller, which the caller raises when `irq_flag` transitions
+    /// non-zero).
+    ///
+    /// Returns `true` if this call raised an IRQ that was previously
+    /// clear — the caller (Bus) uses that to poke `IrqSource::Cdrom`.
+    pub fn tick(&mut self, cycles_now: u64) -> bool {
+        let mut raised = false;
+        // Fix up pending events with absolute deadlines. We used 0 and
+        // small relative numbers as markers; translate them now.
+        for ev in self.pending.iter_mut() {
+            if ev.deadline < cycles_now {
+                // Interpret 0 as "immediate = +FIRST_RESPONSE_CYCLES";
+                // anything else non-zero as the relative offset itself.
+                let offset = if ev.deadline == 0 {
+                    FIRST_RESPONSE_CYCLES
+                } else {
+                    ev.deadline
+                };
+                ev.deadline = cycles_now.saturating_add(offset);
+            }
+        }
+
+        while let Some(front) = self.pending.front() {
+            if front.deadline > cycles_now {
+                break;
+            }
+            let ev = self.pending.pop_front().unwrap();
+            for b in ev.bytes.iter().copied() {
+                if self.responses.len() < RESPONSE_FIFO_DEPTH {
+                    self.responses.push_back(b);
+                }
+            }
+            // Only fire IRQ if none is currently pending — hardware
+            // holds the latched IRQ until software acks.
+            if self.irq_flag == 0 {
+                self.irq_flag = ev.irq as u8;
+                raised = true;
+            } else {
+                // Re-enqueue at the front with a tiny delay; the BIOS
+                // will ack eventually.
+                let mut re = ev;
+                re.deadline = cycles_now + FIRST_RESPONSE_CYCLES / 10;
+                self.pending.push_front(re);
+                break;
+            }
+        }
+
+        raised
+    }
+
+    /// Total commands received — used by `smoke_draw` to confirm BIOS
+    /// is talking to the drive.
     pub fn commands_dispatched(&self) -> u64 {
         self.commands_dispatched
     }
 
-    /// Diagnostic: current IRQ-flag value.
+    /// Per-command histogram (indexed by command byte) — same purpose.
+    pub fn command_histogram(&self) -> &[u32; 32] {
+        &self.command_hist
+    }
+
+    /// Current raw IRQ-flag (for diagnostics).
     pub fn irq_flag(&self) -> u8 {
         self.irq_flag
     }
@@ -345,9 +633,13 @@ mod tests {
     }
 
     #[test]
-    fn shell_open_is_set_on_cold_boot() {
+    fn cold_boot_is_closed_lid_no_disc() {
+        // Cold boot state for "Please insert disc" path: lid closed
+        // (SHELL_OPEN cleared) so Init succeeds, motor off until
+        // Init runs. No disc (GetID returns the no-disc response).
         let cd = CdRom::new();
-        assert_eq!(cd.drive_status & drive_status_bit::SHELL_OPEN, drive_status_bit::SHELL_OPEN);
-        assert_eq!(cd.drive_status & drive_status_bit::MOTOR_ON, 0);
+        assert_eq!(cd.drive_status & drive_status_bit::SHELL_OPEN, 0);
+        assert!(!cd.motor_on);
+        assert!(!cd.disc_present);
     }
 }
