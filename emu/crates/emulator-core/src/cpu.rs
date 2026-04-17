@@ -979,12 +979,21 @@ impl Cpu {
     }
 }
 
-/// Cycle cost per instruction — phase 4a's "simple model", matching
-/// Redux's baseline accounting. Every instruction costs 1 cycle. As
-/// parity probes reveal divergence, specific opcodes (MULT/DIV,
-/// memory accesses by region) gain their real costs here.
+/// Cycle cost per instruction — matches PCSX-Redux's simple-interpreter
+/// `BIAS = 2` (every instruction adds 2 to its cycle counter before
+/// any opcode-specific accounting). Some opcodes on real hardware cost
+/// more (MULT ≈ 7–13, DIV ≈ 36, memory stalls by region) and Redux
+/// models a handful of those in its accurate mode; when our parity
+/// probes reveal a divergence where the extra cycles matter, specific
+/// opcodes pick up their costs here.
+///
+/// Keeping this equal to Redux's `BIAS` is what makes Phase 4b's
+/// VBlank scheduler line up on the same instruction as Redux — and
+/// thus preserves parity once it turns on.
+const BIAS: u32 = 2;
+
 fn cycle_cost(_instr: u32) -> u32 {
-    1
+    BIAS
 }
 
 /// MIPS R3000 exception codes (CAUSE.ExcCode). Only the ones we
