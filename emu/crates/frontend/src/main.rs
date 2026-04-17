@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 mod app;
+mod disasm;
 mod gfx;
 mod icons;
 mod theme;

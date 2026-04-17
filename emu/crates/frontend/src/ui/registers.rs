@@ -81,9 +81,11 @@ fn draw_history(ui: &mut egui::Ui, history: &VecDeque<InstructionRecord>) {
         ui.monospace("(empty — step or run the CPU)");
         return;
     }
-    // Newest at the bottom: log-style reading order.
+    // Newest at the bottom: log-style reading order. Each row is
+    // "PC: mnemonic" via the in-tree MIPS disassembler.
     for record in history {
-        ui.monospace(format!("{:08X}: {:08X}", record.pc, record.instr));
+        let mnem = crate::disasm::disasm(record.pc, record.instr);
+        ui.monospace(format!("{:08X}  {mnem}", record.pc));
     }
 }
 
