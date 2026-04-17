@@ -153,8 +153,35 @@ impl Cpu {
     /// Execute one instruction and return a trace record of the state
     /// after retirement.
     pub fn step(&mut self, bus: &mut Bus) -> Result<InstructionRecord, ExecutionError> {
+        // Mirror the external interrupt line into COP0.CAUSE.IP[2]
+        // each step. Software reads CAUSE directly to poll for
+        // interrupts even when globally disabled.
+        self.sync_external_interrupt(bus);
+
         let pc_before = self.pc;
         let instr = bus.read32(pc_before);
+
+        // If an external interrupt is pending AND enabled AND globally
+        // allowed, take the exception instead of running this instruction.
+        // We still record the pre-empted PC+instr so the trace reads as
+        // "we were about to run X when IRQ n fired" — matching how
+        // typical MIPS emulators surface this in per-instruction hooks.
+        if self.should_take_interrupt() {
+            let in_delay_slot = self.pending_pc.is_some();
+            self.pending_pc = None;
+            self.enter_exception(ExceptionCode::Interrupt, pc_before, in_delay_slot);
+            self.pc = self
+                .pending_exception_pc
+                .take()
+                .expect("enter_exception staged a vector");
+            self.tick += 1;
+            return Ok(InstructionRecord {
+                tick: self.tick,
+                pc: pc_before,
+                instr,
+                gprs: self.gprs,
+            });
+        }
 
         // If the *previous* instruction was a branch, the current
         // instruction is its delay slot — after retiring, PC goes to
@@ -844,6 +871,29 @@ impl Cpu {
         self.cop0[12] & (1 << 16) != 0
     }
 
+    /// Mirror the external IRQ line into `CAUSE.IP[2]`. The CPU reads
+    /// this bit to decide whether to take an interrupt exception; the
+    /// BIOS also reads it directly to poll.
+    fn sync_external_interrupt(&mut self, bus: &Bus) {
+        if bus.external_interrupt_pending() {
+            self.cop0[13] |= 1 << 10;
+        } else {
+            self.cop0[13] &= !(1 << 10);
+        }
+    }
+
+    /// `true` when the CPU should take an interrupt exception right
+    /// now: globally enabled (`SR.IEc`), mask-enabled for the pending
+    /// source (`SR.IM` over bits 8..=15 of `CAUSE.IP`).
+    fn should_take_interrupt(&self) -> bool {
+        let sr = self.cop0[12];
+        let cause = self.cop0[13];
+        let global_enable = sr & 1 != 0;
+        let im = (sr >> 8) & 0xFF;
+        let ip = (cause >> 8) & 0xFF;
+        global_enable && (im & ip) != 0
+    }
+
     /// `SYSCALL` — raise a syscall exception (CAUSE.ExcCode = 8). The
     /// BIOS uses this for every kernel-mode thunk: A/B/C-table calls,
     /// memcpy, printf, event handling, etc.
@@ -906,6 +956,9 @@ impl Cpu {
 #[repr(u8)]
 #[derive(Copy, Clone)]
 enum ExceptionCode {
+    /// External interrupt — asserted by the IRQ controller. See
+    /// [`Cpu::should_take_interrupt`] for the gating logic.
+    Interrupt = 0,
     Syscall = 8,
     Break = 9,
 }

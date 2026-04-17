@@ -10,8 +10,10 @@
 
 pub mod bus;
 pub mod cpu;
+pub mod irq;
 pub mod vram;
 
 pub use bus::{Bus, BusError};
 pub use cpu::{Cpu, ExecutionError};
+pub use irq::{Irq, IrqSource};
 pub use vram::{Vram, VRAM_HEIGHT, VRAM_WIDTH};

@@ -7,6 +7,13 @@
 use psx_hw::memory::{self, to_physical};
 use thiserror::Error;
 
+use crate::irq::Irq;
+
+/// Physical address of `I_STAT` (interrupt status / ack register).
+const IRQ_STAT_ADDR: u32 = 0x1F80_1070;
+/// Physical address of `I_MASK` (interrupt enable register).
+const IRQ_MASK_ADDR: u32 = 0x1F80_1074;
+
 /// Errors constructing a [`Bus`].
 #[derive(Error, Debug)]
 pub enum BusError {
@@ -26,11 +33,14 @@ pub struct Bus {
     bios: Box<[u8; memory::bios::SIZE]>,
     scratchpad: Box<[u8; memory::scratchpad::SIZE]>,
     /// Write-echoes-on-read buffer for the MMIO window. **Placeholder.**
-    /// Real peripherals (GPU, SPU, CD-ROM, DMA, timers, IRQ controller)
-    /// will claim ranges out of this and expose their own semantics; for
-    /// now this lets the BIOS's init code write-then-read-back registers
-    /// (e.g. enabling the SPU via `SPUCNT`) and observe its own writes.
+    /// Individual peripherals with real semantics (IRQ below, later GPU /
+    /// SPU / CD-ROM / DMA / timers) intercept their own ranges ahead of
+    /// this fallback; the rest of MMIO still round-trips writes to reads.
     io: Box<[u8; memory::io::SIZE]>,
+    /// Interrupt controller (`I_STAT` / `I_MASK`). Accessed via the MMIO
+    /// dispatch below and queried by the CPU each step to update
+    /// `COP0.CAUSE.IP[2]`.
+    irq: Irq,
 }
 
 impl Bus {
@@ -55,7 +65,20 @@ impl Bus {
             bios: bios_arr,
             scratchpad: zeroed_box(),
             io: zeroed_box(),
+            irq: Irq::new(),
         })
+    }
+
+    /// Borrow the interrupt controller — caller can `.raise()` sources
+    /// or inspect state without going through MMIO.
+    pub fn irq_mut(&mut self) -> &mut Irq {
+        &mut self.irq
+    }
+
+    /// True when some source is both pending in `I_STAT` and enabled
+    /// in `I_MASK`. The CPU mirrors this into `COP0.CAUSE.IP[2]`.
+    pub fn external_interrupt_pending(&self) -> bool {
+        self.irq.pending()
     }
 
     /// Read a 32-bit little-endian word from a virtual address.
@@ -161,6 +184,13 @@ impl Bus {
             return 0xFFFF_FFFF;
         }
 
+        if phys == IRQ_STAT_ADDR {
+            return self.irq.stat();
+        }
+        if phys == IRQ_MASK_ADDR {
+            return self.irq.mask();
+        }
+
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             let offset = (phys - memory::io::BASE) as usize;
             return read_u32_le(&self.io[offset..]);
@@ -185,6 +215,16 @@ impl Bus {
         }
 
         let phys = to_physical(virt);
+
+        if phys == IRQ_STAT_ADDR {
+            self.irq.write_stat(value);
+            return;
+        }
+        if phys == IRQ_MASK_ADDR {
+            self.irq.write_mask(value);
+            return;
+        }
+
         let bytes = value.to_le_bytes();
 
         if phys < memory::ram::MIRROR_END {
