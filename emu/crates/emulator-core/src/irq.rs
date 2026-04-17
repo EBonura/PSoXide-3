@@ -46,6 +46,21 @@ pub enum IrqSource {
 pub struct Irq {
     stat: u32,
     mask: u32,
+    /// Per-source count of `raise()` calls since reset. Diagnostic only.
+    raise_counts: [u64; 11],
+    /// Count of `pending()` calls that returned `true`. Diagnostic only.
+    pending_true_calls: u64,
+    /// Peak observed `I_STAT` value across the run. Tells us whether any
+    /// pending bits have ever been set (before the BIOS ack cleared them).
+    peak_stat: u32,
+    /// Number of `write_mask` calls (any width). Diagnostic — tells us
+    /// whether the BIOS is reaching `I_MASK` through the IRQ controller
+    /// at all, or whether its writes are landing in the io[] echo buffer.
+    mask_write_count: u64,
+    /// Number of `write_stat` calls. Diagnostic.
+    stat_write_count: u64,
+    /// First 16 values written to `I_MASK`. Diagnostic.
+    mask_write_log: Vec<u32>,
 }
 
 impl Irq {
@@ -54,20 +69,65 @@ impl Irq {
 
     /// All bits cleared — matches post-reset hardware.
     pub fn new() -> Self {
-        Self { stat: 0, mask: 0 }
+        Self {
+            stat: 0,
+            mask: 0,
+            raise_counts: [0; 11],
+            pending_true_calls: 0,
+            peak_stat: 0,
+            mask_write_count: 0,
+            stat_write_count: 0,
+            mask_write_log: Vec::new(),
+        }
+    }
+
+    /// Per-source count of `raise()` calls. Diagnostic.
+    pub fn raise_counts(&self) -> [u64; 11] {
+        self.raise_counts
+    }
+
+    /// Peak observed I_STAT since reset. Diagnostic.
+    pub fn peak_stat(&self) -> u32 {
+        self.peak_stat
     }
 
     /// Raise interrupt `source` — sets its bit in `I_STAT`. Pending-ness
     /// is OR'd: calling `raise` multiple times before acknowledgement
     /// is a no-op after the first.
     pub fn raise(&mut self, source: IrqSource) {
+        let idx = source as usize;
+        if idx < self.raise_counts.len() {
+            self.raise_counts[idx] = self.raise_counts[idx].saturating_add(1);
+        }
         self.stat |= 1 << (source as u32);
+        self.peak_stat |= self.stat;
     }
 
     /// `true` when some source is both pending and enabled — drives the
     /// single CPU IP[2] pin.
     pub fn pending(&self) -> bool {
-        (self.stat & self.mask & Self::VALID_BITS) != 0
+        let p = (self.stat & self.mask & Self::VALID_BITS) != 0;
+        if p {
+            // This isn't quite kosher — `pending` takes `&self` — but
+            // the counter is `&mut` on the interior. Fix via a dedicated
+            // method on `&mut self` that Cpu calls each step.
+        }
+        p
+    }
+
+    /// Same as [`Irq::pending`] but also increments the diagnostic
+    /// counter. Call this exactly once per CPU step, from the bus.
+    pub fn pending_tick(&mut self) -> bool {
+        let p = (self.stat & self.mask & Self::VALID_BITS) != 0;
+        if p {
+            self.pending_true_calls = self.pending_true_calls.saturating_add(1);
+        }
+        p
+    }
+
+    /// How many times `pending_tick` returned `true`. Diagnostic.
+    pub fn pending_true_calls(&self) -> u64 {
+        self.pending_true_calls
     }
 
     /// Current `I_STAT` value (pending sources).
@@ -84,11 +144,31 @@ impl Irq {
     /// clears it; writing 1 preserves it.
     pub fn write_stat(&mut self, value: u32) {
         self.stat &= value & Self::VALID_BITS;
+        self.stat_write_count = self.stat_write_count.saturating_add(1);
     }
 
     /// MMIO write to `I_MASK` — direct overwrite.
     pub fn write_mask(&mut self, value: u32) {
         self.mask = value & Self::VALID_BITS;
+        self.mask_write_count = self.mask_write_count.saturating_add(1);
+        if self.mask_write_log.len() < 16 {
+            self.mask_write_log.push(value);
+        }
+    }
+
+    /// Diagnostic: first 16 values written to I_MASK in order.
+    pub fn mask_write_log(&self) -> &[u32] {
+        &self.mask_write_log
+    }
+
+    /// Diagnostic: how many times `write_mask` has been called.
+    pub fn mask_write_count(&self) -> u64 {
+        self.mask_write_count
+    }
+
+    /// Diagnostic: how many times `write_stat` has been called.
+    pub fn stat_write_count(&self) -> u64 {
+        self.stat_write_count
     }
 }
 

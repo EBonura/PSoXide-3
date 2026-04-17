@@ -215,8 +215,13 @@ impl Bus {
 
     /// True when some source is both pending in `I_STAT` and enabled
     /// in `I_MASK`. The CPU mirrors this into `COP0.CAUSE.IP[2]`.
-    pub fn external_interrupt_pending(&self) -> bool {
-        self.irq.pending()
+    pub fn external_interrupt_pending(&mut self) -> bool {
+        self.irq.pending_tick()
+    }
+
+    /// Borrow the IRQ controller immutably for diagnostics.
+    pub fn irq(&self) -> &Irq {
+        &self.irq
     }
 
     /// Run any DMA channels whose start bit was just set.
@@ -473,6 +478,15 @@ impl Bus {
         {
             return 0xFFFF;
         }
+        // Same rationale as in `write16_impl`: BIOS reads `I_STAT` /
+        // `I_MASK` via `lhu` and would otherwise see the stale echo
+        // buffer instead of the live interrupt-controller state.
+        if phys == IRQ_STAT_ADDR {
+            return self.irq.stat() as u16;
+        }
+        if phys == IRQ_MASK_ADDR {
+            return self.irq.mask() as u16;
+        }
         if Spu::contains(phys) {
             return self.spu.read16(phys);
         }
@@ -697,6 +711,19 @@ impl Bus {
         {
             let off = (phys - memory::scratchpad::BASE) as usize;
             self.scratchpad[off..off + 2].copy_from_slice(&bytes);
+            return;
+        }
+        // The BIOS uses `sh` (16-bit store) to write `I_MASK` and ack
+        // `I_STAT`. Without this dispatch the value lands in the io[]
+        // echo buffer and the IRQ controller never sees it — meaning
+        // mask stays 0 and pending() always returns false, so no IRQ
+        // exception is ever taken.
+        if phys == IRQ_STAT_ADDR {
+            self.irq.write_stat(value as u32);
+            return;
+        }
+        if phys == IRQ_MASK_ADDR {
+            self.irq.write_mask(value as u32);
             return;
         }
         if Spu::contains(phys) {

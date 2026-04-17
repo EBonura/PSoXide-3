@@ -73,6 +73,16 @@ pub struct Cpu {
     /// is the exception vector (0x8000_0080 or 0xBFC0_0180 depending on
     /// the BEV bit in SR).
     pending_exception_pc: Option<u32>,
+    /// Per-ExcCode (0..=31) count of exception entries. Diagnostic only.
+    exception_counts: [u64; 32],
+    /// Count of `step()` calls where `bus.external_interrupt_pending()`
+    /// was true — answers "did the IRQ line ever go high from the
+    /// CPU's point of view?". Diagnostic.
+    irq_line_high_steps: u64,
+    /// Count of `step()` calls where `should_take_interrupt()` was
+    /// true — answers "did we reach the threshold that enters an IRQ
+    /// exception?".
+    should_take_interrupt_steps: u64,
 }
 
 impl Cpu {
@@ -93,7 +103,28 @@ impl Cpu {
             hi: 0,
             lo: 0,
             pending_exception_pc: None,
+            exception_counts: [0; 32],
+            irq_line_high_steps: 0,
+            should_take_interrupt_steps: 0,
         }
+    }
+
+    /// Cumulative exception counts, keyed by CAUSE.ExcCode. Diagnostic.
+    #[inline]
+    pub fn exception_counts(&self) -> &[u64; 32] {
+        &self.exception_counts
+    }
+
+    /// How many `step()` calls observed the IRQ line high.
+    #[inline]
+    pub fn irq_line_high_steps(&self) -> u64 {
+        self.irq_line_high_steps
+    }
+
+    /// How many `step()` calls would have entered an IRQ exception.
+    #[inline]
+    pub fn should_take_interrupt_steps(&self) -> u64 {
+        self.should_take_interrupt_steps
     }
 
     /// Current program counter.
@@ -185,6 +216,7 @@ impl Cpu {
         // "we were about to run X when IRQ n fired" — matching how
         // typical MIPS emulators surface this in per-instruction hooks.
         if self.should_take_interrupt() {
+            self.should_take_interrupt_steps = self.should_take_interrupt_steps.saturating_add(1);
             let in_delay_slot = self.pending_pc.is_some();
             self.pending_pc = None;
             self.enter_exception(ExceptionCode::Interrupt, pc_before, in_delay_slot);
@@ -1016,9 +1048,10 @@ impl Cpu {
     /// Mirror the external IRQ line into `CAUSE.IP[2]`. The CPU reads
     /// this bit to decide whether to take an interrupt exception; the
     /// BIOS also reads it directly to poll.
-    fn sync_external_interrupt(&mut self, bus: &Bus) {
+    fn sync_external_interrupt(&mut self, bus: &mut Bus) {
         if bus.external_interrupt_pending() {
             self.cop0[13] |= 1 << 10;
+            self.irq_line_high_steps = self.irq_line_high_steps.saturating_add(1);
         } else {
             self.cop0[13] &= !(1 << 10);
         }
@@ -1066,6 +1099,8 @@ impl Cpu {
     ///   post-reset default the BIOS boots in), else `0x8000_0080`.
     fn enter_exception(&mut self, code: ExceptionCode, pc: u32, in_delay_slot: bool) {
         let code_bits = (code as u32) & 0x1F;
+        self.exception_counts[code_bits as usize] =
+            self.exception_counts[code_bits as usize].saturating_add(1);
 
         let mut cause = self.cop0[13];
         cause &= !((0x1F << 2) | (1 << 31));

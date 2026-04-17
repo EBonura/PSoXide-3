@@ -139,6 +139,64 @@ fn main() {
     println!("SR               = 0x{:08x}", cpu.cop0()[12]);
     println!("CAUSE            = 0x{:08x}", cpu.cop0()[13]);
     println!("EPC              = 0x{:08x}", cpu.cop0()[14]);
+    let exc_counts = cpu.exception_counts();
+    let exc_names: [&str; 32] = [
+        "Int", "Mod", "TLBL", "TLBS", "AdEL", "AdES", "IBE", "DBE", "Syscall",
+        "Break", "RI", "CpU", "Ov", "Tr", "-", "-", "-", "-", "-", "-", "-", "-",
+        "-", "-", "-", "-", "-", "-", "-", "-", "-", "-",
+    ];
+    let mut any = false;
+    for (i, &n) in exc_counts.iter().enumerate() {
+        if n > 0 {
+            if !any {
+                print!("exceptions       =");
+                any = true;
+            }
+            print!(" {}:{n}", exc_names[i]);
+        }
+    }
+    if any {
+        println!();
+    } else {
+        println!("exceptions       = (none)");
+    }
+    println!(
+        "irq_line_high    = {} steps",
+        cpu.irq_line_high_steps()
+    );
+    println!(
+        "should_take_irq  = {} steps",
+        cpu.should_take_interrupt_steps()
+    );
+    let irq = bus.irq();
+    let raise_names = [
+        "VBlank", "Gpu", "Cdrom", "Dma", "Timer0", "Timer1", "Timer2",
+        "Controller", "Sio", "Spu", "Lightpen",
+    ];
+    let raised = irq.raise_counts();
+    print!("irq raises       =");
+    for (i, &n) in raised.iter().enumerate() {
+        if n > 0 {
+            print!(" {}:{n}", raise_names[i]);
+        }
+    }
+    println!();
+    println!("peak I_STAT      = 0x{:08x}", irq.peak_stat());
+    println!("pending_true     = {} calls", irq.pending_true_calls());
+    println!(
+        "irq writes       = mask:{} stat:{}",
+        irq.mask_write_count(),
+        irq.stat_write_count()
+    );
+    println!("irq.stat() raw   = 0x{:08x}", irq.stat());
+    println!("irq.mask() raw   = 0x{:08x}", irq.mask());
+    println!(
+        "mask write log   = {:?}",
+        irq.mask_write_log()
+            .iter()
+            .map(|v| format!("0x{v:08x}"))
+            .collect::<Vec<_>>()
+    );
     println!(
         "  SR.IE={} IM.HW={} CAUSE.IP2={} BEV={}",
         cpu.cop0()[12] & 1,
@@ -159,6 +217,23 @@ fn main() {
         let word = read32(&bus, addr).unwrap_or(0);
         let arrow = if i == 0 { " →" } else { "  " };
         println!("{arrow} {addr:08x}: {word:08x}");
+    }
+
+    // Dump the full hot-region: pick the single hottest PC and walk
+    // ±0x40 bytes either side so we can read the loop body + entry
+    // + exit in one glance. Hits marked with '•'.
+    if let Some(&(hot_pc, _)) = top.first() {
+        let hot_min = hot_pc.wrapping_sub(0x40);
+        let hot_max = hot_pc.wrapping_add(0x40);
+        println!("\n=== ±0x40 around hottest PC {hot_pc:08x} ===");
+        let mut a = hot_min;
+        while a <= hot_max {
+            let word = read32(&bus, a).unwrap_or(0);
+            let hit = pc_hits.get(&a).copied().unwrap_or(0);
+            let mark = if hit > 0 { "•" } else { " " };
+            println!("  {mark} {a:08x}: {word:08x}  ({hit} hits)");
+            a = a.wrapping_add(4);
+        }
     }
 
     // MMIO trace tail — only populated when built with
