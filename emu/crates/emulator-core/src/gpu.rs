@@ -201,6 +201,10 @@ impl Gpu {
             // both as opaque for now).
             0x20..=0x23 => self.draw_monochrome_tri(),
             0x28..=0x2B => self.draw_monochrome_quad(),
+            // Gouraud-shaded triangle / quad — per-vertex colour
+            // interpolated across the primitive via barycentrics.
+            0x30..=0x33 => self.draw_shaded_tri(),
+            0x38..=0x3B => self.draw_shaded_quad(),
             // Monochrome rectangles — bit 3 set selects variable size
             // (followed by a W/H word), else 1×1/8×8/16×16 by bits 5:4.
             0x60..=0x63 => self.draw_monochrome_rect_variable(),
@@ -247,6 +251,35 @@ impl Gpu {
         let v3 = self.decode_vertex(self.gp0_fifo[4]);
         self.rasterize_triangle(v0, v1, v2, color);
         self.rasterize_triangle(v1, v2, v3, color);
+    }
+
+    /// GP0 0x30..=0x33 — Gouraud triangle. Per-vertex RGB24 colours,
+    /// interpolated across the triangle via barycentric weights.
+    /// Words: `[cmd+c0, v0, c1, v1, c2, v2]`.
+    fn draw_shaded_tri(&mut self) {
+        let c0 = self.gp0_fifo[0] & 0x00FF_FFFF;
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let c1 = self.gp0_fifo[2] & 0x00FF_FFFF;
+        let v1 = self.decode_vertex(self.gp0_fifo[3]);
+        let c2 = self.gp0_fifo[4] & 0x00FF_FFFF;
+        let v2 = self.decode_vertex(self.gp0_fifo[5]);
+        self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2);
+    }
+
+    /// GP0 0x38..=0x3B — Gouraud quad. 4 × (colour+vertex) =
+    /// 8 words, split into two shaded triangles sharing the middle
+    /// edge (v1–v2).
+    fn draw_shaded_quad(&mut self) {
+        let c0 = self.gp0_fifo[0] & 0x00FF_FFFF;
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let c1 = self.gp0_fifo[2] & 0x00FF_FFFF;
+        let v1 = self.decode_vertex(self.gp0_fifo[3]);
+        let c2 = self.gp0_fifo[4] & 0x00FF_FFFF;
+        let v2 = self.decode_vertex(self.gp0_fifo[5]);
+        let c3 = self.gp0_fifo[6] & 0x00FF_FFFF;
+        let v3 = self.decode_vertex(self.gp0_fifo[7]);
+        self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2);
+        self.rasterize_shaded_triangle(v1, v2, v3, c1, c2, c3);
     }
 
     /// GP0 0x60..=0x63 — monochrome variable-size rectangle.
@@ -320,6 +353,61 @@ impl Gpu {
                 let w2 = edge(v0, v1, p) * area_sign;
                 if (w0 | w1 | w2) >= 0 {
                     self.vram.set_pixel(x as u16, y as u16, color);
+                }
+            }
+        }
+    }
+
+    /// Rasterize a triangle with per-vertex colours — Gouraud shading.
+    /// Same edge-function inside test as the flat path, but interpolates
+    /// RGB using normalized barycentric weights `(w0, w1, w2)` per pixel
+    /// and packs the result back into a 15-bit BGR VRAM word.
+    fn rasterize_shaded_triangle(
+        &mut self,
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        c0: u32,
+        c1: u32,
+        c2: u32,
+    ) {
+        let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
+        let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
+        let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
+        let max_y = v0.1.max(v1.1).max(v2.1).min(self.draw_area_bottom as i32);
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+
+        let area = edge(v0, v1, v2);
+        if area == 0 {
+            return;
+        }
+        let area_sign = area.signum();
+        let area_abs = area.unsigned_abs() as i64;
+
+        // Channel-extract closures — r/g/b are low/mid/high bytes of the
+        // 24-bit word written in the command.
+        let r = |c: u32| (c & 0xFF) as i64;
+        let g = |c: u32| ((c >> 8) & 0xFF) as i64;
+        let b = |c: u32| ((c >> 16) & 0xFF) as i64;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let p = (x, y);
+                let w0 = (edge(v1, v2, p) * area_sign) as i64;
+                let w1 = (edge(v2, v0, p) * area_sign) as i64;
+                let w2 = (edge(v0, v1, p) * area_sign) as i64;
+                if (w0 | w1 | w2) >= 0 {
+                    let ri = (w0 * r(c0) + w1 * r(c1) + w2 * r(c2)) / area_abs;
+                    let gi = (w0 * g(c0) + w1 * g(c1) + w2 * g(c2)) / area_abs;
+                    let bi = (w0 * b(c0) + w1 * b(c1) + w2 * b(c2)) / area_abs;
+                    let colour = rgb24_to_bgr15(
+                        (ri.clamp(0, 255) as u32)
+                            | ((gi.clamp(0, 255) as u32) << 8)
+                            | ((bi.clamp(0, 255) as u32) << 16),
+                    );
+                    self.vram.set_pixel(x as u16, y as u16, colour);
                 }
             }
         }
