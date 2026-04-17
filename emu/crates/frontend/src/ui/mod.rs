@@ -5,6 +5,7 @@
 //! (bottom/side get clipped to remaining space), then the central area,
 //! then free-floating overlays (Menu, HUD) on top.
 
+pub mod framebuffer;
 pub mod hud;
 pub mod memory;
 pub mod registers;
@@ -45,14 +46,6 @@ pub fn draw_layout(
     }
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading("PSoXide");
-        ui.label("Central area hosts the framebuffer once GPU lands.");
-        ui.label(format!(
-            "Menu: {} — press Esc to toggle.",
-            if state.menu.open { "open" } else { "closed" }
-        ));
-        ui.add_space(8.0);
-
         ui.horizontal(|ui| {
             ui.label("Run speed:");
             ui.add(
@@ -61,6 +54,8 @@ pub fn draw_layout(
                     .suffix(" instr/frame"),
             );
         });
+        ui.add_space(4.0);
+        framebuffer::draw(ui, vram_tex, state.bus.as_ref());
     });
 
     state.menu.draw(ctx, dt);
