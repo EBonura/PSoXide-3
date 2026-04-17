@@ -509,6 +509,13 @@ impl Bus {
         if phys == IRQ_MASK_ADDR {
             return self.irq.mask() as u16;
         }
+        // Timer registers are 16-bit on hardware; the BIOS's
+        // counter-polling loop uses `lhu`. Without this dispatch the
+        // counter reads zero from the io[] echo buffer and the loop
+        // never sees the tick advance.
+        if Timers::contains(phys) {
+            return self.timers.read32(phys) as u16;
+        }
         if Spu::contains(phys) {
             return self.spu.read16(phys);
         }
@@ -776,6 +783,11 @@ impl Bus {
         }
         if phys == IRQ_MASK_ADDR {
             self.irq.write_mask(value as u32);
+            return;
+        }
+        // Timer registers are 16-bit on hardware.
+        if Timers::contains(phys) {
+            self.timers.write32(phys, value as u32);
             return;
         }
         if Spu::contains(phys) {
