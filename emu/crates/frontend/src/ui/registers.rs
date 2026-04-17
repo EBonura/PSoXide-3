@@ -54,6 +54,7 @@ pub fn draw(
     cpu: &Cpu,
     history: &VecDeque<InstructionRecord>,
     breakpoints: &mut BTreeSet<u32>,
+    snapshot: &mut Option<[u32; 32]>,
 ) {
     egui::SidePanel::left("registers")
         .resizable(true)
@@ -61,7 +62,7 @@ pub fn draw(
         .min_width(260.0)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                theme::section(ui, "GPR", |ui| draw_gprs(ui, cpu));
+                theme::section(ui, "GPR", |ui| draw_gprs(ui, cpu, snapshot));
                 theme::section(ui, "PC / HI / LO", |ui| draw_pc_hi_lo(ui, cpu));
                 theme::section(ui, "COP0", |ui| draw_cop0(ui, cpu));
                 theme::section(ui, "Retired", |ui| {
@@ -103,19 +104,47 @@ fn draw_history(ui: &mut egui::Ui, history: &VecDeque<InstructionRecord>) {
     }
 }
 
-fn draw_gprs(ui: &mut egui::Ui, cpu: &Cpu) {
+fn draw_gprs(ui: &mut egui::Ui, cpu: &Cpu, snapshot: &mut Option<[u32; 32]>) {
     let gprs = cpu.gprs();
+
+    ui.horizontal(|ui| {
+        if ui.button("Snapshot").on_hover_text("Freeze current GPR values").clicked() {
+            *snapshot = Some(*gprs);
+        }
+        if snapshot.is_some() && ui.button("Clear").clicked() {
+            *snapshot = None;
+        }
+        if let Some(_snap) = snapshot {
+            ui.label("(changed GPRs shown in accent color)");
+        }
+    });
+
     egui::Grid::new("gprs")
         .num_columns(2)
         .spacing(egui::vec2(12.0, 2.0))
         .show(ui, |ui| {
             // Lay out as two columns: registers 0..16 on left, 16..32 on right.
             for i in 0..16 {
-                reg_cell(ui, GPR_NAMES[i], gprs[i]);
-                reg_cell(ui, GPR_NAMES[i + 16], gprs[i + 16]);
+                reg_cell_diff(ui, GPR_NAMES[i], gprs[i], snapshot.map(|s| s[i]));
+                reg_cell_diff(
+                    ui,
+                    GPR_NAMES[i + 16],
+                    gprs[i + 16],
+                    snapshot.map(|s| s[i + 16]),
+                );
                 ui.end_row();
             }
         });
+}
+
+fn reg_cell_diff(ui: &mut egui::Ui, name: &str, value: u32, snap: Option<u32>) {
+    let changed = snap.is_some_and(|s| s != value);
+    let text = format!("{name:>4}={value:08X}");
+    if changed {
+        ui.monospace(egui::RichText::new(text).color(theme::ACCENT));
+    } else {
+        ui.monospace(text);
+    }
 }
 
 fn draw_pc_hi_lo(ui: &mut egui::Ui, cpu: &Cpu) {

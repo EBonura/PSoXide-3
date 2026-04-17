@@ -28,6 +28,7 @@ pub fn draw_layout(
             &state.cpu,
             &state.exec_history,
             &mut state.breakpoints,
+            &mut state.gpr_snapshot,
         );
     }
     if state.panels.memory {
@@ -93,6 +94,7 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
             state.cpu = emulator_core::Cpu::new();
             state.running = false;
             state.exec_history.clear();
+            state.gpr_snapshot = None;
             state.menu.sync_run_label(false);
             if let Some(bus) = state.bus.as_mut() {
                 bus.gpu.vram.clear();

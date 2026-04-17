@@ -70,6 +70,11 @@ pub struct AppState {
     /// PC addresses at which the run loop pauses. Toggled from the
     /// memory viewer; displayed in the register panel.
     pub breakpoints: BTreeSet<u32>,
+    /// Snapshot of `cpu.gprs()` at some point the user chose (via the
+    /// register panel's "Snapshot" button). The panel highlights GPRs
+    /// whose current value differs from the snapshot. Reset clears
+    /// this along with the rest of the emulator state.
+    pub gpr_snapshot: Option<[u32; 32]>,
 }
 
 impl Default for AppState {
@@ -85,6 +90,7 @@ impl Default for AppState {
             run_steps_per_frame: 100_000,
             exec_history: VecDeque::with_capacity(EXEC_HISTORY_CAP),
             breakpoints: BTreeSet::new(),
+            gpr_snapshot: None,
         }
     }
 }
