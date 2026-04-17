@@ -1,6 +1,8 @@
 .claude/
 /target
 **/target
+# sdk/ uses `target-dir = "../../../build/examples"` for MIPS builds.
+/build
 Cargo.lock.orig
 *.swp
 *.swo

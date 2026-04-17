@@ -20,6 +20,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod cache;
 mod config;
 mod error;
 mod launch;

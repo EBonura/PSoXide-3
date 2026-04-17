@@ -240,6 +240,32 @@ impl Cpu {
         // interrupts even when globally disabled.
         self.sync_external_interrupt(bus);
 
+        // HLE BIOS: when enabled (only for side-loaded EXEs, never
+        // for parity), intercept jumps into the BIOS dispatcher
+        // addresses 0xA0 / 0xB0 / 0xC0. The caller's trampoline has
+        // already loaded `$t1` with the function number and parked
+        // the return address in `$ra`.
+        if bus.hle_bios_enabled {
+            let args = [self.gpr(4), self.gpr(5), self.gpr(6), self.gpr(7)];
+            let t1 = self.gpr(9);
+            let ra = self.gpr(31);
+            if let Some(out) = crate::hle_bios::dispatch(self.pc, bus, args, t1, ra) {
+                self.set_gpr(2, out.v0);
+                self.pc = out.next_pc;
+                self.pending_pc = None;
+                self.pending_load = None;
+                self.committing_load = None;
+                self.tick += 1;
+                bus.tick(2);
+                return Ok(InstructionRecord {
+                    tick: self.tick,
+                    pc: self.pc,
+                    instr: 0,
+                    gprs: self.gprs,
+                });
+            }
+        }
+
         let pc_before = self.pc;
         let instr = bus.read32(pc_before);
 

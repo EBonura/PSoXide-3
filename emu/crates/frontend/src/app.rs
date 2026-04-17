@@ -90,8 +90,9 @@ impl Default for AppState {
             if let Some(exe) = load_exe() {
                 bus.load_exe_payload(exe.load_addr, &exe.payload);
                 cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
+                bus.enable_hle_bios();
                 eprintln!(
-                    "[frontend] side-loaded EXE: entry=0x{:08x} payload={}B",
+                    "[frontend] side-loaded EXE: entry=0x{:08x} payload={}B (hle-bios on)",
                     exe.initial_pc,
                     exe.payload.len()
                 );

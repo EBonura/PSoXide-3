@@ -27,8 +27,12 @@ fn main() {
         let exe = psx_iso::Exe::parse(&raw).expect("parse PSX-EXE");
         bus.load_exe_payload(exe.load_addr, &exe.payload);
         cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
+        // HLE BIOS: fills in BIOS syscalls for side-loaded homebrew
+        // that skipped the real BIOS boot. Parity tests never load
+        // an EXE, so this is always off there.
+        bus.enable_hle_bios();
         eprintln!(
-            "[smoke_draw] side-loaded {exe_path}: entry=0x{:08x} sp={:?} payload={}B",
+            "[smoke_draw] side-loaded {exe_path}: entry=0x{:08x} sp={:?} payload={}B (hle-bios on)",
             exe.initial_pc,
             exe.initial_sp(),
             exe.payload.len()

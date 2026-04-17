@@ -82,6 +82,17 @@ pub struct Bus {
     /// no-op at every call site unless the `trace-mmio` Cargo feature
     /// is enabled — see `mmio_trace.rs` for the rationale.
     pub mmio_trace: MmioTrace,
+    /// When true, the CPU replaces fetches at `0xA0` / `0xB0` / `0xC0`
+    /// with a host-Rust implementation of the BIOS syscall they
+    /// dispatch to. Off by default so parity tests stay bit-exact
+    /// against Redux (which does the real BIOS ROM dispatch).
+    /// Turned on by [`Bus::enable_hle_bios`] — typically right after
+    /// side-loading an EXE that wants BIOS services but skipped the
+    /// BIOS's own init.
+    pub hle_bios_enabled: bool,
+    /// Per-(table, func) count of HLE BIOS calls. Diagnostic only.
+    /// `[table][func]` where table is 0=A, 1=B, 2=C.
+    hle_bios_calls: [[u32; 256]; 3],
 }
 
 // --- Phase 4 scheduler constants (NTSC) ---
@@ -137,7 +148,34 @@ impl Bus {
             cycles: 0,
             next_vblank_cycle: FIRST_VBLANK_CYCLE,
             mmio_trace: MmioTrace::new(),
+            hle_bios_enabled: false,
+            hle_bios_calls: [[0; 256]; 3],
         })
+    }
+
+    /// Turn on HLE BIOS interception. Call after side-loading an EXE
+    /// that expects BIOS services to be live without running the real
+    /// BIOS boot sequence. Never enable when validating parity — the
+    /// oracle emulator runs the real BIOS ROM and will diverge.
+    pub fn enable_hle_bios(&mut self) {
+        self.hle_bios_enabled = true;
+    }
+
+    /// Internal: log one HLE BIOS call. Called from the HLE dispatcher.
+    pub(crate) fn hle_bios_log_call(&mut self, table: crate::hle_bios::Table, func: u8) {
+        let idx = match table {
+            crate::hle_bios::Table::A => 0,
+            crate::hle_bios::Table::B => 1,
+            crate::hle_bios::Table::C => 2,
+        };
+        self.hle_bios_calls[idx][func as usize] =
+            self.hle_bios_calls[idx][func as usize].saturating_add(1);
+    }
+
+    /// Snapshot of HLE BIOS call counts: `[A, B, C]` tables × 256
+    /// function slots. Diagnostic only.
+    pub fn hle_bios_call_counts(&self) -> [[u32; 256]; 3] {
+        self.hle_bios_calls
     }
 
     /// True when `phys` sits inside the MMIO window at `0x1F80_1000..0x1F80_2000`.
