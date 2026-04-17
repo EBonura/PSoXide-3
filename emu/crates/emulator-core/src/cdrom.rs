@@ -414,6 +414,19 @@ impl CdRom {
         });
     }
 
+    /// Like [`schedule_second_response`] but the IRQ type is Error
+    /// (INT5). Used for the second reply of commands that fail because
+    /// the disc isn't present — the first reply is still an ack (INT3)
+    /// so the BIOS can distinguish "command received" from "command
+    /// completed with error".
+    fn schedule_second_error(&mut self, bytes: Vec<u8>, delay: u64) {
+        self.pending.push_back(PendingEvent {
+            deadline: delay,
+            irq: IrqType::Error,
+            bytes,
+        });
+    }
+
     fn schedule_error_response(&mut self, bytes: Vec<u8>) {
         self.pending.push_back(PendingEvent {
             deadline: 0,
@@ -481,8 +494,15 @@ impl CdRom {
 
     fn cmd_read(&mut self) {
         if !self.disc_present {
+            // No disc: two-phase response like the other error-returning
+            // commands. First an ack (INT3) with stat so the BIOS
+            // confirms we got the command, then an error (INT5) a bit
+            // later with stat|ERROR + error code 0x80 (shell open /
+            // no disc). Sending only the error IRQ confuses the BIOS's
+            // command-state machine which expects the ack first.
+            self.schedule_first_response(vec![self.stat_byte()]);
             let stat = self.stat_byte() | drive_status_bit::ERROR;
-            self.schedule_error_response(vec![stat, 0x10]);
+            self.schedule_second_error(vec![stat, 0x80], FIRST_RESPONSE_CYCLES);
             return;
         }
         // First response: ack with READING set.
@@ -559,11 +579,14 @@ impl CdRom {
                 GETID_SECOND_RESPONSE_CYCLES,
             );
         } else {
-            // No disc: 1st response stat, 2nd response error.
-            // Stat/Flags/Type/Region/ZeroZeroZeroZero pattern for
-            // "no disc": BIOS recognises this and shows the shell.
+            // No disc: 1st response (INT3) with stat, 2nd response
+            // (INT5, Error) with the shell-recognised "no disc"
+            // pattern. The second response MUST be Error, not
+            // Complete - the BIOS dispatches on irq_flag and runs a
+            // different code path for INT5 that transitions the shell
+            // state machine from "probing" to "show insert-disc screen".
             self.schedule_first_response(vec![self.stat_byte()]);
-            self.schedule_second_response(
+            self.schedule_second_error(
                 vec![0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 GETID_SECOND_RESPONSE_CYCLES,
             );

@@ -352,15 +352,22 @@ fn main() {
     // can inspect descriptor tables the BIOS is polling.
     if let Ok(list) = std::env::var("PSOXIDE_PEEK") {
         println!("\n=== RAM peek (PSOXIDE_PEEK, via real read path) ===");
-        let addrs: Vec<u32> = list
-            .split(',')
-            .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
-            .collect();
-        // Must use `bus.read32` (not `try_read8`) so MMIO dispatch
-        // runs through live peripheral state, not the echo buffer.
-        for a in addrs {
-            let w = bus.read32(a);
-            println!("  *{a:08x} = {w:08x}");
+        // Token format:
+        //   0xADDR         - single word
+        //   0xADDR:N       - N consecutive words starting at ADDR
+        for tok in list.split(',') {
+            let (addr_s, n) = match tok.trim().split_once(':') {
+                Some((a, n_str)) => (a, n_str.parse::<u32>().unwrap_or(1)),
+                None => (tok.trim(), 1u32),
+            };
+            let Ok(start) = u32::from_str_radix(addr_s.trim_start_matches("0x"), 16) else {
+                continue;
+            };
+            for i in 0..n {
+                let a = start.wrapping_add(i * 4);
+                let w = bus.read32(a);
+                println!("  *{a:08x} = {w:08x}");
+            }
         }
     }
 
