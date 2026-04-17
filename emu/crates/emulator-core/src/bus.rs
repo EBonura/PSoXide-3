@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::dma::Dma;
 use crate::gpu::Gpu;
-use crate::irq::Irq;
+use crate::irq::{Irq, IrqSource};
 use crate::spu::Spu;
 use crate::timers::Timers;
 
@@ -140,6 +140,19 @@ impl Bus {
     /// Cumulative cycles since reset.
     pub fn cycles(&self) -> u64 {
         self.cycles
+    }
+
+    /// Advance the VBlank schedule and raise `IrqSource::VBlank` for
+    /// every period that's elapsed. Not called yet — Phase 4b turns
+    /// this on by invoking it from `tick`. Exposed + public so the
+    /// frontend can turn it on experimentally, and so unit tests can
+    /// exercise it in isolation.
+    pub fn run_vblank_scheduler(&mut self) {
+        while self.cycles >= self.next_vblank_cycle {
+            self.irq.raise(IrqSource::VBlank);
+            self.next_vblank_cycle =
+                self.next_vblank_cycle.wrapping_add(VBLANK_PERIOD_CYCLES);
+        }
     }
 
     /// Borrow the interrupt controller — caller can `.raise()` sources
@@ -499,6 +512,7 @@ fn zeroed_box<const N: usize>() -> Box<[u8; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::IrqSource;
 
     fn synthetic_bios() -> Vec<u8> {
         // 512 KiB. First word is 0xDEADBEEF little-endian, then zeros.
@@ -546,5 +560,42 @@ mod tests {
         assert_eq!(bus.read32(0x0020_0000), 0x1122_3344);
         assert_eq!(bus.read32(0x0040_0000), 0x1122_3344);
         assert_eq!(bus.read32(0x0060_0000), 0x1122_3344);
+    }
+
+    #[test]
+    fn vblank_scheduler_fires_at_first_threshold() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        // Just below the first VBlank — no fire yet.
+        bus.tick(FIRST_VBLANK_CYCLE as u32 - 1);
+        bus.run_vblank_scheduler();
+        assert_eq!(bus.irq.stat() & 1, 0);
+
+        // Cross the threshold — one VBlank fires.
+        bus.tick(2);
+        bus.run_vblank_scheduler();
+        assert_eq!(bus.irq.stat() & 1, 1);
+        assert_eq!(bus.next_vblank_cycle(), FIRST_VBLANK_CYCLE + VBLANK_PERIOD_CYCLES);
+    }
+
+    #[test]
+    fn vblank_scheduler_catches_up_after_long_tick() {
+        // Tick far past the first VBlank in one go — the scheduler
+        // must fire every VBlank that would have elapsed, not just one.
+        // Ack each time so we can count.
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        bus.tick((FIRST_VBLANK_CYCLE + 3 * VBLANK_PERIOD_CYCLES + 1) as u32);
+        bus.run_vblank_scheduler();
+        // irq.stat bit 0 is either 0 or 1 — can't count from there.
+        // Instead, check next_vblank_cycle advanced by 4 periods.
+        let expected = FIRST_VBLANK_CYCLE + 4 * VBLANK_PERIOD_CYCLES;
+        assert_eq!(bus.next_vblank_cycle(), expected);
+        // VBlank bit should be set (at least one fire happened).
+        assert_eq!(bus.irq.stat() & 1, 1);
+    }
+
+    #[test]
+    fn vblank_source_index_is_0() {
+        // Sanity: IrqSource::VBlank is bit 0, matching Redux's setIrq(0x01).
+        assert_eq!(IrqSource::VBlank as u32, 0);
     }
 }
