@@ -15,3 +15,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 parity-oracle = { workspace = true }
+
+[features]
+default = []
+# Record every MMIO read/write in a bounded ring buffer on the Bus.
+# Off by default — see `mmio_trace.rs` for why it's compile-time gated.
+trace-mmio = []

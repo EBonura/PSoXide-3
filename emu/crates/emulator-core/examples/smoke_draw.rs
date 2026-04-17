@@ -22,8 +22,7 @@ fn main() {
     // Sample the last ~1% of the run for a PC histogram — tells us
     // whether BIOS is in a tight loop or executing broadly.
     let sample_start = n.saturating_sub(n / 100);
-    let mut pc_hits: std::collections::BTreeMap<u32, u32> =
-        std::collections::BTreeMap::new();
+    let mut pc_hits: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
 
     let mut stopped_at: Option<(u64, emulator_core::ExecutionError)> = None;
     for i in 0..n {
@@ -127,6 +126,41 @@ fn main() {
         println!("{arrow} {addr:08x}: {word:08x}");
     }
 
+    // MMIO trace tail — only populated when built with
+    //   cargo run --example smoke_draw --features emulator-core/trace-mmio
+    // Otherwise `len()` is 0 and this block is silent.
+    #[cfg(feature = "trace-mmio")]
+    {
+        let n_trace = bus.mmio_trace.len();
+        if n_trace > 0 {
+            println!("\n=== MMIO trace tail (last 60 of {n_trace} recorded) ===");
+            let entries: Vec<_> = bus.mmio_trace.iter_chronological().collect();
+            let skip = entries.len().saturating_sub(60);
+            for e in &entries[skip..] {
+                println!(
+                    "  cyc={:>12}  {}  {:08x}  {:08x}",
+                    e.cycle,
+                    e.kind.tag(),
+                    e.addr,
+                    e.value
+                );
+            }
+            // Hot-address histogram — which MMIO ports is the BIOS
+            // hammering? Spinning on one is a tell for a wait loop.
+            let mut counts: std::collections::BTreeMap<u32, u32> =
+                std::collections::BTreeMap::new();
+            for e in &entries {
+                *counts.entry(e.addr).or_insert(0) += 1;
+            }
+            let mut sorted: Vec<_> = counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("\n=== MMIO trace top-10 hot addresses ===");
+            for (addr, hits) in sorted.iter().take(10) {
+                println!("  {addr:08x}: {hits} accesses");
+            }
+        }
+    }
+
     let vram = &bus.gpu.vram;
     let nz = vram.words().iter().filter(|&&w| w != 0).count();
     println!("\nVRAM non-zero    = {nz} / {} words", 1024 * 512);
@@ -137,7 +171,11 @@ fn main() {
         println!("unique colors    = {}", colors.len());
         println!(
             "first 10 colors  = {:?}",
-            colors.iter().take(10).map(|c| format!("0x{c:04X}")).collect::<Vec<_>>()
+            colors
+                .iter()
+                .take(10)
+                .map(|c| format!("0x{c:04X}"))
+                .collect::<Vec<_>>()
         );
 
         // Pixel density heatmap: which 64×64 blocks of VRAM have

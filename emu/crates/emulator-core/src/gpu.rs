@@ -52,6 +52,13 @@ pub struct Gpu {
     /// Active CPU→VRAM transfer state. `Some` when GP0 0xA0 has set
     /// up a destination rect and is now expecting pixel-data words.
     vram_upload: Option<VramTransfer>,
+    /// Active VRAM→CPU transfer state. `Some` when GP0 0xC0 set up a
+    /// source rect and is now supplying pixel-data words via GPUREAD.
+    vram_download: Option<VramTransfer>,
+    /// Most-recent single-word response to a GP1 0x10 (Get GPU Info)
+    /// request — returned on the next GPUREAD while a VRAM download
+    /// isn't active. Matches hardware's "GPU info" latch.
+    gpuread_latch: u32,
 
     // --- Texture-page state (GP0 0xE1 draw mode) ---
     /// VRAM X base of the current texture page (pixels, 0..=960,
@@ -142,6 +149,8 @@ impl Gpu {
             display_width: 320,
             display_height: 240,
             display_24bpp: false,
+            vram_download: None,
+            gpuread_latch: 0,
         }
     }
 
@@ -165,11 +174,27 @@ impl Gpu {
     /// Dispatch an MMIO read inside the GPU window. Returns `Some` for
     /// the two valid ports; `None` means the caller should fall through
     /// to a different region.
-    pub fn read32(&self, phys: u32) -> Option<u32> {
+    ///
+    /// `&mut self` because the GP0 (GPUREAD) port drains an in-flight
+    /// VRAM→CPU transfer one word at a time; the GP1 (GPUSTAT) port
+    /// stays side-effect-free.
+    pub fn read32(&mut self, phys: u32) -> Option<u32> {
         match phys {
-            GP0_ADDR => Some(0),
+            GP0_ADDR => Some(self.read_gpuread()),
             GP1_ADDR => Some(self.status.read()),
             _ => None,
+        }
+    }
+
+    /// GPUREAD — two paths:
+    /// - If a VRAM→CPU transfer is active, return the next 2 packed
+    ///   16bpp pixels from the source rect.
+    /// - Otherwise return the latch written by the last GP1 0x10.
+    fn read_gpuread(&mut self) -> u32 {
+        if self.vram_download.is_some() {
+            self.download_next_word()
+        } else {
+            self.gpuread_latch
         }
     }
 
@@ -198,13 +223,109 @@ impl Gpu {
         }
     }
 
+    /// GP0 0xC0 — VRAM→CPU transfer. `[cmd, xy, wh]` header; pixel
+    /// words are then drained by GPUREAD. Two 16bpp pixels per word
+    /// in row-major order across the source rect.
+    fn begin_vram_download(&mut self) {
+        let xy = self.gp0_fifo[1];
+        let wh = self.gp0_fifo[2];
+        let x = (xy & 0x3FF) as u16;
+        let y = ((xy >> 16) & 0x1FF) as u16;
+        let w = {
+            let raw = (wh & 0x3FF) as u16;
+            if raw == 0 {
+                1024
+            } else {
+                raw
+            }
+        };
+        let h = {
+            let raw = ((wh >> 16) & 0x1FF) as u16;
+            if raw == 0 {
+                512
+            } else {
+                raw
+            }
+        };
+        let pixels = w as u32 * h as u32;
+        let remaining = pixels.div_ceil(2);
+        self.vram_download = Some(VramTransfer {
+            x,
+            y,
+            w,
+            h,
+            row: 0,
+            col: 0,
+            remaining,
+        });
+    }
+
+    /// Pop two pixels from the active VRAM→CPU transfer, packed into
+    /// a u32 (low 16 = first pixel, high 16 = second). When the
+    /// transfer completes, the download slot clears and subsequent
+    /// GPUREAD reads return the GP1 0x10 latch.
+    fn download_next_word(&mut self) -> u32 {
+        let Some(t) = self.vram_download.as_mut() else {
+            return self.gpuread_latch;
+        };
+        let pix_a = Self::read_download_pixel(t, &self.vram);
+        let pix_b = Self::read_download_pixel(t, &self.vram);
+        t.remaining = t.remaining.saturating_sub(1);
+        let word = (pix_a as u32) | ((pix_b as u32) << 16);
+        if t.remaining == 0 {
+            self.vram_download = None;
+        }
+        word
+    }
+
+    /// Fetch the next pixel from the source rect for a VRAM→CPU
+    /// download. Advances row/col; over-draws past the final row
+    /// return zero (paired-halving at odd widths).
+    fn read_download_pixel(t: &mut VramTransfer, vram: &Vram) -> u16 {
+        if t.row >= t.h {
+            return 0;
+        }
+        let px = t.x.wrapping_add(t.col);
+        let py = t.y.wrapping_add(t.row);
+        let texel = vram.get_pixel(px, py);
+        t.col += 1;
+        if t.col >= t.w {
+            t.col = 0;
+            t.row += 1;
+        }
+        texel
+    }
+
     /// Handle GP1 commands that update the display-area state
-    /// (0x05 / 0x06 / 0x07 / 0x08). The status-bit updates stay in
-    /// `GpuStatus::gp1_write`; this function captures the geometry
-    /// the frontend needs.
+    /// (0x05 / 0x06 / 0x07 / 0x08) or the GPU-info latch (0x10).
+    /// The status-bit updates stay in `GpuStatus::gp1_write`; this
+    /// function captures the geometry + latch the frontend + CPU need.
     fn apply_gp1_display(&mut self, value: u32) {
         let cmd = (value >> 24) & 0xFF;
         match cmd {
+            // GP1 0x10 — Get GPU Info. Sub-op selects what latches
+            // into GPUREAD. See nocash PSX-SPX "GPU Memory Transfer
+            // Commands / GP1(10h)". Common sub-ops:
+            //   0x02 — texture window (E2 readback)
+            //   0x03 — draw area top-left  (E3 readback)
+            //   0x04 — draw area bottom-right (E4)
+            //   0x05 — draw offset (E5)
+            //   0x07 — GPU version / misc (returns 0x0000_0002)
+            //   0x08 — unknown / returns 0
+            0x10 => {
+                let sub_op = value & 0x0F;
+                self.gpuread_latch = match sub_op {
+                    0x03 => (self.draw_area_left as u32) | ((self.draw_area_top as u32) << 10),
+                    0x04 => (self.draw_area_right as u32) | ((self.draw_area_bottom as u32) << 10),
+                    0x05 => {
+                        let x = (self.draw_offset_x as u32) & 0x7FF;
+                        let y = (self.draw_offset_y as u32) & 0x7FF;
+                        x | (y << 11)
+                    }
+                    0x07 => 0x0000_0002,
+                    _ => 0,
+                };
+            }
             // GP1 0x00 — GPU reset — also resets the display area.
             0x00 => {
                 self.display_start_x = 0;
@@ -345,8 +466,10 @@ impl Gpu {
             // CPU→VRAM transfer — 3 words of setup, then `w*h/2`
             // words of pixel data follow as a separate mode.
             0xA0 => self.begin_vram_upload(),
-            // VRAM→VRAM copy / VRAM→CPU download / textured + shaded
-            // primitives — scaffolded but not rasterized yet.
+            // VRAM→CPU transfer — 3 words of setup, pixel words are
+            // then pulled by the CPU via GPUREAD.
+            0xC0 => self.begin_vram_download(),
+            // VRAM→VRAM copy — not rasterized yet.
             _ => {}
         }
     }
@@ -688,9 +811,7 @@ impl Gpu {
                 if (w0 | w1 | w2) >= 0 {
                     let u = (w0 * t0.0 as i64 + w1 * t1.0 as i64 + w2 * t2.0 as i64) / area_abs;
                     let v = (w0 * t0.1 as i64 + w1 * t1.1 as i64 + w2 * t2.1 as i64) / area_abs;
-                    if let Some(texel) =
-                        self.sample_texture(u as u16, v as u16, clut_x, clut_y)
-                    {
+                    if let Some(texel) = self.sample_texture(u as u16, v as u16, clut_x, clut_y) {
                         self.vram.set_pixel(x as u16, y as u16, texel);
                     }
                 }
@@ -935,7 +1056,11 @@ fn edge(a: (i32, i32), b: (i32, i32), c: (i32, i32)) -> i32 {
 /// Sign-extend an 11-bit integer (PS1 vertex coords + drawing offset
 /// are 11-bit signed).
 fn sign_extend_11(v: i32) -> i32 {
-    if v & 0x400 != 0 { v | !0x7FF } else { v & 0x7FF }
+    if v & 0x400 != 0 {
+        v | !0x7FF
+    } else {
+        v & 0x7FF
+    }
 }
 
 /// Convert a 24-bit RGB value (as written by the CPU in GP0 packets)
@@ -1049,7 +1174,7 @@ mod tests {
 
     #[test]
     fn read_status_has_always_ready_bits() {
-        let gpu = Gpu::new();
+        let mut gpu = Gpu::new();
         let stat = gpu.read32(GP1_ADDR).unwrap();
         // Bits 26, 27, 28 are the "ready" bits we force on every read.
         assert_eq!(stat & 0x1C00_0000, 0x1C00_0000);
@@ -1127,13 +1252,13 @@ mod tests {
         gpu.write32(GP0_ADDR, 0xE200_0000); // texture window
         gpu.write32(GP0_ADDR, 0xE300_0000); // drawing area TL
         gpu.write32(GP0_ADDR, 0xE400_0000); // drawing area BR
-        // None of these should have stuck a packet in the FIFO.
-        // (Implementation detail, but worth guarding against.)
+                                            // None of these should have stuck a packet in the FIFO.
+                                            // (Implementation detail, but worth guarding against.)
     }
 
     #[test]
     fn gpu_address_match_returns_none_off_port() {
-        let gpu = Gpu::new();
+        let mut gpu = Gpu::new();
         assert!(gpu.read32(0x1F80_1800).is_none());
         assert!(gpu.read32(0x1F80_1818).is_none());
     }

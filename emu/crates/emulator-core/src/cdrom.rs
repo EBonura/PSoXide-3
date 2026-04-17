@@ -486,9 +486,7 @@ impl CdRom {
             return;
         }
         // First response: ack with READING set.
-        self.schedule_first_response(vec![
-            self.stat_byte() | drive_status_bit::READING
-        ]);
+        self.schedule_first_response(vec![self.stat_byte() | drive_status_bit::READING]);
         // Kick off sector delivery.
         self.reading = true;
         let (m, s, f) = self.setloc_msf;
@@ -655,6 +653,19 @@ impl CdRom {
     /// Current raw IRQ-flag (for diagnostics).
     pub fn irq_flag(&self) -> u8 {
         self.irq_flag
+    }
+
+    /// Pull one byte from the data FIFO — used by DMA channel 3's
+    /// block-read path to drain a sector into RAM. Returns `0` when
+    /// the FIFO is empty (hardware returns stale-bus bytes; `0` is
+    /// a safe stand-in).
+    pub fn pop_data_byte(&mut self) -> u8 {
+        self.data_fifo.pop_front().unwrap_or(0)
+    }
+
+    /// Number of bytes currently buffered in the data FIFO.
+    pub fn data_fifo_len(&self) -> usize {
+        self.data_fifo.len()
     }
 }
 

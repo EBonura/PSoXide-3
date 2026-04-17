@@ -11,6 +11,7 @@ use crate::cdrom::CdRom;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::irq::{Irq, IrqSource};
+use crate::mmio_trace::{MmioKind, MmioTrace};
 use crate::spu::Spu;
 use crate::timers::Timers;
 
@@ -73,6 +74,10 @@ pub struct Bus {
     /// Phase 4a tracks this but doesn't fire — Phase 4b hangs the
     /// VBlank IRQ off reaching this threshold.
     next_vblank_cycle: u64,
+    /// Bounded ring buffer of recent MMIO accesses. Zero-sized and
+    /// no-op at every call site unless the `trace-mmio` Cargo feature
+    /// is enabled — see `mmio_trace.rs` for the rationale.
+    pub mmio_trace: MmioTrace,
 }
 
 // --- Phase 4 scheduler constants (NTSC) ---
@@ -126,7 +131,24 @@ impl Bus {
             cdrom: CdRom::new(),
             cycles: 0,
             next_vblank_cycle: FIRST_VBLANK_CYCLE,
+            mmio_trace: MmioTrace::new(),
         })
+    }
+
+    /// True when `phys` sits inside the MMIO window at `0x1F80_1000..0x1F80_2000`.
+    /// Used to filter trace recording — RAM / BIOS fetches are out of scope.
+    #[inline]
+    fn is_mmio(phys: u32) -> bool {
+        (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys)
+    }
+
+    /// Record an MMIO access in the ring buffer when tracing is enabled.
+    /// Call sites stay cfg-free; the inner record() is a no-op otherwise.
+    #[inline]
+    fn trace_mmio(&mut self, kind: MmioKind, phys: u32, value: u32) {
+        if Self::is_mmio(phys) {
+            self.mmio_trace.record(self.cycles, kind, phys, value);
+        }
     }
 
     /// Cycle count at which the next VBlank is scheduled to fire.
@@ -174,8 +196,7 @@ impl Bus {
             // the VBlank IRQ to detect frame boundaries. Matches
             // Redux's `SoftGPU::vblank` which does the same.
             self.gpu.toggle_vblank_field();
-            self.next_vblank_cycle =
-                self.next_vblank_cycle.wrapping_add(VBLANK_PERIOD_CYCLES);
+            self.next_vblank_cycle = self.next_vblank_cycle.wrapping_add(VBLANK_PERIOD_CYCLES);
         }
     }
 
@@ -210,9 +231,55 @@ impl Bus {
     fn maybe_run_dma(&mut self) {
         let otc_ran = self.dma.run_otc(&mut self.ram[..]);
         let gpu_ran = self.run_dma_gpu();
-        if otc_ran || gpu_ran {
+        let cdrom_ran = self.run_dma_cdrom();
+        if otc_ran || gpu_ran || cdrom_ran {
             self.irq.raise(IrqSource::Dma);
         }
+    }
+
+    /// Execute DMA channel 3 → CPU. Block mode (sync=1) is the only
+    /// mode used for CD-ROM reads: pull `BS × BA` words from the data
+    /// FIFO and write them to RAM at `MADR` with +4 step.
+    fn run_dma_cdrom(&mut self) -> bool {
+        let ch = self.dma.channels[3];
+        if (ch.channel_control >> 24) & 1 == 0 {
+            return false;
+        }
+        let sync_mode = (ch.channel_control >> 9) & 0x3;
+        if sync_mode != 1 {
+            // Manual / linked-list aren't used for the CD-ROM channel.
+            let ch = &mut self.dma.channels[3];
+            ch.channel_control &= !((1 << 24) | (1 << 28));
+            return true;
+        }
+
+        let bcr = ch.block_control;
+        let block_size = bcr & 0xFFFF;
+        let block_count = (bcr >> 16) & 0xFFFF;
+        let total_words = block_size * block_count.max(1);
+        let mut addr = ch.base & 0x001F_FFFC;
+        let step: u32 = if (ch.channel_control >> 1) & 1 != 0 {
+            0xFFFF_FFFCu32
+        } else {
+            4
+        };
+
+        for _ in 0..total_words {
+            let b0 = self.cdrom.pop_data_byte() as u32;
+            let b1 = self.cdrom.pop_data_byte() as u32;
+            let b2 = self.cdrom.pop_data_byte() as u32;
+            let b3 = self.cdrom.pop_data_byte() as u32;
+            let word = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            let offset = (addr & 0x001F_FFFF) as usize;
+            if offset + 4 <= self.ram.len() {
+                self.ram[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            addr = addr.wrapping_add(step);
+        }
+
+        let ch = &mut self.dma.channels[3];
+        ch.channel_control &= !((1 << 24) | (1 << 28));
+        true
     }
 
     /// Execute DMA channel 2 → GPU (GP0). Supports the two sync modes
@@ -311,14 +378,12 @@ impl Bus {
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             return Some(self.io[(phys - memory::io::BASE) as usize]);
         }
-        if (memory::expansion1::BASE
-            ..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
+        if (memory::expansion1::BASE..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
             .contains(&phys)
         {
             return Some(0xFF);
         }
-        if (memory::expansion2::BASE
-            ..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
+        if (memory::expansion2::BASE..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
             .contains(&phys)
         {
             return Some(0xFF);
@@ -336,6 +401,12 @@ impl Bus {
     /// read — popping response FIFOs, advancing data-transfer state.
     pub fn read8(&mut self, virt: u32) -> u8 {
         let phys = to_physical(virt);
+        let value = self.read8_impl(virt, phys);
+        self.trace_mmio(MmioKind::R8, phys, value as u32);
+        value
+    }
+
+    fn read8_impl(&mut self, virt: u32, phys: u32) -> u8 {
         if phys < memory::ram::MIRROR_END {
             return self.ram[(phys as usize) % memory::ram::SIZE];
         }
@@ -350,8 +421,7 @@ impl Bus {
         if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32).contains(&phys) {
             return self.bios[(phys - memory::bios::BASE) as usize];
         }
-        if (memory::expansion1::BASE
-            ..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
+        if (memory::expansion1::BASE..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
             .contains(&phys)
         {
             return 0xFF;
@@ -359,8 +429,7 @@ impl Bus {
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             return self.io[(phys - memory::io::BASE) as usize];
         }
-        if (memory::expansion2::BASE
-            ..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
+        if (memory::expansion2::BASE..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
             .contains(&phys)
         {
             return 0xFF;
@@ -376,6 +445,12 @@ impl Bus {
     /// effects.
     pub fn read16(&mut self, virt: u32) -> u16 {
         let phys = to_physical(virt);
+        let value = self.read16_impl(virt, phys);
+        self.trace_mmio(MmioKind::R16, phys, value as u32);
+        value
+    }
+
+    fn read16_impl(&mut self, virt: u32, phys: u32) -> u16 {
         if phys < memory::ram::MIRROR_END {
             let off = (phys as usize) % memory::ram::SIZE;
             return u16::from_le_bytes([self.ram[off], self.ram[off + 1]]);
@@ -393,8 +468,7 @@ impl Bus {
             let off = (phys - memory::bios::BASE) as usize;
             return u16::from_le_bytes([self.bios[off], self.bios[off + 1]]);
         }
-        if (memory::expansion1::BASE
-            ..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
+        if (memory::expansion1::BASE..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
             .contains(&phys)
         {
             return 0xFFFF;
@@ -406,8 +480,7 @@ impl Bus {
             let off = (phys - memory::io::BASE) as usize;
             return u16::from_le_bytes([self.io[off], self.io[off + 1]]);
         }
-        if (memory::expansion2::BASE
-            ..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
+        if (memory::expansion2::BASE..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
             .contains(&phys)
         {
             return 0xFFFF;
@@ -422,7 +495,12 @@ impl Bus {
     /// the rare case software word-accesses that range) mutate.
     pub fn read32(&mut self, virt: u32) -> u32 {
         let phys = to_physical(virt);
+        let value = self.read32_impl(virt, phys);
+        self.trace_mmio(MmioKind::R32, phys, value);
+        value
+    }
 
+    fn read32_impl(&mut self, virt: u32, phys: u32) -> u32 {
         if phys < memory::ram::MIRROR_END {
             let offset = (phys as usize) % memory::ram::SIZE;
             return read_u32_le(&self.ram[offset..]);
@@ -440,8 +518,7 @@ impl Bus {
             return read_u32_le(&self.bios[offset..]);
         }
 
-        if (memory::expansion1::BASE
-            ..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
+        if (memory::expansion1::BASE..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
             .contains(&phys)
         {
             return 0xFFFF_FFFF;
@@ -498,7 +575,11 @@ impl Bus {
         }
 
         let phys = to_physical(virt);
+        self.trace_mmio(MmioKind::W32, phys, value);
+        self.write32_impl(virt, phys, value);
+    }
 
+    fn write32_impl(&mut self, virt: u32, phys: u32, value: u32) {
         if phys == IRQ_STAT_ADDR {
             self.irq.write_stat(value);
             return;
@@ -558,9 +639,7 @@ impl Bus {
             return;
         }
 
-        panic!(
-            "bus: unmapped write32 @ virt={virt:#010x} phys={phys:#010x} value={value:#010x}"
-        );
+        panic!("bus: unmapped write32 @ virt={virt:#010x} phys={phys:#010x} value={value:#010x}");
     }
 
     /// Write a byte to a virtual address. Unmapped writes in MMIO /
@@ -568,6 +647,11 @@ impl Bus {
     /// [`Bus::write32`]).
     pub fn write8(&mut self, virt: u32, value: u8) {
         let phys = to_physical(virt);
+        self.trace_mmio(MmioKind::W8, phys, value as u32);
+        self.write8_impl(virt, phys, value);
+    }
+
+    fn write8_impl(&mut self, virt: u32, phys: u32, value: u8) {
         if phys < memory::ram::MIRROR_END {
             self.ram[(phys as usize) % memory::ram::SIZE] = value;
             return;
@@ -597,6 +681,11 @@ impl Bus {
     /// policy as [`Bus::write32`].
     pub fn write16(&mut self, virt: u32, value: u16) {
         let phys = to_physical(virt);
+        self.trace_mmio(MmioKind::W16, phys, value as u32);
+        self.write16_impl(virt, phys, value);
+    }
+
+    fn write16_impl(&mut self, virt: u32, phys: u32, value: u16) {
         let bytes = value.to_le_bytes();
         if phys < memory::ram::MIRROR_END {
             let off = (phys as usize) % memory::ram::SIZE;
@@ -641,7 +730,12 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
 fn read_ram_u32(ram: &[u8], phys: u32) -> u32 {
     let offset = (phys & 0x001F_FFFF) as usize;
     if offset + 4 <= ram.len() {
-        u32::from_le_bytes([ram[offset], ram[offset + 1], ram[offset + 2], ram[offset + 3]])
+        u32::from_le_bytes([
+            ram[offset],
+            ram[offset + 1],
+            ram[offset + 2],
+            ram[offset + 3],
+        ])
     } else {
         0
     }
@@ -721,7 +815,10 @@ mod tests {
         bus.tick(2);
         bus.run_vblank_scheduler();
         assert_eq!(bus.irq.stat() & 1, 1);
-        assert_eq!(bus.next_vblank_cycle(), FIRST_VBLANK_CYCLE + VBLANK_PERIOD_CYCLES);
+        assert_eq!(
+            bus.next_vblank_cycle(),
+            FIRST_VBLANK_CYCLE + VBLANK_PERIOD_CYCLES
+        );
     }
 
     #[test]
