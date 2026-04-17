@@ -141,6 +141,9 @@ impl Bus {
     pub fn tick(&mut self, n: u32) {
         self.cycles = self.cycles.wrapping_add(n as u64);
         self.run_vblank_scheduler();
+        if self.cdrom.tick(self.cycles) {
+            self.irq.raise(IrqSource::Cdrom);
+        }
     }
 
     /// Cumulative cycles since reset.
