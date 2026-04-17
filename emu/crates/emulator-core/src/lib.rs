@@ -15,6 +15,7 @@ pub mod dma;
 pub mod gpu;
 pub mod gte;
 pub mod irq;
+pub mod hle_bios;
 pub mod mmio_trace;
 pub mod sio;
 pub mod spu;

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use emulator_core::{Bus, Cpu};
-use parity_oracle::{OracleConfig, ReduxProcess};
+use parity_oracle::{cache, OracleConfig, ReduxProcess};
 use psx_trace::InstructionRecord;
 
 const DEFAULT_BIOS: &str = "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN";
@@ -59,6 +59,49 @@ fn redux_trace(n: u32) -> Vec<InstructionRecord> {
     redux.send_command("quit").ok();
     let _ = redux.wait_for_response(STEP_TIMEOUT);
     let _ = redux.terminate();
+    records
+}
+
+/// Redux trace with on-disk cache. First run pays the full Redux
+/// cost (several minutes for 10M+ steps); subsequent runs with the
+/// same BIOS and step count load from disk in a fraction of a
+/// second. See [`parity_oracle::cache`] for the file format.
+///
+/// `PSOXIDE_PARITY_NO_CACHE=1` forces a fresh Redux run even when
+/// a cache exists — useful when tweaking the oracle Lua script.
+fn redux_trace_cached(n: usize) -> Vec<InstructionRecord> {
+    let bios_bytes = fs::read(bios_path()).expect("BIOS readable");
+    let dir = cache::default_dir();
+    let path = cache::path_for(&dir, &bios_bytes, n);
+
+    if std::env::var("PSOXIDE_PARITY_NO_CACHE").is_err() {
+        // Prefer the exact-step cache; fall back to any longer
+        // cache with the same BIOS hash. This means a single 50M
+        // run satisfies every parity rung below 50M.
+        if let Some(records) = cache::load(&path) {
+            eprintln!(
+                "[parity-cache] hit {} ({} records)",
+                path.display(),
+                records.len()
+            );
+            return records;
+        }
+        if let Some(records) = cache::load_prefix(&dir, &bios_bytes, n) {
+            return records;
+        }
+    }
+
+    eprintln!("[parity-cache] miss {} — invoking Redux", path.display());
+    let records = redux_trace(n as u32);
+    if let Err(e) = cache::save(&path, &records) {
+        eprintln!("[parity-cache] save failed: {e}");
+    } else {
+        eprintln!(
+            "[parity-cache] saved {} ({} records)",
+            path.display(),
+            records.len()
+        );
+    }
     records
 }
 
@@ -149,7 +192,7 @@ fn first_divergence(
 fn assert_parity_for_steps(n: usize) {
     let bios_bytes = fs::read(bios_path()).expect("BIOS readable");
     let (ours, err) = our_trace(bios_bytes, n);
-    let theirs = redux_trace(n as u32);
+    let theirs = redux_trace_cached(n);
 
     let report_prefix = || -> String {
         let mut s = format!("parity ran for {}/{} steps\n", ours.len(), n);
@@ -242,6 +285,29 @@ fn first_million_steps_match_redux() {
 #[ignore = "requires PCSX-Redux binary; run via `make parity`"]
 fn first_ten_million_steps_match_redux() {
     assert_parity_for_steps(10_000_000);
+}
+
+// Binary-search rungs between 10M and 50M. Once a 50M (or longer)
+// cache exists, these all resolve in ~1s instead of re-invoking
+// Redux — handy for localising a divergence without rebuilding
+// the whole trace.
+
+#[test]
+#[ignore = "requires Redux cache; run via `make parity`"]
+fn first_twenty_million_steps_match_redux() {
+    assert_parity_for_steps(20_000_000);
+}
+
+#[test]
+#[ignore = "requires Redux cache; run via `make parity`"]
+fn first_thirty_million_steps_match_redux() {
+    assert_parity_for_steps(30_000_000);
+}
+
+#[test]
+#[ignore = "requires Redux cache; run via `make parity`"]
+fn first_forty_million_steps_match_redux() {
+    assert_parity_for_steps(40_000_000);
 }
 
 /// Probe past the next expected blocker — the BIOS reaches state 25

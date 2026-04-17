@@ -19,9 +19,12 @@
 extern crate psx_rt;
 
 use psx_gpu::{self as gpu, Resolution, VideoMode};
+use psx_rt::tty;
 
 #[no_mangle]
 fn main() {
+    tty::println("hello-tri: booted via HLE BIOS");
+
     gpu::init(VideoMode::Ntsc, Resolution::R320X240);
 
     // Enable drawing into the display region. Draw-area covers the
@@ -29,6 +32,7 @@ fn main() {
     gpu::set_draw_area(0, 0, 319, 239);
     gpu::set_draw_offset(0, 0);
 
+    tty::println("hello-tri: entering render loop");
     let mut frame: u16 = 0;
     loop {
         // Clear to dark blue.
