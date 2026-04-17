@@ -29,6 +29,8 @@ const ANIM_SPEED: f32 = 10.0;
 /// emulator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
+    /// Toggle between continuous-run and paused.
+    ToggleRun,
     /// Advance the CPU by one retired instruction.
     StepOne,
     /// Reseat the CPU at its reset vector.
@@ -57,8 +59,9 @@ pub struct MenuInput {
     pub toggle_open: bool,
 }
 
-#[derive(Clone)]
 struct MenuItem {
+    /// Mutable so the Run/Pause label can swap in place without
+    /// rebuilding the whole category tree on every toggle.
     label: &'static str,
     action: MenuAction,
     value: Option<&'static str>,
@@ -86,11 +89,21 @@ impl Default for MenuState {
 
 impl MenuState {
     pub fn new() -> Self {
+        Self::with_running(false)
+    }
+
+    pub fn with_running(running: bool) -> Self {
+        let run_label = if running { "Pause" } else { "Run" };
         let categories = vec![
             Category {
                 name: "Game",
                 icon: icons::PLAY,
                 items: vec![
+                    MenuItem {
+                        label: run_label,
+                        action: MenuAction::ToggleRun,
+                        value: None,
+                    },
                     MenuItem {
                         label: "Step one instruction",
                         action: MenuAction::StepOne,
@@ -146,6 +159,17 @@ impl MenuState {
             item_index: 0,
             anim_x: 0.0,
             categories,
+        }
+    }
+
+    /// Rebuild categories with a fresh "Run"/"Pause" label. Called when
+    /// `AppState.running` flips.
+    pub fn sync_run_label(&mut self, running: bool) {
+        let run_label = if running { "Pause" } else { "Run" };
+        if let Some(game) = self.categories.first_mut() {
+            if let Some(item) = game.items.first_mut() {
+                item.label = run_label;
+            }
         }
     }
 

@@ -63,7 +63,7 @@ impl HudState {
 }
 
 /// Paint the HUD bar.
-pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu) {
+pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu, running: bool) {
     let screen = ctx.screen_rect();
     let rect = Rect::from_min_size(
         Pos2::new(screen.left(), screen.bottom() - HUD_HEIGHT),
@@ -75,6 +75,8 @@ pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu) {
 
     painter.rect_filled(rect, 0.0, BG);
 
+    // Left-aligned status indicator; right-aligned perf metrics.
+    let left = screen.left() + 12.0;
     let right = screen.right() - 12.0;
     let mid_y = rect.top() + HUD_HEIGHT * 0.5;
     let line1_y = mid_y - 8.0;
@@ -82,6 +84,19 @@ pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu) {
 
     let fps = hud.fps();
     let dt_ms = hud.average_dt() * 1000.0;
+    let (status_text, status_color) = if running {
+        ("● RUNNING", Color32::from_rgb(80, 200, 120))
+    } else {
+        ("❚❚ PAUSED", TEXT)
+    };
+
+    painter.text(
+        Pos2::new(left, mid_y),
+        Align2::LEFT_CENTER,
+        status_text,
+        FontId::proportional(12.0),
+        status_color,
+    );
 
     painter.text(
         Pos2::new(right, line1_y),

@@ -40,13 +40,22 @@ pub fn draw_layout(
     state.menu.draw(ctx, dt);
 
     if state.panels.hud {
-        hud::draw(ctx, &state.hud, &state.cpu);
+        hud::draw(ctx, &state.hud, &state.cpu, state.running);
     }
 }
 
 pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> MenuOutcome {
     use menu::MenuAction::*;
     match action {
+        ToggleRun => {
+            state.running = !state.running;
+            state.menu.sync_run_label(state.running);
+            // Auto-close the overlay so Run is observable immediately.
+            if state.running {
+                state.menu.open = false;
+            }
+            MenuOutcome::None
+        }
         StepOne => {
             if let Some(bus) = state.bus.as_mut() {
                 let _ = state.cpu.step(bus);
@@ -55,6 +64,8 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
         }
         Reset => {
             state.cpu = emulator_core::Cpu::new();
+            state.running = false;
+            state.menu.sync_run_label(false);
             MenuOutcome::None
         }
         FillVramTestPattern => {

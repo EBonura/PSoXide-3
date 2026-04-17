@@ -46,6 +46,13 @@ pub struct AppState {
     pub vram: Vram,
     pub menu: MenuState,
     pub hud: HudState,
+    /// When true, the shell drives `cpu.step` at `run_steps_per_frame`
+    /// instructions per redraw. Toggled via the Menu's Run/Pause item.
+    pub running: bool,
+    /// How many CPU instructions the run loop retires per frame when
+    /// `running` is true. Tuned to stay real-time-ish on a modern host
+    /// without overshooting VBlank granularity once timers land.
+    pub run_steps_per_frame: u32,
 }
 
 impl Default for AppState {
@@ -57,6 +64,8 @@ impl Default for AppState {
             vram: Vram::new(),
             menu: MenuState::new(),
             hud: HudState::default(),
+            running: false,
+            run_steps_per_frame: 100_000,
         }
     }
 }

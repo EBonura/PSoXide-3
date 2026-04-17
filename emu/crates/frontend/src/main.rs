@@ -115,6 +115,26 @@ impl ApplicationHandler for Shell {
                     }
                 }
 
+                // Run loop: retire `run_steps_per_frame` instructions this
+                // frame if we're in run mode. Any execution error auto-
+                // pauses and surfaces via the register panel.
+                if self.state.running {
+                    if let Some(bus) = self.state.bus.as_mut() {
+                        for _ in 0..self.state.run_steps_per_frame {
+                            if self.state.cpu.step(bus).is_err() {
+                                self.state.running = false;
+                                self.state.menu.sync_run_label(false);
+                                self.state.menu.open = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        // No BIOS — running is meaningless; flip back.
+                        self.state.running = false;
+                        self.state.menu.sync_run_label(false);
+                    }
+                }
+
                 let state = &mut self.state;
                 gfx.prepare_vram(&state.vram);
                 let vram_tex = gfx.vram_texture_id();
