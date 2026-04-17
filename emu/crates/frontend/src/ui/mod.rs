@@ -5,6 +5,7 @@
 //! (bottom/side get clipped to remaining space), then the central area,
 //! then free-floating overlays (Menu, HUD) on top.
 
+pub mod hud;
 pub mod registers;
 pub mod vram;
 pub mod menu;
@@ -18,6 +19,8 @@ pub fn draw_layout(
     vram_tex: egui::TextureId,
     dt: f32,
 ) {
+    state.hud.push(dt);
+
     if state.panels.registers {
         registers::draw(ctx, &state.cpu);
     }
@@ -35,6 +38,10 @@ pub fn draw_layout(
     });
 
     state.menu.draw(ctx, dt);
+
+    if state.panels.hud {
+        hud::draw(ctx, &state.hud, &state.cpu);
+    }
 }
 
 pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> MenuOutcome {

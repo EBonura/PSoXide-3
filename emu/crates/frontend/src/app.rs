@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use emulator_core::{Bus, Cpu, Vram};
 
 use crate::ui;
+use crate::ui::hud::HudState;
 use crate::ui::menu::MenuState;
 
 /// Default BIOS location. Matches the parity-test default so both
@@ -44,6 +45,7 @@ pub struct AppState {
     pub bus: Option<Bus>,
     pub vram: Vram,
     pub menu: MenuState,
+    pub hud: HudState,
 }
 
 impl Default for AppState {
@@ -54,6 +56,7 @@ impl Default for AppState {
             bus: load_bus(),
             vram: Vram::new(),
             menu: MenuState::new(),
+            hud: HudState::default(),
         }
     }
 }
