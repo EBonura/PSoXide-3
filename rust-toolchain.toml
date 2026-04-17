@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable"
-components = ["rustfmt", "clippy"]
+# Nightly required: `mipsel-sony-psx` target, `build-std`, and
+# `asm_experimental_arch` (psx-rt's BIOS trampolines). rustfmt +
+# clippy nightlies are installed alongside for the host workspace.
+channel    = "nightly"
+components = ["rustfmt", "clippy", "rust-src", "llvm-tools"]

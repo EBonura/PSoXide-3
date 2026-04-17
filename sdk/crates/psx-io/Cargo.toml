@@ -1,0 +1,13 @@
+[package]
+name         = "psx-io"
+version      = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description  = "Volatile MMIO primitives for PSoXide-3 target code."
+
+[dependencies]
+psx-hw = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"

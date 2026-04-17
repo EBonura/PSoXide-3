@@ -1,0 +1,27 @@
+[package]
+name    = "hello-tri"
+version = "0.1.0"
+edition = "2021"
+
+# Examples live outside the sdk/ workspace so cargo doesn't try to
+# compile them for the host target when the user runs `cargo check`
+# from the repo root.
+[workspace]
+
+[[bin]]
+name = "hello-tri"
+path = "src/main.rs"
+
+[profile.release]
+# No unwinder in no_std; abort on panic keeps the binary small and
+# doesn't require `libunwind` bits.
+panic = "abort"
+codegen-units = 1
+# Link-time optimisation shrinks the binary; optional, but handy
+# when examples are the smoke test for the SDK.
+lto = true
+
+[dependencies]
+psx-sdk = { path = "../../crates/psx-sdk" }
+psx-gpu = { path = "../../crates/psx-gpu" }
+psx-rt  = { path = "../../crates/psx-rt" }
