@@ -34,6 +34,20 @@ const COP0_LABELS: &[(usize, &str)] = &[
     (8, "BadVAddr"),
 ];
 
+/// R3000 exception codes, by their numeric value in `CAUSE.ExcCode`.
+const EXC_CODES: &[(u32, &str)] = &[
+    (0, "Int"),
+    (4, "AdEL"),
+    (5, "AdES"),
+    (6, "IBE"),
+    (7, "DBE"),
+    (8, "Syscall"),
+    (9, "Bp"),
+    (10, "RI"),
+    (11, "CpU"),
+    (12, "Ov"),
+];
+
 /// Paint the register viewer as a left-docked resizable side panel.
 pub fn draw(
     ctx: &egui::Context,
@@ -130,6 +144,54 @@ fn draw_cop0(ui: &mut egui::Ui, cpu: &Cpu) {
                 ui.end_row();
             }
         });
+
+    // Bit-level breakdowns for the two registers whose hex values are
+    // opaque at a glance. BadVAddr / EPC are raw addresses; they don't
+    // benefit from the same treatment.
+    ui.add_space(4.0);
+    ui.small(format!("SR: {}", format_sr_bits(cop0[12])));
+    ui.small(format!("Cause: {}", format_cause_bits(cop0[13])));
+}
+
+fn format_sr_bits(sr: u32) -> String {
+    // Bits we actually care about at a glance. Flags show by name only
+    // when set; the KU/IE stack shows as three comma-joined pairs.
+    let mut flags: Vec<&str> = Vec::new();
+    for (bit, name) in [
+        (16, "IsC"), (17, "SwC"), (22, "BEV"),
+        (28, "CU0"), (30, "CU2"),
+    ] {
+        if sr & (1 << bit) != 0 {
+            flags.push(name);
+        }
+    }
+    let stack = format!(
+        "c={ku_c}/{ie_c} p={ku_p}/{ie_p} o={ku_o}/{ie_o}",
+        ie_c = sr & 1,
+        ku_c = (sr >> 1) & 1,
+        ie_p = (sr >> 2) & 1,
+        ku_p = (sr >> 3) & 1,
+        ie_o = (sr >> 4) & 1,
+        ku_o = (sr >> 5) & 1,
+    );
+    let im = (sr >> 8) & 0xFF;
+    let flags_str = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", flags.join(" "))
+    };
+    format!("{stack}  IM=0x{im:02X}{flags_str}")
+}
+
+fn format_cause_bits(cause: u32) -> String {
+    let exc_code = (cause >> 2) & 0x1F;
+    let ip = (cause >> 8) & 0xFF;
+    let bd = if cause & (1 << 31) != 0 { " BD" } else { "" };
+    let exc_name = EXC_CODES
+        .iter()
+        .find_map(|(c, name)| if *c == exc_code { Some(*name) } else { None })
+        .unwrap_or("?");
+    format!("ExcCode={exc_code} ({exc_name})  IP=0x{ip:02X}{bd}")
 }
 
 fn reg_cell(ui: &mut egui::Ui, name: &str, value: u32) {
