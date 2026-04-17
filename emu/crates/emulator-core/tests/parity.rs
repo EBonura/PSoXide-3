@@ -83,6 +83,18 @@ fn first_divergence(
                 "  prev instr: pc=0x{:08x} instr=0x{:08x}",
                 prev.pc, prev.instr
             ));
+            // Dump the full prior GPR state so we can compute effective
+            // addresses and cross-check memory reads.
+            lines.push("  prev gprs (theirs):".to_string());
+            for r in (0..32).step_by(4) {
+                lines.push(format!(
+                    "    $r{:02}={:08x}  $r{:02}={:08x}  $r{:02}={:08x}  $r{:02}={:08x}",
+                    r, prev.gprs[r],
+                    r + 1, prev.gprs[r + 1],
+                    r + 2, prev.gprs[r + 2],
+                    r + 3, prev.gprs[r + 3],
+                ));
+            }
         }
         if us.pc != them.pc {
             lines.push(format!(
@@ -210,5 +222,15 @@ fn first_two_hundred_thousand_steps_match_redux() {
 #[ignore = "requires PCSX-Redux binary; run via `make parity`"]
 fn first_million_steps_match_redux() {
     assert_parity_for_steps(1_000_000);
+}
+
+/// Highest currently-passing count: exercises SYSCALL (first hit near
+/// 2.7M) and the MMIO echo buffer (SPUCNT write/read roundtrip). Next
+/// blocker is SPUSTAT at step 2,735,076 — a read-only register whose
+/// value tracks SPUCNT, not its own writes.
+#[test]
+#[ignore = "requires PCSX-Redux binary; run via `make parity`"]
+fn first_two_point_seven_million_steps_match_redux() {
+    assert_parity_for_steps(2_735_000);
 }
 

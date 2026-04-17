@@ -25,6 +25,12 @@ pub struct Bus {
     ram: Box<[u8; memory::ram::SIZE]>,
     bios: Box<[u8; memory::bios::SIZE]>,
     scratchpad: Box<[u8; memory::scratchpad::SIZE]>,
+    /// Write-echoes-on-read buffer for the MMIO window. **Placeholder.**
+    /// Real peripherals (GPU, SPU, CD-ROM, DMA, timers, IRQ controller)
+    /// will claim ranges out of this and expose their own semantics; for
+    /// now this lets the BIOS's init code write-then-read-back registers
+    /// (e.g. enabling the SPU via `SPUCNT`) and observe its own writes.
+    io: Box<[u8; memory::io::SIZE]>,
 }
 
 impl Bus {
@@ -48,6 +54,7 @@ impl Bus {
             ram: zeroed_box(),
             bios: bios_arr,
             scratchpad: zeroed_box(),
+            io: zeroed_box(),
         })
     }
 
@@ -76,7 +83,7 @@ impl Bus {
             return 0xFF;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
-            return 0;
+            return self.io[(phys - memory::io::BASE) as usize];
         }
         if (memory::expansion2::BASE
             ..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
@@ -113,7 +120,8 @@ impl Bus {
             return 0xFFFF;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
-            return 0;
+            let off = (phys - memory::io::BASE) as usize;
+            return u16::from_le_bytes([self.io[off], self.io[off + 1]]);
         }
         if (memory::expansion2::BASE
             ..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
@@ -154,7 +162,8 @@ impl Bus {
         }
 
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
-            return 0;
+            let offset = (phys - memory::io::BASE) as usize;
+            return read_u32_le(&self.io[offset..]);
         }
 
         panic!("bus: unmapped read32 @ virt={virt:#010x} phys={phys:#010x}");
@@ -193,6 +202,8 @@ impl Bus {
         }
 
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
+            let offset = (phys - memory::io::BASE) as usize;
+            self.io[offset..offset + 4].copy_from_slice(&bytes);
             return;
         }
 
@@ -227,6 +238,7 @@ impl Bus {
             return;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
+            self.io[(phys - memory::io::BASE) as usize] = value;
             return;
         }
         if (memory::expansion2::BASE..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
@@ -258,6 +270,8 @@ impl Bus {
             return;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
+            let off = (phys - memory::io::BASE) as usize;
+            self.io[off..off + 2].copy_from_slice(&bytes);
             return;
         }
         if (memory::expansion2::BASE..memory::expansion2::BASE + memory::expansion2::SIZE as u32)

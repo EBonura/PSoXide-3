@@ -63,6 +63,11 @@ pub struct Cpu {
     pending_load: Option<(u8, u32)>,
     hi: u32,
     lo: u32,
+    /// When a SYSCALL/BREAK/exception fires, the post-retire PC goes
+    /// here instead of `pc + 4` or a pending branch target. The value
+    /// is the exception vector (0x8000_0080 or 0xBFC0_0180 depending on
+    /// the BEV bit in SR).
+    pending_exception_pc: Option<u32>,
 }
 
 impl Cpu {
@@ -81,6 +86,7 @@ impl Cpu {
             pending_load: None,
             hi: 0,
             lo: 0,
+            pending_exception_pc: None,
         }
     }
 
@@ -123,6 +129,7 @@ impl Cpu {
         // instruction is its delay slot — after retiring, PC goes to
         // the branch target instead of the usual `pc + 4`.
         let branch_after_this = self.pending_pc.take();
+        let in_delay_slot = branch_after_this.is_some();
 
         // The load delay queued by the *previous* instruction is held
         // and applied after this instruction executes. The delay slot
@@ -131,15 +138,21 @@ impl Cpu {
         // the *next* call to `step`.
         let load_to_commit = self.pending_load.take();
 
-        self.execute(instr, pc_before, bus)?;
+        self.execute(instr, pc_before, in_delay_slot, bus)?;
 
         if let Some((reg, value)) = load_to_commit {
             self.set_gpr(reg, value);
         }
 
-        self.pc = match branch_after_this {
-            Some(target) => target,
-            None => self.pc.wrapping_add(4),
+        // Exception takes priority: it cancels any pending branch and
+        // redirects PC to the exception vector.
+        self.pc = if let Some(exc_pc) = self.pending_exception_pc.take() {
+            exc_pc
+        } else {
+            match branch_after_this {
+                Some(target) => target,
+                None => self.pc.wrapping_add(4),
+            }
         };
         self.tick += 1;
 
@@ -154,10 +167,20 @@ impl Cpu {
     /// Decode and execute a single instruction. Does not advance PC
     /// (the caller is responsible, to keep branch-delay handling
     /// localised to the branch opcodes that will add it later).
-    fn execute(&mut self, instr: u32, pc: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+    ///
+    /// `in_delay_slot` is `true` when the current instruction sits in
+    /// the delay slot of a taken branch — the SYSCALL/BREAK handlers
+    /// need it to set the BD bit in `CAUSE` correctly.
+    fn execute(
+        &mut self,
+        instr: u32,
+        pc: u32,
+        in_delay_slot: bool,
+        bus: &mut Bus,
+    ) -> Result<(), ExecutionError> {
         let opcode = ((instr >> 26) & 0x3F) as u8;
         match opcode {
-            0x00 => self.dispatch_special(instr, pc),
+            0x00 => self.dispatch_special(instr, pc, in_delay_slot),
             0x01 => self.dispatch_regimm(instr, pc),
             0x02 => self.op_j(instr, pc),
             0x03 => self.op_jal(instr, pc),
@@ -223,7 +246,12 @@ impl Cpu {
 
     /// Dispatch table for primary-opcode `SPECIAL` (0x00), selected by
     /// the 6-bit function field in bits 5..=0.
-    fn dispatch_special(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+    fn dispatch_special(
+        &mut self,
+        instr: u32,
+        pc: u32,
+        in_delay_slot: bool,
+    ) -> Result<(), ExecutionError> {
         let funct = (instr & 0x3F) as u8;
         match funct {
             0x00 => self.op_sll(instr),
@@ -234,6 +262,8 @@ impl Cpu {
             0x07 => self.op_srav(instr),
             0x08 => self.op_jr(instr, pc),
             0x09 => self.op_jalr(instr, pc),
+            0x0C => self.op_syscall(pc, in_delay_slot),
+            0x0D => self.op_break(pc, in_delay_slot),
             0x10 => self.op_mfhi(instr),
             0x11 => self.op_mthi(instr),
             0x12 => self.op_mflo(instr),
@@ -782,6 +812,71 @@ impl Cpu {
     fn cache_isolated(&self) -> bool {
         self.cop0[12] & (1 << 16) != 0
     }
+
+    /// `SYSCALL` — raise a syscall exception (CAUSE.ExcCode = 8). The
+    /// BIOS uses this for every kernel-mode thunk: A/B/C-table calls,
+    /// memcpy, printf, event handling, etc.
+    fn op_syscall(&mut self, pc: u32, in_delay_slot: bool) -> Result<(), ExecutionError> {
+        self.enter_exception(ExceptionCode::Syscall, pc, in_delay_slot);
+        Ok(())
+    }
+
+    /// `BREAK` — raise a breakpoint exception (CAUSE.ExcCode = 9). Not
+    /// hit during normal BIOS boot but cheap to add alongside SYSCALL
+    /// since they share the exception-entry plumbing.
+    fn op_break(&mut self, pc: u32, in_delay_slot: bool) -> Result<(), ExecutionError> {
+        self.enter_exception(ExceptionCode::Break, pc, in_delay_slot);
+        Ok(())
+    }
+
+    /// Shared exception-entry sequence. Mutates COP0 registers and
+    /// stages the exception-vector PC for [`Cpu::step`] to apply.
+    ///
+    /// - **CAUSE**: write `code` into `ExcCode` (bits 6..=2). Set `BD`
+    ///   (bit 31) iff the faulting instruction was in a branch delay
+    ///   slot; in that case `EPC` is backed up to the branch PC so
+    ///   `RFE` can re-execute the branch.
+    /// - **SR**: push the 3-level KU/IE stack — bits `SR[5:0]` become
+    ///   `(SR[3:0] << 2)`, with the new current pair (bits 1..0)
+    ///   entering kernel-mode / interrupts-disabled.
+    /// - **Vector**: `0xBFC0_0180` when `SR.BEV` (bit 22) is set (the
+    ///   post-reset default the BIOS boots in), else `0x8000_0080`.
+    fn enter_exception(&mut self, code: ExceptionCode, pc: u32, in_delay_slot: bool) {
+        let code_bits = (code as u32) & 0x1F;
+
+        let mut cause = self.cop0[13];
+        cause &= !((0x1F << 2) | (1 << 31));
+        cause |= code_bits << 2;
+        if in_delay_slot {
+            cause |= 1 << 31;
+        }
+        self.cop0[13] = cause;
+
+        self.cop0[14] = if in_delay_slot {
+            pc.wrapping_sub(4)
+        } else {
+            pc
+        };
+
+        let sr = self.cop0[12];
+        self.cop0[12] = (sr & !0x3F) | ((sr & 0x0F) << 2);
+
+        let vector = if sr & (1 << 22) != 0 {
+            0xBFC0_0180
+        } else {
+            0x8000_0080
+        };
+        self.pending_exception_pc = Some(vector);
+    }
+}
+
+/// MIPS R3000 exception codes (CAUSE.ExcCode). Only the ones we
+/// actively raise are listed; the rest arrive as they're implemented.
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum ExceptionCode {
+    Syscall = 8,
+    Break = 9,
 }
 
 impl Default for Cpu {
