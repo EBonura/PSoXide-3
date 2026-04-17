@@ -210,6 +210,34 @@ fn main() {
 
     // Disassemble ±4 instructions around the current PC so we can tell
     // at a glance whether we're in a wait loop and what it's waiting on.
+    let gpr_names = [
+        "$0 ", "$at", "$v0", "$v1", "$a0", "$a1", "$a2", "$a3",
+        "$t0", "$t1", "$t2", "$t3", "$t4", "$t5", "$t6", "$t7",
+        "$s0", "$s1", "$s2", "$s3", "$s4", "$s5", "$s6", "$s7",
+        "$t8", "$t9", "$k0", "$k1", "$gp", "$sp", "$fp", "$ra",
+    ];
+    println!("\n=== GPRs ===");
+    for row in 0..4 {
+        let mut line = String::new();
+        for col in 0..8 {
+            let i = row * 8 + col;
+            line.push_str(&format!(" {}={:08x}", gpr_names[i], cpu.gprs()[i]));
+        }
+        println!("{line}");
+    }
+
+    // Probes for the BIOS event-counter wait loop at PC ~0x80059dxx.
+    // The loop waits for *(0x80079D9C) to reach $a1; both should be
+    // visible here so we can tell whether the counter is being
+    // incremented by IRQs.
+    if let Some(counter) = read32(&bus, 0x80079D9C) {
+        println!(
+            "wait counter     = *(0x80079D9C) = 0x{counter:08x} ({counter})  threshold $a1 = 0x{:08x} ({})",
+            cpu.gprs()[5],
+            cpu.gprs()[5]
+        );
+    }
+
     println!("\n=== instructions around PC ===");
     let pc = cpu.pc();
     for i in -4i32..=4 {
@@ -224,7 +252,7 @@ fn main() {
     // + exit in one glance. Hits marked with '•'.
     if let Some(&(hot_pc, _)) = top.first() {
         let hot_min = hot_pc.wrapping_sub(0x40);
-        let hot_max = hot_pc.wrapping_add(0x40);
+        let hot_max = hot_pc.wrapping_add(0x80);
         println!("\n=== ±0x40 around hottest PC {hot_pc:08x} ===");
         let mut a = hot_min;
         while a <= hot_max {
