@@ -62,7 +62,35 @@ pub struct Bus {
     /// (VBlank, timer ticks, DMA completion). Phase 4a just counts;
     /// Phase 4b starts firing IRQs off it.
     cycles: u64,
+    /// Absolute cycle count at which the *next* VBlank should fire.
+    /// Matches PCSX-Redux's counter-3 math: first VBlank at scanline
+    /// 243 of 263 (NTSC) at `HSync * 243 = 2146 * 243 = 521_478`
+    /// cycles, then every `HSync * 263 = 564_398` cycles thereafter.
+    /// Phase 4a tracks this but doesn't fire — Phase 4b hangs the
+    /// VBlank IRQ off reaching this threshold.
+    next_vblank_cycle: u64,
 }
+
+// --- Phase 4 scheduler constants (NTSC) ---
+//
+// Match Redux's `psxcounters.cc` math exactly so VBlank fires at the
+// same cycle — and therefore at the same instruction — on both sides.
+//
+//   HSync period   = psxClockSpeed / (FrameRate × HSyncTotal)
+//                  = 33_868_800 / (60 × 263) = 2146 cycles
+//   VBlank period  = HSyncTotal × HSync     = 263 × 2146 = 564_398 cycles
+//   First VBlank   = VBlankStart × HSync    = 243 × 2146 = 521_478 cycles
+//
+// `VBLANK_PERIOD_CYCLES` is kept for Phase 4b even though it's unused
+// in 4a — silenced with `allow(dead_code)`.
+
+const HSYNC_CYCLES_NTSC: u64 = 2146;
+#[allow(dead_code)]
+const HSYNC_TOTAL_NTSC: u64 = 263;
+const VBLANK_START_SCANLINE: u64 = 243;
+const FIRST_VBLANK_CYCLE: u64 = HSYNC_CYCLES_NTSC * VBLANK_START_SCANLINE;
+#[allow(dead_code)]
+const VBLANK_PERIOD_CYCLES: u64 = HSYNC_CYCLES_NTSC * HSYNC_TOTAL_NTSC;
 
 impl Bus {
     /// Build a bus with the given BIOS image. RAM and scratchpad are
@@ -92,7 +120,14 @@ impl Bus {
             gpu: Gpu::new(),
             spu: Spu::new(),
             cycles: 0,
+            next_vblank_cycle: FIRST_VBLANK_CYCLE,
         })
+    }
+
+    /// Cycle count at which the next VBlank is scheduled to fire.
+    /// Exposed for diagnostics / the HUD.
+    pub fn next_vblank_cycle(&self) -> u64 {
+        self.next_vblank_cycle
     }
 
     /// Advance the cycle counter by `n` cycles. Called once per
