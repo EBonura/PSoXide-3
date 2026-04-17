@@ -457,6 +457,25 @@ impl Bus {
     /// Byte-granular reads of the GPU / timer / DMA / IRQ MMIO don't
     /// try to decompose the typed 32-bit registers — they return the
     /// echo-buffer byte, which is fine for a diagnostic dump.
+    /// Byte write that silently drops addresses outside mapped RAM /
+    /// scratchpad. Used by HLE BIOS helpers (like `memset`) where
+    /// a buggy guest program shouldn't panic the host.
+    pub fn write8_safe(&mut self, virt: u32, value: u8) -> bool {
+        let phys = to_physical(virt);
+        if phys < memory::ram::MIRROR_END {
+            self.ram[(phys as usize) % memory::ram::SIZE] = value;
+            true
+        } else if (memory::scratchpad::BASE
+            ..memory::scratchpad::BASE + memory::scratchpad::SIZE as u32)
+            .contains(&phys)
+        {
+            self.scratchpad[(phys - memory::scratchpad::BASE) as usize] = value;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn try_read8(&self, virt: u32) -> Option<u8> {
         let phys = to_physical(virt);
         if phys < memory::ram::MIRROR_END {
