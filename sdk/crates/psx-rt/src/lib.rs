@@ -19,7 +19,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-#![feature(asm_experimental_arch)]
+// Required for MIPS `global_asm!` blocks (BIOS trampolines). Suppress
+// the "feature is declared but not used" warning that shows on the
+// host target where only the panic handler + heap are live.
+#![cfg_attr(target_arch = "mips", feature(asm_experimental_arch))]
 
 pub mod bios;
 pub mod tty;
