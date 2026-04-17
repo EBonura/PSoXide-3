@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 emulator-core = { workspace = true }
+psx-iso       = { workspace = true }
 psx-trace     = { workspace = true }
 
 winit      = { workspace = true }
