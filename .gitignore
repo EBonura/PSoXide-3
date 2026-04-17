@@ -1,3 +1,4 @@
+.claude/
 /target
 **/target
 Cargo.lock.orig
