@@ -690,6 +690,16 @@ impl Bus {
             self.scratchpad[(phys - memory::scratchpad::BASE) as usize] = value;
             return;
         }
+        // CDROM is byte-addressed (4 registers, each switching meaning by
+        // index). Without this dispatch the BIOS's `sb` to 1F801800..1803
+        // ends up in the io[] echo buffer and the CDROM module never sees
+        // the index switch / param push / command write — so commands are
+        // silently dropped, no IRQ ever fires, and the BIOS stalls in the
+        // event-wait loop after the Sony intro.
+        if CdRom::contains(phys) {
+            self.cdrom.write8(phys, value);
+            return;
+        }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             self.io[(phys - memory::io::BASE) as usize] = value;
             return;
