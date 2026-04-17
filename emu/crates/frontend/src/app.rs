@@ -7,6 +7,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use emulator_core::{Bus, Cpu};
+use psx_iso::{Disc, SECTOR_BYTES};
 use psx_trace::InstructionRecord;
 
 use crate::ui;
@@ -113,19 +114,58 @@ fn load_bus() -> Option<Bus> {
     let path = std::env::var("PSOXIDE_BIOS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_BIOS));
-    match std::fs::read(&path) {
+    let mut bus = match std::fs::read(&path) {
         Ok(bytes) => match Bus::new(bytes) {
-            Ok(bus) => Some(bus),
+            Ok(bus) => bus,
             Err(e) => {
                 eprintln!("[frontend] BIOS at {} rejected: {e}", path.display());
-                None
+                return None;
             }
         },
         Err(e) => {
             eprintln!("[frontend] no BIOS at {}: {e}", path.display());
-            None
+            return None;
         }
+    };
+
+    // Optional disc. Absence is not an error — BIOS boots fine without
+    // one and just sits on the "insert disc" screen. Presence wires the
+    // bytes into the CD-ROM controller's tray so `CdlGetID` / `CdlReadN`
+    // return real data once the BIOS/game asks.
+    if let Some(disc) = load_disc() {
+        bus.cdrom.insert_disc(Some(disc));
     }
+
+    Some(bus)
+}
+
+/// Read `PSOXIDE_DISC` → BIN file → `Disc`. Logs and returns `None` on
+/// any trouble so a misconfigured path doesn't wedge the frontend.
+fn load_disc() -> Option<Disc> {
+    let var = std::env::var("PSOXIDE_DISC").ok()?;
+    let path = PathBuf::from(&var);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[frontend] PSOXIDE_DISC={} unreadable: {e}", path.display());
+            return None;
+        }
+    };
+    if bytes.len() < SECTOR_BYTES {
+        eprintln!(
+            "[frontend] PSOXIDE_DISC={} too small ({} bytes, need at least {SECTOR_BYTES})",
+            path.display(),
+            bytes.len()
+        );
+        return None;
+    }
+    let disc = Disc::from_bin(bytes);
+    eprintln!(
+        "[frontend] mounted disc {} ({} sectors)",
+        path.display(),
+        disc.sector_count()
+    );
+    Some(disc)
 }
 
 /// Build all panels/overlays for one frame. Called from `gfx::Graphics::render`
