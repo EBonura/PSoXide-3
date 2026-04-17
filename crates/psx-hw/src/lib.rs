@@ -18,14 +18,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-pub mod memory;
-pub mod interrupt;
+pub mod bios;
+pub mod cdrom;
+pub mod dma;
 pub mod gpu;
 pub mod gte;
-pub mod spu;
-pub mod cdrom;
+pub mod interrupt;
 pub mod mdec;
-pub mod dma;
-pub mod timer;
+pub mod memory;
 pub mod sio;
-pub mod bios;
+pub mod spu;
+pub mod timer;

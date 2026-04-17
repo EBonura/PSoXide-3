@@ -105,7 +105,11 @@ impl GpuStat {
     /// Texture page Y base in pixels (0 or 256).
     #[inline]
     pub const fn texpage_y(self) -> u16 {
-        if self.contains(Self::TEXPAGE_Y) { 256 } else { 0 }
+        if self.contains(Self::TEXPAGE_Y) {
+            256
+        } else {
+            0
+        }
     }
 
     /// Horizontal resolution in pixels (256, 320, 368, 512, 640).
@@ -127,7 +131,11 @@ impl GpuStat {
     /// Vertical resolution in pixels (240 or 480).
     #[inline]
     pub const fn vertical_resolution(self) -> u16 {
-        if self.contains(Self::VRES) { 480 } else { 240 }
+        if self.contains(Self::VRES) {
+            480
+        } else {
+            240
+        }
     }
 
     /// DMA direction as a decoded enum.

@@ -31,7 +31,13 @@ fn bios_path() -> PathBuf {
 /// emulator doesn't yet decode. The caller can then compare the partial
 /// trace against Redux's full trace to see exactly which opcode we
 /// need to implement next.
-fn our_trace(bios: Vec<u8>, n: usize) -> (Vec<InstructionRecord>, Option<emulator_core::ExecutionError>) {
+fn our_trace(
+    bios: Vec<u8>,
+    n: usize,
+) -> (
+    Vec<InstructionRecord>,
+    Option<emulator_core::ExecutionError>,
+) {
     let mut bus = Bus::new(bios).expect("BIOS size");
     let mut cpu = Cpu::new();
     let mut records = Vec::with_capacity(n);
@@ -89,10 +95,14 @@ fn first_divergence(
             for r in (0..32).step_by(4) {
                 lines.push(format!(
                     "    $r{:02}={:08x}  $r{:02}={:08x}  $r{:02}={:08x}  $r{:02}={:08x}",
-                    r, prev.gprs[r],
-                    r + 1, prev.gprs[r + 1],
-                    r + 2, prev.gprs[r + 2],
-                    r + 3, prev.gprs[r + 3],
+                    r,
+                    prev.gprs[r],
+                    r + 1,
+                    prev.gprs[r + 1],
+                    r + 2,
+                    prev.gprs[r + 2],
+                    r + 3,
+                    prev.gprs[r + 3],
                 ));
             }
         }
@@ -241,4 +251,3 @@ fn first_two_point_seven_million_steps_match_redux() {
 fn probe_next_divergence_after_spu() {
     assert_parity_for_steps(50_000_000);
 }
-

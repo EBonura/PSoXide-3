@@ -19,20 +19,14 @@ use crate::theme;
 
 /// Canonical MIPS GPR names, indexed 0..=31.
 const GPR_NAMES: [&str; 32] = [
-    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
-    "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
-    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-    "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+    "t7", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp",
+    "ra",
 ];
 
 /// COP0 register indices we display. These are the ones the emulator
 /// actually reads or writes today; others stay zeroed until needed.
-const COP0_LABELS: &[(usize, &str)] = &[
-    (12, "SR"),
-    (13, "Cause"),
-    (14, "EPC"),
-    (8, "BadVAddr"),
-];
+const COP0_LABELS: &[(usize, &str)] = &[(12, "SR"), (13, "Cause"), (14, "EPC"), (8, "BadVAddr")];
 
 /// R3000 exception codes, by their numeric value in `CAUSE.ExcCode`.
 const EXC_CODES: &[(u32, &str)] = &[
@@ -108,7 +102,11 @@ fn draw_gprs(ui: &mut egui::Ui, cpu: &Cpu, snapshot: &mut Option<[u32; 32]>) {
     let gprs = cpu.gprs();
 
     ui.horizontal(|ui| {
-        if ui.button("Snapshot").on_hover_text("Freeze current GPR values").clicked() {
+        if ui
+            .button("Snapshot")
+            .on_hover_text("Freeze current GPR values")
+            .clicked()
+        {
             *snapshot = Some(*gprs);
         }
         if snapshot.is_some() && ui.button("Clear").clicked() {
@@ -187,8 +185,11 @@ fn format_sr_bits(sr: u32) -> String {
     // when set; the KU/IE stack shows as three comma-joined pairs.
     let mut flags: Vec<&str> = Vec::new();
     for (bit, name) in [
-        (16, "IsC"), (17, "SwC"), (22, "BEV"),
-        (28, "CU0"), (30, "CU2"),
+        (16, "IsC"),
+        (17, "SwC"),
+        (22, "BEV"),
+        (28, "CU0"),
+        (30, "CU2"),
     ] {
         if sr & (1 << bit) != 0 {
             flags.push(name);

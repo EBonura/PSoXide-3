@@ -15,12 +15,7 @@ pub mod xmb;
 use crate::app::AppState;
 
 /// Paint every panel for this frame, in layering order.
-pub fn draw_layout(
-    ctx: &egui::Context,
-    state: &mut AppState,
-    vram_tex: egui::TextureId,
-    dt: f32,
-) {
+pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::TextureId, dt: f32) {
     state.hud.update(dt, state.cpu.tick());
 
     if state.panels.registers {

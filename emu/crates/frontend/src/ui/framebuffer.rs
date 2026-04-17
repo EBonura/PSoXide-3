@@ -24,15 +24,13 @@ const DEFAULT_FB_HEIGHT: f32 = 240.0;
 pub fn draw(ui: &mut egui::Ui, vram_tex: egui::TextureId, bus: Option<&Bus>) {
     // Pull the GPU's configured display area when a Bus is live;
     // otherwise fall back to the canonical 320×240 @ (0, 0) layout.
-    let area = bus
-        .map(|b| b.gpu.display_area())
-        .unwrap_or(DisplayArea {
-            x: 0,
-            y: 0,
-            width: DEFAULT_FB_WIDTH as u16,
-            height: DEFAULT_FB_HEIGHT as u16,
-            bpp24: false,
-        });
+    let area = bus.map(|b| b.gpu.display_area()).unwrap_or(DisplayArea {
+        x: 0,
+        y: 0,
+        width: DEFAULT_FB_WIDTH as u16,
+        height: DEFAULT_FB_HEIGHT as u16,
+        bpp24: false,
+    });
 
     let title = format!(
         "Framebuffer ({}×{} at {},{}){}",

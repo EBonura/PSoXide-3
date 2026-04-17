@@ -9,7 +9,9 @@ use thiserror::Error;
 pub enum OracleError {
     /// The Redux binary could not be found at the configured or fallback
     /// paths.
-    #[error("Redux binary not found (tried {tried:?}). Set PSOXIDE_REDUX_BIN or build pcsx-redux.")]
+    #[error(
+        "Redux binary not found (tried {tried:?}). Set PSOXIDE_REDUX_BIN or build pcsx-redux."
+    )]
     BinaryNotFound {
         /// The list of paths that were searched, in order.
         tried: Vec<PathBuf>,
