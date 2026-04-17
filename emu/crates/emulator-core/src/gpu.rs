@@ -36,6 +36,40 @@ pub struct Gpu {
     /// for `examples/smoke_draw` and the frontend HUD, tells us whether
     /// software has actually started shipping commands.
     gp0_write_count: u64,
+    /// X offset (signed 11-bit) added to every primitive vertex —
+    /// set by GP0 0xE5. Usually zero on BIOS boot, non-zero once the
+    /// kernel sets up a display-list origin.
+    draw_offset_x: i32,
+    /// Y offset (signed 11-bit) added to every primitive vertex.
+    draw_offset_y: i32,
+    /// Drawing area clipping rectangle. All primitive pixels outside
+    /// `[left..=right] × [top..=bottom]` are discarded. Set by
+    /// GP0 0xE3 (top-left) and 0xE4 (bottom-right).
+    draw_area_left: u16,
+    draw_area_top: u16,
+    draw_area_right: u16,
+    draw_area_bottom: u16,
+    /// Active CPU→VRAM transfer state. `Some` when GP0 0xA0 has set
+    /// up a destination rect and is now expecting pixel-data words.
+    vram_upload: Option<VramTransfer>,
+}
+
+/// In-flight CPU→VRAM transfer state — 2 pixels per incoming GP0 word,
+/// written in row-major order across the destination rect. Completes
+/// when `remaining == 0`, and then the GPU goes back to accepting
+/// command packets on GP0.
+#[derive(Clone, Copy)]
+struct VramTransfer {
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    /// Row of the next pixel to write (0 = top of the rect).
+    row: u16,
+    /// Column of the next pixel to write (0 = left of the rect).
+    col: u16,
+    /// Words still expected (= ceil(w*h / 2)).
+    remaining: u32,
 }
 
 impl Gpu {
@@ -48,6 +82,13 @@ impl Gpu {
             gp0_fifo: Vec::with_capacity(12),
             gp0_expected: 0,
             gp0_write_count: 0,
+            draw_offset_x: 0,
+            draw_offset_y: 0,
+            draw_area_left: 0,
+            draw_area_top: 0,
+            draw_area_right: VRAM_WIDTH as u16 - 1,
+            draw_area_bottom: VRAM_HEIGHT as u16 - 1,
+            vram_upload: None,
         }
     }
 
@@ -94,6 +135,14 @@ impl Gpu {
     /// completes a packet, the packet is executed and the FIFO clears.
     fn gp0_write(&mut self, word: u32) {
         self.gp0_write_count += 1;
+
+        // CPU→VRAM transfer consumes pixel words ahead of the packet
+        // assembler — it's a mode, not a packet.
+        if self.vram_upload.is_some() {
+            self.ingest_vram_upload_word(word);
+            return;
+        }
+
         if self.gp0_expected == 0 {
             let op = (word >> 24) & 0xFF;
             self.gp0_expected = gp0_packet_size(op as u8);
@@ -112,15 +161,32 @@ impl Gpu {
         }
     }
 
-    /// Execute a command whose packet size is exactly 1. Most draw-
-    /// mode setters (GP0 0xE1..=0xE6) live here; for now we accept
-    /// them without affecting state beyond the GPU-internal flags
-    /// a full implementation would track.
-    fn execute_gp0_single(&mut self, _word: u32) {
-        // Draw-mode / texture-window / drawing-area / mask-bit setters
-        // all fit here. We don't rasterize yet, so they don't do
-        // anything observable. Tracking them lands with the primitive
-        // rasterizer.
+    /// Execute a command whose packet size is exactly 1. Draw-mode
+    /// setters (GP0 0xE1..=0xE6) live here; we track drawing-area
+    /// and drawing-offset because the rasterizer needs them.
+    fn execute_gp0_single(&mut self, word: u32) {
+        let op = (word >> 24) & 0xFF;
+        match op {
+            // GP0 0xE3 — drawing area top-left. X bits 9:0, Y bits 18:10.
+            0xE3 => {
+                self.draw_area_left = (word & 0x3FF) as u16;
+                self.draw_area_top = ((word >> 10) & 0x1FF) as u16;
+            }
+            // GP0 0xE4 — drawing area bottom-right.
+            0xE4 => {
+                self.draw_area_right = (word & 0x3FF) as u16;
+                self.draw_area_bottom = ((word >> 10) & 0x1FF) as u16;
+            }
+            // GP0 0xE5 — drawing offset. X / Y are both signed 11-bit.
+            0xE5 => {
+                self.draw_offset_x = sign_extend_11((word & 0x7FF) as i32);
+                self.draw_offset_y = sign_extend_11(((word >> 11) & 0x7FF) as i32);
+            }
+            // 0xE1 (draw mode), 0xE2 (texture window), 0xE6 (mask bit):
+            // we don't rasterize with textures / mask-bit logic yet, so
+            // these settings land when those paths come online.
+            _ => {}
+        }
     }
 
     /// Execute a multi-word packet that has just been fully assembled
@@ -128,13 +194,215 @@ impl Gpu {
     fn execute_gp0_packet(&mut self) {
         let op = (self.gp0_fifo[0] >> 24) & 0xFF;
         match op {
+            // Monochrome fill rect (ignores draw area / offset).
             0x02 => self.fill_rect(),
-            _ => {
-                // Polygons, lines, rects, VRAM transfers — scaffolding
-                // for all of them lands as we implement each one. For
-                // now, unknown multi-word commands are silently dropped
-                // so the BIOS can finish shipping its command stream.
+            // Monochrome triangle / quad. Bit 3 distinguishes 3-vs-4
+            // vertices; bit 1 is opaque-vs-semi-transparent (we treat
+            // both as opaque for now).
+            0x20..=0x23 => self.draw_monochrome_tri(),
+            0x28..=0x2B => self.draw_monochrome_quad(),
+            // Monochrome rectangles — bit 3 set selects variable size
+            // (followed by a W/H word), else 1×1/8×8/16×16 by bits 5:4.
+            0x60..=0x63 => self.draw_monochrome_rect_variable(),
+            0x68..=0x6B => self.draw_monochrome_rect_sized(1, 1),
+            0x70..=0x73 => self.draw_monochrome_rect_sized(8, 8),
+            0x78..=0x7B => self.draw_monochrome_rect_sized(16, 16),
+            // CPU→VRAM transfer — 3 words of setup, then `w*h/2`
+            // words of pixel data follow as a separate mode.
+            0xA0 => self.begin_vram_upload(),
+            // VRAM→VRAM copy / VRAM→CPU download / textured + shaded
+            // primitives — scaffolded but not rasterized yet.
+            _ => {}
+        }
+    }
+
+    // --- Primitive rasterization ---
+
+    /// Parse a polygon vertex word: low 16 bits X, next 16 bits Y,
+    /// both signed 11-bit. The drawing-offset is added here so callers
+    /// get screen-space coordinates ready to rasterize.
+    fn decode_vertex(&self, word: u32) -> (i32, i32) {
+        let x = sign_extend_11((word & 0x7FF) as i32) + self.draw_offset_x;
+        let y = sign_extend_11(((word >> 16) & 0x7FF) as i32) + self.draw_offset_y;
+        (x, y)
+    }
+
+    /// GP0 0x20..=0x23 — monochrome 3-vertex triangle.
+    /// Words: `[cmd+color, v0, v1, v2]`.
+    fn draw_monochrome_tri(&mut self) {
+        let color = rgb24_to_bgr15(self.gp0_fifo[0] & 0x00FF_FFFF);
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let v1 = self.decode_vertex(self.gp0_fifo[2]);
+        let v2 = self.decode_vertex(self.gp0_fifo[3]);
+        self.rasterize_triangle(v0, v1, v2, color);
+    }
+
+    /// GP0 0x28..=0x2B — monochrome 4-vertex quad, split into two
+    /// triangles `(v0, v1, v2)` + `(v1, v2, v3)`.
+    fn draw_monochrome_quad(&mut self) {
+        let color = rgb24_to_bgr15(self.gp0_fifo[0] & 0x00FF_FFFF);
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let v1 = self.decode_vertex(self.gp0_fifo[2]);
+        let v2 = self.decode_vertex(self.gp0_fifo[3]);
+        let v3 = self.decode_vertex(self.gp0_fifo[4]);
+        self.rasterize_triangle(v0, v1, v2, color);
+        self.rasterize_triangle(v1, v2, v3, color);
+    }
+
+    /// GP0 0x60..=0x63 — monochrome variable-size rectangle.
+    /// Words: `[cmd+color, xy, wh]`.
+    fn draw_monochrome_rect_variable(&mut self) {
+        let color = rgb24_to_bgr15(self.gp0_fifo[0] & 0x00FF_FFFF);
+        let pos = self.gp0_fifo[1];
+        let size = self.gp0_fifo[2];
+        let x = sign_extend_11((pos & 0x7FF) as i32) + self.draw_offset_x;
+        let y = sign_extend_11(((pos >> 16) & 0x7FF) as i32) + self.draw_offset_y;
+        let w = (size & 0xFFFF) as i32;
+        let h = ((size >> 16) & 0xFFFF) as i32;
+        self.paint_rect(x, y, w, h, color);
+    }
+
+    /// GP0 0x68/0x70/0x78 — fixed-size monochrome rectangles.
+    fn draw_monochrome_rect_sized(&mut self, w: i32, h: i32) {
+        let color = rgb24_to_bgr15(self.gp0_fifo[0] & 0x00FF_FFFF);
+        let pos = self.gp0_fifo[1];
+        let x = sign_extend_11((pos & 0x7FF) as i32) + self.draw_offset_x;
+        let y = sign_extend_11(((pos >> 16) & 0x7FF) as i32) + self.draw_offset_y;
+        self.paint_rect(x, y, w, h, color);
+    }
+
+    /// Plot a rectangle of `color` in screen-space, clipped to the
+    /// GPU's drawing area.
+    fn paint_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let left = x.max(self.draw_area_left as i32);
+        let top = y.max(self.draw_area_top as i32);
+        let right = (x + w - 1).min(self.draw_area_right as i32);
+        let bottom = (y + h - 1).min(self.draw_area_bottom as i32);
+        if left > right || top > bottom {
+            return;
+        }
+        for py in top..=bottom {
+            for px in left..=right {
+                self.vram.set_pixel(px as u16, py as u16, color);
             }
+        }
+    }
+
+    /// Scanline-ish triangle rasterizer using the edge-function test.
+    /// For each pixel in the bounding box we evaluate three edge
+    /// equations; a pixel is inside iff all three have the same sign.
+    /// Works regardless of triangle winding. Clipped to both VRAM
+    /// bounds and the active drawing area.
+    fn rasterize_triangle(&mut self, v0: (i32, i32), v1: (i32, i32), v2: (i32, i32), color: u16) {
+        let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
+        let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
+        let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
+        let max_y = v0.1.max(v1.1).max(v2.1).min(self.draw_area_bottom as i32);
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+
+        // Precompute fixed area; we just need its sign to normalize.
+        let area = edge(v0, v1, v2);
+        if area == 0 {
+            return; // degenerate
+        }
+        let area_sign = area.signum();
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let p = (x, y);
+                let w0 = edge(v1, v2, p) * area_sign;
+                let w1 = edge(v2, v0, p) * area_sign;
+                let w2 = edge(v0, v1, p) * area_sign;
+                if (w0 | w1 | w2) >= 0 {
+                    self.vram.set_pixel(x as u16, y as u16, color);
+                }
+            }
+        }
+    }
+
+    // --- CPU→VRAM transfer (GP0 0xA0) ---
+
+    /// GP0 0xA0 — start a CPU-to-VRAM transfer. `[cmd, xy, wh]` is
+    /// followed (in subsequent GP0 writes) by `ceil(w*h / 2)` words
+    /// of 16bpp pixel data, 2 pixels per word. Transfer state lives
+    /// in [`Gpu::vram_upload`] until every pixel has been ingested.
+    fn begin_vram_upload(&mut self) {
+        let xy = self.gp0_fifo[1];
+        let wh = self.gp0_fifo[2];
+        let x = (xy & 0x3FF) as u16;
+        let y = ((xy >> 16) & 0x1FF) as u16;
+        // Hardware uses a wrap-around convention: width/height of 0
+        // means 1024 / 512 respectively. Matches Redux.
+        let w = {
+            let raw = (wh & 0x3FF) as u16;
+            if raw == 0 {
+                1024
+            } else {
+                raw
+            }
+        };
+        let h = {
+            let raw = ((wh >> 16) & 0x1FF) as u16;
+            if raw == 0 {
+                512
+            } else {
+                raw
+            }
+        };
+        let pixels = w as u32 * h as u32;
+        // Two 16bpp pixels per 32-bit word, round up.
+        let remaining = pixels.div_ceil(2);
+        self.vram_upload = Some(VramTransfer {
+            x,
+            y,
+            w,
+            h,
+            row: 0,
+            col: 0,
+            remaining,
+        });
+    }
+
+    /// Consume one word of pixel data for the active CPU→VRAM
+    /// transfer. When `remaining` hits zero, the transfer closes and
+    /// the next GP0 write is interpreted as a new command.
+    fn ingest_vram_upload_word(&mut self, word: u32) {
+        let done = {
+            let Some(t) = self.vram_upload.as_mut() else {
+                return;
+            };
+            let pix_a = word as u16;
+            let pix_b = (word >> 16) as u16;
+            Self::write_upload_pixel(t, pix_a, &mut self.vram);
+            Self::write_upload_pixel(t, pix_b, &mut self.vram);
+            t.remaining = t.remaining.saturating_sub(1);
+            t.remaining == 0
+        };
+        if done {
+            self.vram_upload = None;
+        }
+    }
+
+    /// Place the next pixel in an active upload. Advances `col`; at
+    /// the right edge wraps to the next `row`. Pixels past the final
+    /// row are silently dropped (VRAM wrap on the destination only
+    /// applies to coordinates, not to an over-long upload payload).
+    fn write_upload_pixel(t: &mut VramTransfer, pixel: u16, vram: &mut Vram) {
+        if t.row >= t.h {
+            return;
+        }
+        let px = t.x.wrapping_add(t.col);
+        let py = t.y.wrapping_add(t.row);
+        vram.set_pixel(px, py, pixel);
+        t.col += 1;
+        if t.col >= t.w {
+            t.col = 0;
+            t.row += 1;
         }
     }
 
@@ -176,22 +444,70 @@ impl Gpu {
 }
 
 /// Expected total word count for a GP0 command starting with opcode `op`.
-/// `0` means the opcode is unknown / unimplemented — treated as no-op.
+///
+/// For commands we don't decode yet (textured / shaded primitives,
+/// VRAM-to-VRAM blits, VRAM-to-CPU transfers), returning `1` means
+/// we consume just the first word and drop subsequent data on the
+/// floor. That's usually harmless because nothing reads VRAM from
+/// those paths yet — when we add them, the packet size here grows
+/// to match.
 fn gp0_packet_size(op: u8) -> usize {
     match op {
-        // NOP / clear cache / flip misc — single word, no data.
+        // NOP / clear cache / misc — single word.
         0x00 | 0x01 | 0x03..=0x1E => 1,
         // Quick fill — RGB + (X,Y) + (W,H) = 3 words.
         0x02 => 3,
+        // Monochrome flat triangle: color + 3 vertices = 4 words.
+        0x20..=0x23 => 4,
+        // Shaded flat triangle: 3 × (color+vertex) = 6 words.
+        0x30..=0x33 => 6,
+        // Monochrome flat quad: color + 4 vertices = 5 words.
+        0x28..=0x2B => 5,
+        // Shaded flat quad: 4 × (color+vertex) = 8 words.
+        0x38..=0x3B => 8,
+        // Textured primitives (flat + textured): 3-vert = 7, 4-vert = 9.
+        0x24..=0x27 => 7,
+        0x2C..=0x2F => 9,
+        // Textured + shaded: 3-vert = 9, 4-vert = 12.
+        0x34..=0x37 => 9,
+        0x3C..=0x3F => 12,
+        // Lines: 3 words (color + 2 vertices) for monochrome,
+        // 4 words for shaded.
+        0x40..=0x43 => 3,
+        0x50..=0x53 => 4,
+        // Monochrome rectangles: variable (3), 1×1 (2), 8×8 (2), 16×16 (2).
+        0x60..=0x63 => 3,
+        0x64..=0x67 => 4, // variable + textured
+        0x68..=0x6B => 2,
+        0x6C..=0x6F => 3, // 1×1 textured
+        0x70..=0x73 => 2,
+        0x74..=0x77 => 3, // 8×8 textured
+        0x78..=0x7B => 2,
+        0x7C..=0x7F => 3, // 16×16 textured
+        // VRAM-to-VRAM copy: opcode + src + dst + size = 4 words.
+        0x80..=0x9F => 4,
+        // CPU-to-VRAM transfer: opcode + xy + wh = 3 words, then
+        // pixel data is consumed in a separate "upload mode".
+        0xA0..=0xBF => 3,
+        // VRAM-to-CPU: same 3-word header.
+        0xC0..=0xDF => 3,
         // Draw-mode settings (E1..=E6) — single word each.
         0xE1..=0xE6 => 1,
-        // Everything else (polygons, lines, rects, transfers): we
-        // don't know the size without full decoding, so treat as 1
-        // word. That drops data on the floor for multi-word commands
-        // we haven't taught the decoder yet — fine for now since no
-        // one consumes VRAM from those paths.
         _ => 1,
     }
+}
+
+/// Triangle edge function: signed doubled area of △(a, b, c). Positive
+/// when the winding is counter-clockwise. Used by `rasterize_triangle`
+/// for per-pixel inside/outside tests.
+fn edge(a: (i32, i32), b: (i32, i32), c: (i32, i32)) -> i32 {
+    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+}
+
+/// Sign-extend an 11-bit integer (PS1 vertex coords + drawing offset
+/// are 11-bit signed).
+fn sign_extend_11(v: i32) -> i32 {
+    if v & 0x400 != 0 { v | !0x7FF } else { v & 0x7FF }
 }
 
 /// Convert a 24-bit RGB value (as written by the CPU in GP0 packets)
