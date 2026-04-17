@@ -15,8 +15,11 @@
 #![warn(missing_docs)]
 
 pub mod framebuf;
+pub mod ot;
+pub mod prim;
 
 use psx_hw::gpu::{GpuStat, gp0, gp1, pack_color, pack_vertex, pack_xy};
+use psx_io::dma::{self, Channel};
 use psx_io::gpu::{gpustat, wait_cmd_ready, write_gp0, write_gp1};
 use psx_io::timers;
 
@@ -160,4 +163,29 @@ pub fn draw_quad_flat(verts: [(i16, i16); 4], r: u8, g: u8, b: u8) {
     write_gp0(pack_vertex(verts[1].0, verts[1].1));
     write_gp0(pack_vertex(verts[2].0, verts[2].1));
     write_gp0(pack_vertex(verts[3].0, verts[3].1));
+}
+
+/// Submit a linked-list chain starting at `head` to GPU GP0 via
+/// DMA channel 2 in linked-list mode. Blocks until the walker hits
+/// the `0x00FFFFFF` terminator.
+///
+/// `head` must point at a 4-byte-aligned RAM address; the DMA
+/// controller clocks bits 23..=0 of the 32-bit tag as the next-
+/// node address and bits 31..=24 as that packet's data-word count.
+pub fn submit_linked_list(head: *const u32) {
+    draw_sync();
+    // Make sure the GPU's DMA direction is CPU→GP0 before we kick
+    // off the walker. `gpu::init` sets this, but games occasionally
+    // re-route DMA for VRAM readback and forget to reset it.
+    write_gp1(gp1::dma_direction(2));
+    dma::enable_channel(Channel::Gpu);
+    dma::set_madr(Channel::Gpu, head as u32);
+    // BCR is ignored in linked-list mode but must be written to
+    // some value on real hardware; zero is conventional.
+    dma::set_bcr_manual(Channel::Gpu, 0);
+    dma::set_chcr(
+        Channel::Gpu,
+        dma::CHCR_TO_DEVICE | dma::CHCR_SYNC_LINKED | dma::CHCR_START,
+    );
+    while dma::is_busy(Channel::Gpu) {}
 }

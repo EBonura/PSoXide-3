@@ -1,0 +1,19 @@
+[package]
+name    = "hello-ot"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "hello-ot"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[dependencies]
+psx-gpu = { path = "../../crates/psx-gpu" }
+psx-rt  = { path = "../../crates/psx-rt" }
