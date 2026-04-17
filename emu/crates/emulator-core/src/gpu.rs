@@ -213,7 +213,7 @@ impl Gpu {
     pub fn read32(&mut self, phys: u32) -> Option<u32> {
         match phys {
             GP0_ADDR => Some(self.read_gpuread()),
-            GP1_ADDR => Some(self.status.read()),
+            GP1_ADDR => Some(self.status.read(self.vram_download.is_some())),
             _ => None,
         }
     }
@@ -1162,19 +1162,38 @@ struct GpuStatus {
 
 impl GpuStatus {
     fn new() -> Self {
-        // Reset: display disabled (bit 23), DMA direction 0,
-        // interlace odd field, ready bits cleared (filled in on read).
-        Self { raw: 0x1480_2000 }
+        // Reset defaults matching Redux:
+        //   bit 23 (DISPLAY_DISABLE) = 1
+        //   bit 21 = 1 (reserved, Redux sets on reset)
+        //   bit 13 (INTERLACE_FIELD) = 1
+        //   bit 31 (DRAWING_ODD) = 1 (odd field is the "ready" default
+        //           at power-on; matches Redux's post-reset GPUSTAT).
+        // Ready bits 26/28 are filled in by `read`; VRAM-ready (27) is
+        // gated on an active VRAM→CPU transfer.
+        Self {
+            raw: 0x9480_2000,
+        }
     }
 
-    fn read(&self) -> u32 {
+    /// Compose the observable GPUSTAT word. `vram_send_ready` is the
+    /// live "is a VRAM→CPU transfer in progress and has pixels
+    /// waiting" flag owned by the GPU proper — we pass it in so the
+    /// status register doesn't duplicate state that lives elsewhere.
+    fn read(&self, vram_send_ready: bool) -> u32 {
         let mut ret = self.raw;
 
-        // Always-ready: bits 26 (cmd FIFO ready), 27 (VRAM→CPU ready),
-        // 28 (DMA block ready). Always on for a soft GPU.
-        ret |= 0x1C00_0000;
+        // Always-ready: bits 26 (cmd FIFO ready) + 28 (DMA block ready).
+        // Bit 27 (VRAM→CPU ready) is only set while software is
+        // actually pulling pixels from a GPUREAD; Redux's default is 0
+        // and the BIOS polls this bit to detect transfer completion.
+        ret |= 0x1400_0000;
+        if vram_send_ready {
+            ret |= 0x0800_0000;
+        } else {
+            ret &= !0x0800_0000;
+        }
 
-        // Bit 25 (DMA data request) is derived from direction (bits 29:30).
+        // Bit 25 (DMA data request) derives from direction (bits 29:30).
         //   Direction 0 (Off):       bit 25 = 0
         //   Direction 1 (FIFO):      bit 25 = 1
         //   Direction 2 (CPU→GPU):   bit 25 = copy of bit 28
@@ -1246,8 +1265,22 @@ mod tests {
     fn read_status_has_always_ready_bits() {
         let mut gpu = Gpu::new();
         let stat = gpu.read32(GP1_ADDR).unwrap();
-        // Bits 26, 27, 28 are the "ready" bits we force on every read.
-        assert_eq!(stat & 0x1C00_0000, 0x1C00_0000);
+        // Bits 26 (cmd ready) + 28 (DMA block ready) are always set.
+        // Bit 27 (VRAM→CPU ready) is gated on an active transfer;
+        // we don't have one here, so it's clear.
+        assert_eq!(stat & 0x1400_0000, 0x1400_0000);
+        assert_eq!(stat & 0x0800_0000, 0, "VRAM-send ready clear when idle");
+    }
+
+    #[test]
+    fn read_status_sets_vram_send_ready_during_download() {
+        let mut gpu = Gpu::new();
+        // Start a VRAM→CPU download via GP0 0xC0.
+        gpu.write32(GP0_ADDR, 0xC000_0000); // header
+        gpu.write32(GP0_ADDR, 0); // xy
+        gpu.write32(GP0_ADDR, 0x0001_0001); // 1x1 size
+        let stat = gpu.read32(GP1_ADDR).unwrap();
+        assert_eq!(stat & 0x0800_0000, 0x0800_0000, "bit 27 set during transfer");
     }
 
     #[test]
