@@ -1,22 +1,39 @@
 # PSoXide-3 development commands.
 #
-# The repo has two Cargo workspaces: root (shared no_std crates) and emu/
-# (host-side emulator). Every target fans out to both.
+# Three Cargo workspaces:
+#   root - no_std shared crates (psx-hw, psx-iso, psx-trace)
+#   emu  - host-side emulator (emulator-core, frontend, parity-oracle)
+#   sdk  - MIPS target SDK (psx-io, psx-rt, psx-gpu, psx-pad, psx-sdk)
+#
+# SDK examples live under sdk/examples/ and are compiled individually
+# with cargo build in their own directory so they can use their own
+# .cargo/config.toml for the mipsel-sony-psx target.
 
-.PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke parity run
+.PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke parity run \
+        examples hello-tri hello-input hello-ot run-tri run-input run-ot
 
 help:
 	@echo "PSoXide-3 targets:"
-	@echo "  make check        - cargo check on root + emu workspaces"
-	@echo "  make test         - fast unit tests (both workspaces, excludes canaries)"
-	@echo "  make canaries     - run commercial-game canary tests (Milestones D-K)"
-	@echo "  make fmt          - format all code in both workspaces"
-	@echo "  make lint         - clippy -D warnings on both workspaces"
-	@echo "  make clean        - cargo clean in both workspaces"
-	@echo "  make run          - launch the desktop frontend"
-	@echo "  make fetch-opcode - smoke: print first BIOS opcode (needs BIOS=<path>)"
-	@echo "  make oracle-smoke - smoke: launch headless Redux and verify Lua runs"
-	@echo "  make parity       - step both emulators and assert bit-identical traces"
+	@echo ""
+	@echo "  Emulator / host:"
+	@echo "    make check        - cargo check on root + emu + sdk workspaces"
+	@echo "    make test         - fast unit tests (both workspaces, excludes canaries)"
+	@echo "    make canaries     - commercial-game canary tests (Milestones D-K)"
+	@echo "    make fmt          - format all code"
+	@echo "    make lint         - clippy -D warnings"
+	@echo "    make clean        - cargo clean all workspaces"
+	@echo "    make run          - launch the desktop frontend (no EXE)"
+	@echo "    make parity       - step both emulators and assert bit-identical traces"
+	@echo "    make oracle-smoke - smoke: launch headless Redux and verify Lua runs"
+	@echo ""
+	@echo "  SDK examples (build mipsel-sony-psx binaries):"
+	@echo "    make examples     - build every example"
+	@echo "    make hello-tri    - build the direct-GP0 triangle demo"
+	@echo "    make hello-input  - build the pad-poll demo"
+	@echo "    make hello-ot     - build the DMA linked-list demo"
+	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
+	@echo "    make run-input    - build + side-load hello-input into the frontend"
+	@echo "    make run-ot       - build + side-load hello-ot into the frontend"
 
 run:
 	cd emu && cargo run -p frontend --release
@@ -24,6 +41,7 @@ run:
 check:
 	cargo check --workspace --all-features
 	cd emu && cargo check --workspace --all-features
+	cd sdk && cargo check --workspace --all-features
 
 test:
 	cargo test --workspace
@@ -44,6 +62,8 @@ lint:
 clean:
 	cargo clean
 	cd emu && cargo clean
+	cd sdk && cargo clean
+	rm -rf build
 
 fetch-opcode:
 	@if [ -z "$(BIOS)" ]; then echo "usage: make fetch-opcode BIOS=/path/to/bios.bin"; exit 2; fi
@@ -53,4 +73,35 @@ oracle-smoke:
 	cd emu && cargo test -p parity-oracle --test smoke -- --ignored --nocapture
 
 parity:
-	cd emu && cargo test -p emulator-core --test parity -- --ignored --nocapture
+	cd emu && cargo test -p emulator-core --release --test parity -- --ignored --nocapture
+
+# --- SDK examples ---------------------------------------------------------
+
+EXAMPLE_OUT := build/examples/mipsel-sony-psx/release
+
+hello-tri:
+	cd sdk/examples/hello-tri && cargo build --release
+
+hello-input:
+	cd sdk/examples/hello-input && cargo build --release
+
+hello-ot:
+	cd sdk/examples/hello-ot && cargo build --release
+
+examples: hello-tri hello-input hello-ot
+	@echo ""
+	@echo "Built SDK examples:"
+	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
+
+# Frontend side-load helpers. PSOXIDE_EXE makes the frontend skip the
+# BIOS reset vector and jump straight into the homebrew. HLE BIOS +
+# digital pad are auto-enabled for side-loaded EXEs.
+
+run-tri: hello-tri
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/hello-tri.exe cargo run -p frontend --release
+
+run-input: hello-input
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/hello-input.exe cargo run -p frontend --release
+
+run-ot: hello-ot
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/hello-ot.exe cargo run -p frontend --release
