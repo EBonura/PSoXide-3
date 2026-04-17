@@ -5,12 +5,16 @@
 //! (bottom/side get clipped to remaining space), then the central area,
 //! then free-floating overlays (Menu, HUD) on top.
 
+pub mod registers;
 pub mod vram;
 
 use crate::app::AppState;
 
 /// Paint every panel for this frame, in layering order.
 pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::TextureId) {
+    if state.panels.registers {
+        registers::draw(ctx, &state.cpu);
+    }
     if state.panels.vram {
         vram::draw(ctx, vram_tex);
     }
