@@ -23,10 +23,21 @@ pub fn draw_layout(
     state.hud.push(dt);
 
     if state.panels.registers {
-        registers::draw(ctx, &state.cpu, &state.exec_history);
+        registers::draw(
+            ctx,
+            &state.cpu,
+            &state.exec_history,
+            &mut state.breakpoints,
+        );
     }
     if state.panels.memory {
-        memory::draw(ctx, &mut state.memory_view, state.bus.as_ref(), &state.cpu);
+        memory::draw(
+            ctx,
+            &mut state.memory_view,
+            state.bus.as_ref(),
+            &state.cpu,
+            &mut state.breakpoints,
+        );
     }
     if state.panels.vram {
         vram::draw(ctx, vram_tex);
