@@ -32,7 +32,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let bus = match Bus::new(bios) {
+    let mut bus = match Bus::new(bios) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("bus setup failed: {e}");
@@ -41,7 +41,7 @@ fn main() -> ExitCode {
     };
 
     let cpu = Cpu::new();
-    let opcode = cpu.fetch(&bus);
+    let opcode = cpu.fetch(&mut bus);
 
     println!("BIOS        : {path}");
     println!("reset vector: {:#010x}", cpu.pc());
