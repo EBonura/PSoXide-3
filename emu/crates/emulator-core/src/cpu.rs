@@ -61,6 +61,11 @@ pub struct Cpu {
     /// delay-slot instruction observes the old register value — which
     /// is what the R3000A hardware does.
     pending_load: Option<(u8, u32)>,
+    /// Load staged at the start of `step` and held during `execute`.
+    /// Separate from `pending_load` so `set_gpr` can look at it and
+    /// squash a same-register writeback when a non-load in the delay
+    /// slot writes the same target — R3000 load-delay semantics.
+    committing_load: Option<(u8, u32)>,
     hi: u32,
     lo: u32,
     /// When a SYSCALL/BREAK/exception fires, the post-retire PC goes
@@ -84,6 +89,7 @@ impl Cpu {
             tick: 0,
             pending_pc: None,
             pending_load: None,
+            committing_load: None,
             hi: 0,
             lo: 0,
             pending_exception_pc: None,
@@ -135,11 +141,22 @@ impl Cpu {
 
     /// Write a general-purpose register, enforcing the MIPS invariant
     /// that `$0` is hardwired to zero.
+    ///
+    /// Also implements R3000 load-delay squashing: if a load is about
+    /// to commit into the same register this instruction is writing,
+    /// the load's writeback is cancelled. The hardware only has one
+    /// writeback port per GPR, and if the delay slot non-load-wise
+    /// writes to the load's target, its value wins — the load is lost.
     #[inline]
     fn set_gpr(&mut self, index: u8, value: u32) {
         let i = (index & 31) as usize;
         if i != 0 {
             self.gprs[i] = value;
+        }
+        if let Some((reg, _)) = &self.committing_load {
+            if *reg == index {
+                self.committing_load = None;
+            }
         }
     }
 
@@ -190,16 +207,21 @@ impl Cpu {
         let in_delay_slot = branch_after_this.is_some();
 
         // The load delay queued by the *previous* instruction is held
-        // and applied after this instruction executes. The delay slot
-        // itself sees the pre-load value; the commit happens after.
-        // Any new load this instruction issues will be picked up on
-        // the *next* call to `step`.
-        let load_to_commit = self.pending_load.take();
+        // in `committing_load` for the duration of `execute`. The
+        // delay slot itself sees the pre-load value; any `set_gpr`
+        // in execute that targets the load's register will squash
+        // the commit (R3000 writeback-port collision — the
+        // non-load write wins). Any new load this instruction issues
+        // goes into `pending_load` and fires on the *next* call.
+        self.committing_load = self.pending_load.take();
 
         self.execute(instr, pc_before, in_delay_slot, bus)?;
 
-        if let Some((reg, value)) = load_to_commit {
-            self.set_gpr(reg, value);
+        if let Some((reg, value)) = self.committing_load.take() {
+            let i = (reg & 31) as usize;
+            if i != 0 {
+                self.gprs[i] = value;
+            }
         }
 
         // Exception takes priority: it cancels any pending branch and
@@ -1067,5 +1089,36 @@ mod tests {
         cpu.gprs[9] = 0xFFFF_0000; // $t1 = 0xFFFF0000
         let record = cpu.step(&mut bus).expect("ori decodes");
         assert_eq!(record.gprs[8], 0xFFFF_ABCD);
+    }
+
+    #[test]
+    fn load_delay_squashed_by_same_reg_addiu() {
+        // Regression test for the 12.7M-step parity divergence:
+        //   lw    $t1, 0($a0)      # stages load delay
+        //   addiu $t1, $zero, 1    # delay slot writes $t1 non-load-wise
+        //   nop                    # reveals committed $t1
+        // R3000 semantics: addiu's write squashes the load's writeback,
+        // so after the three instructions $t1 = 1, not the loaded word.
+        let mut bios = vec![0u8; memory::bios::SIZE];
+        // lw $t1, 0($a0): opcode=0x23, rs=4 ($a0), rt=9 ($t1), offset=0
+        bios[0..4].copy_from_slice(&0x8C89_0000u32.to_le_bytes());
+        // addiu $t1, $zero, 1: opcode=0x09, rs=0, rt=9, imm=1
+        bios[4..8].copy_from_slice(&0x2409_0001u32.to_le_bytes());
+        // nop
+        bios[8..12].copy_from_slice(&0u32.to_le_bytes());
+
+        let mut bus = Bus::new(bios).unwrap();
+        let mut cpu = Cpu::new();
+        // $a0 = 0xBFC0_0000 (some RAM-ish address — LW reads whatever's
+        // there, which for this test is the BIOS itself / zeroes).
+        // Actual loaded value doesn't matter; what matters is that
+        // ADDIU's write survives.
+        cpu.gprs[4] = 0xBFC0_0000;
+
+        cpu.step(&mut bus).expect("lw");
+        cpu.step(&mut bus).expect("addiu in delay slot");
+        let record = cpu.step(&mut bus).expect("nop reveals state");
+
+        assert_eq!(record.gprs[9], 1, "addiu must survive LW's delay");
     }
 }
