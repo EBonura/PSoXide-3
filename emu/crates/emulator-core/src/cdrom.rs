@@ -30,6 +30,8 @@
 
 use std::collections::VecDeque;
 
+use psx_iso::{msf_to_lba, Disc};
+
 /// Base MMIO address — the whole controller fits in 4 bytes at
 /// `0x1F80_1800..=0x1F80_1803`.
 pub const BASE: u32 = 0x1F80_1800;
@@ -130,6 +132,10 @@ const FIRST_RESPONSE_CYCLES: u64 = 50_000;
 const INIT_SECOND_RESPONSE_CYCLES: u64 = 900_000;
 const GETID_SECOND_RESPONSE_CYCLES: u64 = 33_000;
 const SEEK_SECOND_RESPONSE_CYCLES: u64 = 500_000;
+/// Cycles between sector reads at 2× drive speed (BIOS default).
+/// Real hardware is ~33_868_800 / 150 sectors/s = 225k cycles;
+/// Redux uses a closer approximation.
+const SECTOR_READ_CYCLES: u64 = 225_000;
 
 /// A deferred response: when `bus.cycles` passes `deadline`, the
 /// event's bytes land in the response FIFO and its IRQ type fires.
@@ -181,6 +187,19 @@ pub struct CdRom {
     /// is enough to capture every BIOS command. Exposed via
     /// [`CdRom::command_histogram`] for `smoke_draw`.
     command_hist: [u32; 32],
+    /// Loaded disc image, if any. When `Some`, `disc_present` is also
+    /// true and GetID / ReadN follow the disc-present paths; when
+    /// `None`, they fall back to the "please insert disc" path.
+    disc: Option<Disc>,
+    /// Data FIFO — 2048 bytes of sector user data, drained by MMIO
+    /// reads at `0x1F80_1802` or by DMA channel 3. Filled by each
+    /// DataReady event during an active ReadN / ReadS.
+    data_fifo: VecDeque<u8>,
+    /// Set while a read is in progress; controls whether new
+    /// DataReady events chain into further sectors.
+    reading: bool,
+    /// Next sector LBA to deliver during an active read.
+    read_lba: u32,
 }
 
 impl CdRom {
@@ -205,7 +224,25 @@ impl CdRom {
             setloc_msf: (0, 0, 0),
             commands_dispatched: 0,
             command_hist: [0; 32],
+            disc: None,
+            data_fifo: VecDeque::new(),
+            reading: false,
+            read_lba: 0,
         }
+    }
+
+    /// Load a disc image. After this, GetID returns the licensed-disc
+    /// response and ReadN streams real sector data through the
+    /// DataReady event chain.
+    ///
+    /// `insert_disc(None)` "ejects" — disc_present flips false, any
+    /// in-flight read is cancelled, and the next GetID returns the
+    /// no-disc response again.
+    pub fn insert_disc(&mut self, disc: Option<Disc>) {
+        self.disc = disc;
+        self.disc_present = self.disc.is_some();
+        self.reading = false;
+        self.data_fifo.clear();
     }
 
     /// `true` when `phys` is inside the CD-ROM MMIO range.
@@ -222,8 +259,7 @@ impl CdRom {
             // 0x1F80_1801 — response FIFO (any index).
             (1, _) => self.pop_response(),
             // 0x1F80_1802 — data FIFO (any index).
-            //   Stubbed to zero until sector reads land in 6d.
-            (2, _) => 0,
+            (2, _) => self.data_fifo.pop_front().unwrap_or(0),
             // 0x1F80_1803 — index-dependent:
             //   idx=0 → interrupt enable,
             //   idx=1 → interrupt flag,
@@ -278,7 +314,6 @@ impl CdRom {
     /// Compose the MMIO status byte from live FIFO + index state.
     fn status_byte(&self) -> u8 {
         let mut s = self.index;
-        // Parameter-FIFO-empty bit is set when the FIFO has room.
         if self.params.is_empty() {
             s |= status_bit::PARAM_FIFO_EMPTY;
         }
@@ -288,9 +323,11 @@ impl CdRom {
         if !self.responses.is_empty() {
             s |= status_bit::RESPONSE_FIFO_NOT_EMPTY;
         }
-        // Data FIFO state (bit 6) + transmission busy (bit 7) + ADPCM
-        // busy (bit 2) come from subsystems not yet wired in; all zero
-        // for the moment.
+        if !self.data_fifo.is_empty() {
+            s |= status_bit::DATA_FIFO_NOT_EMPTY;
+        }
+        // Transmission busy (bit 7) + ADPCM busy (bit 2) come from
+        // subsystems not yet wired in; both zero for now.
         s
     }
 
@@ -443,17 +480,51 @@ impl CdRom {
     }
 
     fn cmd_read(&mut self) {
-        if self.disc_present {
-            // Sector streaming lands in 6d; for now we ack but never
-            // deliver data.
-            self.schedule_first_response(vec![
-                self.stat_byte() | drive_status_bit::READING
-            ]);
-        } else {
-            // Error: stat | (1<<0 error) + error code 0x10 (no disc).
+        if !self.disc_present {
             let stat = self.stat_byte() | drive_status_bit::ERROR;
             self.schedule_error_response(vec![stat, 0x10]);
+            return;
         }
+        // First response: ack with READING set.
+        self.schedule_first_response(vec![
+            self.stat_byte() | drive_status_bit::READING
+        ]);
+        // Kick off sector delivery.
+        self.reading = true;
+        let (m, s, f) = self.setloc_msf;
+        self.read_lba = msf_to_lba(m, s, f);
+        // Schedule the first DataReady event. Subsequent sectors are
+        // chained in `tick` so the BIOS sees a steady stream.
+        self.schedule_sector_event();
+    }
+
+    /// Enqueue the next DataReady event for the in-flight read. The
+    /// event carries a single stat byte; the actual sector data is
+    /// copied into `data_fifo` when the event fires (in `tick`).
+    fn schedule_sector_event(&mut self) {
+        let stat = self.stat_byte() | drive_status_bit::READING;
+        self.pending.push_back(PendingEvent {
+            deadline: SECTOR_READ_CYCLES,
+            irq: IrqType::DataReady,
+            bytes: vec![stat],
+        });
+    }
+
+    /// On DataReady event firing: populate the data FIFO with the
+    /// next sector's user data and bump the read LBA. Called from
+    /// `tick` once per sector event.
+    fn load_next_sector(&mut self) {
+        let lba = self.read_lba;
+        self.read_lba = self.read_lba.wrapping_add(1);
+        if let Some(disc) = self.disc.as_ref() {
+            if let Some(user) = disc.read_sector_user(lba) {
+                self.data_fifo.clear();
+                self.data_fifo.extend(user.iter().copied());
+                return;
+            }
+        }
+        // Past end of disc — stop the read and leave the FIFO empty.
+        self.reading = false;
     }
 
     fn cmd_simple_stat_or_nodisc(&mut self) {
@@ -535,6 +606,21 @@ impl CdRom {
             for b in ev.bytes.iter().copied() {
                 if self.responses.len() < RESPONSE_FIFO_DEPTH {
                     self.responses.push_back(b);
+                }
+            }
+            // DataReady events drive the sector-stream — load the next
+            // sector's payload into the data FIFO as the event fires,
+            // and chain the subsequent DataReady while we're still
+            // reading.
+            if ev.irq == IrqType::DataReady {
+                self.load_next_sector();
+                if self.reading {
+                    self.schedule_sector_event();
+                    // Convert the relative delay we just used into an
+                    // absolute deadline against `cycles_now`.
+                    if let Some(last) = self.pending.back_mut() {
+                        last.deadline = cycles_now.saturating_add(SECTOR_READ_CYCLES);
+                    }
                 }
             }
             // Only fire IRQ if none is currently pending — hardware

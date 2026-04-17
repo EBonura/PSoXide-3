@@ -9,6 +9,7 @@ description = "PSoXide emulator core: CPU, bus, and peripherals. No UI, no windo
 
 [dependencies]
 psx-hw    = { workspace = true }
+psx-iso   = { workspace = true }
 psx-trace = { workspace = true }
 thiserror = { workspace = true }
 

@@ -544,6 +544,7 @@ version = "0.1.0"
 dependencies = [
  "parity-oracle",
  "psx-hw",
+ "psx-iso",
  "psx-trace",
  "thiserror 1.0.69",
 ]
@@ -1839,6 +1840,10 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
 ]
+
+[[package]]
+name = "psx-iso"
+version = "0.1.0"
 
 [[package]]
 name = "psx-trace"
