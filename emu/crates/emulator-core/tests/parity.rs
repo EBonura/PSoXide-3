@@ -234,3 +234,11 @@ fn first_two_point_seven_million_steps_match_redux() {
     assert_parity_for_steps(2_735_000);
 }
 
+/// Probe past the former SPUSTAT divergence — temporary probe that
+/// tells us the next blocker. Remove once absorbed into the ladder.
+#[test]
+#[ignore = "probe — move to named milestone once the next finding is in"]
+fn probe_next_divergence_after_spu() {
+    assert_parity_for_steps(50_000_000);
+}
+

@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::irq::Irq;
+use crate::spu::Spu;
 use crate::timers::Timers;
 
 /// Physical address of `I_STAT` (interrupt status / ack register).
@@ -53,6 +54,9 @@ pub struct Bus {
     /// GPU — owns VRAM and handles the GP0/GP1 MMIO ports. The
     /// frontend's VRAM viewer reads `bus.gpu.vram` directly.
     pub gpu: Gpu,
+    /// SPU — phase 3a scope: just `SPUCNT` + `SPUSTAT`. Everything
+    /// else SPU-related still round-trips through the echo buffer.
+    spu: Spu,
 }
 
 impl Bus {
@@ -81,6 +85,7 @@ impl Bus {
             timers: Timers::new(),
             dma: Dma::new(),
             gpu: Gpu::new(),
+            spu: Spu::new(),
         })
     }
 
@@ -196,6 +201,9 @@ impl Bus {
         {
             return 0xFFFF;
         }
+        if Spu::contains(phys) {
+            return self.spu.read16(phys);
+        }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             let off = (phys - memory::io::BASE) as usize;
             return u16::from_le_bytes([self.io[off], self.io[off + 1]]);
@@ -253,6 +261,9 @@ impl Bus {
         if let Some(v) = self.gpu.read32(phys) {
             return v;
         }
+        if Spu::contains(phys) {
+            return self.spu.read32(phys);
+        }
 
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             let offset = (phys - memory::io::BASE) as usize;
@@ -296,6 +307,10 @@ impl Bus {
             return;
         }
         if self.gpu.write32(phys, value) {
+            return;
+        }
+        if Spu::contains(phys) {
+            self.spu.write32(phys, value);
             return;
         }
 
@@ -381,6 +396,10 @@ impl Bus {
         {
             let off = (phys - memory::scratchpad::BASE) as usize;
             self.scratchpad[off..off + 2].copy_from_slice(&bytes);
+            return;
+        }
+        if Spu::contains(phys) {
+            self.spu.write16(phys, value);
             return;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
