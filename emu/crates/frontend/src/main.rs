@@ -146,9 +146,10 @@ impl ApplicationHandler for Shell {
 
 /// Retire up to `run_steps_per_frame` instructions. Any execution
 /// error auto-pauses, reopens the XMB, and surfaces the stopped
-/// state via the register panel. Split out so the borrow checker
-/// sees `state.bus`, `state.cpu`, and `state.exec_history` as
-/// disjoint field borrows instead of one big `&mut state`.
+/// state via the register panel. Hitting a breakpoint does the
+/// same. Split out so the borrow checker sees `state.bus`,
+/// `state.cpu`, and `state.exec_history` as disjoint field borrows
+/// instead of one big `&mut state`.
 fn run_frame(state: &mut AppState) {
     let steps = state.run_steps_per_frame;
     let Some(bus) = state.bus.as_mut() else {
@@ -158,6 +159,16 @@ fn run_frame(state: &mut AppState) {
     };
 
     for _ in 0..steps {
+        // Breakpoint check happens BEFORE stepping so the paused PC
+        // is the BP address itself — the instruction at that PC has
+        // not yet executed.
+        if state.breakpoints.contains(&state.cpu.pc()) {
+            state.running = false;
+            state.xmb.sync_run_label(false);
+            state.xmb.open = true;
+            break;
+        }
+
         match state.cpu.step(bus) {
             Ok(record) => {
                 app::push_history(&mut state.exec_history, record);

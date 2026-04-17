@@ -6,6 +6,8 @@
 //! PC. Unmapped rows render as `--` so the viewer doesn't panic when
 //! the user scrolls past the end of a region.
 
+use std::collections::BTreeSet;
+
 use emulator_core::{Bus, Cpu};
 
 use crate::theme;
@@ -39,21 +41,32 @@ impl MemoryView {
     }
 }
 
-pub fn draw(ctx: &egui::Context, view: &mut MemoryView, bus: Option<&Bus>, cpu: &Cpu) {
+pub fn draw(
+    ctx: &egui::Context,
+    view: &mut MemoryView,
+    bus: Option<&Bus>,
+    cpu: &Cpu,
+    breakpoints: &mut BTreeSet<u32>,
+) {
     egui::SidePanel::right("memory")
         .resizable(true)
         .default_width(360.0)
         .min_width(300.0)
         .show(ctx, |ui| {
             theme::viz_frame(ui, "Memory", |ui| {
-                draw_header(ui, view, cpu);
+                draw_header(ui, view, cpu, breakpoints);
                 ui.separator();
-                draw_dump(ui, view, bus);
+                draw_dump(ui, view, bus, breakpoints);
             });
         });
 }
 
-fn draw_header(ui: &mut egui::Ui, view: &mut MemoryView, cpu: &Cpu) {
+fn draw_header(
+    ui: &mut egui::Ui,
+    view: &mut MemoryView,
+    cpu: &Cpu,
+    breakpoints: &mut BTreeSet<u32>,
+) {
     ui.horizontal(|ui| {
         ui.label("addr");
         let resp = ui.add(
@@ -93,6 +106,14 @@ fn draw_header(ui: &mut egui::Ui, view: &mut MemoryView, cpu: &Cpu) {
             view.addr = view.addr.wrapping_add(256);
             view.addr_input = format!("{:08X}", view.addr);
         }
+        let bp_label = if breakpoints.contains(&view.addr) {
+            "Clear BP"
+        } else {
+            "Set BP"
+        };
+        if ui.button(bp_label).clicked() && !breakpoints.remove(&view.addr) {
+            breakpoints.insert(view.addr);
+        }
     });
 }
 
@@ -104,7 +125,12 @@ fn apply_addr_input(view: &mut MemoryView) {
     }
 }
 
-fn draw_dump(ui: &mut egui::Ui, view: &MemoryView, bus: Option<&Bus>) {
+fn draw_dump(
+    ui: &mut egui::Ui,
+    view: &MemoryView,
+    bus: Option<&Bus>,
+    breakpoints: &BTreeSet<u32>,
+) {
     let Some(bus) = bus else {
         ui.monospace("(no BIOS loaded — Bus unavailable)");
         return;
@@ -115,20 +141,33 @@ fn draw_dump(ui: &mut egui::Ui, view: &MemoryView, bus: Option<&Bus>) {
         .show(ui, |ui| {
             for row in 0..ROWS {
                 let row_addr = view.addr.wrapping_add(row as u32 * BYTES_PER_ROW as u32);
-                ui.monospace(format_row(bus, row_addr));
+                let has_bp = row_has_breakpoint(row_addr, breakpoints);
+                let text = format_row(bus, row_addr, has_bp);
+                if has_bp {
+                    ui.monospace(egui::RichText::new(text).color(theme::ACCENT));
+                } else {
+                    ui.monospace(text);
+                }
                 if row_addr.wrapping_add(BYTES_PER_ROW as u32) < row_addr {
-                    break; // overflow — stop instead of wrapping around
+                    break;
                 }
             }
-            // Reference the constant so the dead_code lint doesn't fire
-            // on the window-size declaration while the panel's scroll
-            // area grows beyond it.
             let _ = WINDOW_SIZE;
         });
 }
 
-fn format_row(bus: &Bus, base: u32) -> String {
-    let mut out = format!("{base:08X}  ");
+fn row_has_breakpoint(base: u32, breakpoints: &BTreeSet<u32>) -> bool {
+    for i in 0..BYTES_PER_ROW as u32 {
+        if breakpoints.contains(&base.wrapping_add(i)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn format_row(bus: &Bus, base: u32, has_bp: bool) -> String {
+    let marker = if has_bp { '●' } else { ' ' };
+    let mut out = format!("{marker} {base:08X}  ");
     let mut ascii = String::with_capacity(BYTES_PER_ROW);
 
     for i in 0..BYTES_PER_ROW {
@@ -144,7 +183,7 @@ fn format_row(bus: &Bus, base: u32) -> String {
             }
         }
         if i == 7 {
-            out.push(' '); // extra gap at half-row
+            out.push(' ');
         }
     }
     out.push(' ');

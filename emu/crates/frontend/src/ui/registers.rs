@@ -10,7 +10,7 @@
 //! Layout + grouping mirrors PSoXide-2's `debug_pane_contents`, using
 //! the themed `section` helper so each group reads as a framed block.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use emulator_core::Cpu;
 use psx_trace::InstructionRecord;
@@ -35,7 +35,12 @@ const COP0_LABELS: &[(usize, &str)] = &[
 ];
 
 /// Paint the register viewer as a left-docked resizable side panel.
-pub fn draw(ctx: &egui::Context, cpu: &Cpu, history: &VecDeque<InstructionRecord>) {
+pub fn draw(
+    ctx: &egui::Context,
+    cpu: &Cpu,
+    history: &VecDeque<InstructionRecord>,
+    breakpoints: &mut BTreeSet<u32>,
+) {
     egui::SidePanel::left("registers")
         .resizable(true)
         .default_width(340.0)
@@ -48,9 +53,27 @@ pub fn draw(ctx: &egui::Context, cpu: &Cpu, history: &VecDeque<InstructionRecord
                 theme::section(ui, "Retired", |ui| {
                     ui.monospace(format!("tick = {}", cpu.tick()));
                 });
+                theme::section(ui, "Breakpoints", |ui| draw_breakpoints(ui, breakpoints));
                 theme::section(ui, "Execution history", |ui| draw_history(ui, history));
             });
         });
+}
+
+fn draw_breakpoints(ui: &mut egui::Ui, breakpoints: &mut BTreeSet<u32>) {
+    if breakpoints.is_empty() {
+        ui.monospace("(none — set from the memory panel)");
+        return;
+    }
+    // Collect first so we can mutate the set while iterating.
+    let addrs: Vec<u32> = breakpoints.iter().copied().collect();
+    for addr in addrs {
+        ui.horizontal(|ui| {
+            ui.monospace(format!("{addr:08X}"));
+            if ui.small_button("×").on_hover_text("Remove").clicked() {
+                breakpoints.remove(&addr);
+            }
+        });
+    }
 }
 
 fn draw_history(ui: &mut egui::Ui, history: &VecDeque<InstructionRecord>) {

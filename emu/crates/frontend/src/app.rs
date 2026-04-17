@@ -3,7 +3,7 @@
 //! Owns the emulator state (currently just a `Cpu` + `Bus` — VRAM will
 //! join once the GPU subsystem lands) and drives the per-frame UI build.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use emulator_core::{Bus, Cpu, Vram};
@@ -68,6 +68,9 @@ pub struct AppState {
     /// instructions, newest at the back. Driven by both single-step
     /// and continuous-run paths.
     pub exec_history: VecDeque<InstructionRecord>,
+    /// PC addresses at which the run loop pauses. Toggled from the
+    /// memory viewer; displayed in the register panel.
+    pub breakpoints: BTreeSet<u32>,
 }
 
 impl Default for AppState {
@@ -83,6 +86,7 @@ impl Default for AppState {
             running: false,
             run_steps_per_frame: 100_000,
             exec_history: VecDeque::with_capacity(EXEC_HISTORY_CAP),
+            breakpoints: BTreeSet::new(),
         }
     }
 }
