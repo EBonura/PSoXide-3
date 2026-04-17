@@ -52,6 +52,16 @@ pub struct Gpu {
     /// Active CPU→VRAM transfer state. `Some` when GP0 0xA0 has set
     /// up a destination rect and is now expecting pixel-data words.
     vram_upload: Option<VramTransfer>,
+
+    // --- Texture-page state (GP0 0xE1 draw mode) ---
+    /// VRAM X base of the current texture page (pixels, 0..=960,
+    /// multiples of 64).
+    tex_page_x: u16,
+    /// VRAM Y base of the current texture page (0 or 256).
+    tex_page_y: u16,
+    /// Texture colour depth: 0 = 4bpp (CLUT), 1 = 8bpp (CLUT),
+    /// 2 = 15bpp (direct).
+    tex_depth: u8,
 }
 
 /// In-flight CPU→VRAM transfer state — 2 pixels per incoming GP0 word,
@@ -89,6 +99,9 @@ impl Gpu {
             draw_area_right: VRAM_WIDTH as u16 - 1,
             draw_area_bottom: VRAM_HEIGHT as u16 - 1,
             vram_upload: None,
+            tex_page_x: 0,
+            tex_page_y: 0,
+            tex_depth: 0,
         }
     }
 
@@ -182,9 +195,16 @@ impl Gpu {
                 self.draw_offset_x = sign_extend_11((word & 0x7FF) as i32);
                 self.draw_offset_y = sign_extend_11(((word >> 11) & 0x7FF) as i32);
             }
-            // 0xE1 (draw mode), 0xE2 (texture window), 0xE6 (mask bit):
-            // we don't rasterize with textures / mask-bit logic yet, so
-            // these settings land when those paths come online.
+            // GP0 0xE1 — draw mode: texture page base + colour depth
+            // + dither/display/transparency flags. We pick up the
+            // bits the texture rasterizer consults; the rest are for
+            // future work.
+            0xE1 => {
+                self.tex_page_x = ((word & 0x0F) as u16) * 64;
+                self.tex_page_y = if (word >> 4) & 1 != 0 { 256 } else { 0 };
+                self.tex_depth = ((word >> 7) & 0x3) as u8;
+            }
+            // 0xE2 (texture window), 0xE6 (mask bit): not wired up yet.
             _ => {}
         }
     }
@@ -205,12 +225,22 @@ impl Gpu {
             // interpolated across the primitive via barycentrics.
             0x30..=0x33 => self.draw_shaded_tri(),
             0x38..=0x3B => self.draw_shaded_quad(),
+            // Textured (flat-shade) triangle / quad — per-vertex UV,
+            // texture-page and CLUT pulled from the UV words.
+            0x24..=0x27 => self.draw_textured_tri(),
+            0x2C..=0x2F => self.draw_textured_quad(),
             // Monochrome rectangles — bit 3 set selects variable size
             // (followed by a W/H word), else 1×1/8×8/16×16 by bits 5:4.
             0x60..=0x63 => self.draw_monochrome_rect_variable(),
             0x68..=0x6B => self.draw_monochrome_rect_sized(1, 1),
             0x70..=0x73 => self.draw_monochrome_rect_sized(8, 8),
             0x78..=0x7B => self.draw_monochrome_rect_sized(16, 16),
+            // Textured rectangles — same geometry as the monochrome
+            // variants plus a UV/CLUT word between pos and size.
+            0x64..=0x67 => self.draw_textured_rect_variable(),
+            0x6C..=0x6F => self.draw_textured_rect_sized(1, 1),
+            0x74..=0x77 => self.draw_textured_rect_sized(8, 8),
+            0x7C..=0x7F => self.draw_textured_rect_sized(16, 16),
             // CPU→VRAM transfer — 3 words of setup, then `w*h/2`
             // words of pixel data follow as a separate mode.
             0xA0 => self.begin_vram_upload(),
@@ -304,6 +334,115 @@ impl Gpu {
         self.paint_rect(x, y, w, h, color);
     }
 
+    /// Variable-size textured rect. Words: `[cmd+tint, xy, clut+uv, wh]`.
+    fn draw_textured_rect_variable(&mut self) {
+        let pos = self.gp0_fifo[1];
+        let uv_clut = self.gp0_fifo[2];
+        let size = self.gp0_fifo[3];
+        let x = sign_extend_11((pos & 0x7FF) as i32) + self.draw_offset_x;
+        let y = sign_extend_11(((pos >> 16) & 0x7FF) as i32) + self.draw_offset_y;
+        let w = (size & 0xFFFF) as i32;
+        let h = ((size >> 16) & 0xFFFF) as i32;
+        let u0 = (uv_clut & 0xFF) as u16;
+        let v0 = ((uv_clut >> 8) & 0xFF) as u16;
+        let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
+        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word);
+    }
+
+    /// Fixed-size textured rect (1×1, 8×8, 16×16).
+    /// Words: `[cmd+tint, xy, clut+uv]`.
+    fn draw_textured_rect_sized(&mut self, w: i32, h: i32) {
+        let pos = self.gp0_fifo[1];
+        let uv_clut = self.gp0_fifo[2];
+        let x = sign_extend_11((pos & 0x7FF) as i32) + self.draw_offset_x;
+        let y = sign_extend_11(((pos >> 16) & 0x7FF) as i32) + self.draw_offset_y;
+        let u0 = (uv_clut & 0xFF) as u16;
+        let v0 = ((uv_clut >> 8) & 0xFF) as u16;
+        let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
+        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word);
+    }
+
+    /// Plot a textured rectangle. Each destination pixel samples a
+    /// 1:1 texel from the current texture page, CLUT-indexed for
+    /// 4bpp / 8bpp modes, direct for 15bpp. Texels of value 0 are
+    /// transparent (standard PS1 convention).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_textured_rect(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        u0: u16,
+        v0: u16,
+        clut_word: u16,
+    ) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let clut_x = (clut_word & 0x3F) * 16;
+        let clut_y = (clut_word >> 6) & 0x1FF;
+
+        let left = x.max(self.draw_area_left as i32);
+        let top = y.max(self.draw_area_top as i32);
+        let right = (x + w - 1).min(self.draw_area_right as i32);
+        let bottom = (y + h - 1).min(self.draw_area_bottom as i32);
+        if left > right || top > bottom {
+            return;
+        }
+
+        for py in top..=bottom {
+            for px in left..=right {
+                let tex_u = u0.wrapping_add((px - x) as u16);
+                let tex_v = v0.wrapping_add((py - y) as u16);
+                if let Some(texel) = self.sample_texture(tex_u, tex_v, clut_x, clut_y) {
+                    self.vram.set_pixel(px as u16, py as u16, texel);
+                }
+            }
+        }
+    }
+
+    /// Fetch a single texel from the active texture page. Returns
+    /// `None` for transparent (texel value 0 in CLUT modes, or 0x0000
+    /// with mask bit clear in direct mode).
+    fn sample_texture(&self, u: u16, v: u16, clut_x: u16, clut_y: u16) -> Option<u16> {
+        let tpy = self.tex_page_y.wrapping_add(v);
+        match self.tex_depth {
+            0 => {
+                // 4bpp: 4 texels per VRAM word; select by (u & 3).
+                let tpx = self.tex_page_x.wrapping_add(u / 4);
+                let word = self.vram.get_pixel(tpx, tpy);
+                let idx = (word >> ((u & 3) * 4)) & 0xF;
+                if idx == 0 {
+                    None
+                } else {
+                    Some(self.vram.get_pixel(clut_x + idx, clut_y))
+                }
+            }
+            1 => {
+                // 8bpp: 2 texels per VRAM word.
+                let tpx = self.tex_page_x.wrapping_add(u / 2);
+                let word = self.vram.get_pixel(tpx, tpy);
+                let idx = (word >> ((u & 1) * 8)) & 0xFF;
+                if idx == 0 {
+                    None
+                } else {
+                    Some(self.vram.get_pixel(clut_x + idx, clut_y))
+                }
+            }
+            _ => {
+                // 15bpp: direct colour, 1 texel per word.
+                let tpx = self.tex_page_x.wrapping_add(u);
+                let texel = self.vram.get_pixel(tpx, tpy);
+                if texel == 0 {
+                    None
+                } else {
+                    Some(texel)
+                }
+            }
+        }
+    }
+
     /// Plot a rectangle of `color` in screen-space, clipped to the
     /// GPU's drawing area.
     fn paint_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16) {
@@ -353,6 +492,106 @@ impl Gpu {
                 let w2 = edge(v0, v1, p) * area_sign;
                 if (w0 | w1 | w2) >= 0 {
                     self.vram.set_pixel(x as u16, y as u16, color);
+                }
+            }
+        }
+    }
+
+    /// GP0 0x24..=0x27 — textured triangle. 7 words:
+    /// `[cmd+tint, v0, clut+uv0, v1, tpage+uv1, v2, uv2]`.
+    fn draw_textured_tri(&mut self) {
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let uv0 = self.gp0_fifo[2];
+        let v1 = self.decode_vertex(self.gp0_fifo[3]);
+        let uv1 = self.gp0_fifo[4];
+        let v2 = self.decode_vertex(self.gp0_fifo[5]);
+        let uv2 = self.gp0_fifo[6];
+        let clut_word = ((uv0 >> 16) & 0xFFFF) as u16;
+        // The tpage word in UV1 overrides the current draw-mode tpage
+        // for the duration of this primitive.
+        self.apply_primitive_tpage(uv1);
+        let t0 = ((uv0 & 0xFF) as u16, ((uv0 >> 8) & 0xFF) as u16);
+        let t1 = ((uv1 & 0xFF) as u16, ((uv1 >> 8) & 0xFF) as u16);
+        let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
+        self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word);
+    }
+
+    /// GP0 0x2C..=0x2F — textured quad. 9 words; split into two
+    /// textured triangles sharing v1–v2.
+    fn draw_textured_quad(&mut self) {
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let uv0 = self.gp0_fifo[2];
+        let v1 = self.decode_vertex(self.gp0_fifo[3]);
+        let uv1 = self.gp0_fifo[4];
+        let v2 = self.decode_vertex(self.gp0_fifo[5]);
+        let uv2 = self.gp0_fifo[6];
+        let v3 = self.decode_vertex(self.gp0_fifo[7]);
+        let uv3 = self.gp0_fifo[8];
+        let clut_word = ((uv0 >> 16) & 0xFFFF) as u16;
+        self.apply_primitive_tpage(uv1);
+        let t0 = ((uv0 & 0xFF) as u16, ((uv0 >> 8) & 0xFF) as u16);
+        let t1 = ((uv1 & 0xFF) as u16, ((uv1 >> 8) & 0xFF) as u16);
+        let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
+        let t3 = ((uv3 & 0xFF) as u16, ((uv3 >> 8) & 0xFF) as u16);
+        self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word);
+        self.rasterize_textured_triangle(v1, v2, v3, t1, t2, t3, clut_word);
+    }
+
+    /// Apply the tpage bits embedded in a textured-primitive UV word
+    /// (they override the draw-mode tpage for this primitive onward).
+    fn apply_primitive_tpage(&mut self, uv_word: u32) {
+        let tpage = (uv_word >> 16) & 0xFFFF;
+        self.tex_page_x = ((tpage & 0x0F) as u16) * 64;
+        self.tex_page_y = if (tpage >> 4) & 1 != 0 { 256 } else { 0 };
+        self.tex_depth = ((tpage >> 7) & 0x3) as u8;
+    }
+
+    /// Rasterize a textured triangle — same edge-function test as the
+    /// other triangle paths, with nearest-neighbor texture sampling
+    /// via barycentric-interpolated UV.
+    #[allow(clippy::too_many_arguments)]
+    fn rasterize_textured_triangle(
+        &mut self,
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        t0: (u16, u16),
+        t1: (u16, u16),
+        t2: (u16, u16),
+        clut_word: u16,
+    ) {
+        let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
+        let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
+        let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
+        let max_y = v0.1.max(v1.1).max(v2.1).min(self.draw_area_bottom as i32);
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+
+        let area = edge(v0, v1, v2);
+        if area == 0 {
+            return;
+        }
+        let area_sign = area.signum();
+        let area_abs = area.unsigned_abs() as i64;
+
+        let clut_x = (clut_word & 0x3F) * 16;
+        let clut_y = (clut_word >> 6) & 0x1FF;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let p = (x, y);
+                let w0 = (edge(v1, v2, p) * area_sign) as i64;
+                let w1 = (edge(v2, v0, p) * area_sign) as i64;
+                let w2 = (edge(v0, v1, p) * area_sign) as i64;
+                if (w0 | w1 | w2) >= 0 {
+                    let u = (w0 * t0.0 as i64 + w1 * t1.0 as i64 + w2 * t2.0 as i64) / area_abs;
+                    let v = (w0 * t0.1 as i64 + w1 * t1.1 as i64 + w2 * t2.1 as i64) / area_abs;
+                    if let Some(texel) =
+                        self.sample_texture(u as u16, v as u16, clut_x, clut_y)
+                    {
+                        self.vram.set_pixel(x as u16, y as u16, texel);
+                    }
                 }
             }
         }
