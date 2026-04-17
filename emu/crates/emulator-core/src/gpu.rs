@@ -90,6 +90,13 @@ pub struct Gpu {
     /// of the header word). Diagnostic only — lets `smoke_draw` see at
     /// a glance which primitive types the BIOS is issuing.
     gp0_opcode_hist: [u32; 256],
+    /// Count of GP1 writes by opcode byte. Same diagnostic role as
+    /// gp0_opcode_hist but for the display / control port.
+    gp1_opcode_hist: [u32; 256],
+    /// Distinct (x, y) pairs written to GP1 0x05 (display-start). Lets
+    /// diagnostics see whether the BIOS is flipping buffers or just
+    /// repeatedly re-writing the same location.
+    display_start_history: std::collections::BTreeSet<(u16, u16)>,
 }
 
 /// Public snapshot of the GPU's display configuration, read by the
@@ -157,13 +164,26 @@ impl Gpu {
             vram_download: None,
             gpuread_latch: 0,
             gp0_opcode_hist: [0; 256],
+            gp1_opcode_hist: [0; 256],
+            display_start_history: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// Distinct display-start corners the BIOS has written to. Useful
+    /// for telling a re-write loop from a front/back-buffer flip.
+    pub fn display_start_history(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        self.display_start_history.iter().copied()
     }
 
     /// Snapshot of the GP0 opcode histogram — per-byte count of
     /// executed packets keyed by high-byte of word 0. Diagnostic.
     pub fn gp0_opcode_histogram(&self) -> [u32; 256] {
         self.gp0_opcode_hist
+    }
+
+    /// Snapshot of the GP1 opcode histogram. Diagnostic.
+    pub fn gp1_opcode_histogram(&self) -> [u32; 256] {
+        self.gp1_opcode_hist
     }
 
     /// Snapshot of the currently-configured display area, for the
@@ -227,6 +247,8 @@ impl Gpu {
                 true
             }
             GP1_ADDR => {
+                let op = ((value >> 24) & 0xFF) as usize;
+                self.gp1_opcode_hist[op] = self.gp1_opcode_hist[op].saturating_add(1);
                 self.apply_gp1_display(value);
                 self.status.gp1_write(value);
                 true
@@ -352,6 +374,8 @@ impl Gpu {
             0x05 => {
                 self.display_start_x = (value & 0x3FF) as u16;
                 self.display_start_y = ((value >> 10) & 0x1FF) as u16;
+                self.display_start_history
+                    .insert((self.display_start_x, self.display_start_y));
             }
             // GP1 0x08 — display mode. Resolve to pixel W/H.
             0x08 => {

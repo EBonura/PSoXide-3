@@ -87,6 +87,41 @@ fn main() {
         if da.bpp24 { " · 24bpp" } else { "" }
     );
 
+    let ds_hist: Vec<(u16, u16)> = bus.gpu.display_start_history().collect();
+    println!(
+        "display-start seen = {:?}",
+        ds_hist
+            .iter()
+            .map(|(x, y)| format!("({x},{y})"))
+            .collect::<Vec<_>>()
+    );
+
+    let gp1_hist = bus.gpu.gp1_opcode_histogram();
+    let nonzero_gp1: Vec<(usize, u32)> = gp1_hist
+        .iter()
+        .enumerate()
+        .filter_map(|(op, &c)| if c > 0 { Some((op, c)) } else { None })
+        .collect();
+    if !nonzero_gp1.is_empty() {
+        println!("GP1 opcode histogram (op: count):");
+        for (op, c) in &nonzero_gp1 {
+            let name = match *op as u8 {
+                0x00 => "reset-gpu",
+                0x01 => "reset-buffer",
+                0x02 => "ack-irq",
+                0x03 => "display-enable",
+                0x04 => "dma-direction",
+                0x05 => "display-start",
+                0x06 => "h-range",
+                0x07 => "v-range",
+                0x08 => "display-mode",
+                0x10 => "get-gpu-info",
+                _ => "?",
+            };
+            println!("  0x{op:02X} {name:<14} {c}");
+        }
+    }
+
     let gp0_hist = bus.gpu.gp0_opcode_histogram();
     let nonzero_gp0: Vec<(usize, u32)> = gp0_hist
         .iter()
