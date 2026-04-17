@@ -36,7 +36,7 @@ const BUFFER_CAPACITY: usize = 64 * 1024;
 
 /// Granularity for mid-wait child-death polling. A response that arrives
 /// within this window is still prompt; a dead child is noticed within it.
-const POLL_CHUNK: Duration = Duration::from_millis(100);
+const POLL_CHUNK: Duration = Duration::from_millis(1);
 
 /// A live (or recently terminated) Redux subprocess.
 pub struct ReduxProcess {
@@ -153,6 +153,15 @@ impl ReduxProcess {
     /// surfaced as [`OracleError::EarlyExit`] within ~100 ms instead of
     /// blocking for the full timeout.
     pub fn wait_for_response(&mut self, timeout: Duration) -> Result<String, OracleError> {
+        // Fast path: if a response is already queued, return it without
+        // touching any syscall. Only when the channel is empty do we
+        // fall back to the polling loop that also watches for child
+        // death. This matters because the drain thread pushes responses
+        // in bursts and the main-thread recv is the hot path.
+        if let Ok(line) = self.responses.try_recv() {
+            return Ok(line);
+        }
+
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -166,8 +175,6 @@ impl ReduxProcess {
 
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(status) = self.child.try_wait()? {
-                        // Drain the channel of any response that landed
-                        // just before the child died before declaring failure.
                         if let Ok(line) = self.responses.try_recv() {
                             return Ok(line);
                         }
@@ -176,8 +183,6 @@ impl ReduxProcess {
                 }
 
                 Err(RecvTimeoutError::Disconnected) => {
-                    // Drain thread closed its sender — child's stdout hit
-                    // EOF, meaning the process is gone or about to be.
                     let status = self.child.try_wait()?.and_then(|s| s.code());
                     return Err(self.early_exit_error(status));
                 }

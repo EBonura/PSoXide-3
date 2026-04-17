@@ -193,3 +193,22 @@ fn first_two_thousand_steps_match_redux() {
 fn first_five_thousand_steps_match_redux() {
     assert_parity_for_steps(5000);
 }
+
+#[test]
+#[ignore = "requires PCSX-Redux binary; run via `make parity`"]
+fn first_fifty_thousand_steps_match_redux() {
+    assert_parity_for_steps(50_000);
+}
+
+#[test]
+#[ignore = "requires PCSX-Redux binary; run via `make parity`"]
+fn first_two_hundred_thousand_steps_match_redux() {
+    assert_parity_for_steps(200_000);
+}
+
+#[test]
+#[ignore = "requires PCSX-Redux binary; run via `make parity`"]
+fn first_million_steps_match_redux() {
+    assert_parity_for_steps(1_000_000);
+}
+
