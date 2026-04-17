@@ -7,6 +7,7 @@
 use psx_hw::memory::{self, to_physical};
 use thiserror::Error;
 
+use crate::dma::Dma;
 use crate::irq::Irq;
 use crate::timers::Timers;
 
@@ -45,6 +46,9 @@ pub struct Bus {
     /// Root counters (Timer 0 / 1 / 2). Phase 2e is register-backing
     /// only; ticking lands with the cycle model.
     timers: Timers,
+    /// DMA controller (7 channels + DPCR + DICR). Phase 2g is
+    /// register-backing only; transfers land as subsystems come online.
+    dma: Dma,
 }
 
 impl Bus {
@@ -71,6 +75,7 @@ impl Bus {
             io: zeroed_box(),
             irq: Irq::new(),
             timers: Timers::new(),
+            dma: Dma::new(),
         })
     }
 
@@ -233,6 +238,9 @@ impl Bus {
         if Timers::contains(phys) {
             return self.timers.read32(phys);
         }
+        if Dma::contains(phys) {
+            return self.dma.read32(phys);
+        }
 
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             let offset = (phys - memory::io::BASE) as usize;
@@ -269,6 +277,10 @@ impl Bus {
         }
         if Timers::contains(phys) {
             self.timers.write32(phys, value);
+            return;
+        }
+        if Dma::contains(phys) {
+            self.dma.write32(phys, value);
             return;
         }
 
