@@ -81,6 +81,41 @@ impl Bus {
         self.irq.pending()
     }
 
+    /// Non-panicking byte read. Returns `None` for addresses outside
+    /// any currently-mapped region. Diagnostic UIs (memory viewer,
+    /// disassembler) use this to browse arbitrary ranges without
+    /// crashing the emulator on unmapped addresses.
+    pub fn try_read8(&self, virt: u32) -> Option<u8> {
+        let phys = to_physical(virt);
+        if phys < memory::ram::MIRROR_END {
+            return Some(self.ram[(phys as usize) % memory::ram::SIZE]);
+        }
+        if (memory::scratchpad::BASE..memory::scratchpad::BASE + memory::scratchpad::SIZE as u32)
+            .contains(&phys)
+        {
+            return Some(self.scratchpad[(phys - memory::scratchpad::BASE) as usize]);
+        }
+        if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32).contains(&phys) {
+            return Some(self.bios[(phys - memory::bios::BASE) as usize]);
+        }
+        if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
+            return Some(self.io[(phys - memory::io::BASE) as usize]);
+        }
+        if (memory::expansion1::BASE
+            ..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
+            .contains(&phys)
+        {
+            return Some(0xFF);
+        }
+        if (memory::expansion2::BASE
+            ..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
+            .contains(&phys)
+        {
+            return Some(0xFF);
+        }
+        None
+    }
+
     /// Read a 32-bit little-endian word from a virtual address.
     ///
     /// Panics on any address that does not resolve to a currently-mapped
