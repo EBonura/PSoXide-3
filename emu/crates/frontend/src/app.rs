@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 
-use emulator_core::{Bus, Cpu, Vram};
+use emulator_core::{Bus, Cpu};
 use psx_trace::InstructionRecord;
 
 use crate::ui;
@@ -53,7 +53,6 @@ pub struct AppState {
     /// but no instruction stepping is possible. Unused until the step
     /// button lands alongside the Menu.
     pub bus: Option<Bus>,
-    pub vram: Vram,
     pub menu: MenuState,
     pub hud: HudState,
     pub memory_view: MemoryView,
@@ -79,7 +78,6 @@ impl Default for AppState {
             panels: PanelVisibility::default(),
             cpu: Cpu::new(),
             bus: load_bus(),
-            vram: Vram::new(),
             menu: MenuState::new(),
             hud: HudState::default(),
             memory_view: MemoryView::default(),

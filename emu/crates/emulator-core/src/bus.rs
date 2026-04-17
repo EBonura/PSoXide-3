@@ -8,6 +8,7 @@ use psx_hw::memory::{self, to_physical};
 use thiserror::Error;
 
 use crate::dma::Dma;
+use crate::gpu::Gpu;
 use crate::irq::Irq;
 use crate::timers::Timers;
 
@@ -49,6 +50,9 @@ pub struct Bus {
     /// DMA controller (7 channels + DPCR + DICR). Phase 2g is
     /// register-backing only; transfers land as subsystems come online.
     dma: Dma,
+    /// GPU — owns VRAM and handles the GP0/GP1 MMIO ports. The
+    /// frontend's VRAM viewer reads `bus.gpu.vram` directly.
+    pub gpu: Gpu,
 }
 
 impl Bus {
@@ -76,6 +80,7 @@ impl Bus {
             irq: Irq::new(),
             timers: Timers::new(),
             dma: Dma::new(),
+            gpu: Gpu::new(),
         })
     }
 
@@ -95,6 +100,10 @@ impl Bus {
     /// any currently-mapped region. Diagnostic UIs (memory viewer,
     /// disassembler) use this to browse arbitrary ranges without
     /// crashing the emulator on unmapped addresses.
+    ///
+    /// Byte-granular reads of the GPU / timer / DMA / IRQ MMIO don't
+    /// try to decompose the typed 32-bit registers — they return the
+    /// echo-buffer byte, which is fine for a diagnostic dump.
     pub fn try_read8(&self, virt: u32) -> Option<u8> {
         let phys = to_physical(virt);
         if phys < memory::ram::MIRROR_END {
@@ -241,6 +250,9 @@ impl Bus {
         if Dma::contains(phys) {
             return self.dma.read32(phys);
         }
+        if let Some(v) = self.gpu.read32(phys) {
+            return v;
+        }
 
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             let offset = (phys - memory::io::BASE) as usize;
@@ -281,6 +293,9 @@ impl Bus {
         }
         if Dma::contains(phys) {
             self.dma.write32(phys, value);
+            return;
+        }
+        if self.gpu.write32(phys, value) {
             return;
         }
 

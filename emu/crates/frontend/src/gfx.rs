@@ -123,8 +123,12 @@ impl Graphics {
     }
 
     /// Upload a full VRAM snapshot to the GPU-side texture. Called once
-    /// per frame from `App` before `render`.
-    pub fn prepare_vram(&self, vram: &Vram) {
+    /// per frame from `App` before `render`. `None` means "no Bus yet"
+    /// — we leave the last texture contents alone (typically zeros).
+    pub fn prepare_vram(&self, vram: Option<&Vram>) {
+        let Some(vram) = vram else {
+            return;
+        };
         let rgba = vram.to_rgba8(0, 0, VRAM_WIDTH as u16, VRAM_HEIGHT as u16);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
