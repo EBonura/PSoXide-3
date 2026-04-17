@@ -21,41 +21,66 @@ const HUD_HEIGHT: f32 = 34.0;
 const BG: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 102);
 const TEXT: Color32 = Color32::from_rgb(153, 153, 166);
 
-/// Rolling-window frame-rate tracker. Keeps the last ~1 s of frame
-/// times and reports the average.
+/// Rolling-window tracker for frame time + CPU instruction rate.
+/// Keeps ~1 s worth of samples (at 60 Hz that's 120 frames).
 pub struct HudState {
-    samples: std::collections::VecDeque<f32>,
+    dt_samples: std::collections::VecDeque<f32>,
+    tick_samples: std::collections::VecDeque<u64>,
+    prev_tick: u64,
 }
 
 impl Default for HudState {
     fn default() -> Self {
         Self {
-            samples: std::collections::VecDeque::with_capacity(120),
+            dt_samples: std::collections::VecDeque::with_capacity(120),
+            tick_samples: std::collections::VecDeque::with_capacity(120),
+            prev_tick: 0,
         }
     }
 }
 
 impl HudState {
-    /// Record the elapsed seconds for one frame.
-    pub fn push(&mut self, dt: f32) {
-        if self.samples.len() >= 120 {
-            self.samples.pop_front();
+    /// Record this frame's wall-time dt and the CPU's current retired-
+    /// instruction tick. The per-frame tick delta is computed here so
+    /// callers don't need to remember the previous tick.
+    pub fn update(&mut self, dt: f32, current_tick: u64) {
+        if self.dt_samples.len() >= 120 {
+            self.dt_samples.pop_front();
         }
-        self.samples.push_back(dt);
+        self.dt_samples.push_back(dt);
+
+        let delta = current_tick.saturating_sub(self.prev_tick);
+        self.prev_tick = current_tick;
+        if self.tick_samples.len() >= 120 {
+            self.tick_samples.pop_front();
+        }
+        self.tick_samples.push_back(delta);
     }
 
     fn average_dt(&self) -> f32 {
-        if self.samples.is_empty() {
+        if self.dt_samples.is_empty() {
             return 0.0;
         }
-        let sum: f32 = self.samples.iter().sum();
-        sum / self.samples.len() as f32
+        let sum: f32 = self.dt_samples.iter().sum();
+        sum / self.dt_samples.len() as f32
     }
 
     fn fps(&self) -> f32 {
         let avg = self.average_dt();
         if avg > 0.0 {
             1.0 / avg
+        } else {
+            0.0
+        }
+    }
+
+    /// CPU instructions per second, averaged over the rolling window.
+    /// Returns 0 when paused or when the window has no data yet.
+    fn ips(&self) -> f32 {
+        let total_ticks: u64 = self.tick_samples.iter().sum();
+        let total_dt: f32 = self.dt_samples.iter().sum();
+        if total_dt > 0.0 {
+            total_ticks as f32 / total_dt
         } else {
             0.0
         }
@@ -84,6 +109,7 @@ pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu, running: bool) {
 
     let fps = hud.fps();
     let dt_ms = hud.average_dt() * 1000.0;
+    let mips = hud.ips() / 1_000_000.0;
     let (status_text, status_color) = if running {
         ("● RUNNING", Color32::from_rgb(80, 200, 120))
     } else {
@@ -101,7 +127,7 @@ pub fn draw(ctx: &egui::Context, hud: &HudState, cpu: &Cpu, running: bool) {
     painter.text(
         Pos2::new(right, line1_y),
         Align2::RIGHT_CENTER,
-        format!("FPS {fps:5.1}"),
+        format!("FPS {fps:5.1}   {mips:5.1} Mips"),
         FontId::proportional(12.0),
         TEXT,
     );

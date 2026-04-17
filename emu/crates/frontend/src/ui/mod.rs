@@ -20,7 +20,7 @@ pub fn draw_layout(
     vram_tex: egui::TextureId,
     dt: f32,
 ) {
-    state.hud.push(dt);
+    state.hud.update(dt, state.cpu.tick());
 
     if state.panels.registers {
         registers::draw(
@@ -50,6 +50,16 @@ pub fn draw_layout(
             "Menu: {} — press Esc to toggle.",
             if state.menu.open { "open" } else { "closed" }
         ));
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Run speed:");
+            ui.add(
+                egui::Slider::new(&mut state.run_steps_per_frame, 1_000..=2_000_000)
+                    .logarithmic(true)
+                    .suffix(" instr/frame"),
+            );
+        });
     });
 
     state.menu.draw(ctx, dt);
