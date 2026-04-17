@@ -56,6 +56,76 @@ impl Bus {
     /// Panics on any address that does not resolve to a currently-mapped
     /// region. This is intentional — unmapped reads during development
     /// should surface immediately, not return silent zeros.
+    pub fn read8(&self, virt: u32) -> u8 {
+        let phys = to_physical(virt);
+        if phys < memory::ram::MIRROR_END {
+            return self.ram[(phys as usize) % memory::ram::SIZE];
+        }
+        if (memory::scratchpad::BASE..memory::scratchpad::BASE + memory::scratchpad::SIZE as u32)
+            .contains(&phys)
+        {
+            return self.scratchpad[(phys - memory::scratchpad::BASE) as usize];
+        }
+        if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32).contains(&phys) {
+            return self.bios[(phys - memory::bios::BASE) as usize];
+        }
+        if (memory::expansion1::BASE
+            ..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
+            .contains(&phys)
+        {
+            return 0xFF;
+        }
+        if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
+            return 0;
+        }
+        if (memory::expansion2::BASE
+            ..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
+            .contains(&phys)
+        {
+            return 0xFF;
+        }
+        panic!("bus: unmapped read8 @ virt={virt:#010x} phys={phys:#010x}");
+    }
+
+    /// Read a 16-bit little-endian half-word from a virtual address.
+    /// Unmapped regions behave identically to [`Bus::read8`] (see the
+    /// region-by-region notes there).
+    pub fn read16(&self, virt: u32) -> u16 {
+        let phys = to_physical(virt);
+        if phys < memory::ram::MIRROR_END {
+            let off = (phys as usize) % memory::ram::SIZE;
+            return u16::from_le_bytes([self.ram[off], self.ram[off + 1]]);
+        }
+        if (memory::scratchpad::BASE..memory::scratchpad::BASE + memory::scratchpad::SIZE as u32)
+            .contains(&phys)
+        {
+            let off = (phys - memory::scratchpad::BASE) as usize;
+            return u16::from_le_bytes([self.scratchpad[off], self.scratchpad[off + 1]]);
+        }
+        if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32).contains(&phys) {
+            let off = (phys - memory::bios::BASE) as usize;
+            return u16::from_le_bytes([self.bios[off], self.bios[off + 1]]);
+        }
+        if (memory::expansion1::BASE
+            ..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
+            .contains(&phys)
+        {
+            return 0xFFFF;
+        }
+        if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
+            return 0;
+        }
+        if (memory::expansion2::BASE
+            ..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
+            .contains(&phys)
+        {
+            return 0xFFFF;
+        }
+        panic!("bus: unmapped read16 @ virt={virt:#010x} phys={phys:#010x}");
+    }
+
+    /// Read a 32-bit little-endian word from a virtual address. This is
+    /// the instruction-fetch path.
     pub fn read32(&self, virt: u32) -> u32 {
         let phys = to_physical(virt);
 
@@ -74,6 +144,17 @@ impl Bus {
         if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32).contains(&phys) {
             let offset = (phys - memory::bios::BASE) as usize;
             return read_u32_le(&self.bios[offset..]);
+        }
+
+        if (memory::expansion1::BASE
+            ..memory::expansion1::BASE + memory::expansion1::SIZE as u32)
+            .contains(&phys)
+        {
+            return 0xFFFF_FFFF;
+        }
+
+        if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
+            return 0;
         }
 
         panic!("bus: unmapped read32 @ virt={virt:#010x} phys={phys:#010x}");
@@ -112,7 +193,12 @@ impl Bus {
         }
 
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
-            // MMIO: accepted silently until real peripherals attach.
+            return;
+        }
+
+        if (memory::expansion2::BASE..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
+            .contains(&phys)
+        {
             return;
         }
 
@@ -123,6 +209,66 @@ impl Bus {
         panic!(
             "bus: unmapped write32 @ virt={virt:#010x} phys={phys:#010x} value={value:#010x}"
         );
+    }
+
+    /// Write a byte to a virtual address. Unmapped writes in MMIO /
+    /// expansion / BIOS ranges are silently dropped (same rationale as
+    /// [`Bus::write32`]).
+    pub fn write8(&mut self, virt: u32, value: u8) {
+        let phys = to_physical(virt);
+        if phys < memory::ram::MIRROR_END {
+            self.ram[(phys as usize) % memory::ram::SIZE] = value;
+            return;
+        }
+        if (memory::scratchpad::BASE..memory::scratchpad::BASE + memory::scratchpad::SIZE as u32)
+            .contains(&phys)
+        {
+            self.scratchpad[(phys - memory::scratchpad::BASE) as usize] = value;
+            return;
+        }
+        if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
+            return;
+        }
+        if (memory::expansion2::BASE..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
+            .contains(&phys)
+        {
+            return;
+        }
+        if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32).contains(&phys) {
+            return;
+        }
+        panic!("bus: unmapped write8 @ virt={virt:#010x} phys={phys:#010x} value={value:#04x}");
+    }
+
+    /// Write a 16-bit half-word to a virtual address. Same unmapped-region
+    /// policy as [`Bus::write32`].
+    pub fn write16(&mut self, virt: u32, value: u16) {
+        let phys = to_physical(virt);
+        let bytes = value.to_le_bytes();
+        if phys < memory::ram::MIRROR_END {
+            let off = (phys as usize) % memory::ram::SIZE;
+            self.ram[off..off + 2].copy_from_slice(&bytes);
+            return;
+        }
+        if (memory::scratchpad::BASE..memory::scratchpad::BASE + memory::scratchpad::SIZE as u32)
+            .contains(&phys)
+        {
+            let off = (phys - memory::scratchpad::BASE) as usize;
+            self.scratchpad[off..off + 2].copy_from_slice(&bytes);
+            return;
+        }
+        if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
+            return;
+        }
+        if (memory::expansion2::BASE..memory::expansion2::BASE + memory::expansion2::SIZE as u32)
+            .contains(&phys)
+        {
+            return;
+        }
+        if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32).contains(&phys) {
+            return;
+        }
+        panic!("bus: unmapped write16 @ virt={virt:#010x} phys={phys:#010x} value={value:#06x}");
     }
 }
 

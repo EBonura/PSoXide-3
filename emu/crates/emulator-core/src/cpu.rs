@@ -61,6 +61,8 @@ pub struct Cpu {
     /// delay-slot instruction observes the old register value — which
     /// is what the R3000A hardware does.
     pending_load: Option<(u8, u32)>,
+    hi: u32,
+    lo: u32,
 }
 
 impl Cpu {
@@ -77,6 +79,8 @@ impl Cpu {
             tick: 0,
             pending_pc: None,
             pending_load: None,
+            hi: 0,
+            lo: 0,
         }
     }
 
@@ -154,15 +158,29 @@ impl Cpu {
         let opcode = ((instr >> 26) & 0x3F) as u8;
         match opcode {
             0x00 => self.dispatch_special(instr, pc),
+            0x01 => self.dispatch_regimm(instr, pc),
             0x02 => self.op_j(instr, pc),
+            0x03 => self.op_jal(instr, pc),
             0x04 => self.op_beq(instr, pc),
             0x05 => self.op_bne(instr, pc),
+            0x06 => self.op_blez(instr, pc),
+            0x07 => self.op_bgtz(instr, pc),
             0x08 => self.op_addi(instr),
             0x09 => self.op_addiu(instr),
+            0x0A => self.op_slti(instr),
+            0x0B => self.op_sltiu(instr),
+            0x0C => self.op_andi(instr),
             0x0D => self.op_ori(instr),
+            0x0E => self.op_xori(instr),
             0x0F => self.op_lui(instr),
             0x10 => self.dispatch_cop0(instr, pc),
+            0x20 => self.op_lb(instr, bus),
+            0x21 => self.op_lh(instr, bus),
             0x23 => self.op_lw(instr, bus),
+            0x24 => self.op_lbu(instr, bus),
+            0x25 => self.op_lhu(instr, bus),
+            0x28 => self.op_sb(instr, bus),
+            0x29 => self.op_sh(instr, bus),
             0x2B => self.op_sw(instr, bus),
             _ => Err(ExecutionError::Unimplemented { opcode, pc, instr }),
         }
@@ -173,12 +191,25 @@ impl Cpu {
     fn dispatch_cop0(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
         let cop_op = ((instr >> 21) & 0x1F) as u8;
         match cop_op {
+            0x00 => self.op_mfc0(instr),
             0x04 => self.op_mtc0(instr),
+            0x10 => self.op_rfe(),
             _ => Err(ExecutionError::Unimplemented {
                 opcode: 0x10,
                 pc,
                 instr,
             }),
+        }
+    }
+
+    fn dispatch_regimm(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        match rt {
+            0x00 => self.op_bltz(instr, pc),
+            0x01 => self.op_bgez(instr, pc),
+            0x10 => self.op_bltzal(instr, pc),
+            0x11 => self.op_bgezal(instr, pc),
+            _ => Err(ExecutionError::Unimplemented { opcode: 0x01, pc, instr }),
         }
     }
 
@@ -196,7 +227,29 @@ impl Cpu {
         let funct = (instr & 0x3F) as u8;
         match funct {
             0x00 => self.op_sll(instr),
+            0x02 => self.op_srl(instr),
+            0x03 => self.op_sra(instr),
+            0x04 => self.op_sllv(instr),
+            0x06 => self.op_srlv(instr),
+            0x07 => self.op_srav(instr),
+            0x08 => self.op_jr(instr, pc),
+            0x09 => self.op_jalr(instr, pc),
+            0x10 => self.op_mfhi(instr),
+            0x11 => self.op_mthi(instr),
+            0x12 => self.op_mflo(instr),
+            0x13 => self.op_mtlo(instr),
+            0x18 => self.op_mult(instr),
+            0x19 => self.op_multu(instr),
+            0x1A => self.op_div(instr),
+            0x1B => self.op_divu(instr),
+            0x20 => self.op_add(instr),
+            0x21 => self.op_addu(instr),
+            0x22 => self.op_sub(instr),
+            0x23 => self.op_subu(instr),
+            0x24 => self.op_and(instr),
             0x25 => self.op_or(instr),
+            0x26 => self.op_xor(instr),
+            0x27 => self.op_nor(instr),
             0x2A => self.op_slt(instr),
             0x2B => self.op_sltu(instr),
             _ => Err(ExecutionError::UnimplementedSpecial { funct, pc, instr }),
@@ -252,6 +305,15 @@ impl Cpu {
         let rt = ((instr >> 16) & 0x1F) as u8;
         let rd = ((instr >> 11) & 0x1F) as u8;
         self.set_gpr(rd, self.gpr(rs) | self.gpr(rt));
+        Ok(())
+    }
+
+    /// `ADDU rd, rs, rt` — add unsigned (no overflow trap): `rd = rs + rt`.
+    fn op_addu(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.set_gpr(rd, self.gpr(rs).wrapping_add(self.gpr(rt)));
         Ok(())
     }
 
@@ -360,6 +422,360 @@ impl Cpu {
         Ok(())
     }
 
+    fn op_mfc0(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as usize;
+        if rt != 0 {
+            self.pending_load = Some((rt, self.cop0[rd]));
+        }
+        Ok(())
+    }
+
+    fn op_rfe(&mut self) -> Result<(), ExecutionError> {
+        // Restore previous interrupt enable/mode bits in SR.
+        let sr = self.cop0[12];
+        let restored = (sr & !0b1111) | ((sr >> 2) & 0b1111);
+        self.cop0[12] = restored;
+        Ok(())
+    }
+
+    fn op_jal(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        let target_field = instr & 0x03FF_FFFF;
+        let delay_slot_pc = pc.wrapping_add(4);
+        let target = (delay_slot_pc & 0xF000_0000) | (target_field << 2);
+        self.set_gpr(31, delay_slot_pc.wrapping_add(4));
+        self.pending_pc = Some(target);
+        Ok(())
+    }
+
+    fn op_jr(&mut self, instr: u32, _pc: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        self.pending_pc = Some(self.gpr(rs));
+        Ok(())
+    }
+
+    fn op_jalr(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        let target = self.gpr(rs);
+        self.set_gpr(rd, pc.wrapping_add(8));
+        self.pending_pc = Some(target);
+        Ok(())
+    }
+
+    fn op_blez(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        if (self.gpr(rs) as i32) <= 0 {
+            self.pending_pc = Some(branch_target(pc, instr));
+        }
+        Ok(())
+    }
+
+    fn op_bgtz(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        if (self.gpr(rs) as i32) > 0 {
+            self.pending_pc = Some(branch_target(pc, instr));
+        }
+        Ok(())
+    }
+
+    fn op_bltz(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        if (self.gpr(rs) as i32) < 0 {
+            self.pending_pc = Some(branch_target(pc, instr));
+        }
+        Ok(())
+    }
+
+    fn op_bgez(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        if (self.gpr(rs) as i32) >= 0 {
+            self.pending_pc = Some(branch_target(pc, instr));
+        }
+        Ok(())
+    }
+
+    fn op_bltzal(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        self.set_gpr(31, pc.wrapping_add(8));
+        if (self.gpr(rs) as i32) < 0 {
+            self.pending_pc = Some(branch_target(pc, instr));
+        }
+        Ok(())
+    }
+
+    fn op_bgezal(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        self.set_gpr(31, pc.wrapping_add(8));
+        if (self.gpr(rs) as i32) >= 0 {
+            self.pending_pc = Some(branch_target(pc, instr));
+        }
+        Ok(())
+    }
+
+    fn op_slti(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let imm = (instr as i16) as i32;
+        self.set_gpr(rt, ((self.gpr(rs) as i32) < imm) as u32);
+        Ok(())
+    }
+
+    fn op_sltiu(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let imm = (instr as i16) as i32 as u32;
+        self.set_gpr(rt, (self.gpr(rs) < imm) as u32);
+        Ok(())
+    }
+
+    fn op_andi(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let imm = instr & 0xFFFF;
+        self.set_gpr(rt, self.gpr(rs) & imm);
+        Ok(())
+    }
+
+    fn op_xori(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let imm = instr & 0xFFFF;
+        self.set_gpr(rt, self.gpr(rs) ^ imm);
+        Ok(())
+    }
+
+    fn op_lb(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        let value = bus.read8(addr) as i8 as i32 as u32;
+        if rt != 0 {
+            self.pending_load = Some((rt, value));
+        }
+        Ok(())
+    }
+
+    fn op_lbu(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        let value = bus.read8(addr) as u32;
+        if rt != 0 {
+            self.pending_load = Some((rt, value));
+        }
+        Ok(())
+    }
+
+    fn op_lh(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        let value = bus.read16(addr) as i16 as i32 as u32;
+        if rt != 0 {
+            self.pending_load = Some((rt, value));
+        }
+        Ok(())
+    }
+
+    fn op_lhu(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        let value = bus.read16(addr) as u32;
+        if rt != 0 {
+            self.pending_load = Some((rt, value));
+        }
+        Ok(())
+    }
+
+    fn op_sb(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        bus.write8(addr, self.gpr(rt) as u8);
+        Ok(())
+    }
+
+    fn op_sh(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        bus.write16(addr, self.gpr(rt) as u16);
+        Ok(())
+    }
+
+    fn op_srl(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        let sa = (instr >> 6) & 0x1F;
+        self.set_gpr(rd, self.gpr(rt) >> sa);
+        Ok(())
+    }
+
+    fn op_sra(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        let sa = (instr >> 6) & 0x1F;
+        self.set_gpr(rd, ((self.gpr(rt) as i32) >> sa) as u32);
+        Ok(())
+    }
+
+    fn op_sllv(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.set_gpr(rd, self.gpr(rt) << (self.gpr(rs) & 0x1F));
+        Ok(())
+    }
+
+    fn op_srlv(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.set_gpr(rd, self.gpr(rt) >> (self.gpr(rs) & 0x1F));
+        Ok(())
+    }
+
+    fn op_srav(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.set_gpr(rd, ((self.gpr(rt) as i32) >> (self.gpr(rs) & 0x1F)) as u32);
+        Ok(())
+    }
+
+    fn op_add(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        // TODO: trap on signed overflow. BIOS code doesn't overflow here.
+        self.op_addu(instr)
+    }
+
+    fn op_sub(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        // TODO: trap on signed overflow.
+        self.op_subu(instr)
+    }
+
+    fn op_subu(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.set_gpr(rd, self.gpr(rs).wrapping_sub(self.gpr(rt)));
+        Ok(())
+    }
+
+    fn op_and(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.set_gpr(rd, self.gpr(rs) & self.gpr(rt));
+        Ok(())
+    }
+
+    fn op_xor(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.set_gpr(rd, self.gpr(rs) ^ self.gpr(rt));
+        Ok(())
+    }
+
+    fn op_nor(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        self.set_gpr(rd, !(self.gpr(rs) | self.gpr(rt)));
+        Ok(())
+    }
+
+    fn op_mfhi(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        let hi = self.hi;
+        self.set_gpr(rd, hi);
+        Ok(())
+    }
+
+    fn op_mthi(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        self.hi = self.gpr(rs);
+        Ok(())
+    }
+
+    fn op_mflo(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        let lo = self.lo;
+        self.set_gpr(rd, lo);
+        Ok(())
+    }
+
+    fn op_mtlo(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        self.lo = self.gpr(rs);
+        Ok(())
+    }
+
+    fn op_mult(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let result = (self.gpr(rs) as i32 as i64) * (self.gpr(rt) as i32 as i64);
+        self.hi = (result >> 32) as u32;
+        self.lo = result as u32;
+        Ok(())
+    }
+
+    fn op_multu(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let result = (self.gpr(rs) as u64) * (self.gpr(rt) as u64);
+        self.hi = (result >> 32) as u32;
+        self.lo = result as u32;
+        Ok(())
+    }
+
+    fn op_div(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let n = self.gpr(rs) as i32;
+        let d = self.gpr(rt) as i32;
+        if d == 0 {
+            self.hi = n as u32;
+            self.lo = if n < 0 { 1 } else { u32::MAX };
+        } else if n == i32::MIN && d == -1 {
+            self.hi = 0;
+            self.lo = i32::MIN as u32;
+        } else {
+            self.hi = (n % d) as u32;
+            self.lo = (n / d) as u32;
+        }
+        Ok(())
+    }
+
+    fn op_divu(&mut self, instr: u32) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let n = self.gpr(rs);
+        let d = self.gpr(rt);
+        if d == 0 {
+            self.hi = n;
+            self.lo = u32::MAX;
+        } else {
+            self.hi = n % d;
+            self.lo = n / d;
+        }
+        Ok(())
+    }
+
     /// COP0 SR bit 16 (IsC). When set, D-cache is isolated from memory
     /// and loads/stores don't reach RAM.
     #[inline]
@@ -442,14 +858,14 @@ mod tests {
 
     #[test]
     fn unimplemented_opcode_returns_structured_error() {
-        // opcode 0x01 = REGIMM (BLTZ/BGEZ family); not implemented yet.
-        // Encoding: 0x04000000 = (0x01 << 26) | 0.
-        let mut bus = Bus::new(synthetic_bios_with_first_word(0x0400_0000)).unwrap();
+        // opcode 0x22 = LWL (Load Word Left); genuine R3000 opcode we
+        // haven't decoded yet. Encoding: 0x88000000 = (0x22 << 26) | 0.
+        let mut bus = Bus::new(synthetic_bios_with_first_word(0x8800_0000)).unwrap();
         let mut cpu = Cpu::new();
         let err = cpu.step(&mut bus).unwrap_err();
         assert!(matches!(
             err,
-            ExecutionError::Unimplemented { opcode: 0x01, .. }
+            ExecutionError::Unimplemented { opcode: 0x22, .. }
         ));
     }
 
