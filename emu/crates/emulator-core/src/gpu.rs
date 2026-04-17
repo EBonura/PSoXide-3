@@ -32,6 +32,10 @@ pub struct Gpu {
     /// Number of words the current packet expects in total (including
     /// the first/opcode word). `0` means "no packet in progress".
     gp0_expected: usize,
+    /// Total GP0 writes the GPU has received since reset — diagnostic
+    /// for `examples/smoke_draw` and the frontend HUD, tells us whether
+    /// software has actually started shipping commands.
+    gp0_write_count: u64,
 }
 
 impl Gpu {
@@ -43,7 +47,13 @@ impl Gpu {
             status: GpuStatus::new(),
             gp0_fifo: Vec::with_capacity(12),
             gp0_expected: 0,
+            gp0_write_count: 0,
         }
+    }
+
+    /// Total GP0 writes received since reset. Diagnostic counter.
+    pub fn gp0_write_count(&self) -> u64 {
+        self.gp0_write_count
     }
 
     /// Dispatch an MMIO read inside the GPU window. Returns `Some` for
@@ -73,9 +83,17 @@ impl Gpu {
         }
     }
 
+    /// Feed one 32-bit word to the GP0 packet assembler. Public so DMA
+    /// channel 2 can ship words through the same path CPU-direct writes
+    /// take.
+    pub fn gp0_push(&mut self, word: u32) {
+        self.gp0_write(word);
+    }
+
     /// Feed one 32-bit word to the GP0 packet assembler. If this word
     /// completes a packet, the packet is executed and the FIFO clears.
     fn gp0_write(&mut self, word: u32) {
+        self.gp0_write_count += 1;
         if self.gp0_expected == 0 {
             let op = (word >> 24) & 0xFF;
             self.gp0_expected = gp0_packet_size(op as u8);

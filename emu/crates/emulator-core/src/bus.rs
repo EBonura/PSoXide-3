@@ -162,18 +162,97 @@ impl Bus {
         &mut self.irq
     }
 
+    /// Diagnostic: per-channel count of CHCR writes with the start
+    /// bit set since reset. Index 0..=6 corresponds to MDEC-in,
+    /// MDEC-out, GPU, CD-ROM, SPU, PIO, OTC.
+    pub fn dma_start_triggers(&self) -> [u64; 7] {
+        self.dma.start_trigger_counts
+    }
+
     /// True when some source is both pending in `I_STAT` and enabled
     /// in `I_MASK`. The CPU mirrors this into `COP0.CAUSE.IP[2]`.
     pub fn external_interrupt_pending(&self) -> bool {
         self.irq.pending()
     }
 
-    /// Run any DMA channels whose start bit was just set. Only OTC
-    /// (channel 6) transfers self-contained right now; GPU, SPU,
-    /// CD-ROM, and MDEC channels need their consumer subsystems to
-    /// come online first.
+    /// Run any DMA channels whose start bit was just set.
+    /// - Channel 6 (OTC) fills the ordering table in RAM.
+    /// - Channel 2 (GPU) ships command words from RAM to the GPU's GP0 port.
+    /// - Other channels need their consumer subsystems online first.
     fn maybe_run_dma(&mut self) {
         self.dma.run_otc(&mut self.ram[..]);
+        self.run_dma_gpu();
+    }
+
+    /// Execute DMA channel 2 → GPU (GP0). Supports the two sync modes
+    /// the BIOS + games actually use for this channel:
+    ///
+    /// - **Mode 1 (block)**: Ship `BS × BA` words starting at
+    ///   `MADR` straight into GP0, with the `MADR` step direction
+    ///   given by CHCR bit 1 (+4 or -4). PS1 always uses +4 direction
+    ///   for CPU→GPU.
+    /// - **Mode 2 (linked list)**: Walk a chain of packets in RAM.
+    ///   Each node header is `[NN AAAAAA]` — top byte = word count
+    ///   (following 32-bit words to ship to GP0), low 24 bits = next
+    ///   node address. Terminator is `AAAAAA == 0xFFFFFF`.
+    ///
+    /// Both variants clear `CHCR.start` + `busy` bits on completion
+    /// so BIOS polling sees "done".
+    fn run_dma_gpu(&mut self) {
+        let ch = &self.dma.channels[2];
+        if (ch.channel_control >> 24) & 1 == 0 {
+            return;
+        }
+        let sync_mode = (ch.channel_control >> 9) & 0x3;
+        match sync_mode {
+            1 => self.dma_gpu_block(),
+            2 => self.dma_gpu_linked_list(),
+            _ => {
+                // Manual (0) + prohibited (3) — nothing standard uses
+                // them for the GPU channel. Drop the trigger silently.
+            }
+        }
+        let ch = &mut self.dma.channels[2];
+        ch.channel_control &= !((1 << 24) | (1 << 28));
+    }
+
+    fn dma_gpu_block(&mut self) {
+        let ch = self.dma.channels[2];
+        let mut addr = ch.base & 0x001F_FFFC;
+        let bcr = ch.block_control;
+        let block_size = bcr & 0xFFFF;
+        let block_count = (bcr >> 16) & 0xFFFF;
+        let total_words = block_size * block_count.max(1);
+        let step = if (ch.channel_control >> 1) & 1 != 0 {
+            // Decrement mode — rarely used for GPU but handle for safety.
+            0xFFFF_FFFCu32
+        } else {
+            4
+        };
+        for _ in 0..total_words {
+            let word = read_ram_u32(&self.ram[..], addr);
+            self.gpu.gp0_push(word);
+            addr = addr.wrapping_add(step);
+        }
+    }
+
+    fn dma_gpu_linked_list(&mut self) {
+        let mut addr = self.dma.channels[2].base & 0x001F_FFFC;
+        // Bound the walk so a malformed list can't spin forever.
+        for _ in 0..0x100_0000 {
+            let header = read_ram_u32(&self.ram[..], addr);
+            let word_count = (header >> 24) & 0xFF;
+            for i in 0..word_count {
+                let word_addr = addr.wrapping_add(4 + i * 4);
+                let word = read_ram_u32(&self.ram[..], word_addr);
+                self.gpu.gp0_push(word);
+            }
+            let next = header & 0x00FF_FFFF;
+            if next == 0x00FF_FFFF {
+                return;
+            }
+            addr = next;
+        }
     }
 
     /// Non-panicking byte read. Returns `None` for addresses outside
@@ -499,6 +578,18 @@ impl Bus {
 
 fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// Word read from a RAM slice at a physical RAM offset (already masked
+/// to the 2 MiB range). Used by the DMA-GPU paths to pull command
+/// words without going through the full bus dispatch.
+fn read_ram_u32(ram: &[u8], phys: u32) -> u32 {
+    let offset = (phys & 0x001F_FFFF) as usize;
+    if offset + 4 <= ram.len() {
+        u32::from_le_bytes([ram[offset], ram[offset + 1], ram[offset + 2], ram[offset + 3]])
+    } else {
+        0
+    }
 }
 
 fn zeroed_box<const N: usize>() -> Box<[u8; N]> {

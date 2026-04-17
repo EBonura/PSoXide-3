@@ -285,12 +285,16 @@ impl Cpu {
             0x10 => self.dispatch_cop0(instr, pc),
             0x20 => self.op_lb(instr, bus),
             0x21 => self.op_lh(instr, bus),
+            0x22 => self.op_lwl(instr, bus),
             0x23 => self.op_lw(instr, bus),
             0x24 => self.op_lbu(instr, bus),
             0x25 => self.op_lhu(instr, bus),
+            0x26 => self.op_lwr(instr, bus),
             0x28 => self.op_sb(instr, bus),
             0x29 => self.op_sh(instr, bus),
+            0x2A => self.op_swl(instr, bus),
             0x2B => self.op_sw(instr, bus),
+            0x2E => self.op_swr(instr, bus),
             _ => Err(ExecutionError::Unimplemented { opcode, pc, instr }),
         }
     }
@@ -731,6 +735,111 @@ impl Cpu {
         let addr = self.gpr(rs).wrapping_add(offset);
         bus.write16(addr, self.gpr(rt) as u16);
         Ok(())
+    }
+
+    /// `LWL rt, offset(rs)` — Load Word Left. Together with `LWR`,
+    /// loads a 32-bit word that may be unaligned. LWL reads the word
+    /// containing `addr` and merges its high-order bytes into `rt`
+    /// from the top down.
+    ///
+    /// Canonical memcpy use: `LWL rt, 3(rs)` + `LWR rt, 0(rs)`
+    /// loads 4 bytes from `rs..rs+4` regardless of alignment.
+    ///
+    /// Also: LWL/LWR preserve bytes in the destination they don't
+    /// overwrite, so the delay-slot value of `rt` matters — the
+    /// previous instruction's committing load gets **merged**, not
+    /// squashed (the opposite of non-load writes). Redux's model
+    /// peeks at the staged `rt` via the pending-load slot.
+    fn op_lwl(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        let aligned = addr & !3;
+        let word = bus.read32(aligned);
+        // If there's a pending-commit load for the same register, see
+        // its staged value instead of the current register file —
+        // that's what matches hardware's LWL-LWR-merge convention.
+        let current = self.staged_gpr(rt);
+        let shift = (addr & 3) * 8;
+        let merged = (current & !(0xFFFF_FFFFu32 << shift)) | (word << shift);
+        if rt != 0 {
+            self.pending_load = Some((rt, merged));
+        }
+        Ok(())
+    }
+
+    /// `LWR rt, offset(rs)` — Load Word Right. Mirror of LWL; merges
+    /// the low-order bytes of the word containing `addr` into `rt`.
+    fn op_lwr(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        let aligned = addr & !3;
+        let word = bus.read32(aligned);
+        let current = self.staged_gpr(rt);
+        let shift = (addr & 3) * 8;
+        let mask = 0xFFFF_FFFFu32 >> (24 - shift);
+        let merged = (current & !(0xFFFF_FFFFu32 >> shift)) | (word >> shift);
+        let _ = mask; // the mask form above is equivalent to the >> chain used
+        if rt != 0 {
+            self.pending_load = Some((rt, merged));
+        }
+        Ok(())
+    }
+
+    /// `SWL rt, offset(rs)` — Store Word Left. Mirror of LWL on the
+    /// store side. Writes `rt`'s high bytes into the word containing
+    /// `addr`, preserving the lower bytes of the memory word.
+    fn op_swl(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        let aligned = addr & !3;
+        let mem = bus.read32(aligned);
+        let reg = self.gpr(rt);
+        let shift = (addr & 3) * 8;
+        let merged = (mem & !(0xFFFF_FFFFu32 >> (24 - shift))) | (reg >> (24 - shift));
+        bus.write32(aligned, merged);
+        Ok(())
+    }
+
+    /// `SWR rt, offset(rs)` — Store Word Right. Mirror of LWR on the
+    /// store side.
+    fn op_swr(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let offset = (instr as i16) as i32 as u32;
+        let addr = self.gpr(rs).wrapping_add(offset);
+        let aligned = addr & !3;
+        let mem = bus.read32(aligned);
+        let reg = self.gpr(rt);
+        let shift = (addr & 3) * 8;
+        let merged = (mem & !(0xFFFF_FFFFu32 << shift)) | (reg << shift);
+        bus.write32(aligned, merged);
+        Ok(())
+    }
+
+    /// Return the register value that would be seen by an LWL/LWR
+    /// merge: prefer the staged (`committing_load`) value if one is
+    /// pending for this register, else the current register file.
+    /// Matches R3000 hardware behaviour where LWL and LWR merge with
+    /// a load delay they share with each other.
+    fn staged_gpr(&self, index: u8) -> u32 {
+        if let Some((reg, value)) = &self.committing_load {
+            if *reg == index {
+                return *value;
+            }
+        }
+        self.gpr(index)
     }
 
     fn op_srl(&mut self, instr: u32) -> Result<(), ExecutionError> {

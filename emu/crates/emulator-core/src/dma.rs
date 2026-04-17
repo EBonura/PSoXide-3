@@ -58,6 +58,10 @@ pub struct Dma {
     pub dpcr: u32,
     /// `DICR` — DMA Interrupt Register (IRQ enable + pending bits).
     pub dicr: u32,
+    /// Per-channel count of CHCR writes with the start bit set.
+    /// Diagnostic only — tells us which channels software is using
+    /// and how often. Cleared on `new()`, never decremented.
+    pub start_trigger_counts: [u64; NUM_CHANNELS],
 }
 
 impl Dma {
@@ -80,6 +84,7 @@ impl Dma {
             channels: [DmaChannel::default(); NUM_CHANNELS],
             dpcr: 0,
             dicr: 0,
+            start_trigger_counts: [0; NUM_CHANNELS],
         }
     }
 
@@ -128,7 +133,12 @@ impl Dma {
                 match field {
                     0x0 => c.base = value & 0x00FF_FFFF,
                     0x4 => c.block_control = value,
-                    0x8 => c.channel_control = value,
+                    0x8 => {
+                        c.channel_control = value;
+                        if (value >> 24) & 1 != 0 {
+                            self.start_trigger_counts[ch] += 1;
+                        }
+                    }
                     _ => {}
                 }
             }
