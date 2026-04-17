@@ -78,6 +78,16 @@ fn main() {
     println!("I_STAT           = 0x{i_stat:08x}");
     println!("I_MASK           = 0x{i_mask:08x}");
 
+    let da = bus.gpu.display_area();
+    println!(
+        "display area     = {}×{} at ({},{}){}",
+        da.width,
+        da.height,
+        da.x,
+        da.y,
+        if da.bpp24 { " · 24bpp" } else { "" }
+    );
+
     // Top 10 PCs in the sampled window.
     println!("\n=== top PCs in last 1% of run ===");
     let mut top: Vec<(u32, u32)> = pc_hits.iter().map(|(k, v)| (*k, *v)).collect();
