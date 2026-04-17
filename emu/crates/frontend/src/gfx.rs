@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use emulator_core::{Vram, VRAM_HEIGHT, VRAM_WIDTH};
 use winit::window::Window;
 
 /// All GPU / windowing state. Built lazily in `App::resumed` because
@@ -21,6 +22,13 @@ pub struct Graphics {
     pub egui_ctx: egui::Context,
     pub egui_winit: egui_winit::State,
     pub egui_renderer: egui_wgpu::Renderer,
+
+    /// Persistent 1024×512 RGBA8 texture that mirrors VRAM for display.
+    /// Uploaded once per frame in `prepare_vram`.
+    vram_texture: wgpu::Texture,
+    /// Egui-side handle for the VRAM texture; panels reference it via
+    /// [`Graphics::vram_texture_id`].
+    vram_texture_id: egui::TextureId,
 }
 
 impl Graphics {
@@ -73,7 +81,26 @@ impl Graphics {
             None,
             None,
         );
-        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+        let mut egui_renderer =
+            egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+
+        let vram_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("psoxide3-vram"),
+            size: wgpu::Extent3d {
+                width: VRAM_WIDTH as u32,
+                height: VRAM_HEIGHT as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let vram_view = vram_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let vram_texture_id =
+            egui_renderer.register_native_texture(&device, &vram_view, wgpu::FilterMode::Nearest);
 
         Self {
             window,
@@ -84,7 +111,40 @@ impl Graphics {
             egui_ctx,
             egui_winit,
             egui_renderer,
+            vram_texture,
+            vram_texture_id,
         }
+    }
+
+    /// Egui handle for the VRAM texture. Stable for the life of the
+    /// window; safe to pass to panels once per frame.
+    pub fn vram_texture_id(&self) -> egui::TextureId {
+        self.vram_texture_id
+    }
+
+    /// Upload a full VRAM snapshot to the GPU-side texture. Called once
+    /// per frame from `App` before `render`.
+    pub fn prepare_vram(&self, vram: &Vram) {
+        let rgba = vram.to_rgba8(0, 0, VRAM_WIDTH as u16, VRAM_HEIGHT as u16);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.vram_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(VRAM_WIDTH as u32 * 4),
+                rows_per_image: Some(VRAM_HEIGHT as u32),
+            },
+            wgpu::Extent3d {
+                width: VRAM_WIDTH as u32,
+                height: VRAM_HEIGHT as u32,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {

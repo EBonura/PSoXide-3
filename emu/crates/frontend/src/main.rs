@@ -76,7 +76,9 @@ impl ApplicationHandler for Shell {
             }
             WindowEvent::RedrawRequested => {
                 let state = &mut self.state;
-                gfx.render(|ctx| app::build_ui(ctx, state));
+                gfx.prepare_vram(&state.vram);
+                let vram_tex = gfx.vram_texture_id();
+                gfx.render(|ctx| app::build_ui(ctx, state, vram_tex));
             }
             _ => {
                 if !consumed {
