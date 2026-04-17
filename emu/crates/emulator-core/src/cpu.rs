@@ -102,6 +102,37 @@ impl Cpu {
         self.gprs[(index & 31) as usize]
     }
 
+    /// All 32 general-purpose registers. Useful for UI snapshots.
+    #[inline]
+    pub fn gprs(&self) -> &[u32; 32] {
+        &self.gprs
+    }
+
+    /// COP0 register file — System Control coprocessor state (SR, Cause,
+    /// EPC, BadVAddr, …).
+    #[inline]
+    pub fn cop0(&self) -> &[u32; 32] {
+        &self.cop0
+    }
+
+    /// HI half of the multiply/divide result register.
+    #[inline]
+    pub fn hi(&self) -> u32 {
+        self.hi
+    }
+
+    /// LO half of the multiply/divide result register.
+    #[inline]
+    pub fn lo(&self) -> u32 {
+        self.lo
+    }
+
+    /// Retired-instruction counter since reset.
+    #[inline]
+    pub fn tick(&self) -> u64 {
+        self.tick
+    }
+
     /// Write a general-purpose register, enforcing the MIPS invariant
     /// that `$0` is hardwired to zero.
     #[inline]
