@@ -85,6 +85,11 @@ pub struct Gpu {
     /// decode VRAM as 15bpp; when this flag comes into play the
     /// frontend's framebuffer view can respect it.
     display_24bpp: bool,
+
+    /// Count of executed GP0 packets by opcode byte (the high 8 bits
+    /// of the header word). Diagnostic only — lets `smoke_draw` see at
+    /// a glance which primitive types the BIOS is issuing.
+    gp0_opcode_hist: [u32; 256],
 }
 
 /// Public snapshot of the GPU's display configuration, read by the
@@ -151,7 +156,14 @@ impl Gpu {
             display_24bpp: false,
             vram_download: None,
             gpuread_latch: 0,
+            gp0_opcode_hist: [0; 256],
         }
+    }
+
+    /// Snapshot of the GP0 opcode histogram — per-byte count of
+    /// executed packets keyed by high-byte of word 0. Diagnostic.
+    pub fn gp0_opcode_histogram(&self) -> [u32; 256] {
+        self.gp0_opcode_hist
     }
 
     /// Snapshot of the currently-configured display area, for the
@@ -435,6 +447,8 @@ impl Gpu {
     /// in `gp0_fifo`. Dispatches on the opcode in word 0.
     fn execute_gp0_packet(&mut self) {
         let op = (self.gp0_fifo[0] >> 24) & 0xFF;
+        self.gp0_opcode_hist[op as usize] =
+            self.gp0_opcode_hist[op as usize].saturating_add(1);
         match op {
             // Monochrome fill rect (ignores draw area / offset).
             0x02 => self.fill_rect(),
@@ -469,8 +483,40 @@ impl Gpu {
             // VRAM→CPU transfer — 3 words of setup, pixel words are
             // then pulled by the CPU via GPUREAD.
             0xC0 => self.begin_vram_download(),
-            // VRAM→VRAM copy — not rasterized yet.
+            // VRAM→VRAM copy — source rect blitted to dest rect.
+            0x80..=0x9F => self.vram_to_vram_copy(),
             _ => {}
+        }
+    }
+
+    /// GP0 0x80 — copy a rectangle of VRAM to another VRAM location.
+    /// Packet: `[cmd, src_xy, dst_xy, wh]`. PS1 hardware masks the
+    /// coordinates to VRAM size and wraps at the edges; our `get_pixel`
+    /// / `set_pixel` already do that, so a simple double loop suffices.
+    /// We buffer the source row into a temp so that overlapping
+    /// src/dst rects blit correctly.
+    fn vram_to_vram_copy(&mut self) {
+        let src_word = self.gp0_fifo[1];
+        let dst_word = self.gp0_fifo[2];
+        let wh_word = self.gp0_fifo[3];
+        let sx = (src_word & 0xFFFF) as u16;
+        let sy = ((src_word >> 16) & 0xFFFF) as u16;
+        let dx = (dst_word & 0xFFFF) as u16;
+        let dy = ((dst_word >> 16) & 0xFFFF) as u16;
+        // Width / height: 0 → 1024 / 512 (mask-and-wrap convention).
+        let raw_w = (wh_word & 0xFFFF) as u16;
+        let raw_h = ((wh_word >> 16) & 0xFFFF) as u16;
+        let w = if raw_w == 0 { 1024 } else { raw_w };
+        let h = if raw_h == 0 { 512 } else { raw_h };
+        let mut row = vec![0u16; w as usize];
+        for dy_off in 0..h {
+            for dx_off in 0..w {
+                row[dx_off as usize] = self.vram.get_pixel(sx + dx_off, sy + dy_off);
+            }
+            for dx_off in 0..w {
+                self.vram
+                    .set_pixel(dx + dx_off, dy + dy_off, row[dx_off as usize]);
+            }
         }
     }
 

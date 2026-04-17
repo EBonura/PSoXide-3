@@ -87,6 +87,41 @@ fn main() {
         if da.bpp24 { " · 24bpp" } else { "" }
     );
 
+    let gp0_hist = bus.gpu.gp0_opcode_histogram();
+    let nonzero_gp0: Vec<(usize, u32)> = gp0_hist
+        .iter()
+        .enumerate()
+        .filter_map(|(op, &c)| if c > 0 { Some((op, c)) } else { None })
+        .collect();
+    if !nonzero_gp0.is_empty() {
+        println!("GP0 opcode histogram (op: count):");
+        for (op, c) in &nonzero_gp0 {
+            let name = match *op as u8 {
+                0x00 => "nop",
+                0x01 => "clear-cache",
+                0x02 => "fill-rect",
+                0x20..=0x23 => "mono-tri",
+                0x24..=0x27 => "textured-tri",
+                0x28..=0x2B => "mono-quad",
+                0x2C..=0x2F => "textured-quad",
+                0x30..=0x33 => "shaded-tri",
+                0x38..=0x3B => "shaded-quad",
+                0x60..=0x7F => "rect",
+                0x80..=0x9F => "vram-blit",
+                0xA0..=0xBF => "cpu->vram",
+                0xC0..=0xDF => "vram->cpu",
+                0xE1 => "draw-mode",
+                0xE2 => "tex-window",
+                0xE3 => "draw-area-tl",
+                0xE4 => "draw-area-br",
+                0xE5 => "draw-offset",
+                0xE6 => "mask-bit",
+                _ => "?",
+            };
+            println!("  0x{op:02X} {name:<14} {c}");
+        }
+    }
+
     // Top 10 PCs in the sampled window.
     println!("\n=== top PCs in last 1% of run ===");
     let mut top: Vec<(u32, u32)> = pc_hits.iter().map(|(k, v)| (*k, *v)).collect();
@@ -165,6 +200,16 @@ fn main() {
     let nz = vram.words().iter().filter(|&&w| w != 0).count();
     println!("\nVRAM non-zero    = {nz} / {} words", 1024 * 512);
 
+    // Dump VRAM if the caller asked via the env var. Keeps the default
+    // smoke_draw invocation fast / output-free, but lets us actually
+    // see what the BIOS is drawing when we want to.
+    if let Ok(path) = std::env::var("PSOXIDE_VRAM_DUMP") {
+        match dump_vram_ppm(vram, &path) {
+            Ok(()) => println!("VRAM dumped to   = {path}"),
+            Err(e) => eprintln!("VRAM dump failed = {e}"),
+        }
+    }
+
     if nz > 0 {
         let colors: std::collections::BTreeSet<u16> =
             vram.words().iter().copied().filter(|&w| w != 0).collect();
@@ -218,4 +263,28 @@ fn read32(bus: &Bus, addr: u32) -> Option<u32> {
     let b2 = bus.try_read8(addr.wrapping_add(2))? as u32;
     let b3 = bus.try_read8(addr.wrapping_add(3))? as u32;
     Some(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+
+/// Dump full 1024×512 VRAM to a binary PPM at `path`. PPM is header +
+/// raw RGB — every image viewer (Preview, feh, `open`, etc.) opens it
+/// with no extra deps. 15bpp → 8bpp uses the `(v << 3) | (v >> 2)`
+/// expansion to reach full 0..=255 range.
+#[allow(dead_code)]
+fn dump_vram_ppm(vram: &emulator_core::Vram, path: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let w = emulator_core::VRAM_WIDTH;
+    let h = emulator_core::VRAM_HEIGHT;
+    let mut file = std::fs::File::create(path)?;
+    writeln!(file, "P6\n{w} {h}\n255")?;
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for &pix in vram.words() {
+        let r5 = (pix & 0x1F) as u8;
+        let g5 = ((pix >> 5) & 0x1F) as u8;
+        let b5 = ((pix >> 10) & 0x1F) as u8;
+        rgb.push((r5 << 3) | (r5 >> 2));
+        rgb.push((g5 << 3) | (g5 >> 2));
+        rgb.push((b5 << 3) | (b5 >> 2));
+    }
+    file.write_all(&rgb)?;
+    Ok(())
 }
