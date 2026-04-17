@@ -39,6 +39,8 @@ pub enum MenuAction {
     FillVramTestPattern,
     /// Toggle visibility of the register side panel.
     ToggleRegisters,
+    /// Toggle visibility of the memory viewer panel.
+    ToggleMemory,
     /// Toggle visibility of the VRAM bottom panel.
     ToggleVram,
     /// Toggle visibility of the HUD overlay.
@@ -123,6 +125,11 @@ impl MenuState {
                     MenuItem {
                         label: "Toggle registers panel",
                         action: MenuAction::ToggleRegisters,
+                        value: None,
+                    },
+                    MenuItem {
+                        label: "Toggle memory panel",
+                        action: MenuAction::ToggleMemory,
                         value: None,
                     },
                     MenuItem {

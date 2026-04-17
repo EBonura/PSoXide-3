@@ -11,6 +11,7 @@ use psx_trace::InstructionRecord;
 
 use crate::ui;
 use crate::ui::hud::HudState;
+use crate::ui::memory::MemoryView;
 use crate::ui::menu::MenuState;
 
 /// Ring-buffer capacity for the execution-history panel. 64 rows fits
@@ -26,6 +27,7 @@ const DEFAULT_BIOS: &str = "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PanelVisibility {
     pub registers: bool,
+    pub memory: bool,
     pub vram: bool,
     pub hud: bool,
 }
@@ -34,6 +36,7 @@ impl Default for PanelVisibility {
     fn default() -> Self {
         Self {
             registers: true,
+            memory: false,
             vram: true,
             hud: true,
         }
@@ -53,6 +56,7 @@ pub struct AppState {
     pub vram: Vram,
     pub menu: MenuState,
     pub hud: HudState,
+    pub memory_view: MemoryView,
     /// When true, the shell drives `cpu.step` at `run_steps_per_frame`
     /// instructions per redraw. Toggled via the Menu's Run/Pause item.
     pub running: bool,
@@ -75,6 +79,7 @@ impl Default for AppState {
             vram: Vram::new(),
             menu: MenuState::new(),
             hud: HudState::default(),
+            memory_view: MemoryView::default(),
             running: false,
             run_steps_per_frame: 100_000,
             exec_history: VecDeque::with_capacity(EXEC_HISTORY_CAP),

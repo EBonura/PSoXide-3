@@ -6,6 +6,7 @@
 //! then free-floating overlays (Menu, HUD) on top.
 
 pub mod hud;
+pub mod memory;
 pub mod registers;
 pub mod vram;
 pub mod menu;
@@ -23,6 +24,9 @@ pub fn draw_layout(
 
     if state.panels.registers {
         registers::draw(ctx, &state.cpu, &state.exec_history);
+    }
+    if state.panels.memory {
+        memory::draw(ctx, &mut state.memory_view, state.bus.as_ref(), &state.cpu);
     }
     if state.panels.vram {
         vram::draw(ctx, vram_tex);
@@ -77,6 +81,10 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
         }
         ToggleRegisters => {
             state.panels.registers = !state.panels.registers;
+            MenuOutcome::None
+        }
+        ToggleMemory => {
+            state.panels.memory = !state.panels.memory;
             MenuOutcome::None
         }
         ToggleVram => {
