@@ -56,7 +56,7 @@ pub fn draw(
             theme::viz_frame(ui, "Memory", |ui| {
                 draw_header(ui, view, cpu, breakpoints);
                 ui.separator();
-                draw_dump(ui, view, bus, breakpoints);
+                draw_dump(ui, view, bus, breakpoints, cpu.pc());
             });
         });
 }
@@ -130,6 +130,7 @@ fn draw_dump(
     view: &MemoryView,
     bus: Option<&Bus>,
     breakpoints: &BTreeSet<u32>,
+    pc: u32,
 ) {
     let Some(bus) = bus else {
         ui.monospace("(no BIOS loaded — Bus unavailable)");
@@ -142,12 +143,20 @@ fn draw_dump(
             for row in 0..ROWS {
                 let row_addr = view.addr.wrapping_add(row as u32 * BYTES_PER_ROW as u32);
                 let has_bp = row_has_breakpoint(row_addr, breakpoints);
-                let text = format_row(bus, row_addr, has_bp);
-                if has_bp {
-                    ui.monospace(egui::RichText::new(text).color(theme::ACCENT));
-                } else {
-                    ui.monospace(text);
-                }
+                let has_pc = row_contains(row_addr, pc);
+                let text = format_row(bus, row_addr, has_bp, has_pc);
+
+                let color = match (has_pc, has_bp) {
+                    // PC wins over BP — the arrow marker is the one we
+                    // most want to eyeball.
+                    (true, _) => Some(egui::Color32::from_rgb(80, 200, 120)),
+                    (false, true) => Some(theme::ACCENT),
+                    (false, false) => None,
+                };
+                match color {
+                    Some(c) => ui.monospace(egui::RichText::new(text).color(c)),
+                    None => ui.monospace(text),
+                };
                 if row_addr.wrapping_add(BYTES_PER_ROW as u32) < row_addr {
                     break;
                 }
@@ -165,8 +174,19 @@ fn row_has_breakpoint(base: u32, breakpoints: &BTreeSet<u32>) -> bool {
     false
 }
 
-fn format_row(bus: &Bus, base: u32, has_bp: bool) -> String {
-    let marker = if has_bp { '●' } else { ' ' };
+fn row_contains(base: u32, addr: u32) -> bool {
+    addr.wrapping_sub(base) < BYTES_PER_ROW as u32
+}
+
+fn format_row(bus: &Bus, base: u32, has_bp: bool, has_pc: bool) -> String {
+    // Markers: `▸` for PC row, `●` for breakpoint row. PC wins since
+    // knowing where execution is now is more urgent than which
+    // addresses we've decided to stop on.
+    let marker = match (has_pc, has_bp) {
+        (true, _) => '▸',
+        (false, true) => '●',
+        (false, false) => ' ',
+    };
     let mut out = format!("{marker} {base:08X}  ");
     let mut ascii = String::with_capacity(BYTES_PER_ROW);
 
