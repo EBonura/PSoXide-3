@@ -8,6 +8,7 @@ use psx_hw::memory::{self, to_physical};
 use thiserror::Error;
 
 use crate::irq::Irq;
+use crate::timers::Timers;
 
 /// Physical address of `I_STAT` (interrupt status / ack register).
 const IRQ_STAT_ADDR: u32 = 0x1F80_1070;
@@ -41,6 +42,9 @@ pub struct Bus {
     /// dispatch below and queried by the CPU each step to update
     /// `COP0.CAUSE.IP[2]`.
     irq: Irq,
+    /// Root counters (Timer 0 / 1 / 2). Phase 2e is register-backing
+    /// only; ticking lands with the cycle model.
+    timers: Timers,
 }
 
 impl Bus {
@@ -66,6 +70,7 @@ impl Bus {
             scratchpad: zeroed_box(),
             io: zeroed_box(),
             irq: Irq::new(),
+            timers: Timers::new(),
         })
     }
 
@@ -225,6 +230,9 @@ impl Bus {
         if phys == IRQ_MASK_ADDR {
             return self.irq.mask();
         }
+        if Timers::contains(phys) {
+            return self.timers.read32(phys);
+        }
 
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             let offset = (phys - memory::io::BASE) as usize;
@@ -257,6 +265,10 @@ impl Bus {
         }
         if phys == IRQ_MASK_ADDR {
             self.irq.write_mask(value);
+            return;
+        }
+        if Timers::contains(phys) {
+            self.timers.write32(phys, value);
             return;
         }
 
