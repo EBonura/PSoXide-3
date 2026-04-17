@@ -57,6 +57,11 @@ pub struct Bus {
     /// SPU — phase 3a scope: just `SPUCNT` + `SPUSTAT`. Everything
     /// else SPU-related still round-trips through the echo buffer.
     spu: Spu,
+    /// Cumulative CPU cycles retired since reset. Fed by `Cpu::step`
+    /// via [`Bus::tick`]. Peripherals read this to schedule events
+    /// (VBlank, timer ticks, DMA completion). Phase 4a just counts;
+    /// Phase 4b starts firing IRQs off it.
+    cycles: u64,
 }
 
 impl Bus {
@@ -86,7 +91,20 @@ impl Bus {
             dma: Dma::new(),
             gpu: Gpu::new(),
             spu: Spu::new(),
+            cycles: 0,
         })
+    }
+
+    /// Advance the cycle counter by `n` cycles. Called once per
+    /// instruction from `Cpu::step`. In phase 4a this is pure
+    /// accounting; phase 4b starts raising scheduled IRQs here.
+    pub fn tick(&mut self, n: u32) {
+        self.cycles = self.cycles.wrapping_add(n as u64);
+    }
+
+    /// Cumulative cycles since reset.
+    pub fn cycles(&self) -> u64 {
+        self.cycles
     }
 
     /// Borrow the interrupt controller — caller can `.raise()` sources
