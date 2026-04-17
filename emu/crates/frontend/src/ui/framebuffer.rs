@@ -13,29 +13,51 @@
 //! we pull the rectangle from `bus.gpu`. Until then, `_bus` is
 //! accepted as a hook for that migration.
 
-use emulator_core::{Bus, VRAM_HEIGHT, VRAM_WIDTH};
+use emulator_core::{Bus, DisplayArea, VRAM_HEIGHT, VRAM_WIDTH};
 
 use crate::theme;
 use crate::ui::vram as vram_panel;
 
-const FB_WIDTH: f32 = 320.0;
-const FB_HEIGHT: f32 = 240.0;
+const DEFAULT_FB_WIDTH: f32 = 320.0;
+const DEFAULT_FB_HEIGHT: f32 = 240.0;
 
-pub fn draw(ui: &mut egui::Ui, vram_tex: egui::TextureId, _bus: Option<&Bus>) {
-    // When the GPU tracks display-start for real, replace these with
-    // values from `_bus.as_ref().map(|b| b.gpu.display_start)`.
-    let fb_x = 0.0_f32;
-    let fb_y = 0.0_f32;
+pub fn draw(ui: &mut egui::Ui, vram_tex: egui::TextureId, bus: Option<&Bus>) {
+    // Pull the GPU's configured display area when a Bus is live;
+    // otherwise fall back to the canonical 320×240 @ (0, 0) layout.
+    let area = bus
+        .map(|b| b.gpu.display_area())
+        .unwrap_or(DisplayArea {
+            x: 0,
+            y: 0,
+            width: DEFAULT_FB_WIDTH as u16,
+            height: DEFAULT_FB_HEIGHT as u16,
+            bpp24: false,
+        });
 
-    theme::viz_frame(ui, "Framebuffer (320×240 at 0,0)", |ui| {
+    let title = format!(
+        "Framebuffer ({}×{} at {},{}){}",
+        area.width,
+        area.height,
+        area.x,
+        area.y,
+        if area.bpp24 { " · 24bpp" } else { "" }
+    );
+
+    theme::viz_frame(ui, &title, |ui| {
         let uv = egui::Rect::from_min_size(
-            egui::pos2(fb_x / VRAM_WIDTH as f32, fb_y / VRAM_HEIGHT as f32),
-            egui::vec2(FB_WIDTH / VRAM_WIDTH as f32, FB_HEIGHT / VRAM_HEIGHT as f32),
+            egui::pos2(
+                area.x as f32 / VRAM_WIDTH as f32,
+                area.y as f32 / VRAM_HEIGHT as f32,
+            ),
+            egui::vec2(
+                area.width as f32 / VRAM_WIDTH as f32,
+                area.height as f32 / VRAM_HEIGHT as f32,
+            ),
         );
         vram_panel::paint_image_fit(
             ui,
             vram_tex,
-            egui::vec2(FB_WIDTH, FB_HEIGHT),
+            egui::vec2(area.width as f32, area.height as f32),
             uv,
         );
     });

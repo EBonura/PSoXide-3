@@ -62,6 +62,41 @@ pub struct Gpu {
     /// Texture colour depth: 0 = 4bpp (CLUT), 1 = 8bpp (CLUT),
     /// 2 = 15bpp (direct).
     tex_depth: u8,
+
+    // --- Display area (GP1 0x05 / 0x06 / 0x07 / 0x08) ---
+    /// VRAM X of the top-left pixel of the displayed framebuffer.
+    display_start_x: u16,
+    /// VRAM Y of the top-left pixel of the displayed framebuffer.
+    display_start_y: u16,
+    /// Horizontal display resolution from GP1 0x08 (pixels). One of
+    /// 256, 320, 368, 512, 640.
+    display_width: u16,
+    /// Vertical display resolution from GP1 0x08 (pixels). 240 or 480
+    /// depending on interlace.
+    display_height: u16,
+    /// 24bpp colour depth flag from GP1 0x08 bit 4. For now we always
+    /// decode VRAM as 15bpp; when this flag comes into play the
+    /// frontend's framebuffer view can respect it.
+    display_24bpp: bool,
+}
+
+/// Public snapshot of the GPU's display configuration, read by the
+/// frontend's framebuffer panel. Updated by the GP1 0x05 (display
+/// start) and GP1 0x08 (display mode) handlers.
+#[derive(Debug, Clone, Copy)]
+pub struct DisplayArea {
+    /// VRAM X of the top-left displayed pixel.
+    pub x: u16,
+    /// VRAM Y of the top-left displayed pixel.
+    pub y: u16,
+    /// Horizontal resolution in pixels (one of 256/320/384/512/640).
+    pub width: u16,
+    /// Vertical resolution in pixels (240 or 480 interlaced).
+    pub height: u16,
+    /// `true` when the GP1 0x08 colour-depth bit selected 24bpp mode.
+    /// The frontend framebuffer panel still decodes VRAM as 15bpp;
+    /// respecting this flag is a future refinement.
+    pub bpp24: bool,
 }
 
 /// In-flight CPU→VRAM transfer state — 2 pixels per incoming GP0 word,
@@ -102,6 +137,23 @@ impl Gpu {
             tex_page_x: 0,
             tex_page_y: 0,
             tex_depth: 0,
+            display_start_x: 0,
+            display_start_y: 0,
+            display_width: 320,
+            display_height: 240,
+            display_24bpp: false,
+        }
+    }
+
+    /// Snapshot of the currently-configured display area, for the
+    /// frontend's framebuffer panel. Cheap to call each frame.
+    pub fn display_area(&self) -> DisplayArea {
+        DisplayArea {
+            x: self.display_start_x,
+            y: self.display_start_y,
+            width: self.display_width,
+            height: self.display_height,
+            bpp24: self.display_24bpp,
         }
     }
 
@@ -138,10 +190,51 @@ impl Gpu {
                 true
             }
             GP1_ADDR => {
+                self.apply_gp1_display(value);
                 self.status.gp1_write(value);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Handle GP1 commands that update the display-area state
+    /// (0x05 / 0x06 / 0x07 / 0x08). The status-bit updates stay in
+    /// `GpuStatus::gp1_write`; this function captures the geometry
+    /// the frontend needs.
+    fn apply_gp1_display(&mut self, value: u32) {
+        let cmd = (value >> 24) & 0xFF;
+        match cmd {
+            // GP1 0x00 — GPU reset — also resets the display area.
+            0x00 => {
+                self.display_start_x = 0;
+                self.display_start_y = 0;
+                self.display_width = 320;
+                self.display_height = 240;
+                self.display_24bpp = false;
+            }
+            // GP1 0x05 — display area start (top-left corner in VRAM).
+            //   bits 9:0  = X (pixels)
+            //   bits 18:10 = Y (pixels)
+            0x05 => {
+                self.display_start_x = (value & 0x3FF) as u16;
+                self.display_start_y = ((value >> 10) & 0x1FF) as u16;
+            }
+            // GP1 0x08 — display mode. Resolve to pixel W/H.
+            0x08 => {
+                let hres = match value & 0x3 {
+                    0 => 256,
+                    1 => 320,
+                    2 => 512,
+                    3 => 640,
+                    _ => unreachable!(),
+                };
+                let hres = if value & (1 << 6) != 0 { 384 } else { hres };
+                self.display_width = hres;
+                self.display_height = if value & (1 << 2) != 0 { 480 } else { 240 };
+                self.display_24bpp = value & (1 << 4) != 0;
+            }
+            _ => {}
         }
     }
 
@@ -909,11 +1002,14 @@ impl GpuStatus {
     }
 
     fn gp1_write(&mut self, value: u32) {
+        // GP1 writes that affect GpuStatus itself are handled here.
+        // Display-area writes (0x05 / 0x06 / 0x07 / 0x08) are routed
+        // through `Gpu::apply_gp1_display` in the outer impl so they
+        // can update the display-area fields. We still apply the
+        // subset that touches GPUSTAT bits (0x08).
         let cmd = (value >> 24) & 0xFF;
         match cmd {
-            // GP1(0x00): reset GPU. Restore the post-boot state.
             0x00 => *self = Self::new(),
-            // GP1(0x03): display enable. Bit 0: 0=on, 1=off.
             0x03 => {
                 if value & 1 != 0 {
                     self.raw |= 1 << 23;
@@ -921,16 +1017,28 @@ impl GpuStatus {
                     self.raw &= !(1 << 23);
                 }
             }
-            // GP1(0x04): DMA direction. Value bits 0:1 → GPUSTAT 29:30.
             0x04 => {
                 self.raw = (self.raw & !0x6000_0000) | ((value & 3) << 29);
             }
-            _ => {
-                // Other GP1 commands (display area, horizontal range,
-                // vertical range, display mode, GPU info request) are
-                // recorded but unmodeled for now — they only matter
-                // once we actually present a framebuffer.
+            0x08 => {
+                // GP1 0x08: display mode. Update the GPUSTAT bits that
+                // mirror it (16:17 for h-res-1, 18 for v-res, 19 for
+                // mode, 20 for 24bpp, 21 for v-interlace, 22 for h-res-2).
+                let hres1 = value & 0x3;
+                let vres = (value >> 2) & 0x1;
+                let mode = (value >> 3) & 0x1;
+                let bpp = (value >> 4) & 0x1;
+                let vinter = (value >> 5) & 0x1;
+                let hres2 = (value >> 6) & 0x1;
+                let status_bits = (hres1 << 17)
+                    | (vres << 19)
+                    | (mode << 20)
+                    | (bpp << 21)
+                    | (vinter << 22)
+                    | (hres2 << 16);
+                self.raw = (self.raw & !0x007F_0000) | status_bits;
             }
+            _ => {}
         }
     }
 }

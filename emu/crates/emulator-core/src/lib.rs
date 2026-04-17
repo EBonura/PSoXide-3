@@ -22,7 +22,7 @@ pub use bus::{Bus, BusError};
 pub use cdrom::CdRom;
 pub use cpu::{Cpu, ExecutionError};
 pub use dma::{Dma, DmaChannel};
-pub use gpu::Gpu;
+pub use gpu::{DisplayArea, Gpu};
 pub use irq::{Irq, IrqSource};
 pub use spu::Spu;
 pub use timers::{Timer, Timers};
