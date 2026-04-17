@@ -224,6 +224,12 @@ impl Cpu {
             }
         }
 
+        // Advance the bus-side cycle counter. Phase 4a uses a flat
+        // 1 cycle/instr — this matches Redux's simplest accounting
+        // for most opcodes; MULT/DIV/memory stalls will come in as
+        // parity probes reveal them.
+        bus.tick(cycle_cost(instr));
+
         // Exception takes priority: it cancels any pending branch and
         // redirects PC to the exception vector.
         self.pc = if let Some(exc_pc) = self.pending_exception_pc.take() {
@@ -971,6 +977,14 @@ impl Cpu {
         };
         self.pending_exception_pc = Some(vector);
     }
+}
+
+/// Cycle cost per instruction — phase 4a's "simple model", matching
+/// Redux's baseline accounting. Every instruction costs 1 cycle. As
+/// parity probes reveal divergence, specific opcodes (MULT/DIV,
+/// memory accesses by region) gain their real costs here.
+fn cycle_cost(_instr: u32) -> u32 {
+    1
 }
 
 /// MIPS R3000 exception codes (CAUSE.ExcCode). Only the ones we
