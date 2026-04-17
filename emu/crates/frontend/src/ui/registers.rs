@@ -5,11 +5,15 @@
 //! - PC / HI / LO
 //! - COP0: SR, Cause, EPC, BadVAddr (the registers we actually touch)
 //! - Retired instruction count
+//! - Execution history (newest last)
 //!
 //! Layout + grouping mirrors PSoXide-2's `debug_pane_contents`, using
 //! the themed `section` helper so each group reads as a framed block.
 
+use std::collections::VecDeque;
+
 use emulator_core::Cpu;
+use psx_trace::InstructionRecord;
 
 use crate::theme;
 
@@ -31,7 +35,7 @@ const COP0_LABELS: &[(usize, &str)] = &[
 ];
 
 /// Paint the register viewer as a left-docked resizable side panel.
-pub fn draw(ctx: &egui::Context, cpu: &Cpu) {
+pub fn draw(ctx: &egui::Context, cpu: &Cpu, history: &VecDeque<InstructionRecord>) {
     egui::SidePanel::left("registers")
         .resizable(true)
         .default_width(340.0)
@@ -44,8 +48,20 @@ pub fn draw(ctx: &egui::Context, cpu: &Cpu) {
                 theme::section(ui, "Retired", |ui| {
                     ui.monospace(format!("tick = {}", cpu.tick()));
                 });
+                theme::section(ui, "Execution history", |ui| draw_history(ui, history));
             });
         });
+}
+
+fn draw_history(ui: &mut egui::Ui, history: &VecDeque<InstructionRecord>) {
+    if history.is_empty() {
+        ui.monospace("(empty — step or run the CPU)");
+        return;
+    }
+    // Newest at the bottom: log-style reading order.
+    for record in history {
+        ui.monospace(format!("{:08X}: {:08X}", record.pc, record.instr));
+    }
 }
 
 fn draw_gprs(ui: &mut egui::Ui, cpu: &Cpu) {

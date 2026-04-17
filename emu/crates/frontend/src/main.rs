@@ -117,22 +117,11 @@ impl ApplicationHandler for Shell {
 
                 // Run loop: retire `run_steps_per_frame` instructions this
                 // frame if we're in run mode. Any execution error auto-
-                // pauses and surfaces via the register panel.
+                // pauses and surfaces via the register panel. History
+                // captures only the tail via `push_history`'s ring-buffer
+                // semantics, so a 100k-instruction frame doesn't allocate.
                 if self.state.running {
-                    if let Some(bus) = self.state.bus.as_mut() {
-                        for _ in 0..self.state.run_steps_per_frame {
-                            if self.state.cpu.step(bus).is_err() {
-                                self.state.running = false;
-                                self.state.menu.sync_run_label(false);
-                                self.state.menu.open = true;
-                                break;
-                            }
-                        }
-                    } else {
-                        // No BIOS — running is meaningless; flip back.
-                        self.state.running = false;
-                        self.state.menu.sync_run_label(false);
-                    }
+                    run_frame(&mut self.state);
                 }
 
                 let state = &mut self.state;
@@ -151,6 +140,34 @@ impl ApplicationHandler for Shell {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(gfx) = self.graphics.as_ref() {
             gfx.window.request_redraw();
+        }
+    }
+}
+
+/// Retire up to `run_steps_per_frame` instructions. Any execution
+/// error auto-pauses, reopens the Menu, and surfaces the stopped
+/// state via the register panel. Split out so the borrow checker
+/// sees `state.bus`, `state.cpu`, and `state.exec_history` as
+/// disjoint field borrows instead of one big `&mut state`.
+fn run_frame(state: &mut AppState) {
+    let steps = state.run_steps_per_frame;
+    let Some(bus) = state.bus.as_mut() else {
+        state.running = false;
+        state.menu.sync_run_label(false);
+        return;
+    };
+
+    for _ in 0..steps {
+        match state.cpu.step(bus) {
+            Ok(record) => {
+                app::push_history(&mut state.exec_history, record);
+            }
+            Err(_) => {
+                state.running = false;
+                state.menu.sync_run_label(false);
+                state.menu.open = true;
+                break;
+            }
         }
     }
 }

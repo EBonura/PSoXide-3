@@ -696,6 +696,7 @@ dependencies = [
  "egui-winit",
  "emulator-core",
  "pollster",
+ "psx-trace",
  "wgpu",
  "winit",
 ]

@@ -22,7 +22,7 @@ pub fn draw_layout(
     state.hud.push(dt);
 
     if state.panels.registers {
-        registers::draw(ctx, &state.cpu);
+        registers::draw(ctx, &state.cpu, &state.exec_history);
     }
     if state.panels.vram {
         vram::draw(ctx, vram_tex);
@@ -58,13 +58,16 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
         }
         StepOne => {
             if let Some(bus) = state.bus.as_mut() {
-                let _ = state.cpu.step(bus);
+                if let Ok(record) = state.cpu.step(bus) {
+                    crate::app::push_history(&mut state.exec_history, record);
+                }
             }
             MenuOutcome::None
         }
         Reset => {
             state.cpu = emulator_core::Cpu::new();
             state.running = false;
+            state.exec_history.clear();
             state.menu.sync_run_label(false);
             MenuOutcome::None
         }
