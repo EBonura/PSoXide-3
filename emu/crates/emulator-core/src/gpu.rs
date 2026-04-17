@@ -11,7 +11,7 @@
 //! - `0x1F80_1810` GP0 write  / `GPUREAD` read
 //! - `0x1F80_1814` GP1 write / `GPUSTAT` read
 
-use crate::vram::Vram;
+use crate::vram::{Vram, VRAM_HEIGHT, VRAM_WIDTH};
 
 /// Physical address of the GP0 / GPUREAD port.
 pub const GP0_ADDR: u32 = 0x1F80_1810;
@@ -24,6 +24,14 @@ pub struct Gpu {
     /// the frontend decodes this each frame.
     pub vram: Vram,
     status: GpuStatus,
+    /// Packet assembler for GP0 commands that span multiple words.
+    /// Holds words from the start of the current command; once the
+    /// full packet has arrived, [`Gpu::execute_gp0_packet`] dispatches
+    /// on the opcode and clears the buffer.
+    gp0_fifo: Vec<u32>,
+    /// Number of words the current packet expects in total (including
+    /// the first/opcode word). `0` means "no packet in progress".
+    gp0_expected: usize,
 }
 
 impl Gpu {
@@ -33,6 +41,8 @@ impl Gpu {
         Self {
             vram: Vram::new(),
             status: GpuStatus::new(),
+            gp0_fifo: Vec::with_capacity(12),
+            gp0_expected: 0,
         }
     }
 
@@ -52,10 +62,7 @@ impl Gpu {
     pub fn write32(&mut self, phys: u32, value: u32) -> bool {
         match phys {
             GP0_ADDR => {
-                // GP0 command word — Phase 2h accepts and discards.
-                // Real command decoding lands when DMA actually ships
-                // lists (GPU channel 2 + Phase 2g's scaffolding).
-                let _ = value;
+                self.gp0_write(value);
                 true
             }
             GP1_ADDR => {
@@ -65,6 +72,118 @@ impl Gpu {
             _ => false,
         }
     }
+
+    /// Feed one 32-bit word to the GP0 packet assembler. If this word
+    /// completes a packet, the packet is executed and the FIFO clears.
+    fn gp0_write(&mut self, word: u32) {
+        if self.gp0_expected == 0 {
+            let op = (word >> 24) & 0xFF;
+            self.gp0_expected = gp0_packet_size(op as u8);
+            // Single-word commands execute immediately without buffering.
+            if self.gp0_expected == 1 {
+                self.execute_gp0_single(word);
+                self.gp0_expected = 0;
+                return;
+            }
+        }
+        self.gp0_fifo.push(word);
+        if self.gp0_fifo.len() == self.gp0_expected {
+            self.execute_gp0_packet();
+            self.gp0_fifo.clear();
+            self.gp0_expected = 0;
+        }
+    }
+
+    /// Execute a command whose packet size is exactly 1. Most draw-
+    /// mode setters (GP0 0xE1..=0xE6) live here; for now we accept
+    /// them without affecting state beyond the GPU-internal flags
+    /// a full implementation would track.
+    fn execute_gp0_single(&mut self, _word: u32) {
+        // Draw-mode / texture-window / drawing-area / mask-bit setters
+        // all fit here. We don't rasterize yet, so they don't do
+        // anything observable. Tracking them lands with the primitive
+        // rasterizer.
+    }
+
+    /// Execute a multi-word packet that has just been fully assembled
+    /// in `gp0_fifo`. Dispatches on the opcode in word 0.
+    fn execute_gp0_packet(&mut self) {
+        let op = (self.gp0_fifo[0] >> 24) & 0xFF;
+        match op {
+            0x02 => self.fill_rect(),
+            _ => {
+                // Polygons, lines, rects, VRAM transfers — scaffolding
+                // for all of them lands as we implement each one. For
+                // now, unknown multi-word commands are silently dropped
+                // so the BIOS can finish shipping its command stream.
+            }
+        }
+    }
+
+    /// GP0 0x02 — monochrome fill rectangle, ignores draw mode /
+    /// clipping / blending. Writes `color` directly into VRAM.
+    ///
+    /// Packet layout (Redux `GPU::cmdFillRect`):
+    ///   word 0: `0x02RRGGBB`      — opcode + 24-bit RGB
+    ///   word 1: `0xYYYYXXXX`      — top-left: X is 16-pixel-aligned
+    ///   word 2: `0xHHHHWWWW`      — width is rounded up to 16 pixels
+    ///
+    /// Both coordinates and sizes wrap mod VRAM dimensions.
+    fn fill_rect(&mut self) {
+        let color24 = self.gp0_fifo[0] & 0x00FF_FFFF;
+        let (x, y) = {
+            let w = self.gp0_fifo[1];
+            // X is aligned to 16-pixel boundaries; low 4 bits ignored.
+            let x = (w & 0x3F0) as u16;
+            let y = ((w >> 16) & 0x1FF) as u16;
+            (x, y)
+        };
+        let (w, h) = {
+            let s = self.gp0_fifo[2];
+            // Width rounded up to next multiple of 16.
+            let w = (((s & 0x3FF) + 0x0F) & !0x0F) as u16;
+            let h = ((s >> 16) & 0x1FF) as u16;
+            (w, h)
+        };
+
+        let color15 = rgb24_to_bgr15(color24);
+        for row in 0..h {
+            for col in 0..w {
+                let px = (x + col) as usize % VRAM_WIDTH;
+                let py = (y + row) as usize % VRAM_HEIGHT;
+                self.vram.set_pixel(px as u16, py as u16, color15);
+            }
+        }
+    }
+}
+
+/// Expected total word count for a GP0 command starting with opcode `op`.
+/// `0` means the opcode is unknown / unimplemented — treated as no-op.
+fn gp0_packet_size(op: u8) -> usize {
+    match op {
+        // NOP / clear cache / flip misc — single word, no data.
+        0x00 | 0x01 | 0x03..=0x1E => 1,
+        // Quick fill — RGB + (X,Y) + (W,H) = 3 words.
+        0x02 => 3,
+        // Draw-mode settings (E1..=E6) — single word each.
+        0xE1..=0xE6 => 1,
+        // Everything else (polygons, lines, rects, transfers): we
+        // don't know the size without full decoding, so treat as 1
+        // word. That drops data on the floor for multi-word commands
+        // we haven't taught the decoder yet — fine for now since no
+        // one consumes VRAM from those paths.
+        _ => 1,
+    }
+}
+
+/// Convert a 24-bit RGB value (as written by the CPU in GP0 packets)
+/// into the 15-bit BGR word VRAM stores. Matches Redux / PS1
+/// hardware: the 3 high bits of each channel are discarded.
+fn rgb24_to_bgr15(rgb24: u32) -> u16 {
+    let r = ((rgb24 >> 3) & 0x1F) as u16;
+    let g = (((rgb24 >> 8) >> 3) & 0x1F) as u16;
+    let b = (((rgb24 >> 16) >> 3) & 0x1F) as u16;
+    r | (g << 5) | (b << 10)
 }
 
 impl Default for Gpu {
@@ -187,6 +306,48 @@ mod tests {
         gpu.write32(GP0_ADDR, 0xE100_0000);
         let stat_after = gpu.read32(GP1_ADDR).unwrap();
         assert_eq!(stat_before, stat_after);
+    }
+
+    #[test]
+    fn rgb24_to_bgr15_white_reaches_0x7fff() {
+        assert_eq!(rgb24_to_bgr15(0x00FFFFFF), 0x7FFF);
+    }
+
+    #[test]
+    fn rgb24_to_bgr15_primary_channels() {
+        // Pure red (FF in low byte): bottom 5 bits set.
+        assert_eq!(rgb24_to_bgr15(0x000000FF), 0x001F);
+        // Pure green: middle 5.
+        assert_eq!(rgb24_to_bgr15(0x0000FF00), 0x03E0);
+        // Pure blue: top 5.
+        assert_eq!(rgb24_to_bgr15(0x00FF0000), 0x7C00);
+    }
+
+    #[test]
+    fn gp0_fill_rect_writes_vram() {
+        let mut gpu = Gpu::new();
+        // Fill a 16×16 red rect at (0, 0).
+        gpu.write32(GP0_ADDR, 0x0200_00FF); // 0x02 + red
+        gpu.write32(GP0_ADDR, 0x0000_0000); // y=0, x=0
+        gpu.write32(GP0_ADDR, 0x0010_0010); // h=16, w=16
+
+        assert_eq!(gpu.vram.get_pixel(0, 0), 0x001F);
+        assert_eq!(gpu.vram.get_pixel(15, 15), 0x001F);
+        // Just outside stays zero.
+        assert_eq!(gpu.vram.get_pixel(16, 0), 0);
+        assert_eq!(gpu.vram.get_pixel(0, 16), 0);
+    }
+
+    #[test]
+    fn gp0_draw_mode_commands_are_accepted() {
+        let mut gpu = Gpu::new();
+        // Four draw-mode setters back-to-back, each 1 word.
+        gpu.write32(GP0_ADDR, 0xE100_0000); // draw mode
+        gpu.write32(GP0_ADDR, 0xE200_0000); // texture window
+        gpu.write32(GP0_ADDR, 0xE300_0000); // drawing area TL
+        gpu.write32(GP0_ADDR, 0xE400_0000); // drawing area BR
+        // None of these should have stuck a packet in the FIFO.
+        // (Implementation detail, but worth guarding against.)
     }
 
     #[test]
