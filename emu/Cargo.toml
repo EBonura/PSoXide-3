@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/emulator-core",
+    "crates/frontend",
     "crates/parity-oracle",
 ]
 
@@ -18,9 +19,19 @@ psx-iso   = { path = "../crates/psx-iso" }
 psx-trace = { path = "../crates/psx-trace" }
 
 # Host-workspace-internal deps (one crate depends on another here).
+emulator-core = { path = "crates/emulator-core" }
 parity-oracle = { path = "crates/parity-oracle" }
 
 thiserror  = "1.0"
 serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile   = "3.10"
+
+# Frontend stack. Locked-in versions that PSoXide-1/-2 both converged on;
+# bumping is a deliberate decision, not a drift.
+winit       = "0.30"
+wgpu        = "24"
+egui        = "0.31"
+egui-wgpu   = "0.31"
+egui-winit  = "0.31"
+pollster    = "0.3"

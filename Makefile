@@ -3,7 +3,7 @@
 # The repo has two Cargo workspaces: root (shared no_std crates) and emu/
 # (host-side emulator). Every target fans out to both.
 
-.PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke parity
+.PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke parity run
 
 help:
 	@echo "PSoXide targets:"
@@ -13,9 +13,13 @@ help:
 	@echo "  make fmt          - format all code in both workspaces"
 	@echo "  make lint         - clippy -D warnings on both workspaces"
 	@echo "  make clean        - cargo clean in both workspaces"
+	@echo "  make run          - launch the desktop frontend"
 	@echo "  make fetch-opcode - smoke: print first BIOS opcode (needs BIOS=<path>)"
 	@echo "  make oracle-smoke - smoke: launch headless Redux and verify Lua runs"
 	@echo "  make parity       - step both emulators and assert bit-identical traces"
+
+run:
+	cd emu && cargo run -p frontend --release
 
 check:
 	cargo check --workspace --all-features
