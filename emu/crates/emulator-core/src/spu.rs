@@ -283,18 +283,96 @@ fn parse_adsr_hi(hi: u16, cfg: &mut AdsrConfig) {
 //  Voice state.
 // ===============================================================
 
+/// One SPU volume channel. Holds the raw 16-bit register value so
+/// reads round-trip verbatim, plus a live `current` level that
+/// animates over time when the register's bit 15 is set (sweep
+/// mode). Games use sweep for fade-in / fade-out, and for
+/// arbitrary volume automation (track-wide crossfade).
+#[derive(Copy, Clone, Debug, Default)]
+struct VolumeEnvelope {
+    /// The last 16-bit word written to the register. `reads` echo
+    /// this so software verification paths see the exact config.
+    raw: u16,
+    /// Current signed Q14 level, 0..=±0x3FFF. Multiplied directly
+    /// into per-sample mix. Updated on register write (static
+    /// mode) or per SPU sample (sweep mode).
+    current: i16,
+    /// Sub-sample counter for the sweep rate — counts up to
+    /// `denominator[rate]` before each current-level step.
+    sweep_sub: i32,
+}
+
+impl VolumeEnvelope {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accept a new 16-bit register value. Static-mode writes snap
+    /// `current` to the decoded level immediately; sweep-mode
+    /// writes preserve `current` and let `tick` animate from there.
+    fn write(&mut self, raw: u16) {
+        self.raw = raw;
+        if raw & 0x8000 == 0 {
+            // Static mode: bits 0..=13 are the unsigned magnitude,
+            // bit 14 is phase-invert.
+            let level = (raw & 0x3FFF) as i16;
+            self.current = if raw & 0x4000 != 0 { -level } else { level };
+            self.sweep_sub = 0;
+        }
+        // Sweep mode: leave `current` untouched so the new rate
+        // takes effect from wherever the level currently sits.
+    }
+
+    /// Advance one SPU sample. Applies the sweep animation when
+    /// bit 15 is set — uses the same rate tables the ADSR envelope
+    /// uses, matching Redux's approach.
+    fn tick(&mut self) {
+        if self.raw & 0x8000 == 0 {
+            return; // static mode, nothing to do
+        }
+        let rate = (self.raw & 0x7F) as usize;
+        let increasing = self.raw & (1 << 13) == 0; // bit 13 = direction (0 = inc)
+        let exp = self.raw & (1 << 14) != 0; // bit 14 = exponential
+        let denom = envelope_denominator(rate);
+        self.sweep_sub += 1;
+        if self.sweep_sub >= denom {
+            self.sweep_sub = 0;
+            let step = if increasing {
+                envelope_numerator_increase(rate)
+            } else {
+                envelope_numerator_decrease(rate)
+            };
+            let mut new_current = self.current as i32;
+            if exp && increasing && new_current >= 0x6000 {
+                // Slow down past 0x6000 in exponential-increase mode —
+                // matches ADSR's Attack exp slope.
+                new_current += step / 4;
+            } else if exp && !increasing {
+                new_current += (step * new_current) >> 15;
+            } else {
+                new_current += step;
+            }
+            self.current = new_current.clamp(-0x7FFF, 0x7FFF) as i16;
+        }
+    }
+
+    /// Read-back value — always returns the raw register the CPU
+    /// wrote, not the animated current level.
+    fn reg_read(&self) -> u16 {
+        self.raw
+    }
+}
+
 /// Per-voice runtime state. Holds decode buffers, ADSR envelope,
 /// volumes, and loop pointers. Kept plain (no padding or SIMD) —
 /// 24 copies of this struct live in `Spu::voices` and mix together on
 /// each sample.
 #[derive(Clone, Debug)]
 struct Voice {
-    /// Static L volume, Q14. Values 0..=0x3FFF mean direct level; bit
-    /// 15 set means sweep mode — we snapshot the magnitude and don't
-    /// animate it for now (see module docs).
-    vol_l: i16,
-    /// Static R volume, Q14.
-    vol_r: i16,
+    /// Left volume envelope.
+    vol_l: VolumeEnvelope,
+    /// Right volume envelope.
+    vol_r: VolumeEnvelope,
     /// Raw pitch register (0..=0x3FFF). `0x1000` plays at the sample's
     /// source rate (typically 44.1 kHz).
     raw_pitch: u16,
@@ -348,8 +426,8 @@ struct Voice {
 impl Default for Voice {
     fn default() -> Self {
         Self {
-            vol_l: 0,
-            vol_r: 0,
+            vol_l: VolumeEnvelope::new(),
+            vol_r: VolumeEnvelope::new(),
             raw_pitch: 0,
             start_addr: 0,
             loop_addr: 0,
@@ -955,8 +1033,8 @@ impl Spu {
     fn read_voice_reg(&self, v: usize, off: u32) -> u16 {
         let voice = &self.voices[v];
         match off {
-            voice_offset::VOLUME_L => voice.vol_l as u16,
-            voice_offset::VOLUME_R => voice.vol_r as u16,
+            voice_offset::VOLUME_L => voice.vol_l.reg_read(),
+            voice_offset::VOLUME_R => voice.vol_r.reg_read(),
             voice_offset::PITCH => voice.raw_pitch,
             voice_offset::START_ADDR => (voice.start_addr >> 3) as u16,
             voice_offset::ADSR_LO => voice.adsr_lo,
@@ -987,8 +1065,8 @@ impl Spu {
     fn write_voice_reg(&mut self, v: usize, off: u32, value: u16) {
         let voice = &mut self.voices[v];
         match off {
-            voice_offset::VOLUME_L => voice.vol_l = decode_volume(value),
-            voice_offset::VOLUME_R => voice.vol_r = decode_volume(value),
+            voice_offset::VOLUME_L => voice.vol_l.write(value),
+            voice_offset::VOLUME_R => voice.vol_r.write(value),
             voice_offset::PITCH => voice.raw_pitch = value.min(0x3FFF),
             voice_offset::START_ADDR => {
                 // 16-byte aligned byte address.
@@ -1125,6 +1203,13 @@ impl Spu {
         //     actual register updates).
         self.noise_tick();
 
+        // 1c. Advance per-voice volume envelopes (static registers
+        //     are no-ops; sweep-configured registers animate).
+        for v in 0..NUM_VOICES {
+            self.voices[v].vol_l.tick();
+            self.voices[v].vol_r.tick();
+        }
+
         // 2. For each voice, step envelope + ADPCM playback, accumulate
         //    stereo contribution.
         let mut sum_l: i32 = 0;
@@ -1195,9 +1280,10 @@ impl Spu {
         let voice = &mut self.voices[v];
         voice.last_sample = mixed_i16;
 
-        // Apply per-voice L / R volumes (Q14).
-        let l = ((mixed_i16 as i32) * voice.vol_l as i32) >> 14;
-        let r = ((mixed_i16 as i32) * voice.vol_r as i32) >> 14;
+        // Apply per-voice L / R volumes (Q14). Uses the animated
+        // `current` level so sweep-configured voices fade live.
+        let l = ((mixed_i16 as i32) * voice.vol_l.current as i32) >> 14;
+        let r = ((mixed_i16 as i32) * voice.vol_r.current as i32) >> 14;
         (saturate_i16(l), saturate_i16(r))
     }
 
@@ -1888,6 +1974,48 @@ mod tests {
         let (l, r) = out[0];
         assert!(l > 0, "left should carry CD input: {l}");
         assert!(r > 0, "right should carry CD input: {r}");
+    }
+
+    #[test]
+    fn volume_envelope_static_mode_snaps_level_on_write() {
+        let mut env = VolumeEnvelope::new();
+        env.write(0x3FFF); // near-unity gain
+        assert_eq!(env.current, 0x3FFF);
+        env.write(0x4100); // bit 14 set → phase-invert
+        assert_eq!(env.current, -0x100);
+    }
+
+    #[test]
+    fn volume_envelope_sweep_mode_animates_on_tick() {
+        let mut env = VolumeEnvelope::new();
+        // Sweep mode, increasing, fast rate (0).
+        // Bit 15 = 1 (sweep), bit 13 = 0 (increase), rate = 0.
+        env.write(0x8000);
+        env.current = 0;
+        for _ in 0..10 {
+            env.tick();
+        }
+        assert!(env.current > 0, "sweep-increase must raise current: {}", env.current);
+    }
+
+    #[test]
+    fn volume_envelope_sweep_decrease_lowers_level() {
+        let mut env = VolumeEnvelope::new();
+        // Sweep mode, decreasing, fast rate.
+        env.write(0x8000 | (1 << 13));
+        env.current = 0x3FFF;
+        for _ in 0..10 {
+            env.tick();
+        }
+        assert!(env.current < 0x3FFF, "sweep-decrease must lower: {}", env.current);
+    }
+
+    #[test]
+    fn volume_envelope_static_tick_is_noop() {
+        let mut env = VolumeEnvelope::new();
+        env.write(0x2000);
+        env.tick();
+        assert_eq!(env.current, 0x2000);
     }
 
     #[test]
