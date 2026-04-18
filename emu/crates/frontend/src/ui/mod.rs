@@ -17,7 +17,10 @@ use crate::app::AppState;
 /// Paint every panel for this frame, in layering order.
 pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::TextureId, dt: f32) {
     state.hud.update(dt, state.cpu.tick());
+    state.tick_status(dt);
 
+    // Side-docked panels paint before the central area so egui's
+    // layout clips the central panel to what's left.
     if state.panels.registers {
         registers::draw(
             ctx,
@@ -100,6 +103,36 @@ pub fn apply_menu_action(state: &mut AppState, action: xmb::MenuAction) -> MenuO
         FillVramTestPattern => {
             if let Some(bus) = state.bus.as_mut() {
                 fill_vram_test_pattern(&mut bus.gpu.vram);
+            }
+            MenuOutcome::None
+        }
+        LaunchGame(id) => {
+            // Game-launch rebuilds Bus + Cpu from scratch. Close
+            // the XMB on success so the user sees the freshly-
+            // booted BIOS / EXE, exactly like a real PSX shell.
+            match state.launch_by_id(&id) {
+                Ok(()) => {
+                    state.xmb.open = false;
+                }
+                Err(e) => {
+                    eprintln!("[frontend] launch failed: {e}");
+                    state.status_message_set(format!("Launch failed: {e}"));
+                }
+            }
+            MenuOutcome::None
+        }
+        RescanLibrary => {
+            match state.rescan_library() {
+                Ok(n) => {
+                    state.status_message_set(format!(
+                        "Scan complete: {} entries ({n} new/changed)",
+                        state.library.entries.len()
+                    ));
+                }
+                Err(e) => {
+                    eprintln!("[frontend] rescan failed: {e}");
+                    state.status_message_set(format!("Rescan failed: {e}"));
+                }
             }
             MenuOutcome::None
         }

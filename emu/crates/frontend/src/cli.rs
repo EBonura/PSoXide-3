@@ -42,6 +42,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
 
+    /// Launch the GUI in true borderless-fullscreen mode (primary
+    /// monitor). Only meaningful when no headless subcommand is
+    /// given — subcommands always run windowless.
+    #[arg(long)]
+    pub fullscreen: bool,
+
     /// Headless subcommand. Omit to launch the GUI.
     #[command(subcommand)]
     pub command: Option<Command>,

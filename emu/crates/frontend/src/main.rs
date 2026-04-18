@@ -34,8 +34,11 @@ use crate::ui::{xmb::XmbInput, MenuOutcome};
 
 use emulator_core::button;
 
-const INITIAL_WIDTH: u32 = 1280;
-const INITIAL_HEIGHT: u32 = 800;
+/// Default window size when not running fullscreen. Chosen big
+/// enough to show the XMB + a framebuffer comfortably on a
+/// standard laptop display.
+const INITIAL_WIDTH: u32 = 1600;
+const INITIAL_HEIGHT: u32 = 1000;
 
 fn main() {
     // Argument parsing first — if a subcommand is present, we
@@ -51,10 +54,16 @@ fn main() {
         return;
     }
 
+    // `--config-dir` also applies to the GUI path — lets testers
+    // point the app at a scratch directory without touching their
+    // real settings. Ditto `--fullscreen`.
+    let config_dir = cli.config_dir;
+    let fullscreen = cli.fullscreen;
+
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = Shell::default();
+    let mut app = Shell::new(config_dir, fullscreen);
     event_loop.run_app(&mut app).expect("event loop");
 }
 
@@ -68,16 +77,27 @@ struct Shell {
     /// frame before running CPU steps so the guest always sees the
     /// latest state.
     pad1_mask: u16,
+    /// Whether to open the window in borderless-fullscreen mode.
+    /// Decision is made at startup via CLI flag and then captured
+    /// here; changing it at runtime would need a window recreation.
+    fullscreen: bool,
 }
 
 impl Default for Shell {
     fn default() -> Self {
+        Self::new(None, false)
+    }
+}
+
+impl Shell {
+    fn new(config_dir: Option<std::path::PathBuf>, fullscreen: bool) -> Self {
         Self {
             graphics: None,
-            state: AppState::default(),
+            state: AppState::with_config_dir(config_dir),
             pending_input: XmbInput::default(),
             last_frame: Instant::now(),
             pad1_mask: 0,
+            fullscreen,
         }
     }
 }
@@ -119,9 +139,16 @@ impl ApplicationHandler for Shell {
             return;
         }
 
-        let attrs = Window::default_attributes()
+        // Borderless-fullscreen on the primary monitor when
+        // `--fullscreen` was passed. Falls back to a windowed
+        // 1600×1000 otherwise so development on a laptop with
+        // panels + a terminal remains bearable.
+        let mut attrs = Window::default_attributes()
             .with_title("PSoXide-3")
             .with_inner_size(winit::dpi::PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT));
+        if self.fullscreen {
+            attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
         self.graphics = Some(pollster::block_on(Graphics::new(window)));
