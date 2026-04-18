@@ -162,13 +162,18 @@ fn milestone_a_bios_to_sony_logo() {
     // when pixel parity hits 0% differing bytes, replace with the
     // captured Redux hash to lock in correctness.
     let state = run_milestone(100_000_000, None);
+    // Hashes updated 2026-04-18-C after GPU 4×4 Bayer dithering
+    // landed. The BIOS enables dither for the Sony logo's gradient
+    // — previously every Gouraud channel truncated 8→5 bit without
+    // any dither, producing a visible banding pattern. The dithered
+    // output now matches PSX hardware's interleaved-pixel pattern.
     assert_milestone(
         "Milestone A",
         &state,
-        0x97d2_2145_75f2_99d4, // full VRAM (self)
-        0x2035_49d0_b4b8_5eb6, // display area (self)
+        0xab9d_c8a3_570a_9b5d, // full VRAM (self)
+        0xfb83_fcea_d16a_cf79, // display area (self)
         (640, 478),
-        None, // Redux-parity hash pending renderer fixes (~3.21% pixel diff)
+        None, // Redux-parity hash pending renderer fixes
     );
 }
 
@@ -179,13 +184,16 @@ fn milestone_b_bios_to_shell() {
     // boot logo to the MAIN MENU shell screen (MEMORY CARD / CD
     // PLAYER, radial blue gradient).
     let state = run_milestone(500_000_000, None);
+    // Hashes updated 2026-04-18-C after GPU dithering landed — same
+    // reasoning as milestone A. The shell screen's radial blue
+    // gradient is Gouraud-shaded so it picks up the dither pattern.
     assert_milestone(
         "Milestone B",
         &state,
-        0x0f00_2542_a50c_0dd0, // full VRAM (self)
-        0x7410_746e_003a_8d85, // display area (self)
+        0x3872_1ffb_bcec_5821, // full VRAM (self)
+        0x9676_78bd_29e7_7986, // display area (self)
         (640, 478),
-        None, // Redux parity capture pending (~17 min oracle run)
+        None, // Redux parity capture pending
     );
 }
 
