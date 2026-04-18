@@ -112,31 +112,47 @@ impl Timers {
     }
 
     /// Advance all three timers by `cycles` system-clock ticks. Each
-    /// timer converts that to its own clock source first (HBlank for
-    /// T1, /8 for T2, system clock elsewhere — dot-clock for T0 would
-    /// need GPU scan-out to land first; treat as system clock for now).
+    /// timer converts that to its own clock source first:
+    /// - Timer 0 source 1 / 3 → dot-clock (pixels per `dot_clock_divisor`
+    ///   system cycles — `GPU::dot_clock_divisor` gives the current
+    ///   value based on H-resolution).
+    /// - Timer 1 source 1 / 3 → HBlank (`hsync_period` cycles per tick).
+    /// - Timer 2 source 2 / 3 → system / 8.
+    /// - Everything else → system clock.
     ///
     /// Returns a 3-bit mask of timers that fired an IRQ this tick.
     /// The caller (Bus) uses it to call `Irq::raise(IrqSource::Timer0/1/2)`.
-    pub fn tick(&mut self, cycles: u64, hsync_period: u64) -> u8 {
+    pub fn tick(&mut self, cycles: u64, hsync_period: u64, dot_clock_divisor: u64) -> u8 {
         let mut fired: u8 = 0;
         for i in 0..3 {
-            if self.advance_timer(i, cycles, hsync_period) {
+            if self.advance_timer(i, cycles, hsync_period, dot_clock_divisor) {
                 fired |= 1 << i;
             }
         }
         fired
     }
 
-    fn advance_timer(&mut self, idx: usize, cycles: u64, hsync_period: u64) -> bool {
+    fn advance_timer(
+        &mut self,
+        idx: usize,
+        cycles: u64,
+        hsync_period: u64,
+        dot_clock_divisor: u64,
+    ) -> bool {
         let t = &mut self.timers[idx];
         let source = (t.mode >> 8) & 0x3;
 
         // Convert `cycles` system clocks into source clocks.
         let ticks = match (idx, source) {
-            // Timer 0: dot clock (1) uses GPU scan-out — not modelled,
-            // fall back to system clock.
-            // Timer 1 source 1 = HBlank: one tick per HSync period.
+            // Timer 0 source 1/3 = dot clock.
+            (0, 1) | (0, 3) => {
+                t.accum += cycles;
+                let divisor = dot_clock_divisor.max(1);
+                let n = t.accum / divisor;
+                t.accum %= divisor;
+                n
+            }
+            // Timer 1 source 1/3 = HBlank: one tick per HSync period.
             (1, 1) | (1, 3) => {
                 t.accum += cycles;
                 let n = t.accum / hsync_period;
@@ -270,5 +286,29 @@ mod tests {
         assert!(Timers::contains(0x1F80_1128));
         assert!(!Timers::contains(0x1F80_1130));
         assert!(!Timers::contains(0x1F80_10FF));
+    }
+
+    #[test]
+    fn timer0_dot_clock_source_ticks_at_divisor_rate() {
+        let mut t = Timers::new();
+        // Set Timer 0 mode with clock source = 1 (dot clock).
+        t.write32(0x1F80_1104, 1 << 8, 0);
+        // At 320-pixel resolution, divisor = 8 (system clocks per dot).
+        // Advance by 80 cycles → 10 dot-clock ticks.
+        let fired = t.tick(80, 2146, 8);
+        assert_eq!(fired, 0);
+        assert_eq!(t.read32(0x1F80_1100) & 0xFFFF, 10);
+        // Another 40 cycles → 5 more dot-clock ticks.
+        t.tick(40, 2146, 8);
+        assert_eq!(t.read32(0x1F80_1100) & 0xFFFF, 15);
+    }
+
+    #[test]
+    fn timer0_system_clock_source_unaffected_by_divisor() {
+        let mut t = Timers::new();
+        t.write32(0x1F80_1104, 0, 0); // source 0 = system clock
+        // Divisor changes shouldn't matter at system-clock source.
+        t.tick(100, 2146, 8);
+        assert_eq!(t.read32(0x1F80_1100) & 0xFFFF, 100);
     }
 }

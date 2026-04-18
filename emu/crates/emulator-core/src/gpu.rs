@@ -568,6 +568,25 @@ impl Gpu {
         }
     }
 
+    /// Current dot-clock divisor: system clocks per pixel-clock tick.
+    /// Indexed by the current display resolution. Values match Redux's
+    /// `HDotClock` array in `src/core/psxcounters.cc`.
+    ///
+    /// Used by Timer 0 when its source is set to "dot clock" (mode
+    /// bits 8..9 = 1 or 3). Games that sync to horizontal raster
+    /// (rare — dot-clock timing is usually a bit granular) key off
+    /// this.
+    pub fn dot_clock_divisor(&self) -> u64 {
+        match self.display_width {
+            256 => 10,
+            320 => 8,
+            368 | 384 => 7,
+            512 => 5,
+            640 => 4,
+            _ => 10, // Safe fallback.
+        }
+    }
+
     /// Effective vertical pixel count shown on the video output —
     /// derived from V-range (`GP1(07h)`) and the 480-mode flag
     /// (`GP1(08h)` bit 2). Matches Redux's

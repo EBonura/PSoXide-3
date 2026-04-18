@@ -430,7 +430,9 @@ impl Bus {
     /// bank's accumulator matches Redux's lazy-read timer model.
     fn advance_cycles(&mut self, n: u32) {
         self.cycles = self.cycles.wrapping_add(n as u64);
-        let fired = self.timers.tick(n as u64, HSYNC_CYCLES_NTSC);
+        let fired = self
+            .timers
+            .tick(n as u64, HSYNC_CYCLES_NTSC, self.gpu.dot_clock_divisor());
         if fired & 1 != 0 {
             self.irq.raise(IrqSource::Timer0);
         }
