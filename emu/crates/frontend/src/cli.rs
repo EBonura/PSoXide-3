@@ -171,7 +171,8 @@ fn cmd_info(paths: &ConfigPaths) -> Result<(), String> {
 }
 
 fn cmd_scan(paths: &ConfigPaths, args: ScanArgs) -> Result<(), String> {
-    let settings = Settings::load(&paths.settings_file()).unwrap_or_default();
+    let mut settings = Settings::load(&paths.settings_file()).unwrap_or_default();
+    let explicit_root = args.root.clone();
     let root = args
         .root
         .map(Ok)
@@ -207,6 +208,24 @@ fn cmd_scan(paths: &ConfigPaths, args: ScanArgs) -> Result<(), String> {
             before,
             lib.entries.len()
         );
+    }
+
+    // Persist the root into settings.ron whenever `--root` was passed
+    // explicitly. A fresh config dir that never had settings.ron
+    // written stays empty otherwise — the GUI would find the library
+    // but wouldn't know where to rescan from, so the next GUI-triggered
+    // rescan would fail. Writing here keeps the "scan once on the CLI,
+    // then use the GUI" path frictionless.
+    if let Some(new_root) = explicit_root {
+        let new_str = new_root.to_string_lossy().into_owned();
+        if settings.paths.game_library != new_str {
+            settings.paths.game_library = new_str;
+            if let Err(e) = settings.save(&paths.settings_file()) {
+                eprintln!("warning: could not save settings.ron: {e}");
+            } else {
+                println!("settings.paths.game_library updated -> {}", new_root.display());
+            }
+        }
     }
     Ok(())
 }
