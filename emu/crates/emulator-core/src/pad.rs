@@ -214,6 +214,13 @@ impl PortDevice {
         }
     }
 
+    /// Immutable access to the attached pad, if any. Used by the
+    /// frontend to read motor state + analog positions without
+    /// going through the SIO transaction loop.
+    pub fn pad(&self) -> Option<&DigitalPad> {
+        self.pad.as_ref()
+    }
+
     /// Immutable access to the attached memory card, if any. The
     /// frontend uses this to snapshot card bytes for persistence
     /// at shutdown.
@@ -267,9 +274,8 @@ pub enum PadMode {
 }
 
 /// PS1 controller — digital by default, DualShock-capable. Tracks
-/// the active operating mode, the 16 digital buttons, and the four
-/// analog axes. Holds zero rumble state at the moment; the vibration
-/// motor protocol is a separate follow-up.
+/// the active operating mode, the 16 digital buttons, the four
+/// analog axes, and DualShock vibration state.
 pub struct DigitalPad {
     buttons: ButtonState,
     /// Right-stick horizontal axis, 0..=255 (centre `0x80`).
@@ -297,6 +303,21 @@ pub struct DigitalPad {
     /// just sent the address byte; 1 = sent command; 2..=N = payload
     /// / response bytes.
     step: u8,
+    /// DualShock vibration-motor byte mapping. Set by command
+    /// `0x4D` in Config mode. Each entry maps a byte position in
+    /// the `0x42` (poll) command's payload (steps 2..=7) to a
+    /// motor:
+    /// - `0x00` → small motor (on/off — `0xFF` = on).
+    /// - `0x01` → big motor (strength `0..=0xFF`).
+    /// - `0xFF` → no motor at this position (default).
+    ///
+    /// Default state is `[0xFF; 6]` — no motors mapped — matching
+    /// a fresh DualShock before a game has configured rumble.
+    motor_mapping: [u8; 6],
+    /// Current small-motor state (binary on/off).
+    motor_small: bool,
+    /// Current big-motor strength (0..=255).
+    motor_big: u8,
 }
 
 /// Zero-indexed step of the last byte in a transaction. Ack stays
@@ -326,7 +347,20 @@ impl DigitalPad {
             mode_before_config: PadMode::Digital,
             cmd: 0,
             step: 0,
+            motor_mapping: [0xFF; 6],
+            motor_small: false,
+            motor_big: 0,
         }
+    }
+
+    /// Current vibration-motor state: `(small_on, big_strength)`.
+    /// The frontend polls this once per frame to drive a host
+    /// haptics device (gamepad rumble, phone vibrate, etc.).
+    /// Values are latched — they persist across polls — so a
+    /// reader that samples less often than the game polls still
+    /// sees the most recently-commanded state.
+    pub fn motor_state(&self) -> (bool, u8) {
+        (self.motor_small, self.motor_big)
     }
 
     fn reset(&mut self) {
@@ -443,7 +477,17 @@ impl DigitalPad {
             // Digital, 8 in Analog. `self.step` currently points at
             // the byte we're ABOUT to respond with (step 2 = buttons
             // group 1, step 3 = buttons group 2, etc).
-            0x42 => self.poll_byte(self.step),
+            //
+            // When the motor mapping has been set (command 0x4D),
+            // this is also where rumble TX bytes land: the host
+            // ships motor-command bytes alongside the poll, and we
+            // dispatch by mapping slot.
+            0x42 => {
+                if self.mode == PadMode::Analog {
+                    self.apply_rumble_tx(tx, self.step);
+                }
+                self.poll_byte(self.step)
+            }
 
             // 0x43 — enter / exit config mode. Param at step 2:
             //   0x01 → enter config (save prior mode first)
@@ -495,11 +539,59 @@ impl DigitalPad {
                 _ => 0x00,
             },
 
-            // 0x46-0x4F — various config commands (vibration map,
-            // motor test, etc). Not modelled — zero-fill.
-            0x46..=0x4F => 0x00,
+            // 0x4D — vibration-motor mapping. 6 param bytes at
+            // steps 2..=7 each assign a motor to its corresponding
+            // 0x42-poll slot (see `motor_mapping` docs). The
+            // response is the PREVIOUS mapping byte at that slot —
+            // games read the returned bytes to confirm their
+            // mapping took effect.
+            0x4D => {
+                let slot = (self.step.saturating_sub(2)) as usize;
+                if slot < self.motor_mapping.len() {
+                    let prev = self.motor_mapping[slot];
+                    self.motor_mapping[slot] = tx;
+                    prev
+                } else {
+                    0x00
+                }
+            }
+
+            // 0x46..=0x4F (except 0x4D handled above) — other
+            // config commands (e.g. 0x46 = constant query,
+            // 0x47 = extended query, 0x4C = unknown). Not modelled;
+            // zero-fill matches a no-op reply that the BIOS
+            // tolerates.
+            0x46..=0x4C | 0x4E | 0x4F => 0x00,
 
             _ => 0xFF,
+        }
+    }
+
+    /// Apply a rumble-control TX byte at the given step when a
+    /// `0x42` poll is in progress. `step` is the same step index
+    /// the response path uses — values 2..=7 map to motor slots
+    /// 0..=5 (matching the 6 mapping bytes set by command 0x4D).
+    fn apply_rumble_tx(&mut self, tx: u8, step: u8) {
+        let slot = match step {
+            2..=7 => (step - 2) as usize,
+            _ => return,
+        };
+        if slot >= self.motor_mapping.len() {
+            return;
+        }
+        match self.motor_mapping[slot] {
+            0x00 => {
+                // Small motor — binary on/off. Any value != 0xFF
+                // means off; 0xFF means on. Redux matches this
+                // in `pad/controller.cc`.
+                self.motor_small = tx == 0xFF;
+            }
+            0x01 => {
+                // Big motor — strength directly from the byte.
+                self.motor_big = tx;
+            }
+            // Unmapped slot — ignore.
+            _ => {}
         }
     }
 }
@@ -1078,6 +1170,71 @@ mod tests {
         let (rx, ack) = port.exchange(0x01);
         assert_eq!(rx, 0x41);
         assert!(ack);
+    }
+
+    #[test]
+    fn rumble_mapping_defaults_to_unmapped() {
+        let pad = DigitalPad::new();
+        assert_eq!(pad.motor_mapping, [0xFF; 6]);
+        assert_eq!(pad.motor_state(), (false, 0));
+    }
+
+    #[test]
+    fn command_0x4d_stores_mapping_and_returns_previous() {
+        let mut pad = DigitalPad::new();
+        // Preload a distinctive mapping.
+        pad.motor_mapping = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let mapping = [0x00u8, 0x01, 0xFF, 0xFF, 0xFF, 0xFF];
+        // Run the 0x4D transaction.
+        assert_eq!(pad.exchange(0x01).0, 0x41); // ID low (Digital is fine for test)
+        assert_eq!(pad.exchange(0x4D).0, 0x5A);
+        // Send 6 mapping bytes, one per payload slot; expect the
+        // previous value in the response.
+        for (i, &m) in mapping.iter().enumerate() {
+            let expected_prev = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF][i];
+            let (rx, _) = pad.exchange(m);
+            assert_eq!(rx, expected_prev, "slot {i}");
+        }
+        assert_eq!(pad.motor_mapping, mapping);
+    }
+
+    #[test]
+    fn analog_poll_with_mapping_drives_motors() {
+        let mut pad = DigitalPad::new();
+        pad.mode = PadMode::Analog;
+        // slot 0 -> small motor, slot 1 -> big motor.
+        pad.motor_mapping = [0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF];
+        // Poll: 0x01, 0x42, then 6 TX bytes. First TX byte is the
+        // small-motor on/off (0xFF = on); second is big-motor
+        // strength.
+        assert_eq!(pad.exchange(0x01).0, 0x73);
+        assert_eq!(pad.exchange(0x42).0, 0x5A);
+        // Payload step 2 — small motor slot. 0xFF turns it on.
+        let _ = pad.exchange(0xFF);
+        // Payload step 3 — big motor slot. 0x80 = half strength.
+        let _ = pad.exchange(0x80);
+        // Consume remaining payload bytes.
+        for _ in 4..=7 {
+            let _ = pad.exchange(0x00);
+        }
+        assert_eq!(pad.motor_state(), (true, 0x80));
+    }
+
+    #[test]
+    fn small_motor_turns_off_with_non_ff_tx() {
+        let mut pad = DigitalPad::new();
+        pad.mode = PadMode::Analog;
+        pad.motor_mapping = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        pad.motor_small = true;
+        // Poll.
+        let _ = pad.exchange(0x01);
+        let _ = pad.exchange(0x42);
+        // Any non-0xFF value turns the small motor off.
+        let _ = pad.exchange(0x00);
+        for _ in 3..=7 {
+            let _ = pad.exchange(0x00);
+        }
+        assert_eq!(pad.motor_state(), (false, 0));
     }
 
     // --- MemoryCard tests ---

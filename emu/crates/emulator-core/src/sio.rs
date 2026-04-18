@@ -95,10 +95,26 @@ impl Sio0 {
         }
     }
 
+    /// Immutable access to port 1. Used by the frontend to read
+    /// pad state (rumble motor) without having to mutate.
+    pub fn port1(&self) -> &crate::pad::PortDevice {
+        &self.port1
+    }
+
     /// Mutable access to port 1 — lets higher layers swap a
     /// memory card in while keeping the pad attached.
     pub fn port1_mut(&mut self) -> &mut crate::pad::PortDevice {
         &mut self.port1
+    }
+
+    /// Immutable access to port 2.
+    pub fn port2(&self) -> &crate::pad::PortDevice {
+        &self.port2
+    }
+
+    /// Mutable access to port 2.
+    pub fn port2_mut(&mut self) -> &mut crate::pad::PortDevice {
+        &mut self.port2
     }
 
     /// Plug a device into port 1 (typical for "player 1" games).
