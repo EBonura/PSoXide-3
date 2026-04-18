@@ -124,18 +124,41 @@ pub mod drive_status_bit {
 const PARAM_FIFO_DEPTH: usize = 16;
 const RESPONSE_FIFO_DEPTH: usize = 16;
 
-/// Canonical cycle delays for command responses, matching the
-/// ballpark Redux uses. Real hardware values depend on motor speed,
-/// seek distance, head position, etc.; these are fine for "emulates
-/// enough to boot" use.
-const FIRST_RESPONSE_CYCLES: u64 = 50_000;
-const INIT_SECOND_RESPONSE_CYCLES: u64 = 900_000;
-const GETID_SECOND_RESPONSE_CYCLES: u64 = 33_000;
-const SEEK_SECOND_RESPONSE_CYCLES: u64 = 500_000;
-/// Cycles between sector reads at 2× drive speed (BIOS default).
-/// Real hardware is ~33_868_800 / 150 sectors/s = 225k cycles;
-/// Redux uses a closer approximation.
-const SECTOR_READ_CYCLES: u64 = 225_000;
+/// Canonical cycle delays for command responses, transcribed from
+/// Redux's `core/cdrom.cc`. Exact match is the difference between
+/// our CDROM events landing on the same instructions as Redux's
+/// and silently scheduling them thousands of cycles apart — which
+/// compounds into full game-state divergence over tens of millions
+/// of instructions.
+///
+/// Redux cross-references (line numbers from the upstream file):
+///
+/// - `AddIrqQueue(m_cmd, 0x800)` — universal first-response delay
+///   (L1284). Every command's ack fires 2048 cycles after issue.
+/// - `AddIrqQueue(CdlInit + 0x100, 20480)` — Init / GetID second
+///   response, ~4.4 µs, observed across boot roms (L900, and the
+///   shellopen path L938 scheduleCDLidIRQ(20480)).
+/// - `cdReadTime = psxClockSpeed / 75` — one PSX CD-frame period
+///   (L135). At double-speed (mode bit 7) a sector is ready every
+///   `cdReadTime` cycles; at single-speed, `cdReadTime * 2`. We
+///   don't track the mode bit yet — the BIOS's disc probe uses
+///   double-speed, so pick that as the default.
+/// - `scheduleCDPlayIRQ(SEEK_DONE ? 0x800 : cdReadTime * 4)` —
+///   SeekL / SeekP second response (L875). If the target is already
+///   seeked, quick ack; otherwise a full seek-time equivalent.
+const FIRST_RESPONSE_CYCLES: u64 = 0x800; // 2048
+const INIT_SECOND_RESPONSE_CYCLES: u64 = 20_480;
+const GETID_SECOND_RESPONSE_CYCLES: u64 = 20_480;
+const SEEK_SECOND_RESPONSE_CYCLES: u64 = CD_READ_TIME * 4; // ≈ 1,806,336
+/// PSX system clock / CD frames per second. `33_868_800 / 75`.
+/// Redux's `cdReadTime`.
+const CD_READ_TIME: u64 = 451_584;
+/// Cycles between sector reads — matches Redux's double-speed path
+/// (`scheduleCDReadIRQ(cdReadTime)` when mode bit 7 is set).
+/// Single-speed would be `cdReadTime * 2` = 903,168; the BIOS's
+/// disc probe runs at double-speed so we default there. If / when
+/// we start tracking the SetMode bit, we'll branch on it.
+const SECTOR_READ_CYCLES: u64 = CD_READ_TIME;
 
 /// A deferred response: when `bus.cycles` passes `deadline`, the
 /// event's bytes land in the response FIFO and its IRQ type fires.
