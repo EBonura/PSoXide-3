@@ -255,6 +255,19 @@ impl Bus {
         self.sio0.set_port1_buttons(buttons);
     }
 
+    /// Snapshot of the port-1 DualShock vibration-motor state:
+    /// `(small_on, big_strength)` where `small_on` is a binary
+    /// on/off and `big_strength` is 0..=255. Returns `(false, 0)`
+    /// when no pad is attached to port 1. Frontend drives host
+    /// haptics from this each frame.
+    pub fn port1_motor_state(&self) -> (bool, u8) {
+        self.sio0
+            .port1()
+            .pad()
+            .map(|p| p.motor_state())
+            .unwrap_or((false, 0))
+    }
+
     /// Internal: log one HLE BIOS call. Called from the HLE dispatcher.
     pub(crate) fn hle_bios_log_call(&mut self, table: crate::hle_bios::Table, func: u8) {
         let idx = match table {
