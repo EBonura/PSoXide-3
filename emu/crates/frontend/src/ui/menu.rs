@@ -27,7 +27,11 @@ const ANIM_SPEED: f32 = 10.0;
 /// A menu action the Menu emits when the user confirms an item. The
 /// app layer interprets these — Menu stays stateless about the
 /// emulator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Note: dropped `Copy` in favour of `Clone` to carry the
+/// game-ID payload on `LaunchGame`. The dispatch cost is one
+/// `String::clone` per selection — negligible.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuAction {
     /// Toggle between continuous-run and paused.
     ToggleRun,
@@ -37,6 +41,15 @@ pub enum MenuAction {
     Reset,
     /// Paint a test pattern into VRAM (dev aid until the GPU renders).
     FillVramTestPattern,
+    /// Launch a game by its stable library ID. The app layer
+    /// looks the entry up in `AppState::library` and rebuilds
+    /// the emulator around it.
+    LaunchGame(String),
+    /// Re-walk the configured library root and refresh
+    /// `library.ron`. Surfaced as a "Refresh library" item in
+    /// the Games / Examples categories so users can trigger a
+    /// rescan without leaving the Menu.
+    RescanLibrary,
     /// Toggle visibility of the register side panel.
     ToggleRegisters,
     /// Toggle visibility of the memory viewer panel.
@@ -61,14 +74,22 @@ pub struct MenuInput {
     pub toggle_open: bool,
 }
 
+/// One row inside a category. Labels + values are `String` so we
+/// can populate them from library entries at runtime (titles,
+/// region tags, sizes). Static strings like "Run" / "Pause" also
+/// fit the same shape at a small allocation cost — the whole
+/// category tree is rebuilt at most a few times a session.
 struct MenuItem {
-    /// Mutable so the Run/Pause label can swap in place without
-    /// rebuilding the whole category tree on every toggle.
-    label: &'static str,
+    label: String,
     action: MenuAction,
-    value: Option<&'static str>,
+    /// Optional right-aligned subtitle — used for region tags
+    /// ("NTSC-U"), file sizes, and keyboard shortcut hints.
+    value: Option<String>,
 }
 
+/// One Menu column. `icon_name` is a short tag used by tests /
+/// diagnostics so we can identify a category without comparing
+/// Unicode codepoints.
 struct Category {
     name: &'static str,
     icon: char,
@@ -89,73 +110,46 @@ impl Default for MenuState {
     }
 }
 
+/// An entry passed into the Menu from the library layer — minimal
+/// subset of [`psoxide_settings::LibraryEntry`] the Menu needs to
+/// render an item (title + id for dispatch + region/size as the
+/// right-aligned value). Kept separate so the Menu module stays
+/// decoupled from the settings crate's types (and from the GUI
+/// from the tests' perspective).
+#[derive(Debug, Clone)]
+pub struct LibraryItem {
+    /// Stable game ID (16-hex-char fingerprint). Payload of
+    /// [`MenuAction::LaunchGame`] when the user confirms.
+    pub id: String,
+    /// Main label — typically the PVD volume identifier or the
+    /// file stem.
+    pub title: String,
+    /// Right-aligned subtitle, e.g. "NTSC-U · 602 MiB".
+    pub subtitle: String,
+}
+
 impl MenuState {
     pub fn new() -> Self {
         Self::with_running(false)
     }
 
     pub fn with_running(running: bool) -> Self {
-        let run_label = if running { "Pause" } else { "Run" };
+        // Boot categories with the library sections empty — they
+        // get filled by `set_library` once AppState loads the
+        // cached entries. A fresh install sees placeholder "No
+        // games found — run Refresh library" rows.
         let categories = vec![
+            build_games_category(&[]),
+            build_examples_category(&[]),
+            build_system_category(running),
+            build_debug_category(),
             Category {
-                name: "Game",
-                icon: icons::PLAY,
-                items: vec![
-                    MenuItem {
-                        label: run_label,
-                        action: MenuAction::ToggleRun,
-                        value: None,
-                    },
-                    MenuItem {
-                        label: "Step one instruction",
-                        action: MenuAction::StepOne,
-                        value: None,
-                    },
-                    MenuItem {
-                        label: "Reset CPU",
-                        action: MenuAction::Reset,
-                        value: None,
-                    },
-                ],
-            },
-            Category {
-                name: "Debug",
-                icon: icons::BUG,
-                items: vec![
-                    MenuItem {
-                        label: "Toggle registers panel",
-                        action: MenuAction::ToggleRegisters,
-                        value: None,
-                    },
-                    MenuItem {
-                        label: "Toggle memory panel",
-                        action: MenuAction::ToggleMemory,
-                        value: None,
-                    },
-                    MenuItem {
-                        label: "Toggle VRAM panel",
-                        action: MenuAction::ToggleVram,
-                        value: None,
-                    },
-                    MenuItem {
-                        label: "Toggle HUD",
-                        action: MenuAction::ToggleHud,
-                        value: None,
-                    },
-                    MenuItem {
-                        label: "Fill VRAM test pattern",
-                        action: MenuAction::FillVramTestPattern,
-                        value: None,
-                    },
-                ],
-            },
-            Category {
-                name: "System",
-                icon: icons::CPU,
+                name: "Quit",
+                icon: icons::POWER,
                 items: vec![MenuItem {
-                    label: "Quit",
+                    label: "Quit PSoXide".to_string(),
                     action: MenuAction::Quit,
-                    value: Some("Esc ×2"),
+                    value: Some("Esc ×2".to_string()),
                 }],
             },
         ];
@@ -169,13 +163,50 @@ impl MenuState {
         }
     }
 
-    /// Rebuild categories with a fresh "Run"/"Pause" label. Called when
-    /// `AppState.running` flips.
+    /// Rebuild the Games + Examples categories from a library
+    /// snapshot. Call after load, after a rescan, and whenever the
+    /// library changes. Existing selection is preserved when
+    /// possible (same category + in-range item) and clamped to the
+    /// new bounds otherwise.
+    pub fn set_library(&mut self, games: &[LibraryItem], examples: &[LibraryItem]) {
+        // Snapshot the current selection's category NAME so we can
+        // re-resolve after rebuilding (indices may change).
+        let current_cat_name = self
+            .categories
+            .get(self.category_index)
+            .map(|c| c.name)
+            .unwrap_or("");
+
+        if let Some(games_cat) = self.categories.first_mut() {
+            *games_cat = build_games_category(games);
+        }
+        if let Some(examples_cat) = self.categories.get_mut(1) {
+            *examples_cat = build_examples_category(examples);
+        }
+
+        // Try to preserve the user's category if it still exists.
+        if let Some(idx) = self.categories.iter().position(|c| c.name == current_cat_name) {
+            self.category_index = idx;
+        } else {
+            self.category_index = 0;
+        }
+        // Clamp item index to the new category bounds.
+        let item_count = self.categories[self.category_index].items.len();
+        if self.item_index >= item_count {
+            self.item_index = item_count.saturating_sub(1);
+        }
+    }
+
+    /// Rebuild categories with a fresh "Run"/"Pause" label. Called
+    /// when `AppState.running` flips.
     pub fn sync_run_label(&mut self, running: bool) {
-        let run_label = if running { "Pause" } else { "Run" };
-        if let Some(game) = self.categories.first_mut() {
-            if let Some(item) = game.items.first_mut() {
-                item.label = run_label;
+        if let Some(system) = self
+            .categories
+            .iter_mut()
+            .find(|c| c.name == "System")
+        {
+            if let Some(item) = system.items.first_mut() {
+                item.label = if running { "Pause".into() } else { "Run".into() };
             }
         }
     }
@@ -209,13 +240,34 @@ impl MenuState {
         }
 
         if input.confirm && num_items > 0 {
-            return Some(self.categories[self.category_index].items[self.item_index].action);
+            return Some(
+                self.categories[self.category_index].items[self.item_index]
+                    .action
+                    .clone(),
+            );
         }
 
         if input.back {
             self.open = false;
         }
         None
+    }
+
+    /// Public reader for the currently-selected item's action —
+    /// tests use it to assert the menu is populated correctly
+    /// without driving input events.
+    #[cfg(test)]
+    pub fn selected_action(&self) -> Option<&MenuAction> {
+        self.categories
+            .get(self.category_index)
+            .and_then(|c| c.items.get(self.item_index))
+            .map(|i| &i.action)
+    }
+
+    /// Current category name — also exposed for test assertions.
+    #[cfg(test)]
+    pub fn current_category(&self) -> Option<&'static str> {
+        self.categories.get(self.category_index).map(|c| c.name)
     }
 
     /// Draw the Menu overlay on a middle-layer painter. `dt` drives the
@@ -319,12 +371,12 @@ impl MenuState {
             painter.text(
                 Pos2::new(items_x + 14.0, y + ITEM_HEIGHT / 2.0),
                 Align2::LEFT_CENTER,
-                item.label,
+                item.label.clone(),
                 label_font.clone(),
                 label_color,
             );
 
-            if let Some(val) = item.value {
+            if let Some(val) = item.value.as_deref() {
                 let val_color = if is_selected {
                     theme::MENU_TEXT_VALUE
                 } else {
@@ -333,7 +385,7 @@ impl MenuState {
                 painter.text(
                     Pos2::new(items_x + ITEM_WIDTH - 12.0, y + ITEM_HEIGHT / 2.0),
                     Align2::RIGHT_CENTER,
-                    val,
+                    val.to_string(),
                     value_font.clone(),
                     val_color,
                 );
@@ -348,5 +400,237 @@ impl MenuState {
             FontId::proportional(12.0),
             theme::MENU_HINT,
         );
+    }
+}
+
+/// Construct the Games category from a library snapshot. Empty
+/// libraries get a helpful placeholder item so the user
+/// understands the category isn't broken, just unpopulated.
+fn build_games_category(games: &[LibraryItem]) -> Category {
+    let mut items = Vec::with_capacity(games.len() + 1);
+    if games.is_empty() {
+        items.push(MenuItem {
+            label: "No games found yet".into(),
+            action: MenuAction::RescanLibrary,
+            value: Some("Refresh".into()),
+        });
+    } else {
+        for g in games {
+            items.push(MenuItem {
+                label: g.title.clone(),
+                action: MenuAction::LaunchGame(g.id.clone()),
+                value: if g.subtitle.is_empty() {
+                    None
+                } else {
+                    Some(g.subtitle.clone())
+                },
+            });
+        }
+        // Always offer a rescan at the end of the Games list —
+        // matches menu UX where "Refresh" sits below the
+        // scrollable section.
+        items.push(MenuItem {
+            label: "Refresh library".into(),
+            action: MenuAction::RescanLibrary,
+            value: Some("↻".into()),
+        });
+    }
+    Category {
+        name: "Games",
+        icon: icons::DISC,
+        items,
+    }
+}
+
+/// Construct the Examples category. Homebrew EXEs are shown here
+/// so they don't compete with commercial games; the two lists
+/// have different conventions for naming + running.
+fn build_examples_category(examples: &[LibraryItem]) -> Category {
+    let mut items = Vec::with_capacity(examples.len() + 1);
+    if examples.is_empty() {
+        items.push(MenuItem {
+            label: "No homebrew EXEs found".into(),
+            action: MenuAction::RescanLibrary,
+            value: Some("Refresh".into()),
+        });
+    } else {
+        for e in examples {
+            items.push(MenuItem {
+                label: e.title.clone(),
+                action: MenuAction::LaunchGame(e.id.clone()),
+                value: if e.subtitle.is_empty() {
+                    None
+                } else {
+                    Some(e.subtitle.clone())
+                },
+            });
+        }
+        items.push(MenuItem {
+            label: "Refresh library".into(),
+            action: MenuAction::RescanLibrary,
+            value: Some("↻".into()),
+        });
+    }
+    Category {
+        name: "Examples",
+        icon: icons::FOLDER,
+        items,
+    }
+}
+
+/// The System category holds emulator-wide actions: run/pause,
+/// step, reset. Renamed from "Game" — on the PSX-style Menu, the
+/// Game column holds games, System holds controls. Matches
+/// menu convention.
+fn build_system_category(running: bool) -> Category {
+    let run_label = if running { "Pause" } else { "Run" };
+    Category {
+        name: "System",
+        icon: icons::CPU,
+        items: vec![
+            MenuItem {
+                label: run_label.into(),
+                action: MenuAction::ToggleRun,
+                value: Some("Space".into()),
+            },
+            MenuItem {
+                label: "Step one instruction".into(),
+                action: MenuAction::StepOne,
+                value: None,
+            },
+            MenuItem {
+                label: "Reset emulator".into(),
+                action: MenuAction::Reset,
+                value: None,
+            },
+        ],
+    }
+}
+
+/// Debug utilities — panel toggles + VRAM test pattern.
+fn build_debug_category() -> Category {
+    Category {
+        name: "Debug",
+        icon: icons::BUG,
+        items: vec![
+            MenuItem {
+                label: "Toggle registers panel".into(),
+                action: MenuAction::ToggleRegisters,
+                value: None,
+            },
+            MenuItem {
+                label: "Toggle memory panel".into(),
+                action: MenuAction::ToggleMemory,
+                value: None,
+            },
+            MenuItem {
+                label: "Toggle VRAM panel".into(),
+                action: MenuAction::ToggleVram,
+                value: None,
+            },
+            MenuItem {
+                label: "Toggle HUD".into(),
+                action: MenuAction::ToggleHud,
+                value: None,
+            },
+            MenuItem {
+                label: "Fill VRAM test pattern".into(),
+                action: MenuAction::FillVramTestPattern,
+                value: None,
+            },
+        ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_item(id: &str, title: &str, sub: &str) -> LibraryItem {
+        LibraryItem {
+            id: id.into(),
+            title: title.into(),
+            subtitle: sub.into(),
+        }
+    }
+
+    #[test]
+    fn fresh_state_has_five_categories() {
+        let s = MenuState::new();
+        assert_eq!(s.categories.len(), 5);
+        assert_eq!(s.categories[0].name, "Games");
+        assert_eq!(s.categories[1].name, "Examples");
+        assert_eq!(s.categories[2].name, "System");
+        assert_eq!(s.categories[3].name, "Debug");
+        assert_eq!(s.categories[4].name, "Quit");
+    }
+
+    #[test]
+    fn empty_library_shows_placeholder_that_triggers_rescan() {
+        let s = MenuState::new();
+        let first = s.categories[0].items.first().unwrap();
+        assert_eq!(first.action, MenuAction::RescanLibrary);
+    }
+
+    #[test]
+    fn set_library_populates_games_and_examples() {
+        let mut s = MenuState::new();
+        s.set_library(
+            &[dummy_item("g1", "Crash", "NTSC-U · 600 MiB")],
+            &[dummy_item("e1", "hello-tri", "EXE")],
+        );
+        assert_eq!(s.categories[0].items[0].label, "Crash");
+        assert_eq!(
+            s.categories[0].items[0].action,
+            MenuAction::LaunchGame("g1".to_string())
+        );
+        // Refresh row is appended after the actual entries.
+        assert_eq!(s.categories[0].items.last().unwrap().action, MenuAction::RescanLibrary);
+        assert_eq!(s.categories[1].items[0].label, "hello-tri");
+    }
+
+    #[test]
+    fn set_library_preserves_category_across_rebuild() {
+        let mut s = MenuState::new();
+        // Move to "System" category before rebuilding.
+        s.category_index = 2;
+        s.set_library(&[], &[]);
+        assert_eq!(s.current_category(), Some("System"));
+    }
+
+    #[test]
+    fn sync_run_label_flips_system_run_item() {
+        let mut s = MenuState::new();
+        assert_eq!(s.categories[2].items[0].label, "Run");
+        s.sync_run_label(true);
+        assert_eq!(s.categories[2].items[0].label, "Pause");
+        s.sync_run_label(false);
+        assert_eq!(s.categories[2].items[0].label, "Run");
+    }
+
+    #[test]
+    fn navigation_stays_in_bounds() {
+        let mut s = MenuState::new();
+        // Populate some games so there's something to navigate.
+        s.set_library(
+            &[
+                dummy_item("a", "A", ""),
+                dummy_item("b", "B", ""),
+                dummy_item("c", "C", ""),
+            ],
+            &[],
+        );
+        let right = MenuInput { right: true, ..Default::default() };
+        s.update(&right); // → Examples
+        s.update(&right); // → System
+        s.update(&right); // → Debug
+        s.update(&right); // → Quit
+        s.update(&right); // past end — should clamp
+        assert_eq!(s.current_category(), Some("Quit"));
+        let left = MenuInput { left: true, ..Default::default() };
+        for _ in 0..10 {
+            s.update(&left);
+        }
+        assert_eq!(s.current_category(), Some("Games"));
     }
 }

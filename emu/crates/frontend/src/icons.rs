@@ -27,6 +27,18 @@ pub const SAVE: char = '\u{e14d}';
 pub const EYE: char = '\u{e0ba}';
 pub const EYE_OFF: char = '\u{e0bb}';
 
+/// Power-off / quit icon — used for the rightmost Menu category
+/// so "close the app" has its own place instead of hiding inside
+/// Debug.
+pub const POWER: char = '\u{e13e}';
+/// Folder icon — Examples category badge (SDK homebrew feels
+/// more like "scroll through a folder" than "spin a disc").
+pub const FOLDER: char = '\u{e0d8}';
+/// Refresh/rotate icon — rescan-library action.
+pub const ROTATE_CCW: char = '\u{e144}';
+/// Disc icon — Games category badge.
+pub const DISC: char = '\u{e528}';
+
 /// Lucide FontId at a given size.
 pub fn font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("lucide".into()))
