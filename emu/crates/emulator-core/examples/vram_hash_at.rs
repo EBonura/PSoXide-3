@@ -30,8 +30,15 @@ fn main() {
     }
     let mut cpu = Cpu::new();
 
-    for _ in 0..n {
-        cpu.step(&mut bus).expect("step");
+    let mut stopped_at: Option<u64> = None;
+    for i in 0..n {
+        if cpu.step(&mut bus).is_err() {
+            stopped_at = Some(i);
+            break;
+        }
+    }
+    if let Some(at) = stopped_at {
+        eprintln!("[vram_hash_at] stopped at step {at}/{n}");
     }
 
     // Full 1 MiB VRAM hash (self-regression only — determinism check).

@@ -104,6 +104,13 @@ pub struct Bus {
     /// Per-(table, func) count of HLE BIOS calls. Diagnostic only.
     /// `[table][func]` where table is 0=A, 1=B, 2=C.
     hle_bios_calls: [[u32; 256]; 3],
+    /// Addresses we've already logged as unmapped reads. Keeps
+    /// log noise bounded when a buggy game pokes a bad pointer
+    /// in a tight loop.
+    unmapped_read_seen: std::collections::BTreeSet<u32>,
+    /// Same, writes. Separate so read + write to the same bad
+    /// address both log at least once.
+    unmapped_write_seen: std::collections::BTreeSet<u32>,
 }
 
 // --- Phase 4 scheduler constants (NTSC) ---
@@ -162,6 +169,8 @@ impl Bus {
             mmio_trace: MmioTrace::new(),
             hle_bios_enabled: false,
             hle_bios_calls: [[0; 256]; 3],
+            unmapped_read_seen: std::collections::BTreeSet::new(),
+            unmapped_write_seen: std::collections::BTreeSet::new(),
         })
     }
 
@@ -304,6 +313,18 @@ impl Bus {
         self.cycles
     }
 
+    /// Record `addr` as seen on an unmapped *read*, returning
+    /// `true` the first time so the caller logs once.
+    fn log_unmapped_read_once(&mut self, addr: u32) -> bool {
+        self.unmapped_read_seen.insert(addr)
+    }
+
+    /// Record `addr` as seen on an unmapped *write*, returning
+    /// `true` the first time so the caller logs once.
+    fn log_unmapped_write_once(&mut self, addr: u32) -> bool {
+        self.unmapped_write_seen.insert(addr)
+    }
+
     /// Advance the VBlank schedule and raise `IrqSource::VBlank` for
     /// every period that's elapsed. Not called yet — Phase 4b turns
     /// this on by invoking it from `tick`. Exposed + public so the
@@ -416,15 +437,39 @@ impl Bus {
             return None;
         }
         let sync_mode = (ch.channel_control >> 9) & 0x3;
-        if sync_mode != 1 {
-            // Manual / linked-list aren't used for the CD-ROM channel.
-            return Some(0);
-        }
-
+        // PSX BIOS + most games use sync mode 1 (block request) for
+        // CDROM reads, but some firmware paths use sync mode 0
+        // (manual / immediate). They differ only in how BCR is
+        // interpreted:
+        //
+        //   mode 0 (manual): BCR is the total number of words to
+        //                    transfer. BA is ignored.
+        //   mode 1 (block):  BCR is (BA << 16) | BS — transfer BS
+        //                    words per request, BA times.
+        //
+        // Both result in the same byte flow from the CDROM data
+        // FIFO to RAM; computing `total_words` from the right BCR
+        // encoding is what matters. Earlier we short-circuited
+        // sync_mode!=1 to Some(0), which silently dropped every
+        // BIOS disc read: the FIFO still filled (we saw LBA 16 in
+        // it from cdrom_drive_test) but its bytes never landed in
+        // RAM, and the BIOS's PVD parse fell back to reading
+        // LBA 0 on empty input.
         let bcr = ch.block_control;
-        let block_size = bcr & 0xFFFF;
-        let block_count = (bcr >> 16) & 0xFFFF;
-        let total_words = block_size * block_count.max(1);
+        let total_words = match sync_mode {
+            0 => bcr & 0xFFFF,
+            1 => {
+                let block_size = bcr & 0xFFFF;
+                let block_count = (bcr >> 16) & 0xFFFF;
+                block_size * block_count.max(1)
+            }
+            _ => {
+                // Linked-list (2) + reserved (3) — not used for
+                // CDROM. Drop the trigger silently.
+                return Some(0);
+            }
+        };
+
         let mut addr = ch.base & 0x001F_FFFC;
         let step: u32 = if (ch.channel_control >> 1) & 1 != 0 {
             0xFFFF_FFFCu32
@@ -627,7 +672,16 @@ impl Bus {
         {
             return 0xFF;
         }
-        panic!("bus: unmapped read8 @ virt={virt:#010x} phys={phys:#010x}");
+        // Unmapped read on real hardware returns the last bus
+        // value (essentially random from software's POV). Many
+        // games have wild pointers here and there; panicking
+        // would halt perfectly-good emulation. Return 0xFF so
+        // software sees "no peripheral." Log once at non-trivial
+        // addresses so a real bug doesn't hide in the noise.
+        if self.log_unmapped_read_once(virt) {
+            eprintln!("[bus] unmapped read8 @ virt={virt:#010x} phys={phys:#010x}");
+        }
+        0xFF
     }
 
     /// Read a 16-bit little-endian half-word from a virtual address.
@@ -697,7 +751,10 @@ impl Bus {
         {
             return 0xFFFF;
         }
-        panic!("bus: unmapped read16 @ virt={virt:#010x} phys={phys:#010x}");
+        if self.log_unmapped_read_once(virt) {
+            eprintln!("[bus] unmapped read16 @ virt={virt:#010x} phys={phys:#010x}");
+        }
+        0xFFFF
     }
 
     /// Read a 32-bit little-endian word from a virtual address. This is
@@ -771,7 +828,10 @@ impl Bus {
             return read_u32_le(&self.io[offset..]);
         }
 
-        panic!("bus: unmapped read32 @ virt={virt:#010x} phys={phys:#010x}");
+        if self.log_unmapped_read_once(virt) {
+            eprintln!("[bus] unmapped read32 @ virt={virt:#010x} phys={phys:#010x}");
+        }
+        0xFFFF_FFFF
     }
 
     /// Write a 32-bit little-endian word to a virtual address.
@@ -861,7 +921,11 @@ impl Bus {
             return;
         }
 
-        panic!("bus: unmapped write32 @ virt={virt:#010x} phys={phys:#010x} value={value:#010x}");
+        if self.log_unmapped_write_once(virt) {
+            eprintln!(
+                "[bus] unmapped write32 @ virt={virt:#010x} phys={phys:#010x} value={value:#010x}"
+            );
+        }
     }
 
     /// Write a byte to a virtual address. Unmapped writes in MMIO /
@@ -913,7 +977,11 @@ impl Bus {
         if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32).contains(&phys) {
             return;
         }
-        panic!("bus: unmapped write8 @ virt={virt:#010x} phys={phys:#010x} value={value:#04x}");
+        if self.log_unmapped_write_once(virt) {
+            eprintln!(
+                "[bus] unmapped write8 @ virt={virt:#010x} phys={phys:#010x} value={value:#04x}"
+            );
+        }
     }
 
     /// Write a 16-bit half-word to a virtual address. Same unmapped-region
@@ -980,7 +1048,11 @@ impl Bus {
         if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32).contains(&phys) {
             return;
         }
-        panic!("bus: unmapped write16 @ virt={virt:#010x} phys={phys:#010x} value={value:#06x}");
+        if self.log_unmapped_write_once(virt) {
+            eprintln!(
+                "[bus] unmapped write16 @ virt={virt:#010x} phys={phys:#010x} value={value:#06x}"
+            );
+        }
     }
 }
 

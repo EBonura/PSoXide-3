@@ -62,6 +62,11 @@ pub struct Dma {
     /// Diagnostic only — tells us which channels software is using
     /// and how often. Cleared on `new()`, never decremented.
     pub start_trigger_counts: [u64; NUM_CHANNELS],
+    /// Mirror of `start_trigger_counts` that survives cargo-naming
+    /// nuance — a second counter bumped in the same place so a
+    /// probe can distinguish "channel never touched" from "channel
+    /// touched but we haven't picked it up."
+    pub chcr_write_count: [u64; NUM_CHANNELS],
 }
 
 impl Dma {
@@ -85,6 +90,7 @@ impl Dma {
             dpcr: 0,
             dicr: 0,
             start_trigger_counts: [0; NUM_CHANNELS],
+            chcr_write_count: [0; NUM_CHANNELS],
         }
     }
 
@@ -137,6 +143,8 @@ impl Dma {
                         c.channel_control = value;
                         if (value >> 24) & 1 != 0 {
                             self.start_trigger_counts[ch] += 1;
+                            self.chcr_write_count[ch] =
+                                self.chcr_write_count[ch].saturating_add(1);
                         }
                     }
                     _ => {}
