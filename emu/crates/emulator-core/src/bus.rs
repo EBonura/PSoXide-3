@@ -71,24 +71,21 @@ pub struct Bus {
     /// (VBlank, timer ticks, DMA completion). Phase 4a just counts;
     /// Phase 4b starts firing IRQs off it.
     cycles: u64,
-    /// Absolute cycle count at which the *next* VBlank should fire.
-    /// Matches PCSX-Redux's counter-3 math: first VBlank at scanline
-    /// 243 of 263 (NTSC) at `HSync * 243 = 2146 * 243 = 521_478`
-    /// cycles, then every `HSync * 263 = 564_398` cycles thereafter.
-    /// Phase 4a tracks this but doesn't fire — Phase 4b hangs the
-    /// VBlank IRQ off reaching this threshold.
-    next_vblank_cycle: u64,
-    /// Per-channel scheduled cycle at which a DMA transfer's
-    /// completion fires — clears CHCR start bit and raises the DMA
-    /// IRQ. Mirrors Redux's per-channel completion scheduling (e.g.
-    /// `scheduleGPUOTCDMAIRQ(size)` for OTC, `scheduleGPUDMAIRQ(size)`
-    /// for linked-list). Completion is delayed by the transfer's
-    /// word count so that BIOS polls of CHCR see the busy bits for
-    /// the right number of instructions. Firing the IRQ immediately
-    /// on CHCR write triggers a spurious early IRQ take that doesn't
-    /// happen on real hardware and diverges the parity trace by
-    /// several instructions' worth of state.
-    pending_dma_completions: [Option<u64>; 7],
+    // VBlank scheduling lives in `scheduler` under
+    // [`EventSlot::VBlank`]. Seeded at `FIRST_VBLANK_CYCLE` by
+    // `Bus::new`; every VBlank handler invocation re-schedules the
+    // next one `VBLANK_PERIOD_CYCLES` later.
+    /// Unified event scheduler — the 15-slot queue that owns
+    /// DMA / CDROM / VBlank / SPU / MDEC / SIO timings, matching
+    /// Redux's `m_regs.interrupt` + `intTargets`. See
+    /// [`crate::scheduler`] for the model.
+    ///
+    /// Migration status: DMA channel completions (slots `GpuDma`,
+    /// `GpuOtcDma`, `CdrDma`, `MdecInDma`, `MdecOutDma`, `SpuDma`)
+    /// run through the scheduler. VBlank, CDROM command / read
+    /// events, SPU async, SIO — still on their legacy per-subsystem
+    /// timers; migrations land in follow-up commits.
+    pub scheduler: crate::scheduler::Scheduler,
     /// Bounded ring buffer of recent MMIO accesses. Zero-sized and
     /// no-op at every call site unless the `trace-mmio` Cargo feature
     /// is enabled — see `mmio_trace.rs` for the rationale.
@@ -164,8 +161,14 @@ impl Bus {
             sio0: Sio0::new(),
             cdrom: CdRom::new(),
             cycles: 0,
-            next_vblank_cycle: FIRST_VBLANK_CYCLE,
-            pending_dma_completions: [None; 7],
+            scheduler: {
+                let mut s = crate::scheduler::Scheduler::new();
+                // Seed the first VBlank at scanline 243. Every fire
+                // of `EventSlot::VBlank` in `drain_scheduler_events`
+                // reschedules the next one.
+                s.schedule(crate::scheduler::EventSlot::VBlank, 0, FIRST_VBLANK_CYCLE);
+                s
+            },
             mmio_trace: MmioTrace::new(),
             hle_bios_enabled: false,
             hle_bios_calls: [[0; 256]; 3],
@@ -265,9 +268,12 @@ impl Bus {
     }
 
     /// Cycle count at which the next VBlank is scheduled to fire.
-    /// Exposed for diagnostics / the HUD.
+    /// Exposed for diagnostics / the HUD. Reads through to the
+    /// scheduler, which is the source of truth since Phase 5a.
     pub fn next_vblank_cycle(&self) -> u64 {
-        self.next_vblank_cycle
+        self.scheduler
+            .target(crate::scheduler::EventSlot::VBlank)
+            .unwrap_or(u64::MAX)
     }
 
     /// Advance the cycle counter by `n` cycles and run any scheduled
@@ -275,41 +281,106 @@ impl Bus {
     /// instruction from `Cpu::step` (charging BIAS before the opcode).
     pub fn tick(&mut self, n: u32) {
         self.advance_cycles(n);
-        self.run_vblank_scheduler();
-        self.run_dma_scheduler();
+        self.drain_scheduler_events();
         if self.cdrom.tick(self.cycles) {
             self.irq.raise(IrqSource::Cdrom);
         }
     }
 
-    /// Mirror of Redux's `scheduleGPUDMAIRQ` / `gpuotcInterrupt` /
-    /// similar per-channel completion handlers: when a channel's
-    /// scheduled completion cycle is reached, clear CHCR bit 24
-    /// (start/enable) and raise the DMA IRQ on the master-flag edge.
-    /// Bit 28 (busy) stays set until the BIOS IRQ handler writes the
-    /// next CHCR — that's a real-hardware detail Redux preserves and
-    /// we mirror. All channels fire through the single DMA IRQ line;
-    /// individual per-channel identification happens via DICR, which
-    /// we don't model yet — I_MASK's DMA bit is currently the only
-    /// gate.
-    fn run_dma_scheduler(&mut self) {
-        let mut master_edge = false;
-        for ch in 0..7 {
-            let Some(due) = self.pending_dma_completions[ch] else {
-                continue;
-            };
-            if self.cycles < due {
-                continue;
-            }
-            self.pending_dma_completions[ch] = None;
-            self.dma.channels[ch].channel_control &= !(1 << 24);
-            if self.dma.notify_channel_done(ch) {
-                master_edge = true;
+    /// Walk every scheduler slot whose deadline has passed and
+    /// dispatch its handler. Mirrors Redux's `branchTest` interrupt
+    /// loop (`core/r3000a.cc`), which uses a single 15-slot queue
+    /// to drive DMA / CDROM / SPU / MDEC / SIO completions.
+    ///
+    /// DMA channel completions all funnel through the shared
+    /// `Dma` IRQ line: each per-channel slot clears CHCR bit 24
+    /// and records a master-edge if the channel's DICR bit is
+    /// armed. One IRQ raise covers any number of simultaneous
+    /// completions this tick.
+    ///
+    /// Slots we haven't migrated yet (CDROM, VBlank, SPU, SIO,
+    /// MDEC) will never appear here because no subsystem schedules
+    /// them — the legacy timers still own those. Each migration
+    /// replaces a legacy timer with `scheduler.schedule(...)` and
+    /// adds a `match` arm here.
+    fn drain_scheduler_events(&mut self) {
+        use crate::scheduler::EventSlot;
+        let now = self.cycles;
+        let mut dma_edge = false;
+        while let Some((slot, target)) = self.scheduler.take_due(now) {
+            match slot {
+                EventSlot::MdecInDma => {
+                    if self.complete_dma_channel(0) {
+                        dma_edge = true;
+                    }
+                }
+                EventSlot::MdecOutDma => {
+                    if self.complete_dma_channel(1) {
+                        dma_edge = true;
+                    }
+                }
+                EventSlot::GpuDma => {
+                    if self.complete_dma_channel(2) {
+                        dma_edge = true;
+                    }
+                }
+                EventSlot::CdrDma => {
+                    if self.complete_dma_channel(3) {
+                        dma_edge = true;
+                    }
+                }
+                EventSlot::SpuDma => {
+                    if self.complete_dma_channel(4) {
+                        dma_edge = true;
+                    }
+                }
+                EventSlot::GpuOtcDma => {
+                    if self.complete_dma_channel(6) {
+                        dma_edge = true;
+                    }
+                }
+                EventSlot::VBlank => {
+                    self.irq.raise(IrqSource::VBlank);
+                    // Toggle GPUSTAT bit 31 (interlace / field flag)
+                    // — some BIOS and game code polls this instead
+                    // of (or in addition to) the VBlank IRQ to detect
+                    // frame boundaries. Matches Redux's
+                    // `SoftGPU::vblank` which XORs the same bit.
+                    self.gpu.toggle_vblank_field();
+                    // Re-arm the next VBlank from the original
+                    // target, not `now`. A 500K-cycle drain lag
+                    // would otherwise accumulate drift every time.
+                    self.scheduler
+                        .schedule(EventSlot::VBlank, target, VBLANK_PERIOD_CYCLES);
+                }
+                // Not-yet-migrated slots. A subsystem scheduling one
+                // of these today would silently do nothing; they're
+                // listed so `match` stays exhaustive as migrations
+                // roll in.
+                EventSlot::Sio
+                | EventSlot::Sio1
+                | EventSlot::Cdr
+                | EventSlot::CdRead
+                | EventSlot::CdrPlay
+                | EventSlot::CdrDbuf
+                | EventSlot::CdrLid
+                | EventSlot::SpuAsync => {}
             }
         }
-        if master_edge {
+        if dma_edge {
             self.irq.raise(IrqSource::Dma);
         }
+    }
+
+    /// Finalise a DMA channel's transfer: clear the start bit in
+    /// CHCR and notify the DMA controller so it updates DICR and
+    /// returns whether this channel's IRQ-enable bit caused the
+    /// shared `IrqSource::Dma` line to transition high. Caller
+    /// raises that IRQ once per tick if any channel was on the
+    /// edge.
+    fn complete_dma_channel(&mut self, ch: usize) -> bool {
+        self.dma.channels[ch].channel_control &= !(1 << 24);
+        self.dma.notify_channel_done(ch)
     }
 
     /// Advance the cycle counter without running peripheral schedulers.
@@ -360,21 +431,13 @@ impl Bus {
         self.unmapped_write_seen.insert(addr)
     }
 
-    /// Advance the VBlank schedule and raise `IrqSource::VBlank` for
-    /// every period that's elapsed. Not called yet — Phase 4b turns
-    /// this on by invoking it from `tick`. Exposed + public so the
-    /// frontend can turn it on experimentally, and so unit tests can
-    /// exercise it in isolation.
+    /// Drive the VBlank + DMA + (eventually) CDROM / SPU event
+    /// loops once. Provided as a public entry point so tests can
+    /// advance peripheral state directly without stepping the CPU.
+    /// Production callers hit it transitively via
+    /// [`Bus::tick`] → [`Bus::drain_scheduler_events`].
     pub fn run_vblank_scheduler(&mut self) {
-        while self.cycles >= self.next_vblank_cycle {
-            self.irq.raise(IrqSource::VBlank);
-            // Toggle GPUSTAT bit 31 (interlace/field flag) — some BIOS
-            // and game code polls this instead of (or in addition to)
-            // the VBlank IRQ to detect frame boundaries. Matches
-            // Redux's `SoftGPU::vblank` which does the same.
-            self.gpu.toggle_vblank_field();
-            self.next_vblank_cycle = self.next_vblank_cycle.wrapping_add(VBLANK_PERIOD_CYCLES);
-        }
+        self.drain_scheduler_events();
     }
 
     /// Borrow the interrupt controller — caller can `.raise()` sources
@@ -444,18 +507,19 @@ impl Bus {
         // trace step-for-step. An immediate IRQ raise triggers the
         // handler ~1 hblank early and diverges the trace by dozens of
         // instructions.
+        use crate::scheduler::EventSlot;
         let otc_words = self.dma.run_otc(&mut self.ram[..]);
         if otc_words > 0 {
-            self.pending_dma_completions[6] =
-                Some(self.cycles.wrapping_add(otc_words as u64));
+            self.scheduler
+                .schedule(EventSlot::GpuOtcDma, self.cycles, otc_words as u64);
         }
-        if let Some(gpu_words) = self.run_dma_gpu() {
-            self.pending_dma_completions[2] =
-                Some(self.cycles.wrapping_add(gpu_words as u64));
+        if let Some(gpu_cycles) = self.run_dma_gpu() {
+            self.scheduler
+                .schedule(EventSlot::GpuDma, self.cycles, gpu_cycles as u64);
         }
         if let Some(cdrom_words) = self.run_dma_cdrom() {
-            self.pending_dma_completions[3] =
-                Some(self.cycles.wrapping_add(cdrom_words as u64));
+            self.scheduler
+                .schedule(EventSlot::CdrDma, self.cycles, cdrom_words as u64);
         }
     }
 
@@ -540,33 +604,46 @@ impl Bus {
     ///   (following 32-bit words to ship to GP0), low 24 bits = next
     ///   node address. Terminator is `AAAAAA == 0xFFFFFF`.
     ///
-    /// Returns `Some(word_count)` when a transfer was kicked (caller
-    /// uses it to schedule the completion IRQ), `None` when the
-    /// channel wasn't armed. CHCR start/busy bits are NOT cleared
-    /// here — the per-channel scheduler does that at the completion
-    /// cycle.
+    /// Returns `Some(completion_cycles)` when a transfer was kicked
+    /// (caller uses it to schedule the GpuDma event), `None` when
+    /// the channel wasn't armed. CHCR start/busy bits are NOT cleared
+    /// here — the scheduler does that at the completion cycle.
+    ///
+    /// `completion_cycles` is the Redux-accurate event delay, which
+    /// depends on sync mode and transfer direction:
+    ///
+    /// - **Block, mem2vram** (RAM→GPU, bit 0 = 1): `7 * block_count`,
+    ///   per Redux `core/gpu.cc` L551: `scheduleGPUDMAIRQ((7 * size)
+    ///   / bs)` = `7 * block_count`. That's the active path in
+    ///   modern Redux (the `#if 0` branch above it uses `size`).
+    /// - **Block, vram2mem** (GPU→RAM, bit 0 = 0): `total_words`,
+    ///   per Redux L523: `scheduleGPUDMAIRQ(size)`.
+    /// - **Linked list**: `total_words`, per Redux L568:
+    ///   `scheduleGPUDMAIRQ(size)` where size is the
+    ///   `gpuDmaChainSize` traversed count.
     fn run_dma_gpu(&mut self) -> Option<u32> {
         let ch = &self.dma.channels[2];
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
         }
         let sync_mode = (ch.channel_control >> 9) & 0x3;
-        let words = match sync_mode {
-            1 => self.dma_gpu_block(),
+        let direction_to_device = ch.channel_control & 1 != 0;
+        let completion = match sync_mode {
+            1 => self.dma_gpu_block(direction_to_device),
             2 => self.dma_gpu_linked_list(),
             _ => 0, // Manual (0) + prohibited (3) — nothing standard uses
                     // them for the GPU channel. Drop the trigger silently.
         };
-        Some(words)
+        Some(completion)
     }
 
-    fn dma_gpu_block(&mut self) -> u32 {
+    fn dma_gpu_block(&mut self, to_device: bool) -> u32 {
         let ch = self.dma.channels[2];
         let mut addr = ch.base & 0x001F_FFFC;
         let bcr = ch.block_control;
         let block_size = bcr & 0xFFFF;
-        let block_count = (bcr >> 16) & 0xFFFF;
-        let total_words = block_size * block_count.max(1);
+        let block_count = (bcr >> 16).max(1) & 0xFFFF;
+        let total_words = block_size * block_count;
         let step = if (ch.channel_control >> 1) & 1 != 0 {
             // Decrement mode — rarely used for GPU but handle for safety.
             0xFFFF_FFFCu32
@@ -578,7 +655,15 @@ impl Bus {
             self.gpu.gp0_push(word);
             addr = addr.wrapping_add(step);
         }
-        total_words
+        // Redux's formulas: mem2vram uses `7 * block_count` (the
+        // "X-Files video interlace. Experimental delay depending
+        // of BS" active path in `core/gpu.cc`); vram2mem uses the
+        // raw word count.
+        if to_device {
+            7 * block_count
+        } else {
+            total_words
+        }
     }
 
     fn dma_gpu_linked_list(&mut self) -> u32 {
