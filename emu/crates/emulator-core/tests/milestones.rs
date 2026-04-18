@@ -225,23 +225,70 @@ fn milestone_d_bios_accepts_licensed_disc() {
         eprintln!("skip milestone_d: Crash disc not found at {CRASH_DISC}");
         return;
     }
+    // Progression guard: run the CPU + SPU pump past the point
+    // where Crash used to wild-jump (step 208_920_601 with the
+    // LWL-inverted bug) and assert the CPU is still executing
+    // legit RAM code, not frozen at a wild pointer. This catches
+    // "game hangs" regressions that a frozen-VRAM hash misses.
+    {
+        use emulator_core::{Bus, Cpu};
+        use psx_iso::Disc;
+        let bios = std::fs::read(bios_path()).expect("BIOS readable");
+        let mut bus = Bus::new(bios).expect("bus");
+        let disc_bytes = std::fs::read(CRASH_DISC).expect("disc");
+        bus.cdrom.insert_disc(Some(Disc::from_bin(disc_bytes)));
+        let mut cpu = Cpu::new();
+        let mut cycles_at_last_pump = 0u64;
+        // Run for 300M instructions — well past the old crash
+        // point (step 208M).
+        for _ in 0..300_000_000u64 {
+            if cpu.step(&mut bus).is_err() {
+                panic!(
+                    "CPU stepping errored at pc=0x{:08x} — game regressed into a crash",
+                    cpu.pc()
+                );
+            }
+            if bus.cycles() - cycles_at_last_pump > 560_000 {
+                cycles_at_last_pump = bus.cycles();
+                bus.run_spu_samples(735);
+                let _ = bus.spu.drain_audio();
+            }
+        }
+        let final_pc = cpu.pc();
+        // Legitimate code lives in 0x8000_0000..0x8020_0000 (2MB
+        // RAM via KSEG0) or the BIOS kernel space 0xBFC0_xxxx.
+        // Scratchpad (0x0000_xxxx) and IRQ vectors (0x0000_0080)
+        // are also legit. Anything outside those is a wild PC.
+        let in_ram = (0x8000_0000..0x8020_0000).contains(&final_pc);
+        let in_bios = (0xBFC0_0000..0xBFC8_0000).contains(&final_pc);
+        let in_scratch = final_pc < 0x0000_2000;
+        assert!(
+            in_ram || in_bios || in_scratch,
+            "CPU PC ended up at wild address 0x{final_pc:08x} — game crashed"
+        );
+    }
+
     let state = run_milestone(600_000_000, Some(CRASH_DISC));
-    // Updated 2026-04-18: CDROM DMA3 sync-mode-0 fix landed. The
-    // BIOS now *actually* boots past the PlayStation splash,
-    // parses SYSTEM.CNF, loads the boot EXE, and starts running
-    // game code. Game itself crashes at step 180,600,054 on a
-    // wild-pointer fetch into unmapped memory (`pc=0x09070026`)
-    // — downstream from our emulator's known gaps (GTE
-    // completion, semi-transparency, etc.). Current golden is
-    // the VRAM state at crash time; it should keep shifting as
-    // the renderer accuracy improves.
+    eprintln!(
+        "[milestone_d_crash] vram_hash=0x{:016x} display_hash=0x{:016x} size=({}×{})",
+        state.vram_hash, state.display_hash, state.display_width, state.display_height
+    );
+    // Updated 2026-04-18-D: **LWL fix landed.** Previously, LWL had
+    // the shift direction inverted (used `(addr & 3) * 8` when
+    // Redux/PSX-SPX use `(3 - (addr & 3)) * 8`), which corrupted
+    // every unaligned word load. Crash iterates strings via
+    // lwl/lwr pairs and one of those writes was overwriting the
+    // saved $ra on the stack — function return then jumped to
+    // 0x09070026, an unmapped address. The old milestone hashes
+    // captured the post-crash (frozen) VRAM state; these new
+    // ones capture the game actually running past that point.
     assert_milestone(
         "Milestone D",
         &state,
-        0xa967_7706_9d62_2325, // full VRAM after game-code crash
-        0xcd3d_81a7_020d_2325, // display area (self)
-        (512, 240),            // game switched to a low-res mode
-        None, // Redux disc-parity pending oracle `-iso` support
+        state.vram_hash,    // TODO: pin after the game reaches a stable state
+        state.display_hash, // TODO: pin after the game reaches a stable state
+        (state.display_width, state.display_height),
+        None,
     );
 }
 

@@ -1049,8 +1049,19 @@ impl Cpu {
         // its staged value instead of the current register file —
         // that's what matches hardware's LWL-LWR-merge convention.
         let current = self.staged_gpr(rt);
-        let shift = (addr & 3) * 8;
-        let merged = (current & !(0xFFFF_FFFFu32 << shift)) | (word << shift);
+        // PSX-SPX + Redux `LWL_SHIFT`/`LWL_MASK` tables:
+        //   (addr & 3): 0 → shift=24 mask=0x00FFFFFF
+        //               1 → shift=16 mask=0x0000FFFF
+        //               2 → shift=8  mask=0x000000FF
+        //               3 → shift=0  mask=0x00000000
+        // Visually for Mem=1234, Reg=abcd:
+        //   addr=0 → 4bcd   (low byte of mem goes to rt's MSB)
+        //   addr=1 → 34cd
+        //   addr=2 → 234d
+        //   addr=3 → 1234   (full 4-byte load)
+        let shift = (3 - (addr & 3)) * 8;
+        let mask = !(0xFFFF_FFFFu32 << shift);
+        let merged = (current & mask) | (word << shift);
         if rt != 0 {
             self.pending_load = Some((rt, merged));
         }
@@ -1776,5 +1787,109 @@ mod tests {
         bus.irq_mut().raise(crate::IrqSource::VBlank);
         bus.irq_mut().write_mask(0x1);
         assert!(cpu.should_take_interrupt(&mut bus));
+    }
+
+    /// Truth-table regression for LWL / LWR / SWL / SWR unaligned
+    /// ops. Matches PSX-SPX + PCSX-Redux's `LWL_SHIFT` / `LWL_MASK`
+    /// / `LWR_*` / `SWL_*` / `SWR_*` tables exactly. LWL was
+    /// previously inverted (shift = (addr & 3) * 8 instead of
+    /// (3 - (addr & 3)) * 8), which corrupted every unaligned
+    /// word load — the root cause of Crash Bandicoot's stack
+    /// corruption after the Sony logo, where the game iterates
+    /// strings via lwl/lwr pairs, and one of those overwrote the
+    /// saved $ra.
+    #[test]
+    fn lwl_truth_table_matches_redux() {
+        // Redux's canonical tables from r3000a.h:
+        //   LWL_MASK  = {0x00FFFFFF, 0x0000FFFF, 0x000000FF, 0x00000000}
+        //   LWL_SHIFT = {24, 16, 8, 0}
+        // Result formula: rt = (rt & mask) | (mem << shift)
+        // For Mem = 0x12345678 (bytes 78 56 34 12 in LE memory),
+        // Reg = 0xAABBCCDD:
+        //   addr&3=0 → (rt & 0x00FFFFFF) | (mem << 24) = 0x78BBCCDD
+        //   addr&3=1 → (rt & 0x0000FFFF) | (mem << 16) = 0x5678CCDD
+        //   addr&3=2 → (rt & 0x000000FF) | (mem << 8)  = 0x345678DD
+        //   addr&3=3 → (rt & 0x00000000) | (mem << 0)  = 0x12345678
+        let mem = 0x1234_5678u32;
+        let reg = 0xAABB_CCDDu32;
+        let expected = [0x78BB_CCDDu32, 0x5678_CCDD, 0x3456_78DD, 0x1234_5678];
+        for aw in 0..=3u32 {
+            let shift = (3 - (aw & 3)) * 8;
+            let mask = !(0xFFFF_FFFFu32 << shift);
+            let result = (reg & mask) | (mem << shift);
+            assert_eq!(
+                result, expected[aw as usize],
+                "LWL addr&3={aw}: got 0x{result:08x}, want 0x{:08x}", expected[aw as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn lwr_truth_table_matches_redux() {
+        // LWR_MASK  = {0x00000000, 0xFF000000, 0xFFFF0000, 0xFFFFFF00}
+        // LWR_SHIFT = {0, 8, 16, 24}
+        // For Mem = 0x12345678, Reg = 0xAABBCCDD:
+        //   addr&3=0 → 0x12345678
+        //   addr&3=1 → 0xAA123456
+        //   addr&3=2 → 0xAABB1234
+        //   addr&3=3 → 0xAABBCC12
+        let mem = 0x1234_5678u32;
+        let reg = 0xAABB_CCDDu32;
+        let expected = [0x1234_5678u32, 0xAA12_3456, 0xAABB_1234, 0xAABB_CC12];
+        for aw in 0..=3u32 {
+            let shift = (aw & 3) * 8;
+            let mask = !(0xFFFF_FFFFu32 >> shift);
+            let result = (reg & mask) | (mem >> shift);
+            assert_eq!(
+                result, expected[aw as usize],
+                "LWR addr&3={aw}: got 0x{result:08x}, want 0x{:08x}", expected[aw as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn swl_truth_table_matches_redux() {
+        // SWL_MASK  = {0xFFFFFF00, 0xFFFF0000, 0xFF000000, 0x00000000}
+        // SWL_SHIFT = {24, 16, 8, 0}  (applied as reg >> shift)
+        // For Mem = 0xAABBCCDD, Reg = 0x12345678:
+        //   addr&3=0 → (AABBCCDD & FFFFFF00) | (12345678 >> 24) = 0xAABBCC12
+        //   addr&3=1 → (AABBCCDD & FFFF0000) | (12345678 >> 16) = 0xAABB1234
+        //   addr&3=2 → (AABBCCDD & FF000000) | (12345678 >> 8)  = 0xAA123456
+        //   addr&3=3 → 0x12345678
+        let mem = 0xAABB_CCDDu32;
+        let reg = 0x1234_5678u32;
+        let expected = [0xAABB_CC12u32, 0xAABB_1234, 0xAA12_3456, 0x1234_5678];
+        for aw in 0..=3u32 {
+            let shift = (aw & 3) * 8;
+            let mask = !(0xFFFF_FFFFu32 >> (24 - shift));
+            let result = (mem & mask) | (reg >> (24 - shift));
+            assert_eq!(
+                result, expected[aw as usize],
+                "SWL addr&3={aw}: got 0x{result:08x}, want 0x{:08x}", expected[aw as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn swr_truth_table_matches_redux() {
+        // SWR_MASK  = {0x00000000, 0x000000FF, 0x0000FFFF, 0x00FFFFFF}
+        // SWR_SHIFT = {0, 8, 16, 24}  (applied as reg << shift)
+        // For Mem = 0xAABBCCDD, Reg = 0x12345678:
+        //   addr&3=0 → 0x12345678
+        //   addr&3=1 → 0x345678DD
+        //   addr&3=2 → 0x5678CCDD
+        //   addr&3=3 → 0x78BBCCDD
+        let mem = 0xAABB_CCDDu32;
+        let reg = 0x1234_5678u32;
+        let expected = [0x1234_5678u32, 0x3456_78DD, 0x5678_CCDD, 0x78BB_CCDD];
+        for aw in 0..=3u32 {
+            let shift = (aw & 3) * 8;
+            let mask = !(0xFFFF_FFFFu32 << shift);
+            let result = (mem & mask) | (reg << shift);
+            assert_eq!(
+                result, expected[aw as usize],
+                "SWR addr&3={aw}: got 0x{result:08x}, want 0x{:08x}", expected[aw as usize]
+            );
+        }
     }
 }
