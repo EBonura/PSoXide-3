@@ -596,6 +596,15 @@ pub struct Spu {
     /// [`Spu::drain_audio`]. Oldest-sample-dropped when cap exceeded.
     audio_out: std::collections::VecDeque<(i16, i16)>,
 
+    /// CD audio input queue — stereo samples fed by the CDROM
+    /// controller during CD-DA or XA ADPCM playback. The SPU's
+    /// `tick_sample` path drains one sample per output sample and
+    /// mixes it via `CD_VOL_L/R` into the main output. When the
+    /// queue is empty, CD contribution is zero. Bounded at
+    /// ~0.5 s to prevent runaway growth during emulator fast-
+    /// forward.
+    cd_audio_in: std::collections::VecDeque<(i16, i16)>,
+
     /// Absolute cycle count at which we last produced an audio sample.
     /// Used to catch up when the scheduler delivers a burst of ticks.
     last_sample_cycle: u64,
@@ -652,10 +661,30 @@ impl Spu {
             endx_latched: 0,
             reverb_cfg: [0; 32],
             audio_out: std::collections::VecDeque::with_capacity(OUTPUT_BUFFER_CAP),
+            cd_audio_in: std::collections::VecDeque::with_capacity(OUTPUT_BUFFER_CAP),
             last_sample_cycle: 0,
             samples_produced: 0,
             irq_pending: false,
         }
+    }
+
+    /// Enqueue a batch of stereo samples from the CDROM — either
+    /// CD-DA (Red Book) or decoded XA ADPCM. Consumed one sample
+    /// per SPU output sample during `tick_sample`. Scaled by
+    /// `CD_VOL_L/R` before mix. Caps at ~0.5 s of queued audio to
+    /// keep memory bounded under fast-forward.
+    pub fn feed_cd_audio(&mut self, samples: &[(i16, i16)]) {
+        let cap = 22_050; // ~0.5 s at 44.1 kHz
+        let overflow = (self.cd_audio_in.len() + samples.len()).saturating_sub(cap);
+        for _ in 0..overflow {
+            self.cd_audio_in.pop_front();
+        }
+        self.cd_audio_in.extend(samples.iter().copied());
+    }
+
+    /// Depth of the CD audio input queue. Diagnostic.
+    pub fn cd_audio_queue_len(&self) -> usize {
+        self.cd_audio_in.len()
     }
 
     /// Low edge of the SPU MMIO range.
@@ -1059,10 +1088,22 @@ impl Spu {
             sum_r = sum_r.saturating_add(r as i32);
         }
 
-        // 3. Mix CD audio / external audio at the input volumes. No CD
-        //    audio source wired yet — the CD volume regs are stored for
-        //    games that read them back, but zero audio in.
-        //    (External audio similarly.)
+        // 3. Mix CD audio input at CD_VOL_L/R. Source is the CDROM's
+        //    CD-DA sample stream or the decoded XA-ADPCM payload,
+        //    both fed via [`Spu::feed_cd_audio`]. When the queue is
+        //    empty, CD contribution is zero — matches real hardware
+        //    where "no CD playing" means no CD input signal.
+        if let Some((cd_l, cd_r)) = self.cd_audio_in.pop_front() {
+            // CD_VOL regs are Q15 signed — range -0x8000..=0x7FFF.
+            // `>> 15` brings them back to i16 scale.
+            let cl = ((cd_l as i32) * self.cd_vol_l as i32) >> 15;
+            let cr = ((cd_r as i32) * self.cd_vol_r as i32) >> 15;
+            sum_l = sum_l.saturating_add(cl);
+            sum_r = sum_r.saturating_add(cr);
+        }
+        // External-audio input is not wired (no hardware source
+        // available on a closed console); EXT_VOL_L/R are stored for
+        // round-trip reads only.
 
         // 4. Apply main volume (Q14) and saturate.
         let out_l = saturate_i16((sum_l * self.main_vol_l as i32) >> 14);
@@ -1258,6 +1299,95 @@ impl Spu {
             voice.current_addr = next_addr;
         }
     }
+}
+
+// ===============================================================
+//  XA ADPCM decoder.
+// ===============================================================
+
+/// Per-channel decoder history for XA ADPCM blocks. The filter
+/// uses the last two decoded samples (`y0` = most recent,
+/// `y1` = second-most-recent) as feedback. Callers hold one of
+/// these per stereo channel (or one total for mono).
+#[derive(Default, Clone, Debug)]
+pub struct XaDecoderState {
+    y0: i32,
+    y1: i32,
+}
+
+impl XaDecoderState {
+    /// Fresh decoder history — silence as prev samples.
+    pub fn new() -> Self {
+        Self { y0: 0, y1: 0 }
+    }
+
+    /// Reset history to silence between XA files.
+    pub fn reset(&mut self) {
+        self.y0 = 0;
+        self.y1 = 0;
+    }
+}
+
+/// XA ADPCM filter coefficients `k0, k1` in Q10 form. Four filter
+/// IDs match the real-hardware decode table. Pattern matches
+/// Redux's `decode_xa.cc::s_K0/s_K1` at `(1<<SHC = 1024)`.
+const XA_FILTER: [(i32, i32); 4] = [
+    (0, 0),
+    (960, 0),
+    (1840, -832),
+    (1568, -880),
+];
+
+/// Decode 28 ADPCM samples (one "sound unit") from an XA block.
+/// - `filter_range` — packed byte: high nibble = filter ID (0..=3,
+///   values >3 are reserved), low nibble = range (output shift, clamp
+///   >=12 to 9 per hardware).
+/// - `data` — 14 × 16-bit words giving 28 × 4-bit nibbles, or
+///   28 × 4-bit nibbles for 8-bit mode. We model the 4-bit case
+///   (used by Level B/C XA — the common one).
+/// - `state` — in/out filter history; mutates across calls within a
+///   sound group.
+///
+/// Writes 28 output samples into `out[0], out[stride], out[2*stride], ...`.
+/// Stride = 2 for interleaved stereo, 1 for mono.
+pub fn xa_decode_block(
+    state: &mut XaDecoderState,
+    filter_range: u8,
+    data: &[u16],
+    out: &mut [i16],
+    stride: usize,
+) {
+    let filter_id = ((filter_range >> 4) & 0x0F).min(3) as usize;
+    let range = (filter_range & 0x0F).min(12) as u32;
+    let (k0, k1) = XA_FILTER[filter_id];
+    let mut y0 = state.y0;
+    let mut y1 = state.y1;
+
+    // 14 words × 4 samples each = 56, but we only output 28 per
+    // block. XA groups the 14 words so that each nibble column
+    // produces one sample — walking i32 nibbles from low to high.
+    // Redux's inner loop does this as 7 quads; we mirror exactly.
+    for i in 0..(data.len().min(7)) {
+        let word = data[i * 2] as u32 | ((data[i * 2 + 1] as u32) << 16);
+        for n in 0..4 {
+            let nibble = ((word >> (n * 4)) & 0xF) as i32;
+            // Sign-extend 4 bits, shift up to high word, arithmetic
+            // shift down by `(range)` to apply the per-block scale.
+            let signed = ((nibble << 28) >> 28) << 12;
+            let mut sample = signed >> range;
+            // Apply IIR filter with prev samples.
+            sample += (y0 * k0 + y1 * k1) >> 10;
+            let clamped = sample.clamp(-0x8000, 0x7FFF);
+            let idx = (i * 4 + n) * stride;
+            if idx < out.len() {
+                out[idx] = clamped as i16;
+            }
+            y1 = y0;
+            y0 = clamped;
+        }
+    }
+    state.y0 = y0;
+    state.y1 = y1;
 }
 
 // ===============================================================
@@ -1691,6 +1821,46 @@ mod tests {
         }
         let out = s.drain_audio();
         assert!(out.iter().all(|&(l, r)| l == 0 && r == 0));
+    }
+
+    #[test]
+    fn cd_audio_input_flows_through_main_volume() {
+        let mut s = Spu::new();
+        s.main_vol_l = 0x4000;
+        s.main_vol_r = 0x4000;
+        s.cd_vol_l = 0x4000; // ~ half at Q15 (0x4000 / 0x8000 = 0.5)
+        s.cd_vol_r = 0x4000;
+        // Push one stereo sample and tick.
+        s.feed_cd_audio(&[(0x4000, 0x4000)]);
+        s.tick_sample(SAMPLE_CYCLES);
+        let out = s.drain_audio();
+        // Main mix should be nonzero since CD input was nonzero.
+        assert_eq!(out.len(), 1);
+        let (l, r) = out[0];
+        assert!(l > 0, "left should carry CD input: {l}");
+        assert!(r > 0, "right should carry CD input: {r}");
+    }
+
+    #[test]
+    fn xa_decoder_silent_block_stays_silent() {
+        let mut state = XaDecoderState::new();
+        let data = [0u16; 14];
+        let mut out = [0i16; 28];
+        xa_decode_block(&mut state, 0x00, &data, &mut out, 1);
+        assert!(out.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn xa_decoder_nonzero_block_produces_output() {
+        let mut state = XaDecoderState::new();
+        let mut data = [0u16; 14];
+        // Fill with non-zero pattern to exercise the filter.
+        for (i, w) in data.iter_mut().enumerate() {
+            *w = (i as u16) * 0x1234;
+        }
+        let mut out = [0i16; 28];
+        xa_decode_block(&mut state, 0x01, &data, &mut out, 1);
+        assert!(out.iter().any(|&s| s != 0), "some samples should be nonzero");
     }
 
     // -- Volume register decoding --

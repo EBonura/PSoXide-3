@@ -548,7 +548,17 @@ impl Bus {
     /// ticking on every 768th cycle diverges. Callers supply a
     /// sample count that matches their display refresh cadence
     /// (e.g. 735 samples per NTSC frame at 44.1 kHz).
+    ///
+    /// Also forwards any CD audio samples the CDROM has decoded
+    /// (CD-DA / XA ADPCM) into the SPU's CD input mix — one
+    /// drain-and-feed per call keeps the latency bounded.
     pub fn run_spu_samples(&mut self, n: usize) {
+        // Move any freshly-decoded CDROM audio into the SPU's CD
+        // input queue so it participates in this frame's mix.
+        let cd_samples = self.cdrom.drain_cd_audio();
+        if !cd_samples.is_empty() {
+            self.spu.feed_cd_audio(&cd_samples);
+        }
         for _ in 0..n {
             self.spu.tick_sample(self.cycles);
             if self.spu.take_irq_pending() {

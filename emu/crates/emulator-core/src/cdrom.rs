@@ -251,9 +251,19 @@ pub struct CdRom {
     ///   6: XA ADPCM enable
     ///   7: speed (0 = single-speed 1x, 1 = double-speed 2x)
     ///
-    /// We currently key off bit 7 for sector-read pacing. Other bits
-    /// are stored but not yet acted on.
+    /// We act on bit 7 (speed) for sector pacing and bit 6 (XA
+    /// ADPCM enable) for in-stream audio decode.
     mode: u8,
+    /// Decoded stereo sample buffer — filled by XA ADPCM decode
+    /// when an audio sector arrives. Drained by the bus each tick
+    /// and pushed to the SPU's CD audio input.
+    cd_audio: VecDeque<(i16, i16)>,
+    /// XA ADPCM decoder left-channel filter history (y0, y1).
+    /// Persists across blocks within a file; reset between XA
+    /// files / on Pause.
+    xa_left: crate::spu::XaDecoderState,
+    /// XA right-channel history.
+    xa_right: crate::spu::XaDecoderState,
 }
 
 impl CdRom {
@@ -291,7 +301,24 @@ impl CdRom {
             // SetMode still uses double-speed, matching the prior
             // behaviour of always-CD_READ_TIME pacing.
             mode: 0x80,
+            cd_audio: VecDeque::new(),
+            xa_left: crate::spu::XaDecoderState::new(),
+            xa_right: crate::spu::XaDecoderState::new(),
         }
+    }
+
+    /// Pull all pending CD audio samples — called by the bus once
+    /// per frame, then forwarded to `Spu::feed_cd_audio`. Returns
+    /// stereo pairs in playback order (oldest first). Empty when
+    /// no XA / CD-DA decode has produced samples since the last
+    /// drain.
+    pub fn drain_cd_audio(&mut self) -> Vec<(i16, i16)> {
+        self.cd_audio.drain(..).collect()
+    }
+
+    /// Queue depth of the CD audio buffer — diagnostic.
+    pub fn cd_audio_queue_len(&self) -> usize {
+        self.cd_audio.len()
     }
 
     /// Load a disc image. After this, GetID returns the licensed-disc
@@ -438,9 +465,12 @@ impl CdRom {
             0x00 | 0x01 => self.cmd_getstat(),
             // SetLoc: 3 BCD bytes (minute, second, frame).
             0x02 => self.cmd_setloc(&params),
-            // Play (CD-DA): 1 optional byte (track). Treat as no-disc
-            // error if no disc; otherwise we'd need audio plumbing.
-            0x03 => self.cmd_simple_stat_or_nodisc(),
+            // Play (CD-DA): 1 optional byte (track). Starts Red-Book
+            // audio playback. We accept the command and drive the
+            // reading state machine so the BIOS's follow-up polls see
+            // the drive active; actual CD-DA sample data isn't
+            // sourced yet (requires track-level data from the .cue).
+            0x03 => self.cmd_play(&params),
             // ReadN (read with auto-retry). Without a disc, error.
             0x06 => self.cmd_read(),
             // Stop: halt motor.
@@ -648,12 +678,42 @@ impl CdRom {
     }
 
     /// On DataReady event firing: populate the data FIFO with the
-    /// next sector's user data and bump the read LBA. Called from
+    /// next sector's user data and bump the read LBA. When the
+    /// sector's subheader marks it as an XA audio block and mode
+    /// bit 6 (XA ADPCM enable) is set, we ALSO decode the audio
+    /// half into `cd_audio` for the SPU's CD input. Called from
     /// `tick` once per sector event.
     fn load_next_sector(&mut self) {
         let lba = self.read_lba;
         self.read_lba = self.read_lba.wrapping_add(1);
         if let Some(disc) = self.disc.as_ref() {
+            // If XA mode is on, inspect the full raw sector's
+            // subheader to decide "audio or data". Game games
+            // with XA-streamed cutscenes use a single ReadN to
+            // pull both sector kinds; audio sectors go to the SPU
+            // and skip the CPU-visible data FIFO.
+            if self.mode & 0x40 != 0 {
+                if let Some(raw) = disc.read_sector_raw(lba) {
+                    if let Some(samples) = decode_xa_audio_sector(
+                        raw,
+                        &mut self.xa_left,
+                        &mut self.xa_right,
+                    ) {
+                        // XA audio sector — queue samples, leave
+                        // data FIFO empty (games discard it anyway
+                        // for audio sectors).
+                        let cap = 44_100; // ~1 s at SPU rate
+                        let overflow =
+                            (self.cd_audio.len() + samples.len()).saturating_sub(cap);
+                        for _ in 0..overflow {
+                            self.cd_audio.pop_front();
+                        }
+                        self.cd_audio.extend(samples.iter().copied());
+                        self.data_fifo.clear();
+                        return;
+                    }
+                }
+            }
             if let Some(user) = disc.read_sector_user(lba) {
                 self.data_fifo.clear();
                 self.data_fifo.extend(user.iter().copied());
@@ -664,6 +724,9 @@ impl CdRom {
         self.reading = false;
     }
 
+    /// Legacy helper kept for the `0x04` / `0x05` forward / backward
+    /// commands which still use "ack or nodisc-error" semantics.
+    #[allow(dead_code)]
     fn cmd_simple_stat_or_nodisc(&mut self) {
         if self.disc_present {
             self.schedule_first_response(vec![self.stat_byte()]);
@@ -671,6 +734,31 @@ impl CdRom {
             let stat = self.stat_byte() | drive_status_bit::ERROR;
             self.schedule_error_response(vec![stat, 0x80]);
         }
+    }
+
+    /// CdlPlay (0x03) — CD-DA playback. Parameter is an optional
+    /// track number (BCD); when absent, playback continues from
+    /// the last SetLoc position.
+    ///
+    /// We accept the command, mark the drive as playing, and
+    /// respond with status. Real audio-sample delivery requires
+    /// track-level CD-DA data from the `.cue` (most redump
+    /// images interleave CD-DA tracks as separate `.bin`s); we
+    /// don't have that plumbing yet, so `cd_audio` stays empty
+    /// and the SPU sees silence from the CD source. The command
+    /// itself completes successfully so the game's event loop
+    /// doesn't hang.
+    fn cmd_play(&mut self, _params: &[u8]) {
+        if !self.disc_present {
+            let stat = self.stat_byte() | drive_status_bit::ERROR;
+            self.schedule_error_response(vec![stat, 0x80]);
+            return;
+        }
+        // Stat byte with PLAY bit (0x80) set so GetStat polls return
+        // "playing" — match PSX-SPX drive_status_bit layout.
+        self.motor_on = true;
+        let stat = self.stat_byte() | drive_status_bit::PLAYING;
+        self.schedule_first_response(vec![stat]);
     }
 
     fn cmd_test(&mut self, params: &[u8]) {
@@ -856,6 +944,136 @@ impl Default for CdRom {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Decode one raw 2352-byte Mode 2 Form 2 XA ADPCM audio sector into
+/// stereo PCM samples. Returns `None` when the sector isn't an XA
+/// audio sector (subheader submode bit 2 / Form 2 bit 5 not set).
+///
+/// Sector layout (Mode 2):
+/// - 0..=11   : sync pattern (0x00, 12× 0xFF, 0x00)
+/// - 12..=14  : MSF header
+/// - 15       : mode (02 for Mode 2)
+/// - 16..=23  : 8-byte subheader (4 bytes × 2 copies)
+/// - 24..=2347: 2324-byte user data (XA audio payload for Form 2)
+/// - 2348+    : EDC (unused for Form 2)
+///
+/// Subheader byte 2 (submode): bit 2 = audio, bit 5 = Form 2.
+/// Subheader byte 3 (coding info): bits 0-1 mono/stereo, bits 2-3
+/// sample rate, bits 4-5 bits/sample.
+///
+/// For the common case (4-bit stereo, 37800 Hz) we decode the 18
+/// sound groups of 128 bytes each, each producing 112 stereo
+/// samples. Other forms return `None`.
+///
+/// Samples are nearest-neighbour resampled from the source rate up
+/// to the SPU's 44.1 kHz rate on output.
+fn decode_xa_audio_sector(
+    raw: &[u8],
+    left: &mut crate::spu::XaDecoderState,
+    right: &mut crate::spu::XaDecoderState,
+) -> Option<Vec<(i16, i16)>> {
+    if raw.len() < 2352 {
+        return None;
+    }
+    let submode = raw[18];
+    let coding = raw[19];
+    // Must be audio + Form 2.
+    if submode & 0x04 == 0 || submode & 0x20 == 0 {
+        return None;
+    }
+    // Only support 4-bit stereo 37800 Hz for now — the format PS1
+    // FMV XA streams overwhelmingly use. Other configurations
+    // (8-bit, mono, 18900 Hz) fall through to silence rather than
+    // glitching with wrong-shape decodes.
+    let stereo = (coding & 0x03) == 1;
+    let hi_rate = (coding & 0x0C) == 0; // 00 → 37800, 01 → 18900
+    let bits_8 = (coding & 0x30) != 0;
+    if !stereo || !hi_rate || bits_8 {
+        return None;
+    }
+
+    // XA payload starts at offset 24 (after 12+4+8 bytes of header).
+    // 18 sound groups × 128 bytes.
+    let payload = &raw[24..24 + 18 * 128];
+    let mut decoded: Vec<(i16, i16)> = Vec::with_capacity(18 * 112);
+    let head_table = [0usize, 2, 8, 10];
+    for group_idx in 0..18 {
+        let group = &payload[group_idx * 128..group_idx * 128 + 128];
+        let headers = &group[0..16];
+        let data = &group[16..128];
+
+        // 4-bit stereo has 4 blocks per group: 2 interleaved stereo
+        // pairs. Each pair shares 2 filter-range bytes from the
+        // header (positions 0/1, 8/9 in the 16-byte header).
+        for blk in 0..4 {
+            let pair = blk / 2; // 0 or 1
+            let channel = blk & 1; // 0 = L, 1 = R
+            let filter_range = headers[head_table[pair * 2 + channel]];
+            // Each block's 28 samples come from 14 bytes, nibble-
+            // column-arranged across the 112-byte block. For 4-bit
+            // stereo the columns interleave two blocks; we select
+            // our 14 input words by walking `data[blk + k*4]` for
+            // k in 0..28 — but XA packs 4 blocks per group at
+            // byte stride 4. We build 14 16-bit words for the
+            // decoder.
+            let mut words = [0u16; 14];
+            for k in 0..7 {
+                // Each word is 4 nibbles: low nibble from byte
+                // `data[pair*... + k*16 + blk]`, etc.
+                // Mirroring Redux's level-B/C loop in decode_xa.cc:
+                // nibble low from `sound_datap2[0]`, then +4, +8, +12
+                // at stride 16.
+                let base = k * 16;
+                let b0 = data[base + blk] as u16;
+                let b1 = data[base + 4 + blk] as u16;
+                let b2 = data[base + 8 + blk] as u16;
+                let b3 = data[base + 12 + blk] as u16;
+                let (lo, hi) = if blk < 2 {
+                    // First two blocks — low nibble of each byte.
+                    (
+                        (b0 & 0x0F) | ((b1 & 0x0F) << 4),
+                        (b2 & 0x0F) | ((b3 & 0x0F) << 4),
+                    )
+                } else {
+                    // Last two blocks — high nibble.
+                    ((b0 >> 4) | ((b1 >> 4) << 4), (b2 >> 4) | ((b3 >> 4) << 4))
+                };
+                words[k * 2] = lo;
+                words[k * 2 + 1] = hi;
+            }
+            let mut samples = [0i16; 28];
+            let state = if channel == 0 { &mut *left } else { &mut *right };
+            crate::spu::xa_decode_block(state, filter_range, &words, &mut samples, 1);
+
+            // Interleave into `decoded`: block's 28 samples go
+            // into 28 consecutive output slots at this pair's base.
+            let base = pair * 28;
+            for (i, &s) in samples.iter().enumerate() {
+                while decoded.len() <= base + i {
+                    decoded.push((0, 0));
+                }
+                let (l, r) = &mut decoded[base + i];
+                if channel == 0 {
+                    *l = s;
+                } else {
+                    *r = s;
+                }
+            }
+        }
+    }
+
+    // Upsample 37800 → 44100 Hz by nearest-neighbour (ratio ≈
+    // 1.167). Acceptable quality for a first pass; linear /
+    // gaussian can land later.
+    let mut resampled: Vec<(i16, i16)> = Vec::with_capacity(decoded.len() * 44100 / 37800 + 1);
+    let src_n = decoded.len() as u32;
+    let dst_n = (src_n as u64 * 44100 / 37800) as u32;
+    for i in 0..dst_n {
+        let src_idx = ((i as u64 * src_n as u64) / dst_n as u64) as usize;
+        resampled.push(decoded[src_idx.min(decoded.len() - 1)]);
+    }
+    Some(resampled)
 }
 
 #[cfg(test)]
