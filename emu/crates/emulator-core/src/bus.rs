@@ -572,6 +572,85 @@ impl Bus {
             self.scheduler
                 .schedule(EventSlot::SpuDma, self.cycles, spu_words as u64);
         }
+        if let Some(mdec_words) = self.run_dma_mdec_in() {
+            self.scheduler
+                .schedule(EventSlot::MdecInDma, self.cycles, mdec_words as u64);
+        }
+        if let Some(mdec_words) = self.run_dma_mdec_out() {
+            self.scheduler
+                .schedule(EventSlot::MdecOutDma, self.cycles, mdec_words as u64);
+        }
+    }
+
+    /// Execute DMA channel 0 → MDEC input. Ships command + RLE data
+    /// from main RAM to the MDEC's input queue. Sync mode 1 (block)
+    /// is the only mode PS1 software uses for this channel.
+    fn run_dma_mdec_in(&mut self) -> Option<u32> {
+        let ch = &self.dma.channels[0];
+        if (ch.channel_control >> 24) & 1 == 0 {
+            return None;
+        }
+        let sync_mode = (ch.channel_control >> 9) & 0x3;
+        let bcr = ch.block_control;
+        let total_words: u32 = match sync_mode {
+            0 => bcr & 0xFFFF,
+            1 => {
+                let block_size = bcr & 0xFFFF;
+                let block_count = (bcr >> 16).max(1) & 0xFFFF;
+                block_size * block_count
+            }
+            _ => 0,
+        };
+        let step: u32 = if (ch.channel_control >> 1) & 1 != 0 {
+            0xFFFF_FFFCu32
+        } else {
+            4
+        };
+        let mut addr = ch.base & 0x001F_FFFC;
+        let mut words: Vec<u32> = Vec::with_capacity(total_words as usize);
+        for _ in 0..total_words {
+            words.push(read_ram_u32(&self.ram[..], addr));
+            addr = addr.wrapping_add(step);
+        }
+        self.mdec.dma_write_in(&words);
+        Some(total_words)
+    }
+
+    /// Execute DMA channel 1 → main RAM from MDEC output. Pulls
+    /// decoded pixel words from the MDEC's output queue and writes
+    /// them to main RAM at `MADR`.
+    fn run_dma_mdec_out(&mut self) -> Option<u32> {
+        let ch = &self.dma.channels[1];
+        if (ch.channel_control >> 24) & 1 == 0 {
+            return None;
+        }
+        let sync_mode = (ch.channel_control >> 9) & 0x3;
+        let bcr = ch.block_control;
+        let total_words: u32 = match sync_mode {
+            0 => bcr & 0xFFFF,
+            1 => {
+                let block_size = bcr & 0xFFFF;
+                let block_count = (bcr >> 16).max(1) & 0xFFFF;
+                block_size * block_count
+            }
+            _ => 0,
+        };
+        let step: u32 = if (ch.channel_control >> 1) & 1 != 0 {
+            0xFFFF_FFFCu32
+        } else {
+            4
+        };
+        let mut addr = ch.base & 0x001F_FFFC;
+        let mut words = vec![0u32; total_words as usize];
+        self.mdec.dma_read_out(&mut words);
+        for word in words {
+            let offset = (addr & 0x001F_FFFF) as usize;
+            if offset + 4 <= self.ram.len() {
+                self.ram[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            addr = addr.wrapping_add(step);
+        }
+        Some(total_words)
     }
 
     /// Execute DMA channel 4 ↔ SPU. Sync mode 1 (block) is the only
