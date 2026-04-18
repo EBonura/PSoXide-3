@@ -66,6 +66,11 @@ pub struct Bus {
     /// CD-ROM controller — byte-granular MMIO at 0x1F80_1800..=0x1803.
     /// Exposed public so diagnostics can inspect FIFO / command state.
     pub cdrom: CdRom,
+    /// Motion decoder. Defensive stub today — register shape is
+    /// faithful (idle / empty status, DMA-enable latching, reset)
+    /// but no real Huffman / IDCT / YUV→RGB. Games that poll MDEC
+    /// status see plausible values instead of the unmapped 0xFFFF_FFFF.
+    pub mdec: crate::mdec::Mdec,
     /// Cumulative CPU cycles retired since reset. Fed by `Cpu::step`
     /// via [`Bus::tick`]. Peripherals read this to schedule events
     /// (VBlank, timer ticks, DMA completion). Phase 4a just counts;
@@ -160,6 +165,7 @@ impl Bus {
             spu: Spu::new(),
             sio0: Sio0::new(),
             cdrom: CdRom::new(),
+            mdec: crate::mdec::Mdec::new(),
             cycles: 0,
             scheduler: {
                 let mut s = crate::scheduler::Scheduler::new();
@@ -947,6 +953,9 @@ impl Bus {
             let b3 = self.cdrom.read8(phys + 3) as u32;
             return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
         }
+        if crate::mdec::Mdec::contains(phys) {
+            return self.mdec.read32(phys);
+        }
 
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
             let offset = (phys - memory::io::BASE) as usize;
@@ -1011,6 +1020,10 @@ impl Bus {
             if self.sio0.take_pending_irq() {
                 self.irq.raise(IrqSource::Controller);
             }
+            return;
+        }
+        if crate::mdec::Mdec::contains(phys) {
+            self.mdec.write32(phys, value);
             return;
         }
 

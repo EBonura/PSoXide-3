@@ -16,6 +16,7 @@ pub mod gpu;
 pub mod gte;
 pub mod irq;
 pub mod hle_bios;
+pub mod mdec;
 pub mod mmio_trace;
 pub mod pad;
 pub mod scheduler;
