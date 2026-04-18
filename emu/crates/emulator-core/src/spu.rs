@@ -1536,9 +1536,19 @@ const GAUSS_TABLE: [i32; 1024] = [
 fn gauss_interpolate(samples: [i16; 4], frac: u32) -> i16 {
     // Redux: `vl = (spos >> 6) & ~3`, where `spos` is a 16.16
     // fixed-point position (0..=0xFFFF). Our `frac` is 12-bit
-    // (0..=0xFFF), so the equivalent shift is `<< 4 >> 6 = >> 2`
-    // to reach the `vl` scale, then `& ~3` for alignment.
-    let vl = ((frac >> 2) & !3) as usize;
+    // (0..=0xFFF nominally), so the equivalent shift is
+    // `<< 4 >> 6 = >> 2` to reach the `vl` scale, then `& ~3`
+    // for alignment.
+    //
+    // Clamp `vl` to 1020 because the advance loop in
+    // `fetch_voice_sample` can break out of its inner step with
+    // `sample_frac` still >= 0x1000 (when the block boundary is
+    // hit mid-advance at high pitch). The next call then decodes
+    // a new block but inherits that leftover fraction — valid
+    // hardware-wise (the "extra" fraction is consumed on the
+    // next sample) but potentially indexes past 1023 here.
+    let vl_raw = ((frac >> 2) & !3) as usize;
+    let vl = vl_raw.min(1020);
     let a = (GAUSS_TABLE[vl] * samples[0] as i32) & !2047;
     let b = (GAUSS_TABLE[vl + 1] * samples[1] as i32) & !2047;
     let c = (GAUSS_TABLE[vl + 2] * samples[2] as i32) & !2047;
@@ -2122,6 +2132,18 @@ mod tests {
         // zero and in range.
         let out = gauss_interpolate([0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF], 0x800);
         assert!(out > 0);
+    }
+
+    #[test]
+    fn gaussian_interp_handles_frac_past_0x1000() {
+        // Regression: at high pitch with a block-boundary break,
+        // `sample_frac` can leak above 0x1000 by a handful of
+        // units. Make sure the clamp inside `gauss_interpolate`
+        // keeps us in-bounds instead of panicking.
+        for frac in [0x1000, 0x1004, 0x100F, 0x10FF, 0x1FFF] {
+            let _ = gauss_interpolate([0, 0, 0, 0], frac);
+            let _ = gauss_interpolate([0x1234, 0x5678, -0x100, 0x7FFF], frac);
+        }
     }
 
     #[test]
