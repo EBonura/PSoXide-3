@@ -481,6 +481,14 @@ impl CdRom {
             0x0A => self.cmd_init(),
             // Mute / Demute.
             0x0B | 0x0C => self.cmd_getstat(),
+            // GetlocL — current logical MSF + mode + subheader.
+            0x10 => self.cmd_get_loc_l(),
+            // GetlocP — current play position (track, index, MSF).
+            0x11 => self.cmd_get_loc_p(),
+            // ReadS — read without auto-retry. Data arrives the same
+            // way as ReadN for our purposes; games use ReadS for
+            // audio/video streaming where a retry would cause hitching.
+            0x1B => self.cmd_read(),
             // SetMode: 1 byte (speed, CD-DA enable, filter, etc.).
             // We accept and store; full behaviour in 6d.
             0x0E => self.cmd_setmode(&params),
@@ -724,6 +732,61 @@ impl CdRom {
         self.reading = false;
     }
 
+    /// CdlGetlocL (0x10) — return the current logical position
+    /// and sector-header info. 8-byte reply: `[AMM, ASS, ASECT,
+    /// Mode, File, Channel, SM, CI]`, where `AMM/ASS/ASECT` are
+    /// the absolute MSF in BCD of the last-read sector, Mode is
+    /// the last SetMode byte, and the rest come from the Mode 2
+    /// subheader (zeroed when no sector has been read yet — most
+    /// games just look at the MSF).
+    ///
+    /// Without a disc, returns an INT5 error like GetID.
+    fn cmd_get_loc_l(&mut self) {
+        if !self.disc_present {
+            let stat = self.stat_byte() | drive_status_bit::ERROR;
+            self.schedule_error_response(vec![stat, 0x80]);
+            return;
+        }
+        let (m, s, f) = lba_to_msf(self.read_lba.saturating_sub(1));
+        let mode = self.mode;
+        // Subheader fields come from the last read sector. For a
+        // minimal-accuracy reply we zero them; games that stream XA
+        // re-query only to learn the MSF anyway.
+        let (file, channel, sm, ci) = (0, 0, 0, 0);
+        self.schedule_first_response(vec![
+            bin_to_bcd(m),
+            bin_to_bcd(s),
+            bin_to_bcd(f),
+            mode,
+            file,
+            channel,
+            sm,
+            ci,
+        ]);
+    }
+
+    /// CdlGetlocP (0x11) — return the current physical play
+    /// position. 8-byte reply: `[Track, Index, RMM, RSS, RSECT,
+    /// AMM, ASS, ASECT]`. RMM/RSS/RSECT are relative to the
+    /// track start; AMM/ASS/ASECT are absolute MSF. We don't
+    /// track per-track offsets yet (single-bin ISO loader), so
+    /// relative == absolute and track is fixed at 01.
+    fn cmd_get_loc_p(&mut self) {
+        if !self.disc_present {
+            let stat = self.stat_byte() | drive_status_bit::ERROR;
+            self.schedule_error_response(vec![stat, 0x80]);
+            return;
+        }
+        let (m, s, f) = lba_to_msf(self.read_lba.saturating_sub(1));
+        let (bm, bs, bf) = (bin_to_bcd(m), bin_to_bcd(s), bin_to_bcd(f));
+        self.schedule_first_response(vec![
+            0x01, // track
+            0x01, // index
+            bm, bs, bf, // relative MSF
+            bm, bs, bf, // absolute MSF
+        ]);
+    }
+
     /// Legacy helper kept for the `0x04` / `0x05` forward / backward
     /// commands which still use "ack or nodisc-error" semantics.
     #[allow(dead_code)]
@@ -946,6 +1009,22 @@ impl Default for CdRom {
     }
 }
 
+/// Convert an absolute LBA to an MSF triple (binary, not BCD).
+/// Inverse of `psx_iso::msf_to_lba`.
+fn lba_to_msf(lba: u32) -> (u8, u8, u8) {
+    let abs = lba.saturating_add(150);
+    let m = (abs / (60 * 75)) as u8;
+    let s = ((abs / 75) % 60) as u8;
+    let f = (abs % 75) as u8;
+    (m, s, f)
+}
+
+/// Pack a 0..=99 binary value into a 2-digit BCD byte.
+fn bin_to_bcd(v: u8) -> u8 {
+    let v = v.min(99);
+    ((v / 10) << 4) | (v % 10)
+}
+
 /// Decode one raw 2352-byte Mode 2 Form 2 XA ADPCM audio sector into
 /// stereo PCM samples. Returns `None` when the sector isn't an XA
 /// audio sector (subheader submode bit 2 / Form 2 bit 5 not set).
@@ -1139,6 +1218,35 @@ mod tests {
         assert_eq!(cd.drive_status & drive_status_bit::SHELL_OPEN, 0);
         assert!(!cd.motor_on);
         assert!(!cd.disc_present);
+    }
+
+    #[test]
+    fn lba_to_msf_round_trips() {
+        // LBA 0 = MSF 00:02:00 (per 150-frame pre-gap convention).
+        assert_eq!(lba_to_msf(0), (0, 2, 0));
+        assert_eq!(lba_to_msf(75), (0, 3, 0)); // one second in
+        assert_eq!(lba_to_msf(4500), (1, 2, 0)); // one minute in
+    }
+
+    #[test]
+    fn bin_to_bcd_packs_correctly() {
+        assert_eq!(bin_to_bcd(0), 0x00);
+        assert_eq!(bin_to_bcd(42), 0x42);
+        assert_eq!(bin_to_bcd(99), 0x99);
+        assert_eq!(bin_to_bcd(100), 0x99); // clamped
+    }
+
+    #[test]
+    fn getlocl_without_disc_returns_error() {
+        let mut cd = CdRom::new();
+        // No disc.
+        cd.cmd_get_loc_l();
+        // First tick rebases the pending event's relative deadline
+        // to absolute; second tick past the deadline delivers it.
+        cd.tick(0);
+        cd.tick(10_000_000);
+        let first = cd.responses.front().copied().unwrap_or(0);
+        assert_ne!(first & drive_status_bit::ERROR, 0);
     }
 
     #[test]
