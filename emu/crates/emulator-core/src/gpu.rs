@@ -69,6 +69,13 @@ pub struct Gpu {
     /// Texture colour depth: 0 = 4bpp (CLUT), 1 = 8bpp (CLUT),
     /// 2 = 15bpp (direct).
     tex_depth: u8,
+    /// Semi-transparency mode from the current texpage (bits 5-6 of
+    /// GP0 0xE1 or of a textured-primitive's tpage override). Kept
+    /// as a [`BlendMode`] so primitives can plug it straight into
+    /// the rasterizer without re-parsing the bits. Only matters when
+    /// a primitive's cmd-bit-1 selects semi-transparent; opaque
+    /// prims ignore this field.
+    tex_blend_mode: BlendMode,
 
     // --- Display area (GP1 0x05 / 0x06 / 0x07 / 0x08) ---
     /// VRAM X of the top-left pixel of the displayed framebuffer.
@@ -170,6 +177,7 @@ impl Gpu {
             tex_page_x: 0,
             tex_page_y: 0,
             tex_depth: 0,
+            tex_blend_mode: BlendMode::Average,
             display_start_x: 0,
             display_start_y: 0,
             display_width: 320,
@@ -582,6 +590,7 @@ impl Gpu {
                 self.tex_page_x = ((word & 0x0F) as u16) * 64;
                 self.tex_page_y = if (word >> 4) & 1 != 0 { 256 } else { 0 };
                 self.tex_depth = ((word >> 7) & 0x3) as u8;
+                self.tex_blend_mode = BlendMode::from_tpage_bits(word >> 5);
                 // GPUSTAT bits 0..=10 come from E1h bits 0..=10.
                 let stat_bits = word & 0x07FF;
                 self.status.raw = (self.status.raw & !0x07FF) | stat_bits;
@@ -682,43 +691,51 @@ impl Gpu {
     /// GP0 0x20..=0x23 — monochrome 3-vertex triangle.
     /// Words: `[cmd+color, v0, v1, v2]`.
     fn draw_monochrome_tri(&mut self) {
-        let color = rgb24_to_bgr15(self.gp0_fifo[0] & 0x00FF_FFFF);
+        let cmd = self.gp0_fifo[0];
+        let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
         let v1 = self.decode_vertex(self.gp0_fifo[2]);
         let v2 = self.decode_vertex(self.gp0_fifo[3]);
-        self.rasterize_triangle(v0, v1, v2, color);
+        self.rasterize_triangle(v0, v1, v2, color, mode);
     }
 
     /// GP0 0x28..=0x2B — monochrome 4-vertex quad, split into two
     /// triangles `(v0, v1, v2)` + `(v1, v2, v3)`.
     fn draw_monochrome_quad(&mut self) {
-        let color = rgb24_to_bgr15(self.gp0_fifo[0] & 0x00FF_FFFF);
+        let cmd = self.gp0_fifo[0];
+        let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
         let v1 = self.decode_vertex(self.gp0_fifo[2]);
         let v2 = self.decode_vertex(self.gp0_fifo[3]);
         let v3 = self.decode_vertex(self.gp0_fifo[4]);
-        self.rasterize_triangle(v0, v1, v2, color);
-        self.rasterize_triangle(v1, v2, v3, color);
+        self.rasterize_triangle(v0, v1, v2, color, mode);
+        self.rasterize_triangle(v1, v2, v3, color, mode);
     }
 
     /// GP0 0x30..=0x33 — Gouraud triangle. Per-vertex RGB24 colours,
     /// interpolated across the triangle via barycentric weights.
     /// Words: `[cmd+c0, v0, c1, v1, c2, v2]`.
     fn draw_shaded_tri(&mut self) {
-        let c0 = self.gp0_fifo[0] & 0x00FF_FFFF;
+        let cmd = self.gp0_fifo[0];
+        let c0 = cmd & 0x00FF_FFFF;
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
         let c1 = self.gp0_fifo[2] & 0x00FF_FFFF;
         let v1 = self.decode_vertex(self.gp0_fifo[3]);
         let c2 = self.gp0_fifo[4] & 0x00FF_FFFF;
         let v2 = self.decode_vertex(self.gp0_fifo[5]);
-        self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2);
+        self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2, mode);
     }
 
     /// GP0 0x38..=0x3B — Gouraud quad. 4 × (colour+vertex) =
     /// 8 words, split into two shaded triangles sharing the middle
     /// edge (v1–v2).
     fn draw_shaded_quad(&mut self) {
-        let c0 = self.gp0_fifo[0] & 0x00FF_FFFF;
+        let cmd = self.gp0_fifo[0];
+        let c0 = cmd & 0x00FF_FFFF;
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
         let c1 = self.gp0_fifo[2] & 0x00FF_FFFF;
         let v1 = self.decode_vertex(self.gp0_fifo[3]);
@@ -726,34 +743,39 @@ impl Gpu {
         let v2 = self.decode_vertex(self.gp0_fifo[5]);
         let c3 = self.gp0_fifo[6] & 0x00FF_FFFF;
         let v3 = self.decode_vertex(self.gp0_fifo[7]);
-        self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2);
-        self.rasterize_shaded_triangle(v1, v2, v3, c1, c2, c3);
+        self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2, mode);
+        self.rasterize_shaded_triangle(v1, v2, v3, c1, c2, c3, mode);
     }
 
     /// GP0 0x60..=0x63 — monochrome variable-size rectangle.
     /// Words: `[cmd+color, xy, wh]`.
     fn draw_monochrome_rect_variable(&mut self) {
-        let color = rgb24_to_bgr15(self.gp0_fifo[0] & 0x00FF_FFFF);
+        let cmd = self.gp0_fifo[0];
+        let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
         let pos = self.gp0_fifo[1];
         let size = self.gp0_fifo[2];
         let x = sign_extend_11((pos & 0x7FF) as i32) + self.draw_offset_x;
         let y = sign_extend_11(((pos >> 16) & 0x7FF) as i32) + self.draw_offset_y;
         let w = (size & 0xFFFF) as i32;
         let h = ((size >> 16) & 0xFFFF) as i32;
-        self.paint_rect(x, y, w, h, color);
+        self.paint_rect(x, y, w, h, color, mode);
     }
 
     /// GP0 0x68/0x70/0x78 — fixed-size monochrome rectangles.
     fn draw_monochrome_rect_sized(&mut self, w: i32, h: i32) {
-        let color = rgb24_to_bgr15(self.gp0_fifo[0] & 0x00FF_FFFF);
+        let cmd = self.gp0_fifo[0];
+        let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
         let pos = self.gp0_fifo[1];
         let x = sign_extend_11((pos & 0x7FF) as i32) + self.draw_offset_x;
         let y = sign_extend_11(((pos >> 16) & 0x7FF) as i32) + self.draw_offset_y;
-        self.paint_rect(x, y, w, h, color);
+        self.paint_rect(x, y, w, h, color, mode);
     }
 
     /// Variable-size textured rect. Words: `[cmd+tint, xy, clut+uv, wh]`.
     fn draw_textured_rect_variable(&mut self) {
+        let cmd = self.gp0_fifo[0];
         let pos = self.gp0_fifo[1];
         let uv_clut = self.gp0_fifo[2];
         let size = self.gp0_fifo[3];
@@ -764,12 +786,13 @@ impl Gpu {
         let u0 = (uv_clut & 0xFF) as u16;
         let v0 = ((uv_clut >> 8) & 0xFF) as u16;
         let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
-        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word);
+        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word, prim_is_semi_trans(cmd));
     }
 
     /// Fixed-size textured rect (1×1, 8×8, 16×16).
     /// Words: `[cmd+tint, xy, clut+uv]`.
     fn draw_textured_rect_sized(&mut self, w: i32, h: i32) {
+        let cmd = self.gp0_fifo[0];
         let pos = self.gp0_fifo[1];
         let uv_clut = self.gp0_fifo[2];
         let x = sign_extend_11((pos & 0x7FF) as i32) + self.draw_offset_x;
@@ -777,13 +800,17 @@ impl Gpu {
         let u0 = (uv_clut & 0xFF) as u16;
         let v0 = ((uv_clut >> 8) & 0xFF) as u16;
         let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
-        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word);
+        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word, prim_is_semi_trans(cmd));
     }
 
     /// Plot a textured rectangle. Each destination pixel samples a
     /// 1:1 texel from the current texture page, CLUT-indexed for
     /// 4bpp / 8bpp modes, direct for 15bpp. Texels of value 0 are
     /// transparent (standard PS1 convention).
+    ///
+    /// `semi_trans` is the primitive's cmd-bit-1 flag. Texels with
+    /// bit 15 high blend via `self.tex_blend_mode` when it's set;
+    /// texels with bit 15 clear always draw opaque.
     #[allow(clippy::too_many_arguments)]
     fn paint_textured_rect(
         &mut self,
@@ -794,12 +821,14 @@ impl Gpu {
         u0: u16,
         v0: u16,
         clut_word: u16,
+        semi_trans: bool,
     ) {
         if w <= 0 || h <= 0 {
             return;
         }
         let clut_x = (clut_word & 0x3F) * 16;
         let clut_y = (clut_word >> 6) & 0x1FF;
+        let tpage_mode = self.tex_blend_mode;
 
         let left = x.max(self.draw_area_left as i32);
         let top = y.max(self.draw_area_top as i32);
@@ -814,7 +843,12 @@ impl Gpu {
                 let tex_u = u0.wrapping_add((px - x) as u16);
                 let tex_v = v0.wrapping_add((py - y) as u16);
                 if let Some(texel) = self.sample_texture(tex_u, tex_v, clut_x, clut_y) {
-                    self.vram.set_pixel(px as u16, py as u16, texel);
+                    let mode = if semi_trans && (texel & 0x8000) != 0 {
+                        tpage_mode
+                    } else {
+                        BlendMode::Opaque
+                    };
+                    self.plot_pixel(px as u16, py as u16, texel, mode);
                 }
             }
         }
@@ -862,8 +896,11 @@ impl Gpu {
     }
 
     /// Plot a rectangle of `color` in screen-space, clipped to the
-    /// GPU's drawing area.
-    fn paint_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16) {
+    /// GPU's drawing area. `mode` lets the caller pass the
+    /// primitive's semi-transparency mode — opaque for the common
+    /// case, one of the blend variants when the GP0 command's
+    /// cmd-bit-1 is set.
+    fn paint_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16, mode: BlendMode) {
         if w <= 0 || h <= 0 {
             return;
         }
@@ -876,7 +913,7 @@ impl Gpu {
         }
         for py in top..=bottom {
             for px in left..=right {
-                self.vram.set_pixel(px as u16, py as u16, color);
+                self.plot_pixel(px as u16, py as u16, color, mode);
             }
         }
     }
@@ -886,7 +923,14 @@ impl Gpu {
     /// equations; a pixel is inside iff all three have the same sign.
     /// Works regardless of triangle winding. Clipped to both VRAM
     /// bounds and the active drawing area.
-    fn rasterize_triangle(&mut self, v0: (i32, i32), v1: (i32, i32), v2: (i32, i32), color: u16) {
+    fn rasterize_triangle(
+        &mut self,
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        color: u16,
+        mode: BlendMode,
+    ) {
         let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
         let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
         let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
@@ -909,7 +953,7 @@ impl Gpu {
                 let w1 = edge(v2, v0, p) * area_sign;
                 let w2 = edge(v0, v1, p) * area_sign;
                 if (w0 | w1 | w2) >= 0 {
-                    self.vram.set_pixel(x as u16, y as u16, color);
+                    self.plot_pixel(x as u16, y as u16, color, mode);
                 }
             }
         }
@@ -918,6 +962,7 @@ impl Gpu {
     /// GP0 0x24..=0x27 — textured triangle. 7 words:
     /// `[cmd+tint, v0, clut+uv0, v1, tpage+uv1, v2, uv2]`.
     fn draw_textured_tri(&mut self) {
+        let cmd = self.gp0_fifo[0];
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
         let uv0 = self.gp0_fifo[2];
         let v1 = self.decode_vertex(self.gp0_fifo[3]);
@@ -931,12 +976,16 @@ impl Gpu {
         let t0 = ((uv0 & 0xFF) as u16, ((uv0 >> 8) & 0xFF) as u16);
         let t1 = ((uv1 & 0xFF) as u16, ((uv1 >> 8) & 0xFF) as u16);
         let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
-        self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word);
+        self.rasterize_textured_triangle(
+            v0, v1, v2, t0, t1, t2, clut_word,
+            prim_is_semi_trans(cmd),
+        );
     }
 
     /// GP0 0x2C..=0x2F — textured quad. 9 words; split into two
     /// textured triangles sharing v1–v2.
     fn draw_textured_quad(&mut self) {
+        let cmd = self.gp0_fifo[0];
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
         let uv0 = self.gp0_fifo[2];
         let v1 = self.decode_vertex(self.gp0_fifo[3]);
@@ -951,8 +1000,9 @@ impl Gpu {
         let t1 = ((uv1 & 0xFF) as u16, ((uv1 >> 8) & 0xFF) as u16);
         let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
         let t3 = ((uv3 & 0xFF) as u16, ((uv3 >> 8) & 0xFF) as u16);
-        self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word);
-        self.rasterize_textured_triangle(v1, v2, v3, t1, t2, t3, clut_word);
+        let semi = prim_is_semi_trans(cmd);
+        self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word, semi);
+        self.rasterize_textured_triangle(v1, v2, v3, t1, t2, t3, clut_word, semi);
     }
 
     /// Apply the tpage bits embedded in a textured-primitive UV word
@@ -962,11 +1012,33 @@ impl Gpu {
         self.tex_page_x = ((tpage & 0x0F) as u16) * 64;
         self.tex_page_y = if (tpage >> 4) & 1 != 0 { 256 } else { 0 };
         self.tex_depth = ((tpage >> 7) & 0x3) as u8;
+        self.tex_blend_mode = BlendMode::from_tpage_bits(tpage >> 5);
+    }
+
+    /// Plot a single 15bpp pixel at `(x, y)`. When `mode == Opaque`
+    /// this is a plain VRAM write; otherwise we fetch the existing
+    /// pixel and run the semi-transparency blend. Callers do their
+    /// own draw-area clipping before calling this — it's the hot
+    /// per-pixel path and shouldn't re-check bounds.
+    fn plot_pixel(&mut self, x: u16, y: u16, fg: u16, mode: BlendMode) {
+        let pixel = if mode == BlendMode::Opaque {
+            fg
+        } else {
+            let bg = self.vram.get_pixel(x, y);
+            blend_pixel(bg, fg, mode)
+        };
+        self.vram.set_pixel(x, y, pixel);
     }
 
     /// Rasterize a textured triangle — same edge-function test as the
     /// other triangle paths, with nearest-neighbor texture sampling
     /// via barycentric-interpolated UV.
+    ///
+    /// `semi_trans` is the primitive's command-bit-1 state. When it's
+    /// set, texels with bit 15 high blend via `self.tex_blend_mode`;
+    /// texels with bit 15 clear still draw opaquely. When it's clear,
+    /// every texel draws opaque regardless of its bit 15. This
+    /// matches PSX-SPX's per-texel semi-transparency rule.
     #[allow(clippy::too_many_arguments)]
     fn rasterize_textured_triangle(
         &mut self,
@@ -977,6 +1049,7 @@ impl Gpu {
         t1: (u16, u16),
         t2: (u16, u16),
         clut_word: u16,
+        semi_trans: bool,
     ) {
         let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
         let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
@@ -995,6 +1068,7 @@ impl Gpu {
 
         let clut_x = (clut_word & 0x3F) * 16;
         let clut_y = (clut_word >> 6) & 0x1FF;
+        let tpage_mode = self.tex_blend_mode;
 
         for y in min_y..=max_y {
             for x in min_x..=max_x {
@@ -1006,7 +1080,12 @@ impl Gpu {
                     let u = (w0 * t0.0 as i64 + w1 * t1.0 as i64 + w2 * t2.0 as i64) / area_abs;
                     let v = (w0 * t0.1 as i64 + w1 * t1.1 as i64 + w2 * t2.1 as i64) / area_abs;
                     if let Some(texel) = self.sample_texture(u as u16, v as u16, clut_x, clut_y) {
-                        self.vram.set_pixel(x as u16, y as u16, texel);
+                        let mode = if semi_trans && (texel & 0x8000) != 0 {
+                            tpage_mode
+                        } else {
+                            BlendMode::Opaque
+                        };
+                        self.plot_pixel(x as u16, y as u16, texel, mode);
                     }
                 }
             }
@@ -1017,6 +1096,7 @@ impl Gpu {
     /// Same edge-function inside test as the flat path, but interpolates
     /// RGB using normalized barycentric weights `(w0, w1, w2)` per pixel
     /// and packs the result back into a 15-bit BGR VRAM word.
+    #[allow(clippy::too_many_arguments)]
     fn rasterize_shaded_triangle(
         &mut self,
         v0: (i32, i32),
@@ -1025,6 +1105,7 @@ impl Gpu {
         c0: u32,
         c1: u32,
         c2: u32,
+        mode: BlendMode,
     ) {
         let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
         let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
@@ -1062,7 +1143,7 @@ impl Gpu {
                             | ((gi.clamp(0, 255) as u32) << 8)
                             | ((bi.clamp(0, 255) as u32) << 16),
                     );
-                    self.vram.set_pixel(x as u16, y as u16, colour);
+                    self.plot_pixel(x as u16, y as u16, colour, mode);
                 }
             }
         }
@@ -1265,6 +1346,97 @@ fn rgb24_to_bgr15(rgb24: u32) -> u16 {
     let g = (((rgb24 >> 8) >> 3) & 0x1F) as u16;
     let b = (((rgb24 >> 16) >> 3) & 0x1F) as u16;
     r | (g << 5) | (b << 10)
+}
+
+/// PSX semi-transparency mode. The four non-`Opaque` variants map
+/// directly to the four encodings in GP0 0xE1 / tpage bits 5-6.
+/// `Opaque` is our shortcut for "don't touch the destination — just
+/// overwrite" so primitives share one rasterizer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BlendMode {
+    /// Write the foreground pixel directly, ignoring the background.
+    Opaque,
+    /// `(B + F) / 2` — 50% average. Smoke, translucent glass.
+    Average,
+    /// `B + F`, channel-clamped to 31. Additive blending — fire, lights.
+    Add,
+    /// `B - F`, channel-clamped to 0. Subtractive — shadows.
+    Sub,
+    /// `B + F/4`, channel-clamped to 31. Low-intensity additive —
+    /// subtle glow / haze.
+    AddQuarter,
+}
+
+impl BlendMode {
+    /// Decode the 2-bit tpage/E1-command "semi-transparency" field
+    /// (bits 5-6 of GP0 0xE1, or of a textured-primitive tpage word).
+    /// Always returns a non-`Opaque` variant — whether the primitive
+    /// actually blends is determined by the caller's "is this prim
+    /// semi-transparent?" flag.
+    fn from_tpage_bits(bits: u32) -> Self {
+        match bits & 0x3 {
+            0 => Self::Average,
+            1 => Self::Add,
+            2 => Self::Sub,
+            _ => Self::AddQuarter,
+        }
+    }
+}
+
+/// `true` if the primitive-command word's cmd-bit-1 ("semi-trans
+/// flag") is set. GP0 primitive opcodes are laid out as
+/// `0b001XXPTC` where bit 1 (= `P`) is the semi-trans flag: 0 means
+/// opaque, 1 means the primitive blends per the active tpage mode.
+#[inline]
+fn prim_is_semi_trans(cmd_word: u32) -> bool {
+    (cmd_word >> 25) & 1 != 0
+}
+
+/// Resolve the blend mode for a non-textured primitive: opaque if
+/// the cmd-bit-1 flag is clear, otherwise the current tpage's
+/// active semi-transparency mode. Textured primitives don't use
+/// this helper — per-texel bit-15 controls blending there.
+#[inline]
+fn prim_blend_mode(cmd_word: u32, tpage_mode: BlendMode) -> BlendMode {
+    if prim_is_semi_trans(cmd_word) {
+        tpage_mode
+    } else {
+        BlendMode::Opaque
+    }
+}
+
+/// Blend a foreground pixel over a background pixel per `mode`.
+/// Both pixels are 15-bit BGR with a mask bit at bit 15. The mask
+/// bit of the result comes from the foreground so semi-transparent
+/// texels keep marking themselves.
+fn blend_pixel(bg: u16, fg: u16, mode: BlendMode) -> u16 {
+    if mode == BlendMode::Opaque {
+        return fg;
+    }
+    // Channel extraction — 5 bits each, i16 so we can subtract without
+    // wrapping and compare signed for the saturating clamp.
+    let br = (bg & 0x1F) as i16;
+    let bgg = ((bg >> 5) & 0x1F) as i16;
+    let bb = ((bg >> 10) & 0x1F) as i16;
+    let fr = (fg & 0x1F) as i16;
+    let fgg = ((fg >> 5) & 0x1F) as i16;
+    let fb = ((fg >> 10) & 0x1F) as i16;
+    let (r, g, b) = match mode {
+        BlendMode::Opaque => unreachable!(),
+        BlendMode::Average => ((br + fr) / 2, (bgg + fgg) / 2, (bb + fb) / 2),
+        BlendMode::Add => (
+            (br + fr).min(31),
+            (bgg + fgg).min(31),
+            (bb + fb).min(31),
+        ),
+        BlendMode::Sub => ((br - fr).max(0), (bgg - fgg).max(0), (bb - fb).max(0)),
+        BlendMode::AddQuarter => (
+            (br + fr / 4).min(31),
+            (bgg + fgg / 4).min(31),
+            (bb + fb / 4).min(31),
+        ),
+    };
+    (r as u16) | ((g as u16) << 5) | ((b as u16) << 10) | (fg & 0x8000)
 }
 
 impl Default for Gpu {
@@ -1492,5 +1664,100 @@ mod tests {
         let mut gpu = Gpu::new();
         assert!(gpu.read32(0x1F80_1800).is_none());
         assert!(gpu.read32(0x1F80_1818).is_none());
+    }
+
+    #[test]
+    fn blend_mode_decodes_tpage_bits() {
+        assert_eq!(BlendMode::from_tpage_bits(0), BlendMode::Average);
+        assert_eq!(BlendMode::from_tpage_bits(1), BlendMode::Add);
+        assert_eq!(BlendMode::from_tpage_bits(2), BlendMode::Sub);
+        assert_eq!(BlendMode::from_tpage_bits(3), BlendMode::AddQuarter);
+        // Higher bits are masked off.
+        assert_eq!(BlendMode::from_tpage_bits(0b100), BlendMode::Average);
+    }
+
+    #[test]
+    fn blend_opaque_returns_foreground_unchanged() {
+        assert_eq!(blend_pixel(0x1234, 0x5678, BlendMode::Opaque), 0x5678);
+    }
+
+    #[test]
+    fn blend_average_halves_then_sums() {
+        // BG = (10, 10, 10), FG = (20, 20, 20) → avg = (15, 15, 15).
+        let bg = 10 | (10 << 5) | (10 << 10);
+        let fg = 20 | (20 << 5) | (20 << 10);
+        let out = blend_pixel(bg, fg, BlendMode::Average);
+        assert_eq!(out & 0x1F, 15);
+        assert_eq!((out >> 5) & 0x1F, 15);
+        assert_eq!((out >> 10) & 0x1F, 15);
+    }
+
+    #[test]
+    fn blend_add_saturates_at_31() {
+        let bg = 20 | (20 << 5) | (20 << 10);
+        let fg = 20 | (20 << 5) | (20 << 10);
+        let out = blend_pixel(bg, fg, BlendMode::Add);
+        // 20+20 = 40 → clamps to 31 per channel.
+        assert_eq!(out & 0x1F, 31);
+        assert_eq!((out >> 5) & 0x1F, 31);
+        assert_eq!((out >> 10) & 0x1F, 31);
+    }
+
+    #[test]
+    fn blend_sub_saturates_at_zero() {
+        let bg = 5 | (10 << 5) | (15 << 10);
+        let fg = 10 | (10 << 5) | (10 << 10);
+        let out = blend_pixel(bg, fg, BlendMode::Sub);
+        // R: 5-10 = -5 → 0. G: 10-10 = 0. B: 15-10 = 5.
+        assert_eq!(out & 0x1F, 0);
+        assert_eq!((out >> 5) & 0x1F, 0);
+        assert_eq!((out >> 10) & 0x1F, 5);
+    }
+
+    #[test]
+    fn blend_add_quarter_adds_fractional_foreground() {
+        let bg = 10 | (10 << 5) | (10 << 10);
+        let fg = 20 | (20 << 5) | (20 << 10);
+        let out = blend_pixel(bg, fg, BlendMode::AddQuarter);
+        // BG + FG/4 → 10 + 5 = 15 per channel.
+        assert_eq!(out & 0x1F, 15);
+        assert_eq!((out >> 5) & 0x1F, 15);
+        assert_eq!((out >> 10) & 0x1F, 15);
+    }
+
+    #[test]
+    fn blend_preserves_foreground_mask_bit() {
+        // Mask bit (bit 15) must come from the foreground so semi-
+        // transparent texels keep marking themselves.
+        let bg = 0x0000;
+        let fg = 0x8000 | 10;
+        let out = blend_pixel(bg, fg, BlendMode::Average);
+        assert_eq!(out & 0x8000, 0x8000);
+    }
+
+    #[test]
+    fn prim_helpers_decode_semi_trans_bit() {
+        // 0x20 = opaque monochrome tri. 0x22 = semi-trans monochrome tri.
+        // The opcode is in bits 24..=31; bit 25 of the word = bit 1 of op.
+        assert!(!prim_is_semi_trans(0x2000_0000));
+        assert!(prim_is_semi_trans(0x2200_0000));
+        assert_eq!(
+            prim_blend_mode(0x2000_0000, BlendMode::Add),
+            BlendMode::Opaque
+        );
+        assert_eq!(
+            prim_blend_mode(0x2200_0000, BlendMode::Add),
+            BlendMode::Add
+        );
+    }
+
+    #[test]
+    fn draw_mode_e1_extracts_blend_mode() {
+        // GP0 0xE1: bits 5-6 select semi-transparency mode.
+        let mut gpu = Gpu::new();
+        gpu.write32(GP0_ADDR, 0xE100_0020); // bits 5-6 = 01 → Add
+        assert_eq!(gpu.tex_blend_mode, BlendMode::Add);
+        gpu.write32(GP0_ADDR, 0xE100_0060); // bits 5-6 = 11 → AddQuarter
+        assert_eq!(gpu.tex_blend_mode, BlendMode::AddQuarter);
     }
 }
