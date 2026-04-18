@@ -39,8 +39,6 @@ pub struct PanelVisibility {
     pub memory: bool,
     /// VRAM thumbnail at the bottom of the screen.
     pub vram: bool,
-    /// Cycles / PC / FPS overlay in a corner.
-    pub hud: bool,
 }
 
 impl Default for PanelVisibility {
@@ -51,7 +49,6 @@ impl Default for PanelVisibility {
             registers: false,
             memory: false,
             vram: false,
-            hud: true,
         }
     }
 }

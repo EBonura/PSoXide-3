@@ -1,43 +1,56 @@
 //! Top-of-window toolbar.
 //!
-//! Three icon buttons on the right: play/pause (context-sensitive),
-//! reset, advance-one-frame. The rest of the bar stays empty for now —
-//! this is where a game-title or status pill would sit as the UI
-//! grows. Everything is clickable; pressing a button fires the same
-//! state transition as the corresponding Menu menu item, so keyboard
-//! and mouse users stay in sync.
+//! Two halves on a single strip:
 //!
-//! Keeps the CentralPanel free of widgets — before this, the only
-//! top-of-viewport control was a "Run speed" slider that most users
-//! never touched. Removing it reclaims vertical space for the
-//! framebuffer.
+//! - **Left**: live emulator status. Colored dot + RUNNING/PAUSED
+//!   label, followed by FPS / MIPS / frame-time — the same values
+//!   the bottom HUD used to show, now consolidated so the
+//!   framebuffer isn't bracketed by two metric bars.
+//! - **Right**: icon buttons. Play/pause (context-sensitive),
+//!   reset, advance-one-frame. Clicking fires the same state
+//!   transition as the equivalent Menu menu item.
 //!
 //! Layout shape:
 //!
 //! ```text
-//!  ┌────────────────────────────────────────[▶][⟲][⇥]──┐
-//!  │                                                    │
-//!  │                 (framebuffer)                      │
-//!  │                                                    │
-//!  └────────────────────────────────────────────────────┘
+//!  ┌────────────────────────────────────────────────────────────────┐
+//!  │ ● RUNNING    60.0 FPS   58 MIPS   16.7 ms            ▶  ⟲  ⇥ │
+//!  └────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! The left half lays out left-to-right; we then open a
+//! `right_to_left` sub-layout so the buttons cluster on the right
+//! without needing a manual spacer. Both halves live inside a
+//! single `horizontal_centered` so the toolbar's height is bounded
+//! (a bare `right_to_left` at the panel root claimed unbounded
+//! height and inflated to cover the whole window — the previous
+//! iteration's regression).
 
-use egui::{Align, Button, Context, Layout, TopBottomPanel};
+use egui::{Align, Button, Color32, Context, Label, Layout, RichText, TopBottomPanel};
 
 use crate::app::{self, AppState};
 use crate::icons;
 
-/// Icon font size in the toolbar. Matches the HUD's text size so the
-/// bar feels like a sibling of the other system chrome, not a
-/// separate visual register.
+/// Icon font size in the button row.
 const ICON_SIZE: f32 = 16.0;
 /// Minimum clickable size for each icon button. egui will grow the
 /// button to fit its content but won't shrink below this.
 const BUTTON_SIZE: egui::Vec2 = egui::vec2(30.0, 26.0);
-/// Exact height of the toolbar panel. Big enough to hold the buttons
-/// with comfortable padding, small enough that the framebuffer gets
-/// basically all remaining vertical space.
+/// Exact height of the toolbar panel.
 const BAR_HEIGHT: f32 = 34.0;
+
+/// Text size for the left-hand metrics cluster. Slightly smaller than
+/// the default UI font so the three values fit without wrapping on a
+/// narrow window.
+const METRIC_TEXT_SIZE: f32 = 12.0;
+
+/// Running / paused status colours. Green when the CPU is stepping,
+/// dim-text when paused. Kept out of `theme.rs` for now — it's the
+/// only place these get used.
+const STATUS_RUNNING: Color32 = Color32::from_rgb(80, 200, 120);
+const STATUS_PAUSED: Color32 = Color32::from_rgb(153, 153, 166);
+const METRIC_TEXT: Color32 = Color32::from_rgb(204, 204, 217);
+const METRIC_LABEL: Color32 = Color32::from_rgb(102, 102, 115);
 
 /// Paint the top toolbar. Called once per frame before the central
 /// panel so the framebuffer clips underneath it.
@@ -46,64 +59,110 @@ pub fn draw(ctx: &Context, state: &mut AppState) {
         .resizable(false)
         .exact_height(BAR_HEIGHT)
         .show(ctx, |ui| {
-            // Wrap the buttons in a horizontal row so the outer
-            // layout is bounded both vertically (by the panel's
-            // exact height) and horizontally (by the row's content
-            // width). Without `ui.horizontal`, a `right_to_left`
-            // layout at the panel root claims the full remaining
-            // space in both dimensions — which meant on the first
-            // cut of this bar the toolbar silently inflated to
-            // cover the whole window.
             ui.horizontal_centered(|ui| {
+                draw_metrics(ui, state);
+                // Push buttons to the right of the remaining space.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Advance one frame — runs `run_steps_per_frame`
-                    // instructions unconditionally, regardless of the
-                    // current run/pause state. Useful for nudging a
-                    // paused game forward when investigating a hang.
-                    let step_btn = Button::new(icons::text(icons::SKIP_FORWARD, ICON_SIZE))
-                        .min_size(BUTTON_SIZE);
-                    if ui
-                        .add(step_btn)
-                        .on_hover_text("Advance one frame")
-                        .clicked()
-                    {
-                        // Pause first so the shell's per-frame run
-                        // loop doesn't also step; otherwise clicking
-                        // while running advances two frames instead
-                        // of one.
-                        state.running = false;
-                        state.menu.sync_run_label(false);
-                        app::step_one_frame(state);
-                    }
-
-                    // Reset — rebuild the CPU, clear VRAM, leave
-                    // the Bus (disc still inserted).
-                    let reset_btn = Button::new(icons::text(icons::ROTATE_CCW, ICON_SIZE))
-                        .min_size(BUTTON_SIZE);
-                    if ui.add(reset_btn).on_hover_text("Reset CPU").clicked() {
-                        state.cpu = emulator_core::Cpu::new();
-                        state.running = false;
-                        state.exec_history.clear();
-                        state.gpr_snapshot = None;
-                        state.menu.sync_run_label(false);
-                        if let Some(bus) = state.bus.as_mut() {
-                            bus.gpu.vram.clear();
-                        }
-                    }
-
-                    // Play / Pause — icon + tooltip flip with state.
-                    let (icon, tooltip) = if state.running {
-                        (icons::PAUSE, "Pause")
-                    } else {
-                        (icons::PLAY, "Play")
-                    };
-                    let play_btn = Button::new(icons::text(icon, ICON_SIZE))
-                        .min_size(BUTTON_SIZE);
-                    if ui.add(play_btn).on_hover_text(tooltip).clicked() {
-                        state.running = !state.running;
-                        state.menu.sync_run_label(state.running);
-                    }
+                    draw_buttons(ui, state);
                 });
             });
         });
+}
+
+/// Left-hand cluster: status pill + FPS / MIPS / dt metrics.
+fn draw_metrics(ui: &mut egui::Ui, state: &AppState) {
+    ui.add_space(8.0);
+
+    let (dot_color, status_label) = if state.running {
+        (STATUS_RUNNING, "RUNNING")
+    } else {
+        (STATUS_PAUSED, "PAUSED")
+    };
+    ui.add(Label::new(
+        RichText::new("●")
+            .color(dot_color)
+            .size(METRIC_TEXT_SIZE),
+    ));
+    ui.add(Label::new(
+        RichText::new(status_label)
+            .color(METRIC_TEXT)
+            .size(METRIC_TEXT_SIZE),
+    ));
+
+    ui.add_space(16.0);
+
+    let fps = state.hud.fps();
+    let ms = state.hud.average_dt() * 1000.0;
+    let mips = state.hud.ips() / 1_000_000.0;
+
+    metric(ui, "FPS", format!("{fps:4.1}"));
+    ui.add_space(12.0);
+    metric(ui, "MIPS", format!("{mips:4.1}"));
+    ui.add_space(12.0);
+    metric(ui, "dt", format!("{ms:4.1} ms"));
+}
+
+/// One "LABEL value" pair, formatted so the label is dim and the
+/// value uses the primary text colour. Looks uniform across the row.
+fn metric(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.add(Label::new(
+        RichText::new(label)
+            .color(METRIC_LABEL)
+            .size(METRIC_TEXT_SIZE),
+    ));
+    ui.add_space(4.0);
+    ui.add(Label::new(
+        RichText::new(value)
+            .color(METRIC_TEXT)
+            .monospace()
+            .size(METRIC_TEXT_SIZE),
+    ));
+}
+
+/// Right-hand cluster of icon buttons. Added in visual-right-to-left
+/// order because the surrounding layout is `right_to_left`, so the
+/// first button added sits at the rightmost edge.
+fn draw_buttons(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.add_space(4.0);
+
+    // Advance one frame — run `run_steps_per_frame` instructions
+    // unconditionally. Pauses first so clicking while running
+    // doesn't advance two frames (one from the click, one from the
+    // shell's run loop).
+    let step_btn = Button::new(icons::text(icons::SKIP_FORWARD, ICON_SIZE)).min_size(BUTTON_SIZE);
+    if ui
+        .add(step_btn)
+        .on_hover_text("Advance one frame")
+        .clicked()
+    {
+        state.running = false;
+        state.menu.sync_run_label(false);
+        app::step_one_frame(state);
+    }
+
+    // Reset — rebuild the CPU, clear VRAM, keep the Bus (disc stays
+    // inserted).
+    let reset_btn = Button::new(icons::text(icons::ROTATE_CCW, ICON_SIZE)).min_size(BUTTON_SIZE);
+    if ui.add(reset_btn).on_hover_text("Reset CPU").clicked() {
+        state.cpu = emulator_core::Cpu::new();
+        state.running = false;
+        state.exec_history.clear();
+        state.gpr_snapshot = None;
+        state.menu.sync_run_label(false);
+        if let Some(bus) = state.bus.as_mut() {
+            bus.gpu.vram.clear();
+        }
+    }
+
+    // Play / Pause — icon + tooltip flip with state.
+    let (icon, tooltip) = if state.running {
+        (icons::PAUSE, "Pause")
+    } else {
+        (icons::PLAY, "Play")
+    };
+    let play_btn = Button::new(icons::text(icon, ICON_SIZE)).min_size(BUTTON_SIZE);
+    if ui.add(play_btn).on_hover_text(tooltip).clicked() {
+        state.running = !state.running;
+        state.menu.sync_run_label(state.running);
+    }
 }

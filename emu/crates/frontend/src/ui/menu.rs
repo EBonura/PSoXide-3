@@ -56,8 +56,6 @@ pub enum MenuAction {
     ToggleMemory,
     /// Toggle visibility of the VRAM bottom panel.
     ToggleVram,
-    /// Toggle visibility of the HUD overlay.
-    ToggleHud,
     /// Quit the application.
     Quit,
 }
@@ -526,11 +524,6 @@ fn build_debug_category() -> Category {
             MenuItem {
                 label: "Toggle VRAM panel".into(),
                 action: MenuAction::ToggleVram,
-                value: None,
-            },
-            MenuItem {
-                label: "Toggle HUD".into(),
-                action: MenuAction::ToggleHud,
                 value: None,
             },
             MenuItem {
