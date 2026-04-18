@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 mod app;
+mod audio;
 mod cli;
 mod disasm;
 mod gfx;
@@ -81,6 +82,10 @@ struct Shell {
     /// Decision is made at startup via CLI flag and then captured
     /// here; changing it at runtime would need a window recreation.
     fullscreen: bool,
+    /// Host audio output. `None` when no device is available
+    /// (headless CI, devices that can't open a stereo stream).
+    /// Emulation keeps running regardless — silence is fine.
+    audio: Option<audio::AudioOut>,
 }
 
 impl Default for Shell {
@@ -91,6 +96,15 @@ impl Default for Shell {
 
 impl Shell {
     fn new(config_dir: Option<std::path::PathBuf>, fullscreen: bool) -> Self {
+        let audio = audio::AudioOut::open();
+        if let Some(a) = audio.as_ref() {
+            eprintln!(
+                "[audio] opened host stream @ {} Hz",
+                a.host_sample_rate()
+            );
+        } else {
+            eprintln!("[audio] no host output device available — running silent");
+        }
         Self {
             graphics: None,
             state: AppState::with_config_dir(config_dir),
@@ -98,6 +112,7 @@ impl Shell {
             last_frame: Instant::now(),
             pad1_mask: 0,
             fullscreen,
+            audio,
         }
     }
 }
@@ -272,6 +287,25 @@ impl ApplicationHandler for Shell {
                         ));
                     }
                     app::step_one_frame(&mut self.state);
+
+                    // Pump the SPU forward by one NTSC frame's worth of
+                    // samples (44_100 / 60 = 735) and flush the newly-
+                    // produced audio into the cpal ring. SPU ticks
+                    // deliberately don't run inside `Cpu::step` — see
+                    // `Bus::run_spu_samples` for the rationale.
+                    if let Some(bus) = self.state.bus.as_mut() {
+                        bus.run_spu_samples(735);
+                        if let Some(audio) = self.audio.as_ref() {
+                            let samples = bus.spu.drain_audio();
+                            if !samples.is_empty() {
+                                audio.push_samples(&samples);
+                            }
+                        } else {
+                            // No output device — drain and discard so the
+                            // SPU's internal queue doesn't grow unbounded.
+                            let _ = bus.spu.drain_audio();
+                        }
+                    }
                 }
 
                 let state = &mut self.state;
