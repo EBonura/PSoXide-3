@@ -35,6 +35,6 @@ pub use irq::{Irq, IrqSource};
 pub use mmio_trace::{MmioKind, MmioTrace};
 pub use pad::{ButtonState, DigitalPad, PortDevice, button};
 pub use sio::Sio0;
-pub use spu::Spu;
+pub use spu::{Spu, XaDecoderState};
 pub use timers::{Timer, Timers};
 pub use vram::{Vram, VRAM_HEIGHT, VRAM_WIDTH};
