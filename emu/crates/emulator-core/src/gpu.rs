@@ -1322,17 +1322,16 @@ impl GpuStatus {
             ret &= !0x0800_0000;
         }
 
-        // Bit 25 (DMA data request) derives from direction (bits 29:30).
-        //   Direction 0 (Off):       bit 25 = 0
-        //   Direction 1 (FIFO):      bit 25 = 1
-        //   Direction 2 (CPU→GPU):   bit 25 = copy of bit 28
-        //   Direction 3 (GPU→CPU):   bit 25 = copy of bit 27
+        // Bit 25 (DMA data request) — Redux-observed semantics, not
+        // PSX-SPX's. PSX-SPX says dir=2 copies bit 28 and dir=3 copies
+        // bit 27; Redux only sets bit 25 when direction == 1 (FIFO)
+        // and leaves it clear otherwise. Parity at step 19,474,030
+        // pinned this: the BIOS polls GPUSTAT during its post-Sony
+        // intro init with DMA direction 2 and expects bit 25 = 0.
+        // See `pcsx-redux/src/core/gpu.cc::readStatus`.
         ret &= !0x0200_0000;
-        match (ret >> 29) & 3 {
-            1 => ret |= 0x0200_0000,
-            2 => ret |= (ret & 0x1000_0000) >> 3,
-            3 => ret |= (ret & 0x0800_0000) >> 2,
-            _ => {}
+        if (ret & 0x6000_0000) == 0x2000_0000 {
+            ret |= 0x0200_0000;
         }
         ret
     }

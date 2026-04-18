@@ -303,7 +303,10 @@ impl Cpu {
                 bus.tick(2);
                 self.tick += 1;
                 return Ok(InstructionRecord {
-                    tick: self.tick,
+                    // Trace records report bus cycles (same unit Redux's
+                    // `m_regs.cycle` uses). `self.tick` keeps counting
+                    // retired instructions for diagnostics.
+                    tick: bus.cycles(),
                     pc: self.pc,
                     instr: 0,
                     gprs: self.gprs,
@@ -382,7 +385,13 @@ impl Cpu {
 
         self.tick += 1;
         Ok(InstructionRecord {
-            tick: self.tick,
+            // Report bus cycles, not retired-instruction count — the
+            // psx-trace docs call this field a "cycle count", Redux's
+            // oracle populates it from `m_regs.cycle`, and our IRQ
+            // timing is already driven off `bus.cycles()`. Before this
+            // change our tick was step-index-based and silently
+            // diverged from Redux's by a factor of ~2.3.
+            tick: bus.cycles(),
             pc: pc_before,
             instr,
             gprs: self.gprs,
@@ -1451,7 +1460,9 @@ mod tests {
         assert_eq!(record.pc, 0xBFC0_0000);
         assert_eq!(record.instr, 0x3C08_0013);
         assert_eq!(record.gprs[8], 0x0013_0000); // $t0
-        assert_eq!(record.tick, 1);
+        // tick = bus.cycles() = BIAS=2 for the single retired lui.
+        // (Lui is not a load/store so no +1 extra.)
+        assert_eq!(record.tick, 2);
         assert_eq!(cpu.pc(), 0xBFC0_0004);
     }
 
