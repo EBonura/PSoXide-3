@@ -633,15 +633,33 @@ impl Cpu {
         Ok(())
     }
 
-    /// `ADDI rt, rs, imm16` — add sign-extended immediate.
+    /// `ADDI rt, rs, imm16` — add sign-extended immediate, signed.
     ///
-    /// Like `ADDIU` but raises an overflow exception on signed
-    /// overflow. Overflow handling is not yet implemented; for the
-    /// hand-written BIOS sequences we've encountered so far the
-    /// arithmetic doesn't overflow, so for now we treat this as ADDIU.
-    /// TODO: raise `Overflow` exception when `rs + imm` overflows i32.
+    /// Differs from `ADDIU` in one place: on signed overflow, the
+    /// destination register is left unchanged and a 12 (Overflow)
+    /// exception fires. Games occasionally rely on the trap for
+    /// range-check idioms — treating `ADDI` as `ADDIU` means those
+    /// games silently run past what should have been a clamped value.
     fn op_addi(&mut self, instr: u32) -> Result<(), ExecutionError> {
-        self.op_addiu(instr)
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let imm = (instr as i16) as i32;
+        let a = self.gpr(rs) as i32;
+        match a.checked_add(imm) {
+            Some(sum) => {
+                self.set_gpr(rt, sum as u32);
+                Ok(())
+            }
+            None => {
+                // Signed overflow — destination unchanged, raise
+                // CAUSE.ExcCode = 12 (Overflow). `in_delay_slot` is
+                // inferred from the pending branch already staged
+                // when Cpu::step dispatched us.
+                let in_delay_slot = self.pending_pc.is_some();
+                self.enter_exception(ExceptionCode::Overflow, self.pc, in_delay_slot);
+                Ok(())
+            }
+        }
     }
 
     /// `ADDIU rt, rs, imm16` — add sign-extended immediate, no overflow trap:
@@ -1157,14 +1175,47 @@ impl Cpu {
         Ok(())
     }
 
+    /// `ADD rd, rs, rt` — signed add. Raises Overflow (code 12) on
+    /// signed overflow; destination unchanged. `ADDU` is the wrap-
+    /// silently variant.
     fn op_add(&mut self, instr: u32) -> Result<(), ExecutionError> {
-        // TODO: trap on signed overflow. BIOS code doesn't overflow here.
-        self.op_addu(instr)
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        let a = self.gpr(rs) as i32;
+        let b = self.gpr(rt) as i32;
+        match a.checked_add(b) {
+            Some(sum) => {
+                self.set_gpr(rd, sum as u32);
+                Ok(())
+            }
+            None => {
+                let in_delay_slot = self.pending_pc.is_some();
+                self.enter_exception(ExceptionCode::Overflow, self.pc, in_delay_slot);
+                Ok(())
+            }
+        }
     }
 
+    /// `SUB rd, rs, rt` — signed subtract. Raises Overflow (code 12)
+    /// on signed overflow; destination unchanged. `SUBU` wraps.
     fn op_sub(&mut self, instr: u32) -> Result<(), ExecutionError> {
-        // TODO: trap on signed overflow.
-        self.op_subu(instr)
+        let rs = ((instr >> 21) & 0x1F) as u8;
+        let rt = ((instr >> 16) & 0x1F) as u8;
+        let rd = ((instr >> 11) & 0x1F) as u8;
+        let a = self.gpr(rs) as i32;
+        let b = self.gpr(rt) as i32;
+        match a.checked_sub(b) {
+            Some(diff) => {
+                self.set_gpr(rd, diff as u32);
+                Ok(())
+            }
+            None => {
+                let in_delay_slot = self.pending_pc.is_some();
+                self.enter_exception(ExceptionCode::Overflow, self.pc, in_delay_slot);
+                Ok(())
+            }
+        }
     }
 
     fn op_subu(&mut self, instr: u32) -> Result<(), ExecutionError> {
@@ -1400,6 +1451,10 @@ enum ExceptionCode {
     Interrupt = 0,
     Syscall = 8,
     Break = 9,
+    /// Integer arithmetic overflow — raised by `ADD`, `ADDI`, and
+    /// `SUB` when the signed result doesn't fit in 32 bits. `ADDU`,
+    /// `ADDIU`, and `SUBU` are the silently-wrapping variants.
+    Overflow = 12,
 }
 
 impl Default for Cpu {
@@ -1540,5 +1595,139 @@ mod tests {
         let record = cpu.step(&mut bus).expect("nop reveals state");
 
         assert_eq!(record.gprs[9], 1, "addiu must survive LW's delay");
+    }
+
+    #[test]
+    fn addi_traps_on_signed_overflow() {
+        // $t0 = 0x7FFFFFFF (i32::MAX). ADDI $t1, $t0, 1 overflows.
+        // Post-step: $t1 should be unchanged (not 0x80000000), and
+        // CAUSE.ExcCode should read 12 (Overflow).
+        let mut bios = vec![0u8; memory::bios::SIZE];
+        // lui $t0, 0x7FFF
+        bios[0..4].copy_from_slice(&0x3C08_7FFFu32.to_le_bytes());
+        // ori $t0, $t0, 0xFFFF → $t0 = 0x7FFFFFFF
+        bios[4..8].copy_from_slice(&0x3508_FFFFu32.to_le_bytes());
+        // addi $t1, $t0, 1 → overflow
+        bios[8..12].copy_from_slice(&0x2109_0001u32.to_le_bytes());
+
+        let mut bus = Bus::new(bios).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.step(&mut bus).expect("lui");
+        cpu.step(&mut bus).expect("ori");
+        let exc_count_before = cpu.exception_counts()[12];
+        cpu.step(&mut bus).expect("addi does not bubble an Err");
+        assert_eq!(cpu.gprs[9], 0, "t1 must remain unchanged on overflow");
+        assert_eq!(
+            cpu.exception_counts()[12],
+            exc_count_before + 1,
+            "Overflow (12) exception must have fired"
+        );
+        let cause = cpu.cop0[13];
+        assert_eq!((cause >> 2) & 0x1F, 12, "CAUSE.ExcCode = 12 after trap");
+    }
+
+    #[test]
+    fn addi_negative_overflow_traps() {
+        // $t0 = 0x80000000 (i32::MIN). ADDI $t1, $t0, -1 overflows.
+        let mut bios = vec![0u8; memory::bios::SIZE];
+        // lui $t0, 0x8000
+        bios[0..4].copy_from_slice(&0x3C08_8000u32.to_le_bytes());
+        // addi $t1, $t0, -1 (imm = 0xFFFF)
+        bios[4..8].copy_from_slice(&0x2109_FFFFu32.to_le_bytes());
+
+        let mut bus = Bus::new(bios).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.step(&mut bus).expect("lui");
+        cpu.step(&mut bus).expect("addi");
+        assert_eq!(cpu.gprs[9], 0, "t1 unchanged on negative overflow");
+        assert_eq!(cpu.exception_counts()[12], 1);
+    }
+
+    #[test]
+    fn addi_no_overflow_writes_destination() {
+        // Edge: exactly at the boundary (i32::MAX - 1) + 1 = i32::MAX.
+        // No overflow; $t1 should receive the result.
+        let mut bios = vec![0u8; memory::bios::SIZE];
+        // lui $t0, 0x7FFF
+        bios[0..4].copy_from_slice(&0x3C08_7FFFu32.to_le_bytes());
+        // ori $t0, $t0, 0xFFFE → 0x7FFFFFFE
+        bios[4..8].copy_from_slice(&0x3508_FFFEu32.to_le_bytes());
+        // addi $t1, $t0, 1 → 0x7FFFFFFF (no overflow)
+        bios[8..12].copy_from_slice(&0x2109_0001u32.to_le_bytes());
+
+        let mut bus = Bus::new(bios).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.step(&mut bus).expect("lui");
+        cpu.step(&mut bus).expect("ori");
+        cpu.step(&mut bus).expect("addi");
+        assert_eq!(cpu.gprs[9], 0x7FFF_FFFF);
+        assert_eq!(cpu.exception_counts()[12], 0);
+    }
+
+    #[test]
+    fn add_traps_on_signed_overflow() {
+        // $t0 = 0x7FFFFFFF, $t1 = 1. ADD $t2, $t0, $t1 overflows.
+        let mut bios = vec![0u8; memory::bios::SIZE];
+        // lui $t0, 0x7FFF
+        bios[0..4].copy_from_slice(&0x3C08_7FFFu32.to_le_bytes());
+        // ori $t0, $t0, 0xFFFF
+        bios[4..8].copy_from_slice(&0x3508_FFFFu32.to_le_bytes());
+        // ori $t1, $zero, 1
+        bios[8..12].copy_from_slice(&0x3409_0001u32.to_le_bytes());
+        // add $t2, $t0, $t1 — special=0, rs=8, rt=9, rd=10, funct=0x20
+        let add = (8u32 << 21) | (9u32 << 16) | (10u32 << 11) | 0x20u32;
+        bios[12..16].copy_from_slice(&add.to_le_bytes());
+
+        let mut bus = Bus::new(bios).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.step(&mut bus).expect("lui");
+        cpu.step(&mut bus).expect("ori t0");
+        cpu.step(&mut bus).expect("ori t1");
+        cpu.step(&mut bus).expect("add");
+        assert_eq!(cpu.gprs[10], 0, "t2 unchanged on overflow");
+        assert_eq!(cpu.exception_counts()[12], 1);
+    }
+
+    #[test]
+    fn sub_traps_on_signed_overflow() {
+        // $t0 = 0x80000000 (i32::MIN), $t1 = 1. SUB $t2, $t0, $t1 =
+        // i32::MIN - 1, which overflows.
+        let mut bios = vec![0u8; memory::bios::SIZE];
+        // lui $t0, 0x8000
+        bios[0..4].copy_from_slice(&0x3C08_8000u32.to_le_bytes());
+        // ori $t1, $zero, 1
+        bios[4..8].copy_from_slice(&0x3409_0001u32.to_le_bytes());
+        // sub $t2, $t0, $t1 — funct=0x22
+        let sub = (8u32 << 21) | (9u32 << 16) | (10u32 << 11) | 0x22u32;
+        bios[8..12].copy_from_slice(&sub.to_le_bytes());
+
+        let mut bus = Bus::new(bios).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.step(&mut bus).expect("lui");
+        cpu.step(&mut bus).expect("ori t1");
+        cpu.step(&mut bus).expect("sub");
+        assert_eq!(cpu.gprs[10], 0, "t2 unchanged on overflow");
+        assert_eq!(cpu.exception_counts()[12], 1);
+    }
+
+    #[test]
+    fn sub_no_overflow_writes_destination() {
+        // 10 - 3 = 7 — ordinary subtract, no trap.
+        let mut bios = vec![0u8; memory::bios::SIZE];
+        // ori $t0, $zero, 10
+        bios[0..4].copy_from_slice(&0x3408_000Au32.to_le_bytes());
+        // ori $t1, $zero, 3
+        bios[4..8].copy_from_slice(&0x3409_0003u32.to_le_bytes());
+        // sub $t2, $t0, $t1
+        let sub = (8u32 << 21) | (9u32 << 16) | (10u32 << 11) | 0x22u32;
+        bios[8..12].copy_from_slice(&sub.to_le_bytes());
+
+        let mut bus = Bus::new(bios).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.step(&mut bus).expect("ori t0");
+        cpu.step(&mut bus).expect("ori t1");
+        cpu.step(&mut bus).expect("sub");
+        assert_eq!(cpu.gprs[10], 7);
+        assert_eq!(cpu.exception_counts()[12], 0);
     }
 }
