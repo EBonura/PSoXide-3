@@ -130,6 +130,14 @@ pub struct Gpu {
     /// regular packet assembler.
     polyline: Option<PolylineState>,
 
+    /// Wireframe mode — replaces filled triangles with their
+    /// three edges, rendered as lines at the triangle's primary
+    /// colour. Rectangles and already-line primitives are
+    /// unchanged. Off by default; toggled from the frontend's
+    /// debug toolbar for visualising the geometry a game is
+    /// submitting.
+    pub wireframe_enabled: bool,
+
     /// Cumulative "pseudo-busy" credit. Incremented by each
     /// primitive rasterisation proportionally to its pixel count;
     /// decremented by `set_idle_cycles` each time the frontend
@@ -266,6 +274,7 @@ impl Gpu {
             tex_rect_flip_x: false,
             tex_rect_flip_y: false,
             polyline: None,
+            wireframe_enabled: false,
             busy_credit: 0,
             display_start_x: 0,
             display_start_y: 0,
@@ -1290,6 +1299,15 @@ impl Gpu {
         color: u16,
         mode: BlendMode,
     ) {
+        // Wireframe debug mode: replace the filled fill with three
+        // edge lines. Useful for visualising the geometry a game
+        // actually submits, independent of shading / texturing.
+        if self.wireframe_enabled {
+            self.rasterize_line(v0, v1, color, color, mode, false);
+            self.rasterize_line(v1, v2, color, color, mode, false);
+            self.rasterize_line(v2, v0, color, color, mode, false);
+            return;
+        }
         let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
         let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
         let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
@@ -1479,6 +1497,15 @@ impl Gpu {
         semi_trans: bool,
         raw_texture: bool,
     ) {
+        if self.wireframe_enabled {
+            self.rasterize_line_shaded(v0, v1, c0, c1, BlendMode::Opaque);
+            self.rasterize_line_shaded(v1, v2, c1, c2, BlendMode::Opaque);
+            self.rasterize_line_shaded(v2, v0, c2, c0, BlendMode::Opaque);
+            // Silence unused-var warnings for the texture args we
+            // intentionally drop in wireframe mode.
+            let _ = (t0, t1, t2, clut_word, semi_trans, raw_texture);
+            return;
+        }
         let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
         let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
         let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
@@ -1607,6 +1634,17 @@ impl Gpu {
         semi_trans: bool,
         tint: (u32, u32, u32),
     ) {
+        if self.wireframe_enabled {
+            // Wireframe uses the first tint channel triple directly
+            // for the outline colour (or white for raw-texture prims).
+            let edge_rgb = (tint.0 | (tint.1 << 8) | (tint.2 << 16)) as u32;
+            let colour = rgb24_to_bgr15(edge_rgb);
+            self.rasterize_line(v0, v1, colour, colour, BlendMode::Opaque, false);
+            self.rasterize_line(v1, v2, colour, colour, BlendMode::Opaque, false);
+            self.rasterize_line(v2, v0, colour, colour, BlendMode::Opaque, false);
+            let _ = (t0, t1, t2, clut_word, semi_trans);
+            return;
+        }
         let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
         let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
         let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
@@ -1664,6 +1702,12 @@ impl Gpu {
         c2: u32,
         mode: BlendMode,
     ) {
+        if self.wireframe_enabled {
+            self.rasterize_line_shaded(v0, v1, c0, c1, mode);
+            self.rasterize_line_shaded(v1, v2, c1, c2, mode);
+            self.rasterize_line_shaded(v2, v0, c2, c0, mode);
+            return;
+        }
         let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
         let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
         let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
@@ -2896,6 +2940,30 @@ mod tests {
         for op in 0x58..=0x5B {
             assert_eq!(gp0_packet_size(op), 4);
         }
+    }
+
+    #[test]
+    fn wireframe_toggle_makes_tri_draw_edges_only() {
+        let mut gpu = Gpu::new();
+        // Draw area: top-left (0, 0), bottom-right (1023, 511).
+        // GP0 0xE3: x (bits 0..=9), y (bits 10..=18).
+        gpu.write32(GP0_ADDR, 0xE3_00_00_00);
+        // GP0 0xE4: right (bits 0..=9), bottom (bits 10..=18).
+        gpu.write32(GP0_ADDR, 0xE4_00_00_00 | 0x3FF | (0x1FF << 10));
+        gpu.wireframe_enabled = true;
+        // Tiny triangle at (0,0), (4,0), (2,2). With wireframe
+        // on, edges get drawn; interior stays zero.
+        gpu.write32(GP0_ADDR, 0x20_FF_FF_FF);
+        gpu.write32(GP0_ADDR, 0x0000_0000);
+        gpu.write32(GP0_ADDR, 0x0000_0004);
+        gpu.write32(GP0_ADDR, 0x0002_0002);
+        // Corner pixels sit on edges — must be lit.
+        assert_ne!(gpu.vram.get_pixel(0, 0), 0, "corner (0,0)");
+        assert_ne!(gpu.vram.get_pixel(4, 0), 0, "corner (4,0)");
+        assert_ne!(gpu.vram.get_pixel(2, 2), 0, "corner (2,2)");
+        // A fully-interior pixel at (2, 1) sits just inside the
+        // triangle and on no edge — must stay zero.
+        assert_eq!(gpu.vram.get_pixel(2, 1), 0, "interior should be empty");
     }
 
     #[test]
