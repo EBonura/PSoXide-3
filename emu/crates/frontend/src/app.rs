@@ -17,10 +17,11 @@ use crate::ui::hud::HudState;
 use crate::ui::memory::MemoryView;
 use crate::ui::menu::{LibraryItem as MenuLibraryItem, MenuState};
 
-/// Ring-buffer capacity for the execution-history panel. 64 rows fits
-/// comfortably in the register side panel and is enough to recognise
-/// most inner loops by eye.
-pub const EXEC_HISTORY_CAP: usize = 64;
+/// Ring-buffer capacity for the execution-history panel. 16 rows is
+/// the "what just ran" context window — enough to spot a tight loop
+/// or trace a branch without the history section taking over the
+/// registers side panel vertically.
+pub const EXEC_HISTORY_CAP: usize = 16;
 
 /// Default BIOS location. Matches the parity-test default so both
 /// tooling converges on the same image in a fresh checkout.
@@ -565,6 +566,45 @@ pub fn push_history(history: &mut VecDeque<InstructionRecord>, record: Instructi
         history.pop_front();
     }
     history.push_back(record);
+}
+
+/// Retire up to `run_steps_per_frame` instructions. Any execution
+/// error auto-pauses, reopens the Menu, and surfaces the stopped
+/// state via the register panel. Hitting a breakpoint does the
+/// same. Split out here (rather than living in the shell loop) so
+/// both the shell's per-frame run path and the toolbar's "advance
+/// one frame" button can invoke the same logic.
+pub fn step_one_frame(state: &mut AppState) {
+    let steps = state.run_steps_per_frame;
+    let Some(bus) = state.bus.as_mut() else {
+        state.running = false;
+        state.menu.sync_run_label(false);
+        return;
+    };
+
+    for _ in 0..steps {
+        // Breakpoint check happens BEFORE stepping so the paused PC
+        // is the BP address itself — the instruction at that PC has
+        // not yet executed.
+        if state.breakpoints.contains(&state.cpu.pc()) {
+            state.running = false;
+            state.menu.sync_run_label(false);
+            state.menu.open = true;
+            break;
+        }
+
+        match state.cpu.step(bus) {
+            Ok(record) => {
+                push_history(&mut state.exec_history, record);
+            }
+            Err(_) => {
+                state.running = false;
+                state.menu.sync_run_label(false);
+                state.menu.open = true;
+                break;
+            }
+        }
+    }
 }
 
 fn load_bus(settings: &Settings) -> Option<Bus> {

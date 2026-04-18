@@ -9,6 +9,7 @@ pub mod framebuffer;
 pub mod hud;
 pub mod memory;
 pub mod registers;
+pub mod toolbar;
 pub mod vram;
 pub mod menu;
 
@@ -19,8 +20,10 @@ pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::Te
     state.hud.update(dt, state.cpu.tick());
     state.tick_status(dt);
 
-    // Side-docked panels paint before the central area so egui's
-    // layout clips the central panel to what's left.
+    // Top-bar controls go first so the central panel (framebuffer)
+    // clips to what's left under them. Docked side panels come next.
+    toolbar::draw(ctx, state);
+
     if state.panels.registers {
         registers::draw(
             ctx,
@@ -44,15 +47,6 @@ pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::Te
     }
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Run speed:");
-            ui.add(
-                egui::Slider::new(&mut state.run_steps_per_frame, 1_000..=2_000_000)
-                    .logarithmic(true)
-                    .suffix(" instr/frame"),
-            );
-        });
-        ui.add_space(4.0);
         framebuffer::draw(ui, vram_tex, state.bus.as_ref());
     });
 
