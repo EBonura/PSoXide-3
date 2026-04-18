@@ -727,6 +727,12 @@ impl Gpu {
             // texture-page and CLUT pulled from the UV words.
             0x24..=0x27 => self.draw_textured_tri(),
             0x2C..=0x2F => self.draw_textured_quad(),
+            // Textured + Gouraud shaded — both per-vertex tint colours
+            // AND per-vertex UV. The tint modulates every sampled
+            // texel (per PSX-SPX tint formula). Triangle = 9 words,
+            // quad = 12 words.
+            0x34..=0x37 => self.draw_textured_shaded_tri(),
+            0x3C..=0x3F => self.draw_textured_shaded_quad(),
             // Monochrome rectangles — bit 3 set selects variable size
             // (followed by a W/H word), else 1×1/8×8/16×16 by bits 5:4.
             0x60..=0x63 => self.draw_monochrome_rect_variable(),
@@ -1169,6 +1175,160 @@ impl Gpu {
         };
         self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word, semi, tint);
         self.rasterize_textured_triangle(v1, v2, v3, t1, t2, t3, clut_word, semi, tint);
+    }
+
+    /// GP0 0x34..=0x37 — textured + Gouraud-shaded triangle.
+    /// Words: `[cmd+c0, v0, uv0+clut, c1, v1, uv1+texpage, c2, v2, uv2]`.
+    /// Per-vertex tint interpolation is barycentric just like flat
+    /// Gouraud, but the tint modulates the sampled texel instead of
+    /// being the final pixel colour. Raw-texture mode (bit 0 set)
+    /// zeros the tint effect per PSX-SPX.
+    fn draw_textured_shaded_tri(&mut self) {
+        let cmd = self.gp0_fifo[0];
+        let c0 = cmd & 0x00FF_FFFF;
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let uv0 = self.gp0_fifo[2];
+        let c1 = self.gp0_fifo[3] & 0x00FF_FFFF;
+        let v1 = self.decode_vertex(self.gp0_fifo[4]);
+        let uv1 = self.gp0_fifo[5];
+        let c2 = self.gp0_fifo[6] & 0x00FF_FFFF;
+        let v2 = self.decode_vertex(self.gp0_fifo[7]);
+        let uv2 = self.gp0_fifo[8];
+        let clut_word = ((uv0 >> 16) & 0xFFFF) as u16;
+        self.apply_primitive_tpage(uv1);
+        let t0 = ((uv0 & 0xFF) as u16, ((uv0 >> 8) & 0xFF) as u16);
+        let t1 = ((uv1 & 0xFF) as u16, ((uv1 >> 8) & 0xFF) as u16);
+        let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
+        let raw = cmd & 1 != 0;
+        self.rasterize_textured_shaded_triangle(
+            v0,
+            v1,
+            v2,
+            t0,
+            t1,
+            t2,
+            c0,
+            c1,
+            c2,
+            clut_word,
+            prim_is_semi_trans(cmd),
+            raw,
+        );
+    }
+
+    /// GP0 0x3C..=0x3F — textured + Gouraud-shaded quad. 12 words;
+    /// split into two textured-shaded triangles sharing edge v1–v2.
+    /// Words: `[cmd+c0, v0, uv0+clut, c1, v1, uv1+texpage, c2, v2, uv2,
+    ///          c3, v3, uv3]`.
+    fn draw_textured_shaded_quad(&mut self) {
+        let cmd = self.gp0_fifo[0];
+        let c0 = cmd & 0x00FF_FFFF;
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let uv0 = self.gp0_fifo[2];
+        let c1 = self.gp0_fifo[3] & 0x00FF_FFFF;
+        let v1 = self.decode_vertex(self.gp0_fifo[4]);
+        let uv1 = self.gp0_fifo[5];
+        let c2 = self.gp0_fifo[6] & 0x00FF_FFFF;
+        let v2 = self.decode_vertex(self.gp0_fifo[7]);
+        let uv2 = self.gp0_fifo[8];
+        let c3 = self.gp0_fifo[9] & 0x00FF_FFFF;
+        let v3 = self.decode_vertex(self.gp0_fifo[10]);
+        let uv3 = self.gp0_fifo[11];
+        let clut_word = ((uv0 >> 16) & 0xFFFF) as u16;
+        self.apply_primitive_tpage(uv1);
+        let t0 = ((uv0 & 0xFF) as u16, ((uv0 >> 8) & 0xFF) as u16);
+        let t1 = ((uv1 & 0xFF) as u16, ((uv1 >> 8) & 0xFF) as u16);
+        let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
+        let t3 = ((uv3 & 0xFF) as u16, ((uv3 >> 8) & 0xFF) as u16);
+        let semi = prim_is_semi_trans(cmd);
+        let raw = cmd & 1 != 0;
+        self.rasterize_textured_shaded_triangle(
+            v0, v1, v2, t0, t1, t2, c0, c1, c2, clut_word, semi, raw,
+        );
+        self.rasterize_textured_shaded_triangle(
+            v1, v2, v3, t1, t2, t3, c1, c2, c3, clut_word, semi, raw,
+        );
+    }
+
+    /// Rasterize a triangle with per-vertex tint colours AND per-vertex
+    /// UVs. Combines the math from `rasterize_shaded_triangle` (three
+    /// barycentric-weighted colours) and `rasterize_textured_triangle`
+    /// (three barycentric-weighted UVs). The interpolated tint
+    /// modulates the sampled texel via [`modulate_tint`]; raw-texture
+    /// mode passes `0x80, 0x80, 0x80` which is the identity.
+    #[allow(clippy::too_many_arguments)]
+    fn rasterize_textured_shaded_triangle(
+        &mut self,
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        t0: (u16, u16),
+        t1: (u16, u16),
+        t2: (u16, u16),
+        c0: u32,
+        c1: u32,
+        c2: u32,
+        clut_word: u16,
+        semi_trans: bool,
+        raw_texture: bool,
+    ) {
+        let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
+        let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
+        let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
+        let max_y = v0.1.max(v1.1).max(v2.1).min(self.draw_area_bottom as i32);
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+
+        let area = edge(v0, v1, v2);
+        if area == 0 {
+            return;
+        }
+        let area_sign = area.signum();
+        let area_abs = area.unsigned_abs() as i64;
+
+        let clut_x = (clut_word & 0x3F) * 16;
+        let clut_y = (clut_word >> 6) & 0x1FF;
+        let tpage_mode = self.tex_blend_mode;
+
+        let r = |c: u32| (c & 0xFF) as i64;
+        let g = |c: u32| ((c >> 8) & 0xFF) as i64;
+        let b = |c: u32| ((c >> 16) & 0xFF) as i64;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let p = (x, y);
+                let w0 = (edge(v1, v2, p) * area_sign) as i64;
+                let w1 = (edge(v2, v0, p) * area_sign) as i64;
+                let w2 = (edge(v0, v1, p) * area_sign) as i64;
+                if (w0 | w1 | w2) >= 0 {
+                    let u = (w0 * t0.0 as i64 + w1 * t1.0 as i64 + w2 * t2.0 as i64) / area_abs;
+                    let v = (w0 * t0.1 as i64 + w1 * t1.1 as i64 + w2 * t2.1 as i64) / area_abs;
+                    if let Some(texel) = self.sample_texture(u as u16, v as u16, clut_x, clut_y) {
+                        let (tint_r, tint_g, tint_b) = if raw_texture {
+                            RAW_TEXTURE_TINT
+                        } else {
+                            // Interpolated per-pixel tint.
+                            let ri = (w0 * r(c0) + w1 * r(c1) + w2 * r(c2)) / area_abs;
+                            let gi = (w0 * g(c0) + w1 * g(c1) + w2 * g(c2)) / area_abs;
+                            let bi = (w0 * b(c0) + w1 * b(c1) + w2 * b(c2)) / area_abs;
+                            (
+                                ri.clamp(0, 255) as u32,
+                                gi.clamp(0, 255) as u32,
+                                bi.clamp(0, 255) as u32,
+                            )
+                        };
+                        let shaded = modulate_tint(texel, tint_r, tint_g, tint_b);
+                        let mode = if semi_trans && (texel & 0x8000) != 0 {
+                            tpage_mode
+                        } else {
+                            BlendMode::Opaque
+                        };
+                        self.plot_pixel(x as u16, y as u16, shaded, mode);
+                    }
+                }
+            }
+        }
     }
 
     /// Apply the tpage bits embedded in a textured-primitive UV word
@@ -2132,5 +2292,49 @@ mod tests {
         let mask: u16 = 0;
         let off: u16 = 0;
         assert_eq!((u & !mask) | (off & mask), u);
+    }
+
+    #[test]
+    fn textured_shaded_tri_packet_size_is_nine() {
+        // 0x34..=0x37 is "textured + Gouraud-shaded triangle" —
+        // 3 vertices × (colour+vertex+uv) = 9 words total.
+        assert_eq!(gp0_packet_size(0x34), 9);
+        assert_eq!(gp0_packet_size(0x37), 9);
+    }
+
+    #[test]
+    fn textured_shaded_quad_packet_size_is_twelve() {
+        // 0x3C..=0x3F is "textured + Gouraud-shaded quad" —
+        // 4 vertices × (colour+vertex+uv) = 12 words.
+        assert_eq!(gp0_packet_size(0x3C), 12);
+        assert_eq!(gp0_packet_size(0x3F), 12);
+    }
+
+    #[test]
+    fn textured_shaded_tri_consumes_full_packet_without_panic() {
+        // Smoke test: feeding a complete 9-word textured-shaded tri
+        // packet must not panic or leave the FIFO partially full.
+        let mut gpu = Gpu::new();
+        // All vertices inside draw area, degenerate (zero-area) triangle
+        // so we don't need to chase pixel output — the dispatch path is
+        // what we're testing.
+        gpu.write32(GP0_ADDR, 0xE3_00_00_00); // draw area top-left 0,0
+        gpu.write32(GP0_ADDR, 0xE4_00_03_FF); // draw area bottom-right 1023,0
+        let words = [
+            0x34_FF_FF_FFu32, // cmd + c0 = white
+            0x0000_0000,      // v0 = (0, 0)
+            0x0000_1020,      // uv0 + clut
+            0x00FF_00FF,      // c1 = cyan
+            0x0000_0000,      // v1 = (0, 0) (degenerate)
+            0x0040_0000,      // uv1 + texpage
+            0x00_00_FF_00,    // c2 = green
+            0x0000_0000,      // v2 = (0, 0)
+            0x0000_1020,      // uv2
+        ];
+        for w in words {
+            gpu.write32(GP0_ADDR, w);
+        }
+        // FIFO must be empty — the 9-word packet consumed cleanly.
+        assert_eq!(gpu.gp0_expected, 0);
     }
 }
