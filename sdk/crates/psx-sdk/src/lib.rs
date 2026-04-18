@@ -21,6 +21,7 @@
 #![warn(missing_docs)]
 
 pub use psx_gpu as gpu;
+pub use psx_gte as gte;
 pub use psx_hw as hw;
 pub use psx_io as io;
 pub use psx_pad as pad;
