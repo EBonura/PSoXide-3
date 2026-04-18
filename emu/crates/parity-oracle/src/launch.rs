@@ -66,6 +66,30 @@ pub struct Capture {
     pub stderr: String,
 }
 
+/// Snapshot of Redux's currently-visible display area, returned by
+/// [`ReduxProcess::display_hash`]. Pairs an FNV-1a-64 hash of the
+/// pixel bytes with the dimensions + bpp so a consumer can sanity-
+/// check matching resolution before asserting pixel parity.
+///
+/// An empty display (pre-boot, before any display command has run)
+/// is represented by `width = 0, height = 0, byte_len = 0` and the
+/// FNV-1a offset basis `0xCBF2_9CE4_8422_2325` as the hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayHash {
+    /// FNV-1a-64 of the screenshot's raw pixel bytes.
+    pub hash: u64,
+    /// Display width in pixels (from `GP1 0x06 / 0x07` range).
+    pub width: u32,
+    /// Display height in pixels.
+    pub height: u32,
+    /// Redux's `bpp` enum value (opaque to us — use `byte_len`
+    /// and `width` to derive bytes-per-pixel).
+    pub bpp: u32,
+    /// Total byte count of the pixel buffer (width × height ×
+    /// bytes-per-pixel).
+    pub byte_len: usize,
+}
+
 impl ReduxProcess {
     /// Spawn Redux with the configured flags and start draining its
     /// output streams.
@@ -213,6 +237,105 @@ impl ReduxProcess {
             records.push(record);
         }
         Ok(records)
+    }
+
+    /// Silently advance Redux by `n` instructions without emitting
+    /// per-step records. The caller typically follows this with a
+    /// `vram_hash` / `regs` / `peek32` query to capture only the
+    /// final state — avoiding the per-step Lua-stdout overhead that
+    /// makes `step()` cost ~25 s per million instructions. Good for
+    /// milestone tests where intermediate trace records aren't needed.
+    pub fn run(&mut self, n: u64, timeout: Duration) -> Result<u64, OracleError> {
+        self.send_command(&format!("run {n}"))?;
+        let line = self.wait_for_response(timeout)?;
+        // Format: `run ok tick=<cycles>`
+        if let Some(rest) = line.strip_prefix("run ok tick=") {
+            rest.trim()
+                .parse::<u64>()
+                .map_err(|e| OracleError::Protocol {
+                    expected: "cycle count".to_string(),
+                    got: format!("{line} (parse error: {e})"),
+                })
+        } else {
+            Err(OracleError::Protocol {
+                expected: "run ok tick=<cycles>".to_string(),
+                got: line,
+            })
+        }
+    }
+
+    /// Save Redux's current screenshot to `path` as raw
+    /// little-endian 15bpp pixel bytes, with a `<path>.txt` sidecar
+    /// describing the dimensions. Used to diff byte-by-byte against
+    /// our own display buffer when a hash mismatch needs explaining
+    /// (e.g. edge-cropping, V-range differences).
+    pub fn screenshot_save(
+        &mut self,
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<(), OracleError> {
+        self.send_command(&format!("screenshot_save {}", path.display()))?;
+        let line = self.wait_for_response(timeout)?;
+        if line.starts_with("screenshot_save ok ") {
+            Ok(())
+        } else {
+            Err(OracleError::Protocol {
+                expected: "screenshot_save ok ...".to_string(),
+                got: line,
+            })
+        }
+    }
+
+    /// FNV-1a-64 of Redux's visible display area ("screenshot")
+    /// plus its dimensions. Used by milestone tests to verify we
+    /// render the same pixels as Redux at a given instruction
+    /// count, not just that our emulator is self-consistent
+    /// run-to-run. The hash is computed server-side (LuaJIT
+    /// `uint64_t`) so only the header + 16 hex chars cross the
+    /// pipe instead of the full pixel buffer.
+    ///
+    /// Returns an `Err` if Redux's build of the PCSX Lua API
+    /// doesn't expose a screenshot accessor — callers can fall
+    /// back to a determinism-only check.
+    pub fn display_hash(&mut self, timeout: Duration) -> Result<DisplayHash, OracleError> {
+        self.send_command("vram_hash")?;
+        let line = self.wait_for_response(timeout)?;
+        // Success: `vram_hash <16-hex> w=<W> h=<H> bpp=<B> len=<N>`
+        // Error:   `err vram_hash: <reason>`
+        let Some(rest) = line.strip_prefix("vram_hash ") else {
+            return Err(OracleError::Protocol {
+                expected: "vram_hash <hex> ...".to_string(),
+                got: line,
+            });
+        };
+        let mut parts = rest.split_whitespace();
+        let hex = parts.next().ok_or_else(|| OracleError::Protocol {
+            expected: "hash hex".to_string(),
+            got: line.clone(),
+        })?;
+        let hash = u64::from_str_radix(hex, 16).map_err(|e| OracleError::Protocol {
+            expected: "16-hex-char hash".to_string(),
+            got: format!("{line} ({e})"),
+        })?;
+        let mut out = DisplayHash {
+            hash,
+            width: 0,
+            height: 0,
+            bpp: 0,
+            byte_len: 0,
+        };
+        for p in parts {
+            if let Some(v) = p.strip_prefix("w=") {
+                out.width = v.parse().unwrap_or(0);
+            } else if let Some(v) = p.strip_prefix("h=") {
+                out.height = v.parse().unwrap_or(0);
+            } else if let Some(v) = p.strip_prefix("bpp=") {
+                out.bpp = v.parse().unwrap_or(0);
+            } else if let Some(v) = p.strip_prefix("len=") {
+                out.byte_len = v.parse().unwrap_or(0);
+            }
+        }
+        Ok(out)
     }
 
     /// Convenience: consume Lua's initial `ready` announcement and
