@@ -102,6 +102,18 @@ pub struct Gpu {
     /// them. Without this check, HUDs flicker under overlapping
     /// backgrounds.
     mask_check_before_draw: bool,
+    /// When true, apply the PSX 4×4 Bayer dither matrix to every
+    /// 24-bit → 15-bit channel reduction. Set by GP0 0xE1 bit 9.
+    /// Active on Gouraud-shaded primitives + textured primitives
+    /// with tint modulation; flat colour + raw-texture prims are
+    /// unaffected (their source is already 15-bit).
+    ///
+    /// Games rarely enable this — it's a conservative choice that
+    /// trades crispness for banding reduction. When it's on, the
+    /// 24-bit shaded intermediate gets a per-pixel offset in the
+    /// range -4..=+3 added before the `>> 3` truncation, producing
+    /// ordered dither patterns instead of visible 5-bit staircases.
+    dither_enabled: bool,
 
     // --- Display area (GP1 0x05 / 0x06 / 0x07 / 0x08) ---
     /// VRAM X of the top-left pixel of the displayed framebuffer.
@@ -219,6 +231,7 @@ impl Gpu {
             tex_window_offset_y: 0,
             mask_set_on_draw: false,
             mask_check_before_draw: false,
+            dither_enabled: false,
             display_start_x: 0,
             display_start_y: 0,
             display_width: 320,
@@ -661,6 +674,7 @@ impl Gpu {
                 self.tex_page_y = if (word >> 4) & 1 != 0 { 256 } else { 0 };
                 self.tex_depth = ((word >> 7) & 0x3) as u8;
                 self.tex_blend_mode = BlendMode::from_tpage_bits(word >> 5);
+                self.dither_enabled = (word >> 9) & 1 != 0;
                 // GPUSTAT bits 0..=10 come from E1h bits 0..=10.
                 let stat_bits = word & 0x07FF;
                 self.status.raw = (self.status.raw & !0x07FF) | stat_bits;
@@ -1484,11 +1498,15 @@ impl Gpu {
                     let ri = (w0 * r(c0) + w1 * r(c1) + w2 * r(c2)) / area_abs;
                     let gi = (w0 * g(c0) + w1 * g(c1) + w2 * g(c2)) / area_abs;
                     let bi = (w0 * b(c0) + w1 * b(c1) + w2 * b(c2)) / area_abs;
-                    let colour = rgb24_to_bgr15(
-                        (ri.clamp(0, 255) as u32)
-                            | ((gi.clamp(0, 255) as u32) << 8)
-                            | ((bi.clamp(0, 255) as u32) << 16),
-                    );
+                    let colour = if self.dither_enabled {
+                        dither_rgb(ri as i32, gi as i32, bi as i32, x, y)
+                    } else {
+                        rgb24_to_bgr15(
+                            (ri.clamp(0, 255) as u32)
+                                | ((gi.clamp(0, 255) as u32) << 8)
+                                | ((bi.clamp(0, 255) as u32) << 16),
+                        )
+                    };
                     self.plot_pixel(x as u16, y as u16, colour, mode);
                 }
             }
@@ -1692,6 +1710,33 @@ fn rgb24_to_bgr15(rgb24: u32) -> u16 {
     let g = (((rgb24 >> 8) >> 3) & 0x1F) as u16;
     let b = (((rgb24 >> 16) >> 3) & 0x1F) as u16;
     r | (g << 5) | (b << 10)
+}
+
+/// The PSX 4×4 Bayer dither matrix — signed 8-bit offsets applied to
+/// each of R/G/B in 24-bit space before truncating to 5 bits per
+/// channel. Indexed by `(y & 3) * 4 + (x & 3)`. Values are the PSX
+/// hardware's published constants (PSX-SPX, "GPU Render Commands"):
+///
+/// ```text
+///   -4  +0  -3  +1
+///   +2  -2  +3  -1
+///   -3  +1  -4  +0
+///   +3  -1  +2  -2
+/// ```
+const DITHER_MATRIX: [i32; 16] = [
+    -4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2,
+];
+
+/// Apply the Bayer dither offset to an 8-bit RGB triple at screen
+/// position `(x, y)`, clamp to 0..=255, then convert to the 15-bit
+/// BGR VRAM word. Used by shaded + textured-shaded rasterizers when
+/// `Gpu::dither_enabled` is on.
+fn dither_rgb(r: i32, g: i32, b: i32, x: i32, y: i32) -> u16 {
+    let offset = DITHER_MATRIX[((y & 3) * 4 + (x & 3)) as usize];
+    let dr = (r + offset).clamp(0, 255) as u32;
+    let dg = (g + offset).clamp(0, 255) as u32;
+    let db = (b + offset).clamp(0, 255) as u32;
+    rgb24_to_bgr15(dr | (dg << 8) | (db << 16))
 }
 
 /// PSX semi-transparency mode. The four non-`Opaque` variants map
@@ -2308,6 +2353,32 @@ mod tests {
         // 4 vertices × (colour+vertex+uv) = 12 words.
         assert_eq!(gp0_packet_size(0x3C), 12);
         assert_eq!(gp0_packet_size(0x3F), 12);
+    }
+
+    #[test]
+    fn gp0_e1_bit_9_toggles_dither_flag() {
+        let mut gpu = Gpu::new();
+        assert!(!gpu.dither_enabled);
+        // E1h with bit 9 set → dither on.
+        gpu.write32(GP0_ADDR, 0xE100_0000 | (1 << 9));
+        assert!(gpu.dither_enabled);
+        // E1h with bit 9 clear → dither off.
+        gpu.write32(GP0_ADDR, 0xE100_0000);
+        assert!(!gpu.dither_enabled);
+    }
+
+    #[test]
+    fn dither_rgb_produces_offsets_within_clamp() {
+        // Mid-value input (128) with the most negative offset (-4)
+        // still lands in the valid 0..=255 range.
+        let v = dither_rgb(128, 128, 128, 0, 0); // offset = -4
+        // Top 5 bits of 124 (128 - 4 = 124), 124 >> 3 = 15.
+        assert_eq!(v & 0x1F, 15);
+        // Full-saturation input with +3 offset stays clamped at 255.
+        let v = dither_rgb(255, 255, 255, 0, 3); // matrix[12] = +3
+        assert_eq!(v & 0x1F, 31);
+        assert_eq!((v >> 5) & 0x1F, 31);
+        assert_eq!((v >> 10) & 0x1F, 31);
     }
 
     #[test]
