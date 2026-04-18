@@ -1893,6 +1893,8 @@ dependencies = [
 name = "parity-oracle"
 version = "0.1.0"
 dependencies = [
+ "emulator-core",
+ "psx-iso",
  "psx-trace",
  "serde_json",
  "tempfile",

@@ -13,6 +13,13 @@ thiserror  = { workspace = true }
 tempfile   = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# Disc-parity example runs our emulator in-process alongside Redux.
+# Kept as a dev-dep so the core crate stays free of the engine dep
+# for its normal (Redux-only) consumers.
+emulator-core = { path = "../emulator-core" }
+psx-iso       = { workspace = true }
+
 [[test]]
 name = "smoke"
 path = "tests/smoke.rs"
