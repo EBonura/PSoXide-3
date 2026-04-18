@@ -2037,6 +2037,54 @@ mod tests {
     }
 
     #[test]
+    fn stress_test_many_voices_at_high_pitch_no_panic() {
+        // Regression / stress test: exercises the voice advance
+        // loop at maximum pitch (which triggers the block-
+        // boundary fraction leak) across many voices and many
+        // samples. Would have caught the Gaussian OOB before the
+        // Crash 1 run did.
+        let mut s = Spu::new();
+        s.main_vol_l.write(0x3FFF);
+        s.main_vol_r.write(0x3FFF);
+        // Seed SPU RAM with a repeating ADPCM block so each voice
+        // has something to decode.
+        let mut block = [0u8; 16];
+        block[0] = 0x0C; // shift=0x0C, filter=0
+        block[1] = 0x02; // flag 2 = repeat
+        // Loop this one block for the first 0x1000 bytes of RAM.
+        for base in (0..0x1000).step_by(16) {
+            for i in 0..16 {
+                let idx = (base + i) / 2;
+                let byte = block[i] as u16;
+                if (base + i) & 1 == 0 {
+                    s.ram[idx] = (s.ram[idx] & 0xFF00) | byte;
+                } else {
+                    s.ram[idx] = (s.ram[idx] & 0x00FF) | (byte << 8);
+                }
+            }
+        }
+        // Configure all 24 voices: max pitch, KON, loud volume.
+        for v in 0..NUM_VOICES {
+            let base = VOICE_BASE + (v as u32) * 16;
+            s.write16(base + voice_offset::VOLUME_L, 0x3FFF);
+            s.write16(base + voice_offset::VOLUME_R, 0x3FFF);
+            s.write16(base + voice_offset::PITCH, 0x3FFF);
+            s.write16(base + voice_offset::START_ADDR, 0);
+            s.write16(base + voice_offset::ADSR_LO, 0x00FF);
+            s.write16(base + voice_offset::ADSR_HI, 0x0000);
+        }
+        s.write16(KON_LO, 0xFFFF);
+        s.write16(KON_HI, 0x00FF);
+        // Tick through one NTSC frame's worth of samples. If any
+        // voice's state goes out of bounds we'd panic here.
+        for _ in 0..735 {
+            s.tick_sample(SAMPLE_CYCLES);
+        }
+        // Output should contain 735 samples and no crashes.
+        assert_eq!(s.samples_produced(), 735);
+    }
+
+    #[test]
     fn silent_spu_outputs_zero() {
         let mut s = Spu::new();
         // 0x3FFF = max static volume (bits 0..=13 all set, bits

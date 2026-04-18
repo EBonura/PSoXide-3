@@ -94,12 +94,15 @@ fn draw_metrics(ui: &mut egui::Ui, state: &AppState) {
     let fps = state.hud.fps();
     let ms = state.hud.average_dt() * 1000.0;
     let mips = state.hud.ips() / 1_000_000.0;
+    let audio = state.hud.audio_queue_len();
 
     metric(ui, "FPS", format!("{fps:4.1}"));
     ui.add_space(12.0);
     metric(ui, "MIPS", format!("{mips:4.1}"));
     ui.add_space(12.0);
     metric(ui, "dt", format!("{ms:4.1} ms"));
+    ui.add_space(12.0);
+    metric(ui, "AUDIO", format!("{audio}"));
 }
 
 /// One "LABEL value" pair, formatted so the label is dim and the

@@ -15,6 +15,13 @@ pub struct HudState {
     dt_samples: std::collections::VecDeque<f32>,
     tick_samples: std::collections::VecDeque<u64>,
     prev_tick: u64,
+    /// Most recent audio-ring-buffer depth, in stereo samples.
+    /// Updated by [`HudState::set_audio_queue_len`] from the
+    /// shell each frame right after the SPU pump drain. Shown in
+    /// the toolbar so you can see audio backlog — low values
+    /// (< 100) mean we're starving the audio thread; high values
+    /// (> 10k) mean the emu is outrunning real-time playback.
+    audio_queue_len: usize,
 }
 
 impl Default for HudState {
@@ -23,6 +30,7 @@ impl Default for HudState {
             dt_samples: std::collections::VecDeque::with_capacity(120),
             tick_samples: std::collections::VecDeque::with_capacity(120),
             prev_tick: 0,
+            audio_queue_len: 0,
         }
     }
 }
@@ -74,5 +82,17 @@ impl HudState {
         } else {
             0.0
         }
+    }
+
+    /// Snapshot the current audio ring depth. Called by the shell
+    /// after it pushes freshly-drained SPU samples into cpal's
+    /// queue; surfaced in the toolbar as an "AUDIO" metric.
+    pub fn set_audio_queue_len(&mut self, len: usize) {
+        self.audio_queue_len = len;
+    }
+
+    /// Current cached audio backlog (stereo samples).
+    pub fn audio_queue_len(&self) -> usize {
+        self.audio_queue_len
     }
 }
