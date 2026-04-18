@@ -51,6 +51,8 @@
 
 pub mod math;
 pub mod regs;
+pub mod scene;
+pub mod transform;
 
 #[cfg(target_arch = "mips")]
 pub mod ops;
