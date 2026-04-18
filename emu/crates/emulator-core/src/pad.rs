@@ -239,74 +239,267 @@ impl Default for PortDevice {
     }
 }
 
-/// Standard PSX digital controller.
+/// Default analog-stick reading — 0x80 (128) = centre, 0x00 = full
+/// negative, 0xFF = full positive. Matches real DualShock output.
+pub const STICK_CENTER: u8 = 0x80;
+
+/// Pad operating mode.
+///
+/// Fresh-plugged DualShocks boot in Digital and stay there until the
+/// game runs the config-mode dance (`0x43` + `0x44` commands) to
+/// switch them to Analog. Games that expect specific analog
+/// responses (racers, souls-likes, most modern ports) rely on the
+/// mode transition working correctly — reporting Analog from the
+/// start confuses games that assume a Digital → Analog sequence.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PadMode {
+    /// SCPH-1080 digital protocol. ID byte `0x41`, 4-byte poll.
+    /// Default for fresh-plugged controllers.
+    Digital,
+    /// DualShock analog mode. ID byte `0x73`, 8-byte poll (4 extra
+    /// bytes for right + left stick X/Y, each 0-255).
+    Analog,
+    /// Config / escape mode. ID byte `0xF3`, 8-byte transaction.
+    /// Host enters via command `0x43`+`0x01`, uses in-mode commands
+    /// to change pad state (switch between digital/analog, rumble
+    /// mapping, etc), then exits via `0x43`+`0x00`.
+    Config,
+}
+
+/// PS1 controller — digital by default, DualShock-capable. Tracks
+/// the active operating mode, the 16 digital buttons, and the four
+/// analog axes. Holds zero rumble state at the moment; the vibration
+/// motor protocol is a separate follow-up.
 pub struct DigitalPad {
     buttons: ButtonState,
-    state: PadState,
+    /// Right-stick horizontal axis, 0..=255 (centre `0x80`).
+    right_x: u8,
+    /// Right-stick vertical axis.
+    right_y: u8,
+    /// Left-stick horizontal axis.
+    left_x: u8,
+    /// Left-stick vertical axis.
+    left_y: u8,
+    /// Current operating mode. Switched by host via the `0x43` /
+    /// `0x44` config dance.
+    mode: PadMode,
+    /// The mode we were in before entering config. On `0x43`+`0x00`
+    /// (exit config) we restore this instead of defaulting back to
+    /// Digital — matters because a game can enter config from
+    /// Analog mode to change rumble mapping and expects Analog to
+    /// still be active on exit.
+    mode_before_config: PadMode,
+    /// Which command byte the current transaction is running
+    /// (`0x42` poll, `0x43` config-enter/exit, `0x44` set mode,
+    /// etc). Set at the second exchange of the transaction.
+    cmd: u8,
+    /// Which byte of the current transaction we're on. 0 = host
+    /// just sent the address byte; 1 = sent command; 2..=N = payload
+    /// / response bytes.
+    step: u8,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum PadState {
-    /// Waiting for the address byte (`0x01` = "talk to controller").
-    Idle,
-    /// Saw `0x01`, waiting for the poll command (`0x42`).
-    GotAddr,
-    /// Sent the pad-ID high byte, about to send buttons group 1.
-    SendButtons1,
-    /// Sent buttons 1; next TX pops buttons 2 and ends the transfer.
-    SendButtons2,
-}
+/// Zero-indexed step of the last byte in a transaction. Ack stays
+/// low (true) for every step strictly less than this; on the last
+/// step we drop ack so the host stops clocking.
+///
+/// A DualShock analog transaction runs 8 bytes (steps 0..=7). A
+/// legacy digital poll is 4 bytes (0..=3). Config-mode commands
+/// always use the 8-byte shape regardless of the pad's current
+/// active mode.
+const DIGITAL_POLL_LAST: u8 = 3;
+const ANALOG_POLL_LAST: u8 = 7;
 
 impl DigitalPad {
-    /// Build a pad with all buttons released.
+    /// Build a pad with all buttons released, sticks centred, in
+    /// Digital mode (default). Mirrors a freshly-plugged DualShock
+    /// before any game has issued the "switch to analog" config
+    /// sequence.
     pub fn new() -> Self {
         Self {
             buttons: ButtonState::NONE,
-            state: PadState::Idle,
+            right_x: STICK_CENTER,
+            right_y: STICK_CENTER,
+            left_x: STICK_CENTER,
+            left_y: STICK_CENTER,
+            mode: PadMode::Digital,
+            mode_before_config: PadMode::Digital,
+            cmd: 0,
+            step: 0,
         }
     }
 
     fn reset(&mut self) {
-        self.state = PadState::Idle;
+        self.cmd = 0;
+        self.step = 0;
     }
 
+    /// Current operating mode. Diagnostic; games don't read this
+    /// directly (they infer it from the ID byte in the poll).
+    pub fn mode(&self) -> PadMode {
+        self.mode
+    }
+
+    /// Set the analog-stick state. `(right_x, right_y, left_x,
+    /// left_y)` are each 0..=255 with `STICK_CENTER = 0x80`. Games
+    /// only see these when the pad is in Analog (or Config) mode.
+    pub fn set_sticks(&mut self, right_x: u8, right_y: u8, left_x: u8, left_y: u8) {
+        self.right_x = right_x;
+        self.right_y = right_y;
+        self.left_x = left_x;
+        self.left_y = left_y;
+    }
+
+    /// ID low byte reported on byte 0 of a transaction. Derived from
+    /// the current mode.
+    fn id_low_byte(&self) -> u8 {
+        match self.mode {
+            PadMode::Digital => 0x41,
+            PadMode::Analog => 0x73,
+            PadMode::Config => 0xF3,
+        }
+    }
+
+    /// Get the byte to send at step `step` of a standard poll
+    /// (command `0x42`). Step 1 = ID hi (0x5A), 2-3 = buttons, 4-7 =
+    /// analog sticks when present.
+    fn poll_byte(&self, step: u8) -> u8 {
+        match step {
+            1 => 0x5A,
+            2 => !(self.buttons.bits() & 0xFF) as u8,
+            3 => !((self.buttons.bits() >> 8) & 0xFF) as u8,
+            4 => self.right_x,
+            5 => self.right_y,
+            6 => self.left_x,
+            7 => self.left_y,
+            _ => 0xFF,
+        }
+    }
+
+    /// Process one byte of a transaction. Returns `(rx_byte,
+    /// ack_is_low)` — ACK stays low (true) for all bytes except the
+    /// final one of the transaction.
     fn exchange(&mut self, tx: u8) -> (u8, bool) {
-        match (self.state, tx) {
-            // Start of a pad poll. The BIOS clocks `0x01` to the
-            // addressed port; we respond with the digital-pad ID low
-            // byte and hold ACK for the next exchange.
-            (PadState::Idle, 0x01) => {
-                self.state = PadState::GotAddr;
-                (0x41, true)
+        // Step 0: host sent the address byte `0x01`. Reply with
+        // ID_low + hold ACK to invite the next byte.
+        if self.step == 0 {
+            if tx != 0x01 {
+                // Spurious first byte — reset and report no-ack.
+                self.reset();
+                return (0xFF, false);
             }
-            // Poll command. Respond with ID high byte.
-            (PadState::GotAddr, 0x42) => {
-                self.state = PadState::SendButtons1;
-                (0x5A, true)
+            self.step = 1;
+            return (self.id_low_byte(), true);
+        }
+
+        // Step 1: host sends the command byte. Store it and reply
+        // with ID_high (`0x5A`), holding ACK to continue.
+        if self.step == 1 {
+            self.cmd = tx;
+            self.step = 2;
+            return (0x5A, true);
+        }
+
+        // Steps 2..N: payload bytes. `self.step` currently names
+        // the step we're responding for (the payload index). Ack
+        // stays low while that index is less than the transaction's
+        // last-step; when we're answering the last byte, ack drops
+        // so the host stops clocking.
+        let pre_step = self.step;
+        let byte = self.payload_byte(tx);
+        self.step = self.step.saturating_add(1);
+
+        let ack = pre_step < self.last_step_for_cmd(self.cmd);
+        if !ack {
+            self.reset();
+        }
+        (byte, ack)
+    }
+
+    /// Zero-indexed step of the last byte in a transaction for a
+    /// given command. Ack is held (low) for every step strictly less
+    /// than this value; on the last step ack drops so the host
+    /// stops clocking. Poll (0x42) uses the mode's length; config
+    /// + mode-set commands always use the 8-byte shape.
+    fn last_step_for_cmd(&self, cmd: u8) -> u8 {
+        match cmd {
+            0x42 => match self.mode {
+                PadMode::Digital => DIGITAL_POLL_LAST,
+                PadMode::Analog | PadMode::Config => ANALOG_POLL_LAST,
+            },
+            0x43 | 0x44 | 0x45 | 0x46..=0x4F => ANALOG_POLL_LAST,
+            // Unknown command — abort after the ID bytes (steps
+            // 0 + 1) have been exchanged.
+            _ => 1,
+        }
+    }
+
+    /// Byte to return at the current payload step. Called AFTER the
+    /// step's TX has been observed, BEFORE `self.step` advances.
+    /// Dispatches on `self.cmd`.
+    fn payload_byte(&mut self, tx: u8) -> u8 {
+        match self.cmd {
+            // 0x42 — standard button poll. 4 payload bytes in
+            // Digital, 8 in Analog. `self.step` currently points at
+            // the byte we're ABOUT to respond with (step 2 = buttons
+            // group 1, step 3 = buttons group 2, etc).
+            0x42 => self.poll_byte(self.step),
+
+            // 0x43 — enter / exit config mode. Param at step 2:
+            //   0x01 → enter config (save prior mode first)
+            //   0x00 → exit config (restore saved mode)
+            // Remaining bytes are buttons (digital or analog shape
+            // depending on saved mode).
+            0x43 => {
+                if self.step == 2 {
+                    if tx == 0x01 {
+                        self.mode_before_config = self.mode;
+                        self.mode = PadMode::Config;
+                    } else if tx == 0x00 && self.mode == PadMode::Config {
+                        self.mode = self.mode_before_config;
+                    }
+                }
+                self.poll_byte(self.step)
             }
-            // Return buttons group 1 (bits 0..=7 on the wire, active
-            // low: `1` on the wire = released, `0` = pressed). Our
-            // internal [`ButtonState`] stores active-high for easy
-            // composition, so we invert here.
-            (PadState::SendButtons1, _) => {
-                self.state = PadState::SendButtons2;
-                let b1 = !(self.buttons.bits() & 0xFF) as u8;
-                (b1, true)
+
+            // 0x44 — set mode (only valid in Config). Param at step
+            // 2 chooses Digital (0x00) or Analog (0x01). We record
+            // the target into `mode_before_config` so the subsequent
+            // `0x43`+`0x00` exit lands us in the right mode.
+            0x44 => {
+                if self.mode == PadMode::Config && self.step == 2 {
+                    match tx {
+                        0x00 => self.mode_before_config = PadMode::Digital,
+                        0x01 => self.mode_before_config = PadMode::Analog,
+                        _ => {}
+                    }
+                }
+                0x00
             }
-            // Buttons group 2 (bits 8..=15). Last byte of the
-            // transaction — drop ACK so the BIOS stops clocking.
-            (PadState::SendButtons2, _) => {
-                self.state = PadState::Idle;
-                let b2 = !((self.buttons.bits() >> 8) & 0xFF) as u8;
-                (b2, false)
-            }
-            // Any other combination (unexpected TX for current state)
-            // aborts the transfer. Real hardware behaves similarly —
-            // the pad times out DSR when the protocol gets off-rails.
-            _ => {
-                self.state = PadState::Idle;
-                (0xFF, false)
-            }
+
+            // 0x45 — query current mode. Returns a 6-byte status
+            // block. Games probe this to confirm the pad accepted a
+            // mode switch.
+            0x45 => match self.step {
+                2 => 0x01, // device class: DualShock
+                3 => 0x02, // number of analog param words
+                4 => {
+                    if self.mode_before_config == PadMode::Analog {
+                        0x01
+                    } else {
+                        0x00
+                    }
+                }
+                5 => 0x02, // analog mode activated
+                6 => 0x01, // rumble capable (stub)
+                _ => 0x00,
+            },
+
+            // 0x46-0x4F — various config commands (vibration map,
+            // motor test, etc). Not modelled — zero-fill.
+            0x46..=0x4F => 0x00,
+
+            _ => 0xFF,
         }
     }
 }
@@ -759,7 +952,9 @@ mod tests {
         assert_eq!(pad.exchange(0x42), (0x5A, true));
         assert_eq!(pad.exchange(0x00), (0xFF, true)); // all released → 0xFF
         assert_eq!(pad.exchange(0x00), (0xFF, false)); // last byte
-        assert_eq!(pad.state, PadState::Idle);
+        // Transaction state should have reset.
+        assert_eq!(pad.step, 0);
+        assert_eq!(pad.cmd, 0);
     }
 
     #[test]
@@ -786,12 +981,84 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_byte_resets_state_machine() {
+    fn spurious_first_byte_resets_immediately() {
         let mut pad = DigitalPad::new();
-        let _ = pad.exchange(0x01); // GotAddr
-        // Wrong poll command — abort.
+        // Anything other than 0x01 as the first byte should abort
+        // without touching internal state.
         assert_eq!(pad.exchange(0xFF), (0xFF, false));
-        assert_eq!(pad.state, PadState::Idle);
+        assert_eq!(pad.step, 0);
+    }
+
+    #[test]
+    fn unknown_command_aborts_after_id_bytes() {
+        let mut pad = DigitalPad::new();
+        assert_eq!(pad.exchange(0x01), (0x41, true));
+        // Hardware acks the command byte even when the command's
+        // unknown — it's the payload step that aborts.
+        assert_eq!(pad.exchange(0x99), (0x5A, true));
+        // Payload byte returns 0xFF + no ack.
+        assert_eq!(pad.exchange(0x00), (0xFF, false));
+        assert_eq!(pad.step, 0);
+    }
+
+    #[test]
+    fn dualshock_config_sequence_switches_to_analog_mode() {
+        let mut pad = DigitalPad::new();
+        assert_eq!(pad.mode(), PadMode::Digital);
+        // Enter config: 0x01, 0x43, 0x01, ... (8 bytes total).
+        let _ = pad.exchange(0x01);
+        let _ = pad.exchange(0x43);
+        let _ = pad.exchange(0x01);
+        for _ in 3..8 {
+            let _ = pad.exchange(0x00);
+        }
+        assert_eq!(pad.mode(), PadMode::Config);
+
+        // Switch to analog: 0x01, 0x44, 0x01, 0x02, 0, 0, 0, 0.
+        assert_eq!(pad.exchange(0x01), (0xF3, true)); // config ID
+        let _ = pad.exchange(0x44);
+        let _ = pad.exchange(0x01); // analog
+        for _ in 3..8 {
+            let _ = pad.exchange(0x00);
+        }
+        // Still in Config mode until we exit it.
+        assert_eq!(pad.mode(), PadMode::Config);
+
+        // Exit config: 0x01, 0x43, 0x00, ...
+        let _ = pad.exchange(0x01);
+        let _ = pad.exchange(0x43);
+        let _ = pad.exchange(0x00);
+        for _ in 3..8 {
+            let _ = pad.exchange(0x00);
+        }
+        assert_eq!(pad.mode(), PadMode::Analog);
+    }
+
+    #[test]
+    fn analog_poll_returns_8_bytes_with_stick_axes() {
+        let mut pad = DigitalPad::new();
+        // Force pad into analog mode directly for the test.
+        pad.mode = PadMode::Analog;
+        pad.set_sticks(0x10, 0x20, 0x30, 0x40);
+        // Poll in analog mode.
+        assert_eq!(pad.exchange(0x01), (0x73, true)); // analog ID
+        assert_eq!(pad.exchange(0x42), (0x5A, true));
+        assert_eq!(pad.exchange(0x00).0, 0xFF); // buttons low — all released
+        assert_eq!(pad.exchange(0x00).0, 0xFF); // buttons high — all released
+        assert_eq!(pad.exchange(0x00).0, 0x10); // right X
+        assert_eq!(pad.exchange(0x00).0, 0x20); // right Y
+        assert_eq!(pad.exchange(0x00).0, 0x30); // left X
+        // Last byte — no ack.
+        assert_eq!(pad.exchange(0x00), (0x40, false));
+    }
+
+    #[test]
+    fn sticks_default_to_center() {
+        let pad = DigitalPad::new();
+        assert_eq!(pad.right_x, STICK_CENTER);
+        assert_eq!(pad.right_y, STICK_CENTER);
+        assert_eq!(pad.left_x, STICK_CENTER);
+        assert_eq!(pad.left_y, STICK_CENTER);
     }
 
     #[test]
