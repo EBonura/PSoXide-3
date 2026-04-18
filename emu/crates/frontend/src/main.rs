@@ -215,7 +215,38 @@ impl ApplicationHandler for Shell {
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
 
-                let input = std::mem::take(&mut self.pending_input);
+                let mut input = std::mem::take(&mut self.pending_input);
+
+                // Escape is the "PS button" — it toggles between
+                // "game running" and "game paused + menu open".
+                // Intercept it here so the Menu doesn't also interpret
+                // it as a navigation input. The user pressed Escape
+                // to swap contexts, not to press "back" on whatever
+                // menu item happened to be highlighted.
+                if input.toggle_open {
+                    input.toggle_open = false;
+                    input.back = false;
+                    if self.state.running {
+                        // Game mode → menu mode: pause and open overlay.
+                        self.state.running = false;
+                        self.state.menu.sync_run_label(false);
+                        self.state.menu.open = true;
+                    } else if self.state.menu.open {
+                        // Menu mode → game mode: resume if we have a
+                        // live game to resume; otherwise just close
+                        // the overlay.
+                        self.state.menu.open = false;
+                        if self.state.bus.is_some() && self.state.current_game.is_some() {
+                            self.state.running = true;
+                            self.state.menu.sync_run_label(true);
+                        }
+                    } else {
+                        // No game running and Menu already closed —
+                        // Escape just opens the menu.
+                        self.state.menu.open = true;
+                    }
+                }
+
                 if let Some(action) = self.state.menu.update(&input) {
                     if ui::apply_menu_action(&mut self.state, action) == MenuOutcome::Quit {
                         if let Err(e) = self.state.flush_memcard_port1() {
