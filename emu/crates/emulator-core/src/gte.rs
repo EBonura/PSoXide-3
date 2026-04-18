@@ -741,16 +741,20 @@ impl Gte {
 
     /// `NCS` — normal colour single. Lights `V[idx]` against the LLM,
     /// then colours via LCM.
+    ///
+    /// Stage 1 formula per PSX-SPX: `MAC = (LLM × V) >> (sf×12)` —
+    /// *no* BK bias. (The previous implementation added BK in both
+    /// stages and overcounted the bias.) Stage 2 is where BK bias
+    /// belongs: `MAC = (BK<<12 + LCM × IR) >> (sf×12)`.
     fn op_ncs(&mut self, cmd: Cmd, idx: usize) {
         let sf = cmd.shift();
         let v = self.v[idx];
-        // [IR1,IR2,IR3] = LLM * V  (with light bg color bias, sf shifted)
+        // [IR1,IR2,IR3] = (LLM * V) >> (sf*12)
         for i in 0..3 {
-            let bias = (self.bg_color[i] as i64) << 12;
             let prod = (self.light[i][0] as i64) * (v[0] as i64)
                 + (self.light[i][1] as i64) * (v[1] as i64)
                 + (self.light[i][2] as i64) * (v[2] as i64);
-            let mac = self.check_mac((i + 1) as u8, bias + prod) >> sf;
+            let mac = self.check_mac((i + 1) as u8, prod) >> sf;
             self.mac[i] = mac as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, mac as i32, cmd.lm);
         }
@@ -787,15 +791,16 @@ impl Gte {
 
     /// `NCDS` — normal colour depth-cue single. Like NCS but with the
     /// final colour interpolated toward FC by IR0.
+    ///
+    /// Stage-1 BK bias removed — see [`Gte::op_ncs`] for the rationale.
     fn op_ncds(&mut self, cmd: Cmd, idx: usize) {
         let sf = cmd.shift();
         let v = self.v[idx];
         for i in 0..3 {
-            let bias = (self.bg_color[i] as i64) << 12;
             let prod = (self.light[i][0] as i64) * (v[0] as i64)
                 + (self.light[i][1] as i64) * (v[1] as i64)
                 + (self.light[i][2] as i64) * (v[2] as i64);
-            let mac = self.check_mac((i + 1) as u8, bias + prod) >> sf;
+            let mac = self.check_mac((i + 1) as u8, prod) >> sf;
             self.mac[i] = mac as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, mac as i32, cmd.lm);
         }
@@ -838,15 +843,16 @@ impl Gte {
 
     /// `NCCS` — normal colour single (no depth cue, but colour multiplied
     /// against the input RGBC).
+    ///
+    /// Stage-1 BK bias removed — see [`Gte::op_ncs`] for the rationale.
     fn op_nccs(&mut self, cmd: Cmd, idx: usize) {
         let sf = cmd.shift();
         let v = self.v[idx];
         for i in 0..3 {
-            let bias = (self.bg_color[i] as i64) << 12;
             let prod = (self.light[i][0] as i64) * (v[0] as i64)
                 + (self.light[i][1] as i64) * (v[1] as i64)
                 + (self.light[i][2] as i64) * (v[2] as i64);
-            let mac = self.check_mac((i + 1) as u8, bias + prod) >> sf;
+            let mac = self.check_mac((i + 1) as u8, prod) >> sf;
             self.mac[i] = mac as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, mac as i32, cmd.lm);
         }

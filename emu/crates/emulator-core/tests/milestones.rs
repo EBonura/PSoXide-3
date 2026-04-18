@@ -246,11 +246,17 @@ fn milestone_d_tekken_licensed_screen() {
         return;
     }
     let state = run_milestone(800_000_000, Some(TEKKEN_DISC));
+    // Display + VRAM hashes updated 2026-04-18-B after the GTE
+    // NCS/NCDS/NCCS stage-1 BK bias fix. The previous hashes captured
+    // a state where the 3D lighting of the red PlayStation logo was
+    // miscomputed (stage 1 double-counted the background colour).
+    // Redux's GTE has no BK bias in stage 1 either — see
+    // `PCSX::GTE::NCS/NCDS/NCCS` in `pcsx-redux/src/core/gte.cc`.
     assert_milestone(
         "Milestone D (Tekken license screen)",
         &state,
-        0xb18b_d59c_f3ef_3062,
-        0xe751_905e_59a6_3e02,
+        0xd3a9_8c53_208a_c903,
+        0x63cd_31f5_f5d1_2fdf,
         (640, 478),
         None,
     );
