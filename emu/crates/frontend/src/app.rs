@@ -200,6 +200,12 @@ impl AppState {
     /// emulator is paused at the reset vector (or the EXE entry
     /// point); the user clicks Run to start stepping.
     pub fn launch_entry(&mut self, entry: &LibraryEntry) -> Result<(), String> {
+        // Flush the outgoing game's memcard before we discard its
+        // Bus state. Silently log on failure — we'd rather launch
+        // the new game than refuse because of a stale save.
+        if let Err(e) = self.flush_memcard_port1() {
+            eprintln!("[frontend] memcard flush before launch: {e}");
+        }
         let bios_path = resolve_bios_path(&self.settings);
         let bios = std::fs::read(&bios_path)
             .map_err(|e| format!("BIOS {}: {e}", bios_path.display()))?;
@@ -229,6 +235,15 @@ impl AppState {
                 }
                 bus.cdrom.insert_disc(Some(Disc::from_bin(bytes)));
                 bus.attach_digital_pad_port1();
+                // Load + attach the per-game memory card on port 1.
+                // File lives under `<config>/games/<id>/memcard-1.mcd`;
+                // first launch of any game gets a fresh 128 KiB blank.
+                self.paths
+                    .ensure_game_tree(&entry.id)
+                    .map_err(|e| e.to_string())?;
+                let mc_path = self.paths.memcard_file(&entry.id, 1);
+                let mc_bytes = std::fs::read(&mc_path).unwrap_or_default();
+                bus.attach_memcard_port1(mc_bytes);
             }
             GameKind::DiscCue => {
                 return Err("CUE handling is pending — point me at the BIN directly".into());
@@ -436,6 +451,35 @@ impl AppState {
         self.settings
             .save(&self.paths.settings_file())
             .map_err(|e| format!("save settings.ron: {e}"))
+    }
+
+    /// Flush any dirty memory-card state on port 1 back to its
+    /// `<config>/games/<id>/memcard-1.mcd` file. A no-op when no
+    /// card is attached or when no writes have landed since load.
+    /// Called from the shell's exit path and periodically during
+    /// run so a hard crash doesn't lose save progress.
+    pub fn flush_memcard_port1(&mut self) -> Result<(), String> {
+        let Some(game) = self.current_game.as_ref().map(|g| g.id.clone()) else {
+            return Ok(()); // no game loaded → nothing to persist
+        };
+        let Some(bus) = self.bus.as_mut() else {
+            return Ok(());
+        };
+        if let Some(bytes) = bus.memcard_port1_snapshot() {
+            let path = self.paths.memcard_file(&game, 1);
+            self.paths
+                .ensure_game_tree(&game)
+                .map_err(|e| e.to_string())?;
+            std::fs::write(&path, &bytes).map_err(|e| {
+                format!("save memcard {}: {e}", path.display())
+            })?;
+            eprintln!(
+                "[frontend] persisted port-1 memcard → {} ({} bytes)",
+                path.display(),
+                bytes.len()
+            );
+        }
+        Ok(())
     }
 
     /// Decay the short-lived status message. Called once per frame

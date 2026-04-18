@@ -89,10 +89,16 @@ impl Sio0 {
             baud: 0,
             rx: None,
             pending_irq: false,
-            port1: crate::pad::PortDevice::None,
-            port2: crate::pad::PortDevice::None,
+            port1: crate::pad::PortDevice::empty(),
+            port2: crate::pad::PortDevice::empty(),
             last_joyn: false,
         }
+    }
+
+    /// Mutable access to port 1 — lets higher layers swap a
+    /// memory card in while keeping the pad attached.
+    pub fn port1_mut(&mut self) -> &mut crate::pad::PortDevice {
+        &mut self.port1
     }
 
     /// Plug a device into port 1 (typical for "player 1" games).
@@ -344,7 +350,7 @@ mod tests {
         use crate::pad::{button, ButtonState, DigitalPad, PortDevice};
 
         let mut sio = Sio0::new();
-        sio.attach_port1(PortDevice::DigitalPad(DigitalPad::new()));
+        sio.attach_port1(PortDevice::empty().with_pad(DigitalPad::new()));
         // Hold Cross + Start.
         sio.set_port1_buttons(ButtonState::from_bits(button::START | button::CROSS));
 
@@ -373,7 +379,7 @@ mod tests {
         use crate::pad::{DigitalPad, PortDevice};
 
         let mut sio = Sio0::new();
-        sio.attach_port1(PortDevice::DigitalPad(DigitalPad::new()));
+        sio.attach_port1(PortDevice::empty().with_pad(DigitalPad::new()));
         // Port 2 stays empty.
 
         // CTRL.SLOT = 1 → port 2 (empty).
