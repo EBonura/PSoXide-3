@@ -1162,16 +1162,21 @@ struct GpuStatus {
 
 impl GpuStatus {
     fn new() -> Self {
-        // Reset defaults matching Redux:
+        // Reset defaults matching Redux's `SoftGPU::impl::open` /
+        // `softReset`, both of which initialise `m_statusRet` to
+        // `0x14802000`:
         //   bit 23 (DISPLAY_DISABLE) = 1
         //   bit 21 = 1 (reserved, Redux sets on reset)
         //   bit 13 (INTERLACE_FIELD) = 1
-        //   bit 31 (DRAWING_ODD) = 1 (odd field is the "ready" default
-        //           at power-on; matches Redux's post-reset GPUSTAT).
+        //   bit 31 (DRAWING_ODD) = 0 at power-on; first VBlank XORs it
+        //          to 1, second back to 0, etc. Earlier we initialised
+        //          this to 1 (matching the "odd field looks ready"
+        //          intuition), but parity divergence at step 19259778
+        //          showed Redux is the authority and starts at 0.
         // Ready bits 26/28 are filled in by `read`; VRAM-ready (27) is
         // gated on an active VRAM→CPU transfer.
         Self {
-            raw: 0x9480_2000,
+            raw: 0x1480_2000,
         }
     }
 

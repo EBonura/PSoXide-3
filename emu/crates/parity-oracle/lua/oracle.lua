@@ -110,6 +110,102 @@ local function run()
             end
             io.flush()
 
+        elseif cmd == "peek32" then
+            -- `peek32 ADDR` — return the 32-bit value at the given
+            -- physical address (decimal or 0x-prefixed hex). Used to
+            -- inspect IO registers (I_STAT/I_MASK/etc) at the current
+            -- step from the harness side. Wrapped in pcall because
+            -- the MMIO read paths through Redux's API can throw.
+            local addr_str = line:match("^peek32%s+(%S+)$")
+            local addr = tonumber(addr_str)
+            if addr == nil then
+                send("err peek32: bad addr")
+            else
+                local ok, value = pcall(function()
+                    local phys = bit.band(addr, 0x1FFFFFFF)
+                    if phys < 0x00800000 then
+                        local ram_off = phys % 0x00200000
+                        return tonumber(ffi.cast("uint32_t*", ram_ptr + ram_off)[0])
+                    end
+                    if phys >= 0x1FC00000 and phys < 0x1FC80000 then
+                        return tonumber(ffi.cast("uint32_t*", rom_ptr + (phys - 0x1FC00000))[0])
+                    end
+                    -- MMIO read: Redux exposes it via PCSX.getHardwareRegisters()
+                    -- which returns the io[] echo buffer (8KB) — same range as
+                    -- our `io` slice. The IRQ controller writes its live state
+                    -- into io[] on every change, so reading from there is
+                    -- equivalent to what software sees.
+                    if phys >= 0x1F801000 and phys < 0x1F803000 then
+                        local candidates = {
+                            "getHardwareRegisters", "getHardwareRegistersPtr",
+                            "getHWPtr", "getHardwarePtr", "getHwRegPtr",
+                            "getIOPtr", "getIoPtr", "getRegisters",
+                        }
+                        for _, name in ipairs(candidates) do
+                            local fn = PCSX[name]
+                            if type(fn) == "function" then
+                                local hw = fn()
+                                if hw then
+                                    local off = phys - 0x1F801000
+                                    return tonumber(ffi.cast("uint32_t*", hw + off)[0])
+                                end
+                            end
+                        end
+                        -- Last resort: list keys for debugging.
+                        local keys = {}
+                        for k, _ in pairs(PCSX) do keys[#keys+1] = k end
+                        error("no hw-regs accessor; PCSX keys: " .. table.concat(keys, ","))
+                    end
+                    return 0xDEADBEEF
+                end)
+                if ok then
+                    send(string.format("peek32 %d", value or -1))
+                else
+                    send("err peek32: " .. tostring(value))
+                end
+            end
+
+        elseif cmd == "regs" then
+            -- Return CPU+COP0 snapshot useful for IRQ debugging:
+            -- pc, cause, sr, epc, plus the cycle counter. Redux's
+            -- regs.CP0 is a union with `r` (32-element array) — see
+            -- `psxregisters.h`. Cause is index 13, Status is 12, EPC 14.
+            local ok, msg = pcall(function()
+                local pc = tonumber(regs.pc)
+                local cycles = tonumber(PCSX.getCPUCycles())
+                local cp0 = regs.CP0
+                local r = cp0 and cp0.r
+                local cause = r and r[13]
+                local sr = r and r[12]
+                local epc = r and r[14]
+                send(string.format(
+                    "regs pc=%d cause=%s sr=%s epc=%s cycles=%d",
+                    pc,
+                    cause and tostring(tonumber(cause)) or "nil",
+                    sr and tostring(tonumber(sr)) or "nil",
+                    epc and tostring(tonumber(epc)) or "nil",
+                    cycles
+                ))
+            end)
+            if not ok then
+                send("err regs: " .. tostring(msg))
+            end
+
+        elseif cmd == "introspect" then
+            -- One-time discovery: dump all PCSX.* keys and a sampling
+            -- of regs.* keys. Used to find the right Lua API for
+            -- reading hardware registers via the IRQ controller.
+            local pcsx_keys = {}
+            for k, v in pairs(PCSX) do
+                pcsx_keys[#pcsx_keys+1] = k .. ":" .. type(v)
+            end
+            send("pcsx " .. table.concat(pcsx_keys, ","))
+            local reg_keys = {}
+            for k, v in pairs(regs) do
+                reg_keys[#reg_keys+1] = k .. ":" .. type(v)
+            end
+            send("regs " .. table.concat(reg_keys, ","))
+
         elseif cmd == "quit" then
             send("bye")
             break

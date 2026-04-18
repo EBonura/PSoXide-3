@@ -213,19 +213,32 @@ impl Dma {
 impl Dma {
     /// Run the OTC (channel 6) transfer if its start bit is set.
     ///
-    /// OTC fills an ordering table from high address downwards: each
-    /// word becomes the address of the word one step "previous" in
-    /// the list (i.e. `addr + 4`), except the first (highest) word,
-    /// which becomes the linked-list terminator `0x00FF_FFFF`. After
-    /// the transfer the start bit (24) and busy bit (28) in CHCR are
-    /// cleared so BIOS polling sees completion.
+    /// OTC builds an ordering-table linked list with `MADR` as the
+    /// **head** (highest address) and the terminator at the tail
+    /// (`MADR - (count-1)*4`, the lowest address). Each non-terminator
+    /// word holds a 24-bit pointer to the next address, descending by
+    /// 4 each step.
     ///
-    /// Returns `true` if a transfer actually ran (start bit was set).
+    /// Mirrors Redux's `dma6` (psxdma.cc:113-119):
+    /// ```c
+    /// while (bcr--) { *mem-- = (madr - 4) & 0xffffff; madr -= 4; }
+    /// mem++;        *mem = 0xffffff;   // overwrites last chain ptr
+    /// ```
+    /// Crucially, the terminator overwrites the chain pointer the loop
+    /// just wrote at the lowest address — so the structure ends up:
+    /// `madr → madr-4 → … → madr-(count-2)*4 → terminator`.
+    ///
+    /// CHCR start (24) and busy (28) bits are NOT cleared here — the
+    /// caller schedules a delayed completion (Redux's
+    /// `scheduleGPUOTCDMAIRQ(size)`) so BIOS polls of CHCR keep
+    /// observing the busy state for `size` cycles after kickoff.
+    ///
+    /// Returns the word count transferred (0 if start bit was clear).
     /// Called by [`crate::Bus`] after every CHCR write.
-    pub fn run_otc(&mut self, ram: &mut [u8]) -> bool {
+    pub fn run_otc(&mut self, ram: &mut [u8]) -> u32 {
         let ch = &self.channels[6];
         if (ch.channel_control >> 24) & 1 == 0 {
-            return false;
+            return 0;
         }
 
         let base = ch.base & 0x001F_FFFC;
@@ -234,23 +247,27 @@ impl Dma {
             n => n,
         };
 
+        // Chain pointers: at address `base - i*4`, write a pointer
+        // to `base - (i+1)*4` (the address one step further down).
         let mut addr = base;
-        for i in 0..count {
-            let value: u32 = if i == 0 {
-                0x00FF_FFFF
-            } else {
-                addr.wrapping_add(4) & 0x001F_FFFF
-            };
+        for _ in 0..count {
+            let next = addr.wrapping_sub(4) & 0x00FF_FFFF;
             let offset = (addr & 0x001F_FFFF) as usize;
             if offset + 4 <= ram.len() {
-                ram[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                ram[offset..offset + 4].copy_from_slice(&next.to_le_bytes());
             }
             addr = addr.wrapping_sub(4);
         }
+        // Overwrite the last chain entry (at the lowest address) with
+        // the terminator. `addr` after the loop is one step past the
+        // last write, so the tail is `addr + 4`.
+        let tail = addr.wrapping_add(4) & 0x001F_FFFF;
+        let offset = tail as usize;
+        if offset + 4 <= ram.len() {
+            ram[offset..offset + 4].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+        }
 
-        let ch = &mut self.channels[6];
-        ch.channel_control &= !((1 << 24) | (1 << 28));
-        true
+        count
     }
 }
 
@@ -363,33 +380,42 @@ mod tests {
     }
 
     #[test]
-    fn otc_writes_terminator_at_base_and_chain_below() {
+    fn otc_madr_is_head_terminator_at_tail() {
         let mut dma = Dma::new();
         let mut ram = vec![0u8; 2 * 1024 * 1024];
-        // 4-entry OT anchored at word 0x400.
-        set_otc(&mut dma, 0x0000_0400, 4);
-        assert!(dma.run_otc(&mut ram));
+        // Sentinel just below the OT range — must remain untouched
+        // (validates that the loop's last chain-write to 0x3F4 is
+        // overwritten by the terminator, not extended into 0x3F0).
+        write_u32(&mut ram, 0x3F0, 0xDEAD_BEEF);
 
-        // Base word = terminator 0x00FFFFFF.
-        assert_eq!(read_u32(&ram, 0x400), 0x00FF_FFFF);
-        // base - 4 points to base.
-        assert_eq!(read_u32(&ram, 0x3FC), 0x0000_0400);
-        // base - 8 points to base - 4.
-        assert_eq!(read_u32(&ram, 0x3F8), 0x0000_03FC);
-        // base - 12 points to base - 8.
-        assert_eq!(read_u32(&ram, 0x3F4), 0x0000_03F8);
+        // 4-entry OT with MADR (head) at 0x400; terminator lands at
+        // 0x3F4 (= 0x400 - (4-1)*4).
+        set_otc(&mut dma, 0x0000_0400, 4);
+        assert_eq!(dma.run_otc(&mut ram), 4);
+
+        // Head: MADR points to next-step-down.
+        assert_eq!(read_u32(&ram, 0x400), 0x0000_03FC);
+        assert_eq!(read_u32(&ram, 0x3FC), 0x0000_03F8);
+        assert_eq!(read_u32(&ram, 0x3F8), 0x0000_03F4);
+        // Tail: lowest address holds the terminator.
+        assert_eq!(read_u32(&ram, 0x3F4), 0x00FF_FFFF);
+        // Sentinel below the tail is untouched.
+        assert_eq!(read_u32(&ram, 0x3F0), 0xDEAD_BEEF);
     }
 
     #[test]
-    fn otc_clears_start_and_busy_bits() {
+    fn otc_does_not_clear_start_and_busy_bits_synchronously() {
+        // Bus is responsible for clearing the busy bits at the
+        // scheduled completion cycle (Redux's `gpuotcInterrupt`); the
+        // DMA module itself just transfers data.
         let mut dma = Dma::new();
         let mut ram = vec![0u8; 2 * 1024 * 1024];
         set_otc(&mut dma, 0x0000_0100, 1);
-        assert!(dma.run_otc(&mut ram));
+        assert_eq!(dma.run_otc(&mut ram), 1);
 
         let chcr = dma.channels[6].channel_control;
-        assert_eq!(chcr & (1 << 24), 0);
-        assert_eq!(chcr & (1 << 28), 0);
+        assert_ne!(chcr & (1 << 24), 0, "start bit must remain set");
+        assert_ne!(chcr & (1 << 28), 0, "busy bit must remain set");
     }
 
     #[test]
@@ -399,12 +425,17 @@ mod tests {
         // Write base/count but not start bit.
         dma.write32(0x1F80_10E0, 0x0000_0100);
         dma.write32(0x1F80_10E4, 1);
-        assert!(!dma.run_otc(&mut ram));
+        assert_eq!(dma.run_otc(&mut ram), 0);
         assert_eq!(read_u32(&ram, 0x100), 0);
     }
 
     fn read_u32(ram: &[u8], offset: u32) -> u32 {
         let o = offset as usize;
         u32::from_le_bytes([ram[o], ram[o + 1], ram[o + 2], ram[o + 3]])
+    }
+
+    fn write_u32(ram: &mut [u8], offset: u32, value: u32) {
+        let o = offset as usize;
+        ram[o..o + 4].copy_from_slice(&value.to_le_bytes());
     }
 }

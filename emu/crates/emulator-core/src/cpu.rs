@@ -87,6 +87,20 @@ pub struct Cpu {
     /// COP2 — Geometry Transformation Engine. Holds 32 data + 32
     /// control registers and dispatches the GTE function set.
     cop2: Gte,
+    /// `true` from any exception entry until the matching `RFE`.
+    /// Mirrors Redux's `m_inISR`. Diagnostic only right now; the
+    /// parity harness looks at [`Cpu::in_irq_handler`] instead to
+    /// decide whether to aggregate.
+    in_isr: bool,
+    /// Specialised flag: true only from an `Interrupt` (cause=0)
+    /// exception entry until the matching `RFE`. The parity harness
+    /// aggregates trace steps while this is true — matching the
+    /// `if (cause == 0) return;` early-return in Redux's
+    /// `debug.cc` that hides the IRQ handler body from a clean
+    /// user-mode-to-ISR transition. Syscall / Break exceptions do
+    /// NOT set this flag; Redux records their handler instructions
+    /// normally.
+    in_irq_handler: bool,
 }
 
 impl Cpu {
@@ -111,7 +125,27 @@ impl Cpu {
             irq_line_high_steps: 0,
             should_take_interrupt_steps: 0,
             cop2: Gte::new(),
+            in_isr: false,
+            in_irq_handler: false,
         }
+    }
+
+    /// `true` while the CPU is inside any exception handler.
+    /// Diagnostic — the harness uses [`in_irq_handler`] for
+    /// aggregation decisions.
+    #[inline]
+    pub fn in_isr(&self) -> bool {
+        self.in_isr
+    }
+
+    /// `true` while we're inside an `Interrupt`-entered handler
+    /// specifically. Set on `Interrupt` exception entry, cleared on
+    /// `RFE`. The parity harness aggregates trace steps while this
+    /// is true so our trace matches Redux's (which hides the IRQ
+    /// handler body via its `debug.cc` early-return for cause==0).
+    #[inline]
+    pub fn in_irq_handler(&self) -> bool {
+        self.in_irq_handler
     }
 
     /// COP2 (GTE) state. Diagnostics / UI surfaces only — opcode
@@ -235,10 +269,16 @@ impl Cpu {
     /// Execute one instruction and return a trace record of the state
     /// after retirement.
     pub fn step(&mut self, bus: &mut Bus) -> Result<InstructionRecord, ExecutionError> {
-        // Mirror the external interrupt line into COP0.CAUSE.IP[2]
-        // each step. Software reads CAUSE directly to poll for
-        // interrupts even when globally disabled.
-        self.sync_external_interrupt(bus);
+        // Diagnostic only — track how many steps the IRQ pin was high.
+        // We deliberately do NOT mirror the pin into `cop0[13].IP[2]`:
+        // PCSX-Redux's CAUSE register is only written at exception
+        // entry, never live-updated, so software `mfc0 v0, $13` reads
+        // see only what the last exception stored. Mirroring the live
+        // pin would surface as IP[2]=1 in syscall handlers' CAUSE
+        // reads (e.g. step 19258368) and break parity.
+        if bus.external_interrupt_pending() {
+            self.irq_line_high_steps = self.irq_line_high_steps.saturating_add(1);
+        }
 
         // HLE BIOS: when enabled (only for side-loaded EXEs, never
         // for parity), intercept jumps into the BIOS dispatcher
@@ -255,8 +295,8 @@ impl Cpu {
                 self.pending_pc = None;
                 self.pending_load = None;
                 self.committing_load = None;
-                self.tick += 1;
                 bus.tick(2);
+                self.tick += 1;
                 return Ok(InstructionRecord {
                     tick: self.tick,
                     pc: self.pc,
@@ -268,29 +308,6 @@ impl Cpu {
 
         let pc_before = self.pc;
         let instr = bus.read32(pc_before);
-
-        // If an external interrupt is pending AND enabled AND globally
-        // allowed, take the exception instead of running this instruction.
-        // We still record the pre-empted PC+instr so the trace reads as
-        // "we were about to run X when IRQ n fired" — matching how
-        // typical MIPS emulators surface this in per-instruction hooks.
-        if self.should_take_interrupt() {
-            self.should_take_interrupt_steps = self.should_take_interrupt_steps.saturating_add(1);
-            let in_delay_slot = self.pending_pc.is_some();
-            self.pending_pc = None;
-            self.enter_exception(ExceptionCode::Interrupt, pc_before, in_delay_slot);
-            self.pc = self
-                .pending_exception_pc
-                .take()
-                .expect("enter_exception staged a vector");
-            self.tick += 1;
-            return Ok(InstructionRecord {
-                tick: self.tick,
-                pc: pc_before,
-                instr,
-                gprs: self.gprs,
-            });
-        }
 
         // If the *previous* instruction was a branch, the current
         // instruction is its delay slot — after retiring, PC goes to
@@ -332,8 +349,28 @@ impl Cpu {
                 None => self.pc.wrapping_add(4),
             }
         };
-        self.tick += 1;
 
+        // Hardware-IRQ check, end-of-step. Mirrors Redux's `branchTest`,
+        // which only runs when the just-retired instruction was a delay
+        // slot (`if (m_inDelaySlot) ... branchTest()`). Doing it after
+        // the instruction (rather than before the next) means the trace
+        // record still shows the regular instruction at this step, and
+        // the interrupt-vector PC shows up at the *next* step — exactly
+        // how Redux's trace reads.
+        if in_delay_slot && self.should_take_interrupt(bus) {
+            self.should_take_interrupt_steps =
+                self.should_take_interrupt_steps.saturating_add(1);
+            // Redux passes `bd=0` to `exception(0x400, 0)`: the IRQ
+            // is taken cleanly between instructions, not in a delay
+            // slot of its own.
+            self.enter_exception(ExceptionCode::Interrupt, self.pc, false);
+            self.pc = self
+                .pending_exception_pc
+                .take()
+                .expect("enter_exception staged a vector");
+        }
+
+        self.tick += 1;
         Ok(InstructionRecord {
             tick: self.tick,
             pc: pc_before,
@@ -482,12 +519,17 @@ impl Cpu {
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read32(addr);
+        bus.add_cycles(1);
         self.cop2.write_data(rt, value);
         Ok(())
     }
 
     /// `SWC2 rt, offset(rs)` — store COP2 data register `rt` to memory.
     fn op_swc2(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        // Redux's psxSWC2 unconditionally calls write32, which always
+        // charges +1 cycle in psxmem.cc. Even cache-isolated stores
+        // pay the bus cycle, so charge before the bypass.
+        bus.add_cycles(1);
         if self.cache_isolated() {
             return Ok(());
         }
@@ -704,6 +746,7 @@ impl Cpu {
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read32(addr);
+        bus.add_cycles(1);
         // Loads to $zero are no-ops; never queue a commit to it.
         if rt != 0 {
             self.pending_load = Some((rt, value));
@@ -719,6 +762,7 @@ impl Cpu {
     /// model the side effect by simply dropping the write — matching
     /// PS1 hardware, which has no separate D-cache for us to populate.
     fn op_sw(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(1);
         if self.cache_isolated() {
             return Ok(());
         }
@@ -740,10 +784,14 @@ impl Cpu {
     }
 
     fn op_rfe(&mut self) -> Result<(), ExecutionError> {
-        // Restore previous interrupt enable/mode bits in SR.
+        // Mirrors Redux's `psxRFE` (psxinterpreter.cc:779): restore
+        // the previous KU/IE pair. Also clears both in-handler
+        // flags; subsequent exceptions flip them back on entry.
         let sr = self.cop0[12];
         let restored = (sr & !0b1111) | ((sr >> 2) & 0b1111);
         self.cop0[12] = restored;
+        self.in_isr = false;
+        self.in_irq_handler = false;
         Ok(())
     }
 
@@ -859,6 +907,7 @@ impl Cpu {
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read8(addr) as i8 as i32 as u32;
+        bus.add_cycles(1);
         if rt != 0 {
             self.pending_load = Some((rt, value));
         }
@@ -871,6 +920,7 @@ impl Cpu {
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read8(addr) as u32;
+        bus.add_cycles(1);
         if rt != 0 {
             self.pending_load = Some((rt, value));
         }
@@ -883,6 +933,7 @@ impl Cpu {
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read16(addr) as i16 as i32 as u32;
+        bus.add_cycles(1);
         if rt != 0 {
             self.pending_load = Some((rt, value));
         }
@@ -895,6 +946,7 @@ impl Cpu {
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read16(addr) as u32;
+        bus.add_cycles(1);
         if rt != 0 {
             self.pending_load = Some((rt, value));
         }
@@ -902,6 +954,7 @@ impl Cpu {
     }
 
     fn op_sb(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(1);
         if self.cache_isolated() {
             return Ok(());
         }
@@ -914,6 +967,7 @@ impl Cpu {
     }
 
     fn op_sh(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(1);
         if self.cache_isolated() {
             return Ok(());
         }
@@ -945,6 +999,7 @@ impl Cpu {
         let addr = self.gpr(rs).wrapping_add(offset);
         let aligned = addr & !3;
         let word = bus.read32(aligned);
+        bus.add_cycles(1);
         // If there's a pending-commit load for the same register, see
         // its staged value instead of the current register file —
         // that's what matches hardware's LWL-LWR-merge convention.
@@ -966,6 +1021,7 @@ impl Cpu {
         let addr = self.gpr(rs).wrapping_add(offset);
         let aligned = addr & !3;
         let word = bus.read32(aligned);
+        bus.add_cycles(1);
         let current = self.staged_gpr(rt);
         let shift = (addr & 3) * 8;
         let mask = 0xFFFF_FFFFu32 >> (24 - shift);
@@ -981,6 +1037,9 @@ impl Cpu {
     /// store side. Writes `rt`'s high bytes into the word containing
     /// `addr`, preserving the lower bytes of the memory word.
     fn op_swl(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        // Redux's psxSWL always calls read32 + write32 unconditionally;
+        // both charge a cycle each, even under cache isolation.
+        bus.add_cycles(2);
         if self.cache_isolated() {
             return Ok(());
         }
@@ -1000,6 +1059,7 @@ impl Cpu {
     /// `SWR rt, offset(rs)` — Store Word Right. Mirror of LWR on the
     /// store side.
     fn op_swr(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(2);
         if self.cache_isolated() {
             return Ok(());
         }
@@ -1196,28 +1256,17 @@ impl Cpu {
         self.cop0[12] & (1 << 16) != 0
     }
 
-    /// Mirror the external IRQ line into `CAUSE.IP[2]`. The CPU reads
-    /// this bit to decide whether to take an interrupt exception; the
-    /// BIOS also reads it directly to poll.
-    fn sync_external_interrupt(&mut self, bus: &mut Bus) {
-        if bus.external_interrupt_pending() {
-            self.cop0[13] |= 1 << 10;
-            self.irq_line_high_steps = self.irq_line_high_steps.saturating_add(1);
-        } else {
-            self.cop0[13] &= !(1 << 10);
-        }
-    }
-
     /// `true` when the CPU should take an interrupt exception right
-    /// now: globally enabled (`SR.IEc`), mask-enabled for the pending
-    /// source (`SR.IM` over bits 8..=15 of `CAUSE.IP`).
-    fn should_take_interrupt(&self) -> bool {
+    /// now. Mirrors PCSX-Redux's `branchTest`:
+    ///   `(I_STAT & I_MASK) && ((SR & 0x401) == 0x401)`
+    /// — i.e. some hardware source is both pending and enabled,
+    /// SR.IM[2] (hardware-IRQ mask, bit 10) is on, and SR.IEc (global
+    /// interrupt enable, bit 0) is on. Software interrupts on IP[0..1]
+    /// would also raise via this path on real hardware; the BIOS
+    /// doesn't use them, so we don't model that.
+    fn should_take_interrupt(&self, bus: &mut Bus) -> bool {
         let sr = self.cop0[12];
-        let cause = self.cop0[13];
-        let global_enable = sr & 1 != 0;
-        let im = (sr >> 8) & 0xFF;
-        let ip = (cause >> 8) & 0xFF;
-        global_enable && (im & ip) != 0
+        bus.external_interrupt_pending() && (sr & 0x401) == 0x401
     }
 
     /// `SYSCALL` — raise a syscall exception (CAUSE.ExcCode = 8). The
@@ -1239,10 +1288,15 @@ impl Cpu {
     /// Shared exception-entry sequence. Mutates COP0 registers and
     /// stages the exception-vector PC for [`Cpu::step`] to apply.
     ///
-    /// - **CAUSE**: write `code` into `ExcCode` (bits 6..=2). Set `BD`
-    ///   (bit 31) iff the faulting instruction was in a branch delay
-    ///   slot; in that case `EPC` is backed up to the branch PC so
-    ///   `RFE` can re-execute the branch.
+    /// - **CAUSE**: *overwrite* with `(ExcCode << 2) | (BD bit) | (IP[2]
+    ///   for Interrupt)`. Mirrors PCSX-Redux's `m_regs.CP0.n.Cause = code`
+    ///   in `R3000Acpu::exception` — Redux blows the whole register
+    ///   away on every exception, including IP bits, so software-side
+    ///   `mfc0 v0, $13` reads only ever see what the most recent
+    ///   exception parked there. We have to mirror this exactly: if we
+    ///   preserved IP[2] (the natural real-hardware behaviour) BIOS
+    ///   syscall handlers would observe `CAUSE = 0x420` while Redux
+    ///   sees `0x20`, breaking GPR parity.
     /// - **SR**: push the 3-level KU/IE stack — bits `SR[5:0]` become
     ///   `(SR[3:0] << 2)`, with the new current pair (bits 1..0)
     ///   entering kernel-mode / interrupts-disabled.
@@ -1253,9 +1307,19 @@ impl Cpu {
         self.exception_counts[code_bits as usize] =
             self.exception_counts[code_bits as usize].saturating_add(1);
 
-        let mut cause = self.cop0[13];
-        cause &= !((0x1F << 2) | (1 << 31));
-        cause |= code_bits << 2;
+        let mut cause = code_bits << 2;
+        if matches!(code, ExceptionCode::Interrupt) {
+            cause |= 1 << 10;
+            // IRQ-specific flag: only gets set for Interrupt entries.
+            // The parity harness uses this to aggregate the IRQ
+            // handler body into the pre-IRQ record, matching
+            // Redux's debug.cc `return` early-exit for cause==0.
+            self.in_irq_handler = true;
+        }
+        // Mirror Redux's `m_inISR`: flipped true on ANY exception
+        // entry, flipped false on RFE. Diagnostic / general state;
+        // aggregation is gated by `in_irq_handler` above.
+        self.in_isr = true;
         if in_delay_slot {
             cause |= 1 << 31;
         }

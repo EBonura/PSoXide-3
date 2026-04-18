@@ -61,6 +61,11 @@ pub struct Irq {
     stat_write_count: u64,
     /// First 16 values written to `I_MASK`. Diagnostic.
     mask_write_log: Vec<u32>,
+    /// First 16 (cycle, value) pairs of `I_MASK` writes. Diagnostic —
+    /// helps cross-check when our writes happen vs Redux's.
+    mask_write_events: Vec<(u64, u32)>,
+    /// First 16 (cycle, value) pairs of `I_STAT` writes. Diagnostic.
+    stat_write_events: Vec<(u64, u32)>,
 }
 
 impl Irq {
@@ -78,6 +83,8 @@ impl Irq {
             mask_write_count: 0,
             stat_write_count: 0,
             mask_write_log: Vec::new(),
+            mask_write_events: Vec::new(),
+            stat_write_events: Vec::new(),
         }
     }
 
@@ -91,15 +98,17 @@ impl Irq {
         self.peak_stat
     }
 
-    /// Raise interrupt `source` — sets its bit in `I_STAT`. Pending-ness
-    /// is OR'd: calling `raise` multiple times before acknowledgement
-    /// is a no-op after the first.
+    /// Raise interrupt `source` — set its bit in `I_STAT` regardless
+    /// of the mask. Matches real PSX hardware and PCSX-Redux's
+    /// `setIRQ` (an unconditional `istat |= bit`). Mask gating happens
+    /// at delivery time (`pending`), not at latch time.
     pub fn raise(&mut self, source: IrqSource) {
         let idx = source as usize;
         if idx < self.raise_counts.len() {
             self.raise_counts[idx] = self.raise_counts[idx].saturating_add(1);
         }
-        self.stat |= 1 << (source as u32);
+        let bit = 1u32 << (source as u32);
+        self.stat |= bit;
         self.peak_stat |= self.stat;
     }
 
@@ -147,6 +156,16 @@ impl Irq {
         self.stat_write_count = self.stat_write_count.saturating_add(1);
     }
 
+    /// Like [`write_stat`] but also tags the event with the bus
+    /// cycle. Used by the bus so diagnostics can correlate writes
+    /// against Redux's timeline.
+    pub fn write_stat_at(&mut self, value: u32, cycles: u64) {
+        self.write_stat(value);
+        if self.stat_write_events.len() < 16 {
+            self.stat_write_events.push((cycles, value));
+        }
+    }
+
     /// MMIO write to `I_MASK` — direct overwrite.
     pub fn write_mask(&mut self, value: u32) {
         self.mask = value & Self::VALID_BITS;
@@ -154,6 +173,24 @@ impl Irq {
         if self.mask_write_log.len() < 16 {
             self.mask_write_log.push(value);
         }
+    }
+
+    /// Like [`write_mask`] but tags the event with the bus cycle.
+    pub fn write_mask_at(&mut self, value: u32, cycles: u64) {
+        self.write_mask(value);
+        if self.mask_write_events.len() < 16 {
+            self.mask_write_events.push((cycles, value));
+        }
+    }
+
+    /// First 16 (cycle, value) pairs written to `I_MASK`. Diagnostic.
+    pub fn mask_write_events(&self) -> &[(u64, u32)] {
+        &self.mask_write_events
+    }
+
+    /// First 16 (cycle, value) pairs written to `I_STAT`. Diagnostic.
+    pub fn stat_write_events(&self) -> &[(u64, u32)] {
+        &self.stat_write_events
     }
 
     /// Diagnostic: first 16 values written to I_MASK in order.
@@ -191,17 +228,22 @@ mod tests {
     }
 
     #[test]
-    fn raise_sets_bit_in_stat() {
+    fn raise_latches_regardless_of_mask() {
+        // Real-hardware parity: I_STAT latches the source bit even
+        // when the mask is off; the mask only gates *delivery* (via
+        // `pending`), not *latching*.
         let mut irq = Irq::new();
         irq.raise(IrqSource::VBlank);
         assert_eq!(irq.stat(), 1);
+        assert!(!irq.pending()); // latched but not delivered
+        irq.write_mask(1);
+        assert!(irq.pending()); // mask now enables delivery
     }
 
     #[test]
     fn pending_requires_both_stat_and_mask() {
         let mut irq = Irq::new();
         irq.raise(IrqSource::VBlank);
-        assert!(!irq.pending()); // mask is 0
         irq.write_mask(1);
         assert!(irq.pending());
     }

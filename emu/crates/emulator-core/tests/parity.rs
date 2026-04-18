@@ -26,11 +26,16 @@ fn bios_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_BIOS))
 }
 
-/// Step our CPU for `n` instructions, short-circuiting with the last
-/// good records and the first execution error if we hit an opcode the
-/// emulator doesn't yet decode. The caller can then compare the partial
-/// trace against Redux's full trace to see exactly which opcode we
-/// need to implement next.
+/// Step our CPU for `n` trace records, short-circuiting with the
+/// last good records and the first execution error if we hit an
+/// opcode the emulator doesn't yet decode.
+///
+/// IRQ-handler steps are aggregated into the pre-IRQ record: when
+/// `Cpu::step` returns with `in_isr()` true, we keep stepping
+/// silently until `RFE` clears the flag, carrying forward the final
+/// tick / GPRs into the original record. Mirrors PCSX-Redux's
+/// `debug.cc` early-return on clean IRQ entry, which makes its own
+/// trace skip the handler body.
 fn our_trace(
     bios: Vec<u8>,
     n: usize,
@@ -41,11 +46,41 @@ fn our_trace(
     let mut bus = Bus::new(bios).expect("BIOS size");
     let mut cpu = Cpu::new();
     let mut records = Vec::with_capacity(n);
-    for _ in 0..n {
-        match cpu.step(&mut bus) {
-            Ok(rec) => records.push(rec),
+    while records.len() < n {
+        // Snapshot of the "inside any handler" flag BEFORE the step,
+        // mirroring Redux's `m_wasInISR` captured in `startStepping()`.
+        // Used below to gate IRQ-handler aggregation.
+        let was_in_isr = cpu.in_isr();
+        let mut rec = match cpu.step(&mut bus) {
+            Ok(r) => r,
             Err(e) => return (records, Some(e)),
+        };
+        // Aggregate only when:
+        //   1. We weren't in a handler at the start of this step
+        //      (`!was_in_isr`).
+        //   2. The step ended up in an Interrupt-specific handler
+        //      (`cpu.in_irq_handler()`).
+        // Mirrors Redux's `debug.cc:231-237`: the early-return that
+        // hides the trace body only triggers when `!m_wasInISR &&
+        // m_inISR && cause == 0`. Syscall handlers (cause=8) fall
+        // through to `triggerBP` and get recorded per-instruction,
+        // and nested IRQs entered from RFE (`was_in_isr` true) also
+        // record per-instruction.
+        if !was_in_isr && cpu.in_irq_handler() {
+            while cpu.in_irq_handler() {
+                match cpu.step(&mut bus) {
+                    Ok(r) => {
+                        rec.tick = r.tick;
+                        rec.gprs = r.gprs;
+                    }
+                    Err(e) => {
+                        records.push(rec);
+                        return (records, Some(e));
+                    }
+                }
+            }
         }
+        records.push(rec);
     }
     (records, None)
 }

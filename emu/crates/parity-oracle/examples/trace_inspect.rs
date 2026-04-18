@@ -33,8 +33,8 @@ fn main() {
         let n = lo + i;
         let marker = if n == step { ">>>" } else { "   " };
         println!(
-            "{marker} step={n:>10}  pc=0x{:08x}  instr=0x{:08x}  v0={:08x} v1={:08x} t8={:08x} t9={:08x} k0={:08x} k1={:08x}",
-            r.pc, r.instr, r.gprs[2], r.gprs[3], r.gprs[24], r.gprs[25], r.gprs[26], r.gprs[27],
+            "{marker} step={n:>10}  cyc={:>10}  pc=0x{:08x}  instr=0x{:08x}  v0={:08x} v1={:08x}",
+            r.tick, r.pc, r.instr, r.gprs[2], r.gprs[3],
         );
     }
 }

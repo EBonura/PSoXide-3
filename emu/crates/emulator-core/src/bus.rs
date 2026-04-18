@@ -78,6 +78,14 @@ pub struct Bus {
     /// Phase 4a tracks this but doesn't fire — Phase 4b hangs the
     /// VBlank IRQ off reaching this threshold.
     next_vblank_cycle: u64,
+    /// Scheduled cycle at which DMA6 (OTC) completion fires — clears
+    /// CHCR start/busy bits and raises the DMA IRQ. Mirrors Redux's
+    /// `scheduleGPUOTCDMAIRQ(size)` which delays the visible completion
+    /// by `size` cycles (one per word transferred). The BIOS polls
+    /// CHCR in a loop after kicking OTC; if we clear bits immediately
+    /// the polling loop exits one read earlier than Redux, diverging
+    /// the trace.
+    pending_dma6_completion_cycle: Option<u64>,
     /// Bounded ring buffer of recent MMIO accesses. Zero-sized and
     /// no-op at every call site unless the `trace-mmio` Cargo feature
     /// is enabled — see `mmio_trace.rs` for the rationale.
@@ -147,6 +155,7 @@ impl Bus {
             cdrom: CdRom::new(),
             cycles: 0,
             next_vblank_cycle: FIRST_VBLANK_CYCLE,
+            pending_dma6_completion_cycle: None,
             mmio_trace: MmioTrace::new(),
             hle_bios_enabled: false,
             hle_bios_calls: [[0; 256]; 3],
@@ -220,6 +229,7 @@ impl Bus {
     pub fn tick(&mut self, n: u32) {
         self.cycles = self.cycles.wrapping_add(n as u64);
         self.run_vblank_scheduler();
+        self.run_dma6_scheduler();
         let fired = self.timers.tick(n as u64, HSYNC_CYCLES_NTSC);
         if fired & 1 != 0 {
             self.irq.raise(IrqSource::Timer0);
@@ -233,6 +243,35 @@ impl Bus {
         if self.cdrom.tick(self.cycles) {
             self.irq.raise(IrqSource::Cdrom);
         }
+    }
+
+    /// Mirror of Redux's `gpuotcInterrupt()`: when the scheduled
+    /// completion cycle is reached, clear *only* DMA6 CHCR bit 24
+    /// (`clearDMABusy<6>()` masks `0x01000000`) and raise the channel-6
+    /// IRQ on the master-flag edge. Bit 28 stays set until the BIOS
+    /// IRQ handler writes the next CHCR — that's a real hardware
+    /// detail Redux preserves and we mirror.
+    fn run_dma6_scheduler(&mut self) {
+        let Some(due) = self.pending_dma6_completion_cycle else { return };
+        if self.cycles < due {
+            return;
+        }
+        self.pending_dma6_completion_cycle = None;
+        self.dma.channels[6].channel_control &= !(1 << 24);
+        if self.dma.notify_channel_done(6) {
+            self.irq.raise(IrqSource::Dma);
+        }
+    }
+
+    /// Advance the cycle counter without running peripheral schedulers.
+    /// Used by load/store opcodes to charge the per-data-access cycle
+    /// (Redux's `m_regs.cycle += 1` inside `read8/16/32` and
+    /// `write8/16/32` in `psxmem.cc`). Schedulers still see the
+    /// accumulated cycle count when `tick()` runs at end of instruction
+    /// — matching Redux's `psxBranchTest`, which only runs after delay
+    /// slots and observes the post-BIAS, post-data-access total.
+    pub fn add_cycles(&mut self, n: u32) {
+        self.cycles = self.cycles.wrapping_add(n as u64);
     }
 
     /// Cumulative cycles since reset.
@@ -310,7 +349,15 @@ impl Bus {
     /// DICR per-channel / master enable filtering isn't modeled yet;
     /// the interrupt controller's `I_MASK` is the only gate.
     fn maybe_run_dma(&mut self) {
-        let otc_ran = self.dma.run_otc(&mut self.ram[..]);
+        // OTC: fill the ordering table now, but defer CHCR clear +
+        // IRQ raise to `run_dma6_scheduler` at `cycles + size`. This
+        // keeps the busy bit visible to the BIOS polling loop in the
+        // same way Redux's `scheduleGPUOTCDMAIRQ(size)` does.
+        let otc_words = self.dma.run_otc(&mut self.ram[..]);
+        if otc_words > 0 {
+            self.pending_dma6_completion_cycle =
+                Some(self.cycles.wrapping_add(otc_words as u64));
+        }
         let gpu_ran = self.run_dma_gpu();
         let cdrom_ran = self.run_dma_cdrom();
         // Each channel that completed updates DICR. The IRQ controller
@@ -318,9 +365,6 @@ impl Bus {
         // BIOS handler can identify exactly which channel(s) fired by
         // reading DICR bits 24..30 and ack them via W1C.
         let mut master_edge = false;
-        if otc_ran && self.dma.notify_channel_done(6) {
-            master_edge = true;
-        }
         if gpu_ran && self.dma.notify_channel_done(2) {
             master_edge = true;
         }
@@ -720,11 +764,11 @@ impl Bus {
 
     fn write32_impl(&mut self, virt: u32, phys: u32, value: u32) {
         if phys == IRQ_STAT_ADDR {
-            self.irq.write_stat(value);
+            self.irq.write_stat_at(value, self.cycles);
             return;
         }
         if phys == IRQ_MASK_ADDR {
-            self.irq.write_mask(value);
+            self.irq.write_mask_at(value, self.cycles);
             return;
         }
         if Timers::contains(phys) {
@@ -868,11 +912,11 @@ impl Bus {
         // mask stays 0 and pending() always returns false, so no IRQ
         // exception is ever taken.
         if phys == IRQ_STAT_ADDR {
-            self.irq.write_stat(value as u32);
+            self.irq.write_stat_at(value as u32, self.cycles);
             return;
         }
         if phys == IRQ_MASK_ADDR {
-            self.irq.write_mask(value as u32);
+            self.irq.write_mask_at(value as u32, self.cycles);
             return;
         }
         // Timer registers are 16-bit on hardware.
