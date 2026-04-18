@@ -73,6 +73,10 @@ pub const ENDX_HI_ADDR: u32 = 0x1F80_1D9E;
 const VOICE_ENDX_LATENCY_CYCLES: u64 = 5_000_000;
 
 /// Per-voice register offsets (0..=15 bytes within each voice block).
+/// Only `ADSR_CURRENT` is referenced today (the BIOS polls it); the
+/// rest are documentation placeholders that will become live entry
+/// points once SPU audio synthesis lands.
+#[allow(dead_code)]
 mod voice_offset {
     /// +0..1 volume left.
     pub const VOLUME_L: u32 = 0x0;

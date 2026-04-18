@@ -632,6 +632,11 @@ impl Bus {
         }
     }
 
+    /// Side-effect-free byte read — used by diagnostics (trace
+    /// printer, parity oracle) that must not perturb peripheral
+    /// state. Returns `None` for addresses that aren't backed by
+    /// plain memory (CD-ROM FIFO, timers, etc.); the caller is
+    /// expected to read those through [`Bus::read8`] if needed.
     pub fn try_read8(&self, virt: u32) -> Option<u8> {
         let phys = to_physical(virt);
         if phys < memory::ram::MIRROR_END {
