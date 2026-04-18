@@ -76,6 +76,20 @@ pub struct Gpu {
     /// a primitive's cmd-bit-1 selects semi-transparent; opaque
     /// prims ignore this field.
     tex_blend_mode: BlendMode,
+    /// When true, every plotted pixel gets its mask bit (VRAM bit 15)
+    /// forced to 1. Set by GP0 0xE6 bit 0. Mirrors GPUSTAT bit 11.
+    /// Used by games that want to protect pixels from being
+    /// overwritten by later primitives (combined with
+    /// `mask_check_before_draw`).
+    mask_set_on_draw: bool,
+    /// When true, the rasterizer skips plotting over existing pixels
+    /// whose mask bit (bit 15) is already set. Set by GP0 0xE6 bit
+    /// 1. Mirrors GPUSTAT bit 12. Games commonly pair this with
+    /// `mask_set_on_draw`: first pass sets the mask on important
+    /// sprites (HUD, transparent edges), later prims can't stomp
+    /// them. Without this check, HUDs flicker under overlapping
+    /// backgrounds.
+    mask_check_before_draw: bool,
 
     // --- Display area (GP1 0x05 / 0x06 / 0x07 / 0x08) ---
     /// VRAM X of the top-left pixel of the displayed framebuffer.
@@ -187,6 +201,8 @@ impl Gpu {
             tex_page_y: 0,
             tex_depth: 0,
             tex_blend_mode: BlendMode::Average,
+            mask_set_on_draw: false,
+            mask_check_before_draw: false,
             display_start_x: 0,
             display_start_y: 0,
             display_width: 320,
@@ -469,6 +485,10 @@ impl Gpu {
                 self.display_height_480 = false;
                 self.display_24bpp = false;
                 self.display_configured = false;
+                // Mask flags reset per PSX-SPX (GP1 0x00 clears both).
+                self.mask_set_on_draw = false;
+                self.mask_check_before_draw = false;
+                self.status.raw &= !0x1800;
             }
             // GP1 0x05 — display area start (top-left corner in VRAM).
             //   bits 9:0  = X (pixels)
@@ -629,7 +649,23 @@ impl Gpu {
                 let stat_bits = word & 0x07FF;
                 self.status.raw = (self.status.raw & !0x07FF) | stat_bits;
             }
-            // 0xE2 (texture window), 0xE6 (mask bit): not wired up yet.
+            // GP0 0xE6 — mask-bit setting.
+            //   bit 0 = `mask_set_on_draw`: force bit 15 of every
+            //           plotted pixel to 1 (protect it against
+            //           later draws that check the mask).
+            //   bit 1 = `mask_check_before_draw`: skip pixels whose
+            //           existing VRAM bit 15 is already 1.
+            // Both also surface in GPUSTAT at bits 11 / 12 so
+            // software polls see the updated setting.
+            0xE6 => {
+                self.mask_set_on_draw = word & 1 != 0;
+                self.mask_check_before_draw = word & 2 != 0;
+                let stat_bits = (word & 0x3) << 11;
+                self.status.raw = (self.status.raw & !0x1800) | stat_bits;
+            }
+            // 0xE2 (texture window): not wired up yet — most games
+            // that care set the UV base directly, so the hit rate
+            // is low. Future work.
             _ => {}
         }
     }
@@ -1095,16 +1131,30 @@ impl Gpu {
 
     /// Plot a single 15bpp pixel at `(x, y)`. When `mode == Opaque`
     /// this is a plain VRAM write; otherwise we fetch the existing
-    /// pixel and run the semi-transparency blend. Callers do their
-    /// own draw-area clipping before calling this — it's the hot
-    /// per-pixel path and shouldn't re-check bounds.
+    /// pixel and run the semi-transparency blend.
+    ///
+    /// Also respects the GP0 0xE6 mask-bit flags:
+    /// - If `mask_check_before_draw` is on and the existing VRAM
+    ///   pixel's bit 15 is already set, the plot is dropped (the
+    ///   protected pixel survives).
+    /// - If `mask_set_on_draw` is on, the new pixel is OR'd with
+    ///   bit 15 so subsequent mask checks protect it.
+    ///
+    /// Callers do their own draw-area clipping before calling this
+    /// — it's the hot per-pixel path and shouldn't re-check bounds.
     fn plot_pixel(&mut self, x: u16, y: u16, fg: u16, mode: BlendMode) {
-        let pixel = if mode == BlendMode::Opaque {
+        let existing = self.vram.get_pixel(x, y);
+        if self.mask_check_before_draw && existing & 0x8000 != 0 {
+            return;
+        }
+        let mut pixel = if mode == BlendMode::Opaque {
             fg
         } else {
-            let bg = self.vram.get_pixel(x, y);
-            blend_pixel(bg, fg, mode)
+            blend_pixel(existing, fg, mode)
         };
+        if self.mask_set_on_draw {
+            pixel |= 0x8000;
+        }
         self.vram.set_pixel(x, y, pixel);
     }
 
@@ -1936,5 +1986,63 @@ mod tests {
         assert_eq!(split_tint(0x00123456), (0x56, 0x34, 0x12));
         assert_eq!(split_tint(0x00FFFFFF), (0xFF, 0xFF, 0xFF));
         assert_eq!(split_tint(0x0080_8080), RAW_TEXTURE_TINT);
+    }
+
+    #[test]
+    fn gp0_e6_sets_mask_flags() {
+        let mut gpu = Gpu::new();
+        gpu.write32(GP0_ADDR, 0xE600_0000); // both clear
+        assert!(!gpu.mask_set_on_draw);
+        assert!(!gpu.mask_check_before_draw);
+        gpu.write32(GP0_ADDR, 0xE600_0001); // set-on-draw only
+        assert!(gpu.mask_set_on_draw);
+        assert!(!gpu.mask_check_before_draw);
+        gpu.write32(GP0_ADDR, 0xE600_0003); // both on
+        assert!(gpu.mask_set_on_draw);
+        assert!(gpu.mask_check_before_draw);
+        // GPUSTAT bits 11 (set-on-draw) + 12 (check-before-draw)
+        // mirror the flag state.
+        let stat = gpu.read32(GP1_ADDR).unwrap();
+        assert_eq!(stat & 0x1800, 0x1800);
+    }
+
+    #[test]
+    fn plot_pixel_respects_set_mask_on_draw() {
+        let mut gpu = Gpu::new();
+        gpu.write32(GP0_ADDR, 0xE600_0001); // set-on-draw
+        gpu.plot_pixel(10, 10, 0x1234, BlendMode::Opaque);
+        // The drawn pixel should have bit 15 forced to 1.
+        assert_eq!(gpu.vram.get_pixel(10, 10) & 0x8000, 0x8000);
+    }
+
+    #[test]
+    fn plot_pixel_skips_when_mask_check_sees_masked_pixel() {
+        let mut gpu = Gpu::new();
+        // Pre-mark (20, 20) as masked.
+        gpu.vram.set_pixel(20, 20, 0x8000 | 0x1234);
+        gpu.write32(GP0_ADDR, 0xE600_0002); // check-before-draw
+        gpu.plot_pixel(20, 20, 0x5678, BlendMode::Opaque);
+        // Drop: original pixel survives.
+        assert_eq!(gpu.vram.get_pixel(20, 20), 0x8000 | 0x1234);
+    }
+
+    #[test]
+    fn plot_pixel_draws_when_mask_check_sees_unmasked_pixel() {
+        let mut gpu = Gpu::new();
+        gpu.vram.set_pixel(30, 30, 0x1234); // mask bit clear
+        gpu.write32(GP0_ADDR, 0xE600_0002); // check-before-draw
+        gpu.plot_pixel(30, 30, 0x5678, BlendMode::Opaque);
+        assert_eq!(gpu.vram.get_pixel(30, 30), 0x5678);
+    }
+
+    #[test]
+    fn gp1_reset_clears_mask_flags() {
+        let mut gpu = Gpu::new();
+        gpu.write32(GP0_ADDR, 0xE600_0003); // both on
+        gpu.write32(GP1_ADDR, 0x0000_0000); // GP1 reset
+        assert!(!gpu.mask_set_on_draw);
+        assert!(!gpu.mask_check_before_draw);
+        let stat = gpu.read32(GP1_ADDR).unwrap();
+        assert_eq!(stat & 0x1800, 0);
     }
 }
