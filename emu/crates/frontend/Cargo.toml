@@ -7,10 +7,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-emulator-core = { workspace = true }
-psx-iso       = { workspace = true }
-psx-trace     = { workspace = true }
+emulator-core    = { workspace = true }
+psoxide-settings = { workspace = true }
+psx-iso          = { workspace = true }
+psx-trace        = { workspace = true }
 
+clap       = { workspace = true }
 winit      = { workspace = true }
 wgpu       = { workspace = true }
 egui       = { workspace = true }

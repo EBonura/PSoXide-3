@@ -1,0 +1,19 @@
+[package]
+name = "psoxide-settings"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PSoXide on-disk settings, library cache, and save-state file formats. Pure logic — no GUI/wgpu deps, so it's usable from both the frontend and headless CLIs, and fully testable without a window."
+
+[dependencies]
+psx-iso     = { workspace = true }
+serde       = { workspace = true }
+thiserror   = { workspace = true }
+ron         = { workspace = true }
+postcard    = { workspace = true }
+directories = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

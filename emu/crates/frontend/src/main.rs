@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 mod app;
+mod cli;
 mod disasm;
 mod gfx;
 mod icons;
@@ -19,6 +20,7 @@ mod ui;
 use std::sync::Arc;
 use std::time::Instant;
 
+use clap::Parser;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -26,6 +28,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::app::AppState;
+use crate::cli::Cli;
 use crate::gfx::Graphics;
 use crate::ui::{menu::MenuInput, MenuOutcome};
 
@@ -35,6 +38,19 @@ const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 800;
 
 fn main() {
+    // Argument parsing first — if a subcommand is present, we
+    // dispatch through the headless CLI and never open a window.
+    // Clap's derive API panics with a nicely-formatted message on
+    // bad arguments, which is exactly what a CLI user expects.
+    let cli = Cli::parse();
+    if cli.command.is_some() {
+        if let Err(e) = cli::run(cli) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
