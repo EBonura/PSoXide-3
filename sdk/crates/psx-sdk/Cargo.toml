@@ -11,6 +11,7 @@ psx-hw  = { workspace = true }
 psx-io  = { path = "../psx-io" }
 psx-rt  = { path = "../psx-rt" }
 psx-gpu = { path = "../psx-gpu" }
+psx-gte = { path = "../psx-gte" }
 psx-pad = { path = "../psx-pad" }
 
 [features]
