@@ -492,6 +492,10 @@ impl Bus {
                     // frame boundaries. Matches Redux's
                     // `SoftGPU::vblank` which XORs the same bit.
                     self.gpu.toggle_vblank_field();
+                    // Tell the timer bank — Timer 1 sync-mode-3
+                    // unlocks on this pulse, sync-mode-1 resets
+                    // its counter.
+                    self.timers.notify_vblank();
                     // Re-arm the next VBlank from the original
                     // target, not `now`. A 500K-cycle drain lag
                     // would otherwise accumulate drift every time.

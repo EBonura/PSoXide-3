@@ -37,6 +37,16 @@ pub struct Timer {
 }
 
 // Mode-register bit layout (nocash PSX-SPX, section "Timers").
+/// bit 0: sync enable. When set, the timer obeys the sync-mode
+/// bits below; when clear, the timer is "free-run" (pure clock).
+const MODE_SYNC_ENABLE: u32 = 1 << 0;
+/// bits 1..2: sync mode. Meaning depends on the timer index:
+/// - Timer 0 (HBlank-synced): 0=pause in HBlank, 1=reset at HBlank,
+///   2=reset+pause, 3=pause until HBlank then free-run.
+/// - Timer 1 (VBlank-synced): same four modes.
+/// - Timer 2: modes 0/3 free-run, modes 1/2 stop counter.
+#[allow(dead_code)]
+const MODE_SYNC_MODE_MASK: u32 = 0x6;
 /// bit 3: reset counter when reaching target (0 = reset at 0xFFFF).
 const MODE_RESET_AT_TARGET: u32 = 1 << 3;
 /// bit 4: raise IRQ when target reached.
@@ -57,6 +67,12 @@ const MODE_REACHED_WRAP: u32 = 1 << 12;
 pub struct Timers {
     /// Per-counter state. Index 0 / 1 / 2 corresponds to Timer 0 / 1 / 2.
     pub timers: [Timer; 3],
+    /// Has a VBlank fired since the most recent Timer 1 mode
+    /// write? Timer 1 with sync-mode-3 (pause until VBlank) uses
+    /// this to unlock the counter on the first VBlank after a
+    /// mode write. Cleared by `set_mode_for_timer1` (implicit via
+    /// write_mode); set by `notify_vblank`.
+    vblank_seen: bool,
 }
 
 impl Timers {
@@ -105,6 +121,12 @@ impl Timers {
                 t.accum = 0;
                 t.last_reset_cycle = now;
                 t.mode_write_count = t.mode_write_count.saturating_add(1);
+                // A mode write on Timer 1 re-arms the VBlank-wait
+                // latch — sync-mode-3 needs to re-pause until the
+                // next VBlank after each reconfig.
+                if idx == 1 {
+                    self.vblank_seen = false;
+                }
             }
             0x8 => t.target = v16,
             _ => {}
@@ -132,6 +154,46 @@ impl Timers {
         fired
     }
 
+    /// Is this timer currently paused per its sync-mode bits?
+    ///
+    /// We don't have per-pixel or per-scanline state, so timer 0's
+    /// HBlank modes fall back to "never paused" (most accurate for
+    /// a typical game: HBlank is a brief window each scanline, so
+    /// "pause in HBlank" = rarely paused). Timer 1 sync-mode-3
+    /// ("pause until VBlank") respects `vblank_seen`; sync-mode-0
+    /// ("pause in VBlank") falls back to "never paused" for the
+    /// same reason — VBlank is a ~10% duty cycle window. Timer 2
+    /// modes 1/2 are honest-pauses.
+    fn is_timer_paused(&self, idx: usize) -> bool {
+        let t = &self.timers[idx];
+        if t.mode & MODE_SYNC_ENABLE == 0 {
+            return false;
+        }
+        let sync = (t.mode >> 1) & 3;
+        match (idx, sync) {
+            // Timer 1 sync-mode-3: pause until first VBlank after
+            // mode write.
+            (1, 3) => !self.vblank_seen,
+            // Timer 2 sync-mode-1 / 2: stop counter.
+            (2, 1) | (2, 2) => true,
+            _ => false,
+        }
+    }
+
+    /// Pulse a VBlank event to the timer bank. Called by the bus
+    /// when `EventSlot::VBlank` fires. Timer 1 with sync-mode-3
+    /// ("pause until VBlank, then free-run") unlocks on this pulse;
+    /// sync-mode-1 ("reset at VBlank") resets its counter to 0.
+    pub fn notify_vblank(&mut self) {
+        self.vblank_seen = true;
+        // Sync-mode-1 for Timer 1: reset on VBlank.
+        let t1 = &mut self.timers[1];
+        if t1.mode & MODE_SYNC_ENABLE != 0 && ((t1.mode >> 1) & 3) == 1 {
+            t1.counter = 0;
+            t1.accum = 0;
+        }
+    }
+
     fn advance_timer(
         &mut self,
         idx: usize,
@@ -139,6 +201,13 @@ impl Timers {
         hsync_period: u64,
         dot_clock_divisor: u64,
     ) -> bool {
+        // Sync-mode gating — decide whether this timer is
+        // currently paused.
+        let paused = self.is_timer_paused(idx);
+        if paused {
+            return false;
+        }
+
         let t = &mut self.timers[idx];
         let source = (t.mode >> 8) & 0x3;
 
@@ -310,5 +379,48 @@ mod tests {
         // Divisor changes shouldn't matter at system-clock source.
         t.tick(100, 2146, 8);
         assert_eq!(t.read32(0x1F80_1100) & 0xFFFF, 100);
+    }
+
+    #[test]
+    fn timer1_sync_mode_3_pauses_until_vblank() {
+        let mut t = Timers::new();
+        // Sync enable + sync mode 3 (pause until VBlank).
+        t.write32(0x1F80_1114, MODE_SYNC_ENABLE | (3 << 1), 0);
+        // Ticks before VBlank should not advance the counter.
+        t.tick(500, 2146, 8);
+        assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 0);
+        // VBlank pulse unpauses it.
+        t.notify_vblank();
+        t.tick(500, 2146, 8);
+        assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 500);
+    }
+
+    #[test]
+    fn timer1_sync_mode_1_resets_on_vblank() {
+        let mut t = Timers::new();
+        // Sync enable + sync mode 1 (reset at VBlank).
+        t.write32(0x1F80_1114, MODE_SYNC_ENABLE | (1 << 1), 0);
+        t.tick(200, 2146, 8);
+        assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 200);
+        t.notify_vblank();
+        assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 0);
+    }
+
+    #[test]
+    fn timer2_sync_mode_1_stops_counter() {
+        let mut t = Timers::new();
+        // Sync enable + sync mode 1 on Timer 2 = stop counter.
+        t.write32(0x1F80_1124, MODE_SYNC_ENABLE | (1 << 1), 0);
+        t.tick(100, 2146, 8);
+        assert_eq!(t.read32(0x1F80_1120) & 0xFFFF, 0);
+    }
+
+    #[test]
+    fn timer2_sync_mode_0_free_runs() {
+        let mut t = Timers::new();
+        // Sync enable + sync mode 0 on Timer 2 = free-run.
+        t.write32(0x1F80_1124, MODE_SYNC_ENABLE, 0);
+        t.tick(100, 2146, 8);
+        assert_eq!(t.read32(0x1F80_1120) & 0xFFFF, 100);
     }
 }
