@@ -326,17 +326,95 @@ impl Gpu {
         let vram_h = crate::VRAM_HEIGHT as u16;
         let effective_h = da.height.min(vram_h.saturating_sub(da.y));
         let effective_w = da.width.min(vram_w.saturating_sub(da.x));
-        for dy in 0..effective_h {
-            for dx in 0..effective_w {
-                let pixel = self.vram.get_pixel(da.x + dx, da.y + dy);
-                for b in pixel.to_le_bytes() {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(0x0100_0000_01B3);
-                    byte_len += 1;
+        let mut fold = |b: u8, byte_len: &mut usize| {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01B3);
+            *byte_len += 1;
+        };
+        if da.bpp24 {
+            // 24-bit mode: each pixel is 3 bytes packed in VRAM. A row
+            // of W 24-bit pixels occupies W*3 bytes = 1.5 * W 16-bit
+            // words. We read per-byte to span the straddles.
+            for dy in 0..effective_h {
+                for dx in 0..effective_w {
+                    let (r, g, b) = self.read_pixel_rgb24(da.x + dx, da.y + dy);
+                    fold(r, &mut byte_len);
+                    fold(g, &mut byte_len);
+                    fold(b, &mut byte_len);
+                }
+            }
+        } else {
+            for dy in 0..effective_h {
+                for dx in 0..effective_w {
+                    let pixel = self.vram.get_pixel(da.x + dx, da.y + dy);
+                    for b in pixel.to_le_bytes() {
+                        fold(b, &mut byte_len);
+                    }
                 }
             }
         }
         (h, effective_w as u32, effective_h as u32, byte_len)
+    }
+
+    /// Read one 24-bit display pixel. VRAM bytes are packed: pixel
+    /// N lives at byte offsets `3*N..3*N+2` within a row, and each
+    /// row is 2048 bytes (1024 × 16-bit). The three bytes may
+    /// straddle two VRAM halfwords — we read them individually.
+    fn read_pixel_rgb24(&self, x: u16, y: u16) -> (u8, u8, u8) {
+        let byte_x = (x as u32) * 3;
+        let word_x = (byte_x / 2) as u16;
+        let even = byte_x & 1 == 0;
+        let w0 = self.vram.get_pixel(word_x, y);
+        let w1 = self.vram.get_pixel(word_x.wrapping_add(1), y);
+        if even {
+            let r = (w0 & 0xFF) as u8;
+            let g = (w0 >> 8) as u8;
+            let b = (w1 & 0xFF) as u8;
+            (r, g, b)
+        } else {
+            let r = (w0 >> 8) as u8;
+            let g = (w1 & 0xFF) as u8;
+            let b = (w1 >> 8) as u8;
+            (r, g, b)
+        }
+    }
+
+    /// Produce a row-major `RGBA8` buffer of the current display area.
+    /// In 16-bit mode the 5-bit channels are bit-replicated to 8-bit;
+    /// in 24-bit mode the packed RGB888 triplets are used directly.
+    /// Alpha is always 0xFF. Size = `width * height * 4` bytes.
+    ///
+    /// Used by the frontend to upload a display texture — a single
+    /// format regardless of the PS1's current bpp, so the wgpu
+    /// path doesn't need to branch.
+    pub fn display_rgba8(&self) -> (Vec<u8>, u32, u32) {
+        let da = self.display_area();
+        let vram_w = crate::VRAM_WIDTH as u16;
+        let vram_h = crate::VRAM_HEIGHT as u16;
+        let eff_h = da.height.min(vram_h.saturating_sub(da.y));
+        let eff_w = da.width.min(vram_w.saturating_sub(da.x));
+        let mut out = Vec::with_capacity((eff_w as usize) * (eff_h as usize) * 4);
+        for dy in 0..eff_h {
+            for dx in 0..eff_w {
+                if da.bpp24 {
+                    let (r, g, b) = self.read_pixel_rgb24(da.x + dx, da.y + dy);
+                    out.extend_from_slice(&[r, g, b, 0xFF]);
+                } else {
+                    let pixel = self.vram.get_pixel(da.x + dx, da.y + dy);
+                    let r = ((pixel & 0x1F) as u8) << 3;
+                    let g = (((pixel >> 5) & 0x1F) as u8) << 3;
+                    let b = (((pixel >> 10) & 0x1F) as u8) << 3;
+                    // Replicate high 3 bits into low 3 for fuller range.
+                    out.extend_from_slice(&[
+                        r | (r >> 5),
+                        g | (g >> 5),
+                        b | (b >> 5),
+                        0xFF,
+                    ]);
+                }
+            }
+        }
+        (out, eff_w as u32, eff_h as u32)
     }
 
     /// Total GP0 writes received since reset. Diagnostic counter.
