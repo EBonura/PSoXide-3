@@ -311,6 +311,17 @@ impl Bus {
         self.sio0.set_port1_buttons(buttons);
     }
 
+    /// Update the analog-stick positions on the port-1
+    /// controller. Each axis is `0..=255` with `0x80` = centre.
+    /// No-op when no pad is attached to port 1. The stick values
+    /// are only observed by games once the pad is in Analog mode
+    /// (which they enter via the DualShock config protocol).
+    pub fn set_port1_sticks(&mut self, right_x: u8, right_y: u8, left_x: u8, left_y: u8) {
+        if let Some(pad) = self.sio0.port1_mut().pad_mut() {
+            pad.set_sticks(right_x, right_y, left_x, left_y);
+        }
+    }
+
     /// Snapshot of the port-1 DualShock vibration-motor state:
     /// `(small_on, big_strength)` where `small_on` is a binary
     /// on/off and `big_strength` is 0..=255. Returns `(false, 0)`
