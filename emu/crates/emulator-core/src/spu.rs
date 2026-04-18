@@ -622,22 +622,22 @@ pub struct Spu {
     /// Data transfer control (usually 0x0004). Stored for round-trip.
     transfer_ctrl: u16,
 
-    /// Main output volume Left (Q14).
-    main_vol_l: i16,
-    /// Main output volume Right (Q14).
-    main_vol_r: i16,
+    /// Main output volume Left.
+    main_vol_l: VolumeEnvelope,
+    /// Main output volume Right.
+    main_vol_r: VolumeEnvelope,
     /// Reverb output volume Left.
-    reverb_vol_l: i16,
+    reverb_vol_l: VolumeEnvelope,
     /// Reverb output volume Right.
-    reverb_vol_r: i16,
+    reverb_vol_r: VolumeEnvelope,
     /// CD audio input volume Left.
-    cd_vol_l: i16,
+    cd_vol_l: VolumeEnvelope,
     /// CD audio input volume Right.
-    cd_vol_r: i16,
+    cd_vol_r: VolumeEnvelope,
     /// External audio input volume Left.
-    ext_vol_l: i16,
+    ext_vol_l: VolumeEnvelope,
     /// External audio input volume Right.
-    ext_vol_r: i16,
+    ext_vol_r: VolumeEnvelope,
     /// Reverb work-area start (byte address).
     reverb_base: u32,
 
@@ -732,14 +732,14 @@ impl Spu {
             transfer_addr: 0,
             transfer_addr_raw: 0,
             transfer_ctrl: 0x0004,
-            main_vol_l: 0,
-            main_vol_r: 0,
-            reverb_vol_l: 0,
-            reverb_vol_r: 0,
-            cd_vol_l: 0,
-            cd_vol_r: 0,
-            ext_vol_l: 0,
-            ext_vol_r: 0,
+            main_vol_l: VolumeEnvelope::new(),
+            main_vol_r: VolumeEnvelope::new(),
+            reverb_vol_l: VolumeEnvelope::new(),
+            reverb_vol_r: VolumeEnvelope::new(),
+            cd_vol_l: VolumeEnvelope::new(),
+            cd_vol_r: VolumeEnvelope::new(),
+            ext_vol_l: VolumeEnvelope::new(),
+            ext_vol_r: VolumeEnvelope::new(),
             reverb_base: 0,
             kon_raw: 0,
             kon_pending: 0,
@@ -921,10 +921,10 @@ impl Spu {
             return self.read_voice_reg(v, off);
         }
         match phys {
-            MAIN_VOL_L | CURRENT_MAIN_VOL_L => self.main_vol_l as u16,
-            MAIN_VOL_R | CURRENT_MAIN_VOL_R => self.main_vol_r as u16,
-            REVERB_VOL_L => self.reverb_vol_l as u16,
-            REVERB_VOL_R => self.reverb_vol_r as u16,
+            MAIN_VOL_L | CURRENT_MAIN_VOL_L => self.main_vol_l.reg_read(),
+            MAIN_VOL_R | CURRENT_MAIN_VOL_R => self.main_vol_r.reg_read(),
+            REVERB_VOL_L => self.reverb_vol_l.reg_read(),
+            REVERB_VOL_R => self.reverb_vol_r.reg_read(),
             KON_LO => self.kon_raw as u16,
             KON_HI => (self.kon_raw >> 16) as u16,
             KOFF_LO => self.koff_raw as u16,
@@ -944,10 +944,10 @@ impl Spu {
             SPUCNT => self.spucnt,
             TRANSFER_CTRL => self.transfer_ctrl,
             SPUSTAT => self.spustat(),
-            CD_VOL_L => self.cd_vol_l as u16,
-            CD_VOL_R => self.cd_vol_r as u16,
-            EXT_VOL_L => self.ext_vol_l as u16,
-            EXT_VOL_R => self.ext_vol_r as u16,
+            CD_VOL_L => self.cd_vol_l.reg_read(),
+            CD_VOL_R => self.cd_vol_r.reg_read(),
+            EXT_VOL_L => self.ext_vol_l.reg_read(),
+            EXT_VOL_R => self.ext_vol_r.reg_read(),
             a if (REVERB_CFG_BASE..REVERB_CFG_BASE + 64).contains(&a) => {
                 let idx = ((a - REVERB_CFG_BASE) >> 1) as usize;
                 self.reverb_cfg[idx]
@@ -969,10 +969,10 @@ impl Spu {
             return;
         }
         match phys {
-            MAIN_VOL_L => self.main_vol_l = decode_volume(value),
-            MAIN_VOL_R => self.main_vol_r = decode_volume(value),
-            REVERB_VOL_L => self.reverb_vol_l = value as i16,
-            REVERB_VOL_R => self.reverb_vol_r = value as i16,
+            MAIN_VOL_L => self.main_vol_l.write(value),
+            MAIN_VOL_R => self.main_vol_r.write(value),
+            REVERB_VOL_L => self.reverb_vol_l.write(value),
+            REVERB_VOL_R => self.reverb_vol_r.write(value),
             KON_LO => self.queue_kon(value, 0),
             KON_HI => self.queue_kon(value, 16),
             KOFF_LO => self.queue_koff(value, 0),
@@ -995,10 +995,10 @@ impl Spu {
             SPUCNT => self.write_spucnt(value),
             TRANSFER_CTRL => self.transfer_ctrl = value,
             SPUSTAT => { /* read-only — writes dropped */ }
-            CD_VOL_L => self.cd_vol_l = value as i16,
-            CD_VOL_R => self.cd_vol_r = value as i16,
-            EXT_VOL_L => self.ext_vol_l = value as i16,
-            EXT_VOL_R => self.ext_vol_r = value as i16,
+            CD_VOL_L => self.cd_vol_l.write(value),
+            CD_VOL_R => self.cd_vol_r.write(value),
+            EXT_VOL_L => self.ext_vol_l.write(value),
+            EXT_VOL_R => self.ext_vol_r.write(value),
             a if (REVERB_CFG_BASE..REVERB_CFG_BASE + 64).contains(&a) => {
                 let idx = ((a - REVERB_CFG_BASE) >> 1) as usize;
                 self.reverb_cfg[idx] = value;
@@ -1203,12 +1203,21 @@ impl Spu {
         //     actual register updates).
         self.noise_tick();
 
-        // 1c. Advance per-voice volume envelopes (static registers
-        //     are no-ops; sweep-configured registers animate).
+        // 1c. Advance every volume envelope — per-voice L/R + the
+        //     five global stereo pairs. Static-mode writes are
+        //     no-ops; sweep-configured registers animate.
         for v in 0..NUM_VOICES {
             self.voices[v].vol_l.tick();
             self.voices[v].vol_r.tick();
         }
+        self.main_vol_l.tick();
+        self.main_vol_r.tick();
+        self.cd_vol_l.tick();
+        self.cd_vol_r.tick();
+        self.ext_vol_l.tick();
+        self.ext_vol_r.tick();
+        self.reverb_vol_l.tick();
+        self.reverb_vol_r.tick();
 
         // 2. For each voice, step envelope + ADPCM playback, accumulate
         //    stereo contribution.
@@ -1228,8 +1237,8 @@ impl Spu {
         if let Some((cd_l, cd_r)) = self.cd_audio_in.pop_front() {
             // CD_VOL regs are Q15 signed — range -0x8000..=0x7FFF.
             // `>> 15` brings them back to i16 scale.
-            let cl = ((cd_l as i32) * self.cd_vol_l as i32) >> 15;
-            let cr = ((cd_r as i32) * self.cd_vol_r as i32) >> 15;
+            let cl = ((cd_l as i32) * self.cd_vol_l.current as i32) >> 15;
+            let cr = ((cd_r as i32) * self.cd_vol_r.current as i32) >> 15;
             sum_l = sum_l.saturating_add(cl);
             sum_r = sum_r.saturating_add(cr);
         }
@@ -1238,8 +1247,8 @@ impl Spu {
         // round-trip reads only.
 
         // 4. Apply main volume (Q14) and saturate.
-        let out_l = saturate_i16((sum_l * self.main_vol_l as i32) >> 14);
-        let out_r = saturate_i16((sum_r * self.main_vol_r as i32) >> 14);
+        let out_l = saturate_i16((sum_l * self.main_vol_l.current as i32) >> 14);
+        let out_r = saturate_i16((sum_r * self.main_vol_r.current as i32) >> 14);
 
         // 5. Push to output ring, discarding oldest if full.
         if self.audio_out.len() >= OUTPUT_BUFFER_CAP {
@@ -1529,32 +1538,11 @@ pub fn xa_decode_block(
 //  Helpers.
 // ===============================================================
 
-/// Parse a volume register value into a signed Q14 level.
-///
-/// Two modes:
-/// - Bit 15 clear → static level: bits 0..=13 are the unsigned Q14
-///   magnitude (0x3FFF = near unity). Bit 14 set means phase-inverted
-///   (flip the sign).
-/// - Bit 15 set → sweep config. We don't animate; approximate by
-///   scaling the sweep's step field so voices with sweep enabled at
-///   least produce audible output.
-fn decode_volume(raw: u16) -> i16 {
-    if raw & 0x8000 != 0 {
-        // Sweep mode — approximate by taking bits 0..=6 (sweep rate)
-        // as the magnitude and scaling to Q14. Direction + phase bits
-        // are ignored; a zero sweep rate still contributes zero volume.
-        let mag = (raw & 0x7F) as i16;
-        mag.saturating_mul(0x80) // scale 0..127 → 0..0x3F80 (near Q14 max)
-    } else {
-        // Static mode. Phase-invert flag (bit 14) flips sign.
-        let level = (raw & 0x3FFF) as i16;
-        if raw & 0x4000 != 0 {
-            -level
-        } else {
-            level
-        }
-    }
-}
+// `decode_volume` has been subsumed by `VolumeEnvelope::write`, which
+// both snaps static levels AND starts sweep animations. The per-
+// write decode + animate path is now centralised so every volume
+// register (voice L/R × 24, main L/R, CD L/R, ext L/R, reverb L/R)
+// shares the same behaviour.
 
 /// Decode a voice-bank byte address into `(voice_index, byte_offset)`.
 fn decode_voice(phys: u32) -> Option<(usize, u32)> {
@@ -1939,8 +1927,10 @@ mod tests {
     #[test]
     fn silent_spu_outputs_zero() {
         let mut s = Spu::new();
-        s.main_vol_l = 0x4000;
-        s.main_vol_r = 0x4000;
+        // 0x3FFF = max static volume (bits 0..=13 all set, bits
+        // 14/15 clear → no phase-invert, no sweep).
+        s.main_vol_l.write(0x3FFF);
+        s.main_vol_r.write(0x3FFF);
         s.tick_sample(SAMPLE_CYCLES);
         let out = s.drain_audio();
         assert_eq!(out, vec![(0, 0)]);
@@ -1949,8 +1939,8 @@ mod tests {
     #[test]
     fn silent_voice_contributes_zero_even_with_main_volume() {
         let mut s = Spu::new();
-        s.main_vol_l = 0x3FFF;
-        s.main_vol_r = 0x3FFF;
+        s.main_vol_l.write(0x3FFF);
+        s.main_vol_r.write(0x3FFF);
         for _ in 0..10 {
             s.tick_sample(SAMPLE_CYCLES);
         }
@@ -1961,10 +1951,10 @@ mod tests {
     #[test]
     fn cd_audio_input_flows_through_main_volume() {
         let mut s = Spu::new();
-        s.main_vol_l = 0x4000;
-        s.main_vol_r = 0x4000;
-        s.cd_vol_l = 0x4000; // ~ half at Q15 (0x4000 / 0x8000 = 0.5)
-        s.cd_vol_r = 0x4000;
+        s.main_vol_l.write(0x3FFF);
+        s.main_vol_r.write(0x3FFF);
+        s.cd_vol_l.write(0x3FFF);
+        s.cd_vol_r.write(0x3FFF);
         // Push one stereo sample and tick.
         s.feed_cd_audio(&[(0x4000, 0x4000)]);
         s.tick_sample(SAMPLE_CYCLES);
@@ -2043,18 +2033,12 @@ mod tests {
     // -- Volume register decoding --
 
     #[test]
-    fn decode_volume_static_mode() {
-        assert_eq!(decode_volume(0x0000), 0);
-        assert_eq!(decode_volume(0x3FFF), 0x3FFF);
-        // Phase-invert (bit 14).
-        assert_eq!(decode_volume(0x4100), -0x100);
-    }
-
-    #[test]
-    fn decode_volume_sweep_mode_nonzero_when_rate_set() {
-        // Sweep mode (bit 15 set) with a nonzero rate should produce a
-        // nonzero magnitude (approximation).
-        assert_ne!(decode_volume(0x8040), 0);
+    fn volume_envelope_write_static_level() {
+        let mut env = VolumeEnvelope::new();
+        env.write(0x3FFF);
+        assert_eq!(env.current, 0x3FFF);
+        env.write(0x4100);
+        assert_eq!(env.current, -0x100);
     }
 
     // -- Output buffer cap --
