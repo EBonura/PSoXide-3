@@ -57,9 +57,12 @@ pub struct Bus {
     /// GPU — owns VRAM and handles the GP0/GP1 MMIO ports. The
     /// frontend's VRAM viewer reads `bus.gpu.vram` directly.
     pub gpu: Gpu,
-    /// SPU — phase 3a scope: just `SPUCNT` + `SPUSTAT`. Everything
-    /// else SPU-related still round-trips through the echo buffer.
-    spu: Spu,
+    /// SPU — full 24-voice ADPCM synthesis, ADSR envelopes, stereo
+    /// mixing at 44.1 kHz. Output drains into `spu.audio_out`; the
+    /// frontend pulls samples every frame via [`Spu::drain_audio`].
+    /// Public so the frontend can access the audio queue + tests can
+    /// inspect voice state directly.
+    pub spu: Spu,
     /// SIO0 — controller / memory-card port. Currently models a cold
     /// port with nothing connected; enough to satisfy BIOS init polls.
     sio0: Sio0,
@@ -173,6 +176,18 @@ impl Bus {
                 // of `EventSlot::VBlank` in `drain_scheduler_events`
                 // reschedules the next one.
                 s.schedule(crate::scheduler::EventSlot::VBlank, 0, FIRST_VBLANK_CYCLE);
+                // NOTE: SPU scheduler seed is deliberately *not* here.
+                // Reason: Redux's SPU runs in a detached `std::thread`
+                // that doesn't run during the parity-oracle trace. If
+                // we tick the SPU on every 768th cycle during the same
+                // window, our ADSR advances (envelope non-zero,
+                // voice_on_cycle bookkeeping) while Redux's stays
+                // frozen — and downstream SPU reads diverge. Until
+                // the parity oracle learns to pump Redux's SPU thread
+                // synchronously, we leave SPU synthesis dormant during
+                // CPU execution and pump it on demand from the
+                // frontend's per-frame audio callback instead. See
+                // `Spu::seed_scheduler` + `Bus::run_spu_samples`.
                 s
             },
             mmio_trace: MmioTrace::new(),
@@ -359,6 +374,14 @@ impl Bus {
                     self.scheduler
                         .schedule(EventSlot::VBlank, target, VBLANK_PERIOD_CYCLES);
                 }
+                EventSlot::SpuAsync => {
+                    // Kept for forward compatibility; we pump the SPU
+                    // from the frontend instead of the scheduler while
+                    // the parity oracle runs with a dormant SPU
+                    // thread. If anything schedules this slot it is
+                    // a logic bug — log and drop.
+                    debug_assert!(false, "SpuAsync fired but SPU pumps from frontend");
+                }
                 // Not-yet-migrated slots. A subsystem scheduling one
                 // of these today would silently do nothing; they're
                 // listed so `match` stays exhaustive as migrations
@@ -369,8 +392,7 @@ impl Bus {
                 | EventSlot::CdRead
                 | EventSlot::CdrPlay
                 | EventSlot::CdrDbuf
-                | EventSlot::CdrLid
-                | EventSlot::SpuAsync => {}
+                | EventSlot::CdrLid => {}
             }
         }
         if dma_edge {
@@ -444,6 +466,25 @@ impl Bus {
     /// [`Bus::tick`] → [`Bus::drain_scheduler_events`].
     pub fn run_vblank_scheduler(&mut self) {
         self.drain_scheduler_events();
+    }
+
+    /// Pump the SPU forward by `n` samples. Called by the frontend
+    /// once per displayed frame (or when the audio callback drains
+    /// the output ring), producing stereo output for playback.
+    ///
+    /// We decouple SPU timing from the CPU's cycle counter to stay
+    /// bit-exact with the Redux parity oracle: Redux's SPU runs in
+    /// a background thread that doesn't tick during the trace, so
+    /// ticking on every 768th cycle diverges. Callers supply a
+    /// sample count that matches their display refresh cadence
+    /// (e.g. 735 samples per NTSC frame at 44.1 kHz).
+    pub fn run_spu_samples(&mut self, n: usize) {
+        for _ in 0..n {
+            self.spu.tick_sample(self.cycles);
+            if self.spu.take_irq_pending() {
+                self.irq.raise(IrqSource::Spu);
+            }
+        }
     }
 
     /// Borrow the interrupt controller — caller can `.raise()` sources
@@ -527,6 +568,86 @@ impl Bus {
             self.scheduler
                 .schedule(EventSlot::CdrDma, self.cycles, cdrom_words as u64);
         }
+        if let Some(spu_words) = self.run_dma_spu() {
+            self.scheduler
+                .schedule(EventSlot::SpuDma, self.cycles, spu_words as u64);
+        }
+    }
+
+    /// Execute DMA channel 4 ↔ SPU. Sync mode 1 (block) is the only
+    /// mode games use; mode 0 (manual) falls through as a single-block
+    /// transfer with BCR as the total word count (matches Redux). The
+    /// SPU's transfer pointer tracks the current RAM-side address; we
+    /// copy halfword-pairs in the direction the channel selects.
+    ///
+    /// - Direction bit 0 = 1: main RAM → SPU RAM (normal — upload sample data).
+    /// - Direction bit 0 = 0: SPU RAM → main RAM (rare — live capture).
+    ///
+    /// CHCR start/busy bits are NOT cleared here; the completion
+    /// handler in `drain_scheduler_events` does that at the scheduled
+    /// cycle (one tick per word transferred, matching Redux's
+    /// `scheduleSPUDMAIRQ(size)`).
+    fn run_dma_spu(&mut self) -> Option<u32> {
+        let ch = &self.dma.channels[4];
+        if (ch.channel_control >> 24) & 1 == 0 {
+            return None;
+        }
+        // SPUCNT must be in a DMA transfer mode (write or read) for
+        // the transfer to land; otherwise the channel is armed but
+        // the SPU doesn't accept words. Games always program SPUCNT
+        // before kicking the channel, so this is a belt-and-braces
+        // check.
+        if !self.spu.dma_transfer_enabled() {
+            // Still return Some so the completion IRQ fires — the
+            // CHCR start bit must clear or the BIOS's DMA-wait loop
+            // hangs forever.
+            return Some(0);
+        }
+        let sync_mode = (ch.channel_control >> 9) & 0x3;
+        let bcr = ch.block_control;
+        let total_words: u32 = match sync_mode {
+            0 => bcr & 0xFFFF,
+            1 => {
+                let block_size = bcr & 0xFFFF;
+                let block_count = (bcr >> 16).max(1) & 0xFFFF;
+                block_size * block_count
+            }
+            _ => 0, // Linked list + reserved — not used for SPU.
+        };
+        let to_spu = ch.channel_control & 1 != 0;
+        let step: u32 = if (ch.channel_control >> 1) & 1 != 0 {
+            0xFFFF_FFFCu32
+        } else {
+            4
+        };
+        let mut addr = ch.base & 0x001F_FFFC;
+        if to_spu {
+            // Buffer the RAM words so we can ship them to the SPU's
+            // `dma_write` which takes a slice of halfwords. Each 32-bit
+            // word becomes two halfwords, low then high.
+            let mut words: Vec<u16> = Vec::with_capacity((total_words * 2) as usize);
+            for _ in 0..total_words {
+                let word = read_ram_u32(&self.ram[..], addr);
+                words.push(word as u16);
+                words.push((word >> 16) as u16);
+                addr = addr.wrapping_add(step);
+            }
+            self.spu.dma_write(&words);
+        } else {
+            let mut words = vec![0u16; (total_words * 2) as usize];
+            self.spu.dma_read(&mut words);
+            for i in 0..total_words {
+                let lo = words[(i as usize) * 2] as u32;
+                let hi = words[(i as usize) * 2 + 1] as u32;
+                let word = lo | (hi << 16);
+                let offset = (addr & 0x001F_FFFF) as usize;
+                if offset + 4 <= self.ram.len() {
+                    self.ram[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                addr = addr.wrapping_add(step);
+            }
+        }
+        Some(total_words)
     }
 
     /// Execute DMA channel 3 → CPU. Block mode (sync=1) is the only
