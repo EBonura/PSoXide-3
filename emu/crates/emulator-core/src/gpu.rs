@@ -115,6 +115,14 @@ pub struct Gpu {
     /// ordered dither patterns instead of visible 5-bit staircases.
     dither_enabled: bool,
 
+    /// Horizontal-flip flag for textured rectangles (GP0 0xE1 bit 12).
+    /// When true, texture U coordinates are mirrored across the
+    /// rectangle's midline. Common for sprite animations that reuse
+    /// a single source image with direction-dependent facing.
+    tex_rect_flip_x: bool,
+    /// Vertical-flip flag for textured rectangles (GP0 0xE1 bit 13).
+    tex_rect_flip_y: bool,
+
     /// Active polyline receive state. `None` when no polyline is in
     /// flight; `Some(...)` between a polyline start packet and its
     /// terminator word. While `Some`, every GP0 write is
@@ -255,6 +263,8 @@ impl Gpu {
             mask_set_on_draw: false,
             mask_check_before_draw: false,
             dither_enabled: false,
+            tex_rect_flip_x: false,
+            tex_rect_flip_y: false,
             polyline: None,
             busy_credit: 0,
             display_start_x: 0,
@@ -833,6 +843,8 @@ impl Gpu {
                 self.tex_depth = ((word >> 7) & 0x3) as u8;
                 self.tex_blend_mode = BlendMode::from_tpage_bits(word >> 5);
                 self.dither_enabled = (word >> 9) & 1 != 0;
+                self.tex_rect_flip_x = (word >> 12) & 1 != 0;
+                self.tex_rect_flip_y = (word >> 13) & 1 != 0;
                 // GPUSTAT bits 0..=10 come from E1h bits 0..=10.
                 let stat_bits = word & 0x07FF;
                 self.status.raw = (self.status.raw & !0x07FF) | stat_bits;
@@ -1159,10 +1171,18 @@ impl Gpu {
             return;
         }
 
+        let flip_x = self.tex_rect_flip_x;
+        let flip_y = self.tex_rect_flip_y;
+        let last_col = (w - 1) as u16;
+        let last_row = (h - 1) as u16;
         for py in top..=bottom {
             for px in left..=right {
-                let tex_u = u0.wrapping_add((px - x) as u16);
-                let tex_v = v0.wrapping_add((py - y) as u16);
+                let dx = (px - x) as u16;
+                let dy = (py - y) as u16;
+                let u_off = if flip_x { last_col - dx } else { dx };
+                let v_off = if flip_y { last_row - dy } else { dy };
+                let tex_u = u0.wrapping_add(u_off);
+                let tex_v = v0.wrapping_add(v_off);
                 if let Some(texel) = self.sample_texture(tex_u, tex_v, clut_x, clut_y) {
                     let shaded = modulate_tint(texel, tint.0, tint.1, tint.2);
                     let mode = if semi_trans && (texel & 0x8000) != 0 {
@@ -1505,7 +1525,11 @@ impl Gpu {
                                 bi.clamp(0, 255) as u32,
                             )
                         };
-                        let shaded = modulate_tint(texel, tint_r, tint_g, tint_b);
+                        let shaded = if !raw_texture && self.dither_enabled {
+                            modulate_tint_dithered(texel, tint_r, tint_g, tint_b, x, y)
+                        } else {
+                            modulate_tint(texel, tint_r, tint_g, tint_b)
+                        };
                         let mode = if semi_trans && (texel & 0x8000) != 0 {
                             tpage_mode
                         } else {
@@ -2258,6 +2282,29 @@ fn modulate_tint(texel: u16, tint_r: u32, tint_g: u32, tint_b: u32) -> u16 {
     let g = (tint_g * tg / 0x80).min(0x1F) as u16;
     let b = (tint_b * tb / 0x80).min(0x1F) as u16;
     r | (g << 5) | (b << 10) | (texel & 0x8000)
+}
+
+/// Dithered variant of [`modulate_tint`] — computes the modulated
+/// RGB in 8-bit space, applies the 4×4 Bayer dither offset for the
+/// pixel position, then truncates to 5 bits per channel. Used by
+/// textured-Gouraud primitives when GP0 0xE1 bit 9 is on.
+fn modulate_tint_dithered(
+    texel: u16,
+    tint_r: u32,
+    tint_g: u32,
+    tint_b: u32,
+    x: i32,
+    y: i32,
+) -> u16 {
+    // Scale 5-bit texel channels to 8-bit, apply the tint (which
+    // is 0x80 = identity at 8-bit scale), then dither + truncate.
+    let tr = ((texel & 0x1F) as u32) << 3;
+    let tg = (((texel >> 5) & 0x1F) as u32) << 3;
+    let tb = (((texel >> 10) & 0x1F) as u32) << 3;
+    let r = (tint_r * tr / 0x80).min(0xFF) as i32;
+    let g = (tint_g * tg / 0x80).min(0xFF) as i32;
+    let b = (tint_b * tb / 0x80).min(0xFF) as i32;
+    dither_rgb(r, g, b, x, y) | (texel & 0x8000)
 }
 
 /// Split a 24-bit RGB tint word (from the low 24 bits of a textured
