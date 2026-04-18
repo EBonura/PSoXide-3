@@ -122,6 +122,22 @@ pub struct Gpu {
     /// regular packet assembler.
     polyline: Option<PolylineState>,
 
+    /// Cumulative "pseudo-busy" credit. Incremented by each
+    /// primitive rasterisation proportionally to its pixel count;
+    /// decremented by `set_idle_cycles` each time the frontend
+    /// advances the GPU clock. When > 0, GPUSTAT bit 26
+    /// (command-FIFO ready) and bit 28 (DMA-block ready) both
+    /// clear, so games polling for "GPU idle" before pushing the
+    /// next packet see a realistic 0→1 transition instead of an
+    /// always-ready register.
+    ///
+    /// Real hardware's busy flag is driven by the command-FIFO
+    /// fill level and by an internal rasteriser "work credit".
+    /// This approximation is enough for games that do the common
+    /// "wait for GPU" spin on bit 26 right after issuing a big
+    /// draw batch.
+    busy_credit: u64,
+
     // --- Display area (GP1 0x05 / 0x06 / 0x07 / 0x08) ---
     /// VRAM X of the top-left pixel of the displayed framebuffer.
     display_start_x: u16,
@@ -240,6 +256,7 @@ impl Gpu {
             mask_check_before_draw: false,
             dither_enabled: false,
             polyline: None,
+            busy_credit: 0,
             display_start_x: 0,
             display_start_y: 0,
             display_width: 320,
@@ -440,7 +457,7 @@ impl Gpu {
     pub fn read32(&mut self, phys: u32) -> Option<u32> {
         match phys {
             GP0_ADDR => Some(self.read_gpuread()),
-            GP1_ADDR => Some(self.status.read(self.vram_download.is_some())),
+            GP1_ADDR => Some(self.status.read(self.vram_download.is_some(), self.busy_credit > 0)),
             _ => None,
         }
     }
@@ -463,6 +480,35 @@ impl Gpu {
     /// independent of the VBlank IRQ.
     pub fn toggle_vblank_field(&mut self) {
         self.status.toggle_field();
+    }
+
+    /// Charge "busy credit" that clears the GPU's ready-bits until
+    /// it's spent. Called by the rasteriser after each expensive
+    /// primitive (VRAM-to-VRAM copy, full-screen fill) to expose
+    /// a realistic 0→1 transition on GPUSTAT bit 26 / 28 for games
+    /// that spin-wait on GPU idle before kicking the next DMA.
+    ///
+    /// Small primitives (triangles, lines, short rectangles) don't
+    /// charge any credit — they're fast enough on real hardware
+    /// that software rarely polls ready between them, and charging
+    /// busy here would just add delays where none are needed.
+    pub fn charge_busy(&mut self, cost: u64) {
+        self.busy_credit = self.busy_credit.saturating_add(cost);
+    }
+
+    /// Drain busy credit over time. Called by the bus each tick
+    /// so the busy flag settles back to "ready" as cycles advance.
+    /// One cycle of real time decays one unit of credit — with
+    /// primitives charging in the tens of units, the ready flag
+    /// goes high again within a few hundred cycles.
+    pub fn decay_busy(&mut self, cycles: u64) {
+        self.busy_credit = self.busy_credit.saturating_sub(cycles);
+    }
+
+    /// Is the GPU currently "busy"? Used to gate GPUSTAT ready
+    /// bits 26 + 28.
+    pub fn is_busy(&self) -> bool {
+        self.busy_credit > 0
     }
 
     /// Dispatch an MMIO write inside the GPU window. Returns `true` if
@@ -922,6 +968,11 @@ impl Gpu {
                     .set_pixel(dx + dx_off, dy + dy_off, row[dx_off as usize]);
             }
         }
+        // Charge busy: VRAM↔VRAM copies cost one cycle per pixel
+        // on hardware; games may poll ready right after kicking.
+        // Use ~1 cycle/pixel so bit 26 clears for the duration of
+        // the copy as software-visible time advances.
+        self.charge_busy((w as u64) * (h as u64));
     }
 
     // --- Primitive rasterization ---
@@ -1986,6 +2037,8 @@ impl Gpu {
                 self.vram.set_pixel(px as u16, py as u16, color15);
             }
         }
+        // Fill rect costs ~0.5 cycles / pixel on hardware.
+        self.charge_busy(((w as u64) * (h as u64)) / 2);
     }
 }
 
@@ -2298,16 +2351,21 @@ impl GpuStatus {
 
     /// Compose the observable GPUSTAT word. `vram_send_ready` is the
     /// live "is a VRAM→CPU transfer in progress and has pixels
-    /// waiting" flag owned by the GPU proper — we pass it in so the
-    /// status register doesn't duplicate state that lives elsewhere.
-    fn read(&self, vram_send_ready: bool) -> u32 {
+    /// waiting" flag owned by the GPU proper; `busy` is the
+    /// "pseudo-busy" flag from `Gpu::is_busy`.
+    fn read(&self, vram_send_ready: bool, busy: bool) -> u32 {
         let mut ret = self.raw;
 
-        // Always-ready: bits 26 (cmd FIFO ready) + 28 (DMA block ready).
-        // Bit 27 (VRAM→CPU ready) is only set while software is
-        // actually pulling pixels from a GPUREAD; Redux's default is 0
-        // and the BIOS polls this bit to detect transfer completion.
-        ret |= 0x1400_0000;
+        // Ready bits: 26 (cmd FIFO ready) + 28 (DMA block ready).
+        // Set when idle; cleared under `busy`. Bit 27 (VRAM→CPU
+        // ready) is only set while software is actually pulling
+        // pixels from a GPUREAD; Redux's default is 0 and the
+        // BIOS polls this bit to detect transfer completion.
+        if !busy {
+            ret |= 0x1400_0000;
+        } else {
+            ret &= !0x1400_0000;
+        }
         if vram_send_ready {
             ret |= 0x0800_0000;
         } else {

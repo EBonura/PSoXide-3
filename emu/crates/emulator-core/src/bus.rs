@@ -510,6 +510,12 @@ impl Bus {
         if fired & 4 != 0 {
             self.irq.raise(IrqSource::Timer2);
         }
+        // Decay the GPU's pseudo-busy credit as time passes. At
+        // 32 units per cycle a full-screen (~640×478) fill-rect
+        // credit of 153k takes ~4.8k cycles to drain — about the
+        // duration of a short VBlank window, matching real
+        // hardware's "a few scanlines to finish the batch".
+        self.gpu.decay_busy((n as u64) * 32);
     }
 
     /// Cumulative cycles since reset.
