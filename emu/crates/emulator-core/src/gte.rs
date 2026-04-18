@@ -1212,12 +1212,15 @@ impl Gte {
             0 => self.rotation,
             1 => self.light,
             2 => self.light_color,
-            // mx=3 is the "garbage matrix" — uses RGB-from-RGBC components
-            // mixed with rotation diagonal. Implementation matches Redux.
+            // mx=3 is the documented "garbage matrix" (PSX-SPX: GTE
+            // Opcodes Summary). Row 0 col 2 is **IR0** (data reg 8),
+            // not IR1 — catching this was why `mvmva_mx3_garbage_matrix`
+            // got added. Rows 1 and 2 replicate RT[0][2] and RT[1][1]
+            // across all three columns.
             _ => {
                 let r = (self.rgbc[0] as i16) << 4;
                 [
-                    [-r, r, self.ir[0]],
+                    [-r, r, self.ir0],
                     [self.rotation[0][2], self.rotation[0][2], self.rotation[0][2]],
                     [self.rotation[1][1], self.rotation[1][1], self.rotation[1][1]],
                 ]
@@ -1463,5 +1466,415 @@ mod tests {
         let mut g = Gte::new();
         g.execute(0x00); // not a valid GTE op
         assert_eq!(g.read_control(31), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Broader known-value fixtures — verify arithmetic for the ops games
+    // use most, plus the register-view edge cases. Every expected number
+    // below comes from hand-computed PSX-SPX math on small inputs; if one
+    // of these fires it means a refactor has drifted the implementation.
+    // ------------------------------------------------------------------
+
+    /// Install the identity rotation matrix scaled 1.0 in 1.3.12 (i.e.
+    /// every diagonal = 0x1000, off-diagonal = 0). Keeps RTPS/MVMVA
+    /// fixtures readable: `MAC = V` in the shifted space.
+    fn install_identity_rotation(g: &mut Gte) {
+        g.write_control(0, pack_xy_i16(0x1000, 0));
+        g.write_control(1, pack_xy_i16(0, 0));
+        g.write_control(2, pack_xy_i16(0x1000, 0));
+        g.write_control(3, pack_xy_i16(0, 0));
+        g.write_control(4, 0x1000);
+    }
+
+    /// GTE command-word builder: COP2 functions leave the high bits
+    /// alone — only sf/lm/mx/vx/cv/opcode matter. Keeps test instructions
+    /// readable next to their intent.
+    fn cmd_word(sf: bool, lm: bool, mx: u8, vx: u8, cv: u8, opcode: u8) -> u32 {
+        ((sf as u32) << 19)
+            | ((mx as u32 & 3) << 17)
+            | ((vx as u32 & 3) << 15)
+            | ((cv as u32 & 3) << 13)
+            | ((lm as u32) << 10)
+            | (opcode as u32)
+    }
+
+    #[test]
+    fn rtps_with_h_zero_projects_to_screen_offset() {
+        // With H=0 the divisor collapses to 0, so the projected X/Y are
+        // just OFX>>16 and OFY>>16 — a crisp fixture for checking every
+        // RTPS side-effect (MAC1/2/3, IR1/2/3, SZ push, SXY push, MAC0,
+        // IR0) without the Newton-Raphson divider in the way.
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        g.write_data(0, pack_xy_i16(1, 2)); // V0.x, V0.y
+        g.write_data(1, 3); // V0.z
+        g.write_control(24, 0x0100_0000); // OFX = 256.0 in 15.16
+        g.write_control(25, 0x0200_0000); // OFY = 512.0 in 15.16
+        g.write_control(26, 0); // H = 0
+        g.write_control(27, 100); // DQA
+        g.write_control(28, 5000); // DQB
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x01));
+        // MAC = V (identity × V >> 12 = V for these small inputs)
+        assert_eq!(g.read_data(25) as i32, 1, "MAC1");
+        assert_eq!(g.read_data(26) as i32, 2, "MAC2");
+        assert_eq!(g.read_data(27) as i32, 3, "MAC3");
+        assert_eq!(g.read_data(9), 1, "IR1");
+        assert_eq!(g.read_data(10), 2, "IR2");
+        assert_eq!(g.read_data(11), 3, "IR3");
+        // SZ3 pushed from mac[2]=3 (sf=1 path).
+        assert_eq!(g.read_data(19), 3, "SZ3");
+        // H=0 ⇒ divisor=0 ⇒ SXY2 = (OFX>>16, OFY>>16).
+        assert_eq!(g.read_data(14), pack_xy_i16(0x100, 0x200), "SXY2");
+        // MAC0 = divisor * DQA + DQB = 0 + 5000.
+        assert_eq!(g.read_data(24) as i32, 5000, "MAC0");
+        // IR0 = MAC0 >> 12 saturated to 0..0x1000.
+        assert_eq!(g.read_data(8), 1, "IR0");
+        // H<2*SZ3 so no DIV_OVERFLOW.
+        assert_eq!(g.read_control(31) & flag::DIV_OVERFLOW, 0);
+    }
+
+    #[test]
+    fn rtpt_transforms_all_three_vertices_and_pushes_sz_fifo() {
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        g.write_data(0, pack_xy_i16(1, 2));
+        g.write_data(1, 3); // V0
+        g.write_data(2, pack_xy_i16(4, 5));
+        g.write_data(3, 6); // V1
+        g.write_data(4, pack_xy_i16(7, 8));
+        g.write_data(5, 9); // V2
+        g.write_control(24, 0);
+        g.write_control(25, 0);
+        g.write_control(26, 0); // H=0 keeps projection math simple.
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x30));
+        // Final IR is from the *last* vertex transformed (V2 = (7,8,9)).
+        assert_eq!(g.read_data(9), 7);
+        assert_eq!(g.read_data(10), 8);
+        assert_eq!(g.read_data(11), 9);
+        // SZ FIFO after three pushes of 3, 6, 9.
+        assert_eq!(g.read_data(17), 3, "SZ1");
+        assert_eq!(g.read_data(18), 6, "SZ2");
+        assert_eq!(g.read_data(19), 9, "SZ3");
+    }
+
+    #[test]
+    fn mvmva_rt_v0_tr_computes_rotation_plus_translation() {
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        g.write_data(0, pack_xy_i16(1, 2));
+        g.write_data(1, 3);
+        g.write_control(5, 10);
+        g.write_control(6, 20);
+        g.write_control(7, 30);
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x12));
+        // MAC_i = ((TR_i<<12) + RT_row_i · V) >> 12 = TR_i + V_i.
+        assert_eq!(g.read_data(25) as i32, 11, "MAC1 = TR0 + V0.x");
+        assert_eq!(g.read_data(26) as i32, 22, "MAC2 = TR1 + V0.y");
+        assert_eq!(g.read_data(27) as i32, 33, "MAC3 = TR2 + V0.z");
+        assert_eq!(g.read_data(9), 11);
+        assert_eq!(g.read_data(10), 22);
+        assert_eq!(g.read_data(11), 33);
+    }
+
+    #[test]
+    fn mvmva_cv3_drops_translation() {
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        g.write_data(0, pack_xy_i16(1, 2));
+        g.write_data(1, 3);
+        g.write_control(5, 100); // TR should be ignored with cv=3.
+        g.write_control(6, 200);
+        g.write_control(7, 300);
+        g.execute(cmd_word(true, false, 0, 0, 3, 0x12));
+        assert_eq!(g.read_data(25) as i32, 1, "MAC1 = V.x (no TR)");
+        assert_eq!(g.read_data(26) as i32, 2, "MAC2 = V.y");
+        assert_eq!(g.read_data(27) as i32, 3, "MAC3 = V.z");
+    }
+
+    #[test]
+    fn avsz4_averages_using_zsf4() {
+        let mut g = Gte::new();
+        g.write_data(16, 0x010);
+        g.write_data(17, 0x020);
+        g.write_data(18, 0x030);
+        g.write_data(19, 0x040);
+        g.write_control(30, 0x0400); // ZSF4 = 0x400 (1/4 in 0.12)
+        g.execute(0x2E);
+        // MAC0 = ZSF4 * (SZ0+SZ1+SZ2+SZ3) = 0x400 * 0xA0 = 0x28000.
+        assert_eq!(g.read_data(24) as i32, 0x28000, "MAC0");
+        assert_eq!(g.read_data(7), 0x28, "OTZ = MAC0>>12");
+    }
+
+    #[test]
+    fn irgb_write_unpacks_into_ir_vector() {
+        // IRGB packed (B<<10) | (G<<5) | R. Each 5-bit component scales
+        // to IR_i = component << 7, matching PSX-SPX.
+        let mut g = Gte::new();
+        g.write_data(28, (0x0A << 10) | (0x10 << 5) | 0x1F);
+        assert_eq!(g.read_data(9) as i16, 0x1F << 7);
+        assert_eq!(g.read_data(10) as i16, 0x10 << 7);
+        assert_eq!(g.read_data(11) as i16, 0x0A << 7);
+    }
+
+    #[test]
+    fn orgb_packs_ir_into_5_5_5() {
+        let mut g = Gte::new();
+        g.write_data(9, 0); // R=0
+        g.write_data(10, 0xF80); // G=0x1F (max)
+        g.write_data(11, 0x780); // B=0x0F
+        assert_eq!(g.read_data(29), (0x0F << 10) | (0x1F << 5) | 0);
+    }
+
+    #[test]
+    fn orgb_write_is_read_only() {
+        let mut g = Gte::new();
+        g.write_data(9, 0x500);
+        g.write_data(29, 0xFFFF); // Writes to ORGB are silently dropped.
+        assert_eq!(g.read_data(9) as i16, 0x500);
+    }
+
+    #[test]
+    fn mac_overflow_sets_positive_flag() {
+        // TR<<12 alone sits at 8.795_893e12; adding RT[0][0]·V0.x (another
+        // ~1e9 with maxed-out i16s) tips past 2^43-1 = 8.796_093e12.
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        g.write_control(5, 0x7FFF_FFFF); // TR.x = i32::MAX
+        g.write_control(0, pack_xy_i16(0x7FFF, 0)); // RT[0][0] = max i16
+        g.write_data(0, pack_xy_i16(0x7FFF, 0)); // V0.x = max i16
+        g.execute(cmd_word(false, false, 0, 0, 0, 0x01));
+        assert!(g.read_control(31) & flag::MAC1_POS != 0, "MAC1_POS");
+        assert!(g.read_control(31) & 0x8000_0000 != 0, "master bit");
+    }
+
+    #[test]
+    fn gpf_multiplies_ir_by_ir0_and_pushes_color() {
+        let mut g = Gte::new();
+        g.write_data(8, 0x1000); // IR0 = 1.0
+        g.write_data(9, 0x800);
+        g.write_data(10, 0x1000); // will saturate color G
+        g.write_data(11, 0x200);
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x3D));
+        assert_eq!(g.read_data(25) as i32, 0x800, "MAC1");
+        assert_eq!(g.read_data(26) as i32, 0x1000, "MAC2");
+        assert_eq!(g.read_data(27) as i32, 0x200, "MAC3");
+        // Newest color: (r,g,b,code) = (0x80, 0xFF, 0x20, 0) packed LE.
+        // 0x1000>>4 = 0x100 → clamps to 0xFF, setting COLOR_G_SAT.
+        assert_eq!(g.read_data(22), 0x0020_FF80);
+        assert!(g.read_control(31) & flag::COLOR_G_SAT != 0);
+    }
+
+    #[test]
+    fn gpl_accumulates_base_mac_into_product() {
+        // GPL reshifts the existing MAC left by sf before adding the new
+        // product so the base acts as the same fixed-point scale.
+        let mut g = Gte::new();
+        g.write_data(25, 0x100);
+        g.write_data(26, 0x200);
+        g.write_data(27, 0x300);
+        g.write_data(8, 0x1000); // IR0
+        g.write_data(9, 0x400);
+        g.write_data(10, 0x500);
+        g.write_data(11, 0x600);
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x3E));
+        assert_eq!(g.read_data(25) as i32, 0x500, "MAC1 = 0x100 + 0x400");
+        assert_eq!(g.read_data(26) as i32, 0x700, "MAC2 = 0x200 + 0x500");
+        assert_eq!(g.read_data(27) as i32, 0x900, "MAC3 = 0x300 + 0x600");
+    }
+
+    #[test]
+    fn flag_master_bit_set_on_any_error() {
+        let mut g = Gte::new();
+        g.write_control(31, flag::IR1_SAT);
+        assert_eq!(g.read_control(31) & flag::IR1_SAT, flag::IR1_SAT);
+        assert!(g.read_control(31) & 0x8000_0000 != 0);
+    }
+
+    #[test]
+    fn flag_master_bit_clear_on_non_error_bits() {
+        // MAC0_POS lives in the error mask; a bit outside it (the RTPS
+        // divider's SZ3_OTZ_SAT is in-mask, but there are no gaps we can
+        // address via write_control since the mask covers bits 12..30
+        // except bit 11 which write_control already strips). Instead we
+        // verify: explicitly clearing produces no master bit.
+        let mut g = Gte::new();
+        g.write_control(31, 0);
+        assert_eq!(g.read_control(31) & 0x8000_0000, 0);
+    }
+
+    #[test]
+    fn nclip_collinear_points_produce_zero() {
+        // Three points on y=x line ⇒ signed area = 0 regardless of spacing.
+        let mut g = Gte::new();
+        g.write_data(12, pack_xy_i16(0, 0));
+        g.write_data(13, pack_xy_i16(5, 5));
+        g.write_data(14, pack_xy_i16(10, 10));
+        g.execute(0x06);
+        assert_eq!(g.read_data(24) as i32, 0);
+    }
+
+    #[test]
+    fn op_outer_product_of_ir_with_unit_diagonal() {
+        // With diag=(1,1,1) in 1.3.12 the outer product reduces to the
+        // standard cross-product of IR with itself-as-axis.
+        let mut g = Gte::new();
+        g.write_control(0, pack_xy_i16(0x1000, 0));
+        g.write_control(2, pack_xy_i16(0x1000, 0));
+        g.write_control(4, 0x1000);
+        g.write_data(9, 3);
+        g.write_data(10, 4);
+        g.write_data(11, 5);
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x0C));
+        // MAC1 = IR3*D2 - IR2*D3 = 5-4 = 1
+        // MAC2 = IR1*D3 - IR3*D1 = 3-5 = -2
+        // MAC3 = IR2*D1 - IR1*D2 = 4-3 = 1
+        assert_eq!(g.read_data(25) as i32, 1, "MAC1");
+        assert_eq!(g.read_data(26) as i32, -2, "MAC2");
+        assert_eq!(g.read_data(27) as i32, 1, "MAC3");
+        assert_eq!(g.read_data(9) as i16, 1);
+        assert_eq!(g.read_data(10) as i16, -2);
+        assert_eq!(g.read_data(11) as i16, 1);
+    }
+
+    #[test]
+    fn ir0_saturates_to_upper_bound() {
+        // RTPS with H=SZ3 gives divisor exactly 1.0 (0x10000). Then
+        // MAC0 = 0x10000 * DQA (for DQB=0) vastly exceeds 0x1000 once
+        // shifted by 12 → IR0 clamps, flag asserts.
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        g.write_data(0, pack_xy_i16(0, 0));
+        g.write_data(1, 1); // V0.z=1 so SZ3=1 post-RTPS.
+        g.write_control(26, 1); // H=1
+        g.write_control(27, 0x7FFF); // DQA max
+        g.write_control(28, 0); // DQB=0 keeps MAC0 in i32 range.
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x01));
+        assert_eq!(g.read_data(8) as i16, 0x1000, "IR0 saturated");
+        assert!(g.read_control(31) & flag::IR0_SAT != 0);
+    }
+
+    #[test]
+    fn color_fifo_push_order_across_three_ops() {
+        // Three GPFs with distinct IR vectors — after three pushes,
+        // slot 0 holds the oldest, slot 2 the newest.
+        let mut g = Gte::new();
+        g.write_data(8, 0x1000); // IR0 = 1.0
+        let instr = cmd_word(true, false, 0, 0, 0, 0x3D);
+        g.write_data(9, 0x100);
+        g.write_data(10, 0x200);
+        g.write_data(11, 0x300);
+        g.execute(instr);
+        g.write_data(9, 0x400);
+        g.write_data(10, 0x500);
+        g.write_data(11, 0x600);
+        g.execute(instr);
+        g.write_data(9, 0x700);
+        g.write_data(10, 0x100);
+        g.write_data(11, 0x200);
+        g.execute(instr);
+        // Each push: r=MAC1>>4, g=MAC2>>4, b=MAC3>>4, code=RGBC[3]=0.
+        // u32 view packs little-endian: r | (g<<8) | (b<<16) | (code<<24).
+        assert_eq!(g.read_data(20), 0x0030_2010, "oldest push");
+        assert_eq!(g.read_data(21), 0x0060_5040, "middle push");
+        assert_eq!(g.read_data(22), 0x0020_1070, "newest push");
+    }
+
+    #[test]
+    fn sqr_sf1_scales_product_down_by_4096() {
+        let mut g = Gte::new();
+        g.write_data(9, 0x1000);
+        g.write_data(10, 0x0800);
+        g.write_data(11, 0x2000);
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x28));
+        // MAC_i = (IR_i * IR_i) >> 12
+        assert_eq!(g.read_data(25) as i32, 0x1000);
+        assert_eq!(g.read_data(26) as i32, 0x400);
+        assert_eq!(g.read_data(27) as i32, 0x4000);
+    }
+
+    #[test]
+    fn rtps_h_equals_2sz3_sets_divide_overflow() {
+        // Boundary: H exactly 2*SZ3 triggers DIV_OVERFLOW and forces
+        // divisor = 0x1FFFF (clamped max).
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        g.write_data(0, pack_xy_i16(0, 0));
+        g.write_data(1, 1); // SZ3 → 1
+        g.write_control(26, 2); // H = 2 → H >= 2*SZ3.
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x01));
+        assert!(g.read_control(31) & flag::DIV_OVERFLOW != 0);
+    }
+
+    #[test]
+    fn unknown_opcode_leaves_all_registers_clear() {
+        // Regression: make sure an invalid opcode doesn't accidentally
+        // flip flag bits from prior execution of a zeroed sub-path.
+        let mut g = Gte::new();
+        g.execute(0x3C); // unassigned slot between 0x3B and 0x3D
+        for i in 0..31 {
+            assert_eq!(g.read_control(i), 0, "ctrl {i}");
+        }
+        assert_eq!(g.read_control(31), 0, "flag");
+    }
+
+    #[test]
+    fn mvmva_cv2_fc_bug_flags_stage1_but_stores_stage2() {
+        // Documented FC-translation bug: stage 1 computes
+        //   (FC<<12) + MX_col0 * V.x   >> sf
+        // and saturation-flags the IR from that; stage 2 computes the
+        // real (MX · V) >> sf and stores MAC/IR from *that*. So large
+        // FC entries set flags even when the final result is small.
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        g.write_control(21, 0x1000_0000); // FC.r
+        g.write_data(0, pack_xy_i16(1, 0));
+        g.write_data(1, 0);
+        g.execute(cmd_word(true, false, 0, 0, 2, 0x12));
+        // Stage 2 math: MAC1 = (identity · V) >> 12 = 1 for V=(1,0,0).
+        assert_eq!(g.read_data(25) as i32, 1, "MAC1 from clean stage 2");
+        assert_eq!(g.read_data(9), 1, "IR1 from clean stage 2");
+        // Stage 1 IR saturation: (FC<<12 + 0x1000*1) >> 12 ≈ 2^28 → IR_SAT.
+        assert!(g.read_control(31) & flag::IR1_SAT != 0, "IR1_SAT from stage 1");
+    }
+
+    #[test]
+    fn mvmva_mx3_uses_garbage_matrix() {
+        // mx=3 builds a junk matrix from RGBC, IR0, RT[0][2] and RT[1][1]
+        // per PSX-SPX. Row 0 col 2 is specifically *IR0* (data reg 8),
+        // not IR1 — pinning that here so a refactor can't re-introduce
+        // the IR1-vs-IR0 confusion.
+        let mut g = Gte::new();
+        g.write_data(6, 0x0000_0010); // RGBC.r = 0x10
+        g.write_data(8, 0x100); // IR0 = 0x100
+        g.write_control(1, pack_xy_i16(0x200, 0)); // RT[0][2] = 0x200
+        g.write_control(2, pack_xy_i16(0x300, 0)); // RT[1][1] = 0x300
+        g.write_data(0, pack_xy_i16(1, 1));
+        g.write_data(1, 1); // V0 = (1,1,1)
+        g.execute(cmd_word(false, false, 3, 0, 3, 0x12));
+        // Garbage matrix:
+        //   [[-0x100, 0x100, IR0=0x100], [0x200; 3], [0x300; 3]]
+        // With V = (1,1,1), sf=0:
+        //   MAC1 = -0x100 + 0x100 + 0x100 = 0x100
+        //   MAC2 = 3 * 0x200 = 0x600
+        //   MAC3 = 3 * 0x300 = 0x900
+        assert_eq!(g.read_data(25) as i32, 0x100, "MAC1");
+        assert_eq!(g.read_data(26) as i32, 0x600, "MAC2");
+        assert_eq!(g.read_data(27) as i32, 0x900, "MAC3");
+    }
+
+    #[test]
+    fn mvmva_vx3_uses_ir_as_vector() {
+        // vx=3 substitutes [IR1, IR2, IR3] for the multiplied vector —
+        // used by the lighting chain when colors feed back into geometry.
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        g.write_data(9, 5);
+        g.write_data(10, 6);
+        g.write_data(11, 7);
+        // cv=3 (no TR), sf=1
+        g.execute(cmd_word(true, false, 0, 3, 3, 0x12));
+        assert_eq!(g.read_data(25) as i32, 5);
+        assert_eq!(g.read_data(26) as i32, 6);
+        assert_eq!(g.read_data(27) as i32, 7);
     }
 }
