@@ -1206,8 +1206,16 @@ impl Gpu {
     }
 
     /// Fetch a single texel from the active texture page. Returns
-    /// `None` for transparent (texel value 0 in CLUT modes, or 0x0000
-    /// with mask bit clear in direct mode).
+    /// `None` for transparent — PSX convention is **the resolved
+    /// 16-bit colour == 0x0000**, regardless of mode. For 4bpp/8bpp,
+    /// that means `CLUT[idx] == 0` (not `idx == 0`); games routinely
+    /// place `0x0000` at non-zero CLUT entries to punch transparency
+    /// into sprites (e.g. the BIOS TM glyph: background uses a CLUT
+    /// index whose entry is 0 → transparent). Checking `idx == 0`
+    /// instead is a common simplification that renders those pixels
+    /// opaque black, producing the infamous "TM on a black box"
+    /// regression. Matches Redux's `getTextureTransCol*` which all
+    /// start with `if (color == 0) return;`.
     ///
     /// The incoming `u` / `v` are run through the GP0 0xE2 texture
     /// window first: `U' = (U & ~mask) | (offset & mask)` per axis.
@@ -1227,39 +1235,31 @@ impl Gpu {
         let v = (v & !mask_y) | (off_y & mask_y);
 
         let tpy = self.tex_page_y.wrapping_add(v);
-        match self.tex_depth {
+        let texel = match self.tex_depth {
             0 => {
                 // 4bpp: 4 texels per VRAM word; select by (u & 3).
                 let tpx = self.tex_page_x.wrapping_add(u / 4);
                 let word = self.vram.get_pixel(tpx, tpy);
                 let idx = (word >> ((u & 3) * 4)) & 0xF;
-                if idx == 0 {
-                    None
-                } else {
-                    Some(self.vram.get_pixel(clut_x + idx, clut_y))
-                }
+                self.vram.get_pixel(clut_x + idx, clut_y)
             }
             1 => {
                 // 8bpp: 2 texels per VRAM word.
                 let tpx = self.tex_page_x.wrapping_add(u / 2);
                 let word = self.vram.get_pixel(tpx, tpy);
                 let idx = (word >> ((u & 1) * 8)) & 0xFF;
-                if idx == 0 {
-                    None
-                } else {
-                    Some(self.vram.get_pixel(clut_x + idx, clut_y))
-                }
+                self.vram.get_pixel(clut_x + idx, clut_y)
             }
             _ => {
                 // 15bpp: direct colour, 1 texel per word.
                 let tpx = self.tex_page_x.wrapping_add(u);
-                let texel = self.vram.get_pixel(tpx, tpy);
-                if texel == 0 {
-                    None
-                } else {
-                    Some(texel)
-                }
+                self.vram.get_pixel(tpx, tpy)
             }
+        };
+        if texel == 0 {
+            None
+        } else {
+            Some(texel)
         }
     }
 
@@ -3027,5 +3027,92 @@ mod tests {
         }
         // FIFO must be empty — the 9-word packet consumed cleanly.
         assert_eq!(gpu.gp0_expected, 0);
+    }
+
+    // --- sample_texture transparency rules ---
+    //
+    // PSX convention: a texel is transparent when the **resolved
+    // 16-bit colour** is 0x0000. For 4bpp/8bpp that means
+    // `CLUT[idx] == 0`, not `idx == 0`. The BIOS TM-glyph regression
+    // was caused by the simpler `idx == 0` check rendering opaque
+    // black where the CLUT had deliberately-zero entries at non-zero
+    // indices to punch the letter cutouts.
+
+    #[test]
+    fn sample_texture_4bpp_idx0_resolves_to_clut_entry() {
+        // CLUT entry at index 0 is non-zero → idx==0 is NOT transparent.
+        // Matches Redux: only the resolved colour's 0x0000 is skipped.
+        let mut gpu = Gpu::new();
+        gpu.tex_depth = 0; // 4bpp
+        gpu.tex_page_x = 0;
+        gpu.tex_page_y = 0;
+        // Texture word at (0, 0) — all four texels point to CLUT idx 0.
+        gpu.vram.set_pixel(0, 0, 0x0000);
+        // CLUT row at (0x100, 0), entry 0 = red (0x001F).
+        gpu.vram.set_pixel(0x100, 0, 0x001F);
+        // u=0..3 all sample idx=0 → all must resolve to CLUT[0] = 0x001F.
+        for u in 0..4u16 {
+            assert_eq!(
+                gpu.sample_texture(u, 0, 0x100, 0),
+                Some(0x001F),
+                "u={u}: CLUT[0]=0x001F should be opaque, not transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn sample_texture_4bpp_nonzero_idx_with_zero_clut_is_transparent() {
+        // The TM-glyph bug: CLUT entry at non-zero index is 0x0000
+        // (deliberate punch-through). Hardware skips (transparent);
+        // the bugged emulator would draw opaque black.
+        let mut gpu = Gpu::new();
+        gpu.tex_depth = 0;
+        gpu.tex_page_x = 0;
+        gpu.tex_page_y = 0;
+        // Texture word at (0, 0): idx[0]=5, idx[1]=3, idx[2]=2, idx[3]=1.
+        // We want to hit idx=5 — that means bits 0..3 should be 5.
+        // (word >> 0) & 0xF = 5. So word low nibble = 5.
+        gpu.vram.set_pixel(0, 0, 0x0005);
+        // CLUT at (0x200, 0): entry 5 is 0x0000 (punch-through).
+        // All others set to non-zero so we can be sure the transparency
+        // comes from CLUT[5]=0 and not from a wrong index.
+        for e in 0..16u16 {
+            gpu.vram.set_pixel(0x200 + e, 0, if e == 5 { 0x0000 } else { 0x7FFF });
+        }
+        assert_eq!(
+            gpu.sample_texture(0, 0, 0x200, 0),
+            None,
+            "CLUT[5]=0x0000 should be transparent even though idx=5, not 0",
+        );
+    }
+
+    #[test]
+    fn sample_texture_8bpp_zero_clut_is_transparent_regardless_of_idx() {
+        // Same rule for 8bpp mode.
+        let mut gpu = Gpu::new();
+        gpu.tex_depth = 1; // 8bpp
+        gpu.tex_page_x = 0;
+        gpu.tex_page_y = 0;
+        // Texture word at (0, 0) low byte = 42.
+        gpu.vram.set_pixel(0, 0, 42);
+        // CLUT[42] = 0x0000 → should be transparent.
+        gpu.vram.set_pixel(0x100 + 42, 0, 0x0000);
+        assert_eq!(gpu.sample_texture(0, 0, 0x100, 0), None);
+        // Flip CLUT[42] to non-zero → must draw opaque.
+        gpu.vram.set_pixel(0x100 + 42, 0, 0x1234);
+        assert_eq!(gpu.sample_texture(0, 0, 0x100, 0), Some(0x1234));
+    }
+
+    #[test]
+    fn sample_texture_15bpp_zero_is_transparent() {
+        // Direct-colour mode: 0x0000 is transparent, anything else opaque.
+        let mut gpu = Gpu::new();
+        gpu.tex_depth = 2; // 15bpp
+        gpu.tex_page_x = 0;
+        gpu.tex_page_y = 0;
+        gpu.vram.set_pixel(0, 0, 0x0000);
+        assert_eq!(gpu.sample_texture(0, 0, 0, 0), None);
+        gpu.vram.set_pixel(1, 0, 0x1234);
+        assert_eq!(gpu.sample_texture(1, 0, 0, 0), Some(0x1234));
     }
 }

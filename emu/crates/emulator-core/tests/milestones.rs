@@ -175,18 +175,22 @@ fn milestone_a_bios_to_sony_logo() {
     // when pixel parity hits 0% differing bytes, replace with the
     // captured Redux hash to lock in correctness.
     let state = run_milestone(100_000_000, None);
-    // Hashes updated 2026-04-18-C after GPU 4×4 Bayer dithering
-    // landed. The BIOS enables dither for the Sony logo's gradient
-    // — previously every Gouraud channel truncated 8→5 bit without
-    // any dither, producing a visible banding pattern. The dithered
-    // output now matches PSX hardware's interleaved-pixel pattern.
+    // Hashes updated 2026-04-18-E after the GPU-transparency fix:
+    // `sample_texture` now treats a CLUT entry of 0x0000 as
+    // transparent (matches Redux's `if (color == 0) return;`), not
+    // just index 0. The BIOS TM glyph deliberately places 0x0000 at
+    // non-zero CLUT entries to punch the letter cutout — the old
+    // `idx == 0` check drew those pixels as opaque black, giving
+    // the infamous "TM on a black box" artifact. See
+    // `sample_texture_4bpp_nonzero_idx_with_zero_clut_is_transparent`
+    // for the unit-level regression guard.
     assert_milestone(
         "Milestone A",
         &state,
-        0xab9d_c8a3_570a_9b5d, // full VRAM (self)
-        0xfb83_fcea_d16a_cf79, // display area (self)
+        0x1d7f_8e83_19d2_978d, // full VRAM (self)
+        0x94f6_6784_c260_9dc1, // display area (self)
         (640, 478),
-        None, // Redux-parity hash pending renderer fixes
+        None, // Redux-parity hash pending remaining renderer fixes
     );
 }
 
@@ -197,14 +201,15 @@ fn milestone_b_bios_to_shell() {
     // boot logo to the MAIN MENU shell screen (MEMORY CARD / CD
     // PLAYER, radial blue gradient).
     let state = run_milestone(500_000_000, None);
-    // Hashes updated 2026-04-18-C after GPU dithering landed — same
-    // reasoning as milestone A. The shell screen's radial blue
-    // gradient is Gouraud-shaded so it picks up the dither pattern.
+    // Hashes updated 2026-04-18-E alongside milestone A — same
+    // transparency fix changes any CLUT-backed primitive that uses
+    // a 0x0000 entry at a non-zero index. Shell icons and the CD-
+    // PLAYER UI use that pattern.
     assert_milestone(
         "Milestone B",
         &state,
-        0x3872_1ffb_bcec_5821, // full VRAM (self)
-        0x9676_78bd_29e7_7986, // display area (self)
+        0x8e4e_a7f4_0606_6ac5, // full VRAM (self)
+        0xf842_d300_dc31_89ca, // display area (self)
         (640, 478),
         None, // Redux parity capture pending
     );
@@ -314,17 +319,15 @@ fn milestone_d_tekken_licensed_screen() {
         return;
     }
     let state = run_milestone(800_000_000, Some(TEKKEN_DISC));
-    // Display + VRAM hashes updated 2026-04-18-B after the GTE
-    // NCS/NCDS/NCCS stage-1 BK bias fix. The previous hashes captured
-    // a state where the 3D lighting of the red PlayStation logo was
-    // miscomputed (stage 1 double-counted the background colour).
-    // Redux's GTE has no BK bias in stage 1 either — see
-    // `PCSX::GTE::NCS/NCDS/NCCS` in `pcsx-redux/src/core/gte.cc`.
+    // Hashes updated 2026-04-18-E after the GPU-transparency fix.
+    // The PlayStation licensed-disc screen uses small CLUT-backed
+    // sprites (SCEA™ text, copyright line) that rely on the correct
+    // "CLUT entry == 0 is transparent, regardless of index" rule.
     assert_milestone(
         "Milestone D (Tekken license screen)",
         &state,
-        0xd3a9_8c53_208a_c903,
-        0x63cd_31f5_f5d1_2fdf,
+        0x2781_c9df_d291_3ac1,
+        0xf38e_d486_3bd3_a1ed,
         (640, 478),
         None,
     );
