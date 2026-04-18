@@ -820,7 +820,16 @@ impl Gpu {
         let u0 = (uv_clut & 0xFF) as u16;
         let v0 = ((uv_clut >> 8) & 0xFF) as u16;
         let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
-        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word, prim_is_semi_trans(cmd));
+        let tint = if cmd & 1 != 0 {
+            RAW_TEXTURE_TINT
+        } else {
+            split_tint(cmd & 0x00FF_FFFF)
+        };
+        self.paint_textured_rect(
+            x, y, w, h, u0, v0, clut_word,
+            prim_is_semi_trans(cmd),
+            tint,
+        );
     }
 
     /// Fixed-size textured rect (1×1, 8×8, 16×16).
@@ -834,7 +843,16 @@ impl Gpu {
         let u0 = (uv_clut & 0xFF) as u16;
         let v0 = ((uv_clut >> 8) & 0xFF) as u16;
         let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
-        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word, prim_is_semi_trans(cmd));
+        let tint = if cmd & 1 != 0 {
+            RAW_TEXTURE_TINT
+        } else {
+            split_tint(cmd & 0x00FF_FFFF)
+        };
+        self.paint_textured_rect(
+            x, y, w, h, u0, v0, clut_word,
+            prim_is_semi_trans(cmd),
+            tint,
+        );
     }
 
     /// Plot a textured rectangle. Each destination pixel samples a
@@ -842,9 +860,13 @@ impl Gpu {
     /// 4bpp / 8bpp modes, direct for 15bpp. Texels of value 0 are
     /// transparent (standard PS1 convention).
     ///
-    /// `semi_trans` is the primitive's cmd-bit-1 flag. Texels with
-    /// bit 15 high blend via `self.tex_blend_mode` when it's set;
-    /// texels with bit 15 clear always draw opaque.
+    /// `semi_trans` — cmd-bit-1. Texels with bit 15 high blend via
+    /// `self.tex_blend_mode` when it's set; texels with bit 15 clear
+    /// always draw opaque.
+    ///
+    /// `tint` — 24-bit vertex colour that modulates each texel (see
+    /// [`modulate_tint`]). Raw-texture rectangles pass
+    /// `(0x80, 0x80, 0x80)` so modulation is a no-op.
     #[allow(clippy::too_many_arguments)]
     fn paint_textured_rect(
         &mut self,
@@ -856,6 +878,7 @@ impl Gpu {
         v0: u16,
         clut_word: u16,
         semi_trans: bool,
+        tint: (u32, u32, u32),
     ) {
         if w <= 0 || h <= 0 {
             return;
@@ -877,12 +900,13 @@ impl Gpu {
                 let tex_u = u0.wrapping_add((px - x) as u16);
                 let tex_v = v0.wrapping_add((py - y) as u16);
                 if let Some(texel) = self.sample_texture(tex_u, tex_v, clut_x, clut_y) {
+                    let shaded = modulate_tint(texel, tint.0, tint.1, tint.2);
                     let mode = if semi_trans && (texel & 0x8000) != 0 {
                         tpage_mode
                     } else {
                         BlendMode::Opaque
                     };
-                    self.plot_pixel(px as u16, py as u16, texel, mode);
+                    self.plot_pixel(px as u16, py as u16, shaded, mode);
                 }
             }
         }
@@ -995,6 +1019,9 @@ impl Gpu {
 
     /// GP0 0x24..=0x27 — textured triangle. 7 words:
     /// `[cmd+tint, v0, clut+uv0, v1, tpage+uv1, v2, uv2]`.
+    ///
+    /// Command bit 0 chooses raw-texture (tint ignored) vs
+    /// texture-blended (vertex tint modulates each texel).
     fn draw_textured_tri(&mut self) {
         let cmd = self.gp0_fifo[0];
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
@@ -1010,9 +1037,21 @@ impl Gpu {
         let t0 = ((uv0 & 0xFF) as u16, ((uv0 >> 8) & 0xFF) as u16);
         let t1 = ((uv1 & 0xFF) as u16, ((uv1 >> 8) & 0xFF) as u16);
         let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
+        let tint = if cmd & 1 != 0 {
+            RAW_TEXTURE_TINT
+        } else {
+            split_tint(cmd & 0x00FF_FFFF)
+        };
         self.rasterize_textured_triangle(
-            v0, v1, v2, t0, t1, t2, clut_word,
+            v0,
+            v1,
+            v2,
+            t0,
+            t1,
+            t2,
+            clut_word,
             prim_is_semi_trans(cmd),
+            tint,
         );
     }
 
@@ -1035,8 +1074,13 @@ impl Gpu {
         let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
         let t3 = ((uv3 & 0xFF) as u16, ((uv3 >> 8) & 0xFF) as u16);
         let semi = prim_is_semi_trans(cmd);
-        self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word, semi);
-        self.rasterize_textured_triangle(v1, v2, v3, t1, t2, t3, clut_word, semi);
+        let tint = if cmd & 1 != 0 {
+            RAW_TEXTURE_TINT
+        } else {
+            split_tint(cmd & 0x00FF_FFFF)
+        };
+        self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word, semi, tint);
+        self.rasterize_textured_triangle(v1, v2, v3, t1, t2, t3, clut_word, semi, tint);
     }
 
     /// Apply the tpage bits embedded in a textured-primitive UV word
@@ -1068,11 +1112,15 @@ impl Gpu {
     /// other triangle paths, with nearest-neighbor texture sampling
     /// via barycentric-interpolated UV.
     ///
-    /// `semi_trans` is the primitive's command-bit-1 state. When it's
-    /// set, texels with bit 15 high blend via `self.tex_blend_mode`;
-    /// texels with bit 15 clear still draw opaquely. When it's clear,
-    /// every texel draws opaque regardless of its bit 15. This
-    /// matches PSX-SPX's per-texel semi-transparency rule.
+    /// `semi_trans` is the primitive's command-bit-1 state. When set,
+    /// texels with bit 15 high blend via `self.tex_blend_mode`; texels
+    /// with bit 15 clear still draw opaquely. When clear, every texel
+    /// draws opaque regardless of its bit 15 — matching PSX-SPX's
+    /// per-texel semi-transparency rule.
+    ///
+    /// `tint` is the 24-bit vertex colour that modulates each texel
+    /// (see [`modulate_tint`]). Raw-texture primitives (cmd bit 0 set)
+    /// pass `(0x80, 0x80, 0x80)` so modulation is a no-op.
     #[allow(clippy::too_many_arguments)]
     fn rasterize_textured_triangle(
         &mut self,
@@ -1084,6 +1132,7 @@ impl Gpu {
         t2: (u16, u16),
         clut_word: u16,
         semi_trans: bool,
+        tint: (u32, u32, u32),
     ) {
         let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
         let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
@@ -1114,12 +1163,13 @@ impl Gpu {
                     let u = (w0 * t0.0 as i64 + w1 * t1.0 as i64 + w2 * t2.0 as i64) / area_abs;
                     let v = (w0 * t0.1 as i64 + w1 * t1.1 as i64 + w2 * t2.1 as i64) / area_abs;
                     if let Some(texel) = self.sample_texture(u as u16, v as u16, clut_x, clut_y) {
+                        let shaded = modulate_tint(texel, tint.0, tint.1, tint.2);
                         let mode = if semi_trans && (texel & 0x8000) != 0 {
                             tpage_mode
                         } else {
                             BlendMode::Opaque
                         };
-                        self.plot_pixel(x as u16, y as u16, texel, mode);
+                        self.plot_pixel(x as u16, y as u16, shaded, mode);
                     }
                 }
             }
@@ -1438,6 +1488,47 @@ fn prim_blend_mode(cmd_word: u32, tpage_mode: BlendMode) -> BlendMode {
         BlendMode::Opaque
     }
 }
+
+/// Modulate a 15bpp BGR texel by a 24-bit RGB tint. PSX formula:
+/// `result_channel = (tint_8bit * texel_5bit * 2) / 0x100`, which
+/// makes tint value `0x80` per channel act as identity (no-change)
+/// and `0xFF` act as double-brightness (clamped to 31 per channel).
+///
+/// Called with `tint = 0x80_80_80` when the primitive is a "raw
+/// texture" (cmd bit 0 set) — that passes the texel through
+/// unchanged. Callers of flat-tint textured primitives derive the
+/// tint from the cmd word's low 24 bits; Gouraud-textured primitives
+/// interpolate per pixel and call us with the per-pixel colour.
+///
+/// The texel's mask bit (bit 15) is preserved so downstream
+/// semi-transparency detection still sees it.
+fn modulate_tint(texel: u16, tint_r: u32, tint_g: u32, tint_b: u32) -> u16 {
+    let tr = (texel & 0x1F) as u32;
+    let tg = ((texel >> 5) & 0x1F) as u32;
+    let tb = ((texel >> 10) & 0x1F) as u32;
+    let r = (tint_r * tr / 0x80).min(0x1F) as u16;
+    let g = (tint_g * tg / 0x80).min(0x1F) as u16;
+    let b = (tint_b * tb / 0x80).min(0x1F) as u16;
+    r | (g << 5) | (b << 10) | (texel & 0x8000)
+}
+
+/// Split a 24-bit RGB tint word (from the low 24 bits of a textured
+/// primitive's command) into the three channels the modulator
+/// expects. Returns `(tint_r, tint_g, tint_b)` with each in 0..=255.
+/// For "raw texture" primitives the caller substitutes `(128, 128,
+/// 128)` directly — one code path through [`modulate_tint`].
+#[inline]
+fn split_tint(tint24: u32) -> (u32, u32, u32) {
+    (
+        tint24 & 0xFF,
+        (tint24 >> 8) & 0xFF,
+        (tint24 >> 16) & 0xFF,
+    )
+}
+
+/// Identity tint — pass-through for raw-texture primitives. Each
+/// channel at `0x80` means modulation returns the texel unchanged.
+const RAW_TEXTURE_TINT: (u32, u32, u32) = (0x80, 0x80, 0x80);
 
 /// Blend a foreground pixel over a background pixel per `mode`.
 /// Both pixels are 15-bit BGR with a mask bit at bit 15. The mask
@@ -1793,5 +1884,57 @@ mod tests {
         assert_eq!(gpu.tex_blend_mode, BlendMode::Add);
         gpu.write32(GP0_ADDR, 0xE100_0060); // bits 5-6 = 11 → AddQuarter
         assert_eq!(gpu.tex_blend_mode, BlendMode::AddQuarter);
+    }
+
+    #[test]
+    fn modulate_tint_identity_at_0x80() {
+        // tint 0x80 per channel = identity. Any texel passes unchanged.
+        let texel = 0x1234; // arbitrary 15bpp
+        let out = modulate_tint(texel, 0x80, 0x80, 0x80);
+        assert_eq!(out, texel);
+    }
+
+    #[test]
+    fn modulate_tint_scales_each_channel() {
+        // texel = (R=16, G=10, B=5) at bits (0..5), (5..10), (10..15).
+        let texel: u16 = 16 | (10 << 5) | (5 << 10);
+        // tint R=0xC0 (1.5×), G=0x40 (0.5×), B=0x80 (1.0×).
+        let out = modulate_tint(texel, 0xC0, 0x40, 0x80);
+        // Expected:
+        //   R = 0xC0 * 16 / 0x80 = 192 * 16 / 128 = 24 → clamp 31 → 24
+        //   G = 0x40 * 10 / 0x80 = 64 * 10 / 128 = 5
+        //   B = 0x80 * 5 / 0x80 = 5
+        assert_eq!(out & 0x1F, 24);
+        assert_eq!((out >> 5) & 0x1F, 5);
+        assert_eq!((out >> 10) & 0x1F, 5);
+    }
+
+    #[test]
+    fn modulate_tint_clamps_to_31_on_overbright() {
+        // texel at max (31 each), tint at max (0xFF each) → should
+        // clamp to 31 per channel.
+        let texel: u16 = 31 | (31 << 5) | (31 << 10);
+        let out = modulate_tint(texel, 0xFF, 0xFF, 0xFF);
+        assert_eq!(out & 0x1F, 31);
+        assert_eq!((out >> 5) & 0x1F, 31);
+        assert_eq!((out >> 10) & 0x1F, 31);
+    }
+
+    #[test]
+    fn modulate_tint_preserves_mask_bit() {
+        // Semi-transparent texel (bit 15 set) must keep bit 15 after
+        // modulation so downstream blend logic still fires.
+        let texel: u16 = 0x8000 | 10;
+        let out = modulate_tint(texel, 0x80, 0x80, 0x80);
+        assert_eq!(out & 0x8000, 0x8000);
+    }
+
+    #[test]
+    fn split_tint_extracts_rgb_channels() {
+        // PSX tint word = 0xBBGGRR (the low 24 bits of a
+        // textured-primitive cmd).
+        assert_eq!(split_tint(0x00123456), (0x56, 0x34, 0x12));
+        assert_eq!(split_tint(0x00FFFFFF), (0xFF, 0xFF, 0xFF));
+        assert_eq!(split_tint(0x0080_8080), RAW_TEXTURE_TINT);
     }
 }
