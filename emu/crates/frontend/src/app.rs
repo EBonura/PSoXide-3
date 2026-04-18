@@ -53,10 +53,34 @@ impl Default for PanelVisibility {
     }
 }
 
+/// How the framebuffer panel scales the PSX display into the host
+/// window. Toggled from the debug toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleMode {
+    /// Stretch to fit the available area while preserving aspect
+    /// ratio. Fractional scale factors — smooth but may visibly
+    /// interpolate on integer-pixel art.
+    Fit,
+    /// Integer-multiple scale (1×, 2×, 3×, …) fitting inside the
+    /// available area. Pixel-perfect — the PSX's native res shows
+    /// with no interpolation or stretch. Letterboxes as needed.
+    Integer,
+}
+
+impl Default for ScaleMode {
+    fn default() -> Self {
+        Self::Fit
+    }
+}
+
 /// Top-level app state. Owns the emulator state directly — no Arc/Mutex,
 /// single-threaded, UI reads state in-place per frame.
 pub struct AppState {
     pub panels: PanelVisibility,
+    /// How the framebuffer scales — `Fit` (stretch with aspect
+    /// preserved) vs `Integer` (1×/2×/3× pixel-perfect, letterbox
+    /// as needed). Toggled via the debug toolbar.
+    pub scale_mode: ScaleMode,
     pub cpu: Cpu,
     /// Optional because we let the frontend run without a BIOS for UI
     /// development. If absent, register panels show the reset-state CPU
@@ -167,6 +191,7 @@ impl AppState {
 
         let mut out = Self {
             panels: PanelVisibility::default(),
+            scale_mode: ScaleMode::default(),
             cpu,
             bus,
             menu: MenuState::new(),

@@ -47,7 +47,7 @@ pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::Te
     }
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        framebuffer::draw(ui, vram_tex, state.bus.as_ref());
+        framebuffer::draw(ui, vram_tex, state.bus.as_ref(), state.scale_mode);
     });
 
     state.menu.draw(ctx, dt);

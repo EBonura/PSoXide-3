@@ -28,7 +28,7 @@
 
 use egui::{Align, Button, Color32, Context, Label, Layout, RichText, TopBottomPanel};
 
-use crate::app::{self, AppState};
+use crate::app::{self, AppState, ScaleMode};
 use crate::icons;
 
 /// Icon font size in the button row.
@@ -111,6 +111,21 @@ fn draw_debug_toggles(ui: &mut egui::Ui, state: &mut AppState) {
         if let Some(bus) = state.bus.as_mut() {
             bus.gpu.wireframe_enabled = !bus.gpu.wireframe_enabled;
         }
+    }
+    // Resolution / scale-mode switch: Fit (stretches) ↔ Integer
+    // (pixel-perfect, letterboxed). MONITOR icon, tints green when
+    // Integer mode is active.
+    let integer_active = state.scale_mode == ScaleMode::Integer;
+    let scale_btn = toggle_button(icons::MONITOR, integer_active);
+    if ui
+        .add(scale_btn)
+        .on_hover_text("Toggle native (pixel-perfect integer scale) vs. fit-to-window")
+        .clicked()
+    {
+        state.scale_mode = match state.scale_mode {
+            ScaleMode::Fit => ScaleMode::Integer,
+            ScaleMode::Integer => ScaleMode::Fit,
+        };
     }
 }
 
