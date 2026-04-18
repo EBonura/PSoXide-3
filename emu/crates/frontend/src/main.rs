@@ -13,6 +13,7 @@ mod app;
 mod audio;
 mod cli;
 mod disasm;
+mod gamepad;
 mod gfx;
 mod icons;
 mod theme;
@@ -86,6 +87,10 @@ struct Shell {
     /// (headless CI, devices that can't open a stereo stream).
     /// Emulation keeps running regardless — silence is fine.
     audio: Option<audio::AudioOut>,
+    /// Host gamepad input. Always constructible; a missing pad
+    /// or failed gilrs init just produces empty button masks so
+    /// the keyboard path keeps working.
+    gamepad: gamepad::Gamepad,
 }
 
 impl Default for Shell {
@@ -105,6 +110,10 @@ impl Shell {
         } else {
             eprintln!("[audio] no host output device available — running silent");
         }
+        let gamepad = gamepad::Gamepad::new();
+        if gamepad.is_connected() {
+            eprintln!("[gamepad] {} connected", gamepad.name());
+        }
         Self {
             graphics: None,
             state: AppState::with_config_dir(config_dir),
@@ -113,6 +122,7 @@ impl Shell {
             pad1_mask: 0,
             fullscreen,
             audio,
+            gamepad,
         }
     }
 }
@@ -287,13 +297,21 @@ impl ApplicationHandler for Shell {
                 // captures only the tail via `push_history`'s ring-buffer
                 // semantics, so a 100k-instruction frame doesn't allocate.
                 if self.state.running {
-                    // Flush the current keyboard-derived pad mask into
-                    // the guest just before stepping, so the game/
-                    // homebrew sees fresh input this frame.
+                    // Merge the current keyboard-derived pad mask with
+                    // gamepad input before stepping, so the game/homebrew
+                    // sees fresh input this frame.
+                    let pad_mask = self.pad1_mask | self.gamepad.poll_buttons();
+                    let (rx, ry) = self.gamepad.right_stick();
+                    let (lx, ly) = self.gamepad.left_stick();
                     if let Some(bus) = self.state.bus.as_mut() {
-                        bus.set_port1_buttons(emulator_core::ButtonState::from_bits(
-                            self.pad1_mask,
-                        ));
+                        bus.set_port1_buttons(emulator_core::ButtonState::from_bits(pad_mask));
+                        // Forward analog sticks to the pad's analog
+                        // axes so DualShock-aware games see joystick
+                        // motion. Byte range is 0..=0xFF with 0x80 =
+                        // centre; gilrs gives us -1.0..=1.0. Y axis
+                        // is inverted on host gamepads (up = positive).
+                        let map = |v: f32| ((v.clamp(-1.0, 1.0) * 127.0) + 128.0) as u8;
+                        bus.set_port1_sticks(map(rx), map(-ry), map(lx), map(-ly));
                     }
                     app::step_one_frame(&mut self.state);
 

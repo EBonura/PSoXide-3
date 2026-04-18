@@ -20,3 +20,4 @@ egui-wgpu  = { workspace = true }
 egui-winit = { workspace = true }
 pollster   = { workspace = true }
 cpal       = { workspace = true }
+gilrs      = { workspace = true }

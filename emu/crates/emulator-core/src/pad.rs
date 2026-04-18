@@ -221,6 +221,13 @@ impl PortDevice {
         self.pad.as_ref()
     }
 
+    /// Mutable access to the attached pad — lets the frontend
+    /// push analog-stick samples in each frame without going
+    /// through the SIO protocol loop.
+    pub fn pad_mut(&mut self) -> Option<&mut DigitalPad> {
+        self.pad.as_mut()
+    }
+
     /// Immutable access to the attached memory card, if any. The
     /// frontend uses this to snapshot card bytes for persistence
     /// at shutdown.
