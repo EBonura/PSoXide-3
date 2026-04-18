@@ -202,6 +202,12 @@ pub struct CdRom {
     /// — used by the `cdrom_probe` example to log exactly which
     /// command was just issued at each `commands_dispatched` bump.
     last_command: u8,
+    /// Total bytes popped from the data FIFO via MMIO reads.
+    /// Diagnostic. If this grows in lockstep with DataReady events
+    /// the BIOS is actually consuming the sectors we delivered; if
+    /// it's stuck, the BIOS's read path is blocked on something
+    /// we're not signalling (BFRD / request-register / IRQ ack).
+    data_fifo_pops: u64,
     /// Loaded disc image, if any. When `Some`, `disc_present` is also
     /// true and GetID / ReadN follow the disc-present paths; when
     /// `None`, they fall back to the "please insert disc" path.
@@ -240,6 +246,7 @@ impl CdRom {
             commands_dispatched: 0,
             command_hist: [0; 32],
             last_command: 0,
+            data_fifo_pops: 0,
             disc: None,
             data_fifo: VecDeque::new(),
             reading: false,
@@ -283,7 +290,10 @@ impl CdRom {
             // 0x1F80_1801 — response FIFO (any index).
             (1, _) => self.pop_response(),
             // 0x1F80_1802 — data FIFO (any index).
-            (2, _) => self.data_fifo.pop_front().unwrap_or(0),
+            (2, _) => {
+                self.data_fifo_pops = self.data_fifo_pops.saturating_add(1);
+                self.data_fifo.pop_front().unwrap_or(0)
+            }
             // 0x1F80_1803 — index-dependent:
             //   idx=0 → interrupt enable,
             //   idx=1 → interrupt flag,
@@ -671,6 +681,20 @@ impl CdRom {
                 break;
             }
             let ev = self.pending.pop_front().unwrap();
+
+            // If the drive was paused/reset between this event's
+            // scheduling and now, drop it silently. On real
+            // hardware, Pause/Init kills in-flight sector reads;
+            // letting a stale DataReady fire would clobber the
+            // data FIFO that software was about to drain, or
+            // deliver the wrong LBA entirely (we were burning
+            // hours on exactly this, LBA 17's volume-descriptor
+            // terminator landing in the slot where the BIOS
+            // expected its PVD).
+            if ev.irq == IrqType::DataReady && !self.reading {
+                continue;
+            }
+
             for b in ev.bytes.iter().copied() {
                 if self.responses.len() < RESPONSE_FIFO_DEPTH {
                     self.responses.push_back(b);
@@ -743,11 +767,25 @@ impl CdRom {
         self.last_command
     }
 
+    /// Most-recent `SetLoc` MSF target, as a `(minute, second,
+    /// frame)` BCD triple. Diagnostic-only — lets probes correlate
+    /// `ReadN` events with the LBA the BIOS is asking for.
+    pub fn debug_setloc_msf(&self) -> (u8, u8, u8) {
+        self.setloc_msf
+    }
+
+    /// Total bytes popped from the data FIFO via MMIO reads since
+    /// boot. Diagnostic.
+    pub fn data_fifo_pops(&self) -> u64 {
+        self.data_fifo_pops
+    }
+
     /// Pull one byte from the data FIFO — used by DMA channel 3's
     /// block-read path to drain a sector into RAM. Returns `0` when
     /// the FIFO is empty (hardware returns stale-bus bytes; `0` is
     /// a safe stand-in).
     pub fn pop_data_byte(&mut self) -> u8 {
+        self.data_fifo_pops = self.data_fifo_pops.saturating_add(1);
         self.data_fifo.pop_front().unwrap_or(0)
     }
 
