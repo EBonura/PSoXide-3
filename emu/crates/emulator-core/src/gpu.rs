@@ -115,6 +115,13 @@ pub struct Gpu {
     /// ordered dither patterns instead of visible 5-bit staircases.
     dither_enabled: bool,
 
+    /// Active polyline receive state. `None` when no polyline is in
+    /// flight; `Some(...)` between a polyline start packet and its
+    /// terminator word. While `Some`, every GP0 write is
+    /// interpreted as polyline continuation data, bypassing the
+    /// regular packet assembler.
+    polyline: Option<PolylineState>,
+
     // --- Display area (GP1 0x05 / 0x06 / 0x07 / 0x08) ---
     /// VRAM X of the top-left pixel of the displayed framebuffer.
     display_start_x: u16,
@@ -232,6 +239,7 @@ impl Gpu {
             mask_set_on_draw: false,
             mask_check_before_draw: false,
             dither_enabled: false,
+            polyline: None,
             display_start_x: 0,
             display_start_y: 0,
             display_width: 320,
@@ -704,6 +712,13 @@ impl Gpu {
             return;
         }
 
+        // Polyline receive — every word is either a vertex / colour
+        // or the terminator sentinel until the list ends.
+        if self.polyline.is_some() {
+            self.ingest_polyline_word(word);
+            return;
+        }
+
         if self.gp0_expected == 0 {
             let op = (word >> 24) & 0xFF;
             self.gp0_expected = gp0_packet_size(op as u8);
@@ -830,6 +845,16 @@ impl Gpu {
             // both as opaque for now).
             0x20..=0x23 => self.draw_monochrome_tri(),
             0x28..=0x2B => self.draw_monochrome_quad(),
+            // Single monochrome line — 3 words.
+            0x40..=0x43 => self.draw_line_mono_single(),
+            // Polyline monochrome start — 3 words. After this packet
+            // the FIFO enters a streaming mode that accepts vertex
+            // words until the 0x55555555 / 0x50005000 terminator.
+            0x48..=0x4B => self.draw_line_mono_start_polyline(),
+            // Single shaded line — 4 words.
+            0x50..=0x53 => self.draw_line_shaded_single(),
+            // Polyline shaded start — 4 words.
+            0x58..=0x5B => self.draw_line_shaded_start_polyline(),
             // Gouraud-shaded triangle / quad — per-vertex colour
             // interpolated across the primitive via barycentrics.
             0x30..=0x33 => self.draw_shaded_tri(),
@@ -1610,6 +1635,242 @@ impl Gpu {
         }
     }
 
+    // --- Lines (GP0 0x40..=0x5F) ---
+
+    /// GP0 0x40..=0x43 — single monochrome line. Packet: `[cmd+color, v0, v1]`.
+    fn draw_line_mono_single(&mut self) {
+        let cmd = self.gp0_fifo[0];
+        let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let v1 = self.decode_vertex(self.gp0_fifo[2]);
+        self.rasterize_line(v0, v1, color, color, mode, false);
+    }
+
+    /// GP0 0x50..=0x53 — single Gouraud-shaded line. Packet:
+    /// `[cmd+c0, v0, c1, v1]` — each endpoint carries its own colour
+    /// word.
+    fn draw_line_shaded_single(&mut self) {
+        let cmd = self.gp0_fifo[0];
+        let c0 = cmd & 0x00FF_FFFF;
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let c1 = self.gp0_fifo[2] & 0x00FF_FFFF;
+        let v1 = self.decode_vertex(self.gp0_fifo[3]);
+        self.rasterize_line_shaded(v0, v1, c0, c1, mode);
+    }
+
+    /// GP0 0x48..=0x4B — start a monochrome polyline. The initial
+    /// packet has the same shape as a single line (cmd+color, v0,
+    /// v1); after executing it we switch to receive mode.
+    fn draw_line_mono_start_polyline(&mut self) {
+        let cmd = self.gp0_fifo[0];
+        let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let v1 = self.decode_vertex(self.gp0_fifo[2]);
+        self.rasterize_line(v0, v1, color, color, mode, false);
+        // Enter receive mode with `v1` as the starting point for
+        // the next segment.
+        self.polyline = Some(PolylineState::Mono {
+            color,
+            mode,
+            last_vertex: v1,
+        });
+    }
+
+    /// GP0 0x58..=0x5B — start a Gouraud polyline. Initial packet
+    /// is `[cmd+c0, v0, c1, v1]`; after the first segment we
+    /// enter receive mode waiting for alternating (color, vertex)
+    /// pairs.
+    fn draw_line_shaded_start_polyline(&mut self) {
+        let cmd = self.gp0_fifo[0];
+        let c0 = cmd & 0x00FF_FFFF;
+        let mode = prim_blend_mode(cmd, self.tex_blend_mode);
+        let v0 = self.decode_vertex(self.gp0_fifo[1]);
+        let c1 = self.gp0_fifo[2] & 0x00FF_FFFF;
+        let v1 = self.decode_vertex(self.gp0_fifo[3]);
+        self.rasterize_line_shaded(v0, v1, c0, c1, mode);
+        self.polyline = Some(PolylineState::Shaded {
+            mode,
+            last_color: c1,
+            last_vertex: v1,
+            awaiting_color: true,
+            pending_color: 0,
+        });
+    }
+
+    /// Consume one GP0 word while in polyline mode. Terminator
+    /// pattern per PSX-SPX is `0x50005000` / `0x55555555` — any
+    /// word whose top bits match `0x5000_5000 >> 28 == 0x5` in
+    /// both high and low halves means "end". We accept the
+    /// canonical sentinels.
+    fn ingest_polyline_word(&mut self, word: u32) {
+        // Sentinel check — both halves have the terminator pattern.
+        // Redux uses `(word & 0xF000F000) == 0x50005000`.
+        let is_term = (word & 0xF000_F000) == 0x5000_5000;
+        if is_term {
+            self.polyline = None;
+            return;
+        }
+        match self.polyline.as_mut().unwrap() {
+            PolylineState::Mono {
+                color,
+                mode,
+                last_vertex,
+            } => {
+                let c = *color;
+                let m = *mode;
+                let v0 = *last_vertex;
+                let v1 = self.decode_vertex(word);
+                self.rasterize_line(v0, v1, c, c, m, false);
+                if let Some(PolylineState::Mono { last_vertex, .. }) = self.polyline.as_mut() {
+                    *last_vertex = v1;
+                }
+            }
+            PolylineState::Shaded {
+                mode,
+                last_color,
+                last_vertex,
+                awaiting_color,
+                pending_color,
+            } => {
+                if *awaiting_color {
+                    *pending_color = word & 0x00FF_FFFF;
+                    *awaiting_color = false;
+                } else {
+                    let c0 = *last_color;
+                    let c1 = *pending_color;
+                    let m = *mode;
+                    let v0 = *last_vertex;
+                    let v1 = self.decode_vertex(word);
+                    self.rasterize_line_shaded(v0, v1, c0, c1, m);
+                    if let Some(PolylineState::Shaded {
+                        last_color,
+                        last_vertex,
+                        awaiting_color,
+                        ..
+                    }) = self.polyline.as_mut()
+                    {
+                        *last_color = c1;
+                        *last_vertex = v1;
+                        *awaiting_color = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rasterize a line from `v0` to `v1` using Bresenham's
+    /// algorithm. Clips to the draw area and respects mask-bit
+    /// flags. `c0` and `c1` are the same for monochrome lines;
+    /// Gouraud lines use [`Gpu::rasterize_line_shaded`] which
+    /// interpolates per pixel.
+    ///
+    /// `_interpolate` is reserved for future shaded mode but kept
+    /// here so the signature is stable.
+    fn rasterize_line(
+        &mut self,
+        v0: (i32, i32),
+        v1: (i32, i32),
+        c0: u16,
+        _c1: u16,
+        mode: BlendMode,
+        _interpolate: bool,
+    ) {
+        let (mut x, mut y) = v0;
+        let (x1, y1) = v1;
+        let dx = (x1 - x).abs();
+        let dy = -(y1 - y).abs();
+        let sx: i32 = if x < x1 { 1 } else { -1 };
+        let sy: i32 = if y < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let (min_x, max_x) = (self.draw_area_left as i32, self.draw_area_right as i32);
+        let (min_y, max_y) = (self.draw_area_top as i32, self.draw_area_bottom as i32);
+        loop {
+            if (min_x..=max_x).contains(&x) && (min_y..=max_y).contains(&y) {
+                self.plot_pixel(x as u16, y as u16, c0, mode);
+            }
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    /// Rasterize a Gouraud-shaded line — interpolates RGB between
+    /// `c0` and `c1` linearly in screen space. Uses the same
+    /// Bresenham walk as the mono path; the colour parameter is
+    /// re-evaluated each step from a normalised distance-along-
+    /// line metric.
+    fn rasterize_line_shaded(
+        &mut self,
+        v0: (i32, i32),
+        v1: (i32, i32),
+        c0: u32,
+        c1: u32,
+        mode: BlendMode,
+    ) {
+        let (mut x, mut y) = v0;
+        let (x1, y1) = v1;
+        let dx_abs = (x1 - x).abs();
+        let dy_abs = (y1 - y).abs();
+        let steps = dx_abs.max(dy_abs).max(1);
+        let r0 = (c0 & 0xFF) as i32;
+        let g0 = ((c0 >> 8) & 0xFF) as i32;
+        let b0 = ((c0 >> 16) & 0xFF) as i32;
+        let r1 = (c1 & 0xFF) as i32;
+        let g1 = ((c1 >> 8) & 0xFF) as i32;
+        let b1 = ((c1 >> 16) & 0xFF) as i32;
+        let dx = (x1 - x).abs();
+        let dy = -(y1 - y).abs();
+        let sx: i32 = if x < x1 { 1 } else { -1 };
+        let sy: i32 = if y < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let (min_x, max_x) = (self.draw_area_left as i32, self.draw_area_right as i32);
+        let (min_y, max_y) = (self.draw_area_top as i32, self.draw_area_bottom as i32);
+        let mut step = 0i32;
+        loop {
+            if (min_x..=max_x).contains(&x) && (min_y..=max_y).contains(&y) {
+                // Linear interpolate each channel.
+                let r = r0 + ((r1 - r0) * step) / steps;
+                let g = g0 + ((g1 - g0) * step) / steps;
+                let b = b0 + ((b1 - b0) * step) / steps;
+                let colour = if self.dither_enabled {
+                    dither_rgb(r, g, b, x, y)
+                } else {
+                    rgb24_to_bgr15(
+                        (r.clamp(0, 255) as u32)
+                            | ((g.clamp(0, 255) as u32) << 8)
+                            | ((b.clamp(0, 255) as u32) << 16),
+                    )
+                };
+                self.plot_pixel(x as u16, y as u16, colour, mode);
+            }
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+            step += 1;
+        }
+    }
+
     // --- CPU→VRAM transfer (GP0 0xA0) ---
 
     /// GP0 0xA0 — start a CPU-to-VRAM transfer. `[cmd, xy, wh]` is
@@ -1756,10 +2017,15 @@ fn gp0_packet_size(op: u8) -> usize {
         // Textured + shaded: 3-vert = 9, 4-vert = 12.
         0x34..=0x37 => 9,
         0x3C..=0x3F => 12,
-        // Lines: 3 words (color + 2 vertices) for monochrome,
+        // Single lines: 3 words (color + 2 vertices) for monochrome,
         // 4 words for shaded.
         0x40..=0x43 => 3,
         0x50..=0x53 => 4,
+        // Polyline starts: same initial shape, but after the first
+        // endpoint the FIFO enters a streaming receive mode until
+        // the terminator sentinel is seen.
+        0x48..=0x4B => 3,
+        0x58..=0x5B => 4,
         // Monochrome rectangles: variable (3), 1×1 (2), 8×8 (2), 16×16 (2).
         0x60..=0x63 => 3,
         0x64..=0x67 => 4, // variable + textured
@@ -1834,6 +2100,31 @@ fn dither_rgb(r: i32, g: i32, b: i32, x: i32, y: i32) -> u16 {
     let dg = (g + offset).clamp(0, 255) as u32;
     let db = (b + offset).clamp(0, 255) as u32;
     rgb24_to_bgr15(dr | (dg << 8) | (db << 16))
+}
+
+/// Transient state held between the start of a polyline primitive
+/// (GP0 0x48..=0x4B or 0x58..=0x5B) and its terminator word. Each
+/// variant carries the most recently-rasterised endpoint so the
+/// next segment can chain from it.
+#[derive(Copy, Clone, Debug)]
+enum PolylineState {
+    /// Monochrome polyline — all segments use the same color.
+    Mono {
+        color: u16,
+        mode: BlendMode,
+        last_vertex: (i32, i32),
+    },
+    /// Gouraud polyline — each segment interpolates between the
+    /// prior vertex's colour and the next colour word. Polyline
+    /// receive mode alternates between (color word, vertex word)
+    /// pairs; `awaiting_color` tracks which half we're on.
+    Shaded {
+        mode: BlendMode,
+        last_color: u32,
+        last_vertex: (i32, i32),
+        awaiting_color: bool,
+        pending_color: u32,
+    },
 }
 
 /// PSX semi-transparency mode. The four non-`Opaque` variants map
@@ -2476,6 +2767,65 @@ mod tests {
         assert_eq!(v & 0x1F, 31);
         assert_eq!((v >> 5) & 0x1F, 31);
         assert_eq!((v >> 10) & 0x1F, 31);
+    }
+
+    #[test]
+    fn mono_line_packet_size_is_three() {
+        for op in 0x40..=0x43 {
+            assert_eq!(gp0_packet_size(op), 3, "opcode 0x{op:02X}");
+        }
+    }
+
+    #[test]
+    fn shaded_line_packet_size_is_four() {
+        for op in 0x50..=0x53 {
+            assert_eq!(gp0_packet_size(op), 4, "opcode 0x{op:02X}");
+        }
+    }
+
+    #[test]
+    fn polyline_start_packet_sizes_match_single() {
+        for op in 0x48..=0x4B {
+            assert_eq!(gp0_packet_size(op), 3);
+        }
+        for op in 0x58..=0x5B {
+            assert_eq!(gp0_packet_size(op), 4);
+        }
+    }
+
+    #[test]
+    fn mono_line_horizontal_plots_one_row() {
+        let mut gpu = Gpu::new();
+        // Draw area: full VRAM.
+        gpu.write32(GP0_ADDR, 0xE3_00_00_00); // top-left 0,0
+        gpu.write32(GP0_ADDR, 0xE4_00_03_FF); // bot-right 1023,0 (one row)
+        // Mono line: white, from (0,0) to (9,0).
+        gpu.write32(GP0_ADDR, 0x40_FF_FF_FF); // cmd + white
+        gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
+        gpu.write32(GP0_ADDR, 0x0000_0009); // v1 = (9, 0)
+        for x in 0..=9u16 {
+            let px = gpu.vram.get_pixel(x, 0);
+            assert_ne!(px, 0, "pixel ({x}, 0) should be set");
+        }
+        assert_eq!(gpu.vram.get_pixel(10, 0), 0);
+    }
+
+    #[test]
+    fn mono_polyline_end_sentinel_exits_receive_mode() {
+        let mut gpu = Gpu::new();
+        gpu.write32(GP0_ADDR, 0xE3_00_00_00);
+        gpu.write32(GP0_ADDR, 0xE4_00_03_FF);
+        // Start polyline.
+        gpu.write32(GP0_ADDR, 0x48_FF_FF_FF);
+        gpu.write32(GP0_ADDR, 0x0000_0000); // v0
+        gpu.write32(GP0_ADDR, 0x0000_0005); // v1
+        assert!(gpu.polyline.is_some());
+        // Another vertex.
+        gpu.write32(GP0_ADDR, 0x0000_000A);
+        assert!(gpu.polyline.is_some());
+        // Terminator.
+        gpu.write32(GP0_ADDR, 0x5000_5000);
+        assert!(gpu.polyline.is_none());
     }
 
     #[test]
