@@ -7,6 +7,7 @@
 //! ```
 
 use emulator_core::{Bus, Cpu};
+use psx_iso::Disc;
 use std::path::PathBuf;
 
 fn main() {
@@ -20,6 +21,13 @@ fn main() {
         .unwrap_or_else(|_| PathBuf::from("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN"));
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
     let mut bus = Bus::new(bios).expect("bus");
+    // Optional disc image. Setting PSOXIDE_DISC mounts a BIN image
+    // before stepping so milestone-D-plus goldens capture the
+    // licensed-disc boot path instead of the shell.
+    if let Ok(disc_path) = std::env::var("PSOXIDE_DISC") {
+        let disc_bytes = std::fs::read(&disc_path).expect("disc readable");
+        bus.cdrom.insert_disc(Some(Disc::from_bin(disc_bytes)));
+    }
     let mut cpu = Cpu::new();
 
     for _ in 0..n {

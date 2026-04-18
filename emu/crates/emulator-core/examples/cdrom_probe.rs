@@ -37,26 +37,17 @@ fn main() {
         cpu.step(&mut bus).expect("step");
         let c = bus.cdrom.commands_dispatched();
         if c != last_cmd_count {
-            let hist = bus.cdrom.command_histogram();
-            let latest_op = hist
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, &c)| c > 0)
-                .map(|(i, _)| i as u8)
-                .unwrap_or(0);
-            // Can't directly tell which was the latest command without more
-            // instrumentation; print the new total and delta-counts across
-            // the histogram vs the previous snapshot.
+            let op = bus.cdrom.last_command();
+            let name = cmd_name(op);
             println!(
-                "step={:>10}  cyc={:>12}  pc=0x{:08x}  cmds={} (latest op: 0x{:02x})  irq_flag=0x{:02x}  irq_mask=0x{:02x}",
+                "step={:>10}  cyc={:>12}  pc=0x{:08x}  cmds={:>3}  cmd=0x{:02X} {:<8}  irq_flag=0x{:02x}",
                 cpu.tick(),
                 bus.cycles(),
                 cpu.pc(),
                 c,
-                latest_op,
+                op,
+                name,
                 bus.cdrom.irq_flag(),
-                bus.cdrom.irq_mask_raw(),
             );
             last_cmd_count = c;
         }
@@ -67,27 +58,45 @@ fn main() {
     let hist = bus.cdrom.command_histogram();
     for (op, &c) in hist.iter().enumerate() {
         if c > 0 {
-            let name = match op as u8 {
-                0x01 => "GetStat",
-                0x02 => "SetLoc",
-                0x06 => "ReadN",
-                0x09 => "Pause",
-                0x0A => "Init",
-                0x0B => "Mute",
-                0x0C => "Demute",
-                0x0D => "SetFilter",
-                0x0E => "SetMode",
-                0x13 => "GetTN",
-                0x14 => "GetTD",
-                0x15 => "SeekL",
-                0x16 => "SeekP",
-                0x19 => "Test",
-                0x1A => "GetID",
-                0x1B => "ReadS",
-                0x1E => "ReadTOC",
-                _ => "?",
-            };
-            println!("  0x{op:02X} {name:<10} {c}");
+            println!("  0x{op:02X} {:<10} {c}", cmd_name(op as u8));
         }
+    }
+}
+
+fn cmd_name(op: u8) -> &'static str {
+    match op {
+        0x00 => "Sync",
+        0x01 => "GetStat",
+        0x02 => "SetLoc",
+        0x03 => "Play",
+        0x04 => "Forward",
+        0x05 => "Backward",
+        0x06 => "ReadN",
+        0x07 => "MotorOn",
+        0x08 => "Stop",
+        0x09 => "Pause",
+        0x0A => "Init",
+        0x0B => "Mute",
+        0x0C => "Demute",
+        0x0D => "SetFilter",
+        0x0E => "SetMode",
+        0x0F => "GetParam",
+        0x10 => "GetLocL",
+        0x11 => "GetLocP",
+        0x12 => "SetSession",
+        0x13 => "GetTN",
+        0x14 => "GetTD",
+        0x15 => "SeekL",
+        0x16 => "SeekP",
+        0x17 => "SetClock",
+        0x18 => "GetClock",
+        0x19 => "Test",
+        0x1A => "GetID",
+        0x1B => "ReadS",
+        0x1C => "Reset",
+        0x1D => "GetQ",
+        0x1E => "ReadTOC",
+        0x1F => "VideoCD",
+        _ => "?",
     }
 }
