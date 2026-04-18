@@ -257,15 +257,49 @@ impl AppState {
     /// it. The XMB dispatches [`MenuAction::LaunchGame`] with only
     /// the ID, and we resolve it here so the XMB never needs a
     /// reference to the full library.
+    ///
+    /// For CUE entries the XMB lists, the `id` is the CUE's own
+    /// stable ID. CUEs aren't bootable directly — we have to
+    /// re-read the CUE to find its data-track BIN and launch
+    /// that. The BIN keeps its own `LibraryEntry` (for size /
+    /// mtime tracking) but borrows the CUE's friendly title.
     pub fn launch_by_id(&mut self, id: &str) -> Result<(), String> {
-        let entry = self
-            .library
-            .entries
-            .iter()
-            .find(|e| e.id == id)
-            .cloned()
-            .ok_or_else(|| format!("no library entry with id={id}"))?;
-        self.launch_entry(&entry)
+        let Some(entry) = self.library.entries.iter().find(|e| e.id == id).cloned() else {
+            return Err(format!("no library entry with id={id}"));
+        };
+
+        match entry.kind {
+            GameKind::DiscCue => {
+                // Resolve the CUE's primary BIN, then look up
+                // *that* path in the library to get the BIN's
+                // LibraryEntry (so launch_entry's kind-dispatch
+                // takes the DiscBin branch).
+                let bin_path =
+                    psoxide_settings::library::primary_bin_from_cue(&entry.path)
+                        .ok_or_else(|| {
+                            format!(
+                                "could not find data-track BIN in CUE {}",
+                                entry.path.display()
+                            )
+                        })?;
+                let bin_entry = self
+                    .library
+                    .entries
+                    .iter()
+                    .find(|e| e.path == bin_path)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "CUE {} references BIN {} but it's not in the library — \
+                             scan the directory first",
+                            entry.path.display(),
+                            bin_path.display()
+                        )
+                    })?;
+                self.launch_entry(&bin_entry)
+            }
+            _ => self.launch_entry(&entry),
+        }
     }
 
     /// Walk the configured library root and update the cache. Uses
@@ -300,38 +334,97 @@ impl AppState {
     }
 
     /// Project the current library into the XMB's Games + Examples
-    /// columns. Games get sorted by title (humans scan alphabetised
-    /// lists faster); Examples get sorted by title too but live in
-    /// their own column so commercial discs + homebrew don't share
-    /// a list. Multi-track rips (audio tracks 2..N) are hidden —
-    /// they're not independently bootable, just listing them
-    /// pollutes the grid.
+    /// columns. Three passes:
+    ///
+    /// 1. Walk every CUE entry and parse it to find its primary
+    ///    (data-track) BIN. Build a map
+    ///    `absolute_bin_path → (cue_title, cue_id)` so each BIN
+    ///    the CUE owns shows up with the CUE's friendly filename
+    ///    as its title (e.g. "Crash Bandicoot (USA)" instead of
+    ///    the raw PVD ID "SCUS-94900"), and under the CUE's stable
+    ///    game ID so savestates key off the disc identity rather
+    ///    than the BIN byte hash alone.
+    /// 2. Walk every entry. For BIN entries: drop multi-track
+    ///    audio rips (Track 2..N), prefer the CUE-linked title if
+    ///    one exists, and skip BINs that map to the *same* CUE as
+    ///    an earlier BIN (dedup). For CUE entries: hidden from the
+    ///    games list — they're not independently bootable and
+    ///    their BIN is already listed. For EXE entries: into
+    ///    Examples.
+    /// 3. Alphabetise each column.
+    ///
+    /// Result: Crash Bandicoot shows once, under its friendly
+    /// title, and clicking it launches the BIN.
     pub fn refresh_xmb_library(&mut self) {
+        use std::collections::HashMap;
+
+        // Pass 1: map "BIN path" → (CUE-derived title, CUE id).
+        let mut cue_owns_bin: HashMap<PathBuf, (String, String)> = HashMap::new();
+        for e in &self.library.entries {
+            if e.kind != GameKind::DiscCue {
+                continue;
+            }
+            if let Some(bin) = psoxide_settings::library::primary_bin_from_cue(&e.path) {
+                cue_owns_bin.insert(bin, (e.title.clone(), e.id.clone()));
+            }
+        }
+
+        // Pass 2: project entries, applying dedup + title overrides.
         let mut games: Vec<XmbLibraryItem> = Vec::new();
         let mut examples: Vec<XmbLibraryItem> = Vec::new();
+        let mut cue_already_listed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for e in &self.library.entries {
             let label = e
                 .path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("<unknown>");
-            // Skip audio tracks — any filename with "(Track N)"
-            // where N >= 2 (track 1 is always the data track).
-            if label.contains("(Track ") && !label.contains("(Track 1)") {
+
+            // Audio tracks: any "(Track N)" filename where N != 1.
+            // Multi-track CUE rips leave each audio track as a
+            // standalone BIN; none of those boot, so hide them.
+            if label.contains("(Track ") && !label.contains("(Track 01)")
+                && !label.contains("(Track 1)")
+            {
                 continue;
             }
-            let subtitle = format_subtitle(e);
-            let item = XmbLibraryItem {
-                id: e.id.clone(),
-                title: e.title.clone(),
-                subtitle,
-            };
+
             match e.kind {
-                GameKind::Exe => examples.push(item),
-                GameKind::DiscBin | GameKind::DiscIso | GameKind::DiscCue => games.push(item),
+                // CUEs are never shown directly — their BIN is.
+                GameKind::DiscCue => continue,
+                GameKind::DiscBin | GameKind::DiscIso => {
+                    // If a CUE owns this BIN, use the CUE's
+                    // friendly title + stable ID. Also dedup: the
+                    // *first* BIN of a CUE wins; subsequent BINs
+                    // (multi-disc sets not yet modelled) are
+                    // hidden to keep the list clean.
+                    let (title, id) = if let Some((cue_title, cue_id)) = cue_owns_bin.get(&e.path)
+                    {
+                        if !cue_already_listed.insert(cue_id.clone()) {
+                            continue;
+                        }
+                        (cue_title.clone(), cue_id.clone())
+                    } else {
+                        (e.title.clone(), e.id.clone())
+                    };
+                    games.push(XmbLibraryItem {
+                        id,
+                        title,
+                        subtitle: format_subtitle(e),
+                    });
+                }
+                GameKind::Exe => examples.push(XmbLibraryItem {
+                    id: e.id.clone(),
+                    title: e.title.clone(),
+                    subtitle: format_subtitle(e),
+                }),
                 GameKind::Unknown => {}
             }
         }
+
+        // Pass 3: stable alphabetical order per column.
         games.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
         examples.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
         self.xmb.set_library(&games, &examples);
