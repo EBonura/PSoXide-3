@@ -153,12 +153,9 @@ const SEEK_SECOND_RESPONSE_CYCLES: u64 = CD_READ_TIME * 4; // ≈ 1,806,336
 /// PSX system clock / CD frames per second. `33_868_800 / 75`.
 /// Redux's `cdReadTime`.
 const CD_READ_TIME: u64 = 451_584;
-/// Cycles between sector reads — matches Redux's double-speed path
-/// (`scheduleCDReadIRQ(cdReadTime)` when mode bit 7 is set).
-/// Single-speed would be `cdReadTime * 2` = 903,168; the BIOS's
-/// disc probe runs at double-speed so we default there. If / when
-/// we start tracking the SetMode bit, we'll branch on it.
-const SECTOR_READ_CYCLES: u64 = CD_READ_TIME;
+// Sector-read cycles are now derived per-instance from the current
+// mode byte via [`CdRom::sector_read_cycles`]: double-speed =
+// `CD_READ_TIME`, single-speed = `CD_READ_TIME * 2`.
 
 /// A deferred response: when `bus.cycles` passes `deadline`, the
 /// event's bytes land in the response FIFO and its IRQ type fires.
@@ -244,6 +241,19 @@ pub struct CdRom {
     reading: bool,
     /// Next sector LBA to deliver during an active read.
     read_lba: u32,
+    /// Last SetMode byte written by the CPU. Bit layout:
+    ///   0: CD-DA enable (for Play command)
+    ///   1: auto-pause on track boundary
+    ///   2: play-report enable
+    ///   3: XA filter enable
+    ///   4: ignore-bit (internal)
+    ///   5: sector size (0 = 2048 bytes / data only, 1 = 2340 bytes / full)
+    ///   6: XA ADPCM enable
+    ///   7: speed (0 = single-speed 1x, 1 = double-speed 2x)
+    ///
+    /// We currently key off bit 7 for sector-read pacing. Other bits
+    /// are stored but not yet acted on.
+    mode: u8,
 }
 
 impl CdRom {
@@ -274,6 +284,13 @@ impl CdRom {
             data_fifo: VecDeque::new(),
             reading: false,
             read_lba: 0,
+            // Power-on mode: double-speed, no XA, data-only 2048-byte
+            // sectors. Matches the BIOS's probe-time expectation — it
+            // issues SetMode 0x80 (double-speed) before its first
+            // ReadN. A fresh emulator reset without an intervening
+            // SetMode still uses double-speed, matching the prior
+            // behaviour of always-CD_READ_TIME pacing.
+            mode: 0x80,
         }
     }
 
@@ -529,9 +546,25 @@ impl CdRom {
         self.schedule_first_response(vec![stat]);
     }
 
-    fn cmd_setmode(&mut self, _params: &[u8]) {
+    fn cmd_setmode(&mut self, params: &[u8]) {
+        if let Some(&m) = params.first() {
+            self.mode = m;
+        }
         let stat = self.stat_byte();
         self.schedule_first_response(vec![stat]);
+    }
+
+    /// Cycles between DataReady events for the current speed. Double-
+    /// speed (mode bit 7 set) reads at 150 sectors/sec → `CD_READ_TIME`
+    /// cycles per sector. Single-speed reads at half that rate →
+    /// `CD_READ_TIME * 2` cycles per sector. Matches Redux's pacing in
+    /// `core/cdriso.cc`.
+    fn sector_read_cycles(&self) -> u64 {
+        if self.mode & 0x80 != 0 {
+            CD_READ_TIME
+        } else {
+            CD_READ_TIME * 2
+        }
     }
 
     fn cmd_stop(&mut self) {
@@ -607,7 +640,7 @@ impl CdRom {
     fn schedule_sector_event(&mut self) {
         let stat = self.stat_byte() | drive_status_bit::READING;
         self.pending.push_back(PendingEvent {
-            deadline: SECTOR_READ_CYCLES,
+            deadline: self.sector_read_cycles(),
             rebased: false,
             irq: IrqType::DataReady,
             bytes: vec![stat],
@@ -738,8 +771,9 @@ impl CdRom {
                     // tick, but doing it inline avoids the DataReady
                     // chain firing twice in a single tick when
                     // SECTOR_READ_CYCLES is small.)
+                    let delay = self.sector_read_cycles();
                     if let Some(last) = self.pending.back_mut() {
-                        last.deadline = cycles_now.saturating_add(SECTOR_READ_CYCLES);
+                        last.deadline = cycles_now.saturating_add(delay);
                         last.rebased = true;
                     }
                 }
@@ -887,5 +921,21 @@ mod tests {
         assert_eq!(cd.drive_status & drive_status_bit::SHELL_OPEN, 0);
         assert!(!cd.motor_on);
         assert!(!cd.disc_present);
+    }
+
+    #[test]
+    fn sector_read_cycles_tracks_mode_bit_7() {
+        let mut cd = CdRom::new();
+        // Default mode = 0x80 → double-speed.
+        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME);
+        // Flipping bit 7 off via SetMode gives single-speed (2×).
+        cd.cmd_setmode(&[0x00]);
+        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME * 2);
+        // Setting other bits without bit 7 stays single-speed.
+        cd.cmd_setmode(&[0x60]);
+        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME * 2);
+        // Back to double-speed when bit 7 returns.
+        cd.cmd_setmode(&[0x80]);
+        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME);
     }
 }
