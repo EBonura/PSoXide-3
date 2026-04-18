@@ -110,6 +110,21 @@ local function run()
             end
             io.flush()
 
+        elseif cmd == "run" then
+            -- Like `step N` but WITHOUT emitting per-instruction
+            -- records. Used by milestone tests that only want final
+            -- state (e.g. a `vram_hash` query after N steps). Avoids
+            -- the ~25s-per-million-steps Lua stdout overhead, so a
+            -- 600M-step milestone query runs in ~60s instead of
+            -- multiple hours.
+            local n = tonumber(line:match("^run%s+(%d+)$")) or 1
+            for i = 1, n do
+                PCSX.stepIn()
+                PCSX.runExecute()
+            end
+            local tick = tonumber(PCSX.getCPUCycles())
+            send(string.format("run ok tick=%d", tick))
+
         elseif cmd == "peek32" then
             -- `peek32 ADDR` — return the 32-bit value at the given
             -- physical address (decimal or 0x-prefixed hex). Used to
@@ -191,20 +206,183 @@ local function run()
                 send("err regs: " .. tostring(msg))
             end
 
+        elseif cmd == "screenshot_probe" then
+            -- Probe what `PCSX.GPU.takeScreenShot()` returns in this
+            -- Redux build. Reports table fields, bpp value, and
+            -- data sub-shape so we can pick the right parser for
+            -- `vram_hash`.
+            local ok, result = pcall(function()
+                if not (PCSX.GPU and PCSX.GPU.takeScreenShot) then
+                    error("no takeScreenShot")
+                end
+                local shot = PCSX.GPU.takeScreenShot()
+                local parts = {}
+                parts[#parts+1] = "w=" .. tostring(shot.width)
+                parts[#parts+1] = "h=" .. tostring(shot.height)
+                if type(shot.bpp) == "cdata" then
+                    parts[#parts+1] = "bpp_type=" .. tostring(ffi.typeof(shot.bpp))
+                    parts[#parts+1] = "bpp=" .. tostring(tonumber(shot.bpp))
+                else
+                    parts[#parts+1] = "bpp=" .. tostring(shot.bpp)
+                end
+                if type(shot.data) == "table" then
+                    -- Redux Slice pattern: table with _wrapper (cdata) +
+                    -- _type (string) + methods. Probe the metatable.
+                    local sub_keys = {}
+                    for k, v in pairs(shot.data) do
+                        sub_keys[#sub_keys+1] = tostring(k) .. ":" .. type(v)
+                    end
+                    parts[#parts+1] = "data_keys={" .. table.concat(sub_keys, ",") .. "}"
+                    if shot.data._type then
+                        parts[#parts+1] = "data._type=" .. tostring(shot.data._type)
+                    end
+                    if shot.data._wrapper then
+                        parts[#parts+1] = "data._wrapper=" .. tostring(ffi.typeof(shot.data._wrapper))
+                    end
+                    local mt = getmetatable(shot.data)
+                    if mt then
+                        local mt_keys = {}
+                        for k, v in pairs(mt) do
+                            mt_keys[#mt_keys+1] = tostring(k) .. ":" .. type(v)
+                        end
+                        parts[#parts+1] = "data_mt={" .. table.concat(mt_keys, ",") .. "}"
+                    end
+                elseif type(shot.data) == "cdata" then
+                    parts[#parts+1] = "data_cdata=" .. tostring(ffi.typeof(shot.data))
+                else
+                    parts[#parts+1] = "data_type=" .. type(shot.data)
+                end
+                return table.concat(parts, " ")
+            end)
+            if ok then
+                send("screenshot_probe " .. result)
+            else
+                send("err screenshot_probe: " .. tostring(result))
+            end
+
+        elseif cmd == "screenshot_save" then
+            -- `screenshot_save PATH` — writes Redux's current
+            -- screenshot as raw little-endian 15bpp pixel bytes to
+            -- PATH (plus a sidecar PATH.txt describing dimensions).
+            -- Used for direct byte-by-byte parity diffs against our
+            -- emulator's display_hash path.
+            local path = line:match("^screenshot_save%s+(.+)$")
+            if not path then
+                send("err screenshot_save: missing path")
+            else
+                local ok, result = pcall(function()
+                    if not (PCSX.GPU and PCSX.GPU.takeScreenShot) then
+                        error("no takeScreenShot")
+                    end
+                    local shot = PCSX.GPU.takeScreenShot()
+                    local w = tonumber(shot.width) or 0
+                    local h_dim = tonumber(shot.height) or 0
+                    local len = #shot.data
+                    local bin = io.open(path, "wb")
+                    if not bin then error("cannot open " .. path) end
+                    -- Slice.__index returns byte values; pack in
+                    -- chunks of 4096 to keep the string builder sane.
+                    local chunk_size = 4096
+                    local buf = {}
+                    for i = 0, len - 1 do
+                        buf[#buf+1] = string.char(tonumber(shot.data[i]) or 0)
+                        if #buf >= chunk_size then
+                            bin:write(table.concat(buf))
+                            buf = {}
+                        end
+                    end
+                    if #buf > 0 then bin:write(table.concat(buf)) end
+                    bin:close()
+                    local meta = io.open(path .. ".txt", "w")
+                    if meta then
+                        meta:write(string.format("w=%d h=%d bpp=%d len=%d\n",
+                            w, h_dim, tonumber(shot.bpp) or 0, len))
+                        meta:close()
+                    end
+                    return string.format("w=%d h=%d len=%d", w, h_dim, len)
+                end)
+                if ok then
+                    send("screenshot_save ok " .. result)
+                else
+                    send("err screenshot_save: " .. tostring(result))
+                end
+            end
+
+        elseif cmd == "vram_hash" then
+            -- FNV-1a-64 over Redux's currently-visible display area
+            -- (the output of `PCSX.GPU.takeScreenShot()`). This is
+            -- what the BIOS is actually showing on-screen — it
+            -- varies between 0×0 (before any display command has
+            -- run) and 640×480 (the standard NTSC-interlaced mode).
+            -- Hashing only the visible region gives us Redux-
+            -- anchored "pixel parity" for milestone tests, which
+            -- verifies that we're rendering the same thing Redux
+            -- does at a given instruction count — not just that
+            -- our emulator is self-consistent run-to-run.
+            --
+            -- Redux's PCSX Lua API doesn't expose a direct
+            -- 1 MiB VRAM pointer in this build; the screenshot
+            -- Slice is the closest thing. If / when a VRAM-ptr
+            -- accessor shows up we can extend this to full-VRAM
+            -- hashing.
+            --
+            -- The response also carries `w=... h=... bpp=...` so
+            -- callers can sanity-check that Redux's display area
+            -- matches theirs, since a same-pixel hash on different
+            -- dimensions is meaningless.
+            local ok, result = pcall(function()
+                if not (PCSX.GPU and PCSX.GPU.takeScreenShot) then
+                    error("no takeScreenShot")
+                end
+                local shot = PCSX.GPU.takeScreenShot()
+                local w = tonumber(shot.width) or 0
+                local h_dim = tonumber(shot.height) or 0
+                local bpp = tonumber(shot.bpp) or 0
+                local len = #shot.data
+                local h = ffi.new("uint64_t", 0xCBF29CE484222325ULL)
+                local prime = ffi.new("uint64_t", 0x100000001B3ULL)
+                for i = 0, len - 1 do
+                    local byte = tonumber(shot.data[i]) or 0
+                    h = bit.bxor(h, ffi.new("uint64_t", byte))
+                    h = h * prime
+                end
+                return string.format(
+                    "%016x w=%d h=%d bpp=%d len=%d",
+                    tonumber(ffi.cast("uint64_t", h)),
+                    w, h_dim, bpp, len
+                )
+            end)
+            if ok then
+                send("vram_hash " .. result)
+            else
+                send("err vram_hash: " .. tostring(result))
+            end
+
         elseif cmd == "introspect" then
-            -- One-time discovery: dump all PCSX.* keys and a sampling
-            -- of regs.* keys. Used to find the right Lua API for
-            -- reading hardware registers via the IRQ controller.
-            local pcsx_keys = {}
-            for k, v in pairs(PCSX) do
-                pcsx_keys[#pcsx_keys+1] = k .. ":" .. type(v)
+            -- One-time discovery: dump the namespaces we might pull
+            -- peripheral accessors from. Each section is pcall'd so
+            -- a single-section error (FFI cdata iteration, missing
+            -- namespace) doesn't kill the rest of the introspection.
+            local function dump_table(label, t)
+                local ok, result = pcall(function()
+                    if t == nil then return "<nil>" end
+                    local keys = {}
+                    for k, v in pairs(t) do
+                        keys[#keys+1] = tostring(k) .. ":" .. type(v)
+                    end
+                    return table.concat(keys, ",")
+                end)
+                if ok then
+                    send(label .. " " .. result)
+                else
+                    send(label .. " err:" .. tostring(result))
+                end
             end
-            send("pcsx " .. table.concat(pcsx_keys, ","))
-            local reg_keys = {}
-            for k, v in pairs(regs) do
-                reg_keys[#reg_keys+1] = k .. ":" .. type(v)
-            end
-            send("regs " .. table.concat(reg_keys, ","))
+            dump_table("pcsx", PCSX)
+            dump_table("gpu", PCSX.GPU)
+            dump_table("misc", PCSX.Misc)
+            dump_table("sio0", PCSX.SIO0)
+            dump_table("consts", PCSX.CONSTS)
 
         elseif cmd == "quit" then
             send("bye")

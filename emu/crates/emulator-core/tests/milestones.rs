@@ -1,36 +1,50 @@
 //! Canary milestone regression tests.
 //!
 //! Each test runs the real BIOS for a fixed instruction count and
-//! asserts that VRAM hashes to a known-good value. The hashes were
-//! captured from a passing run and frozen as goldens — any code
-//! change that alters what the BIOS draws at the same step count
-//! breaks the test.
+//! asserts that the result matches a known-good state. We check
+//! three hashes per milestone to give us both correctness and
+//! determinism coverage:
 //!
-//! These tests are `#[ignore]` by default because they take several
-//! seconds each (500M instructions ≈ 11s in release). Run via:
+//! 1. **Full-VRAM hash** (self-regression) — FNV-1a-64 over the
+//!    1 MiB VRAM buffer. Catches any change in VRAM bytes, even
+//!    off-screen CLUT/texture regions the user never sees. This
+//!    pins our emulator to a bit-exact behavior run-to-run so any
+//!    code change that alters rendering fails the test. **Does not
+//!    validate against Redux** — if we're wrong in some consistent
+//!    way, this test will still pass.
 //!
+//! 2. **Display-area hash** (self-regression) — FNV-1a-64 over the
+//!    visible-display rectangle only (`GPU::display_hash`). Same
+//!    caveat: self-consistent, not Redux-correct.
+//!
+//! 3. **Redux-verified display hash** (correctness) — where
+//!    captured, the expected display-area hash that Redux produces
+//!    at the same step count. If `redux_display_hash` is `Some(h)`
+//!    and our `display_hash` doesn't equal it, the test fails and
+//!    we know pixels diverged from reference. If `None`, we haven't
+//!    captured Redux parity yet for that milestone.
+//!
+//! Capture a Redux-verified golden with:
+//! ```bash
+//! cargo run -p emulator-core --example display_parity_at --release -- <steps>
+//! ```
+//! which launches Redux, steps N instructions silently, reads its
+//! screenshot, and diffs byte-for-byte against ours.
+//!
+//! Tests are `#[ignore]` by default because they take ~13s total
+//! in release (the full-VRAM runs are fast; the Redux-parity step
+//! is only triggered by `display_parity_at`, not by the unit test).
+//! Run via:
 //! ```bash
 //! cargo test -p emulator-core --release --test milestones -- --ignored
 //! ```
-//!
-//! The hashes are FNV-1a-64 over the raw little-endian bytes of VRAM
-//! (1024×512 × 2 bytes = 1 MiB). FNV-1a isn't cryptographic but
-//! collisions by accident are vanishingly unlikely for our purpose
-//! — any real regression will flip many VRAM bytes and produce a
-//! completely different hash.
 //!
 //! Milestone ladder reference:
 //! - A = BIOS boots to Sony logo (SCPH1001, no disc)
 //! - B = BIOS boots to shell (MAIN MENU / MEMORY CARD / CD PLAYER)
 //! - C = Homebrew SDK triangle renders (see `sdk/examples/hello-tri`)
-//! - D = BIOS disc-check passes (Crash Bandicoot) — next rung
-//!
-//! When a new milestone passes for the first time, capture its hash
-//! with:
-//! ```bash
-//! cargo run -p emulator-core --example vram_hash_at --release -- <steps>
-//! ```
-//! and paste the value here.
+//! - D = BIOS disc-check passes (Crash Bandicoot) — licensed-disc
+//!       splash rendered; game boot-EXE load is still pending.
 
 use emulator_core::{Bus, Cpu};
 use psx_iso::Disc;
@@ -45,16 +59,18 @@ fn bios_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_BIOS))
 }
 
-/// Run the BIOS for `steps` instructions and return the FNV-1a-64
-/// hash of the resulting VRAM. Panics on any CPU step error — the
-/// BIOS should never encounter an undecoded opcode in a passing
-/// canary, and the milestone goldens are captured assuming clean
-/// completion.
-fn run_and_hash_vram(steps: u64) -> u64 {
-    run_and_hash_vram_with_disc(steps, None)
+/// Aggregate state captured at a milestone step. `vram_hash` is the
+/// full 1 MiB hash (self-regression); `display_hash` is the
+/// visible-display-rect hash (comparable byte-for-byte to Redux's
+/// `PCSX.GPU.takeScreenShot`).
+struct MilestoneState {
+    vram_hash: u64,
+    display_hash: u64,
+    display_width: u32,
+    display_height: u32,
 }
 
-fn run_and_hash_vram_with_disc(steps: u64, disc_path: Option<&str>) -> u64 {
+fn run_milestone(steps: u64, disc_path: Option<&str>) -> MilestoneState {
     let bios = std::fs::read(bios_path()).expect("BIOS readable");
     let mut bus = Bus::new(bios).expect("bus");
     if let Some(path) = disc_path {
@@ -65,48 +81,102 @@ fn run_and_hash_vram_with_disc(steps: u64, disc_path: Option<&str>) -> u64 {
     for _ in 0..steps {
         cpu.step(&mut bus).expect("CPU step failed");
     }
-    let mut h = 0xCBF2_9CE4_8422_2325u64;
+
+    // Full-VRAM FNV-1a-64.
+    let mut vh = 0xCBF2_9CE4_8422_2325u64;
     for &w in bus.gpu.vram.words() {
         for b in w.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0100_0000_01B3);
+            vh ^= b as u64;
+            vh = vh.wrapping_mul(0x0100_0000_01B3);
         }
     }
-    h
+    // Display-area FNV-1a-64 (matches Redux's takeScreenShot path).
+    let (dh, dw, dhi, _dlen) = bus.gpu.display_hash();
+    MilestoneState {
+        vram_hash: vh,
+        display_hash: dh,
+        display_width: dw,
+        display_height: dhi,
+    }
+}
+
+/// Assert our state matches the frozen goldens. `redux_display_hash`
+/// carries the Redux-verified correctness check if we've captured
+/// one — when `Some`, a mismatch means we diverge from Redux at
+/// the pixel level (a real bug); when `None`, we haven't captured
+/// Redux parity yet.
+fn assert_milestone(
+    name: &str,
+    state: &MilestoneState,
+    expected_vram_hash: u64,
+    expected_display_hash: u64,
+    expected_display_size: (u32, u32),
+    redux_display_hash: Option<u64>,
+) {
+    assert_eq!(
+        (state.display_width, state.display_height),
+        expected_display_size,
+        "{name}: display dimensions changed — width/height from V-range or mode-bit differ",
+    );
+    assert_eq!(
+        state.display_hash, expected_display_hash,
+        "{name}: display-area hash changed. \
+         Inspect with `vram_hash_at` and `smoke_draw`.",
+    );
+    assert_eq!(
+        state.vram_hash, expected_vram_hash,
+        "{name}: full-VRAM hash changed (off-screen VRAM differs). \
+         Display may still look right — check display_hash first.",
+    );
+    if let Some(expected) = redux_display_hash {
+        assert_eq!(
+            state.display_hash, expected,
+            "{name}: display hash doesn't match Redux's at the same step count \
+             — we're rendering the wrong pixels. \
+             Compare with `cargo run --example display_parity_at --release -- <steps>`.",
+        );
+    }
 }
 
 #[test]
-#[ignore = "long-running (~2s); run via `cargo test --test milestones -- --ignored`"]
+#[ignore = "long-running (~2s)"]
 fn milestone_a_bios_to_sony_logo() {
     // After 100M instructions the BIOS has rendered the iconic
-    // "SONY / COMPUTER ENTERTAINMENT" diamond logo onto VRAM,
-    // with the double-buffer swap laid out correctly. Captured
-    // 2026-04-18, updated after the CDROM response-ordering fix
-    // (second response was firing before first, shifting the
-    // boot-time command sequence slightly; the displayed logo is
-    // identical, only off-screen CLUT regions differ).
-    let hash = run_and_hash_vram(100_000_000);
-    assert_eq!(
-        hash, 0x97d2_2145_75f2_99d4,
-        "Milestone A regression: VRAM hash changed. \
-         Inspect with `cargo run --example vram_hash_at --release -- 100000000` \
-         and `smoke_draw` to see what diverged."
+    // "SONY / COMPUTER ENTERTAINMENT" diamond logo onto VRAM
+    // (640×478 visible display area in NTSC 480-interlaced mode).
+    //
+    // Current Redux parity: ~3.21% of display-area bytes differ
+    // from Redux at this step — concentrated in the diamond's
+    // gradient shading and the "TM" text region, where our
+    // rasterizer / semi-transparency / dither paths diverge. The
+    // `redux_display_hash` field is left `None` until we fix those;
+    // when pixel parity hits 0% differing bytes, replace with the
+    // captured Redux hash to lock in correctness.
+    let state = run_milestone(100_000_000, None);
+    assert_milestone(
+        "Milestone A",
+        &state,
+        0x97d2_2145_75f2_99d4, // full VRAM (self)
+        0x2035_49d0_b4b8_5eb6, // display area (self)
+        (640, 478),
+        None, // Redux-parity hash pending renderer fixes (~3.21% pixel diff)
     );
 }
 
 #[test]
-#[ignore = "long-running (~11s); run via `cargo test --test milestones -- --ignored`"]
+#[ignore = "long-running (~11s)"]
 fn milestone_b_bios_to_shell() {
     // After 500M instructions the BIOS has transitioned from the
-    // boot logo to the MAIN MENU shell screen with MEMORY CARD and
-    // CD PLAYER options on a radial-gradient blue background —
-    // the "no disc" path of the BIOS. Captured 2026-04-18.
-    let hash = run_and_hash_vram(500_000_000);
-    assert_eq!(
-        hash, 0x0f00_2542_a50c_0dd0,
-        "Milestone B regression: VRAM hash changed. \
-         Inspect with `cargo run --example vram_hash_at --release -- 500000000` \
-         and `smoke_draw` to see what diverged."
+    // boot logo to the MAIN MENU shell screen (MEMORY CARD / CD
+    // PLAYER, radial blue gradient).
+    let state = run_milestone(500_000_000, None);
+    assert_milestone(
+        "Milestone B",
+        &state,
+        0x0f00_2542_a50c_0dd0, // full VRAM (self)
+        0x7410_746e_003a_8d85, // display area (self)
+        (640, 478),
+        None, // Redux parity capture pending (~17 min oracle run)
     );
 }
 
@@ -114,30 +184,24 @@ fn milestone_b_bios_to_shell() {
 #[ignore = "requires Crash Bandicoot USA disc + long-running (~11s)"]
 fn milestone_d_bios_accepts_licensed_disc() {
     // After 600M instructions with Crash Bandicoot USA mounted, the
-    // BIOS has detected the licensed disc (via GetID returning
-    // "SCEA" + disc-type 0x20), issued the cold-boot disc-read
-    // sequence (SetLoc/SeekL/SetMode/ReadN/Pause x4) from ROM code,
-    // cleared the boot-logo VRAM, and rendered the "SONY /
-    // PlayStation\u2122" licensed-disc splash on a black background. This
-    // is the screen a real PSX shows *between* the Sony Computer
-    // Entertainment logo and the game's own intro. Captured
-    // 2026-04-18 after the CDROM response-ordering + Pause-stops-read
-    // fixes.
+    // BIOS has detected the licensed disc, issued the cold-boot
+    // disc-read sequence from ROM, cleared the boot-logo VRAM, and
+    // rendered the "SONY / PlayStation™" licensed-disc splash.
     //
-    // The BIOS then idles at PC=0x000000a4 (A-function syscall
-    // dispatcher) waiting for work that doesn't fire yet — the next
-    // rung past D requires SYSTEM.CNF parsing and boot-EXE load to
-    // advance further.
+    // Redux-parity on this is pending — the oracle doesn't pass
+    // `-iso` to Redux yet, so we can't run Redux with Crash mounted
+    // through the oracle path.
     if !std::path::Path::new(CRASH_DISC).exists() {
         eprintln!("skip milestone_d: Crash disc not found at {CRASH_DISC}");
         return;
     }
-    let hash = run_and_hash_vram_with_disc(600_000_000, Some(CRASH_DISC));
-    assert_eq!(
-        hash, 0x31b1_c1ff_5e22_3daf,
-        "Milestone D regression: VRAM hash changed. \
-         Inspect with `PSOXIDE_DISC=/path/to/Crash.bin \
-         cargo run --example boot_disc --release -- 600000000` \
-         and view /tmp/crash_600m.ppm."
+    let state = run_milestone(600_000_000, Some(CRASH_DISC));
+    assert_milestone(
+        "Milestone D",
+        &state,
+        0x31b1_c1ff_5e22_3daf, // full VRAM (self)
+        0xc57d_ce3d_b60c_102b, // display area (self)
+        (640, 478),
+        None, // Redux disc-parity pending oracle `-iso` support
     );
 }

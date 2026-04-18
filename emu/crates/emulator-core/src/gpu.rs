@@ -78,9 +78,23 @@ pub struct Gpu {
     /// Horizontal display resolution from GP1 0x08 (pixels). One of
     /// 256, 320, 368, 512, 640.
     display_width: u16,
-    /// Vertical display resolution from GP1 0x08 (pixels). 240 or 480
-    /// depending on interlace.
-    display_height: u16,
+    /// Vertical resolution flag from GP1(08h) bit 2 — `true` means
+    /// 480-line interlaced (each V-range line doubles). The actual
+    /// displayed row count is computed from the V-range (Y1..Y2)
+    /// and this flag in [`Gpu::effective_display_height`].
+    display_height_480: bool,
+    /// V-range Y1 from GP1(07h) bits 0..=9 — top scanline of the
+    /// visible window in the video output. Default ~16.
+    v_range_y1: u16,
+    /// V-range Y2 from GP1(07h) bits 10..=19 — bottom scanline of
+    /// the visible window. Default ~256, giving 240 visible rows.
+    v_range_y2: u16,
+    /// H-range X1 from GP1(06h) bits 0..=11 — left-edge GPU clock
+    /// of the visible window. Stored for display-area reporting but
+    /// not (yet) used to derive the width.
+    h_range_x1: u16,
+    /// H-range X2 from GP1(06h) bits 12..=23 — right-edge GPU clock.
+    h_range_x2: u16,
     /// 24bpp colour depth flag from GP1 0x08 bit 4. For now we always
     /// decode VRAM as 15bpp; when this flag comes into play the
     /// frontend's framebuffer view can respect it.
@@ -159,7 +173,15 @@ impl Gpu {
             display_start_x: 0,
             display_start_y: 0,
             display_width: 320,
-            display_height: 240,
+            display_height_480: false,
+            // Redux's power-on defaults for the V-range (GP1 0x07).
+            // The BIOS overwrites these early, but starting at
+            // these values keeps pre-BIOS diagnostics from seeing
+            // nonsense dimensions.
+            v_range_y1: 0x10,
+            v_range_y2: 0x100,
+            h_range_x1: 0x200,
+            h_range_x2: 0xc00,
             display_24bpp: false,
             vram_download: None,
             gpuread_latch: 0,
@@ -187,15 +209,51 @@ impl Gpu {
     }
 
     /// Snapshot of the currently-configured display area, for the
-    /// frontend's framebuffer panel. Cheap to call each frame.
+    /// frontend's framebuffer panel. Cheap to call each frame. The
+    /// `height` is derived from the V-range + 480-mode flag (see
+    /// [`Gpu::effective_display_height`]) so it matches what Redux's
+    /// screenshot path reports — letting milestone parity tests
+    /// compare byte-for-byte.
     pub fn display_area(&self) -> DisplayArea {
         DisplayArea {
             x: self.display_start_x,
             y: self.display_start_y,
             width: self.display_width,
-            height: self.display_height,
+            height: self.effective_display_height(),
             bpp24: self.display_24bpp,
         }
+    }
+
+    /// FNV-1a-64 over the visible display area's 15bpp pixel bytes,
+    /// for Redux-parity comparisons. Rows are packed tightly (no
+    /// stride padding) so a given (width, height, bpp) maps to a
+    /// specific byte sequence — identical to what Redux's
+    /// `PCSX.GPU.takeScreenShot()` produces server-side on the
+    /// oracle path.
+    ///
+    /// Returns `(hash, width, height, byte_len)`. If the display
+    /// area extends past VRAM the rows are clipped at the VRAM
+    /// edge and the row count is reduced — matching Redux's
+    /// behaviour.
+    pub fn display_hash(&self) -> (u64, u32, u32, usize) {
+        let da = self.display_area();
+        let mut h = 0xCBF2_9CE4_8422_2325u64;
+        let mut byte_len = 0usize;
+        let vram_w = crate::VRAM_WIDTH as u16;
+        let vram_h = crate::VRAM_HEIGHT as u16;
+        let effective_h = da.height.min(vram_h.saturating_sub(da.y));
+        let effective_w = da.width.min(vram_w.saturating_sub(da.x));
+        for dy in 0..effective_h {
+            for dx in 0..effective_w {
+                let pixel = self.vram.get_pixel(da.x + dx, da.y + dy);
+                for b in pixel.to_le_bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x0100_0000_01B3);
+                    byte_len += 1;
+                }
+            }
+        }
+        (h, effective_w as u32, effective_h as u32, byte_len)
     }
 
     /// Total GP0 writes received since reset. Diagnostic counter.
@@ -365,7 +423,11 @@ impl Gpu {
                 self.display_start_x = 0;
                 self.display_start_y = 0;
                 self.display_width = 320;
-                self.display_height = 240;
+                self.display_height_480 = false;
+                self.v_range_y1 = 0x10;
+                self.v_range_y2 = 0x100;
+                self.h_range_x1 = 0x200;
+                self.h_range_x2 = 0xc00;
                 self.display_24bpp = false;
             }
             // GP1 0x05 — display area start (top-left corner in VRAM).
@@ -377,7 +439,27 @@ impl Gpu {
                 self.display_start_history
                     .insert((self.display_start_x, self.display_start_y));
             }
-            // GP1 0x08 — display mode. Resolve to pixel W/H.
+            // GP1 0x06 — Horizontal display range (on screen, in GPU
+            // clocks — not pixels). Used for centering the active
+            // display inside the video signal; doesn't change the
+            // VRAM read window's width. Stored for completeness.
+            0x06 => {
+                self.h_range_x1 = (value & 0xFFF) as u16;
+                self.h_range_x2 = ((value >> 12) & 0xFFF) as u16;
+            }
+            // GP1 0x07 — Vertical display range. Bits 0..=9 = top
+            // scanline, bits 10..=19 = bottom scanline. Effective
+            // rendered rows = (y2 - y1), doubled in 480-interlaced
+            // mode. Redux's `takeScreenShot` dimensions come from
+            // this, not from the GP1(08h) mode bit — matching it is
+            // what gets us 640×478 instead of 640×480 at boot.
+            0x07 => {
+                self.v_range_y1 = (value & 0x3FF) as u16;
+                self.v_range_y2 = ((value >> 10) & 0x3FF) as u16;
+            }
+            // GP1 0x08 — display mode. Height is the interlace flag;
+            // actual pixel count is derived together with V-range in
+            // [`Gpu::effective_display_height`].
             0x08 => {
                 let hres = match value & 0x3 {
                     0 => 256,
@@ -388,10 +470,30 @@ impl Gpu {
                 };
                 let hres = if value & (1 << 6) != 0 { 384 } else { hres };
                 self.display_width = hres;
-                self.display_height = if value & (1 << 2) != 0 { 480 } else { 240 };
+                self.display_height_480 = value & (1 << 2) != 0;
                 self.display_24bpp = value & (1 << 4) != 0;
             }
             _ => {}
+        }
+    }
+
+    /// Effective vertical pixel count shown on the video output —
+    /// derived from V-range (`GP1(07h)`) and the 480-mode flag
+    /// (`GP1(08h)` bit 2). Matches Redux's
+    /// `PCSX.GPU.takeScreenShot()` height, so using this value for
+    /// pixel-parity regression tests lines up byte-for-byte.
+    ///
+    /// Formula:
+    /// ```text
+    ///   rows_per_field = max(y2 - y1, 0)
+    ///   visible        = rows_per_field * (480-mode ? 2 : 1)
+    /// ```
+    pub fn effective_display_height(&self) -> u16 {
+        let rows = self.v_range_y2.saturating_sub(self.v_range_y1);
+        if self.display_height_480 {
+            rows.saturating_mul(2)
+        } else {
+            rows
         }
     }
 
