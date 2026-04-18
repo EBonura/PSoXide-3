@@ -109,6 +109,14 @@ pub struct Bus {
     /// Per-(table, func) count of HLE BIOS calls. Diagnostic only.
     /// `[table][func]` where table is 0=A, 1=B, 2=C.
     hle_bios_calls: [[u32; 256]; 3],
+    /// HSync cycles for the current video region (NTSC = 2146,
+    /// PAL = 2157). Used by the timer bank's HBlank source and by
+    /// the VBlank scheduler. Flipped by [`Bus::set_pal_mode`];
+    /// defaults to NTSC for existing parity tests.
+    hsync_cycles: u64,
+    /// VBlank period in cycles — one full frame at the current
+    /// video region. 564_398 for NTSC, 677_343 for PAL.
+    vblank_period: u64,
     /// Addresses we've already logged as unmapped reads. Keeps
     /// log noise bounded when a buggy game pokes a bad pointer
     /// in a tight loop.
@@ -118,26 +126,39 @@ pub struct Bus {
     unmapped_write_seen: std::collections::BTreeSet<u32>,
 }
 
-// --- Phase 4 scheduler constants (NTSC) ---
+// --- Video-timing constants ---
 //
 // Match Redux's `psxcounters.cc` math exactly so VBlank fires at the
 // same cycle — and therefore at the same instruction — on both sides.
 //
 //   HSync period   = psxClockSpeed / (FrameRate × HSyncTotal)
-//                  = 33_868_800 / (60 × 263) = 2146 cycles
-//   VBlank period  = HSyncTotal × HSync     = 263 × 2146 = 564_398 cycles
-//   First VBlank   = VBlankStart × HSync    = 243 × 2146 = 521_478 cycles
+//   NTSC: 33_868_800 / (60 × 263) = 2146 cycles/HSync,  564_398 cyc/frame
+//   PAL : 33_868_800 / (50 × 314) = 2157 cycles/HSync,  677_343 cyc/frame
 //
-// `VBLANK_PERIOD_CYCLES` is kept for Phase 4b even though it's unused
-// in 4a — silenced with `allow(dead_code)`.
+// `FIRST_VBLANK_CYCLE` is derived from the per-region VBlank-start
+// scanline × HSync; kept as NTSC default to preserve existing parity
+// tests. PAL builds call [`Bus::set_pal_mode`] before running, which
+// re-seeds the VBlank scheduler and updates the tick-rate knobs.
 
 const HSYNC_CYCLES_NTSC: u64 = 2146;
 #[allow(dead_code)]
 const HSYNC_TOTAL_NTSC: u64 = 263;
-const VBLANK_START_SCANLINE: u64 = 243;
-const FIRST_VBLANK_CYCLE: u64 = HSYNC_CYCLES_NTSC * VBLANK_START_SCANLINE;
+const VBLANK_START_SCANLINE_NTSC: u64 = 243;
+const FIRST_VBLANK_CYCLE_NTSC: u64 = HSYNC_CYCLES_NTSC * VBLANK_START_SCANLINE_NTSC;
+const VBLANK_PERIOD_CYCLES_NTSC: u64 = HSYNC_CYCLES_NTSC * HSYNC_TOTAL_NTSC;
+
+const HSYNC_CYCLES_PAL: u64 = 2157;
 #[allow(dead_code)]
-const VBLANK_PERIOD_CYCLES: u64 = HSYNC_CYCLES_NTSC * HSYNC_TOTAL_NTSC;
+const HSYNC_TOTAL_PAL: u64 = 314;
+const VBLANK_START_SCANLINE_PAL: u64 = 256;
+const FIRST_VBLANK_CYCLE_PAL: u64 = HSYNC_CYCLES_PAL * VBLANK_START_SCANLINE_PAL;
+const VBLANK_PERIOD_CYCLES_PAL: u64 = HSYNC_CYCLES_PAL * HSYNC_TOTAL_PAL;
+
+// NTSC first-VBlank constant kept for the default scheduler seed.
+// PAL switch re-seeds via [`Bus::set_pal_mode`].
+const FIRST_VBLANK_CYCLE: u64 = FIRST_VBLANK_CYCLE_NTSC;
+#[allow(dead_code)]
+const VBLANK_PERIOD_CYCLES: u64 = VBLANK_PERIOD_CYCLES_NTSC;
 
 impl Bus {
     /// Build a bus with the given BIOS image. RAM and scratchpad are
@@ -193,9 +214,44 @@ impl Bus {
             mmio_trace: MmioTrace::new(),
             hle_bios_enabled: false,
             hle_bios_calls: [[0; 256]; 3],
+            hsync_cycles: HSYNC_CYCLES_NTSC,
+            vblank_period: VBLANK_PERIOD_CYCLES_NTSC,
             unmapped_read_seen: std::collections::BTreeSet::new(),
             unmapped_write_seen: std::collections::BTreeSet::new(),
         })
+    }
+
+    /// Switch to PAL video timing: 50 Hz refresh, 314-scanline
+    /// frames, 2157 HSync cycles. Resets the VBlank scheduler to
+    /// the PAL first-VBlank cycle + period, and reconfigures the
+    /// HBlank tick rate for Timer 1. Call before stepping on a PAL
+    /// game; NTSC is the default.
+    ///
+    /// Calling this after any stepping has already happened leaves
+    /// cumulative `cycles` in place — the next VBlank will still
+    /// fire at the correct *frame* boundary even if mid-frame.
+    pub fn set_pal_mode(&mut self) {
+        self.hsync_cycles = HSYNC_CYCLES_PAL;
+        self.vblank_period = VBLANK_PERIOD_CYCLES_PAL;
+        self.scheduler.cancel(crate::scheduler::EventSlot::VBlank);
+        // Schedule the next VBlank at the PAL first-VBlank offset
+        // from now, so cold-start and mid-run switches both land
+        // at a reasonable first VBlank.
+        self.scheduler.schedule(
+            crate::scheduler::EventSlot::VBlank,
+            self.cycles,
+            FIRST_VBLANK_CYCLE_PAL,
+        );
+    }
+
+    /// Current HSync period in cycles — NTSC = 2146, PAL = 2157.
+    pub fn hsync_cycles(&self) -> u64 {
+        self.hsync_cycles
+    }
+
+    /// Current VBlank period — one frame in cycles.
+    pub fn vblank_period(&self) -> u64 {
+        self.vblank_period
     }
 
     /// Turn on HLE BIOS interception. Call after side-loading an EXE
@@ -440,7 +496,7 @@ impl Bus {
                     // target, not `now`. A 500K-cycle drain lag
                     // would otherwise accumulate drift every time.
                     self.scheduler
-                        .schedule(EventSlot::VBlank, target, VBLANK_PERIOD_CYCLES);
+                        .schedule(EventSlot::VBlank, target, self.vblank_period);
                 }
                 EventSlot::SpuAsync => {
                     // Kept for forward compatibility; we pump the SPU
@@ -498,9 +554,9 @@ impl Bus {
     /// bank's accumulator matches Redux's lazy-read timer model.
     fn advance_cycles(&mut self, n: u32) {
         self.cycles = self.cycles.wrapping_add(n as u64);
-        let fired = self
-            .timers
-            .tick(n as u64, HSYNC_CYCLES_NTSC, self.gpu.dot_clock_divisor());
+        let fired =
+            self.timers
+                .tick(n as u64, self.hsync_cycles, self.gpu.dot_clock_divisor());
         if fired & 1 != 0 {
             self.irq.raise(IrqSource::Timer0);
         }
@@ -1550,6 +1606,27 @@ mod tests {
             Bus::new(vec![0u8; 1024]),
             Err(BusError::BiosSize { .. })
         ));
+    }
+
+    #[test]
+    fn default_video_region_is_ntsc() {
+        let bus = Bus::new(synthetic_bios()).unwrap();
+        assert_eq!(bus.hsync_cycles(), HSYNC_CYCLES_NTSC);
+        assert_eq!(bus.vblank_period(), VBLANK_PERIOD_CYCLES_NTSC);
+    }
+
+    #[test]
+    fn set_pal_mode_switches_timings_and_reschedules_vblank() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        bus.set_pal_mode();
+        assert_eq!(bus.hsync_cycles(), HSYNC_CYCLES_PAL);
+        assert_eq!(bus.vblank_period(), VBLANK_PERIOD_CYCLES_PAL);
+        // VBlank slot should be armed for the PAL first-VBlank cycle.
+        let target = bus
+            .scheduler
+            .target(crate::scheduler::EventSlot::VBlank)
+            .expect("VBlank must be rescheduled on PAL switch");
+        assert_eq!(target, FIRST_VBLANK_CYCLE_PAL);
     }
 
     #[test]
