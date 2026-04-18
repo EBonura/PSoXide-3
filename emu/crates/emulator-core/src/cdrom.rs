@@ -1009,21 +1009,10 @@ impl Default for CdRom {
     }
 }
 
-/// Convert an absolute LBA to an MSF triple (binary, not BCD).
-/// Inverse of `psx_iso::msf_to_lba`.
-fn lba_to_msf(lba: u32) -> (u8, u8, u8) {
-    let abs = lba.saturating_add(150);
-    let m = (abs / (60 * 75)) as u8;
-    let s = ((abs / 75) % 60) as u8;
-    let f = (abs % 75) as u8;
-    (m, s, f)
-}
-
-/// Pack a 0..=99 binary value into a 2-digit BCD byte.
-fn bin_to_bcd(v: u8) -> u8 {
-    let v = v.min(99);
-    ((v / 10) << 4) | (v % 10)
-}
+// Shared helpers — `lba_to_msf` + `bin_to_bcd` live in `psx-iso` so
+// any crate that speaks the CDROM protocol (tools, test harnesses)
+// can use them.
+use psx_iso::{bin_to_bcd, lba_to_msf};
 
 /// Decode one raw 2352-byte Mode 2 Form 2 XA ADPCM audio sector into
 /// stereo PCM samples. Returns `None` when the sector isn't an XA
@@ -1218,22 +1207,6 @@ mod tests {
         assert_eq!(cd.drive_status & drive_status_bit::SHELL_OPEN, 0);
         assert!(!cd.motor_on);
         assert!(!cd.disc_present);
-    }
-
-    #[test]
-    fn lba_to_msf_round_trips() {
-        // LBA 0 = MSF 00:02:00 (per 150-frame pre-gap convention).
-        assert_eq!(lba_to_msf(0), (0, 2, 0));
-        assert_eq!(lba_to_msf(75), (0, 3, 0)); // one second in
-        assert_eq!(lba_to_msf(4500), (1, 2, 0)); // one minute in
-    }
-
-    #[test]
-    fn bin_to_bcd_packs_correctly() {
-        assert_eq!(bin_to_bcd(0), 0x00);
-        assert_eq!(bin_to_bcd(42), 0x42);
-        assert_eq!(bin_to_bcd(99), 0x99);
-        assert_eq!(bin_to_bcd(100), 0x99); // clamped
     }
 
     #[test]
