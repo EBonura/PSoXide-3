@@ -191,6 +191,12 @@ impl ApplicationHandler for Shell {
                 if let Err(e) = self.state.flush_memcard_port1() {
                     eprintln!("[frontend] memcard flush on exit: {e}");
                 }
+                // Persist current settings (BIOS path, library
+                // root, etc.) so the next launch picks up any
+                // user tweaks without needing a manual save step.
+                if let Err(e) = self.state.save_settings() {
+                    eprintln!("[frontend] settings save on exit: {e}");
+                }
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -267,6 +273,9 @@ impl ApplicationHandler for Shell {
                         if let Err(e) = self.state.flush_memcard_port1() {
                             eprintln!("[frontend] memcard flush on quit: {e}");
                         }
+                        if let Err(e) = self.state.save_settings() {
+                            eprintln!("[frontend] settings save on quit: {e}");
+                        }
                         event_loop.exit();
                         return;
                     }
@@ -300,6 +309,8 @@ impl ApplicationHandler for Shell {
                             if !samples.is_empty() {
                                 audio.push_samples(&samples);
                             }
+                            // Surface the cpal ring depth in the HUD.
+                            self.state.hud.set_audio_queue_len(audio.queue_len());
                         } else {
                             // No output device — drain and discard so the
                             // SPU's internal queue doesn't grow unbounded.
