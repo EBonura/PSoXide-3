@@ -268,6 +268,61 @@ impl Bus {
             .unwrap_or((false, 0))
     }
 
+    /// Plug a digital controller into port 2. Used by two-player
+    /// games (Tekken VS, Bomberman, Street Fighter Alpha, etc.).
+    /// SIO0 already multiplexes port 1 / port 2 internally via
+    /// the CTRL.SLOT bit — games switch between them per poll.
+    pub fn attach_digital_pad_port2(&mut self) {
+        let device = crate::pad::PortDevice::empty().with_pad(crate::pad::DigitalPad::new());
+        self.sio0.attach_port2(device);
+    }
+
+    /// Plug a memory card into port 2. Same semantics as
+    /// [`Bus::attach_memcard_port1`].
+    pub fn attach_memcard_port2(&mut self, initial_bytes: Vec<u8>) {
+        let bytes = if initial_bytes.len() == crate::pad::MEMCARD_SIZE {
+            initial_bytes
+        } else {
+            vec![0u8; crate::pad::MEMCARD_SIZE]
+        };
+        let pad = std::mem::replace(self.sio0.port2_mut(), crate::pad::PortDevice::empty())
+            .into_pad();
+        let mut device =
+            crate::pad::PortDevice::empty().with_memcard(crate::pad::MemoryCard::from_bytes(bytes));
+        if let Some(p) = pad {
+            device = device.with_pad(p);
+        }
+        self.sio0.attach_port2(device);
+    }
+
+    /// Snapshot the port-2 memcard bytes for persistence. `None`
+    /// when there's no card on port 2 or the card hasn't been
+    /// written since load.
+    pub fn memcard_port2_snapshot(&mut self) -> Option<Vec<u8>> {
+        let card = self.sio0.port2_mut().memcard_mut()?;
+        if !card.is_dirty() {
+            return None;
+        }
+        let bytes = card.as_bytes().to_vec();
+        card.clear_dirty();
+        Some(bytes)
+    }
+
+    /// Update the buttons currently held on the port-2 controller.
+    pub fn set_port2_buttons(&mut self, buttons: crate::pad::ButtonState) {
+        self.sio0.set_port2_buttons(buttons);
+    }
+
+    /// Port-2 DualShock motor state. Mirrors
+    /// [`Bus::port1_motor_state`].
+    pub fn port2_motor_state(&self) -> (bool, u8) {
+        self.sio0
+            .port2()
+            .pad()
+            .map(|p| p.motor_state())
+            .unwrap_or((false, 0))
+    }
+
     /// Internal: log one HLE BIOS call. Called from the HLE dispatcher.
     pub(crate) fn hle_bios_log_call(&mut self, table: crate::hle_bios::Table, func: u8) {
         let idx = match table {
