@@ -29,7 +29,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub mod exe;
+pub mod iso9660;
 pub use exe::{Exe, ExeError, EXE_HEADER_BYTES};
+pub use iso9660::{default_system_cnf, IsoBuilder, IsoFile};
 
 /// One raw CD-ROM sector — always 2352 bytes on a PS1 disc regardless
 /// of track mode.

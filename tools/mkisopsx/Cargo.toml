@@ -1,0 +1,13 @@
+[package]
+name    = "mkisopsx"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+psx-iso = { path = "../../crates/psx-iso" }
+
+[[bin]]
+name = "mkisopsx"
+path = "src/main.rs"
