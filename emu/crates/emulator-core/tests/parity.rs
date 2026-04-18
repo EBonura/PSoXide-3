@@ -30,12 +30,15 @@ fn bios_path() -> PathBuf {
 /// last good records and the first execution error if we hit an
 /// opcode the emulator doesn't yet decode.
 ///
-/// IRQ-handler steps are aggregated into the pre-IRQ record: when
-/// `Cpu::step` returns with `in_isr()` true, we keep stepping
-/// silently until `RFE` clears the flag, carrying forward the final
-/// tick / GPRs into the original record. Mirrors PCSX-Redux's
-/// `debug.cc` early-return on clean IRQ entry, which makes its own
-/// trace skip the handler body.
+/// IRQ-handler bodies are aggregated into the pre-IRQ record only
+/// for *clean* IRQ entries — i.e. when we weren't already in any
+/// exception handler before the step. This mirrors Redux's
+/// `debug.cc:235` early-return which triggers iff
+/// `!m_wasInISR && m_inISR && cause == 0`. Syscalls (cause=8) are
+/// recorded per-instruction, and IRQs taken from inside a syscall
+/// handler or immediately after an RFE (`was_in_isr` true) are
+/// also per-instruction — Redux's trace shows them as distinct
+/// 2-3-cycle steps rather than the 2000+-cycle collapsed jumps.
 fn our_trace(
     bios: Vec<u8>,
     n: usize,
@@ -47,25 +50,14 @@ fn our_trace(
     let mut cpu = Cpu::new();
     let mut records = Vec::with_capacity(n);
     while records.len() < n {
-        // Snapshot of the "inside any handler" flag BEFORE the step,
-        // mirroring Redux's `m_wasInISR` captured in `startStepping()`.
-        // Used below to gate IRQ-handler aggregation.
+        // `was_in_isr` = were we in ANY handler (IRQ or syscall) at
+        // the start of this step? Matches Redux's `m_wasInISR`
+        // captured by `startStepping()` before the interpreter runs.
         let was_in_isr = cpu.in_isr();
         let mut rec = match cpu.step(&mut bus) {
             Ok(r) => r,
             Err(e) => return (records, Some(e)),
         };
-        // Aggregate only when:
-        //   1. We weren't in a handler at the start of this step
-        //      (`!was_in_isr`).
-        //   2. The step ended up in an Interrupt-specific handler
-        //      (`cpu.in_irq_handler()`).
-        // Mirrors Redux's `debug.cc:231-237`: the early-return that
-        // hides the trace body only triggers when `!m_wasInISR &&
-        // m_inISR && cause == 0`. Syscall handlers (cause=8) fall
-        // through to `triggerBP` and get recorded per-instruction,
-        // and nested IRQs entered from RFE (`was_in_isr` true) also
-        // record per-instruction.
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
                 match cpu.step(&mut bus) {

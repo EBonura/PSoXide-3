@@ -78,14 +78,17 @@ pub struct Bus {
     /// Phase 4a tracks this but doesn't fire — Phase 4b hangs the
     /// VBlank IRQ off reaching this threshold.
     next_vblank_cycle: u64,
-    /// Scheduled cycle at which DMA6 (OTC) completion fires — clears
-    /// CHCR start/busy bits and raises the DMA IRQ. Mirrors Redux's
-    /// `scheduleGPUOTCDMAIRQ(size)` which delays the visible completion
-    /// by `size` cycles (one per word transferred). The BIOS polls
-    /// CHCR in a loop after kicking OTC; if we clear bits immediately
-    /// the polling loop exits one read earlier than Redux, diverging
-    /// the trace.
-    pending_dma6_completion_cycle: Option<u64>,
+    /// Per-channel scheduled cycle at which a DMA transfer's
+    /// completion fires — clears CHCR start bit and raises the DMA
+    /// IRQ. Mirrors Redux's per-channel completion scheduling (e.g.
+    /// `scheduleGPUOTCDMAIRQ(size)` for OTC, `scheduleGPUDMAIRQ(size)`
+    /// for linked-list). Completion is delayed by the transfer's
+    /// word count so that BIOS polls of CHCR see the busy bits for
+    /// the right number of instructions. Firing the IRQ immediately
+    /// on CHCR write triggers a spurious early IRQ take that doesn't
+    /// happen on real hardware and diverges the parity trace by
+    /// several instructions' worth of state.
+    pending_dma_completions: [Option<u64>; 7],
     /// Bounded ring buffer of recent MMIO accesses. Zero-sized and
     /// no-op at every call site unless the `trace-mmio` Cargo feature
     /// is enabled — see `mmio_trace.rs` for the rationale.
@@ -155,7 +158,7 @@ impl Bus {
             cdrom: CdRom::new(),
             cycles: 0,
             next_vblank_cycle: FIRST_VBLANK_CYCLE,
-            pending_dma6_completion_cycle: None,
+            pending_dma_completions: [None; 7],
             mmio_trace: MmioTrace::new(),
             hle_bios_enabled: false,
             hle_bios_calls: [[0; 256]; 3],
@@ -225,11 +228,65 @@ impl Bus {
 
     /// Advance the cycle counter by `n` cycles and run any scheduled
     /// peripheral events that have come due. Called once per
-    /// instruction from `Cpu::step`.
+    /// instruction from `Cpu::step` (charging BIAS before the opcode).
     pub fn tick(&mut self, n: u32) {
-        self.cycles = self.cycles.wrapping_add(n as u64);
+        self.advance_cycles(n);
         self.run_vblank_scheduler();
-        self.run_dma6_scheduler();
+        self.run_dma_scheduler();
+        if self.cdrom.tick(self.cycles) {
+            self.irq.raise(IrqSource::Cdrom);
+        }
+    }
+
+    /// Mirror of Redux's `scheduleGPUDMAIRQ` / `gpuotcInterrupt` /
+    /// similar per-channel completion handlers: when a channel's
+    /// scheduled completion cycle is reached, clear CHCR bit 24
+    /// (start/enable) and raise the DMA IRQ on the master-flag edge.
+    /// Bit 28 (busy) stays set until the BIOS IRQ handler writes the
+    /// next CHCR — that's a real-hardware detail Redux preserves and
+    /// we mirror. All channels fire through the single DMA IRQ line;
+    /// individual per-channel identification happens via DICR, which
+    /// we don't model yet — I_MASK's DMA bit is currently the only
+    /// gate.
+    fn run_dma_scheduler(&mut self) {
+        let mut master_edge = false;
+        for ch in 0..7 {
+            let Some(due) = self.pending_dma_completions[ch] else {
+                continue;
+            };
+            if self.cycles < due {
+                continue;
+            }
+            self.pending_dma_completions[ch] = None;
+            self.dma.channels[ch].channel_control &= !(1 << 24);
+            if self.dma.notify_channel_done(ch) {
+                master_edge = true;
+            }
+        }
+        if master_edge {
+            self.irq.raise(IrqSource::Dma);
+        }
+    }
+
+    /// Advance the cycle counter without running peripheral schedulers.
+    /// Used by load/store opcodes to charge the per-data-access cycle
+    /// (Redux's `m_regs.cycle += 1` inside `read8/16/32` and
+    /// `write8/16/32` in `psxmem.cc`). VBlank / DMA6 / CDROM schedulers
+    /// still see the accumulated cycle count when `tick()` runs at end
+    /// of instruction — matching Redux's `psxBranchTest`, which only
+    /// runs after delay slots and observes the post-BIAS,
+    /// post-data-access total. Timers, however, see every cycle so
+    /// their counter values stay in lock-step with Redux's cycle-derived
+    /// `count = (now - cycle_start) / rate` model.
+    pub fn add_cycles(&mut self, n: u32) {
+        self.advance_cycles(n);
+    }
+
+    /// Inner cycle-advancement helper shared by `tick` and `add_cycles`.
+    /// Any cycle delta must flow through this function so the timer
+    /// bank's accumulator matches Redux's lazy-read timer model.
+    fn advance_cycles(&mut self, n: u32) {
+        self.cycles = self.cycles.wrapping_add(n as u64);
         let fired = self.timers.tick(n as u64, HSYNC_CYCLES_NTSC);
         if fired & 1 != 0 {
             self.irq.raise(IrqSource::Timer0);
@@ -240,38 +297,6 @@ impl Bus {
         if fired & 4 != 0 {
             self.irq.raise(IrqSource::Timer2);
         }
-        if self.cdrom.tick(self.cycles) {
-            self.irq.raise(IrqSource::Cdrom);
-        }
-    }
-
-    /// Mirror of Redux's `gpuotcInterrupt()`: when the scheduled
-    /// completion cycle is reached, clear *only* DMA6 CHCR bit 24
-    /// (`clearDMABusy<6>()` masks `0x01000000`) and raise the channel-6
-    /// IRQ on the master-flag edge. Bit 28 stays set until the BIOS
-    /// IRQ handler writes the next CHCR — that's a real hardware
-    /// detail Redux preserves and we mirror.
-    fn run_dma6_scheduler(&mut self) {
-        let Some(due) = self.pending_dma6_completion_cycle else { return };
-        if self.cycles < due {
-            return;
-        }
-        self.pending_dma6_completion_cycle = None;
-        self.dma.channels[6].channel_control &= !(1 << 24);
-        if self.dma.notify_channel_done(6) {
-            self.irq.raise(IrqSource::Dma);
-        }
-    }
-
-    /// Advance the cycle counter without running peripheral schedulers.
-    /// Used by load/store opcodes to charge the per-data-access cycle
-    /// (Redux's `m_regs.cycle += 1` inside `read8/16/32` and
-    /// `write8/16/32` in `psxmem.cc`). Schedulers still see the
-    /// accumulated cycle count when `tick()` runs at end of instruction
-    /// — matching Redux's `psxBranchTest`, which only runs after delay
-    /// slots and observes the post-BIAS, post-data-access total.
-    pub fn add_cycles(&mut self, n: u32) {
-        self.cycles = self.cycles.wrapping_add(n as u64);
     }
 
     /// Cumulative cycles since reset.
@@ -320,6 +345,11 @@ impl Bus {
         &self.irq
     }
 
+    /// Borrow the timer bank immutably for diagnostics.
+    pub fn timers(&self) -> &Timers {
+        &self.timers
+    }
+
     /// Copy a PSX-EXE payload into RAM at its declared load address.
     ///
     /// The caller is expected to also seed the CPU (see
@@ -349,47 +379,46 @@ impl Bus {
     /// DICR per-channel / master enable filtering isn't modeled yet;
     /// the interrupt controller's `I_MASK` is the only gate.
     fn maybe_run_dma(&mut self) {
-        // OTC: fill the ordering table now, but defer CHCR clear +
-        // IRQ raise to `run_dma6_scheduler` at `cycles + size`. This
-        // keeps the busy bit visible to the BIOS polling loop in the
-        // same way Redux's `scheduleGPUOTCDMAIRQ(size)` does.
+        // Each channel: run the transfer now (so memory / GPU state is
+        // up-to-date for any immediate follow-up reads), but defer the
+        // CHCR start-bit clear and DMA IRQ raise to the channel's
+        // scheduled completion cycle. Redux schedules one cycle per
+        // word transferred (`scheduleGPUOTCDMAIRQ(size)`, etc.), which
+        // keeps the BIOS's "poll CHCR until done" loop matching our
+        // trace step-for-step. An immediate IRQ raise triggers the
+        // handler ~1 hblank early and diverges the trace by dozens of
+        // instructions.
         let otc_words = self.dma.run_otc(&mut self.ram[..]);
         if otc_words > 0 {
-            self.pending_dma6_completion_cycle =
+            self.pending_dma_completions[6] =
                 Some(self.cycles.wrapping_add(otc_words as u64));
         }
-        let gpu_ran = self.run_dma_gpu();
-        let cdrom_ran = self.run_dma_cdrom();
-        // Each channel that completed updates DICR. The IRQ controller
-        // only sees a `Dma` raise on the 0→1 master-flag edge, so the
-        // BIOS handler can identify exactly which channel(s) fired by
-        // reading DICR bits 24..30 and ack them via W1C.
-        let mut master_edge = false;
-        if gpu_ran && self.dma.notify_channel_done(2) {
-            master_edge = true;
+        if let Some(gpu_words) = self.run_dma_gpu() {
+            self.pending_dma_completions[2] =
+                Some(self.cycles.wrapping_add(gpu_words as u64));
         }
-        if cdrom_ran && self.dma.notify_channel_done(3) {
-            master_edge = true;
-        }
-        if master_edge {
-            self.irq.raise(IrqSource::Dma);
+        if let Some(cdrom_words) = self.run_dma_cdrom() {
+            self.pending_dma_completions[3] =
+                Some(self.cycles.wrapping_add(cdrom_words as u64));
         }
     }
 
     /// Execute DMA channel 3 → CPU. Block mode (sync=1) is the only
     /// mode used for CD-ROM reads: pull `BS × BA` words from the data
-    /// FIFO and write them to RAM at `MADR` with +4 step.
-    fn run_dma_cdrom(&mut self) -> bool {
+    /// FIFO and write them to RAM at `MADR` with +4 step. Returns
+    /// `Some(word_count)` when a transfer was kicked (so the caller
+    /// can schedule the completion IRQ), `None` when the channel
+    /// wasn't armed. CHCR start/busy bits are NOT cleared here — the
+    /// per-channel scheduler does that at the completion cycle.
+    fn run_dma_cdrom(&mut self) -> Option<u32> {
         let ch = self.dma.channels[3];
         if (ch.channel_control >> 24) & 1 == 0 {
-            return false;
+            return None;
         }
         let sync_mode = (ch.channel_control >> 9) & 0x3;
         if sync_mode != 1 {
             // Manual / linked-list aren't used for the CD-ROM channel.
-            let ch = &mut self.dma.channels[3];
-            ch.channel_control &= !((1 << 24) | (1 << 28));
-            return true;
+            return Some(0);
         }
 
         let bcr = ch.block_control;
@@ -416,9 +445,7 @@ impl Bus {
             addr = addr.wrapping_add(step);
         }
 
-        let ch = &mut self.dma.channels[3];
-        ch.channel_control &= !((1 << 24) | (1 << 28));
-        true
+        Some(total_words)
     }
 
     /// Execute DMA channel 2 → GPU (GP0). Supports the two sync modes
@@ -433,28 +460,27 @@ impl Bus {
     ///   (following 32-bit words to ship to GP0), low 24 bits = next
     ///   node address. Terminator is `AAAAAA == 0xFFFFFF`.
     ///
-    /// Both variants clear `CHCR.start` + `busy` bits on completion
-    /// so BIOS polling sees "done".
-    fn run_dma_gpu(&mut self) -> bool {
+    /// Returns `Some(word_count)` when a transfer was kicked (caller
+    /// uses it to schedule the completion IRQ), `None` when the
+    /// channel wasn't armed. CHCR start/busy bits are NOT cleared
+    /// here — the per-channel scheduler does that at the completion
+    /// cycle.
+    fn run_dma_gpu(&mut self) -> Option<u32> {
         let ch = &self.dma.channels[2];
         if (ch.channel_control >> 24) & 1 == 0 {
-            return false;
+            return None;
         }
         let sync_mode = (ch.channel_control >> 9) & 0x3;
-        match sync_mode {
+        let words = match sync_mode {
             1 => self.dma_gpu_block(),
             2 => self.dma_gpu_linked_list(),
-            _ => {
-                // Manual (0) + prohibited (3) — nothing standard uses
-                // them for the GPU channel. Drop the trigger silently.
-            }
-        }
-        let ch = &mut self.dma.channels[2];
-        ch.channel_control &= !((1 << 24) | (1 << 28));
-        true
+            _ => 0, // Manual (0) + prohibited (3) — nothing standard uses
+                    // them for the GPU channel. Drop the trigger silently.
+        };
+        Some(words)
     }
 
-    fn dma_gpu_block(&mut self) {
+    fn dma_gpu_block(&mut self) -> u32 {
         let ch = self.dma.channels[2];
         let mut addr = ch.base & 0x001F_FFFC;
         let bcr = ch.block_control;
@@ -472,10 +498,12 @@ impl Bus {
             self.gpu.gp0_push(word);
             addr = addr.wrapping_add(step);
         }
+        total_words
     }
 
-    fn dma_gpu_linked_list(&mut self) {
+    fn dma_gpu_linked_list(&mut self) -> u32 {
         let mut addr = self.dma.channels[2].base & 0x001F_FFFC;
+        let mut total_words: u32 = 0;
         // Bound the walk so a malformed list can't spin forever.
         for _ in 0..0x100_0000 {
             let header = read_ram_u32(&self.ram[..], addr);
@@ -485,12 +513,16 @@ impl Bus {
                 let word = read_ram_u32(&self.ram[..], word_addr);
                 self.gpu.gp0_push(word);
             }
+            // Header + payload both contribute to Redux's per-node
+            // cycle cost accounting.
+            total_words = total_words.saturating_add(1 + word_count);
             let next = header & 0x00FF_FFFF;
             if next == 0x00FF_FFFF {
-                return;
+                return total_words;
             }
             addr = next;
         }
+        total_words
     }
 
     /// Non-panicking byte read. Returns `None` for addresses outside
@@ -772,7 +804,7 @@ impl Bus {
             return;
         }
         if Timers::contains(phys) {
-            self.timers.write32(phys, value);
+            self.timers.write32(phys, value, self.cycles);
             return;
         }
         if Dma::contains(phys) {
@@ -921,7 +953,7 @@ impl Bus {
         }
         // Timer registers are 16-bit on hardware.
         if Timers::contains(phys) {
-            self.timers.write32(phys, value as u32);
+            self.timers.write32(phys, value as u32, self.cycles);
             return;
         }
         if Spu::contains(phys) {

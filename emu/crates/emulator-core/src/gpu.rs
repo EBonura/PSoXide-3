@@ -454,13 +454,35 @@ impl Gpu {
                 self.draw_offset_y = sign_extend_11(((word >> 11) & 0x7FF) as i32);
             }
             // GP0 0xE1 — draw mode: texture page base + colour depth
-            // + dither/display/transparency flags. We pick up the
-            // bits the texture rasterizer consults; the rest are for
-            // future work.
+            // + dither/display/transparency flags. We extract the
+            // subset the texture rasterizer needs AND mirror bits
+            // 0..=10 into `GpuStatus::raw`, since those are
+            // observable via GPUSTAT reads. Redux's softgpu does
+            // the equivalent in `gpuWriteStatus` / `sCommand0xE1`,
+            // and the BIOS polls GPUSTAT right after each E1h to
+            // verify the command took effect. Leaving the status
+            // bits stale produces a GPUSTAT divergence that doesn't
+            // surface until the poll.
+            //
+            // E1h layout:
+            //   bits 0-3: texture page base X (each unit = 64 pix)
+            //   bit  4:   texture page base Y (0=0, 1=256)
+            //   bits 5-6: semi-transparency
+            //   bits 7-8: texture page colour depth
+            //   bit  9:   dither 24→15
+            //   bit  10:  drawing to display area
+            //   bit  11:  texture disable (requires GP1 09h unlock)
+            //   bit  12:  textured rectangle X flip
+            //   bit  13:  textured rectangle Y flip
+            // These map 1:1 to GPUSTAT bits 0..=10 (plus rect-flip
+            // bits that aren't visible in GPUSTAT).
             0xE1 => {
                 self.tex_page_x = ((word & 0x0F) as u16) * 64;
                 self.tex_page_y = if (word >> 4) & 1 != 0 { 256 } else { 0 };
                 self.tex_depth = ((word >> 7) & 0x3) as u8;
+                // GPUSTAT bits 0..=10 come from E1h bits 0..=10.
+                let stat_bits = word & 0x07FF;
+                self.status.raw = (self.status.raw & !0x07FF) | stat_bits;
             }
             // 0xE2 (texture window), 0xE6 (mask bit): not wired up yet.
             _ => {}

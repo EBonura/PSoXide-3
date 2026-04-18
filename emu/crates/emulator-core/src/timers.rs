@@ -29,6 +29,11 @@ pub struct Timer {
     /// on T1, /8 on T2), the residual cycles accumulate here until
     /// they cross the source period.
     accum: u64,
+    /// Bus cycle at which the counter was last reset (mode write).
+    /// Diagnostic — lets us compare against Redux's `cycleStart`.
+    pub last_reset_cycle: u64,
+    /// Number of mode writes since reset. Diagnostic.
+    pub mode_write_count: u64,
 }
 
 // Mode-register bit layout (nocash PSX-SPX, section "Timers").
@@ -85,7 +90,9 @@ impl Timers {
     }
 
     /// Write a 32-bit word. `phys` must be inside `BASE..BASE+SIZE`.
-    pub fn write32(&mut self, phys: u32, value: u32) {
+    /// `now` is the current bus cycle; used only for diagnostics
+    /// (records when mode writes reset the counter).
+    pub fn write32(&mut self, phys: u32, value: u32, now: u64) {
         let (idx, off) = decode(phys);
         let t = &mut self.timers[idx];
         let v16 = value & 0xFFFF;
@@ -96,6 +103,8 @@ impl Timers {
                 t.mode = (value & !MODE_IRQ_ACTIVE_LOW) | MODE_IRQ_ACTIVE_LOW;
                 t.counter = 0;
                 t.accum = 0;
+                t.last_reset_cycle = now;
+                t.mode_write_count = t.mode_write_count.saturating_add(1);
             }
             0x8 => t.target = v16,
             _ => {}
@@ -232,25 +241,26 @@ mod tests {
     #[test]
     fn write_then_read_roundtrips() {
         let mut t = Timers::new();
-        t.write32(0x1F80_1100, 0x1234);
+        t.write32(0x1F80_1100, 0x1234, 0);
         assert_eq!(t.read32(0x1F80_1100), 0x1234);
 
-        t.write32(0x1F80_1108, 0xABCD);
+        t.write32(0x1F80_1108, 0xABCD, 0);
         assert_eq!(t.read32(0x1F80_1108), 0xABCD);
     }
 
     #[test]
     fn mode_write_resets_counter() {
         let mut t = Timers::new();
-        t.write32(0x1F80_1100, 0xFF);
-        t.write32(0x1F80_1104, 0x0001); // mode write — should reset counter
+        t.write32(0x1F80_1100, 0xFF, 0);
+        t.write32(0x1F80_1104, 0x0001, 100); // mode write at cycle 100
         assert_eq!(t.read32(0x1F80_1100), 0);
+        assert_eq!(t.timers[0].last_reset_cycle, 100);
     }
 
     #[test]
     fn upper_bits_masked_to_16() {
         let mut t = Timers::new();
-        t.write32(0x1F80_1100, 0x1234_5678);
+        t.write32(0x1F80_1100, 0x1234_5678, 0);
         assert_eq!(t.read32(0x1F80_1100), 0x5678);
     }
 

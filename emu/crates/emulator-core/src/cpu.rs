@@ -87,20 +87,23 @@ pub struct Cpu {
     /// COP2 — Geometry Transformation Engine. Holds 32 data + 32
     /// control registers and dispatches the GTE function set.
     cop2: Gte,
-    /// `true` from any exception entry until the matching `RFE`.
-    /// Mirrors Redux's `m_inISR`. Diagnostic only right now; the
-    /// parity harness looks at [`Cpu::in_irq_handler`] instead to
-    /// decide whether to aggregate.
-    in_isr: bool,
-    /// Specialised flag: true only from an `Interrupt` (cause=0)
-    /// exception entry until the matching `RFE`. The parity harness
-    /// aggregates trace steps while this is true — matching the
-    /// `if (cause == 0) return;` early-return in Redux's
-    /// `debug.cc` that hides the IRQ handler body from a clean
-    /// user-mode-to-ISR transition. Syscall / Break exceptions do
-    /// NOT set this flag; Redux records their handler instructions
-    /// normally.
-    in_irq_handler: bool,
+    /// Depth of nested exception handlers. Incremented on every
+    /// exception entry (IRQ, syscall, break) and decremented on
+    /// every `RFE`. `in_isr()` returns `true` iff this is > 0.
+    /// Counted as depth (not boolean) so that nested RFEs don't
+    /// spuriously clear the flag while we're still inside the
+    /// outer handler — critical for the parity harness's
+    /// aggregation of clean IRQ entries, which must continue
+    /// across nested syscalls/IRQs inside the handler body.
+    isr_depth: u32,
+    /// Latched on the *clean* (depth 0 → 1) entry: `true` iff the
+    /// outermost exception was an `Interrupt` (cause=0). Stays set
+    /// until `isr_depth` returns to 0 via the final RFE. Mirrors
+    /// the `!m_wasInISR && cause == 0` condition in Redux's
+    /// `debug.cc:235` early-return that hides the IRQ-handler body
+    /// from the recorded trace. Syscall-entered spans clear this to
+    /// false and stay that way until the outermost RFE.
+    clean_irq_entry: bool,
 }
 
 impl Cpu {
@@ -125,27 +128,29 @@ impl Cpu {
             irq_line_high_steps: 0,
             should_take_interrupt_steps: 0,
             cop2: Gte::new(),
-            in_isr: false,
-            in_irq_handler: false,
+            isr_depth: 0,
+            clean_irq_entry: false,
         }
     }
 
-    /// `true` while the CPU is inside any exception handler.
-    /// Diagnostic — the harness uses [`in_irq_handler`] for
-    /// aggregation decisions.
+    /// `true` while the CPU is inside any exception handler (at any
+    /// nesting depth). Mirrors Redux's `m_inISR`. Diagnostic.
     #[inline]
     pub fn in_isr(&self) -> bool {
-        self.in_isr
+        self.isr_depth > 0
     }
 
-    /// `true` while we're inside an `Interrupt`-entered handler
-    /// specifically. Set on `Interrupt` exception entry, cleared on
-    /// `RFE`. The parity harness aggregates trace steps while this
-    /// is true so our trace matches Redux's (which hides the IRQ
-    /// handler body via its `debug.cc` early-return for cause==0).
+    /// `true` iff we're still inside the span of a *clean* IRQ
+    /// entry — i.e. the outermost handler on the exception stack
+    /// was entered via `Interrupt` (cause=0) from user mode. Stays
+    /// set across nested exceptions until the outermost RFE. The
+    /// parity harness uses this to decide whether to aggregate
+    /// handler-body steps into the pre-IRQ record, matching
+    /// Redux's `debug.cc:235` early-return which hides the trace
+    /// body of clean IRQ entries.
     #[inline]
     pub fn in_irq_handler(&self) -> bool {
-        self.in_irq_handler
+        self.clean_irq_entry
     }
 
     /// COP2 (GTE) state. Diagnostics / UI surfaces only — opcode
@@ -309,6 +314,17 @@ impl Cpu {
         let pc_before = self.pc;
         let instr = bus.read32(pc_before);
 
+        // BIAS charged BEFORE the opcode runs — matches Redux's
+        // `m_regs.cycle += BIAS` at psxinterpreter.cc:1631, which is
+        // *ahead* of the opcode dispatch. Any MMIO reads the opcode
+        // issues (Timer counters, GPUSTAT, CDROM status) therefore
+        // observe the POST-BIAS cycle. Placing the tick after the
+        // opcode would have them observe the pre-BIAS cycle, drifting
+        // Timer 1's counter behind Redux's by ~2 cycles per memory
+        // access — which showed as a 34-count offset at step
+        // 19,472,447's Timer 1 read.
+        bus.tick(cycle_cost(instr));
+
         // If the *previous* instruction was a branch, the current
         // instruction is its delay slot — after retiring, PC goes to
         // the branch target instead of the usual `pc + 4`.
@@ -332,12 +348,6 @@ impl Cpu {
                 self.gprs[i] = value;
             }
         }
-
-        // Advance the bus-side cycle counter. Phase 4a uses a flat
-        // 1 cycle/instr — this matches Redux's simplest accounting
-        // for most opcodes; MULT/DIV/memory stalls will come in as
-        // parity probes reveal them.
-        bus.tick(cycle_cost(instr));
 
         // Exception takes priority: it cancels any pending branch and
         // redirects PC to the exception vector.
@@ -785,13 +795,21 @@ impl Cpu {
 
     fn op_rfe(&mut self) -> Result<(), ExecutionError> {
         // Mirrors Redux's `psxRFE` (psxinterpreter.cc:779): restore
-        // the previous KU/IE pair. Also clears both in-handler
-        // flags; subsequent exceptions flip them back on entry.
+        // the previous KU/IE pair by shifting SR[5:0] right by two.
+        //
+        // Exception-depth bookkeeping: decrement the handler-depth
+        // counter. When it reaches zero we've exited the outermost
+        // handler and can clear the `clean_irq_entry` latch — the
+        // parity harness's aggregation then stops silently
+        // absorbing steps and starts recording user-code
+        // instructions again.
         let sr = self.cop0[12];
         let restored = (sr & !0b1111) | ((sr >> 2) & 0b1111);
         self.cop0[12] = restored;
-        self.in_isr = false;
-        self.in_irq_handler = false;
+        self.isr_depth = self.isr_depth.saturating_sub(1);
+        if self.isr_depth == 0 {
+            self.clean_irq_entry = false;
+        }
         Ok(())
     }
 
@@ -1310,16 +1328,19 @@ impl Cpu {
         let mut cause = code_bits << 2;
         if matches!(code, ExceptionCode::Interrupt) {
             cause |= 1 << 10;
-            // IRQ-specific flag: only gets set for Interrupt entries.
-            // The parity harness uses this to aggregate the IRQ
-            // handler body into the pre-IRQ record, matching
-            // Redux's debug.cc `return` early-exit for cause==0.
-            self.in_irq_handler = true;
         }
-        // Mirror Redux's `m_inISR`: flipped true on ANY exception
-        // entry, flipped false on RFE. Diagnostic / general state;
-        // aggregation is gated by `in_irq_handler` above.
-        self.in_isr = true;
+        // Latch `clean_irq_entry` only on the outermost entry (depth
+        // 0 → 1) and only if that entry was an IRQ. Nested
+        // exceptions inside an IRQ handler don't flip the latch —
+        // the parity harness keeps aggregating through them until
+        // the outermost RFE brings the depth back to zero.
+        // Matches Redux's `m_wasInISR` which is snapshotted at
+        // `startStepping()` and governs the `debug.cc:235`
+        // early-return for the whole stepIn span.
+        if self.isr_depth == 0 {
+            self.clean_irq_entry = matches!(code, ExceptionCode::Interrupt);
+        }
+        self.isr_depth = self.isr_depth.saturating_add(1);
         if in_delay_slot {
             cause |= 1 << 31;
         }

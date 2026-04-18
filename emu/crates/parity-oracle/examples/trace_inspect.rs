@@ -29,12 +29,23 @@ fn main() {
     let lo = step.saturating_sub(radius);
     let hi = (step + radius).min(records.len() - 1);
 
+    let full = env::var("FULL_GPR").is_ok();
     for (i, r) in records[lo..=hi].iter().enumerate() {
         let n = lo + i;
         let marker = if n == step { ">>>" } else { "   " };
         println!(
-            "{marker} step={n:>10}  cyc={:>10}  pc=0x{:08x}  instr=0x{:08x}  v0={:08x} v1={:08x}",
-            r.tick, r.pc, r.instr, r.gprs[2], r.gprs[3],
+            "{marker} step={n:>10}  cyc={:>10}  pc=0x{:08x}  instr=0x{:08x}",
+            r.tick, r.pc, r.instr,
         );
+        if full || n == step {
+            for row in 0..8 {
+                let mut line = String::from("        ");
+                for col in 0..4 {
+                    let reg = row * 4 + col;
+                    line.push_str(&format!("$r{reg:02}={:08x}  ", r.gprs[reg]));
+                }
+                println!("{line}");
+            }
+        }
     }
 }
