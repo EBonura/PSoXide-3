@@ -18,6 +18,7 @@ pub mod irq;
 pub mod hle_bios;
 pub mod mmio_trace;
 pub mod pad;
+pub mod scheduler;
 pub mod sio;
 pub mod spu;
 pub mod timers;
