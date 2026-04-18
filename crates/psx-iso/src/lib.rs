@@ -89,6 +89,26 @@ pub fn bcd_to_bin(bcd: u8) -> u8 {
     }
 }
 
+/// Pack a binary 0..=99 value into a BCD byte. Values above 99
+/// clamp to 99 — hardware drops the high bits rather than
+/// corrupting the low nibble.
+pub fn bin_to_bcd(v: u8) -> u8 {
+    let v = v.min(99);
+    ((v / 10) << 4) | (v % 10)
+}
+
+/// Convert an absolute LBA to an MSF triple `(minute, second, frame)`
+/// in *binary* form. Caller must `bin_to_bcd` each field before
+/// sending over the wire. LBA 0 = MSF 00:02:00 per the 150-frame
+/// pre-gap convention.
+pub fn lba_to_msf(lba: u32) -> (u8, u8, u8) {
+    let abs = lba.saturating_add(150);
+    let m = (abs / (60 * 75)) as u8;
+    let s = ((abs / 75) % 60) as u8;
+    let f = (abs % 75) as u8;
+    (m, s, f)
+}
+
 /// Convert a 3-byte BCD MSF triple (minute, second, frame) into the
 /// absolute LBA the sector lives at.
 ///
@@ -122,6 +142,21 @@ mod tests {
     #[test]
     fn msf_to_lba_data_area_starts_at_zero() {
         assert_eq!(msf_to_lba(0x00, 0x02, 0x00), 0);
+    }
+
+    #[test]
+    fn bin_to_bcd_packs_correctly() {
+        assert_eq!(bin_to_bcd(0), 0x00);
+        assert_eq!(bin_to_bcd(42), 0x42);
+        assert_eq!(bin_to_bcd(99), 0x99);
+        assert_eq!(bin_to_bcd(100), 0x99); // clamped
+    }
+
+    #[test]
+    fn lba_to_msf_round_trips() {
+        assert_eq!(lba_to_msf(0), (0, 2, 0));
+        assert_eq!(lba_to_msf(75), (0, 3, 0));
+        assert_eq!(lba_to_msf(4500), (1, 2, 0));
     }
 
     #[test]
