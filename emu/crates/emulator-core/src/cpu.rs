@@ -1344,7 +1344,29 @@ impl Cpu {
     /// doesn't use them, so we don't model that.
     fn should_take_interrupt(&self, bus: &mut Bus) -> bool {
         let sr = self.cop0[12];
-        bus.external_interrupt_pending() && (sr & 0x401) == 0x401
+        if !(bus.external_interrupt_pending() && (sr & 0x401) == 0x401) {
+            return false;
+        }
+        // R3000A hardware bug — "interrupts vs GTE commands". If the
+        // next instruction about to execute is a GTE cofun (COP2
+        // function instruction, opcode 0100_10 with bit 25 set —
+        // i.e. top byte masked with 0xFE equals 0x4A), taking the
+        // IRQ here gets the GTE instruction executed anyway but
+        // also parks EPC pointing at it, so the ISR's return
+        // advances PC past the GTE op — effectively losing it.
+        //
+        // Reference: `psx-spx`'s "Interrupts vs GTE Commands"
+        // section; Redux mirrors the fix at `r3000a.cc:411`.
+        //
+        // `peek_instruction` is side-effect-free; it returns `None`
+        // for non-code addresses, which we treat as "not a GTE
+        // cofun" (games never execute from MMIO).
+        if let Some(next) = bus.peek_instruction(self.pc) {
+            if (next & 0xFE00_0000) == 0x4A00_0000 {
+                return false;
+            }
+        }
+        true
     }
 
     /// `SYSCALL` — raise a syscall exception (CAUSE.ExcCode = 8). The
@@ -1729,5 +1751,30 @@ mod tests {
         cpu.step(&mut bus).expect("sub");
         assert_eq!(cpu.gprs[10], 7);
         assert_eq!(cpu.exception_counts()[12], 0);
+    }
+
+    #[test]
+    fn should_take_interrupt_skips_gte_cofun_next() {
+        // Arrange a bus where IRQ is pending + enabled, and the next
+        // instruction at PC is a GTE cofun (top byte 0x4A). The
+        // hardware-bug workaround says: don't fire the IRQ.
+        let mut bus = Bus::new(synthetic_bios_with_first_word(0x4A00_0001)).unwrap();
+        let mut cpu = Cpu::new();
+        // Set SR IEc (bit 0) + IM2 (bit 10) so IRQ is unmasked.
+        cpu.cop0[12] = 0x401;
+        // Raise a hardware IRQ and set the mask so it's pending.
+        bus.irq_mut().raise(crate::IrqSource::VBlank);
+        bus.irq_mut().write_mask(0x1);
+        // PC points at the cofun at the BIOS reset vector.
+        assert_eq!(cpu.pc(), 0xBFC0_0000);
+        // With a GTE cofun at PC, the workaround should refuse to fire.
+        assert!(!cpu.should_take_interrupt(&mut bus));
+        // Now change the word to something non-cofun — same opcode
+        // area but bit 25 clear (MFC2): top byte becomes 0x48 which
+        // doesn't match the mask. The IRQ should fire.
+        bus = Bus::new(synthetic_bios_with_first_word(0x4800_0000)).unwrap();
+        bus.irq_mut().raise(crate::IrqSource::VBlank);
+        bus.irq_mut().write_mask(0x1);
+        assert!(cpu.should_take_interrupt(&mut bus));
     }
 }

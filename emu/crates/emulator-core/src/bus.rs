@@ -1100,6 +1100,28 @@ impl Bus {
         value
     }
 
+    /// Side-effect-free peek at a 32-bit instruction word. Returns
+    /// `None` when `virt` isn't in RAM or BIOS — those are the only
+    /// places PS1 code ever executes from, so a `None` here is
+    /// cheap to treat as "can't be a GTE cofun" at the call site.
+    ///
+    /// Used by [`crate::Cpu::should_take_interrupt`] — see the
+    /// "interrupts vs GTE" hardware bug workaround.
+    pub fn peek_instruction(&self, virt: u32) -> Option<u32> {
+        let phys = to_physical(virt);
+        if phys < memory::ram::MIRROR_END {
+            let offset = (phys as usize) % memory::ram::SIZE;
+            Some(read_u32_le(&self.ram[offset..]))
+        } else if (memory::bios::BASE..memory::bios::BASE + memory::bios::SIZE as u32)
+            .contains(&phys)
+        {
+            let offset = (phys - memory::bios::BASE) as usize;
+            Some(read_u32_le(&self.bios[offset..]))
+        } else {
+            None
+        }
+    }
+
     fn read32_impl(&mut self, virt: u32, phys: u32) -> u32 {
         if phys < memory::ram::MIRROR_END {
             let offset = (phys as usize) % memory::ram::SIZE;
