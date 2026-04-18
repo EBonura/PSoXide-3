@@ -64,9 +64,73 @@ pub fn draw(ctx: &Context, state: &mut AppState) {
                 // Push buttons to the right of the remaining space.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     draw_buttons(ui, state);
+                    ui.add_space(12.0);
+                    draw_debug_toggles(ui, state);
                 });
             });
         });
+}
+
+/// Debug-panel toggle cluster. Each button reflects the current on/off
+/// state of its panel — active buttons tint with the "running" green;
+/// inactive stay dim. Clicking flips the panel's visibility.
+fn draw_debug_toggles(ui: &mut egui::Ui, state: &mut AppState) {
+    // Added right-to-left; reading left-to-right on screen the icons
+    // will appear in the opposite order (wireframe on the left).
+    debug_toggle(
+        ui,
+        icons::LAYERS,
+        "Toggle VRAM viewer",
+        &mut state.panels.vram,
+    );
+    debug_toggle(
+        ui,
+        icons::TERMINAL,
+        "Toggle memory viewer",
+        &mut state.panels.memory,
+    );
+    debug_toggle(
+        ui,
+        icons::CPU,
+        "Toggle CPU registers panel",
+        &mut state.panels.registers,
+    );
+    // Wireframe mode lives on the GPU, not a frontend panel — we
+    // dereference through Bus to flip it.
+    let wf_active = state
+        .bus
+        .as_ref()
+        .map(|b| b.gpu.wireframe_enabled)
+        .unwrap_or(false);
+    let wf_btn = toggle_button(icons::GRID, wf_active);
+    if ui
+        .add(wf_btn)
+        .on_hover_text("Wireframe mode — edges only")
+        .clicked()
+    {
+        if let Some(bus) = state.bus.as_mut() {
+            bus.gpu.wireframe_enabled = !bus.gpu.wireframe_enabled;
+        }
+    }
+}
+
+/// One flag-backed toggle button. Tooltip + tint reflect the flag;
+/// clicking mutates it in place.
+fn debug_toggle(ui: &mut egui::Ui, icon: char, tooltip: &str, flag: &mut bool) {
+    let btn = toggle_button(icon, *flag);
+    if ui.add(btn).on_hover_text(tooltip).clicked() {
+        *flag = !*flag;
+    }
+}
+
+/// Build a Button at the shared icon size, tinted to indicate active
+/// vs. inactive state. Keeps the toggle cluster visually coherent.
+fn toggle_button(icon: char, active: bool) -> Button<'static> {
+    let color = if active { STATUS_RUNNING } else { METRIC_LABEL };
+    let label = RichText::new(icon.to_string())
+        .font(icons::font(ICON_SIZE))
+        .color(color);
+    Button::new(label).min_size(BUTTON_SIZE)
 }
 
 /// Left-hand cluster: status pill + FPS / MIPS / dt metrics.
