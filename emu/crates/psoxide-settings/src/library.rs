@@ -491,6 +491,50 @@ fn pvd_volume_identifier(user_data: &[u8]) -> Option<String> {
     Some(cleaned.trim().to_string())
 }
 
+/// Parse a CUE sheet to find the path of its first (data) track's
+/// BIN file. Used to collapse CUE + BIN pairs in the UI — the
+/// same physical disc shouldn't show up twice in the library.
+///
+/// CUE format is plain text; we only care about:
+///
+/// ```text
+/// FILE "some_game (Track 01).bin" BINARY
+///   TRACK 01 MODE2/2352
+///     INDEX 01 00:00:00
+/// ...
+/// ```
+///
+/// The first `FILE` entry is by convention the data track on
+/// PSX discs (MODE2/2352). Audio tracks follow but aren't the
+/// primary boot source. Returned path is resolved relative to
+/// the CUE's directory, so the caller can match it against
+/// scanner-discovered BIN absolute paths.
+///
+/// Returns `None` on:
+/// - CUE unreadable
+/// - No `FILE "…"` line found
+/// - Parent directory couldn't be resolved (shouldn't happen for
+///   scanned-from-root entries)
+pub fn primary_bin_from_cue(cue_path: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(cue_path).ok()?;
+    let dir = cue_path.parent()?;
+    for line in contents.lines() {
+        let trimmed = line.trim_start();
+        // CUE keywords are case-insensitive in practice.
+        if trimmed.len() < 5 || !trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"FILE") {
+            continue;
+        }
+        let after_file = trimmed.get(4..)?.trim_start();
+        // The filename is quoted: FILE "name.bin" BINARY
+        let q1 = after_file.find('"')?;
+        let rest = &after_file[q1 + 1..];
+        let q2 = rest.find('"')?;
+        let filename = &rest[..q2];
+        return Some(dir.join(filename));
+    }
+    None
+}
+
 /// FNV-1a-64 over any number of input slices, rendered as a
 /// 16-hex-char string. Same algorithm the parity-cache uses — no
 /// adversarial input, just a stable fingerprint.
@@ -678,6 +722,46 @@ mod tests {
     fn fingerprint_is_stable() {
         assert_eq!(fingerprint(&[b"hello"]), fingerprint(&[b"hello"]));
         assert_ne!(fingerprint(&[b"hello"]), fingerprint(&[b"world"]));
+    }
+
+    #[test]
+    fn primary_bin_from_cue_extracts_first_file_line() {
+        let tmp = TempDir::new().unwrap();
+        let cue_path = tmp.path().join("game.cue");
+        // Realistic multi-track PSX CUE — the data track is track 1.
+        std::fs::write(
+            &cue_path,
+            concat!(
+                "FILE \"game (Track 01).bin\" BINARY\n",
+                "  TRACK 01 MODE2/2352\n",
+                "    INDEX 01 00:00:00\n",
+                "FILE \"game (Track 02).bin\" BINARY\n",
+                "  TRACK 02 AUDIO\n",
+                "    INDEX 00 00:00:00\n",
+            ),
+        )
+        .unwrap();
+        let bin = primary_bin_from_cue(&cue_path).unwrap();
+        assert_eq!(bin, tmp.path().join("game (Track 01).bin"));
+    }
+
+    #[test]
+    fn primary_bin_from_cue_handles_lowercase_keyword() {
+        let tmp = TempDir::new().unwrap();
+        let cue_path = tmp.path().join("g.cue");
+        std::fs::write(&cue_path, "file \"g.bin\" BINARY\n").unwrap();
+        assert_eq!(
+            primary_bin_from_cue(&cue_path).unwrap(),
+            tmp.path().join("g.bin")
+        );
+    }
+
+    #[test]
+    fn primary_bin_from_cue_returns_none_on_garbage() {
+        let tmp = TempDir::new().unwrap();
+        let cue_path = tmp.path().join("bad.cue");
+        std::fs::write(&cue_path, "REM some comment with no FILE\n").unwrap();
+        assert!(primary_bin_from_cue(&cue_path).is_none());
     }
 
     #[test]
