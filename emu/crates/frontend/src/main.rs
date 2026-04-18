@@ -167,7 +167,17 @@ impl ApplicationHandler for Shell {
         let consumed = gfx.egui_winit.on_window_event(&gfx.window, &event).consumed;
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Flush any dirty memory card so save progress
+                // survives a window-close. A hard crash still
+                // loses whatever hasn't been flushed — the run
+                // loop could call this periodically; for now
+                // graceful exit is enough.
+                if let Err(e) = self.state.flush_memcard_port1() {
+                    eprintln!("[frontend] memcard flush on exit: {e}");
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 gfx.resize(size);
                 gfx.window.request_redraw();
@@ -208,6 +218,9 @@ impl ApplicationHandler for Shell {
                 let input = std::mem::take(&mut self.pending_input);
                 if let Some(action) = self.state.menu.update(&input) {
                     if ui::apply_menu_action(&mut self.state, action) == MenuOutcome::Quit {
+                        if let Err(e) = self.state.flush_memcard_port1() {
+                            eprintln!("[frontend] memcard flush on quit: {e}");
+                        }
                         event_loop.exit();
                         return;
                     }

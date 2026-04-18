@@ -186,8 +186,43 @@ impl Bus {
     /// games can poll for button state. Convenience: most single-player
     /// games use port 1 only.
     pub fn attach_digital_pad_port1(&mut self) {
-        self.sio0
-            .attach_port1(crate::pad::PortDevice::DigitalPad(crate::pad::DigitalPad::new()));
+        let device = crate::pad::PortDevice::empty().with_pad(crate::pad::DigitalPad::new());
+        self.sio0.attach_port1(device);
+    }
+
+    /// Plug a memory card into port 1 with the given backing
+    /// contents (128 KiB buffer, typically loaded from a
+    /// `.mcd` file). Pass an empty `Vec` to start with a fresh
+    /// card. Keeps any pad already attached — real hardware
+    /// multiplexes pad + memcard on the same port.
+    pub fn attach_memcard_port1(&mut self, initial_bytes: Vec<u8>) {
+        let bytes = if initial_bytes.len() == crate::pad::MEMCARD_SIZE {
+            initial_bytes
+        } else {
+            vec![0u8; crate::pad::MEMCARD_SIZE]
+        };
+        // Preserve any existing pad.
+        let pad = std::mem::replace(self.sio0.port1_mut(), crate::pad::PortDevice::empty())
+            .into_pad();
+        let mut device =
+            crate::pad::PortDevice::empty().with_memcard(crate::pad::MemoryCard::from_bytes(bytes));
+        if let Some(p) = pad {
+            device = device.with_pad(p);
+        }
+        self.sio0.attach_port1(device);
+    }
+
+    /// Snapshot the port-1 memcard bytes for persistence. `None`
+    /// when there's no card on port 1 or the card hasn't been
+    /// written since load.
+    pub fn memcard_port1_snapshot(&mut self) -> Option<Vec<u8>> {
+        let card = self.sio0.port1_mut().memcard_mut()?;
+        if !card.is_dirty() {
+            return None;
+        }
+        let bytes = card.as_bytes().to_vec();
+        card.clear_dirty();
+        Some(bytes)
     }
 
     /// Update the buttons currently held on the port-1 controller.
