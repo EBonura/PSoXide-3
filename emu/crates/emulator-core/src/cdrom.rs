@@ -235,12 +235,20 @@ impl CdRom {
     /// response and ReadN streams real sector data through the
     /// DataReady event chain.
     ///
-    /// `insert_disc(None)` "ejects" — disc_present flips false, any
-    /// in-flight read is cancelled, and the next GetID returns the
-    /// no-disc response again.
+    /// Inserting a disc also spins up the motor. On real hardware the
+    /// motor starts when the shell is closed with a disc seated, even
+    /// before the BIOS issues `Init`. Without this, `GetID`'s stat
+    /// byte reports motor-off (0x00), which the BIOS's shell poll
+    /// treats as "drive not ready yet" and never advances past the
+    /// disc-probe loop to issue `SetLoc + SeekL + ReadN`.
+    ///
+    /// `insert_disc(None)` "ejects" — disc_present flips false, the
+    /// motor stops, any in-flight read is cancelled, and the next
+    /// `GetID` returns the no-disc response again.
     pub fn insert_disc(&mut self, disc: Option<Disc>) {
         self.disc = disc;
         self.disc_present = self.disc.is_some();
+        self.motor_on = self.disc_present;
         self.reading = false;
         self.data_fifo.clear();
     }
@@ -676,6 +684,11 @@ impl CdRom {
     /// Current raw IRQ-flag (for diagnostics).
     pub fn irq_flag(&self) -> u8 {
         self.irq_flag
+    }
+
+    /// Current IRQ-enable mask (for diagnostics).
+    pub fn irq_mask_raw(&self) -> u8 {
+        self.irq_mask
     }
 
     /// Pull one byte from the data FIFO — used by DMA channel 3's
