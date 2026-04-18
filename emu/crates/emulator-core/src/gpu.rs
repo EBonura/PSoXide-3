@@ -76,6 +76,18 @@ pub struct Gpu {
     /// a primitive's cmd-bit-1 selects semi-transparent; opaque
     /// prims ignore this field.
     tex_blend_mode: BlendMode,
+    /// Texture-window mask X in pixels (multiple of 8). Set by
+    /// GP0 0xE2 bits 0..=4, left-shifted by 3. Used at UV-lookup
+    /// time to force the high bits of the effective U to a constant
+    /// pattern — typically 0 (no mask) so UV passes through, but
+    /// games that tile a texture via this feature set specific bits.
+    tex_window_mask_x: u8,
+    /// Texture-window mask Y, same shape.
+    tex_window_mask_y: u8,
+    /// Texture-window offset X (OR'd into the masked-out U bits).
+    tex_window_offset_x: u8,
+    /// Texture-window offset Y.
+    tex_window_offset_y: u8,
     /// When true, every plotted pixel gets its mask bit (VRAM bit 15)
     /// forced to 1. Set by GP0 0xE6 bit 0. Mirrors GPUSTAT bit 11.
     /// Used by games that want to protect pixels from being
@@ -201,6 +213,10 @@ impl Gpu {
             tex_page_y: 0,
             tex_depth: 0,
             tex_blend_mode: BlendMode::Average,
+            tex_window_mask_x: 0,
+            tex_window_mask_y: 0,
+            tex_window_offset_x: 0,
+            tex_window_offset_y: 0,
             mask_set_on_draw: false,
             mask_check_before_draw: false,
             display_start_x: 0,
@@ -663,9 +679,28 @@ impl Gpu {
                 let stat_bits = (word & 0x3) << 11;
                 self.status.raw = (self.status.raw & !0x1800) | stat_bits;
             }
-            // 0xE2 (texture window): not wired up yet — most games
-            // that care set the UV base directly, so the hit rate
-            // is low. Future work.
+            // GP0 0xE2 — texture window. Lets a textured primitive
+            // AND-mask its U/V into a smaller patch of the tpage,
+            // effectively tiling a sub-rectangle of texture across
+            // the prim. Format:
+            //   bits 0-4  : mask X (U high bits forced; in 8-pixel steps)
+            //   bits 5-9  : mask Y
+            //   bits 10-14: offset X (U low bits OR'd)
+            //   bits 15-19: offset Y
+            // Per PSX-SPX, the effective texture coordinate is
+            //     U' = (U & ~(mask_x << 3)) | ((offset_x & mask_x) << 3)
+            //     V' = (V & ~(mask_y << 3)) | ((offset_y & mask_y) << 3)
+            // (mask is in 8-pixel units; left-shift by 3 gives the
+            // pixel-space mask.) Games that use palettes laid out in
+            // small sub-rectangles rely on this to save VRAM — the
+            // same 128×128 tile gets reused for many prims with
+            // different offsets.
+            0xE2 => {
+                self.tex_window_mask_x = ((word & 0x1F) as u8) << 3;
+                self.tex_window_mask_y = (((word >> 5) & 0x1F) as u8) << 3;
+                self.tex_window_offset_x = (((word >> 10) & 0x1F) as u8) << 3;
+                self.tex_window_offset_y = (((word >> 15) & 0x1F) as u8) << 3;
+            }
             _ => {}
         }
     }
@@ -951,7 +986,24 @@ impl Gpu {
     /// Fetch a single texel from the active texture page. Returns
     /// `None` for transparent (texel value 0 in CLUT modes, or 0x0000
     /// with mask bit clear in direct mode).
+    ///
+    /// The incoming `u` / `v` are run through the GP0 0xE2 texture
+    /// window first: `U' = (U & ~mask) | (offset & mask)` per axis.
+    /// With the default (all zeroes) that's a no-op; games that use
+    /// tiling set non-zero mask/offset to reuse a sub-rectangle of
+    /// the tpage across multiple primitives.
     fn sample_texture(&self, u: u16, v: u16, clut_x: u16, clut_y: u16) -> Option<u16> {
+        // Apply the texture window — PSX-SPX:
+        //   U' = (U AND NOT(mask_x * 8)) OR ((offset_x * 8) AND (mask_x * 8))
+        // but both `mask_*` and `offset_*` are already pre-shifted (×8)
+        // when we stored them in the GP0 0xE2 handler.
+        let mask_x = self.tex_window_mask_x as u16;
+        let mask_y = self.tex_window_mask_y as u16;
+        let off_x = self.tex_window_offset_x as u16;
+        let off_y = self.tex_window_offset_y as u16;
+        let u = (u & !mask_x) | (off_x & mask_x);
+        let v = (v & !mask_y) | (off_y & mask_y);
+
         let tpy = self.tex_page_y.wrapping_add(v);
         match self.tex_depth {
             0 => {
@@ -2044,5 +2096,41 @@ mod tests {
         assert!(!gpu.mask_check_before_draw);
         let stat = gpu.read32(GP1_ADDR).unwrap();
         assert_eq!(stat & 0x1800, 0);
+    }
+
+    #[test]
+    fn gp0_e2_parses_texture_window_fields() {
+        let mut gpu = Gpu::new();
+        // mask_x = 3 (24 px), mask_y = 5 (40 px), off_x = 1 (8 px),
+        // off_y = 2 (16 px).
+        //
+        //   bits 0..=4  : mask_x  = 3
+        //   bits 5..=9  : mask_y  = 5
+        //   bits 10..=14: off_x   = 1
+        //   bits 15..=19: off_y   = 2
+        let word = 0xE200_0000u32 | 3 | (5 << 5) | (1 << 10) | (2 << 15);
+        gpu.write32(GP0_ADDR, word);
+        assert_eq!(gpu.tex_window_mask_x, 24);
+        assert_eq!(gpu.tex_window_mask_y, 40);
+        assert_eq!(gpu.tex_window_offset_x, 8);
+        assert_eq!(gpu.tex_window_offset_y, 16);
+    }
+
+    #[test]
+    fn texture_window_default_is_passthrough() {
+        // Default window (all zeroes) must leave UV unchanged when
+        // sampled; otherwise we'd break every game that doesn't
+        // touch GP0 0xE2.
+        let gpu = Gpu::new();
+        assert_eq!(gpu.tex_window_mask_x, 0);
+        assert_eq!(gpu.tex_window_mask_y, 0);
+        assert_eq!(gpu.tex_window_offset_x, 0);
+        assert_eq!(gpu.tex_window_offset_y, 0);
+        // The sample-time formula is `u & !mask | offset & mask`;
+        // with mask=0 every u passes through.
+        let u: u16 = 0x5A;
+        let mask: u16 = 0;
+        let off: u16 = 0;
+        assert_eq!((u & !mask) | (off & mask), u);
     }
 }
