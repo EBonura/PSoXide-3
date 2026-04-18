@@ -737,7 +737,7 @@ impl Bus {
             return self.timers.read32(phys) as u16;
         }
         if Spu::contains(phys) {
-            return self.spu.read16(phys);
+            return self.spu.read16_at(phys, self.cycles);
         }
         if Sio0::contains(phys) {
             return self.sio0.read16(phys).unwrap_or(0);
@@ -809,7 +809,7 @@ impl Bus {
             return v;
         }
         if Spu::contains(phys) {
-            return self.spu.read32(phys);
+            return self.spu.read32_at(phys, self.cycles);
         }
         if Sio0::contains(phys) {
             return self.sio0.read32(phys).unwrap_or(0);
@@ -878,7 +878,7 @@ impl Bus {
             return;
         }
         if Spu::contains(phys) {
-            self.spu.write32(phys, value);
+            self.spu.write32_at(phys, value, self.cycles);
             return;
         }
         if Sio0::contains(phys) {
@@ -1025,7 +1025,7 @@ impl Bus {
             return;
         }
         if Spu::contains(phys) {
-            self.spu.write16(phys, value);
+            self.spu.write16_at(phys, value, self.cycles);
             return;
         }
         if Sio0::contains(phys) {
