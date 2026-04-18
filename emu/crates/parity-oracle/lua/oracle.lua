@@ -346,9 +346,16 @@ local function run()
                     h = bit.bxor(h, ffi.new("uint64_t", byte))
                     h = h * prime
                 end
+                -- Format as two 32-bit halves. `tonumber(u64)` goes
+                -- through Lua's `double`, which only has a 53-bit
+                -- mantissa — so `%016x` on the result silently
+                -- zeroes the bottom ~11 bits of the hash. Splitting
+                -- into high and low u32s keeps every bit precise.
+                local hi = ffi.cast("uint32_t", bit.rshift(h, 32))
+                local lo = ffi.cast("uint32_t", bit.band(h, 0xFFFFFFFFULL))
                 return string.format(
-                    "%016x w=%d h=%d bpp=%d len=%d",
-                    tonumber(ffi.cast("uint64_t", h)),
+                    "%08x%08x w=%d h=%d bpp=%d len=%d",
+                    tonumber(hi), tonumber(lo),
                     w, h_dim, bpp, len
                 )
             end)

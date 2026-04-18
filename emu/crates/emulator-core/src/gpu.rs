@@ -106,6 +106,15 @@ pub struct Gpu {
     /// decode VRAM as 15bpp; when this flag comes into play the
     /// frontend's framebuffer view can respect it.
     display_24bpp: bool,
+    /// `true` after the BIOS / game has written GP1 0x07 (V-range) or
+    /// GP1 0x08 (display mode). Before that, `display_area` reports
+    /// (0, 0) — matching Redux's `takeScreenShot`, which also hands
+    /// back a zero-sized image until its internal
+    /// `updateDisplayIfChanged` runs (triggered by those same two
+    /// GP1 writes). Parity tools rely on this to avoid seeing a
+    /// spurious "dimension mismatch" before the first configured
+    /// frame even exists.
+    display_configured: bool,
 
     /// Count of executed GP0 packets by opcode byte (the high 8 bits
     /// of the header word). Diagnostic only — lets `smoke_draw` see at
@@ -182,15 +191,22 @@ impl Gpu {
             display_start_y: 0,
             display_width: 320,
             display_height_480: false,
-            // Redux's power-on defaults for the V-range (GP1 0x07).
-            // The BIOS overwrites these early, but starting at
-            // these values keeps pre-BIOS diagnostics from seeing
-            // nonsense dimensions.
-            v_range_y1: 0x10,
-            v_range_y2: 0x100,
-            h_range_x1: 0x200,
-            h_range_x2: 0xc00,
+            // Power-on V- and H-range defaults, matching Redux's
+            // `SoftGPU::impl::initBackend` which zeroes `Range.x0 =
+            // Range.x1 = Range.y0 = Range.y1 = 0`. Crucially the
+            // BIOS writes GP1 0x08 (display mode) *before* GP1 0x07
+            // (v-range), and because Redux derives Height from
+            // `y1 - y0` — both zero — its `takeScreenShot` height
+            // is 0 during that window. Earlier we defaulted these
+            // to 0x10/0x100, which made our screenshot height 240
+            // during the same window and broke lockstep parity at
+            // step 19.3 M on Crash's BIOS handoff.
+            v_range_y1: 0,
+            v_range_y2: 0,
+            h_range_x1: 0,
+            h_range_x2: 0,
             display_24bpp: false,
+            display_configured: false,
             vram_download: None,
             gpuread_latch: 0,
             gp0_opcode_hist: [0; 256],
@@ -223,6 +239,20 @@ impl Gpu {
     /// screenshot path reports — letting milestone parity tests
     /// compare byte-for-byte.
     pub fn display_area(&self) -> DisplayArea {
+        if !self.display_configured {
+            // Match Redux's `takeScreenShot`: zero-sized image until
+            // GP1 0x07 or 0x08 has been written. That's what lets
+            // `display_hash` compare apples to apples from the very
+            // first instruction onward, instead of us reporting our
+            // `GP1 0x00` reset defaults while Redux still reports 0×0.
+            return DisplayArea {
+                x: self.display_start_x,
+                y: self.display_start_y,
+                width: 0,
+                height: 0,
+                bpp24: self.display_24bpp,
+            };
+        }
         DisplayArea {
             x: self.display_start_x,
             y: self.display_start_y,
@@ -426,17 +456,19 @@ impl Gpu {
                     _ => 0,
                 };
             }
-            // GP1 0x00 — GPU reset — also resets the display area.
+            // GP1 0x00 — GPU reset. Matches Redux's `CtrlReset`:
+            // clears the display-enable flag + RGB24/interlace bits
+            // and resets DrawOffset, but **does not** touch the
+            // V/H-ranges or DisplayPosition. The BIOS writes those
+            // via the explicit GP1 0x05 / 0x06 / 0x07 commands
+            // later, so reset-persisting them matches hardware.
             0x00 => {
                 self.display_start_x = 0;
                 self.display_start_y = 0;
                 self.display_width = 320;
                 self.display_height_480 = false;
-                self.v_range_y1 = 0x10;
-                self.v_range_y2 = 0x100;
-                self.h_range_x1 = 0x200;
-                self.h_range_x2 = 0xc00;
                 self.display_24bpp = false;
+                self.display_configured = false;
             }
             // GP1 0x05 — display area start (top-left corner in VRAM).
             //   bits 9:0  = X (pixels)
@@ -464,6 +496,7 @@ impl Gpu {
             0x07 => {
                 self.v_range_y1 = (value & 0x3FF) as u16;
                 self.v_range_y2 = ((value >> 10) & 0x3FF) as u16;
+                self.display_configured = true;
             }
             // GP1 0x08 — display mode. Height is the interlace flag;
             // actual pixel count is derived together with V-range in
@@ -480,6 +513,7 @@ impl Gpu {
                 self.display_width = hres;
                 self.display_height_480 = value & (1 << 2) != 0;
                 self.display_24bpp = value & (1 << 4) != 0;
+                self.display_configured = true;
             }
             _ => {}
         }
