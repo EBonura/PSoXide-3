@@ -12,9 +12,20 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 name = "hello-input"
 version = "0.1.0"
 dependencies = [
+ "psx-font",
  "psx-gpu",
  "psx-pad",
  "psx-rt",
+ "psx-vram",
+]
+
+[[package]]
+name = "psx-font"
+version = "0.1.0"
+dependencies = [
+ "psx-hw",
+ "psx-io",
+ "psx-vram",
 ]
 
 [[package]]
@@ -49,6 +60,14 @@ dependencies = [
 
 [[package]]
 name = "psx-rt"
+version = "0.1.0"
+dependencies = [
+ "psx-hw",
+ "psx-io",
+]
+
+[[package]]
+name = "psx-vram"
 version = "0.1.0"
 dependencies = [
  "psx-hw",

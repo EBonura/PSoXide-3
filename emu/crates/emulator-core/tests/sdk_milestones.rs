@@ -381,12 +381,18 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-input" => Some(SdkGolden {
             example: "hello-input",
             vblanks: 4,
-            vram_hash: 0x0ca7_e96b_ef71_5bf1,
-            display_hash: 0xba6a_5312_9e9f_e3f1,
+            // Refreshed 2026-04-19-e after folding `psx-font` into the
+            // example: HELD: header + bottom-right hex mask drawn via
+            // `FontAtlas::draw_text`. VRAM hash shifts (atlas texture
+            // at tpage (320, 0) + 2-entry CLUT at (320, 256)); display
+            // hash shifts (label glyphs on screen); final PC shifts
+            // (extra code size from the font atlas upload path).
+            vram_hash: 0x82e5_f04a_3f03_a4c4,
+            display_hash: 0x7dac_2cef_bc15_db1b,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_04dc,
+            final_pc: 0x8001_0b14,
             redux_display_hash: None,
         }),
         "hello-gte" => Some(SdkGolden {

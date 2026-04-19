@@ -1,0 +1,15 @@
+[package]
+name         = "psx-font"
+version      = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description  = "Bitmap-font atlas for PS1 SDK: generic over glyph dimensions, 1bpp source → 4bpp CLUT VRAM texture, GP0 textured-rect draw path."
+
+[dependencies]
+psx-hw   = { workspace = true }
+psx-io   = { path = "../psx-io" }
+psx-vram = { path = "../psx-vram" }
+
+[lints.rust]
+missing_docs = "warn"
