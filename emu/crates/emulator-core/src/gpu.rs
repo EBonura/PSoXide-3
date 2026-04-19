@@ -138,6 +138,27 @@ pub struct Gpu {
     /// submitting.
     pub wireframe_enabled: bool,
 
+    /// Pixel-owner trace — when `Some`, every `plot_pixel` records
+    /// the index of the currently-executing GPU command into
+    /// `pixel_owner[y*VRAM_WIDTH + x]`. Paired with `cmd_log`
+    /// this lets us answer "which command drew the pixel at
+    /// (x, y)?" after a run, the essential first step in
+    /// diagnosing per-pixel parity divergences against Redux.
+    ///
+    /// Allocating is opt-in because the buffer is 2 MiB — tiny
+    /// in absolute terms but enough to want control over when it
+    /// appears in core state.
+    pub pixel_owner: Option<Vec<u32>>,
+    /// Command log — one entry per GP0 packet executed since this
+    /// tracer was enabled. Each entry captures the opcode plus
+    /// the raw fifo words the packet consumed, so we can replay
+    /// the exact inputs to a single draw in isolation.
+    pub cmd_log: Vec<GpuCmdLogEntry>,
+    /// The index that will be written into `pixel_owner` for the
+    /// NEXT pixel plotted — i.e., the index of the currently-
+    /// executing command. Bumped just before each packet dispatch.
+    current_cmd_index: u32,
+
     /// Cumulative "pseudo-busy" credit. Incremented by each
     /// primitive rasterisation proportionally to its pixel count;
     /// decremented by `set_idle_cycles` each time the frontend
@@ -225,6 +246,24 @@ pub struct DisplayArea {
     pub bpp24: bool,
 }
 
+/// One captured GP0 packet in the pixel-tracer's command log.
+/// `index` matches the value stored in [`Gpu::pixel_owner`] for every
+/// pixel this packet plotted, so `pixel_owner[y*W+x]` → look up the
+/// corresponding `cmd_log` entry to see what primitive drew that
+/// pixel.
+#[derive(Debug, Clone)]
+pub struct GpuCmdLogEntry {
+    /// Monotonic command index, starting at 0. Wraps via saturation
+    /// at u32::MAX; not a concern for typical debug runs (a few
+    /// hundred thousand draw calls at most).
+    pub index: u32,
+    /// Opcode byte — top 8 bits of the first FIFO word.
+    pub opcode: u8,
+    /// Full FIFO contents at dispatch time. Short slices (3..=12 words)
+    /// so cloning per command is cheap.
+    pub fifo: Vec<u32>,
+}
+
 /// In-flight CPU→VRAM transfer state — 2 pixels per incoming GP0 word,
 /// written in row-major order across the destination rect. Completes
 /// when `remaining == 0`, and then the GPU goes back to accepting
@@ -275,6 +314,9 @@ impl Gpu {
             tex_rect_flip_y: false,
             polyline: None,
             wireframe_enabled: false,
+            pixel_owner: None,
+            cmd_log: Vec::new(),
+            current_cmd_index: 0,
             busy_credit: 0,
             display_start_x: 0,
             display_start_y: 0,
@@ -398,6 +440,37 @@ impl Gpu {
             }
         }
         (h, effective_w as u32, effective_h as u32, byte_len)
+    }
+
+    /// Enable per-pixel command tracing. Allocates the 2 MiB owner
+    /// buffer (one u32 per VRAM pixel). Every subsequent
+    /// `plot_pixel` stamps the currently-executing command's index
+    /// into the buffer; every subsequent `execute_gp0_packet`
+    /// pushes a `GpuCmdLogEntry` into `cmd_log`.
+    ///
+    /// Idempotent: re-enabling resets the tracer to empty.
+    pub fn enable_pixel_tracer(&mut self) {
+        const SENTINEL_NO_OWNER: u32 = u32::MAX;
+        self.pixel_owner = Some(vec![
+            SENTINEL_NO_OWNER;
+            VRAM_WIDTH * VRAM_HEIGHT
+        ]);
+        self.cmd_log.clear();
+        self.current_cmd_index = 0;
+    }
+
+    /// Look up which command drew the pixel at (x, y), returning
+    /// `None` if no command has touched that pixel since the tracer
+    /// was enabled (or if the tracer is off). The returned entry
+    /// carries the opcode + raw FIFO words, enough to replay the
+    /// single command in isolation.
+    pub fn pixel_owner_at(&self, x: u16, y: u16) -> Option<&GpuCmdLogEntry> {
+        let pixel_owner = self.pixel_owner.as_ref()?;
+        let idx = pixel_owner.get(y as usize * VRAM_WIDTH + x as usize).copied()?;
+        if idx == u32::MAX {
+            return None;
+        }
+        self.cmd_log.get(idx as usize)
     }
 
     /// Read one 24-bit display pixel. VRAM bytes are packed: pixel
@@ -807,6 +880,20 @@ impl Gpu {
     /// and drawing-offset because the rasterizer needs them.
     fn execute_gp0_single(&mut self, word: u32) {
         let op = (word >> 24) & 0xFF;
+        // Pixel tracer also wants to see state-modifying single-word
+        // packets (0xE1..=0xE6 draw-mode / tex-window / draw-area /
+        // draw-offset / mask). These don't plot pixels but they shift
+        // the state that subsequent draws interpret — useful to see
+        // in the log when chasing a parity divergence.
+        if self.pixel_owner.is_some() {
+            let index = self.cmd_log.len() as u32;
+            self.current_cmd_index = index;
+            self.cmd_log.push(GpuCmdLogEntry {
+                index,
+                opcode: op as u8,
+                fifo: vec![word],
+            });
+        }
         match op {
             // GP0 0xE3 — drawing area top-left. X bits 9:0, Y bits 18:10.
             0xE3 => {
@@ -904,6 +991,19 @@ impl Gpu {
         let op = (self.gp0_fifo[0] >> 24) & 0xFF;
         self.gp0_opcode_hist[op as usize] =
             self.gp0_opcode_hist[op as usize].saturating_add(1);
+        // If the pixel tracer is armed, stamp this packet into the
+        // command log *before* dispatching — `plot_pixel` uses
+        // `current_cmd_index` to tag every write, so it must point
+        // at the index of the entry we're about to push.
+        if self.pixel_owner.is_some() {
+            let index = self.cmd_log.len() as u32;
+            self.current_cmd_index = index;
+            self.cmd_log.push(GpuCmdLogEntry {
+                index,
+                opcode: op as u8,
+                fifo: self.gp0_fifo.clone(),
+            });
+        }
         match op {
             // Monochrome fill rect (ignores draw area / offset).
             0x02 => self.fill_rect(),
@@ -1613,6 +1713,13 @@ impl Gpu {
             pixel |= 0x8000;
         }
         self.vram.set_pixel(x, y, pixel);
+        // Stamp ownership for the pixel tracer if enabled. We hit
+        // this every time a primitive writes a pixel, but the cost
+        // is a single array write behind an Option check — cheap
+        // enough to keep on even in release diagnostic builds.
+        if let Some(ref mut owner) = self.pixel_owner {
+            owner[y as usize * VRAM_WIDTH + x as usize] = self.current_cmd_index;
+        }
     }
 
     /// Rasterize a textured triangle — same edge-function test as the
