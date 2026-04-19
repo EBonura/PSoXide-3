@@ -381,17 +381,17 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-input" => Some(SdkGolden {
             example: "hello-input",
             vblanks: 4,
-            // Refreshed 2026-04-19-f after factoring the codepoint
-            // lookup into `FontAtlas::glyph_uv`. VRAM + display
-            // hashes stayed identical (the rendered pixels are
-            // unchanged), only `final_pc` shifted -8 bytes as the
-            // shared helper let LLVM inline slightly less code.
+            // Refreshed 2026-04-19-g after the `MAX_PACK_HALFWORDS`
+            // bump from 2048 to 8192 (16 KiB upload scratch, needed
+            // for 8×16 / 16×16 fonts). Render output unchanged;
+            // binary layout shifts as the larger stack array moves
+            // register alloc around. Hashes byte-identical.
             vram_hash: 0x82e5_f04a_3f03_a4c4,
             display_hash: 0x7dac_2cef_bc15_db1b,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0b0c,
+            final_pc: 0x8001_0b14,
             redux_display_hash: None,
         }),
         "hello-gte" => Some(SdkGolden {
@@ -433,12 +433,15 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-text" => Some(SdkGolden {
             example: "showcase-text",
             vblanks: 4,
+            // final_pc +4 after the MAX_PACK_HALFWORDS bump —
+            // same reason as hello-input above. VRAM + display
+            // hashes unchanged.
             vram_hash: 0xde61_1495_21fe_4592,
             display_hash: 0x55dc_43d0_b950_5909,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0a24,
+            final_pc: 0x8001_0a28,
             redux_display_hash: None,
         }),
         _ => None,
