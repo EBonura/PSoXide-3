@@ -50,13 +50,17 @@ const GT2_DISC: &str =
 const MGS_DISC: &str =
     "/Users/ebonura/Downloads/ps1 games/Metal Gear Solid (USA) (Disc 1) (Rev 1)/Metal Gear Solid (USA) (Disc 1) (Rev 1).bin";
 const RE2_DISC: &str =
-    "/Users/ebonura/Downloads/ps1 games/Resident Evil 2 - Dual Shock Ver. (USA) (Disc 1)/Resident Evil 2 - Dual Shock Ver. (USA) (Disc 1).bin";
+    "/Users/ebonura/Downloads/ps1 games/Resident Evil 2 - Dual Shock Ver. (USA) (Disc 1)/Resident Evil 2 - Dual Shock Ver. (USA) (Disc 1) (Track 1).bin";
+// The WipEout rips have a quirky double-nested directory layout
+// from their CDRomance source — the inner `(v1.1) (Track 01).bin`
+// is the data track. Keeping the full path here (rather than
+// resolving via `.cue`) because our oracle reads raw BIN.
 const WIPEOUT1_DISC: &str =
-    "/Users/ebonura/Downloads/ps1 games/WipEout (Europe) (v1.1)/WipEout (Europe) (v1.1).bin";
+    "/Users/ebonura/Downloads/ps1 games/WipEout (Europe) (v1.1)/WipEout (Europe) (v1.1)/WipEout (Europe) (v1.1) (Track 01).bin";
 const WIPEOUT2097_DISC: &str =
-    "/Users/ebonura/Downloads/ps1 games/WipEout 2097 (Europe)/WipEout 2097 (Europe).bin";
+    "/Users/ebonura/Downloads/ps1 games/WipEout 2097 (Europe)/WipEout 2097 (Europe)/WipEout 2097 (Europe) (Track 01).bin";
 const WIPEOUT3_DISC: &str =
-    "/Users/ebonura/Downloads/ps1 games/WipEout 3 - Special Edition (Europe) (En,Fr,De,Es,It)/WipEout 3 - Special Edition (Europe) (En,Fr,De,Es,It).bin";
+    "/Users/ebonura/Downloads/ps1 games/WipEout 3 - Special Edition (Europe) (En,Fr,De,Es,It)/WipEout 3 - Special Edition (Europe) (En,Fr,De,Es,It)/WipEout 3 - Special Edition (Europe) (En,Fr,De,Es,It) (Track 01).bin";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
