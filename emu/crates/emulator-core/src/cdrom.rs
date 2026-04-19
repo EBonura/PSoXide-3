@@ -826,13 +826,18 @@ impl CdRom {
 
     fn cmd_test(&mut self, params: &[u8]) {
         // Only Test 0x20 (drive version / BIOS date) is commonly used
-        // by the BIOS. Return the PSX SCPH-5502 canonical 6-byte
-        // response; real responses vary by firmware but the BIOS
-        // doesn't check.
+        // by the BIOS. Must match Redux byte-for-byte — the BIOS's
+        // IRQ handler stores the 4-byte response into a kernel
+        // buffer, and later code paths read those bytes back to
+        // dispatch on firmware version. Parity step 89,184,517
+        // diverged on a byte out of this buffer.
+        //
+        // Redux (cdrom.cc): `Test20[] = {0x98, 0x06, 0x10, 0xC3}`.
+        // Format is YY MM DD VER — 1998-06-10 v0xC3, matching the
+        // SCPH-550x / 700x firmware Redux targets by default.
         match params.first().copied() {
             Some(0x20) => {
-                // 6-byte: YY MM DD VER
-                self.schedule_first_response(vec![0x94, 0x09, 0x19, 0xC0]);
+                self.schedule_first_response(vec![0x98, 0x06, 0x10, 0xC3]);
             }
             _ => self.cmd_getstat(),
         }
