@@ -208,24 +208,21 @@ impl AppState {
             current_game: None,
             status_message: None,
         };
-        // First-boot seed: if the library cache has no SDK-built
-        // homebrew but the auto-detected SDK-examples dir exists
-        // and contains .exe files, run a silent rescan so the
-        // Examples column populates without requiring the user to
-        // hit Refresh. Failure is non-fatal — we just skip the
-        // auto-scan and the UI shows "No homebrew EXEs found" the
-        // way it did before.
-        let has_cached_exe = out
-            .library
-            .entries
-            .iter()
-            .any(|e| e.kind == GameKind::Exe);
-        if !has_cached_exe {
-            if let Some(sdk_dir) = out.resolve_sdk_examples_dir() {
-                if sdk_dir.exists() {
-                    if let Err(e) = out.rescan_library() {
-                        eprintln!("[frontend] startup auto-rescan skipped: {e}");
-                    }
+        // Startup auto-rescan: always run when the SDK-examples dir
+        // exists so stale `library.ron` entries (e.g. cargo
+        // `deps/<name>-<hash>.exe` intermediates picked up by an
+        // earlier version of the scanner before the deps/ filter
+        // landed) get purged. `scan_roots` is mtime-cached for
+        // already-seen files, so the cost is bounded by
+        // "number of files that changed since last scan" — cheap
+        // on every boot.
+        //
+        // Scoped to "SDK dir exists" so an end-user install without
+        // the MIPS toolchain doesn't pay the cost every startup.
+        if let Some(sdk_dir) = out.resolve_sdk_examples_dir() {
+            if sdk_dir.exists() {
+                if let Err(e) = out.rescan_library() {
+                    eprintln!("[frontend] startup auto-rescan skipped: {e}");
                 }
             }
         }
@@ -263,9 +260,18 @@ impl AppState {
                 let exe = Exe::parse(&bytes).map_err(|e| format!("parse EXE: {e:?}"))?;
                 bus.load_exe_payload(exe.load_addr, &exe.payload);
                 cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
-                if self.settings.emulator.hle_bios_for_side_load {
-                    bus.enable_hle_bios();
-                }
+                // HLE BIOS is effectively mandatory for side-loaded
+                // EXEs: the kernel's syscall tables (A0 / B0 / C0)
+                // + cold-init state aren't populated when we jump
+                // straight to the EXE entry instead of the reset
+                // vector. Previously gated on
+                // `settings.emulator.hle_bios_for_side_load` — the
+                // gate stayed on `false` (derived Default) for
+                // users with a pre-existing settings.ron, which
+                // made EXEs launched from the XMB render blank
+                // while the env-var path `PSOXIDE_EXE=…` (HLE
+                // unconditional) worked. Both paths now match.
+                bus.enable_hle_bios();
                 bus.attach_digital_pad_port1();
             }
             GameKind::DiscBin | GameKind::DiscIso => {
