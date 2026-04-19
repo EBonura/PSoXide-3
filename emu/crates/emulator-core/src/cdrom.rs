@@ -157,22 +157,15 @@ const CD_READ_TIME: u64 = 451_584;
 // mode byte via [`CdRom::sector_read_cycles`]: double-speed =
 // `CD_READ_TIME`, single-speed = `CD_READ_TIME * 2`.
 
-/// A deferred response: when `bus.cycles` passes `deadline`, the
-/// event's bytes land in the response FIFO and its IRQ type fires.
-///
-/// `deadline` has two interpretations depending on `rebased`:
-/// - `rebased=false` → deadline is a *relative offset in cycles*
-///   from the moment [`tick`] first sees the event. `tick` rebases
-///   it to an absolute cycle and sets `rebased=true`.
-/// - `rebased=true` → deadline is an absolute bus-cycle count.
-///
-/// Encoding relative-vs-absolute explicitly (instead of relying on
-/// comparing against `cycles_now`) avoids a re-rebase ambiguity
-/// when an event is re-queued due to IRQ-flag collision.
+/// A deferred response: when `bus.cycles` passes `deadline` (an
+/// absolute bus-cycle count), the event's bytes land in the response
+/// FIFO and its IRQ type fires. Scheduler helpers compute the
+/// absolute deadline at issue time from `scheduling_cycle` threaded
+/// through [`CdRom::write8_at`]; matches Redux's `AddIrqQueue` which
+/// anchors on `m_regs.cycle` at the command-port write.
 #[derive(Debug, Clone)]
 struct PendingEvent {
     deadline: u64,
-    rebased: bool,
     irq: IrqType,
     bytes: Vec<u8>,
 }
@@ -228,6 +221,12 @@ pub struct CdRom {
     /// it's stuck, the BIOS's read path is blocked on something
     /// we're not signalling (BFRD / request-register / IRQ ack).
     data_fifo_pops: u64,
+    /// Bus cycle at which the currently-dispatching command was
+    /// received. `queue_command` stashes the caller-supplied `now`
+    /// here so `schedule_*_response` helpers can compute absolute
+    /// deadlines without threading `now` through every command
+    /// handler.
+    scheduling_cycle: u64,
     /// Loaded disc image, if any. When `Some`, `disc_present` is also
     /// true and GetID / ReadN follow the disc-present paths; when
     /// `None`, they fall back to the "please insert disc" path.
@@ -290,6 +289,7 @@ impl CdRom {
             command_hist: [0; 32],
             last_command: 0,
             data_fifo_pops: 0,
+            scheduling_cycle: 0,
             disc: None,
             data_fifo: VecDeque::new(),
             reading: false,
@@ -374,12 +374,28 @@ impl CdRom {
 
     /// 8-bit write through the index-selected register at `phys`.
     pub fn write8(&mut self, phys: u32, value: u8) {
+        // Back-compat shim: tests that aren't cycle-aware call this
+        // variant. For parity-correct scheduling, the bus uses
+        // `write8_at` instead so command-port writes carry the
+        // current bus cycle through to the CDROM scheduler.
+        self.write8_at(phys, value, 0);
+    }
+
+    /// Like [`write8`], but threads the bus cycle through so
+    /// `queue_command` can schedule first/second responses with
+    /// absolute deadlines anchored on issue time. Matches Redux's
+    /// `AddIrqQueue(cmd, delay)` which anchors on `m_regs.cycle` at
+    /// the cmd-port write. The previous "relative then rebase on
+    /// next tick" scheme lost the BIAS + memory-access cycles of
+    /// the SB that issued the command — surfaced as a 5-cycle late
+    /// IRQ dispatch at parity step 89,198,894.
+    pub fn write8_at(&mut self, phys: u32, value: u8, now: u64) {
         let offset = (phys - BASE) as u8;
         match (offset, self.index) {
             // 0x1F80_1800 write — set the index.
             (0, _) => self.index = value & status_bit::INDEX_MASK,
             // 0x1F80_1801 idx=0 — command register. Queue for 6b.
-            (1, 0) => self.queue_command(value),
+            (1, 0) => self.queue_command(value, now),
             // 0x1F80_1801 idx=1/2/3 — audio sound-map / CD-to-SPU
             // volume. Accepted for now; XA audio arrives in 6f.
             (1, _) => {}
@@ -449,12 +465,17 @@ impl CdRom {
     /// A handful of commands use the parameter FIFO for arguments
     /// (SetLoc MSF, SetMode, Test sub-op). The parameters are drained
     /// inline by the handler.
-    fn queue_command(&mut self, command: u8) {
+    fn queue_command(&mut self, command: u8, now: u64) {
         self.commands_dispatched += 1;
         self.last_command = command;
         if (command as usize) < self.command_hist.len() {
             self.command_hist[command as usize] += 1;
         }
+        // Stash the issue-time cycle so each `schedule_*_response`
+        // call below resolves its absolute deadline against the
+        // right anchor, without threading `now` through every
+        // command handler's signature.
+        self.scheduling_cycle = now;
 
         // Drain parameters into a local vec — handlers need them and
         // pop-order matches push-order.
@@ -505,18 +526,13 @@ impl CdRom {
 
     // --- Command handlers ---
 
-    /// Schedule a first-response IRQ containing the given bytes, at
-    /// now + `FIRST_RESPONSE_CYCLES`. Used by almost every command's
-    /// acknowledge path.
-    ///
-    /// Deadlines are stored as "relative cycles from scheduling time"
-    /// and rebased into absolute bus cycles by the next [`tick`] call
-    /// (which is the first place we know `now`). Sentinel `u64::MAX`
-    /// means "already absolute, do not rebase."
+    /// Schedule a first-response IRQ at
+    /// `scheduling_cycle + FIRST_RESPONSE_CYCLES` (absolute). Matches
+    /// Redux's `AddIrqQueue` which anchors on `m_regs.cycle` at the
+    /// moment of the cmd-port write.
     fn schedule_first_response(&mut self, bytes: Vec<u8>) {
         self.pending.push_back(PendingEvent {
-            deadline: FIRST_RESPONSE_CYCLES,
-            rebased: false,
+            deadline: self.scheduling_cycle.saturating_add(FIRST_RESPONSE_CYCLES),
             irq: IrqType::Acknowledge,
             bytes,
         });
@@ -525,16 +541,12 @@ impl CdRom {
     /// Schedule a second-response IRQ. `additional_delay` is time
     /// *after* the first response — so the actual cycle delta from
     /// command issue is `FIRST_RESPONSE_CYCLES + additional_delay`.
-    /// This matters: if you pass a small delay here without adding
-    /// the first-response time, the second response fires BEFORE the
-    /// first, and the BIOS sees an INT2 (Complete) with 8 data bytes
-    /// before its expected INT3 (Acknowledge) — breaking the
-    /// command-response chain completely and stranding the boot in
-    /// the shell.
     fn schedule_second_response(&mut self, bytes: Vec<u8>, additional_delay: u64) {
         self.pending.push_back(PendingEvent {
-            deadline: FIRST_RESPONSE_CYCLES.saturating_add(additional_delay),
-            rebased: false,
+            deadline: self
+                .scheduling_cycle
+                .saturating_add(FIRST_RESPONSE_CYCLES)
+                .saturating_add(additional_delay),
             irq: IrqType::Complete,
             bytes,
         });
@@ -542,13 +554,13 @@ impl CdRom {
 
     /// Like [`schedule_second_response`] but the IRQ type is Error
     /// (INT5). Used for the second reply of commands that fail because
-    /// the disc isn't present — the first reply is still an ack (INT3)
-    /// so the BIOS can distinguish "command received" from "command
-    /// completed with error".
+    /// the disc isn't present.
     fn schedule_second_error(&mut self, bytes: Vec<u8>, additional_delay: u64) {
         self.pending.push_back(PendingEvent {
-            deadline: FIRST_RESPONSE_CYCLES.saturating_add(additional_delay),
-            rebased: false,
+            deadline: self
+                .scheduling_cycle
+                .saturating_add(FIRST_RESPONSE_CYCLES)
+                .saturating_add(additional_delay),
             irq: IrqType::Error,
             bytes,
         });
@@ -556,8 +568,7 @@ impl CdRom {
 
     fn schedule_error_response(&mut self, bytes: Vec<u8>) {
         self.pending.push_back(PendingEvent {
-            deadline: FIRST_RESPONSE_CYCLES,
-            rebased: false,
+            deadline: self.scheduling_cycle.saturating_add(FIRST_RESPONSE_CYCLES),
             irq: IrqType::Error,
             bytes,
         });
@@ -675,11 +686,20 @@ impl CdRom {
     /// Enqueue the next DataReady event for the in-flight read. The
     /// event carries a single stat byte; the actual sector data is
     /// copied into `data_fifo` when the event fires (in `tick`).
+    ///
+    /// Called from `cmd_read` (where `scheduling_cycle` is fresh).
+    /// `tick` chains further sectors via `schedule_sector_event_at`
+    /// so each DataReady is anchored on the event's firing cycle,
+    /// not the original `cmd_read` cycle.
     fn schedule_sector_event(&mut self) {
+        let base = self.scheduling_cycle;
+        self.schedule_sector_event_at(base);
+    }
+
+    fn schedule_sector_event_at(&mut self, base_cycle: u64) {
         let stat = self.stat_byte() | drive_status_bit::READING;
         self.pending.push_back(PendingEvent {
-            deadline: self.sector_read_cycles(),
-            rebased: false,
+            deadline: base_cycle.saturating_add(self.sector_read_cycles()),
             irq: IrqType::DataReady,
             bytes: vec![stat],
         });
@@ -879,14 +899,6 @@ impl CdRom {
     /// clear — the caller (Bus) uses that to poke `IrqSource::Cdrom`.
     pub fn tick(&mut self, cycles_now: u64) -> bool {
         let mut raised = false;
-        // Rebase newly-scheduled events from relative cycles into
-        // absolute bus-cycle deadlines. See `PendingEvent::rebased`.
-        for ev in self.pending.iter_mut() {
-            if !ev.rebased {
-                ev.deadline = cycles_now.saturating_add(ev.deadline);
-                ev.rebased = true;
-            }
-        }
 
         while let Some(front) = self.pending.front() {
             if front.deadline > cycles_now {
@@ -899,10 +911,7 @@ impl CdRom {
             // hardware, Pause/Init kills in-flight sector reads;
             // letting a stale DataReady fire would clobber the
             // data FIFO that software was about to drain, or
-            // deliver the wrong LBA entirely (we were burning
-            // hours on exactly this, LBA 17's volume-descriptor
-            // terminator landing in the slot where the BIOS
-            // expected its PVD).
+            // deliver the wrong LBA entirely.
             if ev.irq == IrqType::DataReady && !self.reading {
                 continue;
             }
@@ -912,26 +921,16 @@ impl CdRom {
                     self.responses.push_back(b);
                 }
             }
-            // DataReady events drive the sector-stream — load the next
-            // sector's payload into the data FIFO as the event fires,
-            // and chain the subsequent DataReady while we're still
-            // reading.
+            // DataReady events drive the sector-stream — load the
+            // next sector's payload into the data FIFO as the event
+            // fires, and chain the subsequent DataReady (anchored on
+            // `cycles_now` so the next sector fires
+            // `sector_read_cycles` after the PREVIOUS one, not from
+            // the ancient `cmd_read` issue time).
             if ev.irq == IrqType::DataReady {
                 self.load_next_sector();
                 if self.reading {
-                    self.schedule_sector_event();
-                    // The event we just pushed has a *relative*
-                    // deadline; promote it to absolute here since we
-                    // already know `cycles_now`. (The per-event
-                    // `rebased` flag would handle this on the next
-                    // tick, but doing it inline avoids the DataReady
-                    // chain firing twice in a single tick when
-                    // SECTOR_READ_CYCLES is small.)
-                    let delay = self.sector_read_cycles();
-                    if let Some(last) = self.pending.back_mut() {
-                        last.deadline = cycles_now.saturating_add(delay);
-                        last.rebased = true;
-                    }
+                    self.schedule_sector_event_at(cycles_now);
                 }
             }
             // Only fire IRQ if none is currently pending — hardware
@@ -940,12 +939,10 @@ impl CdRom {
                 self.irq_flag = ev.irq as u8;
                 raised = true;
             } else {
-                // Re-enqueue at the front with a tiny delay; the BIOS
-                // will ack eventually. The deadline we set here is
-                // already absolute, so mark rebased.
+                // Re-enqueue at the front with a tiny delay; the
+                // BIOS will ack eventually.
                 let mut re = ev;
                 re.deadline = cycles_now + FIRST_RESPONSE_CYCLES / 10;
-                re.rebased = true;
                 self.pending.push_front(re);
                 break;
             }

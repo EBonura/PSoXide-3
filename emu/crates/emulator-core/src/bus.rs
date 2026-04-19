@@ -1601,7 +1601,10 @@ impl Bus {
         // silently dropped, no IRQ ever fires, and the BIOS stalls in the
         // event-wait loop after the Sony intro.
         if CdRom::contains(phys) {
-            self.cdrom.write8(phys, value);
+            // Thread `self.cycles` through so the CDROM scheduler
+            // anchors response-IRQ deadlines on the exact cycle at
+            // the cmd-port write, matching Redux's `AddIrqQueue`.
+            self.cdrom.write8_at(phys, value, self.cycles);
             return;
         }
         if Sio0::contains(phys) {
