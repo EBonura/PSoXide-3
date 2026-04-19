@@ -392,12 +392,18 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-gte" => Some(SdkGolden {
             example: "hello-gte",
             vblanks: 2,
-            vram_hash: 0x7f8a_da39_13fa_2325,
-            display_hash: 0x76ac_e489_eb6d_0325,
+            // Captured 2026-04-19-c after the cube-draws-as-lines
+            // fix: edges now drawn via GP0 0x40 (real diagonal line
+            // rasteriser) instead of `fill_rect` + 2×2 staircase.
+            // Previous golden was pinning the 16-pixel-aligned noise
+            // fill_rect produced — garbage output that happened to
+            // be deterministic.
+            vram_hash: 0x019e_81dc_704c_7e7b,
+            display_hash: 0xe749_8488_bb15_9e7b,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_07c8,
+            final_pc: 0x8001_0a30,
             redux_display_hash: None,
         }),
         "showcase-textured-sprite" => Some(SdkGolden {

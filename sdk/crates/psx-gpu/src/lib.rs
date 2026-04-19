@@ -155,6 +155,37 @@ pub fn draw_tri_gouraud(verts: [(i16, i16); 3], colors: [(u8, u8, u8); 3]) {
     write_gp0(pack_vertex(verts[2].0, verts[2].1));
 }
 
+/// Draw a single monochrome line from `(x0, y0)` to `(x1, y1)`
+/// via GP0 0x40 (single mono line, 3 words). The GPU's line
+/// rasteriser handles diagonal paths correctly — unlike building
+/// a line out of `fill_rect` calls, which the PSX fill-rect
+/// primitive (GP0 0x02) rounds to 16-pixel X boundaries and
+/// produces blocky staircase output.
+///
+/// Packet: `[cmd+color, v0, v1]`.
+pub fn draw_line_mono(x0: i16, y0: i16, x1: i16, y1: i16, r: u8, g: u8, b: u8) {
+    wait_cmd_ready();
+    // 0x40 = single mono line, opaque. Color in the low 24 bits
+    // of the first word (same as other monochrome primitives).
+    write_gp0(0x4000_0000 | pack_color(r, g, b));
+    write_gp0(pack_vertex(x0, y0));
+    write_gp0(pack_vertex(x1, y1));
+}
+
+/// Draw a Gouraud-shaded line from `(x0, y0, c0)` to `(x1, y1, c1)`.
+/// The GPU interpolates RGB across the segment. Packet (GP0 0x50,
+/// 4 words): `[cmd+c0, v0, c1, v1]`.
+pub fn draw_line_gouraud(
+    x0: i16, y0: i16, c0: (u8, u8, u8),
+    x1: i16, y1: i16, c1: (u8, u8, u8),
+) {
+    wait_cmd_ready();
+    write_gp0(0x5000_0000 | pack_color(c0.0, c0.1, c0.2));
+    write_gp0(pack_vertex(x0, y0));
+    write_gp0(pack_color(c1.0, c1.1, c1.2));
+    write_gp0(pack_vertex(x1, y1));
+}
+
 /// Draw a flat-shaded quad (two triangles sharing the v1-v2 edge).
 pub fn draw_quad_flat(verts: [(i16, i16); 4], r: u8, g: u8, b: u8) {
     wait_cmd_ready();
