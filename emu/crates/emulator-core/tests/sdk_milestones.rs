@@ -337,93 +337,76 @@ fn print_capture(state: &SdkExampleState, example: &str, vblanks: u64) {
 /// test with panic output and pasting the new literal.
 fn golden_for(example: &str) -> Option<SdkGolden> {
     match example {
+        // All examples refreshed 2026-04-19-j for the "every
+        // example is double-buffered" pass. Display hashes shift
+        // because the displayed buffer alternates A/B per frame
+        // now — the capture grabs whichever is currently on
+        // display. Render output visually identical to the
+        // single-buffered goldens.
         "hello-tri" => Some(SdkGolden {
             example: "hello-tri",
             vblanks: 2,
-            vram_hash: 0x6c0e_8b93_a400_5724,
-            display_hash: 0x29dd_3c79_8152_b324,
+            vram_hash: 0xb872_c8b3_8b8e_f208,
+            display_hash: 0x1d9b_e70c_acb5_0241,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_0400,
+            final_pc: 0x8001_0470,
             redux_display_hash: None,
         }),
         "hello-tex" => Some(SdkGolden {
             example: "hello-tex",
             vblanks: 2,
-            // VRAM + display bytes are identical to the pre-refactor
-            // values (the `rgb5(31,16,4)` / `rgb5(4,24,28)` calls
-            // emit the same 5-bit pixels the hand-math used).
-            vram_hash: 0x5256_9600_727a_9f25,
-            display_hash: 0xfffc_c5ce_2a8d_0225,
+            vram_hash: 0x7804_338e_66fb_9425,
+            display_hash: 0x09ee_8c6c_72b2_f825,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            // Refreshed 2026-04-19-b after the `psx-vram` refactor.
-            // Binary layout shifted — different final instruction
-            // address at the 2-VBlank checkpoint. Render output
-            // unchanged (hashes above are byte-identical to pre-
-            // refactor).
-            final_pc: 0x8001_03ac,
+            final_pc: 0x8001_041c,
             redux_display_hash: None,
         }),
         "hello-ot" => Some(SdkGolden {
             example: "hello-ot",
             vblanks: 2,
-            vram_hash: 0x1ce1_429a_eeeb_68ec,
-            display_hash: 0xf1d4_4ba6_1e83_e0ec,
+            vram_hash: 0x1221_829d_adad_9c40,
+            display_hash: 0x6a96_cd01_9d5b_98b9,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_04e0,
+            final_pc: 0x8001_0548,
             redux_display_hash: None,
         }),
         "hello-input" => Some(SdkGolden {
             example: "hello-input",
             vblanks: 4,
-            // Refreshed 2026-04-19-g after the `MAX_PACK_HALFWORDS`
-            // bump from 2048 to 8192 (16 KiB upload scratch, needed
-            // for 8×16 / 16×16 fonts). Render output unchanged;
-            // binary layout shifts as the larger stack array moves
-            // register alloc around. Hashes byte-identical.
-            vram_hash: 0x82e5_f04a_3f03_a4c4,
+            vram_hash: 0xcb9c_cb9f_9940_820a,
             display_hash: 0x7dac_2cef_bc15_db1b,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0b14,
+            final_pc: 0x8001_0b90,
             redux_display_hash: None,
         }),
         "hello-gte" => Some(SdkGolden {
             example: "hello-gte",
             vblanks: 2,
-            // Refreshed 2026-04-19-d after the MFC2/CFC2 load-delay
-            // fix in `psx-gte::regs`. Previous goldens pinned the
-            // pre-fix output where `scene::project_vertex` returned
-            // the STALE $8 register value (whatever was written by
-            // the preceding MTC2) instead of the coprocessor result
-            // — visually that produced an entirely blank frame since
-            // the resulting "screen coords" were the raw vertex
-            // XY/Z bits (e.g. (-2048, -1)), clipped off-screen.
-            // The new golden captures a real wireframe cube with
-            // 12 visible edges tumbling on the blue background.
-            vram_hash: 0xfe80_941e_838f_6e81,
-            display_hash: 0x3bd7_90b1_1224_0a81,
+            vram_hash: 0x13bd_5425_2a05_0149,
+            display_hash: 0x579e_bb71_f21c_fd8d,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_0a68,
+            final_pc: 0x8001_0ae0,
             redux_display_hash: None,
         }),
         "showcase-textured-sprite" => Some(SdkGolden {
             example: "showcase-textured-sprite",
             vblanks: 3,
-            vram_hash: 0x7e78_155a_0f2b_da99,
-            display_hash: 0x50ad_9226_b84a_64ad,
+            vram_hash: 0xa521_4f52_d0cd_b221,
+            display_hash: 0x37bd_e306_ae08_a28d,
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
-            final_pc: 0x8001_04fc,
+            final_pc: 0x8001_055c,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:
@@ -433,15 +416,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-text" => Some(SdkGolden {
             example: "showcase-text",
             vblanks: 4,
-            // Refreshed 2026-04-19-i after adding a second font
-            // atlas (`BASIC_8X16`) and re-laying-out the demo to
-            // use it for the title / rotation / affine sections.
-            // The 8×8 atlas still powers the size ladder, tint
-            // palette, gradient row, and footer. Two atlases live
-            // at separate tpages (320, 0, Bit4) and (384, 0,
-            // Bit4); CLUTs at (320, 256) and (384, 256).
-            vram_hash: 0x0b58_eb3a_1e82_000b,
-            display_hash: 0x5dda_be7d_5429_569c,
+            vram_hash: 0x6d07_cc0c_c747_9433,
+            display_hash: 0x6bf5_0168_dd6e_c8ff,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,

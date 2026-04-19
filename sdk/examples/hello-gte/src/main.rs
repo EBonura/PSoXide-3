@@ -17,7 +17,7 @@
 
 extern crate psx_rt;
 
-use psx_gpu::{self as gpu, Resolution, VideoMode};
+use psx_gpu::{self as gpu, Resolution, VideoMode, framebuf::FrameBuffer};
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene;
 use psx_rt::tty;
@@ -54,6 +54,9 @@ fn main() {
     tty::println("hello-gte: booted");
 
     gpu::init(VideoMode::Ntsc, Resolution::R320X240);
+    // Double-buffer: tear-free cube spinning, even under the
+    // mono-line rasteriser's per-pixel cost.
+    let mut fb = FrameBuffer::new(320, 240);
     gpu::set_draw_area(0, 0, 319, 239);
     gpu::set_draw_offset(0, 0);
 
@@ -67,7 +70,7 @@ fn main() {
 
     let mut frame: u16 = 0;
     loop {
-        gpu::fill_rect(0, 0, 320, 240, 0, 0, 32);
+        fb.clear(0, 0, 32);
 
         // Compose yaw × pitch on the CPU, upload once to GTE R0..R4.
         let yaw = Mat3I16::rotate_y(frame.wrapping_mul(YAW_STEP));
@@ -98,6 +101,7 @@ fn main() {
 
         gpu::draw_sync();
         gpu::vsync();
+        fb.swap();
         frame = frame.wrapping_add(1);
     }
 }

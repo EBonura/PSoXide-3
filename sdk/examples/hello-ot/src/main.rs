@@ -18,6 +18,7 @@
 
 extern crate psx_rt;
 
+use psx_gpu::framebuf::FrameBuffer;
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::TriGouraud;
 use psx_gpu::{self as gpu, Resolution, VideoMode};
@@ -58,6 +59,7 @@ static mut TRIS: [TriGouraud; 3] = [
 #[no_mangle]
 fn main() {
     gpu::init(VideoMode::Ntsc, Resolution::R320X240);
+    let mut fb = FrameBuffer::new(320, 240);
     gpu::set_draw_area(0, 0, 319, 239);
     gpu::set_draw_offset(0, 0);
 
@@ -66,7 +68,9 @@ fn main() {
         let t = frame as i16;
 
         // Three overlapping triangles at different depth slots.
-        // Slot 0 = back, slot 15 = front.
+        // Slot 0 = back, slot 15 = front. Vertex coordinates are
+        // in draw-offset-relative space, which `FrameBuffer::swap`
+        // keeps pointing at the current back buffer for us.
         let red = TriGouraud::new(
             [(80 + (t % 40), 60), (40, 160), (200, 160)],
             [(220, 80, 80), (80, 220, 80), (80, 80, 220)],
@@ -92,11 +96,12 @@ fn main() {
             OT.add(8, &mut TRIS[1], TriGouraud::WORDS);
             OT.add(6, &mut TRIS[2], TriGouraud::WORDS);
 
-            gpu::fill_rect(0, 0, 320, 240, 0, 0, 48);
+            fb.clear(0, 0, 48);
             OT.submit();
         }
 
         gpu::vsync();
+        fb.swap();
         frame = frame.wrapping_add(1);
     }
 }

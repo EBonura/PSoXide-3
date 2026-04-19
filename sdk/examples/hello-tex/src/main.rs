@@ -20,7 +20,7 @@
 
 extern crate psx_rt;
 
-use psx_gpu::{self as gpu, Resolution, VideoMode};
+use psx_gpu::{self as gpu, Resolution, VideoMode, framebuf::FrameBuffer};
 use psx_hw::gpu::{pack_color, pack_texcoord, pack_vertex, pack_xy};
 use psx_io::gpu::{wait_cmd_ready, write_gp0};
 use psx_vram::{Color555, Tpage, TexDepth, VramRect, upload_15bpp};
@@ -42,6 +42,9 @@ const TEX_RECT: VramRect = VramRect::new(
 #[no_mangle]
 fn main() {
     gpu::init(VideoMode::Ntsc, Resolution::R320X240);
+    // Double-buffer display. Texture at (640, 0) is well clear of
+    // both buffer A (0..320, 0..240) and buffer B (0..320, 240..480).
+    let mut fb = FrameBuffer::new(320, 240);
     gpu::set_draw_area(0, 0, 319, 239);
     gpu::set_draw_offset(0, 0);
 
@@ -70,7 +73,7 @@ fn main() {
 
     let mut frame: u16 = 0;
     loop {
-        gpu::fill_rect(0, 0, 320, 240, 16, 16, 32);
+        fb.clear(16, 16, 32);
 
         // Bouncing motion across the visible area.
         let t = frame as i16;
@@ -80,6 +83,7 @@ fn main() {
 
         gpu::draw_sync();
         gpu::vsync();
+        fb.swap();
         frame = frame.wrapping_add(1);
     }
 }

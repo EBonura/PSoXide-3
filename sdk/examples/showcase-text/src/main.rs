@@ -166,17 +166,27 @@ fn tint_palette(font: &FontAtlas) {
 /// Section 5: five gradient variations side-by-side. Each shows a
 /// different top/bottom tint pair, revealing how the gouraud-
 /// textured quad path interpolates vertically.
+///
+/// **Tint design note.** PSX tint math is `output = texel * tint /
+/// 128`. Any channel with `tint >= 128` and a pure-white texel
+/// saturates to max — so if all three top channels are ≥ 128, the
+/// top of the glyph reads as near-white regardless of hue intent.
+/// To keep every gradient visibly coloured top AND bottom, we
+/// drop at least one channel below 128 on each tier. FIRE's top
+/// (255, 120, 20) shows orange because G and B don't clamp; ICE's
+/// (80, 200, 255) shows cyan because R is low; and so on.
 fn gradient_varieties(font: &FontAtlas) {
-    // Fire: bright yellow → deep red (classic)
-    font.draw_text_gradient(8, 116, "FIRE", (255, 240, 100), (180, 30, 20));
-    // Ice: white → blue (cool chromatic)
-    font.draw_text_gradient(64, 116, "ICE", (240, 240, 255), (60, 100, 220));
-    // Toxic: lime → dark green (poison/radioactive)
+    // Fire: saturated orange → deep red.
+    font.draw_text_gradient(8, 116, "FIRE", (255, 120, 20), (200, 20, 10));
+    // Ice: bright cyan → deep blue.
+    font.draw_text_gradient(64, 116, "ICE", (80, 200, 255), (20, 40, 180));
+    // Toxic: lime → dark green (poison/radioactive). The reference
+    // gradient — both top and bottom have clearly-dominant green.
     font.draw_text_gradient(104, 116, "TOXIC", (180, 255, 80), (30, 100, 20));
-    // Royal: gold → purple (richness)
-    font.draw_text_gradient(160, 116, "ROYAL", (255, 220, 120), (100, 40, 160));
-    // Sunset: pink → navy (dusk sky)
-    font.draw_text_gradient(216, 116, "SUNSET", (255, 160, 160), (60, 40, 120));
+    // Royal: gold → violet.
+    font.draw_text_gradient(160, 116, "ROYAL", (255, 100, 20), (80, 20, 200));
+    // Sunset: coral pink → dusk navy.
+    font.draw_text_gradient(216, 116, "SUNSET", (255, 100, 120), (60, 20, 120));
 }
 
 /// Section 6: rotating "SPIN!" around a left-side pivot in the
