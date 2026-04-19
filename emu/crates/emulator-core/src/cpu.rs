@@ -370,6 +370,19 @@ impl Cpu {
         // record still shows the regular instruction at this step, and
         // the interrupt-vector PC shows up at the *next* step — exactly
         // how Redux's trace reads.
+        //
+        // But BEFORE that IRQ check: drain scheduler events against
+        // the POST-opcode cycle count. Otherwise peripheral events
+        // whose deadline falls during this instruction's memory-
+        // access cycles (BIAS passed them, but `add_cycles` did not)
+        // don't raise their IRQ bit in time for this step's check,
+        // and the IRQ only dispatches at the NEXT delay slot — a
+        // consistent 5-6 instruction delay that compounds into the
+        // Crash 900M -6% drift. Redux's `branchTest` calls
+        // `counters->update()` inline for the same reason.
+        if in_delay_slot {
+            bus.drain_scheduler_events_post_op();
+        }
         if in_delay_slot && self.should_take_interrupt(bus) {
             self.should_take_interrupt_steps =
                 self.should_take_interrupt_steps.saturating_add(1);

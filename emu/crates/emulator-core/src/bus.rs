@@ -450,6 +450,20 @@ impl Bus {
         }
     }
 
+    /// Public entry point that the CPU calls between the opcode's
+    /// `add_cycles` (memory-access charges) and the delay-slot IRQ
+    /// check. Ensures any scheduler event whose target was crossed
+    /// DURING the opcode (not just at the BIAS tick that starts the
+    /// instruction) raises its IRQ bit in time for the same step's
+    /// exception dispatch. Redux achieves the same effect via
+    /// `branchTest` → `counters->update()`.
+    pub fn drain_scheduler_events_post_op(&mut self) {
+        self.drain_scheduler_events();
+        if self.cdrom.tick(self.cycles) {
+            self.irq.raise(IrqSource::Cdrom);
+        }
+    }
+
     /// Walk every scheduler slot whose deadline has passed and
     /// dispatch its handler. Mirrors Redux's `branchTest` interrupt
     /// loop (`core/r3000a.cc`), which uses a single 15-slot queue
@@ -699,16 +713,15 @@ impl Bus {
         self.ram[base as usize..base as usize + payload.len()].copy_from_slice(payload);
     }
 
-    /// Run any DMA channels whose start bit was just set.
-    /// - Channel 6 (OTC) fills the ordering table in RAM.
-    /// - Channel 2 (GPU) ships command words from RAM to the GPU's GP0 port.
-    /// - Other channels need their consumer subsystems online first.
-    ///
-    /// After any transfer completes, `IrqSource::Dma` is raised — the
-    /// BIOS's DMA-wait event handlers need this to see completion.
-    /// DICR per-channel / master enable filtering isn't modeled yet;
-    /// the interrupt controller's `I_MASK` is the only gate.
-    fn maybe_run_dma(&mut self) {
+    /// Run DMA on a single channel after its CHCR was just written
+    /// with the start bit set. Mirrors Redux's per-channel
+    /// `dmaExec<N>` dispatch in `psxhw.cc` — each CHCR write goes
+    /// to exactly one channel's handler, NOT a sweep across every
+    /// channel. That distinction matters: if another channel's
+    /// transfer was still in-flight (start bit set, awaiting its
+    /// scheduled completion), a sweep re-runs it and schedules a
+    /// second target that overwrites the first.
+    fn run_dma_channel(&mut self, ch: usize) {
         // Each channel: run the transfer now (so memory / GPU state is
         // up-to-date for any immediate follow-up reads), but defer the
         // CHCR start-bit clear and DMA IRQ raise to the channel's
@@ -719,42 +732,65 @@ impl Bus {
         // handler ~1 hblank early and diverges the trace by dozens of
         // instructions.
         use crate::scheduler::EventSlot;
-        let otc_words = self.dma.run_otc(&mut self.ram[..]);
-        if otc_words > 0 {
-            let target = self.cycles + otc_words as u64;
-            self.log_dma_schedule("GpuOtc", otc_words as u64, target);
-            self.scheduler
-                .schedule(EventSlot::GpuOtcDma, self.cycles, otc_words as u64);
-        }
-        if let Some(gpu_cycles) = self.run_dma_gpu() {
-            let target = self.cycles + gpu_cycles as u64;
-            self.log_dma_schedule("GpuDma", gpu_cycles as u64, target);
-            self.scheduler
-                .schedule(EventSlot::GpuDma, self.cycles, gpu_cycles as u64);
-        }
-        if let Some(cdrom_words) = self.run_dma_cdrom() {
-            let target = self.cycles + cdrom_words as u64;
-            self.log_dma_schedule("CdrDma", cdrom_words as u64, target);
-            self.scheduler
-                .schedule(EventSlot::CdrDma, self.cycles, cdrom_words as u64);
-        }
-        if let Some(spu_words) = self.run_dma_spu() {
-            let target = self.cycles + spu_words as u64;
-            self.log_dma_schedule("SpuDma", spu_words as u64, target);
-            self.scheduler
-                .schedule(EventSlot::SpuDma, self.cycles, spu_words as u64);
-        }
-        if let Some(mdec_words) = self.run_dma_mdec_in() {
-            let target = self.cycles + mdec_words as u64;
-            self.log_dma_schedule("MdecIn", mdec_words as u64, target);
-            self.scheduler
-                .schedule(EventSlot::MdecInDma, self.cycles, mdec_words as u64);
-        }
-        if let Some(mdec_words) = self.run_dma_mdec_out() {
-            let target = self.cycles + mdec_words as u64;
-            self.log_dma_schedule("MdecOut", mdec_words as u64, target);
-            self.scheduler
-                .schedule(EventSlot::MdecOutDma, self.cycles, mdec_words as u64);
+        // Run only the channel whose CHCR was just written.
+        match ch {
+            0 => {
+                if let Some(mdec_words) = self.run_dma_mdec_in() {
+                    let target = self.cycles + mdec_words as u64;
+                    self.log_dma_schedule("MdecIn", mdec_words as u64, target);
+                    self.scheduler
+                        .schedule(EventSlot::MdecInDma, self.cycles, mdec_words as u64);
+                }
+            }
+            1 => {
+                if let Some(mdec_words) = self.run_dma_mdec_out() {
+                    let target = self.cycles + mdec_words as u64;
+                    self.log_dma_schedule("MdecOut", mdec_words as u64, target);
+                    self.scheduler
+                        .schedule(EventSlot::MdecOutDma, self.cycles, mdec_words as u64);
+                }
+            }
+            2 => {
+                if let Some(gpu_cycles) = self.run_dma_gpu() {
+                    let target = self.cycles + gpu_cycles as u64;
+                    self.log_dma_schedule("GpuDma", gpu_cycles as u64, target);
+                    self.scheduler
+                        .schedule(EventSlot::GpuDma, self.cycles, gpu_cycles as u64);
+                }
+            }
+            3 => {
+                if let Some(cdrom_words) = self.run_dma_cdrom() {
+                    let target = self.cycles + cdrom_words as u64;
+                    self.log_dma_schedule("CdrDma", cdrom_words as u64, target);
+                    self.scheduler
+                        .schedule(EventSlot::CdrDma, self.cycles, cdrom_words as u64);
+                }
+            }
+            4 => {
+                if let Some(spu_words) = self.run_dma_spu() {
+                    let target = self.cycles + spu_words as u64;
+                    self.log_dma_schedule("SpuDma", spu_words as u64, target);
+                    self.scheduler
+                        .schedule(EventSlot::SpuDma, self.cycles, spu_words as u64);
+                }
+            }
+            6 => {
+                let otc_words = if self.dma.is_channel_enabled(6) {
+                    self.dma.run_otc(&mut self.ram[..])
+                } else {
+                    0
+                };
+                if otc_words > 0 {
+                    let target = self.cycles + otc_words as u64;
+                    self.log_dma_schedule("GpuOtc", otc_words as u64, target);
+                    self.scheduler
+                        .schedule(EventSlot::GpuOtcDma, self.cycles, otc_words as u64);
+                }
+            }
+            _ => {
+                // Channel 5 (PIO) + invalid indices — skip silently.
+                // Matches Redux's `#if 0` guard that disables PIO DMA.
+            }
         }
     }
 
@@ -786,6 +822,9 @@ impl Bus {
     /// from main RAM to the MDEC's input queue. Sync mode 1 (block)
     /// is the only mode PS1 software uses for this channel.
     fn run_dma_mdec_in(&mut self) -> Option<u32> {
+        if !self.dma.is_channel_enabled(0) {
+            return None;
+        }
         let ch = &self.dma.channels[0];
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
@@ -820,6 +859,9 @@ impl Bus {
     /// decoded pixel words from the MDEC's output queue and writes
     /// them to main RAM at `MADR`.
     fn run_dma_mdec_out(&mut self) -> Option<u32> {
+        if !self.dma.is_channel_enabled(1) {
+            return None;
+        }
         let ch = &self.dma.channels[1];
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
@@ -867,6 +909,9 @@ impl Bus {
     /// cycle (one tick per word transferred, matching Redux's
     /// `scheduleSPUDMAIRQ(size)`).
     fn run_dma_spu(&mut self) -> Option<u32> {
+        if !self.dma.is_channel_enabled(4) {
+            return None;
+        }
         let ch = &self.dma.channels[4];
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
@@ -937,6 +982,9 @@ impl Bus {
     /// wasn't armed. CHCR start/busy bits are NOT cleared here — the
     /// per-channel scheduler does that at the completion cycle.
     fn run_dma_cdrom(&mut self) -> Option<u32> {
+        if !self.dma.is_channel_enabled(3) {
+            return None;
+        }
         let ch = self.dma.channels[3];
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
@@ -1027,6 +1075,9 @@ impl Bus {
     ///   `scheduleGPUDMAIRQ(size)` where size is the
     ///   `gpuDmaChainSize` traversed count.
     fn run_dma_gpu(&mut self) -> Option<u32> {
+        if !self.dma.is_channel_enabled(2) {
+            return None;
+        }
         let ch = &self.dma.channels[2];
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
@@ -1439,19 +1490,29 @@ impl Bus {
         if Dma::contains(phys) {
             self.dma.write32(phys, value);
             // Only a CHCR write with bit 24 set starts a transfer —
-            // matches Redux's `dmaExec` dispatcher in `psxhw.cc`,
-            // which runs ONLY from the `case 0x1f80_1088/98/a8/b8/c8/e8`
-            // (each CHCR register) paths, not from MADR/BCR writes.
-            // Running on every DMA-register write re-entered the same
-            // transfer multiple times (once per MADR+BCR+CHCR) and
-            // pushed the IRQ completion further out each time. See
-            // `probe_dma_schedules` for the diagnosis.
+            // matches Redux's `dmaExec<N>` dispatcher in `psxhw.cc`,
+            // which runs from the per-channel `case 0x1f80_1088/98/
+            // a8/b8/c8/e8` arms. Crucially it runs ONLY channel N,
+            // not a sweep across all channels.
+            //
+            // Earlier we called `maybe_run_dma()` (iterates every
+            // channel) on every CHCR trigger. If another channel's
+            // transfer was still in-flight (start bit still set,
+            // awaiting its scheduled completion), the sweep re-ran
+            // it, scheduling a second completion that overwrote the
+            // first. Example caught by `probe_dma_schedules`:
+            // writing channel 6's CHCR at cycle 46246689 re-ran
+            // channel 2's in-flight DMA, pushing its IRQ target from
+            // 46247457 to 46247720 — which is exactly the -2488-
+            // cycle drift `probe_cycle_first_divergence` flagged at
+            // step 19474544.
             let offset = phys.wrapping_sub(Dma::BASE);
             let field = offset & 0xF;
             let is_chcr_write = field == 0x8;
             let start_bit_set = value & (1 << 24) != 0;
             if is_chcr_write && start_bit_set {
-                self.maybe_run_dma();
+                let channel = ((offset & 0x70) >> 4) as usize;
+                self.run_dma_channel(channel);
             }
             return;
         }

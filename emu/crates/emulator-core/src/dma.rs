@@ -99,6 +99,21 @@ impl Dma {
         (Self::BASE..Self::END).contains(&phys)
     }
 
+    /// `true` when DPCR has channel `ch` enabled. Mirrors Redux's
+    /// `isDMAEnabled<n>()` in `psxmem.h`: the enable bit for
+    /// channel N is DPCR bit `N*4 + 3`. Software writes DPCR to
+    /// selectively enable/disable channels before starting a
+    /// transfer — if the channel is off, the CHCR start-bit write
+    /// MUST NOT kick the DMA. Skipping this check lets Crash's
+    /// intro issue CHCR writes that Redux ignores, producing extra
+    /// DMA completions on our side and a +2488-cycle drift in the
+    /// first fold after the Sony logo.
+    pub fn is_channel_enabled(&self, ch: usize) -> bool {
+        debug_assert!(ch < NUM_CHANNELS);
+        let bit = 1u32 << (ch * 4 + 3);
+        self.dpcr & bit != 0
+    }
+
     /// Read a 32-bit word. `phys` must be inside [`Dma::BASE`]..[`Dma::END`].
     pub fn read32(&self, phys: u32) -> u32 {
         let offset = phys - Self::BASE;
