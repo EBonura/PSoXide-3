@@ -26,20 +26,32 @@
 extern crate psx_rt;
 
 use psx_font::{FontAtlas, fonts::BASIC};
-use psx_gpu::{self as gpu, Resolution, VideoMode};
+use psx_gpu::{self as gpu, Resolution, VideoMode, framebuf::FrameBuffer};
 use psx_vram::{Clut, TexDepth, Tpage};
 
 /// Font atlas tpage. `x=320` (multiple of 64) is the lowest slot
 /// clear of the 320-pixel framebuffer; 4bpp makes the atlas 64
 /// halfwords × 32 halfword rows — sits entirely inside one tpage.
+/// With double-buffering, buffer A lives at (0, 0) and B at (0,
+/// 240) — the atlas at (320, 0..32) is still clear of both.
 const FONT_TPAGE: Tpage = Tpage::new(320, 0, TexDepth::Bit4);
-/// 2-entry CLUT parked at (320, 256) — past the bottom of the
-/// display, X is a multiple of 16, clear of the atlas.
+/// 2-entry CLUT at (320, 256). X is a multiple of 16 ✓, past the
+/// right edge of buffer B (which ends at x=320) ✓.
 const FONT_CLUT: Clut = Clut::new(320, 256);
 
 #[no_mangle]
 fn main() {
     gpu::init(VideoMode::Ntsc, Resolution::R320X240);
+
+    // Double-buffer the display to avoid tearing during the dense
+    // text draw. Buffer A at (0, 0, 320, 240); B at (0, 240, 320,
+    // 240). Without this, drawing ~870 GP0 words per frame can
+    // race scanout and flicker to black when the rasteriser is
+    // still filling text while the TV scans out.
+    let mut fb = FrameBuffer::new(320, 240);
+    // Prime the draw area + offset to point at the initial back
+    // buffer (buffer A). `FrameBuffer::swap` resets them every
+    // flip, but the first frame needs an explicit bootstrap.
     gpu::set_draw_area(0, 0, 319, 239);
     gpu::set_draw_offset(0, 0);
 
@@ -47,9 +59,10 @@ fn main() {
 
     let mut frame_idx: u32 = 0;
     loop {
-        // Flat dark-navy background — text is bright enough that
-        // midnight-blue reads as "behind the UI."
-        gpu::fill_rect(0, 0, 320, 240, 6, 8, 24);
+        // Clear the back buffer (the one we're about to draw
+        // into). `FrameBuffer::clear` knows which buffer is the
+        // back at the current moment.
+        fb.clear(6, 8, 24);
 
         gradient_title(&font);
         size_ladder(&font);
@@ -61,6 +74,9 @@ fn main() {
 
         gpu::draw_sync();
         gpu::vsync();
+        // Flip: publish the freshly-drawn back buffer and start
+        // drawing into the other one next frame.
+        fb.swap();
         frame_idx = frame_idx.wrapping_add(1);
     }
 }
