@@ -75,8 +75,9 @@
 //! ## Fixed-point conventions (rotation + affine)
 //!
 //! Rotation uses a Q0.12 angle: `u16` in `[0, 4096)` mapping to
-//! `[0°, 360°)`. Sin/cos are looked up from an internal 256-entry
-//! table (Q1.12 values).
+//! `[0°, 360°)`. Sin/cos come from the shared SDK sin LUT in
+//! [`psx_math::sincos`] — see that crate for the precision /
+//! Q-format specifics.
 //!
 //! Affine matrices are Q3.12 — `i16` with 12 fractional bits, so
 //! `4096` = 1.0, `-4096` = -1.0, `8192` = 2.0, and the usable
@@ -90,10 +91,10 @@
 use psx_gpu::{draw_quad_textured, draw_quad_textured_gouraud};
 use psx_hw::gpu::{pack_color, pack_texcoord, pack_vertex, pack_xy};
 use psx_io::gpu::{wait_cmd_ready, write_gp0};
+use psx_math::sincos;
 use psx_vram::{Clut, Color555, TexDepth, Tpage, VramRect, upload_16bpp, upload_clut};
 
 pub mod fonts;
-mod sincos;
 
 // ======================================================================
 // BitmapFont — the static descriptor

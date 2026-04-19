@@ -1,0 +1,10 @@
+[package]
+name         = "psx-math"
+version      = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description  = "Fixed-point math primitives for the PS1 SDK: Q0.12 angles + sin/cos LUTs, plus scaffolding for Q3.12 / Q16.16 / vec / mat as they land."
+
+[lints.rust]
+missing_docs = "warn"
