@@ -10,6 +10,7 @@
 # .cargo/config.toml for the mipsel-sony-psx target.
 
 .PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke parity run \
+        test-sdk \
         examples hello-tri hello-input hello-ot hello-tex hello-gte \
         run-tri run-input run-ot run-tex run-gte
 
@@ -26,6 +27,7 @@ help:
 	@echo "    make run          - launch the desktop frontend (no EXE)"
 	@echo "    make parity       - step both emulators and assert bit-identical traces"
 	@echo "    make oracle-smoke - smoke: launch headless Redux and verify Lua runs"
+	@echo "    make test-sdk     - build every SDK example + run Milestone-C regression suite"
 	@echo ""
 	@echo "  SDK examples (build mipsel-sony-psx binaries):"
 	@echo "    make examples     - build every example"
@@ -79,6 +81,14 @@ oracle-smoke:
 
 parity:
 	cd emu && cargo test -p emulator-core --release --test parity -- --ignored --nocapture
+
+# Milestone-C regression suite — every SDK example side-loaded into
+# the emulator, multi-signal state pinned. Depends on `examples` so
+# every .exe referenced by the tests exists before we run them; the
+# tests themselves skip gracefully when an .exe is missing, but
+# gating on `examples` here surfaces build breaks up-front.
+test-sdk: examples
+	cd emu && cargo test -p emulator-core --release --test sdk_milestones -- --ignored --nocapture
 
 # --- SDK examples ---------------------------------------------------------
 
