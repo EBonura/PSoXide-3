@@ -9,6 +9,7 @@ description  = "Bitmap-font atlas for PS1 SDK: generic over glyph dimensions, 1b
 [dependencies]
 psx-hw   = { workspace = true }
 psx-io   = { path = "../psx-io" }
+psx-gpu  = { path = "../psx-gpu" }
 psx-vram = { path = "../psx-vram" }
 
 [lints.rust]

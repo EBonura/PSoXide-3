@@ -1,14 +1,34 @@
 //! High-level PS1 GPU interface.
 //!
 //! Sits on top of `psx-io::gpu` + `psx-hw::gpu` constructors to expose
-//! a friendlier API: `init()` to set up display mode, primitives
-//! (`draw_tri_flat`, `draw_tri_gouraud`, `fill_rect`), and
-//! synchronisation (`wait_cmd_ready`, `vsync`).
+//! a friendlier API: `init()` to set up display mode, a small
+//! primitives kit, and synchronisation (`draw_sync`, `vsync`).
 //!
-//! This crate is where the engine's rendering pipeline will plug in.
+//! ## Primitives
+//!
+//! | Function                    | GP0 op | Words | Notes                          |
+//! |-----------------------------|--------|-------|--------------------------------|
+//! | [`fill_rect`]               | 0x02   | 3     | Ignores draw area, X %= 16.    |
+//! | [`draw_tri_flat`]           | 0x20   | 4     | Single colour.                 |
+//! | [`draw_tri_gouraud`]        | 0x30   | 6     | Per-vertex colour.             |
+//! | [`draw_quad_flat`]          | 0x28   | 5     | Single colour.                 |
+//! | [`draw_line_mono`]          | 0x40   | 3     | Rasterised line, any slope.    |
+//! | [`draw_line_gouraud`]       | 0x50   | 4     | Gouraud line.                  |
+//! | [`draw_quad_textured`]      | 0x2C   | 9     | Flat tint, free UV per vertex. |
+//! | [`draw_quad_textured_gouraud`] | 0x3C | 12   | Per-vertex colour × texel.     |
+//!
+//! Textured rectangles (GP0 0x64..=0x7F) are the fastest path for
+//! axis-aligned 1:1 sprites; they live in the `psx-vram` /
+//! `psx-font` crates since their size/clut/tpage fields interact
+//! with the VRAM primitives there.
+//!
+//! ## Why split like this
+//!
 //! Keeping the low-level constructors in `psx-hw` means the same
 //! encoding is shared with the emulator's GPU decoder — both sides
-//! can't drift out of sync on command layout.
+//! can't drift out of sync on command layout. `psx-gpu` adds the
+//! thin ergonomic layer: `wait_cmd_ready()` + `write_gp0()`
+//! sequencing, typed depth enums, vertex/UV packing.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -194,6 +214,82 @@ pub fn draw_quad_flat(verts: [(i16, i16); 4], r: u8, g: u8, b: u8) {
     write_gp0(pack_vertex(verts[1].0, verts[1].1));
     write_gp0(pack_vertex(verts[2].0, verts[2].1));
     write_gp0(pack_vertex(verts[3].0, verts[3].1));
+}
+
+/// Draw a textured quad (GP0 0x2C, 9 words) with a single tint.
+///
+/// Vertex order is the PSX fan convention:
+/// - `verts[0]`, `uvs[0]` — top-left
+/// - `verts[1]`, `uvs[1]` — top-right
+/// - `verts[2]`, `uvs[2]` — bottom-left
+/// - `verts[3]`, `uvs[3]` — bottom-right
+///
+/// The GPU raster treats `(v0, v1, v2)` as one triangle and
+/// `(v1, v2, v3)` as the other. Non-rectangular quads shear /
+/// rotate / skew by tweaking vertex positions; UV interpolation
+/// across the destination is perspective-incorrect (this is a
+/// known PSX quirk — fine for text, jitters at grazing angles).
+///
+/// `tint = (128, 128, 128)` leaves texels unmodulated. PSX tint
+/// math is `output = texel * tint / 128`, so any value below 128
+/// darkens and above 128 brightens (clamped).
+///
+/// `clut_word` is a packed CLUT handle (see `Clut::uv_clut_word`);
+/// `tpage_word` is a packed tpage (see `Tpage::uv_tpage_word`).
+pub fn draw_quad_textured(
+    verts: [(i16, i16); 4],
+    uvs: [(u8, u8); 4],
+    clut_word: u16,
+    tpage_word: u16,
+    tint: (u8, u8, u8),
+) {
+    wait_cmd_ready();
+    // GP0 0x2C = textured quad, opaque, blended with tint.
+    write_gp0(0x2C00_0000 | pack_color(tint.0, tint.1, tint.2));
+    write_gp0(pack_vertex(verts[0].0, verts[0].1));
+    write_gp0((uvs[0].0 as u32) | ((uvs[0].1 as u32) << 8) | ((clut_word as u32) << 16));
+    write_gp0(pack_vertex(verts[1].0, verts[1].1));
+    write_gp0((uvs[1].0 as u32) | ((uvs[1].1 as u32) << 8) | ((tpage_word as u32) << 16));
+    write_gp0(pack_vertex(verts[2].0, verts[2].1));
+    write_gp0((uvs[2].0 as u32) | ((uvs[2].1 as u32) << 8));
+    write_gp0(pack_vertex(verts[3].0, verts[3].1));
+    write_gp0((uvs[3].0 as u32) | ((uvs[3].1 as u32) << 8));
+}
+
+/// Draw a gouraud-shaded textured quad (GP0 0x3C, 12 words).
+///
+/// Each vertex carries its own RGB; the GPU interpolates across
+/// the primitive and modulates the sampled texel by the
+/// interpolated colour. Use this for gradient-filled text or
+/// any "per-corner tint" effect.
+///
+/// Vertex order matches [`draw_quad_textured`]: TL, TR, BL, BR.
+/// The four `colors` align with the four vertices.
+///
+/// Per-vertex colour is a plain RGB tint, same `output = texel *
+/// color / 128` scaling as the flat version — (128, 128, 128) is
+/// "unmodulated".
+pub fn draw_quad_textured_gouraud(
+    verts: [(i16, i16); 4],
+    uvs: [(u8, u8); 4],
+    colors: [(u8, u8, u8); 4],
+    clut_word: u16,
+    tpage_word: u16,
+) {
+    wait_cmd_ready();
+    // GP0 0x3C = gouraud-textured quad, opaque.
+    write_gp0(0x3C00_0000 | pack_color(colors[0].0, colors[0].1, colors[0].2));
+    write_gp0(pack_vertex(verts[0].0, verts[0].1));
+    write_gp0((uvs[0].0 as u32) | ((uvs[0].1 as u32) << 8) | ((clut_word as u32) << 16));
+    write_gp0(pack_color(colors[1].0, colors[1].1, colors[1].2));
+    write_gp0(pack_vertex(verts[1].0, verts[1].1));
+    write_gp0((uvs[1].0 as u32) | ((uvs[1].1 as u32) << 8) | ((tpage_word as u32) << 16));
+    write_gp0(pack_color(colors[2].0, colors[2].1, colors[2].2));
+    write_gp0(pack_vertex(verts[2].0, verts[2].1));
+    write_gp0((uvs[2].0 as u32) | ((uvs[2].1 as u32) << 8));
+    write_gp0(pack_color(colors[3].0, colors[3].1, colors[3].2));
+    write_gp0(pack_vertex(verts[3].0, verts[3].1));
+    write_gp0((uvs[3].0 as u32) | ((uvs[3].1 as u32) << 8));
 }
 
 /// Upload raw 16bpp pixels from CPU memory into a VRAM rectangle.

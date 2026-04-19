@@ -13,29 +13,45 @@
 //!    into a 4bpp CLUT texture, uploads that + a two-entry CLUT
 //!    (transparent + white), and returns a handle.
 //!
-//! 3. Call [`FontAtlas::draw_text`] every frame. One GP0 0x64
-//!    (textured rectangle) per glyph. The `tint` argument
-//!    modulates the white glyph via the PSX's per-texel tint
-//!    multiplier, so you can render the same font atlas in any
-//!    colour without re-uploading.
+//! 3. Call one of the [`FontAtlas`] draw methods every frame. The
+//!    same atlas supports both the fast rectangle path and the
+//!    flexible quad path — choose based on what the call needs.
+//!
+//! ## Draw-path cheat sheet
+//!
+//! | Method | Hardware | Cost / glyph | Does |
+//! |---|---|---|---|
+//! | [`FontAtlas::draw_text`] | GP0 0x64 textured rect | 4 words | 1:1 axis-aligned, single tint |
+//! | [`FontAtlas::draw_text_scaled`] | GP0 0x2C textured quad | 9 words | Integer scale (2×, 3×, …), single tint |
+//! | [`FontAtlas::draw_text_rotated`] | GP0 0x2C textured quad | 9 words | Arbitrary angle rotation, single tint |
+//! | [`FontAtlas::draw_text_affine`] | GP0 0x2C textured quad | 9 words | Arbitrary 2×2 matrix, single tint |
+//! | [`FontAtlas::draw_text_gradient`] | GP0 0x3C gouraud-textured quad | 12 words | 1:1, top/bottom gradient |
+//! | [`FontAtlas::draw_text_scaled_gradient`] | GP0 0x3C gouraud-textured quad | 12 words | Scaled + top/bottom gradient |
+//!
+//! `draw_text` is the fast default. Everything below it is a quad
+//! primitive that pays ~2–3× the GP0 bandwidth for transforms or
+//! per-corner colour. At PS1 scale, this matters for text-heavy UIs
+//! (credit crawls, RPG dialogue walls) and doesn't for a HUD of a
+//! few dozen glyphs. Callers pick consciously.
+//!
+//! All methods share the same atlas and CLUT — no duplicate VRAM.
+//! `draw_text_*` variants can freely mix in one frame, and tints
+//! compose with the PSX per-texel multiplier (`output = texel *
+//! tint / 128`).
 //!
 //! ## Generic over glyph dimensions
 //!
 //! Nothing in [`BitmapFont`] or [`FontAtlas`] hard-codes 8×8.
 //! Declare a second font at 6×12 or 8×16, drop it into VRAM at a
-//! different tpage, and you can mix sizes on the same screen (see
-//! the ladder in `sdk/examples/showcase-reference-scene` once it
-//! ships). What's size-dependent:
+//! different tpage, and you can mix sizes on the same screen.
+//! What's size-dependent:
 //!
 //! - **Atlas layout**: the uploader picks `glyphs_per_row` so the
-//!   atlas width stays within one tpage's effective 4bpp span
-//!   (64 pixels at 4bpp). Tall fonts just use more rows.
-//! - **Upload buffer**: sized at compile time by the caller via
-//!   [`FontAtlas::upload`]'s fixed-capacity `packed` argument. The
-//!   stack-only nature of the SDK's no-alloc profile means a font
-//!   whose atlas doesn't fit in the caller's buffer won't even
-//!   compile (with const-generics) — but since each font is a
-//!   one-shot upload at game boot, the working set is small.
+//!   atlas fits within its tpage.
+//! - **Upload buffer**: the stack-only scratch buffer inside
+//!   [`FontAtlas::upload`] is sized for ~128 glyphs of 8×8. Larger
+//!   fonts will want a const-generic buffer — a planned follow-up;
+//!   panics today if the atlas overflows.
 //!
 //! ## Why 4bpp and not 15bpp direct
 //!
@@ -44,16 +60,40 @@
 //! 8×8 atlas fits in 6×8 halfwords = 96 halfwords = 192 bytes of
 //! VRAM. Direct-15bpp would be 768 bytes, and you'd lose the free
 //! recolouring.
+//!
+//! ## Coordinate conventions
+//!
+//! - `draw_text` / `draw_text_scaled` / `draw_text_gradient`:
+//!   `(x, y)` is the **top-left** of the string's first glyph.
+//! - `draw_text_rotated`: `(cx, cy)` is the rotation **pivot** —
+//!   the centre of the baseline. Positive angles rotate
+//!   counter-clockwise in screen coords.
+//! - `draw_text_affine`: `origin` is the point the 2×2 transform
+//!   maps to the top-left of the first glyph. The matrix is applied
+//!   in glyph-local space before translating to `origin`.
+//!
+//! ## Fixed-point conventions (rotation + affine)
+//!
+//! Rotation uses a Q0.12 angle: `u16` in `[0, 4096)` mapping to
+//! `[0°, 360°)`. Sin/cos are looked up from an internal 256-entry
+//! table (Q1.12 values).
+//!
+//! Affine matrices are Q3.12 — `i16` with 12 fractional bits, so
+//! `4096` = 1.0, `-4096` = -1.0, `8192` = 2.0, and the usable
+//! range is `±7.999…`. That's enough headroom for any visually
+//! reasonable 2×2 transform a bitmap font would want.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+use psx_gpu::{draw_quad_textured, draw_quad_textured_gouraud};
 use psx_hw::gpu::{pack_color, pack_texcoord, pack_vertex, pack_xy};
 use psx_io::gpu::{wait_cmd_ready, write_gp0};
 use psx_vram::{Clut, Color555, TexDepth, Tpage, VramRect, upload_16bpp, upload_clut};
 
 pub mod fonts;
+mod sincos;
 
 // ======================================================================
 // BitmapFont — the static descriptor
@@ -286,23 +326,54 @@ impl FontAtlas {
         self.font.line_height as u16
     }
 
+    /// Look up the atlas UV for a character, returning the
+    /// top-left `(u, v)` of the glyph in texel coords, or `None`
+    /// if the char is outside the font's range.
+    ///
+    /// Shared by every draw method so the codepoint-window logic
+    /// lives in one place.
+    #[inline]
+    fn glyph_uv(&self, ch: char) -> Option<(u8, u8)> {
+        let cp = ch as u32;
+        let first = self.font.first_char as u32;
+        if cp < first || cp >= first + self.font.glyph_count as u32 {
+            return None;
+        }
+        let idx = (cp - first) as u16;
+        let col = idx % self.glyphs_per_row;
+        let row = idx / self.glyphs_per_row;
+        let u = (col as u16) * self.font.glyph_w as u16;
+        let v = (row as u16) * self.font.glyph_h as u16;
+        Some((u as u8, v as u8))
+    }
+
     /// Draw `text` at screen-space `(x, y)` with the given tint.
+    ///
     /// `(0x80, 0x80, 0x80)` = unmodulated white; any other value
     /// recolours every glyph via the PSX per-texel multiplier
     /// (`output = texel * tint / 128`).
     ///
+    /// **Fast path** — uses textured rectangles (GP0 0x64, 4 words
+    /// per glyph). For any transform or per-vertex colour needs,
+    /// reach for [`Self::draw_text_scaled`], [`Self::draw_text_rotated`],
+    /// [`Self::draw_text_affine`], or [`Self::draw_text_gradient`].
+    ///
     /// Characters outside the font's codepoint range are skipped —
     /// they still advance the cursor so the rest of the string
-    /// lines up as the caller intended.
-    ///
-    /// Iteration is per-`char`, so any `&str` is valid input. A
-    /// Latin-1 atlas with `first_char = 0xA0` picks up `é`, `ü`, etc.
-    /// automatically through the codepoint-offset lookup.
+    /// lines up as the caller intended. Iteration is per-`char`,
+    /// so any `&str` is valid input; a Latin-1 atlas with
+    /// `first_char = 0xA0` picks up `é`, `ü`, etc. automatically.
     ///
     /// Sets the GP0(0xE1) draw-mode tpage to our atlas once at the
     /// start of the call — if the caller was rendering with a
     /// different tpage, they'll need to re-apply theirs after
     /// draw_text returns.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// atlas.draw_text(8, 8, "SCORE 0042", (0x80, 0x80, 0x80));
+    /// ```
     pub fn draw_text(&self, x: i16, y: i16, text: &str, tint: (u8, u8, u8)) {
         // Our atlas tpage takes over the current draw-mode slot; the
         // per-glyph GP0 0x64 rectangles all sample from it.
@@ -313,20 +384,10 @@ impl FontAtlas {
         let clut_word = self.clut.uv_clut_word();
         let mut cursor_x = x;
         for ch in text.chars() {
-            let cp = ch as u32;
-            let first = font.first_char as u32;
-            let idx_in_font = if cp >= first && cp < first + font.glyph_count as u32 {
-                (cp - first) as u16
-            } else {
+            let Some((u, v)) = self.glyph_uv(ch) else {
                 cursor_x = cursor_x.wrapping_add(advance);
                 continue;
             };
-            // Atlas UV for this glyph — top-left texel within the
-            // atlas texture.
-            let atlas_col = idx_in_font % self.glyphs_per_row;
-            let atlas_row = idx_in_font / self.glyphs_per_row;
-            let u = (atlas_col as u16) * font.glyph_w as u16;
-            let v = (atlas_row as u16) * font.glyph_h as u16;
 
             wait_cmd_ready();
             // GP0 0x64 = variable-size textured rectangle, no blend,
@@ -339,10 +400,296 @@ impl FontAtlas {
             // takes (u, v, extra) where `extra` is the CLUT field
             // (high halfword). The tpage is implied by the current
             // draw mode.
-            write_gp0(pack_texcoord(u as u8, v as u8, clut_word));
+            write_gp0(pack_texcoord(u, v, clut_word));
             // Third word: rectangle size.
             write_gp0(pack_xy(font.glyph_w as u16, font.glyph_h as u16));
 
+            cursor_x = cursor_x.wrapping_add(advance);
+        }
+    }
+
+    /// Draw `text` at screen-space `(x, y)` scaled by `(scale_x,
+    /// scale_y)`. `scale=(1, 1)` matches [`Self::draw_text`]'s
+    /// output, but via the quad path instead of the rect path —
+    /// so prefer `draw_text` for native-size.
+    ///
+    /// **Quad path** — uses textured quads (GP0 0x2C, 9 words per
+    /// glyph). PSX samples textures with nearest-neighbour, so
+    /// integer scales (2×, 3×, 4×) produce crisp pixel-doubled
+    /// output. Non-integer scales are supported but smear the
+    /// texel grid.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// atlas.draw_text_scaled(80, 100, "GAME OVER", 3, 3, (220, 40, 40));
+    /// ```
+    pub fn draw_text_scaled(
+        &self,
+        x: i16,
+        y: i16,
+        text: &str,
+        scale_x: u8,
+        scale_y: u8,
+        tint: (u8, u8, u8),
+    ) {
+        assert!(scale_x > 0 && scale_y > 0, "scale must be > 0 in both axes");
+        let font = self.font;
+        let gw = font.glyph_w as i16;
+        let gh = font.glyph_h as i16;
+        let sw = gw * scale_x as i16;
+        let sh = gh * scale_y as i16;
+        let advance = font.advance_x as i16 * scale_x as i16;
+        let clut = self.clut.uv_clut_word();
+        let tpage = self.tpage.uv_tpage_word(0);
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            let Some((u, v)) = self.glyph_uv(ch) else {
+                cursor_x = cursor_x.wrapping_add(advance);
+                continue;
+            };
+            let verts = [
+                (cursor_x, y),
+                (cursor_x + sw, y),
+                (cursor_x, y + sh),
+                (cursor_x + sw, y + sh),
+            ];
+            let uvs = [
+                (u, v),
+                (u + gw as u8, v),
+                (u, v + gh as u8),
+                (u + gw as u8, v + gh as u8),
+            ];
+            draw_quad_textured(verts, uvs, clut, tpage, tint);
+            cursor_x = cursor_x.wrapping_add(advance);
+        }
+    }
+
+    /// Draw `text` rotated around the pivot `(cx, cy)` by
+    /// `angle_q12` (Q0.12, one revolution = 4096). The string is
+    /// centred on the pivot at angle 0 — its natural extent is
+    /// `text_width × glyph_h`, anchored so `(cx, cy)` sits at the
+    /// centre of the baseline.
+    ///
+    /// **Quad path** — 9 GP0 words per glyph. Sin/cos come from a
+    /// compact 256-entry Q1.12 table ([`sincos`]), good to ~1.4° —
+    /// imperceptible at 8px glyph scale.
+    ///
+    /// See crate-level docs for the Q0.12 angle convention.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Spin a title once per second (frame_idx updates each vsync).
+    /// let angle = ((frame_idx * 68) & 0xFFF) as u16; // ~4096/60 ≈ 68
+    /// atlas.draw_text_rotated(160, 120, "SPIN", angle, (255, 255, 255));
+    /// ```
+    pub fn draw_text_rotated(
+        &self,
+        cx: i16,
+        cy: i16,
+        text: &str,
+        angle_q12: u16,
+        tint: (u8, u8, u8),
+    ) {
+        let font = self.font;
+        let gw = font.glyph_w as i32;
+        let gh = font.glyph_h as i32;
+        let advance = font.advance_x as i32;
+        let total_w = (text.chars().count() as i32) * advance;
+        // Centre the string on the pivot — baseline (top edge of
+        // first glyph) is `gh/2` above the pivot so that the glyph
+        // midline runs through `(cx, cy)`.
+        let origin_x = -total_w / 2;
+        let origin_y = -gh / 2;
+        let s = sincos::sin_q12(angle_q12);
+        let c = sincos::cos_q12(angle_q12);
+        let clut = self.clut.uv_clut_word();
+        let tpage = self.tpage.uv_tpage_word(0);
+
+        // Transform helper: local (lx, ly) → screen (sx, sy), with
+        // Q1.12 rotation matrix and integer translate to (cx, cy).
+        let rot = |lx: i32, ly: i32| -> (i16, i16) {
+            let rx = (lx * c - ly * s) >> 12;
+            let ry = (lx * s + ly * c) >> 12;
+            ((cx as i32 + rx) as i16, (cy as i32 + ry) as i16)
+        };
+
+        for (i, ch) in text.chars().enumerate() {
+            let Some((u, v)) = self.glyph_uv(ch) else {
+                continue;
+            };
+            let lx0 = origin_x + (i as i32) * advance;
+            let lx1 = lx0 + gw;
+            let ly0 = origin_y;
+            let ly1 = origin_y + gh;
+            let verts = [
+                rot(lx0, ly0),
+                rot(lx1, ly0),
+                rot(lx0, ly1),
+                rot(lx1, ly1),
+            ];
+            let uvs = [
+                (u, v),
+                (u + gw as u8, v),
+                (u, v + gh as u8),
+                (u + gw as u8, v + gh as u8),
+            ];
+            draw_quad_textured(verts, uvs, clut, tpage, tint);
+        }
+    }
+
+    /// Draw `text` through an arbitrary 2×2 affine transform.
+    ///
+    /// The matrix `m` is Q3.12 fixed-point — `m = [[4096, 0], [0,
+    /// 4096]]` is the identity (native size, axis-aligned). Each
+    /// glyph's local corner `(lx, ly)` maps onto screen space as
+    /// `(origin.0 + (m[0][0]*lx + m[0][1]*ly) >> 12,
+    ///   origin.1 + (m[1][0]*lx + m[1][1]*ly) >> 12)`.
+    ///
+    /// Covers rotation, non-uniform scale, shear, reflection, and
+    /// any combination — the other quad-path methods are all
+    /// specializations of this one.
+    ///
+    /// **Quad path** — 9 GP0 words per glyph.
+    ///
+    /// # Example: horizontal shear
+    ///
+    /// ```ignore
+    /// // Skew 30° right: x' = x + 0.577·y. 0.577 × 4096 ≈ 2365.
+    /// let m = [[4096, 2365], [0, 4096]];
+    /// atlas.draw_text_affine((40, 40), "SKEW", m, (200, 200, 200));
+    /// ```
+    pub fn draw_text_affine(
+        &self,
+        origin: (i16, i16),
+        text: &str,
+        m: [[i16; 2]; 2],
+        tint: (u8, u8, u8),
+    ) {
+        let font = self.font;
+        let gw = font.glyph_w as i32;
+        let gh = font.glyph_h as i32;
+        let advance = font.advance_x as i32;
+        let (m00, m01) = (m[0][0] as i32, m[0][1] as i32);
+        let (m10, m11) = (m[1][0] as i32, m[1][1] as i32);
+        let clut = self.clut.uv_clut_word();
+        let tpage = self.tpage.uv_tpage_word(0);
+
+        let tx = |lx: i32, ly: i32| -> (i16, i16) {
+            let sx = origin.0 as i32 + ((m00 * lx + m01 * ly) >> 12);
+            let sy = origin.1 as i32 + ((m10 * lx + m11 * ly) >> 12);
+            (sx as i16, sy as i16)
+        };
+
+        for (i, ch) in text.chars().enumerate() {
+            let Some((u, v)) = self.glyph_uv(ch) else {
+                continue;
+            };
+            let lx0 = (i as i32) * advance;
+            let lx1 = lx0 + gw;
+            let ly0 = 0;
+            let ly1 = gh;
+            let verts = [tx(lx0, ly0), tx(lx1, ly0), tx(lx0, ly1), tx(lx1, ly1)];
+            let uvs = [
+                (u, v),
+                (u + gw as u8, v),
+                (u, v + gh as u8),
+                (u + gw as u8, v + gh as u8),
+            ];
+            draw_quad_textured(verts, uvs, clut, tpage, tint);
+        }
+    }
+
+    /// Draw `text` with a top-to-bottom colour gradient.
+    ///
+    /// Top of each glyph is tinted `top`; bottom is tinted
+    /// `bottom`. The GPU gouraud-interpolates down each glyph,
+    /// producing a smooth vertical gradient across the whole line.
+    ///
+    /// **Gouraud quad path** — 12 GP0 words per glyph (GP0 0x3C).
+    /// Use when you want a rainbow title, a torch-lit dialogue
+    /// box, or any per-vertex colour effect; prefer the single-
+    /// tint [`Self::draw_text`] otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Classic "red hot" gradient.
+    /// atlas.draw_text_gradient(
+    ///     40, 10, "INFERNO",
+    ///     (255, 240, 80),  // bright yellow at the top
+    ///     (180, 30, 20),   // deep red at the bottom
+    /// );
+    /// ```
+    pub fn draw_text_gradient(
+        &self,
+        x: i16,
+        y: i16,
+        text: &str,
+        top: (u8, u8, u8),
+        bottom: (u8, u8, u8),
+    ) {
+        self.draw_text_scaled_gradient(x, y, text, 1, 1, top, bottom);
+    }
+
+    /// Draw `text` with a top-to-bottom gradient, scaled by
+    /// `(scale_x, scale_y)`. Combines [`Self::draw_text_scaled`]
+    /// and [`Self::draw_text_gradient`] in one draw — a 3× title
+    /// with a fire-colour sweep costs the same 12 words per glyph
+    /// as a 1× gradient.
+    ///
+    /// Nearest-neighbour sampling still applies, so integer
+    /// scales produce crisp pixel-doubled output.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // 3× "TITLE" with yellow→red gradient.
+    /// atlas.draw_text_scaled_gradient(
+    ///     64, 10, "TITLE", 3, 3,
+    ///     (255, 220, 80), (200, 40, 20),
+    /// );
+    /// ```
+    pub fn draw_text_scaled_gradient(
+        &self,
+        x: i16,
+        y: i16,
+        text: &str,
+        scale_x: u8,
+        scale_y: u8,
+        top: (u8, u8, u8),
+        bottom: (u8, u8, u8),
+    ) {
+        assert!(scale_x > 0 && scale_y > 0, "scale must be > 0 in both axes");
+        let font = self.font;
+        let gw = font.glyph_w as i16;
+        let gh = font.glyph_h as i16;
+        let sw = gw * scale_x as i16;
+        let sh = gh * scale_y as i16;
+        let advance = font.advance_x as i16 * scale_x as i16;
+        let clut = self.clut.uv_clut_word();
+        let tpage = self.tpage.uv_tpage_word(0);
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            let Some((u, v)) = self.glyph_uv(ch) else {
+                cursor_x = cursor_x.wrapping_add(advance);
+                continue;
+            };
+            let verts = [
+                (cursor_x, y),
+                (cursor_x + sw, y),
+                (cursor_x, y + sh),
+                (cursor_x + sw, y + sh),
+            ];
+            let uvs = [
+                (u, v),
+                (u + gw as u8, v),
+                (u, v + gh as u8),
+                (u + gw as u8, v + gh as u8),
+            ];
+            let colors = [top, top, bottom, bottom];
+            draw_quad_textured_gouraud(verts, uvs, colors, clut, tpage);
             cursor_x = cursor_x.wrapping_add(advance);
         }
     }

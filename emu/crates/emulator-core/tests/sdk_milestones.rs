@@ -381,18 +381,17 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-input" => Some(SdkGolden {
             example: "hello-input",
             vblanks: 4,
-            // Refreshed 2026-04-19-e after folding `psx-font` into the
-            // example: HELD: header + bottom-right hex mask drawn via
-            // `FontAtlas::draw_text`. VRAM hash shifts (atlas texture
-            // at tpage (320, 0) + 2-entry CLUT at (320, 256)); display
-            // hash shifts (label glyphs on screen); final PC shifts
-            // (extra code size from the font atlas upload path).
+            // Refreshed 2026-04-19-f after factoring the codepoint
+            // lookup into `FontAtlas::glyph_uv`. VRAM + display
+            // hashes stayed identical (the rendered pixels are
+            // unchanged), only `final_pc` shifted -8 bytes as the
+            // shared helper let LLVM inline slightly less code.
             vram_hash: 0x82e5_f04a_3f03_a4c4,
             display_hash: 0x7dac_2cef_bc15_db1b,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0b14,
+            final_pc: 0x8001_0b0c,
             redux_display_hash: None,
         }),
         "hello-gte" => Some(SdkGolden {
@@ -425,6 +424,21 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             vblank_raises: 3,
             spu_samples: 1470,
             final_pc: 0x8001_04fc,
+            redux_display_hash: None,
+        }),
+        // showcase-text exercises all 6 draw paths in psx-font:
+        // rect, scaled, rotated, affine, gradient, scaled-gradient.
+        // 4 VBlanks captures an early rotation angle while the
+        // static sections stay stable.
+        "showcase-text" => Some(SdkGolden {
+            example: "showcase-text",
+            vblanks: 4,
+            vram_hash: 0xde61_1495_21fe_4592,
+            display_hash: 0x55dc_43d0_b950_5909,
+            display_size: (320, 240),
+            vblank_raises: 4,
+            spu_samples: 2205,
+            final_pc: 0x8001_0a24,
             redux_display_hash: None,
         }),
         _ => None,
@@ -492,4 +506,13 @@ fn milestone_c_showcase_textured_sprite() {
     // a "polished demo" checkpoint — we want to catch regressions in
     // multi-frame state, not just first-frame initialization.
     run_sdk_milestone("showcase-textured-sprite", 3);
+}
+
+#[test]
+#[ignore = "SDK milestone: showcase-text roundtrip"]
+fn milestone_c_showcase_text() {
+    // 4 VBlanks lands the rotation demo at a stable, non-zero
+    // angle (4 × 96 = 384 Q0.12 ≈ 33.75°) — pins both the
+    // rotating quad path and the static sections in one shot.
+    run_sdk_milestone("showcase-text", 4);
 }

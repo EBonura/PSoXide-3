@@ -13,7 +13,8 @@
         test-sdk \
         examples hello-tri hello-input hello-ot hello-tex hello-gte \
         run-tri run-input run-ot run-tex run-gte \
-        showcase-textured-sprite run-showcase-textured-sprite
+        showcase-textured-sprite run-showcase-textured-sprite \
+        showcase-text run-showcase-text
 
 help:
 	@echo "PSoXide targets:"
@@ -39,6 +40,8 @@ help:
 	@echo "    make hello-gte    - build the GTE perspective-transform demo"
 	@echo "    make showcase-textured-sprite"
 	@echo "                      - build the polished textured-sprite showcase"
+	@echo "    make showcase-text"
+	@echo "                      - build the text / font capabilities showcase"
 	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
 	@echo "    make run-input    - build + side-load hello-input into the frontend"
 	@echo "    make run-ot       - build + side-load hello-ot into the frontend"
@@ -46,6 +49,8 @@ help:
 	@echo "    make run-gte      - build + side-load hello-gte into the frontend"
 	@echo "    make run-showcase-textured-sprite"
 	@echo "                      - build + side-load the textured-sprite showcase"
+	@echo "    make run-showcase-text"
+	@echo "                      - build + side-load the text capabilities showcase"
 
 run:
 	cd emu && cargo run -p frontend --release
@@ -117,7 +122,10 @@ hello-gte:
 showcase-textured-sprite:
 	cd sdk/examples/showcase-textured-sprite && cargo build --release
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte showcase-textured-sprite
+showcase-text:
+	cd sdk/examples/showcase-text && cargo build --release
+
+examples: hello-tri hello-input hello-ot hello-tex hello-gte showcase-textured-sprite showcase-text
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -143,3 +151,6 @@ run-gte: hello-gte
 
 run-showcase-textured-sprite: showcase-textured-sprite
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-textured-sprite.exe cargo run -p frontend --release
+
+run-showcase-text: showcase-text
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-text.exe cargo run -p frontend --release
