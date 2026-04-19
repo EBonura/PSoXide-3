@@ -23,3 +23,7 @@ psx-iso       = { workspace = true }
 [[test]]
 name = "smoke"
 path = "tests/smoke.rs"
+
+[[test]]
+name = "display_parity"
+path = "tests/display_parity.rs"
