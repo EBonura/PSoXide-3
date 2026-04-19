@@ -124,6 +124,11 @@ pub struct Bus {
     /// Same, writes. Separate so read + write to the same bad
     /// address both log at least once.
     unmapped_write_seen: std::collections::BTreeSet<u32>,
+    /// Diagnostic: when true, every DMA-completion schedule pushes
+    /// a record to `dma_log`. Off by default — only the
+    /// `probe_dma_schedules` example flips it on.
+    dma_log_enabled: bool,
+    dma_log: Vec<(String, u64, u64, u64)>,
 }
 
 // --- Video-timing constants ---
@@ -218,6 +223,8 @@ impl Bus {
             vblank_period: VBLANK_PERIOD_CYCLES_NTSC,
             unmapped_read_seen: std::collections::BTreeSet::new(),
             unmapped_write_seen: std::collections::BTreeSet::new(),
+            dma_log_enabled: false,
+            dma_log: Vec::new(),
         })
     }
 
@@ -714,28 +721,64 @@ impl Bus {
         use crate::scheduler::EventSlot;
         let otc_words = self.dma.run_otc(&mut self.ram[..]);
         if otc_words > 0 {
+            let target = self.cycles + otc_words as u64;
+            self.log_dma_schedule("GpuOtc", otc_words as u64, target);
             self.scheduler
                 .schedule(EventSlot::GpuOtcDma, self.cycles, otc_words as u64);
         }
         if let Some(gpu_cycles) = self.run_dma_gpu() {
+            let target = self.cycles + gpu_cycles as u64;
+            self.log_dma_schedule("GpuDma", gpu_cycles as u64, target);
             self.scheduler
                 .schedule(EventSlot::GpuDma, self.cycles, gpu_cycles as u64);
         }
         if let Some(cdrom_words) = self.run_dma_cdrom() {
+            let target = self.cycles + cdrom_words as u64;
+            self.log_dma_schedule("CdrDma", cdrom_words as u64, target);
             self.scheduler
                 .schedule(EventSlot::CdrDma, self.cycles, cdrom_words as u64);
         }
         if let Some(spu_words) = self.run_dma_spu() {
+            let target = self.cycles + spu_words as u64;
+            self.log_dma_schedule("SpuDma", spu_words as u64, target);
             self.scheduler
                 .schedule(EventSlot::SpuDma, self.cycles, spu_words as u64);
         }
         if let Some(mdec_words) = self.run_dma_mdec_in() {
+            let target = self.cycles + mdec_words as u64;
+            self.log_dma_schedule("MdecIn", mdec_words as u64, target);
             self.scheduler
                 .schedule(EventSlot::MdecInDma, self.cycles, mdec_words as u64);
         }
         if let Some(mdec_words) = self.run_dma_mdec_out() {
+            let target = self.cycles + mdec_words as u64;
+            self.log_dma_schedule("MdecOut", mdec_words as u64, target);
             self.scheduler
                 .schedule(EventSlot::MdecOutDma, self.cycles, mdec_words as u64);
+        }
+    }
+
+    /// Optional per-DMA-schedule log. Off by default; the
+    /// `probe_dma_schedules` example enables it via the setter to
+    /// capture every DMA completion's `(cycle_now, delta, target)`
+    /// for cycle-parity diagnosis. Stored on the bus so the probe
+    /// can drain it after a run without poking CPU-execution paths.
+    pub fn set_dma_log_enabled(&mut self, enabled: bool) {
+        self.dma_log_enabled = enabled;
+        if enabled {
+            self.dma_log.clear();
+        }
+    }
+
+    /// Drain collected DMA schedule events.
+    pub fn drain_dma_log(&mut self) -> Vec<(String, u64, u64, u64)> {
+        std::mem::take(&mut self.dma_log)
+    }
+
+    fn log_dma_schedule(&mut self, kind: &str, delta: u64, target: u64) {
+        if self.dma_log_enabled {
+            self.dma_log
+                .push((kind.to_string(), self.cycles, delta, target));
         }
     }
 
@@ -770,6 +813,10 @@ impl Bus {
             addr = addr.wrapping_add(step);
         }
         self.mdec.dma_write_in(&words);
+        // Clear the start bit to match Redux — see `run_dma_gpu` for
+        // the full story. Without this, a subsequent DMA-register write
+        // would re-run the transfer.
+        self.dma.channels[0].channel_control &= !(1 << 24);
         Some(total_words)
     }
 
@@ -807,6 +854,8 @@ impl Bus {
             }
             addr = addr.wrapping_add(step);
         }
+        // Clear start bit to match Redux.
+        self.dma.channels[1].channel_control &= !(1 << 24);
         Some(total_words)
     }
 
@@ -883,6 +932,8 @@ impl Bus {
                 addr = addr.wrapping_add(step);
             }
         }
+        // Clear start bit to match Redux.
+        self.dma.channels[4].channel_control &= !(1 << 24);
         Some(total_words)
     }
 
@@ -951,7 +1002,8 @@ impl Bus {
             }
             addr = addr.wrapping_add(step);
         }
-
+        // Clear start bit to match Redux.
+        self.dma.channels[3].channel_control &= !(1 << 24);
         Some(total_words)
     }
 
@@ -997,6 +1049,16 @@ impl Bus {
             _ => 0, // Manual (0) + prohibited (3) — nothing standard uses
                     // them for the GPU channel. Drop the trigger silently.
         };
+        // Clear the start bit NOW, mirroring Redux's `dma2`: the data
+        // movement and CHCR stop-bit-clear happen instantly, only the
+        // completion IRQ is scheduled for later. Without this, every
+        // subsequent write to ANY DMA register re-enters `maybe_run_dma`,
+        // the start bit is still set, and we re-run the same DMA —
+        // re-pushing its GP0 commands and overwriting the scheduled
+        // completion target. Diagnosed from `probe_dma_schedules`
+        // showing 7+ identical-delta schedules for what should have
+        // been a single DMA.
+        self.dma.channels[2].channel_control &= !(1 << 24);
         Some(completion)
     }
 
@@ -1031,7 +1093,13 @@ impl Bus {
 
     fn dma_gpu_linked_list(&mut self) -> u32 {
         let mut addr = self.dma.channels[2].base & 0x001F_FFFC;
-        let mut total_words: u32 = 0;
+        // Start at 1 to account for the initial pointer load —
+        // matches Redux's `gpuDmaChainSize` in `core/gpu.cc:445`:
+        // `size = 1;` before the loop. Without it we underbill the
+        // DMA-completion cycle count by 1 per chain, which looks
+        // harmless until you multiply by hundreds of chains per
+        // frame and end up several thousand cycles early.
+        let mut total_words: u32 = 1;
         // Bound the walk so a malformed list can't spin forever.
         for _ in 0..0x100_0000 {
             let header = read_ram_u32(&self.ram[..], addr);
@@ -1041,14 +1109,18 @@ impl Bus {
                 let word = read_ram_u32(&self.ram[..], word_addr);
                 self.gpu.gp0_push(word);
             }
-            // Header + payload both contribute to Redux's per-node
-            // cycle cost accounting.
-            total_words = total_words.saturating_add(1 + word_count);
-            let next = header & 0x00FF_FFFF;
-            if next == 0x00FF_FFFF {
+            // Redux charges `(header >> 24) + 1` per node (see
+            // `gpuDmaChainSize:474`). The `+1` covers the header
+            // fetch; payload accounts for the rest.
+            total_words = total_words.saturating_add(word_count + 1);
+            // End-of-chain: hardware uses *any* pointer with bit 23
+            // set (0x800000) as the terminator, not just the common
+            // 0x00FF_FFFF sentinel. Matches Redux's
+            // `while (!(addr & 0x800000))` at gpu.cc:483.
+            if (header & 0x800000) != 0 {
                 return total_words;
             }
-            addr = next;
+            addr = header & 0x00FF_FFFF;
         }
         total_words
     }
