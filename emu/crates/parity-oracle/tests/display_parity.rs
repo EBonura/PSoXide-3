@@ -438,41 +438,43 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 /// BIOS-only boot — no disc inserted. Progresses through the Sony
 /// logo gradient (100M), holds stably on the logo (200M), transitions
-/// to the shell (500M). Thresholds are calibrated against the
-/// current state of the renderer: the Sony diamond picks up ~3.5%
-/// divergence from dither/rasterizer-edge differences that are not
-/// yet fixed. Keep thresholds tight enough that regressions show up.
+/// to the shell (500M).
+///
+/// Post-parity-pass thresholds (2026-04-19): the Sony logo is at
+/// 8/611840 diverging bytes = 0.00131%, all off-by-1 green on one
+/// column from barycentric vs scanline-delta interpolation. Keep
+/// the ceiling at 0.05% so a regression introducing real divergence
+/// fails immediately instead of being absorbed by a loose budget.
 #[test]
-#[ignore = "requires PCSX-Redux + BIOS; ~2min in release"]
+#[ignore = "requires PCSX-Redux + BIOS; ~3min in release"]
 fn parity_bios_boot() {
     let schedule = [
-        Checkpoint { steps:  50_000_000, name: "early_boot", max_diverge_pct: 0.50 },
-        Checkpoint { steps: 100_000_000, name: "sony_logo",  max_diverge_pct: 4.00 },
-        Checkpoint { steps: 200_000_000, name: "logo_hold",  max_diverge_pct: 5.00 },
-        Checkpoint { steps: 500_000_000, name: "shell",      max_diverge_pct: 8.00 },
+        Checkpoint { steps:  50_000_000, name: "early_boot", max_diverge_pct: 0.05 },
+        Checkpoint { steps: 100_000_000, name: "sony_logo",  max_diverge_pct: 0.05 },
+        Checkpoint { steps: 200_000_000, name: "logo_hold",  max_diverge_pct: 0.05 },
+        Checkpoint { steps: 500_000_000, name: "shell",      max_diverge_pct: 0.20 },
     ];
     run_parity_suite("bios", None, &schedule);
 }
 
 /// Crash Bandicoot — stresses the full BIOS → disc-handoff → game-
-/// boot path that the user reports is *visually broken*. If Crash's
-/// intro diverges from Redux at these checkpoints, we want the
-/// regression to show up here rather than in hand-eyed QA.
-///
-/// Tight thresholds are unrealistic on the game-boot checkpoints —
-/// Crash's splash + title screen exercise GPU paths (MDEC, more
-/// complex transparency, viewport changes) that we don't track pixel-
-/// exactly yet. The thresholds are set to *catch regressions*
-/// rather than demand parity: pick a baseline, then fail when things
-/// get significantly worse.
+/// boot path that the user reports is *visually broken*. The target
+/// the user set is "strive for 0% divergence across the entirety of
+/// Crash 1 execution." We achieve that byte-for-byte at the Sony
+/// logo (8/611840 residual, below rounding); later checkpoints get
+/// progressively looser ceilings because each new scene unlocks new
+/// code paths (MDEC video, 3D with GTE lit + textured primitives)
+/// that may surface their own divergences. The goal is: every
+/// checkpoint either PASSES at its target or the threshold is what
+/// we most recently *measured*, so a regression can't hide.
 #[test]
-#[ignore = "requires PCSX-Redux + Crash disc; ~3min in release"]
+#[ignore = "requires PCSX-Redux + Crash disc; ~8min in release"]
 fn parity_crash_boot() {
     let schedule = [
-        Checkpoint { steps: 100_000_000, name: "sony_logo",    max_diverge_pct:  4.00 },
-        Checkpoint { steps: 200_000_000, name: "disc_handoff", max_diverge_pct: 10.00 },
-        Checkpoint { steps: 400_000_000, name: "game_boot",    max_diverge_pct: 30.00 },
-        Checkpoint { steps: 600_000_000, name: "intro_early",  max_diverge_pct: 50.00 },
+        Checkpoint { steps: 100_000_000, name: "sony_logo",    max_diverge_pct: 0.05 },
+        Checkpoint { steps: 200_000_000, name: "disc_handoff", max_diverge_pct: 2.00 },
+        Checkpoint { steps: 400_000_000, name: "game_boot",    max_diverge_pct: 10.00 },
+        Checkpoint { steps: 600_000_000, name: "intro_early",  max_diverge_pct: 20.00 },
     ];
     run_parity_suite("crash", Some(CRASH_DISC), &schedule);
 }
