@@ -456,6 +456,22 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_1030,
             redux_display_hash: None,
         }),
+        // Second mini-game. 60 VBlanks captures one serve-arc
+        // (auto-launched at frame 30, ball mid-flight on the way
+        // up) with all 40 bricks still in place. Exercises the
+        // 44-primitive OT path every frame plus the ball physics
+        // + auto-serve state machine.
+        "breakout" => Some(SdkGolden {
+            example: "breakout",
+            vblanks: 60,
+            vram_hash: 0xe817_5a59_78d9_f2f1,
+            display_hash: 0x445b_7be1_6cee_6277,
+            display_size: (320, 240),
+            vblank_raises: 60,
+            spu_samples: 44100,
+            final_pc: 0x8001_2210,
+            redux_display_hash: None,
+        }),
         _ => None,
     }
 }
@@ -530,6 +546,18 @@ fn milestone_c_pong() {
     // after 8 frames it's hit the right paddle area, triggered
     // the paddle-hit SFX, and the AI has begun tracking.
     run_sdk_milestone("pong", 8);
+}
+
+#[test]
+#[ignore = "SDK milestone: breakout roundtrip"]
+fn milestone_c_breakout() {
+    // 60 VBlanks covers one serve arc + first brick break. Serve
+    // auto-launches at frame 30 (no pad in harness), ball climbs
+    // and hits a blue brick around frame 85-90 in the probe —
+    // we leave 60 frames here so the test captures the ball
+    // mid-flight on the way up with all 40 bricks still in place.
+    // Still exercises the 44-primitive OT path every frame.
+    run_sdk_milestone("breakout", 60);
 }
 
 #[test]
