@@ -1728,12 +1728,32 @@ impl Gpu {
 
     /// Apply the tpage bits embedded in a textured-primitive UV word
     /// (they override the draw-mode tpage for this primitive onward).
+    ///
+    /// Mirrors Redux's poly-path behaviour (`gpu.cc:347/396`):
+    /// before calling `texturePage`, the drawPoly handler OR-s bit 9
+    /// of the incoming tpage with the current `m_ditherMode`. That
+    /// gives a primitive the power to *enable* dither but not to
+    /// disable it — in effect, dither is sticky across primitives
+    /// until an explicit GP0 0xE1 turns it off. Then `texturePage`
+    /// copies bits 0..=10 of the (possibly OR-fixed) tpage into
+    /// `m_statusRet`.
+    ///
+    /// Missing this sync surfaced at parity step 60,041,097 as a
+    /// GPUSTAT load that differed in the low byte: our GPUSTAT
+    /// kept reflecting the last E1's tpage-X even after a textured
+    /// polygon's embedded tpage re-pointed it.
     fn apply_primitive_tpage(&mut self, uv_word: u32) {
-        let tpage = (uv_word >> 16) & 0xFFFF;
+        let mut tpage = (uv_word >> 16) & 0xFFFF;
+        if self.dither_enabled {
+            tpage |= 0x200;
+        }
         self.tex_page_x = ((tpage & 0x0F) as u16) * 64;
         self.tex_page_y = if (tpage >> 4) & 1 != 0 { 256 } else { 0 };
         self.tex_depth = ((tpage >> 7) & 0x3) as u8;
         self.tex_blend_mode = BlendMode::from_tpage_bits(tpage >> 5);
+        self.dither_enabled = (tpage >> 9) & 1 != 0;
+        let stat_bits = (tpage & 0x07FF) as u32;
+        self.status.raw = (self.status.raw & !0x07FF) | stat_bits;
     }
 
     /// Plot a single 15bpp pixel at `(x, y)`. When `mode == Opaque`

@@ -546,12 +546,17 @@ impl Cpu {
     /// `LWC2 rt, offset(rs)` — load 32-bit word from memory into COP2
     /// data register `rt`. No GPR is touched, so no load-delay slot.
     fn op_lwc2(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        // Charge the memory-access cycle BEFORE the read so cycle-
+        // sensitive MMIO (timer counters, GPU fields, SPU status)
+        // sees the post-increment cycle — matching Redux's
+        // `psxmem.cc:read32`, which does `m_regs.cycle += 1` on
+        // entry.
+        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read32(addr);
-        bus.add_cycles(1);
         self.cop2.write_data(rt, value);
         Ok(())
     }
@@ -791,12 +796,17 @@ impl Cpu {
     /// stage the load in `pending_load`; [`Cpu::step`] commits it
     /// after the following instruction executes.
     fn op_lw(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        // Charge the memory-access cycle BEFORE the read so cycle-
+        // sensitive MMIO sees the post-increment cycle. Matches
+        // Redux's `psxmem.cc:read32`. Previously we charged after
+        // the read, which made Timer 1 counter reads lag by one
+        // cycle — caught at parity step 79,389,318.
+        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read32(addr);
-        bus.add_cycles(1);
         // Loads to $zero are no-ops; never queue a commit to it.
         if rt != 0 {
             self.pending_load = Some((rt, value));
@@ -960,12 +970,12 @@ impl Cpu {
     }
 
     fn op_lb(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read8(addr) as i8 as i32 as u32;
-        bus.add_cycles(1);
         if rt != 0 {
             self.pending_load = Some((rt, value));
         }
@@ -973,12 +983,12 @@ impl Cpu {
     }
 
     fn op_lbu(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read8(addr) as u32;
-        bus.add_cycles(1);
         if rt != 0 {
             self.pending_load = Some((rt, value));
         }
@@ -986,12 +996,12 @@ impl Cpu {
     }
 
     fn op_lh(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read16(addr) as i16 as i32 as u32;
-        bus.add_cycles(1);
         if rt != 0 {
             self.pending_load = Some((rt, value));
         }
@@ -999,12 +1009,12 @@ impl Cpu {
     }
 
     fn op_lhu(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let value = bus.read16(addr) as u32;
-        bus.add_cycles(1);
         if rt != 0 {
             self.pending_load = Some((rt, value));
         }
@@ -1051,13 +1061,13 @@ impl Cpu {
     /// squashed (the opposite of non-load writes). Redux's model
     /// peeks at the staged `rt` via the pending-load slot.
     fn op_lwl(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let aligned = addr & !3;
         let word = bus.read32(aligned);
-        bus.add_cycles(1);
         // If there's a pending-commit load for the same register, see
         // its staged value instead of the current register file —
         // that's what matches hardware's LWL-LWR-merge convention.
@@ -1084,13 +1094,13 @@ impl Cpu {
     /// `LWR rt, offset(rs)` — Load Word Right. Mirror of LWL; merges
     /// the low-order bytes of the word containing `addr` into `rt`.
     fn op_lwr(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
+        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
         let aligned = addr & !3;
         let word = bus.read32(aligned);
-        bus.add_cycles(1);
         let current = self.staged_gpr(rt);
         let shift = (addr & 3) * 8;
         let mask = 0xFFFF_FFFFu32 >> (24 - shift);
@@ -1106,10 +1116,14 @@ impl Cpu {
     /// store side. Writes `rt`'s high bytes into the word containing
     /// `addr`, preserving the lower bytes of the memory word.
     fn op_swl(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
-        // Redux's psxSWL always calls read32 + write32 unconditionally;
-        // both charge a cycle each, even under cache isolation.
-        bus.add_cycles(2);
+        // Redux's psxSWL calls `memRead32` then `memWrite32`, each
+        // of which bumps the cycle counter by 1 at entry (matching
+        // `psxmem.cc`). Interleaving the +1 charges around the
+        // actual memory ops keeps the read and write at the exact
+        // cycles Redux sees (cycle+1 and cycle+2).
+        bus.add_cycles(1);
         if self.cache_isolated() {
+            bus.add_cycles(1); // account for the would-be write
             return Ok(());
         }
         let rs = ((instr >> 21) & 0x1F) as u8;
@@ -1121,6 +1135,7 @@ impl Cpu {
         let reg = self.gpr(rt);
         let shift = (addr & 3) * 8;
         let merged = (mem & !(0xFFFF_FFFFu32 >> (24 - shift))) | (reg >> (24 - shift));
+        bus.add_cycles(1);
         bus.write32(aligned, merged);
         Ok(())
     }
@@ -1128,8 +1143,9 @@ impl Cpu {
     /// `SWR rt, offset(rs)` — Store Word Right. Mirror of LWR on the
     /// store side.
     fn op_swr(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
-        bus.add_cycles(2);
+        bus.add_cycles(1);
         if self.cache_isolated() {
+            bus.add_cycles(1);
             return Ok(());
         }
         let rs = ((instr >> 21) & 0x1F) as u8;
@@ -1141,6 +1157,7 @@ impl Cpu {
         let reg = self.gpr(rt);
         let shift = (addr & 3) * 8;
         let merged = (mem & !(0xFFFF_FFFFu32 << shift)) | (reg << shift);
+        bus.add_cycles(1);
         bus.write32(aligned, merged);
         Ok(())
     }

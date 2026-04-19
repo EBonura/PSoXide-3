@@ -125,6 +125,46 @@ local function run()
             local tick = tonumber(PCSX.getCPUCycles())
             send(string.format("run ok tick=%d", tick))
 
+        elseif cmd == "run_checkpoint" then
+            -- `run_checkpoint N M` — run N user-side steps silently,
+            -- emitting one `chk step=X tick=Y pc=Z` line every M
+            -- steps. This is the coarse variant of `step`: no GPRs,
+            -- no per-instruction records, just the cycle counter and
+            -- PC at sampled intervals. Used by fast divergence hunts
+            -- — a full 100 M-step scan emits 10 K checkpoints (a few
+            -- hundred KiB) instead of 14 GiB of trace records, and
+            -- finishes in ~30 s instead of ~40 min.
+            --
+            -- ISR folding falls out naturally from Redux's `stepIn`:
+            -- the stepIn breakpoint lives in user code, so IRQ
+            -- handlers run-through under `runExecute` and only the
+            -- post-RFE user instruction trips the breakpoint. Each
+            -- iteration here is one user-side step even if it took
+            -- a full VBlank ISR along the way.
+            local n_str, m_str = line:match("^run_checkpoint%s+(%d+)%s+(%d+)$")
+            local n = tonumber(n_str) or 0
+            local m = tonumber(m_str) or 1
+            if n == 0 then
+                send("err run_checkpoint: bad args")
+            else
+                local emissions = 0
+                for i = 1, n do
+                    PCSX.stepIn()
+                    PCSX.runExecute()
+                    if i % m == 0 then
+                        local tick = tonumber(PCSX.getCPUCycles())
+                        local pc = tonumber(regs.pc)
+                        send_nowait(string.format("chk step=%d tick=%d pc=%d", i, tick, pc))
+                        emissions = emissions + 1
+                        if emissions % 256 == 0 then io.flush() end
+                    end
+                end
+                io.flush()
+                local tick = tonumber(PCSX.getCPUCycles())
+                local pc = tonumber(regs.pc)
+                send(string.format("run_checkpoint ok step=%d tick=%d pc=%d", n, tick, pc))
+            end
+
         elseif cmd == "peek32" then
             -- `peek32 ADDR` — return the 32-bit value at the given
             -- physical address (decimal or 0x-prefixed hex). Used to

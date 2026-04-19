@@ -117,6 +117,47 @@ pub fn load_prefix(
     Some(records)
 }
 
+/// Load the longest cache file on disk matching this BIOS hash,
+/// returning all its records (no truncation). Useful when the caller
+/// wants "whatever's available" rather than a specific minimum step
+/// count — e.g. the divergence probe, which walks until it runs out
+/// of records regardless of how many there are.
+pub fn load_longest(dir: &Path, bios_bytes: &[u8]) -> Option<Vec<InstructionRecord>> {
+    let hash = fold_hash(bios_bytes);
+    let prefix = format!("redux-{hash:016x}-");
+
+    let mut best: Option<(usize, PathBuf)> = None;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".bin") {
+            continue;
+        }
+        let step_str = &name[prefix.len()..name.len() - 4];
+        let Ok(steps) = step_str.parse::<usize>() else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|(best_steps, _)| steps > *best_steps)
+            .unwrap_or(true)
+        {
+            best = Some((steps, path));
+        }
+    }
+
+    let (_cached_steps, path) = best?;
+    let records = load(&path)?;
+    eprintln!(
+        "[parity-cache] loaded longest {} ({} records)",
+        path.display(),
+        records.len()
+    );
+    Some(records)
+}
+
 /// Load a cached trace if one exists at `path` and passes a basic
 /// header validation. Returns `None` on any failure (caller should
 /// fall back to invoking Redux). Corrupt/incompatible caches are
@@ -183,6 +224,90 @@ pub fn save(path: &Path, records: &[InstructionRecord]) -> io::Result<()> {
 
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Streaming writer for traces that wouldn't fit in memory as a single
+/// `Vec<InstructionRecord>` (a 100 M-record trace is ~14 GiB). Writes
+/// to a temp file and atomically renames on [`finish`]; dropping
+/// without `finish` leaves the temp file behind for post-mortem but
+/// never produces a corrupt cache at the target path.
+///
+/// The file header reserves a `count` field that's written at create
+/// time using the caller-supplied expected total; pushing fewer records
+/// than declared produces a corrupt file (load will read past EOF), so
+/// always write exactly `count`.
+pub struct StreamingWriter {
+    tmp: PathBuf,
+    final_path: PathBuf,
+    writer: BufWriter<File>,
+    rec_buf: [u8; RECORD_BYTES],
+    declared: u64,
+    written: u64,
+}
+
+impl StreamingWriter {
+    /// Create a streaming writer. `count` is the exact number of
+    /// records that will be pushed before `finish`; it's written into
+    /// the header so loaders don't need to stat the file.
+    pub fn create(path: &Path, count: u64) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension(format!(
+            "tmp.{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let file = File::create(&tmp)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(MAGIC)?;
+        writer.write_all(&VERSION.to_le_bytes())?;
+        writer.write_all(&0u32.to_le_bytes())?; // reserved
+        writer.write_all(&count.to_le_bytes())?;
+        Ok(Self {
+            tmp,
+            final_path: path.to_path_buf(),
+            writer,
+            rec_buf: [0u8; RECORD_BYTES],
+            declared: count,
+            written: 0,
+        })
+    }
+
+    /// Append one record. Returns an error if the BufWriter fails to
+    /// flush its internal buffer to disk (e.g. ENOSPC).
+    pub fn push(&mut self, r: &InstructionRecord) -> io::Result<()> {
+        encode_record(r, &mut self.rec_buf);
+        self.writer.write_all(&self.rec_buf)?;
+        self.written += 1;
+        Ok(())
+    }
+
+    /// Number of records pushed so far.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Flush, close, and atomically rename the temp file onto the
+    /// target path. Fails if `written != declared` so the header stays
+    /// honest.
+    pub fn finish(mut self) -> io::Result<()> {
+        if self.written != self.declared {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "streaming writer finished early: declared {} records, wrote {}",
+                    self.declared, self.written
+                ),
+            ));
+        }
+        self.writer.flush()?;
+        drop(self.writer);
+        fs::rename(&self.tmp, &self.final_path)?;
+        Ok(())
+    }
 }
 
 fn encode_record(r: &InstructionRecord, buf: &mut [u8; RECORD_BYTES]) {
@@ -325,5 +450,39 @@ mod tests {
         )
         .unwrap();
         assert!(load_prefix(dir.path(), bios, 100).is_none());
+    }
+
+    #[test]
+    fn streaming_writer_produces_same_bytes_as_save() {
+        // The streaming writer must be bit-identical to `save()` so
+        // readers can round-trip either. Asserted here by comparing
+        // file bytes (magic + version + count + records).
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<_> = (0..500).map(sample_record).collect();
+
+        let save_path = dir.path().join("batched.bin");
+        save(&save_path, &records).unwrap();
+
+        let stream_path = dir.path().join("streamed.bin");
+        let mut w = StreamingWriter::create(&stream_path, records.len() as u64).unwrap();
+        for r in &records {
+            w.push(r).unwrap();
+        }
+        w.finish().unwrap();
+
+        assert_eq!(fs::read(&save_path).unwrap(), fs::read(&stream_path).unwrap());
+        assert_eq!(load(&stream_path).unwrap(), records);
+    }
+
+    #[test]
+    fn streaming_writer_finish_rejects_short_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.bin");
+        let mut w = StreamingWriter::create(&path, 5).unwrap();
+        w.push(&sample_record(1)).unwrap();
+        let err = w.finish().expect_err("should reject short write");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Final path must not exist — only the tmp file.
+        assert!(!path.exists());
     }
 }

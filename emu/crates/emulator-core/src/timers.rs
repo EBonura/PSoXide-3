@@ -253,12 +253,18 @@ impl Timers {
         let mut reached_wrap = false;
 
         // Target-reset mode: when counter crosses the target, reset to 0.
+        //
+        // Redux (`psxcounters.cc:reset`) wraps at exactly `target*rate`
+        // cycles per lap — the counter visits 0..=target-1 and a reset
+        // fires the instant it would reach `target`, snapping it back
+        // to 0. We were wrapping at `(target+1)*rate` (visiting
+        // 0..=target and wrapping on the tick after), losing one count
+        // per lap. That surfaced at parity step 79,389,318 as Timer 1
+        // reading one less than Redux a lap after reset.
         if t.mode & MODE_RESET_AT_TARGET != 0 && target != 0 {
-            if new_val > target as u64 {
+            if new_val >= target as u64 {
                 reached_target = true;
-                new_val %= (target as u64) + 1;
-            } else if new_val == target as u64 {
-                reached_target = true;
+                new_val %= target as u64;
             }
         }
 

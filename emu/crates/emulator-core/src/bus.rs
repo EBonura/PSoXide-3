@@ -50,7 +50,7 @@ pub struct Bus {
     irq: Irq,
     /// Root counters (Timer 0 / 1 / 2). Phase 2e is register-backing
     /// only; ticking lands with the cycle model.
-    timers: Timers,
+    pub timers: Timers,
     /// DMA controller (7 channels + DPCR + DICR). Phase 2g is
     /// register-backing only; transfers land as subsystems come online.
     dma: Dma,

@@ -239,6 +239,107 @@ impl ReduxProcess {
         Ok(records)
     }
 
+    /// Like [`step`], but invokes `on_record` for each record as it
+    /// arrives instead of accumulating a `Vec`. Use this when `n` is
+    /// large enough that holding every record in memory would exhaust
+    /// RAM — e.g. a 100 M-record trace is 14 GiB as `Vec`, but only
+    /// kilobytes at a time if the callback writes each record straight
+    /// to disk.
+    ///
+    /// `progress` (if `Some`) is called roughly every time the record
+    /// count crosses a multiple of the given interval. Use it to log
+    /// heartbeat lines on long runs so the operator can tell the
+    /// harness is still alive.
+    pub fn step_streaming<F>(
+        &mut self,
+        n: u64,
+        per_step_timeout: Duration,
+        progress_interval: Option<u64>,
+        mut on_record: F,
+    ) -> Result<(), OracleError>
+    where
+        F: FnMut(&InstructionRecord) -> Result<(), OracleError>,
+    {
+        // Redux's `step N` command accepts a 32-bit count; for longer
+        // runs we issue it in chunks so the protocol's internal loop
+        // stays bounded. A 100 M trace split into 100 × 1 M chunks
+        // still fits comfortably in the pipe's flow control.
+        const CHUNK: u64 = 1_000_000;
+        let mut emitted = 0u64;
+        let mut remaining = n;
+        while remaining > 0 {
+            let take = remaining.min(CHUNK);
+            self.send_command(&format!("step {take}"))?;
+            for _ in 0..take {
+                let line = self.wait_for_response(per_step_timeout)?;
+                let record = InstructionRecord::from_json_line(&line).map_err(|e| {
+                    OracleError::Protocol {
+                        expected: "InstructionRecord JSON".to_string(),
+                        got: format!("{line} (parse error: {e})"),
+                    }
+                })?;
+                on_record(&record)?;
+                emitted += 1;
+                if let Some(step) = progress_interval {
+                    if emitted % step == 0 {
+                        eprintln!(
+                            "[oracle] streamed {emitted}/{n} records ({:.1}%)",
+                            100.0 * emitted as f64 / n as f64
+                        );
+                    }
+                }
+            }
+            remaining -= take;
+        }
+        Ok(())
+    }
+
+    /// Coarse-grained divergence probe: run `n` user-side steps
+    /// silently, invoking `on_checkpoint(step, tick, pc)` every
+    /// `interval` steps. Returns the final Redux tick.
+    ///
+    /// A 100 M-step `run_checkpoint` with `interval = 10_000` emits
+    /// ~10 K checkpoints (a few hundred KiB on the wire) instead of
+    /// 14 GiB of full trace records, and finishes in ~30 s instead of
+    /// ~40 min. Its job is to localize divergence to an `interval`-
+    /// step window; a follow-up full `step()` inside that window
+    /// pinpoints the exact instruction.
+    pub fn run_checkpoint<F>(
+        &mut self,
+        n: u64,
+        interval: u64,
+        timeout: Duration,
+        mut on_checkpoint: F,
+    ) -> Result<u64, OracleError>
+    where
+        F: FnMut(u64, u64, u32) -> Result<(), OracleError>,
+    {
+        if interval == 0 || n == 0 {
+            return Err(OracleError::Protocol {
+                expected: "n > 0, interval > 0".to_string(),
+                got: format!("n={n} interval={interval}"),
+            });
+        }
+        self.send_command(&format!("run_checkpoint {n} {interval}"))?;
+        let expected_checkpoints = n / interval;
+        for _ in 0..expected_checkpoints {
+            let line = self.wait_for_response(timeout)?;
+            let (step, tick, pc) = parse_checkpoint(&line)?;
+            on_checkpoint(step, tick, pc)?;
+        }
+        // Final `run_checkpoint ok` summary line with the terminal
+        // state. It's always emitted even if `n % interval != 0`.
+        let final_line = self.wait_for_response(timeout)?;
+        let rest = final_line
+            .strip_prefix("run_checkpoint ok ")
+            .ok_or_else(|| OracleError::Protocol {
+                expected: "run_checkpoint ok ...".to_string(),
+                got: final_line.clone(),
+            })?;
+        let (_step, tick, _pc) = parse_kv_triple(rest, &final_line)?;
+        Ok(tick)
+    }
+
     /// Silently advance Redux by `n` instructions without emitting
     /// per-step records. The caller typically follows this with a
     /// `vram_hash` / `regs` / `peek32` query to capture only the
@@ -408,6 +509,39 @@ impl Drop for ReduxProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Parse `chk step=X tick=Y pc=Z` checkpoint lines.
+fn parse_checkpoint(line: &str) -> Result<(u64, u64, u32), OracleError> {
+    let rest = line.strip_prefix("chk ").ok_or_else(|| OracleError::Protocol {
+        expected: "chk step=... tick=... pc=...".to_string(),
+        got: line.to_string(),
+    })?;
+    parse_kv_triple(rest, line)
+}
+
+/// Parse `step=X tick=Y pc=Z` fragments (shared between `chk ...`
+/// and the final `run_checkpoint ok ...` line).
+fn parse_kv_triple(rest: &str, full_line: &str) -> Result<(u64, u64, u32), OracleError> {
+    let mut step = None;
+    let mut tick = None;
+    let mut pc = None;
+    for part in rest.split_whitespace() {
+        if let Some(v) = part.strip_prefix("step=") {
+            step = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("tick=") {
+            tick = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("pc=") {
+            pc = v.parse().ok();
+        }
+    }
+    match (step, tick, pc) {
+        (Some(s), Some(t), Some(p)) => Ok((s, t, p)),
+        _ => Err(OracleError::Protocol {
+            expected: "step=... tick=... pc=...".to_string(),
+            got: full_line.to_string(),
+        }),
     }
 }
 

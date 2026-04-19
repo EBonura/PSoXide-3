@@ -37,10 +37,20 @@ fn main() {
         );
     }
 
+    // Default: walk the longest cache on disk. Caller can cap the
+    // walk via arg 1 (useful for localizing a known-early bug
+    // without reading the whole 14 GiB file).
+    let max_steps: Option<usize> = std::env::args().nth(1).and_then(|s| s.parse().ok());
     let dir = cache::default_dir();
     eprintln!("[cache] loading trace from {}", dir.display());
-    let trace = cache::load_prefix(&dir, &bios, 50_000_000)
-        .expect("No cached trace long enough — run parity smoke test first");
+    let mut trace = cache::load_longest(&dir, &bios)
+        .expect("No cached trace — run `generate_trace` first");
+    if let Some(cap) = max_steps {
+        if trace.len() > cap {
+            trace.truncate(cap);
+            eprintln!("[cache] truncated walk to {cap} records");
+        }
+    }
     eprintln!("[cache] loaded {} records", trace.len());
 
     let mut bus = Bus::new(bios).expect("bus");
@@ -58,7 +68,7 @@ fn main() {
     // headline counts so we don't spam.
     const FULL_REPORT_LIMIT: usize = 10;
 
-    for (i, expected) in trace.iter().enumerate().take(50_000_000) {
+    for (i, expected) in trace.iter().enumerate() {
         // Capture our state BEFORE step — Redux's record is "the state
         // after step i retired", so we check AFTER we step too.
         //
