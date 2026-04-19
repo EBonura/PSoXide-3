@@ -433,15 +433,23 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-text" => Some(SdkGolden {
             example: "showcase-text",
             vblanks: 4,
-            // final_pc +4 after the MAX_PACK_HALFWORDS bump —
-            // same reason as hello-input above. VRAM + display
-            // hashes unchanged.
-            vram_hash: 0xde61_1495_21fe_4592,
-            display_hash: 0x55dc_43d0_b950_5909,
+            // Refreshed 2026-04-19-h after switching to the
+            // `FrameBuffer` double-buffered path. Text rendering
+            // was single-buffered before and visibly flickered as
+            // dense draws (~870 GP0 words / frame) crossed into
+            // the TV's active scanout. Double-buffer swaps show a
+            // stable buffer while we draw into the other.
+            //
+            // VRAM + display hashes shift (displayed buffer
+            // alternates A/B per frame now); final_pc shifts from
+            // the extra swap/clear code. Rotation angle at the
+            // 4-VBlank checkpoint is unchanged.
+            vram_hash: 0x3c0a_b554_b68e_a0e2,
+            display_hash: 0x7cfc_87d6_c36a_4ab1,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0a28,
+            final_pc: 0x8001_0ac0,
             redux_display_hash: None,
         }),
         _ => None,
