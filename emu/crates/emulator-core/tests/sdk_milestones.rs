@@ -424,6 +424,24 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_0b40,
             redux_display_hash: None,
         }),
+        // hello-audio: SPU init + 4 voices configured + ADPCM
+        // uploaded. With no pad input in the test harness, no key-on
+        // fires — the checkpoint therefore pins "SPU set up, no
+        // voices playing yet" which still verifies the upload /
+        // register-write path end-to-end. The `irq_histogram`
+        // shows SPU IRQs firing regularly (index 7), confirming
+        // the SPU pipeline runs.
+        "hello-audio" => Some(SdkGolden {
+            example: "hello-audio",
+            vblanks: 3,
+            vram_hash: 0x8b19_03a7_4844_8012,
+            display_hash: 0xf33b_e6bf_7624_17cd,
+            display_size: (320, 240),
+            vblank_raises: 3,
+            spu_samples: 1470,
+            final_pc: 0x8001_0ce8,
+            redux_display_hash: None,
+        }),
         _ => None,
     }
 }
@@ -479,6 +497,15 @@ fn milestone_c_hello_input() {
 #[ignore = "SDK milestone: hello-gte roundtrip"]
 fn milestone_c_hello_gte() {
     run_sdk_milestone("hello-gte", 2);
+}
+
+#[test]
+#[ignore = "SDK milestone: hello-audio roundtrip"]
+fn milestone_c_hello_audio() {
+    // 3 VBlanks lets the SPU run long enough for the init + upload
+    // sequence to fully complete and for a handful of audio-pump
+    // ticks to advance the `samples_produced` counter.
+    run_sdk_milestone("hello-audio", 3);
 }
 
 #[test]
