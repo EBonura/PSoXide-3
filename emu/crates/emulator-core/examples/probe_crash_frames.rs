@@ -24,14 +24,24 @@ fn main() {
     bus.cdrom.insert_disc(Some(Disc::from_bin(disc)));
     let mut cpu = Cpu::new();
 
+    // The "tent + Crash portrait + black bar" frame the user showed
+    // is part of the intro-logo sequence (Naughty Dog / Universal /
+    // SCE). It lives somewhere between the SCEA-licensed splash and
+    // the CRASH BANDICOOT title screen. Scan broadly.
+    // Finer scan covering the whole Crash intro window so we can
+    // locate the broken-black-bar frame the user screenshotted.
+    // Find when the "NAUGHTY DOG" logo-text appears between step
+    // 600M (bar with no text) and step 700M (past the animation).
     let checkpoints = [
-        1_400_000_000u64,
-        1_500_000_000,
-        1_600_000_000,
-        1_700_000_000,
-        1_800_000_000,
-        1_900_000_000,
-        2_000_000_000,
+        610_000_000u64,
+        620_000_000,
+        630_000_000,
+        640_000_000,
+        650_000_000,
+        660_000_000,
+        670_000_000,
+        680_000_000,
+        690_000_000,
     ];
     let mut cycles_at_last_pump = 0u64;
     let mut cursor = 0u64;

@@ -98,8 +98,12 @@ fn main() {
     if let Some(idx) = owner_idx {
         println!();
         println!("--- Nearby commands (opcode + first FIFO word) ---");
+        // Widened from 5 to 40 so we can see whether text / logo
+        // primitives follow the bar background — if they do, we're
+        // drawing them but getting the blend wrong; if they don't,
+        // the game code never issued them.
         let lo = (idx - 5).max(0);
-        let hi = (idx + 5).min(bus.gpu.cmd_log.len() as i64 - 1);
+        let hi = (idx + 40).min(bus.gpu.cmd_log.len() as i64 - 1);
         for i in lo..=hi {
             let e = &bus.gpu.cmd_log[i as usize];
             let mark = if i == idx { ">>>" } else { "   " };
@@ -107,6 +111,38 @@ fn main() {
                 "{mark} idx={:>7}  op=0x{:02x}  word[0]=0x{:08x}  ({})",
                 e.index, e.opcode, e.fifo[0], opcode_name(e.opcode),
             );
+        }
+        // Also scan AHEAD for any primitives that should draw ON TOP
+        // of this pixel's triangle — they'd cover our bar with the
+        // "NAUGHTY DOG" logo / Crash portrait. If none exist, the
+        // game code never emitted them (CPU-side bug). If they
+        // exist but we got nothing visible, the renderer is
+        // rejecting them (GPU-side bug).
+        println!();
+        println!("--- Scan forward 400 commands for texture/line primitives ---");
+        let scan_hi = (idx + 400).min(bus.gpu.cmd_log.len() as i64 - 1);
+        let mut non_shaded_tri_count = 0usize;
+        let mut histogram: std::collections::BTreeMap<u8, usize> = Default::default();
+        for i in (idx + 1)..=scan_hi {
+            let e = &bus.gpu.cmd_log[i as usize];
+            *histogram.entry(e.opcode).or_insert(0) += 1;
+            if !matches!(e.opcode, 0x30..=0x33 | 0x38..=0x3B) {
+                // Non-shaded-tri/quad — log the first 10 of these.
+                if non_shaded_tri_count < 10 {
+                    println!(
+                        "    idx={:>7}  op=0x{:02x}  word[0]=0x{:08x}  ({})",
+                        e.index, e.opcode, e.fifo[0], opcode_name(e.opcode),
+                    );
+                }
+                non_shaded_tri_count += 1;
+            }
+        }
+        println!(
+            "  Total non-shaded-tri commands in next 400: {non_shaded_tri_count}",
+        );
+        println!("  Opcode histogram:");
+        for (op, count) in histogram.iter() {
+            println!("    op=0x{op:02x} ({:>20}) : {count}", opcode_name(*op));
         }
 
         // Walk backwards from the owning draw to find the most-recent
