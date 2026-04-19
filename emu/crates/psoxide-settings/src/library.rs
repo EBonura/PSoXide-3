@@ -369,9 +369,25 @@ fn classify(path: &Path) -> Option<GameKind> {
     }
 }
 
+/// Directory names the recursive walker skips. Primarily cargo's
+/// per-target build-tree siblings — if the user points a library
+/// scanner at a cargo target-dir (the SDK-examples dir is exactly
+/// this case), we'd otherwise surface every intermediate
+/// `hello_tri-<hash>.exe` living under `deps/` as a separate
+/// library entry. Names match cargo's layout; `.fingerprint` +
+/// hidden dirs are caught by the leading-dot filter in `walk`.
+///
+/// Also kept short because a false positive (user has a folder
+/// legitimately named `deps/`) is strictly worse than scanning
+/// through it — keep the list tight and explainable.
+const SKIP_DIRS: &[&str] = &["deps", "incremental", "build"];
+
 /// Recursive directory walk. Returns a flat list of file paths —
 /// a full-blown `WalkDir` dep feels over-engineered for a few
-/// dozen lines of plain `read_dir`.
+/// dozen lines of plain `read_dir`. Skips directories in
+/// [`SKIP_DIRS`] and anything starting with `.`, so cargo's
+/// per-target build siblings don't show up as library entries
+/// when the scanner is pointed at an SDK-build output tree.
 fn walk(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -380,7 +396,22 @@ fn walk(root: &Path) -> Vec<PathBuf> {
         for entry in rd.flatten() {
             let p = entry.path();
             if p.is_dir() {
-                stack.push(p);
+                // Skip cargo's build-artifact siblings (`deps/`,
+                // `incremental/`, `build/`) and any hidden dir
+                // (`.fingerprint/`, dotfiles). Using `file_name()`
+                // rather than full-path matching means a user's
+                // real `deps/` folder anywhere in the walk is also
+                // skipped — an acceptable trade for keeping the
+                // scanner noise-free when rooted at a cargo
+                // target-dir like `build/examples/.../release/`.
+                let skip = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with('.') || SKIP_DIRS.contains(&n))
+                    .unwrap_or(false);
+                if !skip {
+                    stack.push(p);
+                }
             } else if p.is_file() {
                 out.push(p);
             }
@@ -745,6 +776,53 @@ mod tests {
         lib.scan(tmp.path()).unwrap();
         assert_eq!(lib.entries.len(), 1);
         assert_eq!(lib.entries[0].path, a);
+    }
+
+    #[test]
+    fn scan_skips_cargo_build_artifact_dirs() {
+        // Regression: when the library scanner is pointed at an SDK
+        // build-output tree (`build/examples/mipsel-sony-psx/release/`),
+        // cargo's `deps/` subdirectory contains intermediate
+        // `<crate>-<hash>.exe` artifacts. Those used to surface as
+        // separate library entries — the user saw both
+        // `hello-tri` and `hello_tri-<hash>` in the Examples column.
+        //
+        // Fix is in `walk()`: skip `deps/`, `incremental/`, `build/`,
+        // and any hidden dir. This test nails down the invariant.
+        let tmp = TempDir::new().unwrap();
+        // Main release output — the file the user should see.
+        std::fs::write(tmp.path().join("hello-tri.exe"), b"final").unwrap();
+        // Cargo's intermediate layout next to it.
+        let deps = tmp.path().join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(deps.join("hello_tri-0123456789abcdef.exe"), b"dep").unwrap();
+        std::fs::write(deps.join("hello_tri-0123456789abcdef.d"), b"").unwrap();
+        let incr = tmp.path().join("incremental");
+        std::fs::create_dir_all(&incr).unwrap();
+        std::fs::write(incr.join("hello_tri-abcd.exe"), b"inc").unwrap();
+        let hidden = tmp.path().join(".fingerprint");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("hello_tri-xxxx.exe"), b"fp").unwrap();
+        let builddir = tmp.path().join("build");
+        std::fs::create_dir_all(&builddir).unwrap();
+        std::fs::write(builddir.join("some-artifact.exe"), b"b").unwrap();
+
+        let mut lib = Library::default();
+        lib.scan(tmp.path()).unwrap();
+        assert_eq!(
+            lib.entries.len(),
+            1,
+            "only the top-level hello-tri.exe should be surfaced; \
+             got entries: {:?}",
+            lib.entries.iter().map(|e| &e.path).collect::<Vec<_>>(),
+        );
+        assert!(
+            lib.entries[0]
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n == "hello-tri.exe"),
+        );
     }
 
     #[test]
