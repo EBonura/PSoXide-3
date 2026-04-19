@@ -99,6 +99,14 @@ pub struct MenuState {
     category_index: usize,
     item_index: usize,
     anim_x: f32,
+    /// Per-frame animated scroll position for the item list, in
+    /// "rows of (ITEM_HEIGHT + ITEM_GAP)". A value of `N` means
+    /// item `N` is drawn at the top of the visible strip.
+    /// Eased toward the integer target computed from `item_index`
+    /// each frame by the same `ANIM_SPEED` knob that drives the
+    /// category slide, so navigating a long list produces a smooth
+    /// scroll rather than a snap.
+    scroll_y: f32,
     categories: Vec<Category>,
 }
 
@@ -157,6 +165,7 @@ impl MenuState {
             category_index: 0,
             item_index: 0,
             anim_x: 0.0,
+            scroll_y: 0.0,
             categories,
         }
     }
@@ -223,10 +232,17 @@ impl MenuState {
         if input.left && self.category_index > 0 {
             self.category_index -= 1;
             self.item_index = 0;
+            // Snap the scroll so the new category's list shows from
+            // the top — matches the Menu convention. The target for
+            // next frame will be 0.0 regardless; this avoids an
+            // awkward animation from mid-list in the previous
+            // category to top of the new one.
+            self.scroll_y = 0.0;
         }
         if input.right && self.category_index + 1 < num_cats {
             self.category_index += 1;
             self.item_index = 0;
+            self.scroll_y = 0.0;
         }
 
         let num_items = self.categories[self.category_index].items.len();
@@ -339,9 +355,67 @@ impl MenuState {
         let items_x = center_x - ITEM_WIDTH / 2.0;
         let label_font = FontId::proportional(15.0);
         let value_font = FontId::proportional(13.0);
+        let row_stride = ITEM_HEIGHT + ITEM_GAP;
+
+        // How many full rows fit between `items_start_y` and the
+        // bottom edge of the screen (with a small bottom margin so
+        // the list doesn't butt against the edge).
+        //
+        // `max(1)` so a degenerate window height (tiny resize during
+        // launch) still produces at least one visible row and avoids
+        // a divide-by-zero in the visible-count math below.
+        let bottom_margin = 16.0;
+        let available_h = (sh - items_start_y - bottom_margin).max(row_stride);
+        let visible_rows = (available_h / row_stride).floor().max(1.0) as usize;
+
+        // Compute a TARGET scroll position that keeps the selected
+        // item visible with a lead-in margin: once you hit row
+        // `edge_margin` from the top or bottom, further navigation
+        // scrolls the whole list instead of just moving the cursor.
+        // Matches the console Menu behaviour.
+        //
+        // For very short lists (num_items ≤ visible_rows) the target
+        // is 0 — nothing to scroll.
+        let num_items = cat.items.len();
+        let edge_margin: usize = if visible_rows >= 5 { 2 } else { 1 };
+        let target_scroll = if num_items <= visible_rows {
+            0.0_f32
+        } else {
+            let max_scroll = (num_items - visible_rows) as f32;
+            let sel = self.item_index as f32;
+            let top_lead = edge_margin as f32;
+            let bottom_lead = (visible_rows - 1 - edge_margin) as f32;
+            // Ideal scroll keeps the selected row between
+            // [scroll + top_lead, scroll + bottom_lead] inclusive.
+            let t = if sel < self.scroll_y + top_lead {
+                sel - top_lead
+            } else if sel > self.scroll_y + bottom_lead {
+                sel - bottom_lead
+            } else {
+                self.scroll_y
+            };
+            t.clamp(0.0, max_scroll)
+        };
+
+        // Ease `scroll_y` toward the target using the same
+        // `ANIM_SPEED * dt` blend that drives the horizontal
+        // category slide — so navigation feels uniform between
+        // axes. Snap when we're within a pixel of the target.
+        self.scroll_y += (target_scroll - self.scroll_y) * ANIM_SPEED * dt;
+        if (self.scroll_y - target_scroll).abs() * row_stride < 0.5 {
+            self.scroll_y = target_scroll;
+        }
 
         for (i, item) in cat.items.iter().enumerate() {
-            let y = items_start_y + i as f32 * (ITEM_HEIGHT + ITEM_GAP);
+            let y = items_start_y + (i as f32 - self.scroll_y) * row_stride;
+            let row_bottom = y + ITEM_HEIGHT;
+            // Cull items entirely above the list region or below the
+            // bottom margin. One row of overhang on each side so the
+            // scroll animation doesn't "pop" items in/out at the
+            // moment they fully arrive.
+            if row_bottom < items_start_y - row_stride || y > sh - bottom_margin {
+                continue;
+            }
             let is_selected = i == self.item_index;
 
             let bg = if is_selected {
@@ -388,6 +462,32 @@ impl MenuState {
                     val_color,
                 );
             }
+        }
+
+        // Scroll indicators: small triangles at the top/bottom edges
+        // of the item strip when there's content outside the visible
+        // window. Gives the user an affordance that "there's more
+        // here" without waiting for them to hit the edge.
+        let indicator_color = theme::MENU_TEXT_DIM;
+        let has_above = self.scroll_y > 0.1;
+        let has_below = (self.scroll_y + visible_rows as f32) < num_items as f32 - 0.1;
+        if has_above {
+            painter.text(
+                Pos2::new(center_x, items_start_y - 6.0),
+                Align2::CENTER_BOTTOM,
+                "▲",
+                FontId::proportional(10.0),
+                indicator_color,
+            );
+        }
+        if has_below {
+            painter.text(
+                Pos2::new(center_x, sh - bottom_margin + 4.0),
+                Align2::CENTER_TOP,
+                "▼",
+                FontId::proportional(10.0),
+                indicator_color,
+            );
         }
 
         // Bottom hint bar.
