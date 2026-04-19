@@ -16,7 +16,8 @@
         showcase-textured-sprite run-showcase-textured-sprite \
         showcase-text run-showcase-text \
         pong run-pong \
-        breakout run-breakout
+        breakout run-breakout \
+        invaders run-invaders
 
 help:
 	@echo "PSoXide-3 targets:"
@@ -47,6 +48,7 @@ help:
 	@echo "                      - build the text / font capabilities showcase"
 	@echo "    make pong         - build the Pong mini-game"
 	@echo "    make breakout     - build the Breakout mini-game"
+	@echo "    make invaders     - build the Space Invaders mini-game"
 	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
 	@echo "    make run-input    - build + side-load hello-input into the frontend"
 	@echo "    make run-ot       - build + side-load hello-ot into the frontend"
@@ -59,6 +61,7 @@ help:
 	@echo "                      - build + side-load the text capabilities showcase"
 	@echo "    make run-pong     - build + side-load the Pong mini-game"
 	@echo "    make run-breakout - build + side-load the Breakout mini-game"
+	@echo "    make run-invaders - build + side-load the Space Invaders mini-game"
 
 run:
 	cd emu && cargo run -p frontend --release
@@ -142,7 +145,10 @@ pong:
 breakout:
 	cd sdk/examples/breakout && cargo build --release
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text pong breakout
+invaders:
+	cd sdk/examples/invaders && cargo build --release
+
+examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text pong breakout invaders
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -180,3 +186,6 @@ run-pong: pong
 
 run-breakout: breakout
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/breakout.exe cargo run -p frontend --release
+
+run-invaders: invaders
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/invaders.exe cargo run -p frontend --release

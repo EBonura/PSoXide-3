@@ -471,6 +471,22 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_30f4,
             redux_display_hash: None,
         }),
+        // Third mini-game. Space Invaders: 5×10 alien grid, ship
+        // at bottom, bullet + bomb pools, wave progression. At
+        // the 120 VBlank checkpoint the aliens have marched a
+        // couple of steps + dropped their first bombs; no pad
+        // input = no player shots but the enemy AI is firing.
+        "invaders" => Some(SdkGolden {
+            example: "invaders",
+            vblanks: 120,
+            vram_hash: 0x70b9_8021_f18b_6295,
+            display_hash: 0x66a0_de19_df42_4319,
+            display_size: (320, 240),
+            vblank_raises: 120,
+            spu_samples: 88200,
+            final_pc: 0x8001_5338,
+            redux_display_hash: None,
+        }),
         _ => None,
     }
 }
@@ -557,6 +573,15 @@ fn milestone_c_breakout() {
     // mid-flight on the way up with all 40 bricks still in place.
     // Still exercises the 44-primitive OT path every frame.
     run_sdk_milestone("breakout", 60);
+}
+
+#[test]
+#[ignore = "SDK milestone: invaders roundtrip"]
+fn milestone_c_invaders() {
+    // 120 VBlanks captures the grid mid-march with enemy bombs
+    // in flight. Exercises the 50+-primitive OT path + the
+    // march / bullet / particle state machines.
+    run_sdk_milestone("invaders", 120);
 }
 
 #[test]
