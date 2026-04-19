@@ -30,7 +30,7 @@ impl TriFlat {
     pub const WORDS: u8 = 4;
 
     /// Build a flat triangle ready for OT insertion.
-    pub fn new(verts: [(i16, i16); 3], r: u8, g: u8, b: u8) -> Self {
+    pub const fn new(verts: [(i16, i16); 3], r: u8, g: u8, b: u8) -> Self {
         Self {
             tag: 0,
             color_cmd: gp0::polygon_opcode(false, false, false, false, false)
@@ -66,7 +66,7 @@ impl TriGouraud {
     pub const WORDS: u8 = 6;
 
     /// Build a Gouraud-shaded triangle.
-    pub fn new(verts: [(i16, i16); 3], colors: [(u8, u8, u8); 3]) -> Self {
+    pub const fn new(verts: [(i16, i16); 3], colors: [(u8, u8, u8); 3]) -> Self {
         let (r0, g0, b0) = colors[0];
         let (r1, g1, b1) = colors[1];
         let (r2, g2, b2) = colors[2];
@@ -105,7 +105,7 @@ impl QuadFlat {
     pub const WORDS: u8 = 5;
 
     /// Build a flat quad.
-    pub fn new(verts: [(i16, i16); 4], r: u8, g: u8, b: u8) -> Self {
+    pub const fn new(verts: [(i16, i16); 4], r: u8, g: u8, b: u8) -> Self {
         Self {
             tag: 0,
             color_cmd: gp0::polygon_opcode(false, true, false, false, false)
@@ -138,12 +138,200 @@ impl RectFlat {
     pub const WORDS: u8 = 3;
 
     /// Build a rect.
-    pub fn new(x: i16, y: i16, w: u16, h: u16, r: u8, g: u8, b: u8) -> Self {
+    pub const fn new(x: i16, y: i16, w: u16, h: u16, r: u8, g: u8, b: u8) -> Self {
         Self {
             tag: 0,
             color_cmd: 0x6000_0000 | pack_color(r, g, b),
             xy: pack_vertex(x, y),
             wh: pack_xy(w, h),
+        }
+    }
+}
+
+/// Gouraud-shaded quad. 9 words (tag + 8 data).
+///
+/// Same vertex order as [`QuadFlat`] (V0=TL, V1=TR, V2=BL, V3=BR
+/// by convention, though the GPU actually draws (V0,V1,V2) then
+/// (V1,V2,V3)). Each vertex carries its own RGB; the GPU
+/// gouraud-interpolates across the primitive.
+#[repr(C, align(4))]
+pub struct QuadGouraud {
+    /// OT linkage.
+    pub tag: u32,
+    /// Vertex 0 colour + polygon opcode.
+    pub color0_cmd: u32,
+    /// Vertex 0 position.
+    pub v0: u32,
+    /// Vertex 1 colour.
+    pub color1: u32,
+    /// Vertex 1 position.
+    pub v1: u32,
+    /// Vertex 2 colour.
+    pub color2: u32,
+    /// Vertex 2 position.
+    pub v2: u32,
+    /// Vertex 3 colour.
+    pub color3: u32,
+    /// Vertex 3 position.
+    pub v3: u32,
+}
+
+impl QuadGouraud {
+    /// Data-word count after the tag.
+    pub const WORDS: u8 = 8;
+
+    /// Build a Gouraud quad. `colors[i]` corresponds to `verts[i]`.
+    pub const fn new(verts: [(i16, i16); 4], colors: [(u8, u8, u8); 4]) -> Self {
+        let (r0, g0, b0) = colors[0];
+        let (r1, g1, b1) = colors[1];
+        let (r2, g2, b2) = colors[2];
+        let (r3, g3, b3) = colors[3];
+        Self {
+            tag: 0,
+            color0_cmd: gp0::polygon_opcode(true, true, false, false, false)
+                | pack_color(r0, g0, b0),
+            v0: pack_vertex(verts[0].0, verts[0].1),
+            color1: pack_color(r1, g1, b1),
+            v1: pack_vertex(verts[1].0, verts[1].1),
+            color2: pack_color(r2, g2, b2),
+            v2: pack_vertex(verts[2].0, verts[2].1),
+            color3: pack_color(r3, g3, b3),
+            v3: pack_vertex(verts[3].0, verts[3].1),
+        }
+    }
+}
+
+/// Monochrome single line. 4 words (tag + 3 data). GP0 0x40 — the
+/// real diagonal-capable line rasteriser (unlike `RectFlat`, which
+/// the GPU snaps to 16-pixel X boundaries in its GP0 0x02 fill).
+#[repr(C, align(4))]
+pub struct LineMono {
+    /// OT linkage.
+    pub tag: u32,
+    /// `0x40000000 | color` header.
+    pub color_cmd: u32,
+    /// First endpoint.
+    pub v0: u32,
+    /// Second endpoint.
+    pub v1: u32,
+}
+
+impl LineMono {
+    /// Data-word count.
+    pub const WORDS: u8 = 3;
+
+    /// Build a mono line.
+    pub const fn new(x0: i16, y0: i16, x1: i16, y1: i16, r: u8, g: u8, b: u8) -> Self {
+        Self {
+            tag: 0,
+            color_cmd: 0x4000_0000 | pack_color(r, g, b),
+            v0: pack_vertex(x0, y0),
+            v1: pack_vertex(x1, y1),
+        }
+    }
+}
+
+/// Textured triangle with a single flat tint. 8 words (tag + 7 data).
+///
+/// Vertex + UV pairs; CLUT rides in vertex 0's UV high word, tpage
+/// in vertex 1's UV high word (PSX-SPX convention for GP0 0x24).
+#[repr(C, align(4))]
+pub struct TriTextured {
+    /// OT linkage.
+    pub tag: u32,
+    /// `0x24000000 | tint` header.
+    pub color_cmd: u32,
+    /// Vertex 0 position.
+    pub v0: u32,
+    /// `(u0, v0, clut)` packed.
+    pub uv0_clut: u32,
+    /// Vertex 1 position.
+    pub v1: u32,
+    /// `(u1, v1, tpage)` packed.
+    pub uv1_tpage: u32,
+    /// Vertex 2 position.
+    pub v2: u32,
+    /// `(u2, v2, 0)` packed.
+    pub uv2: u32,
+}
+
+impl TriTextured {
+    /// Data-word count.
+    pub const WORDS: u8 = 7;
+
+    /// Build a textured triangle. `tint = (128, 128, 128)` leaves
+    /// texels unmodulated.
+    pub const fn new(
+        verts: [(i16, i16); 3],
+        uvs: [(u8, u8); 3],
+        clut: u16,
+        tpage: u16,
+        tint: (u8, u8, u8),
+    ) -> Self {
+        Self {
+            tag: 0,
+            color_cmd: 0x2400_0000 | pack_color(tint.0, tint.1, tint.2),
+            v0: pack_vertex(verts[0].0, verts[0].1),
+            uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, clut),
+            v1: pack_vertex(verts[1].0, verts[1].1),
+            uv1_tpage: pack_texcoord(uvs[1].0, uvs[1].1, tpage),
+            v2: pack_vertex(verts[2].0, verts[2].1),
+            uv2: pack_texcoord(uvs[2].0, uvs[2].1, 0),
+        }
+    }
+}
+
+/// Textured quad with a single flat tint. 10 words (tag + 9 data).
+///
+/// Same CLUT + tpage embedding as [`TriTextured`], extended by
+/// one vertex. Vertex order: TL, TR, BL, BR.
+#[repr(C, align(4))]
+pub struct QuadTextured {
+    /// OT linkage.
+    pub tag: u32,
+    /// `0x2C000000 | tint` header.
+    pub color_cmd: u32,
+    /// V0 position.
+    pub v0: u32,
+    /// `(u0, v0, clut)`.
+    pub uv0_clut: u32,
+    /// V1 position.
+    pub v1: u32,
+    /// `(u1, v1, tpage)`.
+    pub uv1_tpage: u32,
+    /// V2 position.
+    pub v2: u32,
+    /// `(u2, v2, 0)`.
+    pub uv2: u32,
+    /// V3 position.
+    pub v3: u32,
+    /// `(u3, v3, 0)`.
+    pub uv3: u32,
+}
+
+impl QuadTextured {
+    /// Data-word count.
+    pub const WORDS: u8 = 9;
+
+    /// Build a textured quad.
+    pub const fn new(
+        verts: [(i16, i16); 4],
+        uvs: [(u8, u8); 4],
+        clut: u16,
+        tpage: u16,
+        tint: (u8, u8, u8),
+    ) -> Self {
+        Self {
+            tag: 0,
+            color_cmd: 0x2C00_0000 | pack_color(tint.0, tint.1, tint.2),
+            v0: pack_vertex(verts[0].0, verts[0].1),
+            uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, clut),
+            v1: pack_vertex(verts[1].0, verts[1].1),
+            uv1_tpage: pack_texcoord(uvs[1].0, uvs[1].1, tpage),
+            v2: pack_vertex(verts[2].0, verts[2].1),
+            uv2: pack_texcoord(uvs[2].0, uvs[2].1, 0),
+            v3: pack_vertex(verts[3].0, verts[3].1),
+            uv3: pack_texcoord(uvs[3].0, uvs[3].1, 0),
         }
     }
 }
@@ -170,7 +358,7 @@ impl Sprite {
     /// Build a textured sprite. `clut` is the CLUT register handle
     /// (`y << 6 | x >> 4`); `uv` is the 8-bit texcoord within the
     /// texture page.
-    pub fn new(
+    pub const fn new(
         x: i16,
         y: i16,
         w: u16,
