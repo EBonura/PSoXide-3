@@ -456,20 +456,19 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_1030,
             redux_display_hash: None,
         }),
-        // Second mini-game. 60 VBlanks captures one serve-arc
-        // (auto-launched at frame 30, ball mid-flight on the way
-        // up) with all 40 bricks still in place. Exercises the
-        // 44-primitive OT path every frame plus the ball physics
-        // + auto-serve state machine.
+        // Second mini-game. 60 VBlanks captures one serve-arc +
+        // brick-break region with effects active (gradient BG,
+        // ball trail, particles, potentially screen shake).
+        // Exercises ~50-primitive OT path during effect bursts.
         "breakout" => Some(SdkGolden {
             example: "breakout",
             vblanks: 60,
-            vram_hash: 0xe817_5a59_78d9_f2f1,
-            display_hash: 0x445b_7be1_6cee_6277,
+            vram_hash: 0x287c_bcfb_0959_e891,
+            display_hash: 0x96c6_0f48_bdd3_5cd3,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_2210,
+            final_pc: 0x8001_30f4,
             redux_display_hash: None,
         }),
         _ => None,

@@ -28,7 +28,7 @@ fn main() {
     // 30 = auto-launch just fires; 45 = ball halfway up; 60 =
     // hitting the bottom brick row; 90 = first brick break; 180 =
     // a few more bricks cleared.
-    let sample_targets: &[u64] = &[4, 30, 45, 60, 90, 180, 300];
+    let sample_targets: &[u64] = &[4, 30, 60, 85, 88, 92, 96, 180, 300];
 
     let mut cycles_at_last_pump = 0u64;
     for &target in sample_targets {

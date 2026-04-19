@@ -3,8 +3,9 @@
 //!
 //! Bigger than Pong and stresses parts of the SDK Pong didn't:
 //!
-//! - **OT scale**: up to 44 primitives per frame (40 bricks + 2
-//!   borders + paddle + ball). Validates the ordering-table path
+//! - **OT scale**: ~100 primitives per busy frame (40 bricks + 32
+//!   particle-pool + 4 ball-trail + paddle + ball + 2 borders +
+//!   gradient background). Validates the ordering-table path
 //!   handles non-trivial scene counts.
 //! - **Axis-resolved collision**: bricks can be hit from any side;
 //!   we pick the smallest-penetration axis and reflect that
@@ -17,6 +18,12 @@
 //!   different point values so the scoreboard climbs unevenly,
 //!   showing the font's hex-printing helper stays legible over
 //!   the game frame.
+//! - **Arcade polish effects** — gradient background
+//!   (`QuadGouraud`), screen shake on brick break, brick-break
+//!   particle burst, ball trail afterimages, paddle flash on hit.
+//!   All built from the same `RectFlat` / `QuadGouraud` primitives
+//!   already used for the static scene — no new hardware paths,
+//!   just clever scheduling in the OT.
 
 #![no_std]
 #![no_main]
@@ -27,7 +34,7 @@ extern crate psx_rt;
 use psx_font::{FontAtlas, fonts::BASIC_8X16};
 use psx_gpu::framebuf::FrameBuffer;
 use psx_gpu::ot::OrderingTable;
-use psx_gpu::prim::RectFlat;
+use psx_gpu::prim::{QuadGouraud, RectFlat};
 use psx_gpu::{self as gpu, Resolution, VideoMode};
 use psx_pad::{ButtonState, button, poll_port1};
 use psx_spu::{self as spu, Adsr, Pitch, SpuAddr, Voice, Volume, tones};
@@ -132,11 +139,64 @@ struct Game {
     /// after [`SERVE_AUTO_LAUNCH_FRAMES`] so the game plays itself
     /// if the pad is idle (good UX + deterministic milestones).
     serve_wait: u16,
+    /// Screen-shake countdown. Non-zero = jitter the draw offset.
+    shake_frames: u8,
+    /// Paddle-flash countdown. Non-zero = tint the paddle brighter.
+    paddle_flash_frames: u8,
+    /// Particle pool — bursts from breaking bricks. Reused slots.
+    particles: [Particle; MAX_PARTICLES],
+    /// Ball's last N positions for the trail effect. Ring buffer,
+    /// `trail_head` is the index of the oldest entry.
+    trail_positions: [(i16, i16); TRAIL_LEN],
+    trail_head: u8,
+    /// Tiny LCG PRNG state for particle velocity seeding. Deterministic
+    /// so the milestone goldens stay stable.
+    rng: u32,
+    /// Frame counter — drives per-frame effects that want a phase
+    /// reference (none currently, but useful for future pulse FX).
+    frame: u32,
 }
 
 /// Auto-launch the ball when Serve phase has held for this many
 /// frames without a CROSS press. ~0.5 s at 60 Hz.
 const SERVE_AUTO_LAUNCH_FRAMES: u16 = 30;
+
+/// Maximum concurrent brick-break particles. Each brick hit
+/// spawns [`PARTICLES_PER_BURST`] — pool size needs to cover a
+/// handful of overlapping bursts.
+const MAX_PARTICLES: usize = 32;
+/// Particles spawned per brick break.
+const PARTICLES_PER_BURST: usize = 6;
+/// Particle time-to-live in frames (≈0.5 s at 60 Hz).
+const PARTICLE_TTL: u8 = 30;
+/// How many previous ball positions the trail samples.
+const TRAIL_LEN: usize = 4;
+/// Frames the screen stays shaky after a brick break.
+const SHAKE_FRAMES_ON_BREAK: u8 = 6;
+/// Frames the paddle stays bright after a ball hit.
+const PADDLE_FLASH_FRAMES_ON_HIT: u8 = 6;
+
+/// Single particle — a short-lived coloured dot that drifts then fades.
+#[derive(Copy, Clone)]
+struct Particle {
+    x: i16,
+    y: i16,
+    /// Sub-pixel velocity in Q4.4 — so `vx = 32` is 2 px/frame.
+    vx: i16,
+    vy: i16,
+    /// Packed colour at spawn; renderer fades this by `ttl`.
+    r: u8,
+    g: u8,
+    b: u8,
+    /// Frames remaining. 0 = slot empty.
+    ttl: u8,
+}
+
+impl Particle {
+    const fn empty() -> Self {
+        Self { x: 0, y: 0, vx: 0, vy: 0, r: 0, g: 0, b: 0, ttl: 0 }
+    }
+}
 
 static mut GAME: Game = Game {
     phase: Phase::Serve,
@@ -150,12 +210,32 @@ static mut GAME: Game = Game {
     bricks: [true; BRICK_COUNT],
     bricks_left: BRICK_COUNT as u16,
     serve_wait: 0,
+    shake_frames: 0,
+    paddle_flash_frames: 0,
+    particles: [Particle::empty(); MAX_PARTICLES],
+    trail_positions: [(0, 0); TRAIL_LEN],
+    trail_head: 0,
+    rng: 0xBEEF_0042,
+    frame: 0,
 };
 
 static mut OT: OrderingTable<8> = OrderingTable::new();
-/// Enough rect slots for the full scene: 40 bricks + 2 borders +
-/// paddle + ball = 44 with a little headroom.
-static mut RECTS: [RectFlat; 48] = [const { RectFlat::new(0, 0, 0, 0, 0, 0, 0) }; 48];
+/// Rect slots for the full scene incl. effects:
+///   2 borders + 40 bricks + 32 particles + 4 trail + paddle +
+///   ball = 80, rounded up to 96 for headroom.
+static mut RECTS: [RectFlat; 96] = [const { RectFlat::new(0, 0, 0, 0, 0, 0, 0) }; 96];
+/// One gradient-background quad.
+static mut BG_QUAD: QuadGouraud = QuadGouraud {
+    tag: 0,
+    color0_cmd: 0,
+    v0: 0,
+    color1: 0,
+    v1: 0,
+    color2: 0,
+    v2: 0,
+    color3: 0,
+    v3: 0,
+};
 
 // ----------------------------------------------------------------------
 // Entry point
@@ -223,7 +303,84 @@ fn reset_match() {
     g.bricks = [true; BRICK_COUNT];
     g.bricks_left = BRICK_COUNT as u16;
     g.serve_wait = 0;
+    g.shake_frames = 0;
+    g.paddle_flash_frames = 0;
+    g.particles = [Particle::empty(); MAX_PARTICLES];
+    g.trail_positions = [(0, 0); TRAIL_LEN];
+    g.trail_head = 0;
+    g.rng = 0xBEEF_0042;
+    g.frame = 0;
     reset_ball_on_paddle();
+}
+
+/// Park-miller step — 32-bit integer PRNG, deterministic across
+/// runs. Not cryptographically interesting; perfect for picking
+/// particle velocities.
+fn next_rand(g: &mut Game) -> u32 {
+    g.rng = g.rng.wrapping_mul(1_103_515_245).wrapping_add(12345);
+    g.rng
+}
+
+/// Pick a signed random in `-range..=range` using 5 bits of
+/// entropy from the LCG — enough granularity for particle spray.
+fn rand_sign(g: &mut Game, range: i16) -> i16 {
+    let r = next_rand(g);
+    let raw = ((r >> 16) & 0x1F) as i16; // 0..=31
+    (raw - 16) * range / 16 // scale to -range..=range
+}
+
+/// Spawn a burst of particles from a brick centre. Velocities
+/// spray outward with small random jitter; colour inherits from
+/// the brick that broke.
+fn spawn_brick_particles(g: &mut Game, cx: i16, cy: i16, color: (u8, u8, u8)) {
+    let mut spawned = 0;
+    for slot in 0..MAX_PARTICLES {
+        if g.particles[slot].ttl != 0 {
+            continue;
+        }
+        // Spread: outward "plus gravity" feel. Bias upward a bit
+        // so the explosion looks satisfying then falls.
+        let vx = rand_sign(g, 40);
+        let vy = rand_sign(g, 40) - 16; // pulls up
+        g.particles[slot] = Particle {
+            x: cx,
+            y: cy,
+            vx,
+            vy,
+            r: color.0,
+            g: color.1,
+            b: color.2,
+            ttl: PARTICLE_TTL,
+        };
+        spawned += 1;
+        if spawned >= PARTICLES_PER_BURST {
+            break;
+        }
+    }
+}
+
+/// Update every live particle: drift + gravity + decrement TTL.
+fn update_particles(g: &mut Game) {
+    for p in &mut g.particles {
+        if p.ttl == 0 {
+            continue;
+        }
+        // Q4.4 velocity → integrate into position at 1/16 px /frame.
+        // Tracking a sub-pixel accumulator would be cleaner; for
+        // this TTL (30 frames) the drift is fine as integer px.
+        p.x = p.x.wrapping_add(p.vx / 16);
+        p.y = p.y.wrapping_add(p.vy / 16);
+        // Gravity: +2 Q4.4 per frame → +0.125 px/frame²
+        p.vy = p.vy.saturating_add(2);
+        p.ttl -= 1;
+    }
+}
+
+/// Record the current ball position into the trail ring buffer
+/// (called once per frame).
+fn push_trail(g: &mut Game) {
+    g.trail_positions[g.trail_head as usize] = (g.ball_x, g.ball_y);
+    g.trail_head = (g.trail_head + 1) % TRAIL_LEN as u8;
 }
 
 /// Park the ball on top of the paddle for serve.
@@ -237,6 +394,18 @@ fn reset_ball_on_paddle() {
 
 fn update_game(pad: ButtonState) {
     let g = unsafe { &mut GAME };
+
+    // Effect counters tick every frame so they also decay during
+    // Serve / Won / Lost. Keeps transitions smooth.
+    g.frame = g.frame.wrapping_add(1);
+    if g.shake_frames > 0 {
+        g.shake_frames -= 1;
+    }
+    if g.paddle_flash_frames > 0 {
+        g.paddle_flash_frames -= 1;
+    }
+    update_particles(g);
+    push_trail(g);
 
     match g.phase {
         Phase::Won | Phase::Lost => {
@@ -305,6 +474,7 @@ fn update_game(pad: ButtonState) {
             // Guarantee forward motion — a zero vx would stick.
             g.ball_vx = 1;
         }
+        g.paddle_flash_frames = PADDLE_FLASH_FRAMES_ON_HIT;
         play_sfx(VOICE_PADDLE);
     }
 
@@ -412,6 +582,12 @@ fn resolve_brick_collision(g: &mut Game) {
             g.bricks[idx] = false;
             g.bricks_left -= 1;
             g.score = g.score.saturating_add(ROW_POINTS[row]);
+            // Effect triggers: particle burst + screen shake.
+            let brick_color = ROW_COLORS[row];
+            let brick_cx = bx + BRICK_W as i16 / 2;
+            let brick_cy = by + BRICK_H as i16 / 2;
+            spawn_brick_particles(g, brick_cx, brick_cy, brick_color);
+            g.shake_frames = SHAKE_FRAMES_ON_BREAK;
             play_sfx(VOICE_BRICK);
             return;
         }
@@ -425,14 +601,56 @@ fn resolve_brick_collision(g: &mut Game) {
 fn build_frame_ot() {
     let ot = unsafe { &mut OT };
     let rects = unsafe { &mut RECTS };
+    let bg = unsafe { &mut BG_QUAD };
     ot.clear();
 
     let g = unsafe { &GAME };
 
-    // Side borders (slot 0 = back).
-    rects[0] = RectFlat::new(0, 0, BORDER_W, SCREEN_H as u16, 140, 140, 180);
+    // Screen shake: deterministic triangle-wave jitter over the
+    // last `shake_frames` frames. Keeps the HUD still (it's drawn
+    // immediate-mode after the OT submit, outside this shake).
+    let (shake_dx, shake_dy) = if g.shake_frames > 0 {
+        // Drift sign flips each frame so it reads as a judder.
+        let s = g.shake_frames as i16;
+        let sign = if s & 1 == 0 { 1 } else { -1 };
+        ((s / 2) * sign, ((s + 1) / 2) * -sign)
+    } else {
+        (0, 0)
+    };
+
+    // OT slot convention (see `psx_gpu::ot`): slot N-1 draws
+    // FIRST and slot 0 LAST. On a PSX with no Z-buffer, later
+    // draws paint over earlier draws — so slot 0 = front, slot 7
+    // = back. That's why the gradient goes to slot 7 and the ball
+    // goes to slot 0.
+    //
+    // Slot 7 (back) — gradient background via the new QuadGouraud
+    // primitive. Top is a deep indigo, bottom fades to black-navy
+    // so the bricks pop off the upper half.
+    *bg = QuadGouraud::new(
+        [
+            (0, 0),
+            (SCREEN_W, 0),
+            (0, SCREEN_H),
+            (SCREEN_W, SCREEN_H),
+        ],
+        [
+            (22, 30, 64),   // top-left   — richer indigo
+            (22, 30, 64),
+            (4, 6, 18),     // bottom-left — near-black navy
+            (4, 6, 18),
+        ],
+    );
+    // SAFETY: `bg` points into BG_QUAD which is a fixed static
+    // address; DMA walker sees a stable bus address.
+    unsafe {
+        ot.add(7, bg, QuadGouraud::WORDS);
+    }
+
+    // Slot 6 — side borders just in front of the background.
+    rects[0] = RectFlat::new(shake_dx, 0, BORDER_W, SCREEN_H as u16, 140, 140, 180);
     rects[1] = RectFlat::new(
-        SCREEN_W - BORDER_W as i16,
+        SCREEN_W - BORDER_W as i16 + shake_dx,
         0,
         BORDER_W,
         SCREEN_H as u16,
@@ -441,11 +659,12 @@ fn build_frame_ot() {
         180,
     );
     unsafe {
-        ot.add(0, &mut rects[0], RectFlat::WORDS);
-        ot.add(0, &mut rects[1], RectFlat::WORDS);
+        ot.add(6, &mut rects[0], RectFlat::WORDS);
+        ot.add(6, &mut rects[1], RectFlat::WORDS);
     }
 
-    // Bricks (slot 3).
+    // Slot 4 — bricks. Shake applied as a vertex offset so only
+    // the game field jitters, not the gradient / HUD.
     let mut idx = 2;
     for row in 0..ROWS {
         let (r, gc, b) = ROW_COLORS[row];
@@ -454,27 +673,101 @@ fn build_frame_ot() {
             if !g.bricks[bidx] {
                 continue;
             }
-            let bx = WALL_LEFT + (col as i16) * (BRICK_W as i16 + BRICK_GAP);
-            let by = WALL_TOP + (row as i16) * (BRICK_H as i16 + BRICK_GAP);
+            let bx = WALL_LEFT + (col as i16) * (BRICK_W as i16 + BRICK_GAP) + shake_dx;
+            let by = WALL_TOP + (row as i16) * (BRICK_H as i16 + BRICK_GAP) + shake_dy;
             rects[idx] = RectFlat::new(bx, by, BRICK_W, BRICK_H, r, gc, b);
             unsafe {
-                ot.add(3, &mut rects[idx], RectFlat::WORDS);
+                ot.add(4, &mut rects[idx], RectFlat::WORDS);
             }
             idx += 1;
         }
     }
 
-    // Paddle (slot 5).
-    rects[idx] = RectFlat::new(g.paddle_x, PADDLE_Y, PADDLE_W, PADDLE_H, 220, 220, 240);
+    // Slot 3 — particles, in front of bricks and behind paddle/ball.
+    // Size shrinks + colour dims as TTL decays so each burst fades
+    // out gracefully.
+    for p in &g.particles {
+        if p.ttl == 0 {
+            continue;
+        }
+        // Fade: scale colour channels by ttl / PARTICLE_TTL.
+        let scale = p.ttl as u16;
+        let denom = PARTICLE_TTL as u16;
+        let r = ((p.r as u16 * scale) / denom) as u8;
+        let gc = ((p.g as u16 * scale) / denom) as u8;
+        let b = ((p.b as u16 * scale) / denom) as u8;
+        // Size tapers: 3 px at full ttl, 1 px near death.
+        let size = if p.ttl > PARTICLE_TTL / 2 { 3 } else { 2 };
+        rects[idx] = RectFlat::new(p.x + shake_dx, p.y + shake_dy, size, size, r, gc, b);
+        unsafe {
+            ot.add(3, &mut rects[idx], RectFlat::WORDS);
+        }
+        idx += 1;
+        if idx >= rects.len() - 6 {
+            break; // leave room for paddle + ball + trail
+        }
+    }
+
+    // Slot 2 — ball trail, behind the paddle + ball.
+    // Uses the ring buffer; oldest entry dimmest. Skip drawing
+    // during Serve so the trail doesn't drag along the paddle.
+    if g.phase == Phase::Playing {
+        for i in 0..TRAIL_LEN {
+            let slot_idx = (g.trail_head as usize + i) % TRAIL_LEN;
+            let (tx, ty) = g.trail_positions[slot_idx];
+            // `i=0` is oldest (dimmest), `i=TRAIL_LEN-1` is newest
+            // and closest to the actual ball — skip the newest to
+            // avoid drawing right on top of the ball.
+            if i == TRAIL_LEN - 1 {
+                continue;
+            }
+            // Linear fade by position in history.
+            let brightness = (i + 1) as u16 * 50;
+            let r = (brightness.min(220)) as u8;
+            let gc = (brightness.min(200)) as u8;
+            let b = (brightness.min(120)) as u8;
+            // Trail rects shrink slightly too.
+            let size = 3 + i as u16;
+            rects[idx] = RectFlat::new(tx + shake_dx, ty + shake_dy, size as u16, size as u16, r, gc, b);
+            unsafe {
+                ot.add(2, &mut rects[idx], RectFlat::WORDS);
+            }
+            idx += 1;
+        }
+    }
+
+    // Slot 1 — paddle. Flash brighter while `paddle_flash_frames > 0`.
+    let (pr, pg, pb) = if g.paddle_flash_frames > 0 {
+        (255, 255, 200) // warm white flash
+    } else {
+        (220, 220, 240)
+    };
+    rects[idx] = RectFlat::new(
+        g.paddle_x + shake_dx,
+        PADDLE_Y + shake_dy,
+        PADDLE_W,
+        PADDLE_H,
+        pr,
+        pg,
+        pb,
+    );
     unsafe {
-        ot.add(5, &mut rects[idx], RectFlat::WORDS);
+        ot.add(1, &mut rects[idx], RectFlat::WORDS);
     }
     idx += 1;
 
-    // Ball (slot 7, front).
-    rects[idx] = RectFlat::new(g.ball_x, g.ball_y, BALL_SIZE, BALL_SIZE, 255, 230, 120);
+    // Slot 0 (frontmost) — ball.
+    rects[idx] = RectFlat::new(
+        g.ball_x + shake_dx,
+        g.ball_y + shake_dy,
+        BALL_SIZE,
+        BALL_SIZE,
+        255,
+        230,
+        120,
+    );
     unsafe {
-        ot.add(7, &mut rects[idx], RectFlat::WORDS);
+        ot.add(0, &mut rects[idx], RectFlat::WORDS);
     }
 }
 
