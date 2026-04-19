@@ -274,18 +274,43 @@ impl InputSettings {
 
 /// Emulator-level toggles. `hle_bios` is the big one — everything
 /// else can grow as we add features.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmulatorSettings {
     /// Side-loaded EXEs rely on HLE BIOS by default; fully-booted
     /// commercial games don't. This toggle governs the *default*
     /// that gets applied when launching a game; per-game overrides
     /// in the library cache can flip it.
+    ///
+    /// Defaults to **true** — matches what `PSOXIDE_EXE=…` side-load
+    /// does unconditionally (see `app::load_exe`). Previously this
+    /// derived `Default`, giving `false`, which made the library-
+    /// launch path ship a half-initialised BIOS kernel state to the
+    /// EXE. Every SDK example's SYSCALL to `InstallISR` / `FlushCache`
+    /// etc. landed in a BIOS kernel that hadn't been cold-booted,
+    /// silently fell off a wild PC, and produced a blank screen
+    /// while `make run-tri` (env-var path, HLE unconditional) worked
+    /// fine. Flipping the default brings the two paths into agreement.
+    #[serde(default = "default_hle_for_side_load")]
     pub hle_bios_for_side_load: bool,
     /// If set, the run loop paces itself to real-time instead of
     /// running flat-out. Defaults to false — we want flat-out
     /// speed for parity / debugging. A future audio feature will
     /// flip this on so the SPU stays in sync.
+    #[serde(default)]
     pub real_time_pacing: bool,
+}
+
+fn default_hle_for_side_load() -> bool {
+    true
+}
+
+impl Default for EmulatorSettings {
+    fn default() -> Self {
+        Self {
+            hle_bios_for_side_load: default_hle_for_side_load(),
+            real_time_pacing: false,
+        }
+    }
 }
 
 /// The full settings root. Shape is intentionally flat — no deep
