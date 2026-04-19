@@ -392,18 +392,22 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-gte" => Some(SdkGolden {
             example: "hello-gte",
             vblanks: 2,
-            // Captured 2026-04-19-c after the cube-draws-as-lines
-            // fix: edges now drawn via GP0 0x40 (real diagonal line
-            // rasteriser) instead of `fill_rect` + 2×2 staircase.
-            // Previous golden was pinning the 16-pixel-aligned noise
-            // fill_rect produced — garbage output that happened to
-            // be deterministic.
-            vram_hash: 0x019e_81dc_704c_7e7b,
-            display_hash: 0xe749_8488_bb15_9e7b,
+            // Refreshed 2026-04-19-d after the MFC2/CFC2 load-delay
+            // fix in `psx-gte::regs`. Previous goldens pinned the
+            // pre-fix output where `scene::project_vertex` returned
+            // the STALE $8 register value (whatever was written by
+            // the preceding MTC2) instead of the coprocessor result
+            // — visually that produced an entirely blank frame since
+            // the resulting "screen coords" were the raw vertex
+            // XY/Z bits (e.g. (-2048, -1)), clipped off-screen.
+            // The new golden captures a real wireframe cube with
+            // 12 visible edges tumbling on the blue background.
+            vram_hash: 0xfe80_941e_838f_6e81,
+            display_hash: 0x3bd7_90b1_1224_0a81,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_0a30,
+            final_pc: 0x8001_0a68,
             redux_display_hash: None,
         }),
         "showcase-textured-sprite" => Some(SdkGolden {

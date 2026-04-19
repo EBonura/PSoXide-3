@@ -63,7 +63,20 @@
 //! | 31              | FLAG (error/saturation bits)              |
 
 /// Move-from-COP2 data register. Expands to a single MFC2 instruction
-/// with the register index baked into the `.word` encoding.
+/// with the register index baked into the `.word` encoding, followed
+/// by a NOP that fills the one-cycle load-delay slot.
+///
+/// **Why the NOP**: MIPS R3000 MFC2/CFC2 commit their result to the
+/// CPU GPR at the END of the NEXT instruction — not at the end of
+/// MFC2 itself. Rust's inline-asm output binding (`out("$8") value`)
+/// makes the compiler insert a move-from-$8 right after the `.word`
+/// block, and that move runs in the delay slot → sees the
+/// pre-MFC2 value of $8, not the coprocessor data. The emulator
+/// models this correctly (see `cpu::committing_load`), so without
+/// the NOP every `mfc2!` call silently returns stale data.
+///
+/// Encoded as two `.word`s: the MFC2 then a 32-bit zero (the MIPS
+/// canonical NOP = `SLL $0, $0, 0`).
 #[macro_export]
 macro_rules! mfc2 {
     ($reg:literal) => {{
@@ -72,6 +85,7 @@ macro_rules! mfc2 {
         unsafe {
             core::arch::asm!(
                 ".word {instr}",
+                ".word 0",
                 instr = const (0x4808_0000u32 | (($reg as u32) << 11)),
                 out("$8") value,
                 options(nostack, nomem, preserves_flags)
@@ -102,7 +116,10 @@ macro_rules! mtc2 {
     }};
 }
 
-/// Control-from-COP2 register (reads GTE *control* bank).
+/// Control-from-COP2 register (reads GTE *control* bank). Same
+/// load-delay concern as [`mfc2!`] — emits a NOP after the CFC2 to
+/// give the result a cycle to commit to $8 before Rust's
+/// compiler-inserted move-from-$8 runs.
 #[macro_export]
 macro_rules! cfc2 {
     ($reg:literal) => {{
@@ -111,6 +128,7 @@ macro_rules! cfc2 {
         unsafe {
             core::arch::asm!(
                 ".word {instr}",
+                ".word 0",
                 instr = const (0x4848_0000u32 | (($reg as u32) << 11)),
                 out("$8") value,
                 options(nostack, nomem, preserves_flags)
