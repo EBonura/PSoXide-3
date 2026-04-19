@@ -175,29 +175,25 @@ fn milestone_a_bios_to_sony_logo() {
     // when pixel parity hits 0% differing bytes, replace with the
     // captured Redux hash to lock in correctness.
     let state = run_milestone(100_000_000, None);
-    // Hashes updated 2026-04-19 — three Redux-parity fixes landed
-    // together, dropping visible divergence from 3.48% to effectively
-    // 0% (8 pixels differ, all off-by-1 green from barycentric vs.
-    // scanline rounding on one column):
-    //   1. `dither_rgb` rewritten to Redux's coefficient-threshold
-    //      model (not the PSX-SPX additive offset). See
-    //      `dither_rgb_matches_redux_truth_table`.
-    //   2. `blend_pixel` Average fixed to per-channel `(bg>>1) + (fg>>1)`
-    //      (Redux's `& 0x7bde >> 1` pattern) — the naive `(bg+fg)/2`
-    //      rounded wrong for odd+odd inputs. See
-    //      `blend_average_odd_plus_odd_matches_redux`.
-    //   3. Top-left fill rule applied via `top_left_biases` — PSX
-    //      excludes bottom + right edges; we used to include them.
-    //      See `top_left_bias_classifies_ccw_edges`.
+    // Hashes updated 2026-04-19 — scanline-delta rasterizer port lands.
+    // Byte-exact parity with Redux at the Sony logo:
+    //   display_fnv1a_64 = 0xa3ac6881044333d0
+    //   Redux hash       = 0xa3ac6881044333d0 (same)
+    //
+    // Four renderer-parity fixes in total:
+    //   1. `dither_rgb` — Redux's coefficient-threshold model
+    //   2. `blend_pixel` Average — per-channel `(bg>>1) + (fg>>1)`
+    //   3. Top-left fill rule (now subsumed by the scanline walk)
+    //   4. Scanline-delta rasterizer (replaces the per-pixel
+    //      barycentric interpolator). Matches Redux's `drawPoly3Gi`
+    //      / `drawPoly3TGEx{4,8}i` byte-for-byte.
     assert_milestone(
         "Milestone A",
         &state,
-        0x3d63_9437_6cf4_0218, // full VRAM (self)
-        0x8228_f202_dac3_16d0, // display area (self, ~99.999% Redux-match)
+        0xc9b9_c135_d24c_6f57, // full VRAM (self)
+        0xa3ac_6881_0443_33d0, // display area — PIXEL-EXACT with Redux
         (640, 478),
-        None, // 8/611840 bytes still differ vs Redux — barycentric
-              // interpolation vs scanline-delta rounding, not worth
-              // a major rewrite.
+        Some(0xa3ac_6881_0443_33d0), // Redux-verified pixel parity
     );
 }
 
@@ -208,17 +204,14 @@ fn milestone_b_bios_to_shell() {
     // boot logo to the MAIN MENU shell screen (MEMORY CARD / CD
     // PLAYER, radial blue gradient).
     let state = run_milestone(500_000_000, None);
-    // Hashes updated 2026-04-19 — same renderer parity pass as
-    // milestone A. Shell screen uses lots of Gouraud gradients for
-    // the radial background, so blend + dither + top-left all feed
-    // in.
+    // Hashes updated 2026-04-19 — scanline-delta rasterizer port.
     assert_milestone(
         "Milestone B",
         &state,
-        0x66a2_8807_e59d_8563, // full VRAM (self)
-        0x7123_3c93_c6d8_8b89, // display area (self)
+        0xd893_ba53_aae6_be64, // full VRAM (self)
+        0x64da_b0b5_1f27_1fb7, // display area (self)
         (640, 478),
-        None, // Redux parity capture pending
+        None, // Redux hash at 500M TBD — capture after next parity run
     );
 }
 
@@ -326,15 +319,12 @@ fn milestone_d_tekken_licensed_screen() {
         return;
     }
     let state = run_milestone(800_000_000, Some(TEKKEN_DISC));
-    // Hashes updated 2026-04-19 — renderer parity pass applied here
-    // too. The licensed-disc screen renders the red 3D PlayStation
-    // logo via GTE-lit Gouraud tris with dither enabled, so every
-    // fix in this pass feeds in.
+    // Hashes updated 2026-04-19 — scanline-delta rasterizer port.
     assert_milestone(
         "Milestone D (Tekken license screen)",
         &state,
-        0x7e93_08c4_eb2f_7da7,
-        0xbd2c_627d_0bb4_b82f,
+        0x30f0_f63b_e521_cc1c,
+        0x661d_9f5c_7cc6_11ac,
         (640, 478),
         None,
     );

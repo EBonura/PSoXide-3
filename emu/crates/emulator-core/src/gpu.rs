@@ -1408,32 +1408,44 @@ impl Gpu {
             self.rasterize_line(v2, v0, color, color, mode, false);
             return;
         }
-        let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
-        let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
-        let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
-        let max_y = v0.1.max(v1.1).max(v2.1).min(self.draw_area_bottom as i32);
-        if min_x > max_x || min_y > max_y {
+        // Flat triangles don't need Gouraud or UV interpolation, but
+        // the scanline walk itself is identical — reuse `setup_sections`
+        // with zeroed colour/UV and just plot `color` for every pixel
+        // between leftX and rightX per scanline.
+        let Some(mut setup) = setup_sections(
+            [v0.0, v1.0, v2.0],
+            [v0.1, v1.1, v2.1],
+            [(0, 0, 0); 3],
+            [(0, 0); 3],
+        ) else {
             return;
-        }
+        };
 
-        // Precompute fixed area; we just need its sign to normalize.
-        let area = edge(v0, v1, v2);
-        if area == 0 {
-            return; // degenerate
-        }
-        let area_sign = area.signum();
-        let (bias0, bias1, bias2) = top_left_biases(v0, v1, v2, area_sign);
-
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let p = (x, y);
-                let w0 = edge(v1, v2, p) * area_sign + bias0;
-                let w1 = edge(v2, v0, p) * area_sign + bias1;
-                let w2 = edge(v0, v1, p) * area_sign + bias2;
-                if (w0 | w1 | w2) >= 0 {
-                    self.plot_pixel(x as u16, y as u16, color, mode);
-                }
+        let draw_top = self.draw_area_top as i32;
+        let draw_bottom = self.draw_area_bottom as i32;
+        let draw_left = self.draw_area_left as i32;
+        let draw_right = self.draw_area_right as i32;
+        let mut y = setup.y_min;
+        while y < draw_top {
+            if setup.next_row().is_err() {
+                return;
             }
+            y += 1;
+        }
+        let y_max = setup.y_max.min(draw_bottom);
+        while y <= y_max {
+            let xmin = (setup.left_x >> 16) as i32;
+            let xmax = ((setup.right_x >> 16) as i32 - 1).min(draw_right);
+            let xmin_clipped = xmin.max(draw_left);
+            let mut j = xmin_clipped;
+            while j <= xmax {
+                self.plot_pixel(j as u16, y as u16, color, mode);
+                j += 1;
+            }
+            if setup.next_row().is_err() {
+                return;
+            }
+            y += 1;
         }
     }
 
@@ -1607,60 +1619,88 @@ impl Gpu {
             let _ = (t0, t1, t2, clut_word, semi_trans, raw_texture);
             return;
         }
-        let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
-        let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
-        let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
-        let max_y = v0.1.max(v1.1).max(v2.1).min(self.draw_area_bottom as i32);
-        if min_x > max_x || min_y > max_y {
-            return;
-        }
-
-        let area = edge(v0, v1, v2);
-        if area == 0 {
-            return;
-        }
-        let area_sign = area.signum();
-        let area_abs = area.unsigned_abs() as i64;
-        let (bias0, bias1, bias2) = top_left_biases(v0, v1, v2, area_sign);
-
         let clut_x = (clut_word & 0x3F) * 16;
         let clut_y = (clut_word >> 6) & 0x1FF;
         let tpage_mode = self.tex_blend_mode;
 
-        let r = |c: u32| (c & 0xFF) as i64;
-        let g = |c: u32| ((c >> 8) & 0xFF) as i64;
-        let b = |c: u32| ((c >> 16) & 0xFF) as i64;
+        let r = |c: u32| (c & 0xFF) as i32;
+        let g = |c: u32| ((c >> 8) & 0xFF) as i32;
+        let b = |c: u32| ((c >> 16) & 0xFF) as i32;
+        let v_rgb = [
+            (r(c0), g(c0), b(c0)),
+            (r(c1), g(c1), b(c1)),
+            (r(c2), g(c2), b(c2)),
+        ];
+        let v_uv = [
+            (t0.0 as i32, t0.1 as i32),
+            (t1.0 as i32, t1.1 as i32),
+            (t2.0 as i32, t2.1 as i32),
+        ];
+        let Some(mut setup) = setup_sections(
+            [v0.0, v1.0, v2.0],
+            [v0.1, v1.1, v2.1],
+            v_rgb,
+            v_uv,
+        ) else {
+            return;
+        };
 
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let p = (x, y);
-                let ew0 = (edge(v1, v2, p) * area_sign) as i64;
-                let ew1 = (edge(v2, v0, p) * area_sign) as i64;
-                let ew2 = (edge(v0, v1, p) * area_sign) as i64;
-                let w0 = ew0 + bias0 as i64;
-                let w1 = ew1 + bias1 as i64;
-                let w2 = ew2 + bias2 as i64;
-                if (w0 | w1 | w2) >= 0 {
-                    let u = (ew0 * t0.0 as i64 + ew1 * t1.0 as i64 + ew2 * t2.0 as i64) / area_abs;
-                    let v = (ew0 * t0.1 as i64 + ew1 * t1.1 as i64 + ew2 * t2.1 as i64) / area_abs;
-                    if let Some(texel) = self.sample_texture(u as u16, v as u16, clut_x, clut_y) {
+        let dif_r = setup.delta_col_r;
+        let dif_g = setup.delta_col_g;
+        let dif_b = setup.delta_col_b;
+        let dif_u = setup.delta_col_u;
+        let dif_v = setup.delta_col_v;
+
+        let draw_top = self.draw_area_top as i32;
+        let draw_bottom = self.draw_area_bottom as i32;
+        let draw_left = self.draw_area_left as i32;
+        let draw_right = self.draw_area_right as i32;
+        let mut y = setup.y_min;
+        while y < draw_top {
+            if setup.next_row().is_err() {
+                return;
+            }
+            y += 1;
+        }
+        let y_max = setup.y_max.min(draw_bottom);
+
+        while y <= y_max {
+            let xmin = (setup.left_x >> 16) as i32;
+            let xmax_raw = (setup.right_x >> 16) as i32 - 1;
+            let xmax = xmax_raw.min(draw_right);
+            if xmax >= xmin {
+                let mut c_r = setup.left_r;
+                let mut c_g = setup.left_g;
+                let mut c_b = setup.left_b;
+                let mut c_u = setup.left_u;
+                let mut c_v = setup.left_v;
+                let xmin_clipped = if xmin < draw_left {
+                    let skip = (draw_left - xmin) as i64;
+                    c_r += skip * dif_r;
+                    c_g += skip * dif_g;
+                    c_b += skip * dif_b;
+                    c_u += skip * dif_u;
+                    c_v += skip * dif_v;
+                    draw_left
+                } else {
+                    xmin
+                };
+                let mut j = xmin_clipped;
+                while j <= xmax {
+                    let u = (c_u >> 16) as u16;
+                    let v = (c_v >> 16) as u16;
+                    if let Some(texel) = self.sample_texture(u, v, clut_x, clut_y) {
                         let (tint_r, tint_g, tint_b) = if raw_texture {
                             RAW_TEXTURE_TINT
                         } else {
-                            // Interpolated per-pixel tint uses unbiased
-                            // barycentric weights, same reasoning as the
-                            // shaded-triangle path.
-                            let ri = (ew0 * r(c0) + ew1 * r(c1) + ew2 * r(c2)) / area_abs;
-                            let gi = (ew0 * g(c0) + ew1 * g(c1) + ew2 * g(c2)) / area_abs;
-                            let bi = (ew0 * b(c0) + ew1 * b(c1) + ew2 * b(c2)) / area_abs;
                             (
-                                ri.clamp(0, 255) as u32,
-                                gi.clamp(0, 255) as u32,
-                                bi.clamp(0, 255) as u32,
+                                ((c_r >> 16).clamp(0, 255)) as u32,
+                                ((c_g >> 16).clamp(0, 255)) as u32,
+                                ((c_b >> 16).clamp(0, 255)) as u32,
                             )
                         };
                         let shaded = if !raw_texture && self.dither_enabled {
-                            modulate_tint_dithered(texel, tint_r, tint_g, tint_b, x, y)
+                            modulate_tint_dithered(texel, tint_r, tint_g, tint_b, j, y)
                         } else {
                             modulate_tint(texel, tint_r, tint_g, tint_b)
                         };
@@ -1669,10 +1709,20 @@ impl Gpu {
                         } else {
                             BlendMode::Opaque
                         };
-                        self.plot_pixel(x as u16, y as u16, shaded, mode);
+                        self.plot_pixel(j as u16, y as u16, shaded, mode);
                     }
+                    c_r += dif_r;
+                    c_g += dif_g;
+                    c_b += dif_b;
+                    c_u += dif_u;
+                    c_v += dif_v;
+                    j += 1;
                 }
             }
+            if setup.next_row().is_err() {
+                return;
+            }
+            y += 1;
         }
     }
 
@@ -1759,49 +1809,76 @@ impl Gpu {
             let _ = (t0, t1, t2, clut_word, semi_trans);
             return;
         }
-        let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
-        let max_x = v0.0.max(v1.0).max(v2.0).min(self.draw_area_right as i32);
-        let min_y = v0.1.min(v1.1).min(v2.1).max(self.draw_area_top as i32);
-        let max_y = v0.1.max(v1.1).max(v2.1).min(self.draw_area_bottom as i32);
-        if min_x > max_x || min_y > max_y {
-            return;
-        }
-
-        let area = edge(v0, v1, v2);
-        if area == 0 {
-            return;
-        }
-        let area_sign = area.signum();
-        let area_abs = area.unsigned_abs() as i64;
-        let (bias0, bias1, bias2) = top_left_biases(v0, v1, v2, area_sign);
-
         let clut_x = (clut_word & 0x3F) * 16;
         let clut_y = (clut_word >> 6) & 0x1FF;
         let tpage_mode = self.tex_blend_mode;
 
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let p = (x, y);
-                let ew0 = (edge(v1, v2, p) * area_sign) as i64;
-                let ew1 = (edge(v2, v0, p) * area_sign) as i64;
-                let ew2 = (edge(v0, v1, p) * area_sign) as i64;
-                let w0 = ew0 + bias0 as i64;
-                let w1 = ew1 + bias1 as i64;
-                let w2 = ew2 + bias2 as i64;
-                if (w0 | w1 | w2) >= 0 {
-                    let u = (ew0 * t0.0 as i64 + ew1 * t1.0 as i64 + ew2 * t2.0 as i64) / area_abs;
-                    let v = (ew0 * t0.1 as i64 + ew1 * t1.1 as i64 + ew2 * t2.1 as i64) / area_abs;
-                    if let Some(texel) = self.sample_texture(u as u16, v as u16, clut_x, clut_y) {
+        let v_uv = [
+            (t0.0 as i32, t0.1 as i32),
+            (t1.0 as i32, t1.1 as i32),
+            (t2.0 as i32, t2.1 as i32),
+        ];
+        let Some(mut setup) = setup_sections(
+            [v0.0, v1.0, v2.0],
+            [v0.1, v1.1, v2.1],
+            [(0, 0, 0); 3],
+            v_uv,
+        ) else {
+            return;
+        };
+
+        let dif_u = setup.delta_col_u;
+        let dif_v = setup.delta_col_v;
+
+        let draw_top = self.draw_area_top as i32;
+        let draw_bottom = self.draw_area_bottom as i32;
+        let draw_left = self.draw_area_left as i32;
+        let draw_right = self.draw_area_right as i32;
+        let mut y = setup.y_min;
+        while y < draw_top {
+            if setup.next_row().is_err() {
+                return;
+            }
+            y += 1;
+        }
+        let y_max = setup.y_max.min(draw_bottom);
+
+        while y <= y_max {
+            let xmin = (setup.left_x >> 16) as i32;
+            let xmax = ((setup.right_x >> 16) as i32 - 1).min(draw_right);
+            if xmax >= xmin {
+                let mut c_u = setup.left_u;
+                let mut c_v = setup.left_v;
+                let xmin_clipped = if xmin < draw_left {
+                    let skip = (draw_left - xmin) as i64;
+                    c_u += skip * dif_u;
+                    c_v += skip * dif_v;
+                    draw_left
+                } else {
+                    xmin
+                };
+                let mut j = xmin_clipped;
+                while j <= xmax {
+                    let u = (c_u >> 16) as u16;
+                    let v = (c_v >> 16) as u16;
+                    if let Some(texel) = self.sample_texture(u, v, clut_x, clut_y) {
                         let shaded = modulate_tint(texel, tint.0, tint.1, tint.2);
                         let mode = if semi_trans && (texel & 0x8000) != 0 {
                             tpage_mode
                         } else {
                             BlendMode::Opaque
                         };
-                        self.plot_pixel(x as u16, y as u16, shaded, mode);
+                        self.plot_pixel(j as u16, y as u16, shaded, mode);
                     }
+                    c_u += dif_u;
+                    c_v += dif_v;
+                    j += 1;
                 }
             }
+            if setup.next_row().is_err() {
+                return;
+            }
+            y += 1;
         }
     }
 
@@ -1834,39 +1911,81 @@ impl Gpu {
             return;
         }
 
-        let area = edge(v0, v1, v2);
-        if area == 0 {
-            return;
-        }
-        let area_sign = area.signum();
-        let area_abs = area.unsigned_abs() as i64;
-        let (bias0, bias1, bias2) = top_left_biases(v0, v1, v2, area_sign);
-
         // Channel-extract closures — r/g/b are low/mid/high bytes of the
         // 24-bit word written in the command.
-        let r = |c: u32| (c & 0xFF) as i64;
-        let g = |c: u32| ((c >> 8) & 0xFF) as i64;
-        let b = |c: u32| ((c >> 16) & 0xFF) as i64;
+        let r = |c: u32| (c & 0xFF) as i32;
+        let g = |c: u32| ((c >> 8) & 0xFF) as i32;
+        let b = |c: u32| ((c >> 16) & 0xFF) as i32;
+        let v_rgb = [
+            (r(c0), g(c0), b(c0)),
+            (r(c1), g(c1), b(c1)),
+            (r(c2), g(c2), b(c2)),
+        ];
+        let Some(mut setup) = setup_sections(
+            [v0.0, v1.0, v2.0],
+            [v0.1, v1.1, v2.1],
+            v_rgb,
+            [(0, 0); 3],
+        ) else {
+            return;
+        };
 
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let p = (x, y);
-                // Unbiased weights drive barycentric interpolation —
-                // the bias is only for the inside test, not the
-                // color weighting (biasing would tilt the gradient
-                // toward one vertex by a sub-pixel amount).
-                let ew0 = (edge(v1, v2, p) * area_sign) as i64;
-                let ew1 = (edge(v2, v0, p) * area_sign) as i64;
-                let ew2 = (edge(v0, v1, p) * area_sign) as i64;
-                let w0 = ew0 + bias0 as i64;
-                let w1 = ew1 + bias1 as i64;
-                let w2 = ew2 + bias2 as i64;
-                if (w0 | w1 | w2) >= 0 {
-                    let ri = (ew0 * r(c0) + ew1 * r(c1) + ew2 * r(c2)) / area_abs;
-                    let gi = (ew0 * g(c0) + ew1 * g(c1) + ew2 * g(c2)) / area_abs;
-                    let bi = (ew0 * b(c0) + ew1 * b(c1) + ew2 * b(c2)) / area_abs;
+        // Per-column (per-pixel horizontal) deltas — computed once at
+        // setup, applied on every step within a scanline.
+        let dif_r = setup.delta_col_r;
+        let dif_g = setup.delta_col_g;
+        let dif_b = setup.delta_col_b;
+
+        // Clip the top of the triangle against the draw-area top: step
+        // the sections down until `y_min` reaches `draw_area_top`. If we
+        // exit early, the triangle is entirely above the drawable region.
+        let draw_top = self.draw_area_top as i32;
+        let draw_bottom = self.draw_area_bottom as i32;
+        let draw_left = self.draw_area_left as i32;
+        let draw_right = self.draw_area_right as i32;
+        let mut y = setup.y_min;
+        while y < draw_top {
+            if setup.next_row().is_err() {
+                return;
+            }
+            y += 1;
+        }
+        let y_max = setup.y_max.min(draw_bottom);
+
+        while y <= y_max {
+            let xmin = (setup.left_x >> 16) as i32;
+            let xmax_raw = (setup.right_x >> 16) as i32 - 1;
+            let xmax = xmax_raw.min(draw_right);
+            if xmax >= xmin {
+                // Starting attributes at the left edge of this scanline.
+                let mut c_r = setup.left_r;
+                let mut c_g = setup.left_g;
+                let mut c_b = setup.left_b;
+                // Clip left to draw_area_left: step the per-column deltas
+                // forward by `(draw_left - xmin)` pixels to skip the
+                // hidden left portion.
+                let xmin_clipped = if xmin < draw_left {
+                    let skip = (draw_left - xmin) as i64;
+                    c_r += skip * dif_r;
+                    c_g += skip * dif_g;
+                    c_b += skip * dif_b;
+                    draw_left
+                } else {
+                    xmin
+                };
+                let mut j = xmin_clipped;
+                while j <= xmax {
+                    // Redux packs the 8-bit channels into the top byte
+                    // of each Q16.16 accumulator — recover them with
+                    // `>> 16`. Clamp isn't necessary for well-formed
+                    // triangles (vertex colours are 0..=255 and the
+                    // per-column deltas keep them in range), but we
+                    // clamp to match hardware's saturation anyway.
+                    let ri = (c_r >> 16) as i32;
+                    let gi = (c_g >> 16) as i32;
+                    let bi = (c_b >> 16) as i32;
                     let colour = if self.dither_enabled {
-                        dither_rgb(ri as i32, gi as i32, bi as i32, x, y)
+                        dither_rgb(ri, gi, bi, j, y)
                     } else {
                         rgb24_to_bgr15(
                             (ri.clamp(0, 255) as u32)
@@ -1874,9 +1993,17 @@ impl Gpu {
                                 | ((bi.clamp(0, 255) as u32) << 16),
                         )
                     };
-                    self.plot_pixel(x as u16, y as u16, colour, mode);
+                    self.plot_pixel(j as u16, y as u16, colour, mode);
+                    c_r += dif_r;
+                    c_g += dif_g;
+                    c_b += dif_b;
+                    j += 1;
                 }
             }
+            if setup.next_row().is_err() {
+                return;
+            }
+            y += 1;
         }
     }
 
@@ -2295,64 +2422,351 @@ fn gp0_packet_size(op: u8) -> usize {
     }
 }
 
-/// Triangle edge function: signed doubled area of △(a, b, c). Positive
-/// when the winding is counter-clockwise. Used by `rasterize_triangle`
-/// for per-pixel inside/outside tests.
-fn edge(a: (i32, i32), b: (i32, i32), c: (i32, i32)) -> i32 {
-    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+
+// ======================================================================
+// Scanline-delta triangle rasterizer
+// ======================================================================
+//
+// Direct port of Redux's `drawPoly3Gi` / `drawPoly3TGEx8i` family from
+// `pcsx-redux/src/gpu/soft/soft.cc`. The scanline-delta approach is what
+// PSX hardware actually does: sort vertices by Y, walk each of the three
+// edges as scanline-advancing sections, and for each scanline plot pixels
+// from `leftX` to `rightX - 1` inclusive with attribute interpolation
+// driven by precomputed per-pixel (column) deltas.
+//
+// Why this beats barycentric division-per-pixel: rounding. Two equivalent
+// formulas for interpolated colour or UV produce subtly different integer
+// results at edge-adjacent pixels. Matching Redux's exact algorithm
+// (including its fixed-point shift sizes) is the only way to hit pixel-
+// exact parity on game content; our old barycentric path was 14% off on
+// the Crash title screen even with identical primitive inputs.
+//
+// Naming convention: Redux's `m_deltaRightR` / `m_deltaRightU` etc are
+// actually **per-column** (per-X) deltas despite being named "right".
+// This port keeps the Redux names so a side-by-side diff with
+// `soft.cc` stays readable — even where "right" looks wrong in isolation.
+//
+// Fixed-point layout: X / U / V are Q16.16. Colour channels are stored
+// in bits 16..23 of the state (Q16.8 relative to the 8-bit vertex
+// colours, i.e. the fraction lives in bits 0..15).
+
+/// One vertex as seen by the scanline setup. All attributes — position,
+/// colour, UV — are already shifted into the fixed-point domain the
+/// rasterizer uses. `y` stays as a plain integer because scanlines step
+/// by 1 on hardware; only horizontal attributes need sub-pixel precision.
+#[derive(Copy, Clone, Debug, Default)]
+struct SlVertex {
+    /// X coordinate in Q16.16 fixed-point.
+    x: i64,
+    /// Y coordinate as a plain pixel integer.
+    y: i32,
+    /// Red channel in Q16.16 per-8bit: `vtx_r << 16`. Shifted the same
+    /// way Redux does so its `v->R = rgb & 0x00ff0000` constant stays
+    /// structurally identical.
+    r: i64,
+    g: i64,
+    b: i64,
+    /// U coordinate, Q16.16.
+    u: i64,
+    /// V coordinate, Q16.16.
+    v: i64,
 }
 
-/// Top-left fill-rule bias for a CCW edge `a → b`. Returns 0 when
-/// the edge is a "top" or "left" edge of a CCW-wound triangle
-/// (pixels exactly on it should be INCLUDED), or -1 otherwise
-/// (edge pixels EXCLUDED).
+/// Per-triangle scanline walk state. Built once by `setup_sections_*`,
+/// then `next_row_*` advances it by one scanline between rasterizer
+/// iterations.
 ///
-/// With the bias added to the edge function before the `>= 0`
-/// test, pixels on non-top-left edges fall out at -1 < 0. This
-/// matches PSX hardware (and Redux's scanline rasterizer, which
-/// uses `yMax = v3.y - 1` and `xmax = (rightX >> 16) - 1`
-/// exclusive — equivalent to excluding bottom + right edges of
-/// each triangle).
-///
-/// Definitions (for CCW winding, where the edge function is
-/// positive inside the triangle):
-/// - **Top** edge: horizontal (dy == 0) and pointing right (dx > 0).
-///   The edge is the triangle's top boundary (interior is below).
-/// - **Left** edge: goes strictly upward (dy < 0). The edge is the
-///   triangle's left boundary — CCW traversal walks the left side
-///   from bottom to top, so "going up" = "on the left side".
-///
-/// The common confusion (and the bug that added 1 column of
-/// missing pixels on the Sony logo's background rectangle): the
-/// triangle's geometric "left side" IS an edge going up, not
-/// down, under CCW winding.
-fn top_left_bias(a: (i32, i32), b: (i32, i32)) -> i32 {
-    let dx = b.0 - a.0;
-    let dy = b.1 - a.1;
-    if (dy == 0 && dx > 0) || dy < 0 {
-        0
-    } else {
-        -1
+/// Redux uses two *arrays of 3 pointers* (one for the left walk, one
+/// for the right) plus a section index that decrements on pop. A
+/// single-edge side (the long v1→v3) has 2 entries (section count 1);
+/// a two-edge side (v1→v2 + v2→v3) has 3 entries (section count 2).
+/// We mirror that exactly.
+#[derive(Clone, Debug)]
+struct SlTriSetup {
+    /// Sorted vertices: `[v1 (top), v2 (middle), v3 (bottom)]`, by Y
+    /// ascending. Stored as owned values because we shuffle pointers
+    /// into the left/right arrays below.
+    sorted: [SlVertex; 3],
+    /// Left-edge walk: `[bottom, maybe_middle, top]` — `left_section`
+    /// indexes the highest-unvisited entry; section descends toward 0.
+    left_array: [usize; 3],
+    right_array: [usize; 3],
+    /// Number of edge segments remaining on each side. Starts at 1
+    /// (single-edge long side) or 2 (pivot-at-middle), decrements in
+    /// `next_row_*` when a section exhausts.
+    left_section: i32,
+    right_section: i32,
+
+    // --- Current scanline state (updated every row). ---
+    /// Left X on the current scanline, Q16.16.
+    left_x: i64,
+    /// Right X on the current scanline, Q16.16. Redux stores this pre-
+    /// shifted by 16; the rasterizer reads `rightX >> 16 - 1` as the
+    /// inclusive right edge.
+    right_x: i64,
+    /// Pre-step-to-add for left_x each scanline (Q16.16). Changes
+    /// whenever the left section pops.
+    delta_left_x: i64,
+    delta_right_x: i64,
+    /// Rows remaining in the currently-active section. Hits zero →
+    /// pop to the next section, recompute deltas.
+    left_section_height: i32,
+    right_section_height: i32,
+
+    // --- Gouraud colour at left edge, current scanline (Q16.16). ---
+    left_r: i64, left_g: i64, left_b: i64,
+    delta_left_r: i64, delta_left_g: i64, delta_left_b: i64,
+
+    // --- UV at left edge, current scanline (Q16.16). ---
+    left_u: i64, left_v: i64,
+    delta_left_u: i64, delta_left_v: i64,
+
+    // --- Per-column (per-X) deltas, computed once at setup time. ---
+    //
+    // Named "delta_right_*" to match Redux's `m_deltaRightR` / `m_deltaRightU`
+    // (which are also mis-named — they're per-column, not per-edge).
+    delta_col_r: i64,
+    delta_col_g: i64,
+    delta_col_b: i64,
+    delta_col_u: i64,
+    delta_col_v: i64,
+
+    // --- Scanline bounds ---
+    y_min: i32,
+    y_max: i32,
+}
+
+impl SlTriSetup {
+    /// Pop the active left section to the next shorter one. Returns
+    /// `Err` when the pop runs out of sections (signals the triangle
+    /// walk is done).
+    fn pop_left_section(&mut self) -> Result<(), ()> {
+        self.left_section -= 1;
+        if self.left_section <= 0 {
+            return Err(());
+        }
+        self.compute_left_section()
+    }
+
+    /// Pop the active right section; same contract as `pop_left_section`.
+    fn pop_right_section(&mut self) -> Result<(), ()> {
+        self.right_section -= 1;
+        if self.right_section <= 0 {
+            return Err(());
+        }
+        self.compute_right_section()
+    }
+
+    /// Recompute `left_x` / `delta_left_x` / colour + UV start + deltas
+    /// from the pair of vertices defining the currently-active left
+    /// section.
+    fn compute_left_section(&mut self) -> Result<(), ()> {
+        let idx1 = self.left_array[self.left_section as usize];
+        let idx2 = self.left_array[(self.left_section - 1) as usize];
+        let v1 = self.sorted[idx1];
+        let v2 = self.sorted[idx2];
+        let height = v2.y - v1.y;
+        if height == 0 {
+            return Err(());
+        }
+        let h = height as i64;
+        self.delta_left_x = (v2.x - v1.x) / h;
+        self.left_x = v1.x;
+        // Gouraud + UV tracking are only meaningful when the caller
+        // populated them; zero-divides can't happen because h != 0.
+        self.delta_left_r = (v2.r - v1.r) / h;
+        self.delta_left_g = (v2.g - v1.g) / h;
+        self.delta_left_b = (v2.b - v1.b) / h;
+        self.left_r = v1.r;
+        self.left_g = v1.g;
+        self.left_b = v1.b;
+        self.delta_left_u = (v2.u - v1.u) / h;
+        self.delta_left_v = (v2.v - v1.v) / h;
+        self.left_u = v1.u;
+        self.left_v = v1.v;
+        self.left_section_height = height;
+        Ok(())
+    }
+
+    fn compute_right_section(&mut self) -> Result<(), ()> {
+        let idx1 = self.right_array[self.right_section as usize];
+        let idx2 = self.right_array[(self.right_section - 1) as usize];
+        let v1 = self.sorted[idx1];
+        let v2 = self.sorted[idx2];
+        let height = v2.y - v1.y;
+        if height == 0 {
+            return Err(());
+        }
+        let h = height as i64;
+        self.delta_right_x = (v2.x - v1.x) / h;
+        self.right_x = v1.x;
+        self.right_section_height = height;
+        Ok(())
+    }
+
+    /// Advance one scanline. Returns `Err` when the triangle's bottom
+    /// edge is past.
+    fn next_row(&mut self) -> Result<(), ()> {
+        self.left_section_height -= 1;
+        if self.left_section_height <= 0 {
+            self.pop_left_section()?;
+        } else {
+            self.left_x += self.delta_left_x;
+            self.left_r += self.delta_left_r;
+            self.left_g += self.delta_left_g;
+            self.left_b += self.delta_left_b;
+            self.left_u += self.delta_left_u;
+            self.left_v += self.delta_left_v;
+        }
+        self.right_section_height -= 1;
+        if self.right_section_height <= 0 {
+            self.pop_right_section()?;
+        } else {
+            self.right_x += self.delta_right_x;
+        }
+        Ok(())
     }
 }
 
-/// For a triangle with area-sign `sign` (+1 CCW, -1 CW), compute the
-/// three top-left biases for edges `(v1→v2, v2→v0, v0→v1)` — the
-/// edges used by our barycentric rasterizer. For CW winding, the
-/// edge-function values are negated before the inside test, so we
-/// apply the rule against the reversed edges (`v2→v1, v0→v2,
-/// v1→v0`) which are CCW in the flipped orientation.
-fn top_left_biases(
-    v0: (i32, i32),
-    v1: (i32, i32),
-    v2: (i32, i32),
-    sign: i32,
-) -> (i32, i32, i32) {
-    if sign >= 0 {
-        (top_left_bias(v1, v2), top_left_bias(v2, v0), top_left_bias(v0, v1))
-    } else {
-        (top_left_bias(v2, v1), top_left_bias(v0, v2), top_left_bias(v1, v0))
+/// `(x << 10) / y` with i64 intermediate, matching Redux's
+/// `shl10idiv` helper at `soft.h:276`.
+fn shl10_idiv(x: i64, y: i64) -> i64 {
+    (x << 10) / y
+}
+
+/// Core setup: sort 3 vertices by Y, pick which side has the pivot
+/// (the "middle" vertex v2), and seed left / right walks. Colour + UV
+/// are optional — pass zeros for the ones a particular primitive
+/// doesn't use. Returns the setup ready for the scanline loop, or
+/// `None` when the triangle has zero height or zero "longest" width
+/// (both degenerate).
+///
+/// "longest" meaning: Redux computes the signed horizontal distance
+/// from v2.x to where the long v1→v3 edge crosses y=v2.y. Positive →
+/// the long edge is to the RIGHT of v2 → v1 is on the left side and
+/// the two-edge walk lives on the left. Negative → the inverse.
+fn setup_sections(
+    v_x: [i32; 3],
+    v_y: [i32; 3],
+    v_rgb: [(i32, i32, i32); 3],
+    v_uv: [(i32, i32); 3],
+) -> Option<SlTriSetup> {
+    // Build unsorted vertex structs. X/U/V are shifted into Q16.16
+    // up front; colour channels get `<< 16` to match Redux's
+    // `v->R = rgb & 0x00ff0000` convention.
+    let mut verts = [SlVertex::default(); 3];
+    for i in 0..3 {
+        verts[i] = SlVertex {
+            x: (v_x[i] as i64) << 16,
+            y: v_y[i],
+            r: (v_rgb[i].0 as i64) << 16,
+            g: (v_rgb[i].1 as i64) << 16,
+            b: (v_rgb[i].2 as i64) << 16,
+            u: (v_uv[i].0 as i64) << 16,
+            v: (v_uv[i].1 as i64) << 16,
+        };
     }
+    // Sort by y ascending: bubble sort is fine for n=3.
+    if verts[0].y > verts[1].y { verts.swap(0, 1); }
+    if verts[0].y > verts[2].y { verts.swap(0, 2); }
+    if verts[1].y > verts[2].y { verts.swap(1, 2); }
+
+    let v1 = &verts[0]; // top
+    let v2 = &verts[1]; // middle
+    let v3 = &verts[2]; // bottom
+
+    let height = v3.y - v1.y;
+    if height == 0 {
+        return None;
+    }
+    // `temp = (v2.y - v1.y) / height` in Q16.16.
+    let temp = ((v2.y - v1.y) as i64) << 16;
+    let temp = temp / (height as i64);
+    // longest = temp * (v3.x - v1.x) / (2^16) + (v1.x - v2.x)
+    //   — i.e. extrapolate the v1→v3 edge to y=v2.y, subtract v2.x.
+    // Both factors of `temp` are already in Q16.16, so `(v3.x - v1.x) >> 16`
+    // drops the fixed fraction before multiply (matches Redux).
+    let longest = temp * ((v3.x - v1.x) >> 16) + (v1.x - v2.x);
+    if longest == 0 {
+        return None;
+    }
+
+    let mut setup = SlTriSetup {
+        sorted: [verts[0], verts[1], verts[2]],
+        left_array: [0; 3],
+        right_array: [0; 3],
+        left_section: 0,
+        right_section: 0,
+        left_x: 0, right_x: 0,
+        delta_left_x: 0, delta_right_x: 0,
+        left_section_height: 0, right_section_height: 0,
+        left_r: 0, left_g: 0, left_b: 0,
+        delta_left_r: 0, delta_left_g: 0, delta_left_b: 0,
+        left_u: 0, left_v: 0,
+        delta_left_u: 0, delta_left_v: 0,
+        delta_col_r: 0, delta_col_g: 0, delta_col_b: 0,
+        delta_col_u: 0, delta_col_v: 0,
+        y_min: v1.y,
+        y_max: v3.y - 1, // top-left rule: bottom row excluded
+    };
+
+    // Layout the left/right arrays depending on which side has the pivot.
+    // sorted[] is indexed: 0=v1(top), 1=v2(middle), 2=v3(bottom).
+    if longest < 0 {
+        // Long edge v1→v3 is on the RIGHT. Left = single edge v1→v3.
+        // Right walks v3 → v2 → v1 (two sections).
+        setup.right_array = [2, 1, 0];
+        setup.right_section = 2;
+        setup.left_array = [2, 0, 0];
+        setup.left_section = 1;
+        setup.compute_left_section().ok()?;
+        // Redux: if the first right section degenerates (height 0),
+        // pop once and try again. Handles triangles where v1 == v2 in Y.
+        if setup.compute_right_section().is_err() {
+            setup.right_section -= 1;
+            setup.compute_right_section().ok()?;
+        }
+    } else {
+        // Long edge v1→v3 is on the LEFT. Left walks v3 → v2 → v1.
+        // Right = single edge v1→v3.
+        setup.left_array = [2, 1, 0];
+        setup.left_section = 2;
+        setup.right_array = [2, 0, 0];
+        setup.right_section = 1;
+        setup.compute_right_section().ok()?;
+        if setup.compute_left_section().is_err() {
+            setup.left_section -= 1;
+            setup.compute_left_section().ok()?;
+        }
+    }
+
+    // Clamp `longest` to ±0x1000 (Redux does this as `if (longest <
+    // 0x1000) longest = 0x1000` and symmetric for the other sign —
+    // prevents pathological per-column deltas when the triangle is
+    // degenerately thin horizontally).
+    let longest_clamped: i64 = if longest < 0 {
+        longest.min(-0x1000)
+    } else {
+        longest.max(0x1000)
+    };
+
+    // Per-column deltas. The formula is Redux's `shl10idiv(temp * ((v3->X
+    // - v1->X) >> 10) + ((v1->X - v2->X) << 6), longest)` for each of
+    // R/G/B/U/V. The >> 10 and << 6 line up with `temp`'s Q16.16 so
+    // the final shl10idiv produces a Q16.16 per-column delta.
+    let compute_col_delta = |a3: i64, a1: i64, a2: i64| -> i64 {
+        shl10_idiv(
+            (temp * ((a3 - a1) >> 10)) + ((a1 - a2) << 6),
+            longest_clamped,
+        )
+    };
+    setup.delta_col_r = compute_col_delta(v3.r, v1.r, v2.r);
+    setup.delta_col_g = compute_col_delta(v3.g, v1.g, v2.g);
+    setup.delta_col_b = compute_col_delta(v3.b, v1.b, v2.b);
+    setup.delta_col_u = compute_col_delta(v3.u, v1.u, v2.u);
+    setup.delta_col_v = compute_col_delta(v3.v, v1.v, v2.v);
+
+    Some(setup)
 }
 
 /// Sign-extend an 11-bit integer (PS1 vertex coords + drawing offset
@@ -3171,50 +3585,6 @@ mod tests {
         check(0, 0, 0, 0, 0, 0, 0, 0);
         // coeff[2]=6, 5&7=5, 5 > 6 is false → stays 0.
         check(5, 5, 5, 2, 0, 0, 0, 0);
-    }
-
-    #[test]
-    fn top_left_bias_classifies_ccw_edges() {
-        // CCW unit triangle: (0,0), (10,0), (0,10).
-        //  - v0→v1 = (0,0)→(10,0): horizontal right → TOP edge (bias 0)
-        //  - v1→v2 = (10,0)→(0,10): dy>0 going down-left → hypotenuse (right edge, bias -1)
-        //  - v2→v0 = (0,10)→(0,0): dy<0 going up → LEFT edge (bias 0)
-        assert_eq!(top_left_bias((0, 0), (10, 0)), 0, "horizontal right = top");
-        assert_eq!(top_left_bias((10, 0), (0, 10)), -1, "hypotenuse (right edge)");
-        assert_eq!(top_left_bias((0, 10), (0, 0)), 0, "vertical up = left");
-
-        // Horizontal edge pointing LEFT is a bottom edge — excluded.
-        assert_eq!(top_left_bias((10, 5), (0, 5)), -1, "horizontal left = bottom");
-
-        // Vertical edge going DOWN is a right edge — excluded (under CCW).
-        assert_eq!(top_left_bias((5, 0), (5, 10)), -1, "vertical down = right");
-    }
-
-    #[test]
-    fn top_left_biases_preserves_rule_under_cw_winding() {
-        // CW triangle: (0,0), (0,10), (10,0). Same triangle geometry
-        // as the CCW case above but with v1, v2 swapped. The
-        // top-left-rule-corrected biases must produce the SAME
-        // set of "include/exclude" decisions for matching edges.
-        let ccw_biases = top_left_biases((0, 0), (10, 0), (0, 10), 1);
-        let cw_biases = top_left_biases((0, 0), (0, 10), (10, 0), -1);
-        // For CCW triangle, edges tested are (v1→v2, v2→v0, v0→v1)
-        //   = ((10,0)→(0,10), (0,10)→(0,0), (0,0)→(10,0))
-        //   = (hypotenuse, left, top) = (-1, 0, 0)
-        // For CW triangle under reversal, tested edges are
-        // (v2→v1, v0→v2, v1→v0)
-        //   = ((10,0)→(0,10), (0,0)→(0,10), (0,10)→(0,0))
-        //   = (hypotenuse, right-of-CW-tri, left)
-        // Hmm — these biases are NOT expected to be identical; what
-        // we're really checking is that the net set of pixels drawn
-        // matches Redux. That's covered by the display-parity suite.
-        // For this unit test, just sanity-check that neither bias
-        // triple is all-zero or all-minus-one (which would indicate
-        // the rule is degenerating).
-        let ccw_sum: i32 = [ccw_biases.0, ccw_biases.1, ccw_biases.2].iter().sum();
-        let cw_sum: i32 = [cw_biases.0, cw_biases.1, cw_biases.2].iter().sum();
-        assert!((-3..=0).contains(&ccw_sum));
-        assert!((-3..=0).contains(&cw_sum));
     }
 
     #[test]
