@@ -18,7 +18,7 @@
 // don't force the link because we don't call anything from them.
 extern crate psx_rt;
 
-use psx_gpu::{self as gpu, Resolution, VideoMode};
+use psx_gpu::{self as gpu, Resolution, VideoMode, framebuf::FrameBuffer};
 use psx_rt::tty;
 
 #[no_mangle]
@@ -27,16 +27,23 @@ fn main() {
 
     gpu::init(VideoMode::Ntsc, Resolution::R320X240);
 
-    // Enable drawing into the display region. Draw-area covers the
-    // full 320x240 screen; offset starts at 0.
+    // Double-buffer: buffer A at VRAM (0, 0), buffer B at (0, 240).
+    // The TV always scans out a stable completed frame while we
+    // draw into the other buffer. PS1 games do this universally —
+    // workload-light demos like this one wouldn't flicker even
+    // single-buffered, but adopting the pattern here keeps every
+    // example on the same footing.
+    let mut fb = FrameBuffer::new(320, 240);
+    // Bootstrap draw-area / offset to the first back buffer (A).
+    // `FrameBuffer::swap` re-applies them every flip.
     gpu::set_draw_area(0, 0, 319, 239);
     gpu::set_draw_offset(0, 0);
 
     tty::println("hello-tri: entering render loop");
     let mut frame: u16 = 0;
     loop {
-        // Clear to dark blue.
-        gpu::fill_rect(0, 0, 320, 240, 0, 0, 64);
+        // Clear the back buffer (the one we're about to draw into).
+        fb.clear(0, 0, 64);
 
         // Wobble the triangle: ±30 px vertical bounce.
         let wobble = (((frame % 60) as i16) - 30).abs();
@@ -49,6 +56,7 @@ fn main() {
 
         gpu::draw_sync();
         gpu::vsync();
+        fb.swap();
 
         frame = frame.wrapping_add(1);
     }

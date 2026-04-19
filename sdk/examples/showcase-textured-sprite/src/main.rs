@@ -26,7 +26,7 @@
 
 extern crate psx_rt;
 
-use psx_gpu::{self as gpu, Resolution, VideoMode};
+use psx_gpu::{self as gpu, Resolution, VideoMode, framebuf::FrameBuffer};
 use psx_hw::gpu::{pack_color, pack_texcoord, pack_vertex, pack_xy};
 use psx_io::gpu::{wait_cmd_ready, write_gp0};
 use psx_vram::{Color555, Tpage, TexDepth, VramRect, upload_15bpp};
@@ -46,6 +46,9 @@ const SCREEN_H: u16 = 240;
 #[no_mangle]
 fn main() {
     gpu::init(VideoMode::Ntsc, Resolution::R320X240);
+    // Double-buffer: buffer A at (0, 0) and B at (0, 240). Texture
+    // at Tpage(768, 0) is past both buffers' X extent.
+    let mut fb = FrameBuffer::new(SCREEN_W, SCREEN_H);
     gpu::set_draw_area(0, 0, SCREEN_W - 1, SCREEN_H - 1);
     gpu::set_draw_offset(0, 0);
 
@@ -55,7 +58,7 @@ fn main() {
 
     let mut frame: u16 = 0;
     loop {
-        gpu::fill_rect(0, 0, SCREEN_W, SCREEN_H, 8, 14, 40);
+        fb.clear(8, 14, 40);
 
         // Full 32×32 sprite bouncing left/right + down/up.
         let x_full = 24 + bounce(frame, 200);
@@ -71,6 +74,7 @@ fn main() {
 
         gpu::draw_sync();
         gpu::vsync();
+        fb.swap();
         frame = frame.wrapping_add(1);
     }
 }

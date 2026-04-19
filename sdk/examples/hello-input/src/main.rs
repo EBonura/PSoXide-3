@@ -23,25 +23,26 @@
 extern crate psx_rt;
 
 use psx_font::{FontAtlas, fonts::BASIC};
-use psx_gpu::{self as gpu, Resolution, VideoMode};
+use psx_gpu::{self as gpu, Resolution, VideoMode, framebuf::FrameBuffer};
 use psx_pad::{ButtonState, button, poll_port1};
 use psx_vram::{Clut, TexDepth, Tpage};
 
 /// Font atlas VRAM slot.
 ///
-/// Framebuffer is 320×240 at (0, 0); everything else is free real
-/// estate. Tpage X must be a multiple of 64 → 320 is the lowest slot
-/// that clears the framebuffer. At 4bpp, a BASIC 128-glyph atlas
-/// uses 64 halfwords × 32 halfword rows → (320..384) × (0..32), well
-/// inside the tpage.
+/// With double-buffering, buffer A is at (0..320, 0..240) and B
+/// at (0..320, 240..480). Tpage X must be a multiple of 64 → 320
+/// is the lowest slot that clears both buffers. At 4bpp, a BASIC
+/// 128-glyph atlas uses 64 halfwords × 32 halfword rows →
+/// (320..384) × (0..32), inside tpage (320, 0, Bit4).
 const FONT_TPAGE: Tpage = Tpage::new(320, 0, TexDepth::Bit4);
-/// 2-entry CLUT (transparent + white) at (320, 256). X is a multiple
-/// of 16 ✓, past the 240-pixel framebuffer ✓, clear of the atlas.
+/// 2-entry CLUT (transparent + white) at (320, 256). X is a
+/// multiple of 16 ✓, past the right edge of buffer B at X=320 ✓.
 const FONT_CLUT: Clut = Clut::new(320, 256);
 
 #[no_mangle]
 fn main() {
     gpu::init(VideoMode::Ntsc, Resolution::R320X240);
+    let mut fb = FrameBuffer::new(320, 240);
     gpu::set_draw_area(0, 0, 319, 239);
     gpu::set_draw_offset(0, 0);
 
@@ -73,8 +74,8 @@ fn main() {
             b = 32;
         }
 
-        // Background.
-        gpu::fill_rect(0, 0, 320, 240, r, g, b);
+        // Background — clear the back buffer.
+        fb.clear(r, g, b);
 
         // Face buttons paint a coloured triangle in the centre of
         // the screen. Each direction rotates 90° so "Triangle"
@@ -88,6 +89,7 @@ fn main() {
 
         gpu::draw_sync();
         gpu::vsync();
+        fb.swap();
     }
 }
 
