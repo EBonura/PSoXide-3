@@ -61,3 +61,11 @@ dependencies = [
  "psx-pad",
  "psx-rt",
 ]
+
+[[package]]
+name = "psx-vram"
+version = "0.1.0"
+dependencies = [
+ "psx-hw",
+ "psx-io",
+]

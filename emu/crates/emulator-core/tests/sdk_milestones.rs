@@ -351,12 +351,20 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-tex" => Some(SdkGolden {
             example: "hello-tex",
             vblanks: 2,
+            // VRAM + display bytes are identical to the pre-refactor
+            // values (the `rgb5(31,16,4)` / `rgb5(4,24,28)` calls
+            // emit the same 5-bit pixels the hand-math used).
             vram_hash: 0x5256_9600_727a_9f25,
             display_hash: 0xfffc_c5ce_2a8d_0225,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_03b8,
+            // Refreshed 2026-04-19-b after the `psx-vram` refactor.
+            // Binary layout shifted — different final instruction
+            // address at the 2-VBlank checkpoint. Render output
+            // unchanged (hashes above are byte-identical to pre-
+            // refactor).
+            final_pc: 0x8001_03ac,
             redux_display_hash: None,
         }),
         "hello-ot" => Some(SdkGolden {
@@ -390,6 +398,17 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             vblank_raises: 2,
             spu_samples: 735,
             final_pc: 0x8001_07c8,
+            redux_display_hash: None,
+        }),
+        "showcase-textured-sprite" => Some(SdkGolden {
+            example: "showcase-textured-sprite",
+            vblanks: 3,
+            vram_hash: 0x7e78_155a_0f2b_da99,
+            display_hash: 0x50ad_9226_b84a_64ad,
+            display_size: (320, 240),
+            vblank_raises: 3,
+            spu_samples: 1470,
+            final_pc: 0x8001_04fc,
             redux_display_hash: None,
         }),
         _ => None,
@@ -447,4 +466,14 @@ fn milestone_c_hello_input() {
 #[ignore = "SDK milestone: hello-gte roundtrip"]
 fn milestone_c_hello_gte() {
     run_sdk_milestone("hello-gte", 2);
+}
+
+#[test]
+#[ignore = "SDK milestone: showcase-textured-sprite roundtrip"]
+fn milestone_c_showcase_textured_sprite() {
+    // 3 VBlanks gives the bouncing sprites non-trivial motion in
+    // the captured frame. Larger than the hellos' 2 because this is
+    // a "polished demo" checkpoint — we want to catch regressions in
+    // multi-frame state, not just first-frame initialization.
+    run_sdk_milestone("showcase-textured-sprite", 3);
 }
