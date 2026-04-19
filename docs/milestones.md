@@ -41,11 +41,18 @@ No compatibility percentage. If a game not on the ladder happens to work, good; 
 
 ## Current status
 
-As of the last commit on `main`:
+As of 2026-04-19 (see `emu/crates/emulator-core/tests/milestones.rs` for the frozen-hash tests):
 
-- **Before A**: CPU + SYSCALL + exception machinery + typed register scaffolding for IRQ / Timers / DMA / GPU / SPU.
-- **Parity**: bit-identical against PCSX-Redux through at least 10M BIOS instructions with SCPH1001 (`make parity`).
-- **First real DMA**: OTC channel, ordering-table initialization.
-- **Next**: cycle model + VBlank generation — the piece that breaks parity deliberately and pivots the harness from "bit-identical to instruction N" to "canary X reaches state Y".
+- **A — BIOS Sony logo ✅ passes.** 100M-step VRAM hash pinned. Display-area hash is now **byte-exact with PCSX-Redux**: `0xa3ac6881044333d0` on both sides (0 / 611840 diverging bytes). Proven across all 8 game discs in the collection via `probe_all_games_100m`.
+- **B — BIOS shell (no disc) ✅ passes.** 500M-step hash pinned as a self-regression; Redux-verified hash at 500M is a TBD capture because the oracle's `run N` costs ~25s per million steps.
+- **C — Homebrew SDK triangle.** Scaffolding complete: six SDK crates (`psx-sdk`, `psx-hw`, `psx-rt`, `psx-io`, `psx-gpu`, `psx-gte`, `psx-pad`) plus five examples (`hello-tri`, `hello-tex`, `hello-ot`, `hello-input`, `hello-gte`). The examples build and side-load via `PSOXIDE_EXE=…`; a true end-to-end MVP test (load → draw → hash on real hardware) is still pending.
+- **D — BIOS disc-check ⚠ partial.** `milestone_d_bios_accepts_licensed_disc` passes after the LWL shift-inversion fix (commit `71979f1`) — Crash Bandicoot no longer wild-jumps at step 208M, and the guard runs 300M instructions of Crash before snapshotting. `milestone_d_tekken_licensed_screen` also passes (Tekken holds stably on the SCEA license screen). **Remaining gap**: cycle-accuracy drift makes our rendered frame at Crash 300M a different animation step than Redux's — the renderer is byte-exact on a static frame, but we're at a different virtual clock than Redux (≈ -6% at Crash 900M, per `probe_cycle_parity`).
+- **E–K** — not yet reached.
 
-See [PROGRESS.md](../PROGRESS.md) (not yet written) for a running activity log.
+**Instruction-level parity ceiling**: the cached Redux trace at `target/parity-cache/redux-*-50000000.bin` matches our emulator lock-step up to step **19,474,543** (pc + instr + gprs + tick). The first full divergence at 19,474,544 is a DMA-IRQ scheduling-order difference (captured by `probe_cycle_first_divergence`). Before that, everything — registers, memory accesses, cycle counts — matches Redux exactly.
+
+**Active investigation threads**:
+- Closing the Crash cycle-accuracy gap (currently -6% at 900M) needs identifying why our BIOS issues 5 DMA schedules in a window Redux issues 3 — the extra schedules overwrite scheduler targets and delay IRQ fire. `probe_dma_schedules` + `probe_dma_timeline` + `probe_isr_trace` are the tools for this.
+- Redux-verified 500M / D display hashes are pending fresh capture (oracle is slow; not blocking).
+
+See [../PROGRESS.md](../PROGRESS.md) for the chronological log.
