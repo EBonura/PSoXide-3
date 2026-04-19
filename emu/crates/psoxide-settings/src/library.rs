@@ -281,6 +281,78 @@ impl Library {
         self.version = LIBRARY_VERSION;
         Ok(changed)
     }
+
+    /// Walk multiple roots and union their scan results into a
+    /// single library. Roots that don't exist are silently skipped
+    /// (common case: the SDK-examples path only exists on developer
+    /// machines with the nightly toolchain; end users won't have
+    /// it). Roots that fail with a real error abort the whole
+    /// scan and surface the error.
+    ///
+    /// Internally it does what `scan` does but across every
+    /// provided root, using a single `fresh` accumulator so the
+    /// final `self.entries` is the union. Useful for the
+    /// frontend's "scan retail games + SDK examples together" case.
+    pub fn scan_roots(&mut self, roots: &[&Path]) -> Result<usize, LibraryError> {
+        // Reuse the existing cache map so mtime-match still short-
+        // circuits re-parses across ALL roots.
+        let mut by_path: std::collections::HashMap<PathBuf, usize> =
+            std::collections::HashMap::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            by_path.insert(e.path.clone(), i);
+        }
+
+        let mut fresh: Vec<LibraryEntry> = Vec::new();
+        let mut changed = 0usize;
+
+        for root in roots {
+            if !root.exists() {
+                // Missing roots are a normal condition (end-user
+                // install without SDK builds). Silently skip.
+                continue;
+            }
+            if !root.is_dir() {
+                return Err(LibraryError::Io {
+                    path: root.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "library root exists but is not a directory",
+                    ),
+                });
+            }
+
+            for path in walk(root) {
+                let Some(kind) = classify(&path) else { continue };
+                let meta = match fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let size = meta.len();
+
+                if let Some(&idx) = by_path.get(&path) {
+                    let cached = &self.entries[idx];
+                    if cached.mtime == mtime && cached.size == size {
+                        fresh.push(cached.clone());
+                        continue;
+                    }
+                }
+
+                let parsed = parse_entry(&path, kind, size, mtime);
+                changed += 1;
+                fresh.push(parsed);
+            }
+        }
+
+        self.entries = fresh;
+        self.version = LIBRARY_VERSION;
+        Ok(changed)
+    }
 }
 
 /// Classify a file by extension only. Returns `None` for files we

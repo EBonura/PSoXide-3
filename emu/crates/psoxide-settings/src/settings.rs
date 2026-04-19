@@ -99,6 +99,18 @@ pub struct Paths {
     /// Root directory for the game library scanner. Empty =
     /// library feature inactive until the user sets one.
     pub game_library: String,
+    /// Optional second root for the library scanner that contains
+    /// SDK-built homebrew example `.exe` files. Empty = frontend
+    /// auto-detects the standard `build/examples/mipsel-sony-psx/release/`
+    /// directory relative to the repo root (compile-time path from
+    /// `CARGO_MANIFEST_DIR`). Set explicitly to override — e.g.
+    /// pointing at a co-developer's alternate SDK build tree.
+    ///
+    /// Kept separate from `game_library` so users can ship the
+    /// emulator without disturbing their retail-game directory and
+    /// still get the SDK demos populating the Examples column.
+    #[serde(default)]
+    pub sdk_examples: String,
     /// Optional directory for the parity-trace cache. Empty =
     /// use the default under `target/parity-cache`.
     pub parity_cache_dir: String,

@@ -2,7 +2,27 @@
 /target
 **/target
 # sdk/ uses `target-dir = "../../../build/examples"` for MIPS builds.
-/build
+# Everything under /build/examples is noise EXCEPT the final .exe
+# binaries — those we commit so a fresh clone has runnable SDK
+# examples without needing nightly + build-std installed. The exes
+# are small (<10 KiB each, <25 KiB for the whole set) and rebuilding
+# them is deterministic, so re-committing when they change is
+# cheap. Git-ignore can't re-include a path under an ignored parent,
+# so we use directory-level wildcards instead of a single `/build`
+# rule: everything under /build/examples/mipsel-sony-psx/release/
+# is ignored except `.exe` files.
+/build/examples/**/deps/
+/build/examples/**/incremental/
+/build/examples/**/build/
+/build/examples/**/*.d
+/build/examples/**/*.rlib
+/build/examples/**/*.rmeta
+/build/examples/**/*.timestamp
+/build/examples/**/.cargo-lock
+/build/examples/**/.fingerprint/
+/build/examples/**/.rustc_info.json
+/build/examples/**/.package-cache
+/build/examples/**/CACHEDIR.TAG
 Cargo.lock.orig
 *.swp
 *.swo
@@ -20,3 +40,4 @@ run/
 traces/
 goldens/*.bin
 goldens/*.raw
+/build/examples/**/.cargo-build-lock

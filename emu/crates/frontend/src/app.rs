@@ -208,9 +208,30 @@ impl AppState {
             current_game: None,
             status_message: None,
         };
-        // Seed the Menu's Games + Examples columns from the loaded
-        // library so the user sees entries immediately instead of
-        // a "No games found" placeholder.
+        // First-boot seed: if the library cache has no SDK-built
+        // homebrew but the auto-detected SDK-examples dir exists
+        // and contains .exe files, run a silent rescan so the
+        // Examples column populates without requiring the user to
+        // hit Refresh. Failure is non-fatal — we just skip the
+        // auto-scan and the UI shows "No homebrew EXEs found" the
+        // way it did before.
+        let has_cached_exe = out
+            .library
+            .entries
+            .iter()
+            .any(|e| e.kind == GameKind::Exe);
+        if !has_cached_exe {
+            if let Some(sdk_dir) = out.resolve_sdk_examples_dir() {
+                if sdk_dir.exists() {
+                    if let Err(e) = out.rescan_library() {
+                        eprintln!("[frontend] startup auto-rescan skipped: {e}");
+                    }
+                }
+            }
+        }
+        // Seed the Menu's Games + Examples columns from the (now
+        // possibly-rescanned) library so the user sees entries
+        // immediately instead of a "No games found" placeholder.
         out.refresh_menu_library();
         out
     }
@@ -345,35 +366,86 @@ impl AppState {
         }
     }
 
-    /// Walk the configured library root and update the cache. Uses
-    /// `self.settings.paths.game_library` — if unset, returns an
-    /// error so the UI can surface a "choose a library root"
-    /// prompt. Also refreshes the Menu's Games + Examples columns
-    /// so the newly-scanned entries appear immediately.
+    /// Walk the configured library root(s) and update the cache.
+    /// Scans TWO roots in one pass:
+    ///
+    /// 1. `settings.paths.game_library` — user's retail-disc folder.
+    /// 2. `settings.paths.sdk_examples` (or auto-detected
+    ///    `build/examples/mipsel-sony-psx/release/` under the repo
+    ///    root) — `.exe` homebrew built by `make examples`.
+    ///
+    /// Either can be missing without erroring. If neither yields
+    /// entries, the Menu's columns show the "No … found" placeholder
+    /// instead of blowing up.
+    ///
+    /// Also refreshes the Menu's Games + Examples columns so the
+    /// newly-scanned entries appear immediately.
     pub fn rescan_library(&mut self) -> Result<usize, String> {
-        if self.settings.paths.game_library.is_empty() {
-            return Err(
-                "Library root is not set. Configure paths.game_library in settings.ron."
-                    .to_string(),
-            );
+        let game_root = if self.settings.paths.game_library.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(&self.settings.paths.game_library))
+        };
+        let sdk_root = self.resolve_sdk_examples_dir();
+
+        // No roots → still not an error; the UI shows empty columns.
+        // Matches the "fresh clone, user hasn't set a library yet"
+        // state rather than punishing it with a dialog.
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(g) = game_root.clone() {
+            if g.exists() {
+                roots.push(g);
+            } else {
+                return Err(format!("Library root does not exist: {}", g.display()));
+            }
         }
-        let root = PathBuf::from(&self.settings.paths.game_library);
-        if !root.exists() {
-            return Err(format!("Library root does not exist: {}", root.display()));
+        if let Some(s) = sdk_root.clone() {
+            // sdk_root from auto-detect may not exist (e.g. on an
+            // end-user install that never built the examples); that
+            // doesn't deserve an error. `scan_roots` silently skips
+            // missing roots for exactly this reason.
+            roots.push(s);
         }
+
+        let root_refs: Vec<&std::path::Path> = roots.iter().map(|p| p.as_path()).collect();
         let changed = self
             .library
-            .scan(&root)
+            .scan_roots(&root_refs)
             .map_err(|e| format!("scan failed: {e}"))?;
         self.library
             .save(&self.paths.library_file())
             .map_err(|e| format!("save library.ron: {e}"))?;
         self.refresh_menu_library();
+        let sdk_hint = match &sdk_root {
+            Some(p) if p.exists() => format!(" (SDK: {})", p.display()),
+            _ => String::new(),
+        };
         self.status_message = Some((
-            format!("Scan complete: {} entries", self.library.entries.len()),
+            format!(
+                "Scan complete: {} entries{sdk_hint}",
+                self.library.entries.len()
+            ),
             STATUS_MESSAGE_TTL_SECS,
         ));
         Ok(changed)
+    }
+
+    /// Resolve where to look for SDK-built example `.exe`s. Honours
+    /// the explicit `settings.paths.sdk_examples` if the user set
+    /// one; otherwise walks up from the frontend crate's source
+    /// directory (`CARGO_MANIFEST_DIR`) to the repo root and joins
+    /// the canonical build-output path. Returns `None` when the
+    /// resolver can't place the repo root — in which case scanning
+    /// proceeds with only the game-library root.
+    fn resolve_sdk_examples_dir(&self) -> Option<PathBuf> {
+        if !self.settings.paths.sdk_examples.is_empty() {
+            return Some(PathBuf::from(&self.settings.paths.sdk_examples));
+        }
+        // `emu/crates/frontend/` → four `..`s land at the repo root.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest.parent()?.parent()?.parent()?;
+        let candidate = repo_root.join("build/examples/mipsel-sony-psx/release");
+        Some(candidate)
     }
 
     /// Project the current library into the Menu's Games + Examples
