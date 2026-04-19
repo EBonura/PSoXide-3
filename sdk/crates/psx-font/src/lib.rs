@@ -220,11 +220,21 @@ impl FontAtlas {
     /// in 4bpp mode the effective horizontal texel range per page
     /// maps onto 64 VRAM halfwords = 64 × 4 = 256 texels).
     const MAX_ATLAS_W_TEXELS: u16 = 256;
-    /// Stack buffer for the packed 4bpp atlas. 2048 halfwords =
-    /// 4 KiB — big enough for a 256×32 4bpp atlas, which covers
-    /// 128 × 8×8 glyphs with room to spare. Larger fonts will need
-    /// a matching bump here.
-    const MAX_PACK_HALFWORDS: usize = 2048;
+    /// Stack buffer for the packed 4bpp atlas. 8192 halfwords =
+    /// 16 KiB covers the full 256×128 4bpp atlas footprint, which
+    /// fits:
+    /// - 128 glyphs at 8×8   (2048 hw)
+    /// - 128 glyphs at 8×16  (4096 hw)
+    /// - 64 glyphs  at 16×16 (4096 hw)
+    /// - 128 glyphs at 12×16 (5040 hw)
+    /// - 128 glyphs at 16×16 (8192 hw) — the largest supported
+    ///
+    /// 16 KiB transient stack usage at boot is fine on a 2 MiB
+    /// PS1 (typical stack budget is 32-64 KiB, and `upload` is
+    /// called once before the main loop). Fonts larger than 16×16
+    /// would need a bump — open an issue, we'll add a
+    /// const-generic variant.
+    const MAX_PACK_HALFWORDS: usize = 8192;
 
     /// Upload `font` as a 4bpp CLUT texture at `tpage`, with a
     /// 2-entry CLUT (transparent, white) at `clut`.

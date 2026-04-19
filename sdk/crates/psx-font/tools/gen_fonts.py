@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Convert dhepper/font8x8 `*.h` C headers into Rust const byte
+"""Convert vendored bitmap-font sources into Rust const byte
 arrays in `../src/fonts/`. Run from the crate root:
 
     python3 tools/gen_fonts.py
 
-Parses the `char font8x8_<name>[N][8] = { { 0xHH, ... }, ... };`
-form and emits a matching `FONT8X8_<NAME>: [u8; N*8]` const plus
-a `BitmapFont` descriptor set up to reference it. The generator
-is separate from `build.rs` so generated Rust lands in source
-control — readable diffs when fonts change, no build-script
-dependency on Python.
+Supports two source formats:
+
+1. **dhepper/font8x8 C headers** (`.h`): the
+   `char font8x8_<name>[N][8] = { { 0xHH, ... }, ... };` form.
+   8×8 pixels, LSB-first.
+2. **Raw IBM VGA BIOS dumps** (`.bin`): 256 glyphs × H bytes each,
+   MSB-first, 8-pixel wide. 8×14 and 8×16 sizes come through this
+   path.
+
+Emits a `<PREFIX>_BITMAP: [u8; N*H*Bpr]` const plus a `BitmapFont`
+descriptor referencing it. The generator is separate from
+`build.rs` so generated Rust lands in source control — readable
+diffs when fonts change, no build-script dependency on Python.
 
 Kept pure-Python3 stdlib so contributors don't need extra tooling.
 """
 
 import re
-import sys
 from pathlib import Path
 
 CRATE_ROOT = Path(__file__).resolve().parent.parent
@@ -32,49 +38,96 @@ use crate::{{BitOrder, BitmapFont}};
 
 '''
 
-# Each entry:  (header_file, const_name, first_codepoint, glyph_count, doc)
+# Each entry is a dict so future source formats can add fields
+# without breaking the shape. Required keys:
 #
-# `first_codepoint` is the ASCII/Unicode code of glyph 0 in the
-# bitmap array. dhepper's `basic` starts at U+0000 with the first
-# printable glyph at U+0020 — our `BitmapFont` carries first_char
-# so we can slice the array to just the printable range at upload
-# time, saving VRAM.
+# - source:      path inside `vendor/`
+# - format:      "c_header_8x8" | "ibm_bin"
+# - mod:         Rust module name (filename in `src/fonts/`)
+# - prefix:      const-name prefix (uppercased convention)
+# - first_cp:    first codepoint covered by glyph 0
+# - count:       number of glyphs
+# - doc:         free-form docstring (trimmed per-line)
+# - width / height / bit_order / advance / line_height:
+#                optional overrides; `ibm_bin` defaults to 8×H MSB
+#                and `c_header_8x8` defaults to 8×8 LSB.
 FONTS = [
-    ("font8x8_basic.h", "basic", "BASIC",
-     0x00, 128,
-     "ASCII 0x00..0x7F — the printable range (0x20..0x7E) is the\n"
-     "  default for English + C-source text. Control-character\n"
-     "  glyphs (0x00..0x1F) are empty in dhepper's basic; use\n"
-     "  `font8x8_control` if you need visible control glyphs."),
-    ("font8x8_ext_latin.h", "ext_latin", "EXT_LATIN",
-     0xA0, 96,
-     "Latin-1 supplement, U+00A0..U+00FF (96 glyphs). Accented\n"
-     "  letters + currency + punctuation for Western European\n"
-     "  languages. dhepper's upstream calls this file `ext_latin`\n"
-     "  even though its codepoint range is the Latin-1 supplement.\n"
-     "  Pair with `BASIC` for a full Latin-1-capable atlas."),
-    ("font8x8_box.h", "boxdraw", "BOXDRAW",
-     0x2500, 128,
-     "Box-drawing U+2500..U+257F — single/double line corners and\n"
-     "  intersections. Handy for framing menus. (`box` is a reserved\n"
-     "  keyword in Rust, so the module is named `boxdraw`.)"),
+    {
+        "source": "font8x8_basic.h",
+        "format": "c_header_8x8",
+        "mod": "basic",
+        "prefix": "BASIC",
+        "first_cp": 0x00,
+        "count": 128,
+        "doc": (
+            "ASCII 0x00..0x7F — the printable range (0x20..0x7E) is "
+            "the default for English + C-source text. Control-character "
+            "glyphs (0x00..0x1F) are empty in dhepper's basic; use "
+            "`font8x8_control` if you need visible control glyphs."
+        ),
+    },
+    {
+        "source": "font8x8_ext_latin.h",
+        "format": "c_header_8x8",
+        "mod": "ext_latin",
+        "prefix": "EXT_LATIN",
+        "first_cp": 0xA0,
+        "count": 96,
+        "doc": (
+            "Latin-1 supplement, U+00A0..U+00FF (96 glyphs). Accented "
+            "letters + currency + punctuation for Western European "
+            "languages. dhepper's upstream calls this file `ext_latin` "
+            "even though its codepoint range is the Latin-1 supplement. "
+            "Pair with `BASIC` for a full Latin-1-capable atlas."
+        ),
+    },
+    {
+        "source": "font8x8_box.h",
+        "format": "c_header_8x8",
+        "mod": "boxdraw",
+        "prefix": "BOXDRAW",
+        "first_cp": 0x2500,
+        "count": 128,
+        "doc": (
+            "Box-drawing U+2500..U+257F — single/double line corners and "
+            "intersections. Handy for framing menus. (`box` is a reserved "
+            "keyword in Rust, so the module is named `boxdraw`.)"
+        ),
+    },
+    {
+        "source": "IBM_VGA_8x16.bin",
+        "format": "ibm_bin",
+        "mod": "basic_8x16",
+        "prefix": "BASIC_8X16",
+        "first_cp": 0x00,
+        "count": 128,  # ASCII + control window; caller can bump to 256 for full CP437
+        "height": 16,
+        "doc": (
+            "IBM VGA 8×16 — the canonical BIOS console font every PC-era "
+            "gamer recognises. ASCII range (0x00..0x7F), 16 rows per "
+            "glyph, MSB-first within each byte. Pair with BASIC (8×8) for "
+            "a small-body / large-heading ladder without re-uploading a "
+            "single-size atlas. The full 256-glyph CP437 range (including "
+            "box-drawing and extended symbols) is in the binary — we "
+            "expose the lower 128 here to keep the atlas compact; trim "
+            "`count` to 96 or extend to 256 by editing this table."
+        ),
+    },
 ]
 
 
-def parse_font_file(path: Path, expected_glyphs: int) -> list[list[int]]:
+def parse_c_header_8x8(path: Path, expected_glyphs: int) -> list[list[int]]:
+    """Parse dhepper's C array syntax:
+        { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+    """
     text = path.read_text()
-    # Each glyph line looks like:
-    #   { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   // U+0000 (nul)
     glyph_re = re.compile(
         r"\{\s*(0x[0-9a-fA-F]{2})\s*,\s*(0x[0-9a-fA-F]{2})\s*,\s*"
         r"(0x[0-9a-fA-F]{2})\s*,\s*(0x[0-9a-fA-F]{2})\s*,\s*"
         r"(0x[0-9a-fA-F]{2})\s*,\s*(0x[0-9a-fA-F]{2})\s*,\s*"
         r"(0x[0-9a-fA-F]{2})\s*,\s*(0x[0-9a-fA-F]{2})\s*\}"
     )
-    glyphs = []
-    for match in glyph_re.finditer(text):
-        row_bytes = [int(g, 16) for g in match.groups()]
-        glyphs.append(row_bytes)
+    glyphs = [[int(g, 16) for g in m.groups()] for m in glyph_re.finditer(text)]
     if len(glyphs) != expected_glyphs:
         raise SystemExit(
             f"{path.name}: parsed {len(glyphs)} glyphs, expected {expected_glyphs}"
@@ -82,10 +135,46 @@ def parse_font_file(path: Path, expected_glyphs: int) -> list[list[int]]:
     return glyphs
 
 
-def emit_font_module(
-    source: str, mod: str, const_prefix: str,
-    first_cp: int, count: int, doc: str, glyphs: list[list[int]],
-) -> str:
+def parse_ibm_bin(path: Path, height: int, expected_glyphs: int) -> list[list[int]]:
+    """Parse IBM VGA ROM dump: `expected_glyphs × height` bytes,
+    one byte per row, MSB-first bit order. Some dumps have 256
+    glyphs and we take the first `expected_glyphs`.
+    """
+    data = path.read_bytes()
+    total_glyphs_in_file = len(data) // height
+    if total_glyphs_in_file < expected_glyphs:
+        raise SystemExit(
+            f"{path.name}: only {total_glyphs_in_file} glyphs in file, "
+            f"needed {expected_glyphs}"
+        )
+    glyphs = []
+    for gi in range(expected_glyphs):
+        off = gi * height
+        glyphs.append(list(data[off:off + height]))
+    return glyphs
+
+
+def emit_font_module(entry: dict, glyphs: list[list[int]]) -> str:
+    source = entry["source"]
+    prefix = entry["prefix"]
+    mod = entry["mod"]
+    first_cp = entry["first_cp"]
+    count = entry["count"]
+    doc = entry["doc"]
+    # Per-format defaults.
+    if entry["format"] == "c_header_8x8":
+        width, height = 8, 8
+        bit_order = "Lsb"
+    elif entry["format"] == "ibm_bin":
+        width, height = 8, entry.get("height", 16)
+        bit_order = "Msb"
+    else:
+        raise SystemExit(f"unknown format: {entry['format']}")
+    advance = entry.get("advance", width)
+    line_height = entry.get("line_height", height)
+    row_bytes = (width + 7) // 8
+    total_bytes = count * row_bytes * height
+
     buf = [HEADER_BLOCK.format(source_name=source)]
     for line in doc.strip().split("\n"):
         line = line.lstrip()
@@ -94,10 +183,11 @@ def emit_font_module(
         else:
             buf.append("///\n")
     buf.append(f"///\n")
-    buf.append(f"/// 8×8 pixels per glyph, 1 bit per pixel, LSB = leftmost.\n")
     buf.append(
-        f"pub const {const_prefix}_BITMAP: [u8; {count * 8}] = [\n"
+        f"/// {width}×{height} pixels per glyph, 1 bit per pixel, "
+        f"{'LSB' if bit_order == 'Lsb' else 'MSB'} = leftmost.\n"
     )
+    buf.append(f"pub const {prefix}_BITMAP: [u8; {total_bytes}] = [\n")
     for i, rows in enumerate(glyphs):
         cp = first_cp + i
         hex_row = ", ".join(f"0x{b:02x}" for b in rows)
@@ -109,18 +199,27 @@ def emit_font_module(
     buf.append(
         f"/// [`BitmapFont`] descriptor for the `{mod}` bitmap above.\n"
         f"/// Pass into [`crate::FontAtlas::upload`] to install it in VRAM.\n"
-        f"pub const {const_prefix}: BitmapFont = BitmapFont {{\n"
-        f"    glyph_w: 8,\n"
-        f"    glyph_h: 8,\n"
+        f"pub const {prefix}: BitmapFont = BitmapFont {{\n"
+        f"    glyph_w: {width},\n"
+        f"    glyph_h: {height},\n"
         f"    first_char: 0x{first_cp:04x},\n"
         f"    glyph_count: {count},\n"
-        f"    bitmap: &{const_prefix}_BITMAP,\n"
-        f"    advance_x: 8,\n"
-        f"    line_height: 8,\n"
-        f"    bit_order: BitOrder::Lsb,\n"
+        f"    bitmap: &{prefix}_BITMAP,\n"
+        f"    advance_x: {advance},\n"
+        f"    line_height: {line_height},\n"
+        f"    bit_order: BitOrder::{bit_order},\n"
         f"}};\n"
     )
     return "".join(buf)
+
+
+def parse_entry(entry: dict) -> list[list[int]]:
+    path = VENDOR / entry["source"]
+    if entry["format"] == "c_header_8x8":
+        return parse_c_header_8x8(path, entry["count"])
+    if entry["format"] == "ibm_bin":
+        return parse_ibm_bin(path, entry.get("height", 16), entry["count"])
+    raise SystemExit(f"unknown format: {entry['format']}")
 
 
 def main() -> None:
@@ -128,30 +227,37 @@ def main() -> None:
         raise SystemExit(f"missing vendor dir {VENDOR}")
     OUT.mkdir(parents=True, exist_ok=True)
     mod_lines = [
-        "//! Built-in fonts — all Public Domain (dhepper/font8x8).\n",
+        "//! Built-in fonts — all Public Domain.\n",
+        "//!\n",
+        "//! Mostly from dhepper/font8x8 (8×8 monochrome) plus the\n",
+        "//! canonical IBM VGA 8×16 BIOS font for the heading tier.\n",
+        "//! See `vendor/PROVENANCE.md` for the full chain.\n",
         "//!\n",
         "//! Generated by `tools/gen_fonts.py`. Add new entries there\n",
         "//! rather than editing this file by hand.\n",
         "\n",
     ]
-    for source, mod, const_prefix, first_cp, count, doc in FONTS:
-        glyphs = parse_font_file(VENDOR / source, count)
-        out_path = OUT / f"{mod}.rs"
-        out_path.write_text(emit_font_module(
-            source, mod, const_prefix, first_cp, count, doc, glyphs,
-        ))
-        print(f"wrote {out_path.relative_to(CRATE_ROOT)} — {count} glyphs")
-        mod_lines.append(
-            f"/// Built-in font: `{mod}` "
-            f"(U+{first_cp:04X}..U+{first_cp + count - 1:04X}, "
-            f"{count} glyphs).\n"
+    for entry in FONTS:
+        glyphs = parse_entry(entry)
+        out_path = OUT / f"{entry['mod']}.rs"
+        out_path.write_text(emit_font_module(entry, glyphs))
+        print(
+            f"wrote {out_path.relative_to(CRATE_ROOT)} — "
+            f"{entry['count']} glyphs ({entry['format']})"
         )
-        mod_lines.append(f"pub mod {mod};\n")
+        first_cp = entry["first_cp"]
+        last_cp = first_cp + entry["count"] - 1
+        mod_lines.append(
+            f"/// Built-in font: `{entry['mod']}` "
+            f"(U+{first_cp:04X}..U+{last_cp:04X}, "
+            f"{entry['count']} glyphs).\n"
+        )
+        mod_lines.append(f"pub mod {entry['mod']};\n")
     mod_lines.append("\n")
     mod_lines.append("// Flat re-exports so call sites read as\n")
     mod_lines.append("// `psx_font::fonts::BASIC` etc.\n")
-    for _, mod, const_prefix, _, _, _ in FONTS:
-        mod_lines.append(f"pub use {mod}::{const_prefix};\n")
+    for entry in FONTS:
+        mod_lines.append(f"pub use {entry['mod']}::{entry['prefix']};\n")
     (OUT / "mod.rs").write_text("".join(mod_lines))
     print(f"wrote {(OUT / 'mod.rs').relative_to(CRATE_ROOT)}")
 

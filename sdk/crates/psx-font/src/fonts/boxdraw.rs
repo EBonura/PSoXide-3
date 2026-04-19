@@ -6,9 +6,7 @@
 
 use crate::{BitOrder, BitmapFont};
 
-/// Box-drawing U+2500..U+257F — single/double line corners and
-/// intersections. Handy for framing menus. (`box` is a reserved
-/// keyword in Rust, so the module is named `boxdraw`.)
+/// Box-drawing U+2500..U+257F — single/double line corners and intersections. Handy for framing menus. (`box` is a reserved keyword in Rust, so the module is named `boxdraw`.)
 ///
 /// 8×8 pixels per glyph, 1 bit per pixel, LSB = leftmost.
 pub const BOXDRAW_BITMAP: [u8; 1024] = [

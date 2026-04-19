@@ -6,11 +6,7 @@
 
 use crate::{BitOrder, BitmapFont};
 
-/// Latin-1 supplement, U+00A0..U+00FF (96 glyphs). Accented
-/// letters + currency + punctuation for Western European
-/// languages. dhepper's upstream calls this file `ext_latin`
-/// even though its codepoint range is the Latin-1 supplement.
-/// Pair with `BASIC` for a full Latin-1-capable atlas.
+/// Latin-1 supplement, U+00A0..U+00FF (96 glyphs). Accented letters + currency + punctuation for Western European languages. dhepper's upstream calls this file `ext_latin` even though its codepoint range is the Latin-1 supplement. Pair with `BASIC` for a full Latin-1-capable atlas.
 ///
 /// 8×8 pixels per glyph, 1 bit per pixel, LSB = leftmost.
 pub const EXT_LATIN_BITMAP: [u8; 768] = [
