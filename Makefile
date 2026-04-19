@@ -10,8 +10,8 @@
 # .cargo/config.toml for the mipsel-sony-psx target.
 
 .PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke parity run \
-        examples hello-tri hello-input hello-ot hello-tex \
-        run-tri run-input run-ot run-tex
+        examples hello-tri hello-input hello-ot hello-tex hello-gte \
+        run-tri run-input run-ot run-tex run-gte
 
 help:
 	@echo "PSoXide-3 targets:"
@@ -33,10 +33,12 @@ help:
 	@echo "    make hello-input  - build the pad-poll demo"
 	@echo "    make hello-ot     - build the DMA linked-list demo"
 	@echo "    make hello-tex    - build the textured-sprite demo"
+	@echo "    make hello-gte    - build the GTE perspective-transform demo"
 	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
 	@echo "    make run-input    - build + side-load hello-input into the frontend"
 	@echo "    make run-ot       - build + side-load hello-ot into the frontend"
 	@echo "    make run-tex      - build + side-load hello-tex into the frontend"
+	@echo "    make run-gte      - build + side-load hello-gte into the frontend"
 
 run:
 	cd emu && cargo run -p frontend --release
@@ -94,7 +96,10 @@ hello-ot:
 hello-tex:
 	cd sdk/examples/hello-tex && cargo build --release
 
-examples: hello-tri hello-input hello-ot hello-tex
+hello-gte:
+	cd sdk/examples/hello-gte && cargo build --release
+
+examples: hello-tri hello-input hello-ot hello-tex hello-gte
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -114,3 +119,6 @@ run-ot: hello-ot
 
 run-tex: hello-tex
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/hello-tex.exe cargo run -p frontend --release
+
+run-gte: hello-gte
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/hello-gte.exe cargo run -p frontend --release
