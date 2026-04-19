@@ -45,6 +45,18 @@ const DEFAULT_BIOS: &str = "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN";
 const CRASH_DISC: &str = "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
 const TEKKEN_DISC: &str =
     "/Users/ebonura/Downloads/ps1 games/Tekken 3 (USA)/Tekken 3 (USA) (Track 1).bin";
+const GT2_DISC: &str =
+    "/Users/ebonura/Downloads/ps1 games/Gran Turismo 2 (USA) (Arcade Mode) (Rev 1)/Gran Turismo 2 (USA) (Arcade Mode) (Rev 1).bin";
+const MGS_DISC: &str =
+    "/Users/ebonura/Downloads/ps1 games/Metal Gear Solid (USA) (Disc 1) (Rev 1)/Metal Gear Solid (USA) (Disc 1) (Rev 1).bin";
+const RE2_DISC: &str =
+    "/Users/ebonura/Downloads/ps1 games/Resident Evil 2 - Dual Shock Ver. (USA) (Disc 1)/Resident Evil 2 - Dual Shock Ver. (USA) (Disc 1).bin";
+const WIPEOUT1_DISC: &str =
+    "/Users/ebonura/Downloads/ps1 games/WipEout (Europe) (v1.1)/WipEout (Europe) (v1.1).bin";
+const WIPEOUT2097_DISC: &str =
+    "/Users/ebonura/Downloads/ps1 games/WipEout 2097 (Europe)/WipEout 2097 (Europe).bin";
+const WIPEOUT3_DISC: &str =
+    "/Users/ebonura/Downloads/ps1 games/WipEout 3 - Special Edition (Europe) (En,Fr,De,Es,It)/WipEout 3 - Special Edition (Europe) (En,Fr,De,Es,It).bin";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -487,10 +499,70 @@ fn parity_crash_boot() {
 #[ignore = "requires PCSX-Redux + Tekken 3 disc; ~4min in release"]
 fn parity_tekken_boot() {
     let schedule = [
-        Checkpoint { steps: 100_000_000, name: "sony_logo",    max_diverge_pct:  4.00 },
+        Checkpoint { steps: 100_000_000, name: "sony_logo",    max_diverge_pct: 0.05 },
         Checkpoint { steps: 300_000_000, name: "disc_handoff", max_diverge_pct: 10.00 },
         Checkpoint { steps: 500_000_000, name: "licensed",     max_diverge_pct: 40.00 },
         Checkpoint { steps: 800_000_000, name: "licensed_hold", max_diverge_pct: 40.00 },
     ];
     run_parity_suite("tekken", Some(TEKKEN_DISC), &schedule);
+}
+
+// ===================================================================
+// Parity-at-100M (Sony logo) for every game. At 100M steps, the
+// emulator has only finished the BIOS's logo phase — disc hasn't
+// been booted yet, so CPU timing drift is ~1% and the frame is
+// deterministic. This is where we can meaningfully demand 0%
+// pixel parity for any game.
+//
+// For later checkpoints (disc boot, title screen, gameplay),
+// CPU cycle drift dominates — at Crash 900M we're -6% off
+// Redux's tick count, so even with a pixel-exact renderer, the
+// game is at a slightly different animation frame than Redux.
+// Those checkpoints need cycle-accurate emulation work first.
+// ===================================================================
+
+fn sony_logo_schedule() -> &'static [Checkpoint] {
+    // Static schedule reused across every game's Sony-logo test.
+    // Budget is pinned tight (0.05%) — the renderer is pixel-
+    // exact here, so any divergence implies a CPU/memory-timing
+    // regression worth diagnosing.
+    &[
+        Checkpoint { steps: 100_000_000, name: "sony_logo", max_diverge_pct: 0.05 },
+    ]
+}
+
+#[test]
+#[ignore = "requires GT2 disc"]
+fn parity_gt2_sony_logo() {
+    run_parity_suite("gt2", Some(GT2_DISC), sony_logo_schedule());
+}
+
+#[test]
+#[ignore = "requires MGS Disc 1"]
+fn parity_mgs_sony_logo() {
+    run_parity_suite("mgs", Some(MGS_DISC), sony_logo_schedule());
+}
+
+#[test]
+#[ignore = "requires RE2 Disc 1"]
+fn parity_re2_sony_logo() {
+    run_parity_suite("re2", Some(RE2_DISC), sony_logo_schedule());
+}
+
+#[test]
+#[ignore = "requires WipEout 1 disc"]
+fn parity_wipeout1_sony_logo() {
+    run_parity_suite("wipeout1", Some(WIPEOUT1_DISC), sony_logo_schedule());
+}
+
+#[test]
+#[ignore = "requires WipEout 2097 disc"]
+fn parity_wipeout2097_sony_logo() {
+    run_parity_suite("wipeout2097", Some(WIPEOUT2097_DISC), sony_logo_schedule());
+}
+
+#[test]
+#[ignore = "requires WipEout 3 disc"]
+fn parity_wipeout3_sony_logo() {
+    run_parity_suite("wipeout3", Some(WIPEOUT3_DISC), sony_logo_schedule());
 }
