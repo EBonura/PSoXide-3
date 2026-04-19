@@ -175,22 +175,29 @@ fn milestone_a_bios_to_sony_logo() {
     // when pixel parity hits 0% differing bytes, replace with the
     // captured Redux hash to lock in correctness.
     let state = run_milestone(100_000_000, None);
-    // Hashes updated 2026-04-18-E after the GPU-transparency fix:
-    // `sample_texture` now treats a CLUT entry of 0x0000 as
-    // transparent (matches Redux's `if (color == 0) return;`), not
-    // just index 0. The BIOS TM glyph deliberately places 0x0000 at
-    // non-zero CLUT entries to punch the letter cutout — the old
-    // `idx == 0` check drew those pixels as opaque black, giving
-    // the infamous "TM on a black box" artifact. See
-    // `sample_texture_4bpp_nonzero_idx_with_zero_clut_is_transparent`
-    // for the unit-level regression guard.
+    // Hashes updated 2026-04-19 — three Redux-parity fixes landed
+    // together, dropping visible divergence from 3.48% to effectively
+    // 0% (8 pixels differ, all off-by-1 green from barycentric vs.
+    // scanline rounding on one column):
+    //   1. `dither_rgb` rewritten to Redux's coefficient-threshold
+    //      model (not the PSX-SPX additive offset). See
+    //      `dither_rgb_matches_redux_truth_table`.
+    //   2. `blend_pixel` Average fixed to per-channel `(bg>>1) + (fg>>1)`
+    //      (Redux's `& 0x7bde >> 1` pattern) — the naive `(bg+fg)/2`
+    //      rounded wrong for odd+odd inputs. See
+    //      `blend_average_odd_plus_odd_matches_redux`.
+    //   3. Top-left fill rule applied via `top_left_biases` — PSX
+    //      excludes bottom + right edges; we used to include them.
+    //      See `top_left_bias_classifies_ccw_edges`.
     assert_milestone(
         "Milestone A",
         &state,
-        0x1d7f_8e83_19d2_978d, // full VRAM (self)
-        0x94f6_6784_c260_9dc1, // display area (self)
+        0x3d63_9437_6cf4_0218, // full VRAM (self)
+        0x8228_f202_dac3_16d0, // display area (self, ~99.999% Redux-match)
         (640, 478),
-        None, // Redux-parity hash pending remaining renderer fixes
+        None, // 8/611840 bytes still differ vs Redux — barycentric
+              // interpolation vs scanline-delta rounding, not worth
+              // a major rewrite.
     );
 }
 
@@ -201,15 +208,15 @@ fn milestone_b_bios_to_shell() {
     // boot logo to the MAIN MENU shell screen (MEMORY CARD / CD
     // PLAYER, radial blue gradient).
     let state = run_milestone(500_000_000, None);
-    // Hashes updated 2026-04-18-E alongside milestone A — same
-    // transparency fix changes any CLUT-backed primitive that uses
-    // a 0x0000 entry at a non-zero index. Shell icons and the CD-
-    // PLAYER UI use that pattern.
+    // Hashes updated 2026-04-19 — same renderer parity pass as
+    // milestone A. Shell screen uses lots of Gouraud gradients for
+    // the radial background, so blend + dither + top-left all feed
+    // in.
     assert_milestone(
         "Milestone B",
         &state,
-        0x8e4e_a7f4_0606_6ac5, // full VRAM (self)
-        0xf842_d300_dc31_89ca, // display area (self)
+        0x66a2_8807_e59d_8563, // full VRAM (self)
+        0x7123_3c93_c6d8_8b89, // display area (self)
         (640, 478),
         None, // Redux parity capture pending
     );
@@ -319,15 +326,15 @@ fn milestone_d_tekken_licensed_screen() {
         return;
     }
     let state = run_milestone(800_000_000, Some(TEKKEN_DISC));
-    // Hashes updated 2026-04-18-E after the GPU-transparency fix.
-    // The PlayStation licensed-disc screen uses small CLUT-backed
-    // sprites (SCEA™ text, copyright line) that rely on the correct
-    // "CLUT entry == 0 is transparent, regardless of index" rule.
+    // Hashes updated 2026-04-19 — renderer parity pass applied here
+    // too. The licensed-disc screen renders the red 3D PlayStation
+    // logo via GTE-lit Gouraud tris with dither enabled, so every
+    // fix in this pass feeds in.
     assert_milestone(
         "Milestone D (Tekken license screen)",
         &state,
-        0x2781_c9df_d291_3ac1,
-        0xf38e_d486_3bd3_a1ed,
+        0x7e93_08c4_eb2f_7da7,
+        0xbd2c_627d_0bb4_b82f,
         (640, 478),
         None,
     );

@@ -70,8 +70,24 @@ pub fn draw(
     });
 }
 
-/// Fit `tex_size` into the remaining space, preserving aspect,
-/// scale factor is fractional. Current default — stretches smoothly.
+/// CRT display aspect ratio for NTSC — the visible area is 4:3
+/// regardless of the PSX horizontal-resolution mode the game picks
+/// (256/320/368/384/512/640). A 512×240 game frame is NOT supposed
+/// to display with square pixels; real hardware squashes it
+/// horizontally to hit the 4:3 CRT window. Emulating this squash in
+/// Fit mode is what stops Crash Bandicoot (which runs 512×240)
+/// from looking comically wide-screen.
+const CRT_ASPECT: f32 = 4.0 / 3.0;
+
+/// Fit the framebuffer into the available space AT CRT ASPECT (4:3),
+/// not at 1:1 texture pixels. This matches what a real PSX on a CRT
+/// produces regardless of which horizontal resolution the game
+/// picked — 256, 320, 512, and 640 all fill the same horizontal
+/// span, with differently-shaped pixels.
+///
+/// Integer mode (see `paint_image_integer`) keeps 1:1 pixels for
+/// pixel-art fans; this "Fit" mode is for users who want the game
+/// to look like it did on a TV.
 fn paint_image_fit(
     ui: &mut egui::Ui,
     tex: egui::TextureId,
@@ -82,11 +98,15 @@ fn paint_image_fit(
     if avail.width() <= 0.0 || avail.height() <= 0.0 || tex_size.x <= 0.0 || tex_size.y <= 0.0 {
         return;
     }
-    let scale = (avail.width() / tex_size.x).min(avail.height() / tex_size.y);
-    let size = tex_size * scale;
-    let rect = egui::Rect::from_center_size(avail.center(), size);
+    // Largest 4:3 rectangle that fits inside `avail`. The horizontal
+    // resolution of the framebuffer (512, 640, etc.) doesn't appear
+    // here — the UV already maps the right sub-rectangle of VRAM and
+    // egui handles the horizontal squash during sampling.
+    let h = avail.height().min(avail.width() / CRT_ASPECT);
+    let w = h * CRT_ASPECT;
+    let rect = egui::Rect::from_center_size(avail.center(), egui::vec2(w, h));
     ui.allocate_rect(avail, egui::Sense::hover());
-    egui::Image::new((tex, size)).uv(uv).paint_at(ui, rect);
+    egui::Image::new((tex, rect.size())).uv(uv).paint_at(ui, rect);
 }
 
 /// Integer-scale (nearest-neighbour multiple) fit. Always shows

@@ -30,17 +30,15 @@ fn main() {
         .unwrap_or_else(|_| PathBuf::from("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN"));
 
     // --- Capture Redux side ---
-    // Note: Redux accepts discs via its own CLI (`-iso PATH`), which
-    // needs wiring into OracleConfig. For now we only compare the
-    // no-disc boot path (milestones A, B). Disc-present comparison
-    // (D) lands when the oracle grows `-iso` support.
-    if disc_path.is_some() {
-        eprintln!("[display_parity_at] WARNING: disc path ignored for Redux side — \
-                   oracle config doesn't pass -iso yet. Ours will mount the disc, \
-                   theirs won't. Use a no-disc milestone (A or B) for now.");
-    }
+    // Redux accepts the disc via `-iso PATH`; OracleConfig threads it
+    // through. Passing the same disc to both emulators is what
+    // unlocks milestone-D-plus parity (Crash, Tekken) — the old
+    // "no-disc-only" restriction is dead.
     let lua = OracleConfig::default_lua_dir().join("oracle.lua");
-    let config = OracleConfig::new(bios_path.clone(), lua).expect("Redux binary resolves");
+    let mut config = OracleConfig::new(bios_path.clone(), lua).expect("Redux binary resolves");
+    if let Some(ref p) = disc_path {
+        config = config.with_disc(PathBuf::from(p));
+    }
 
     let mut redux = ReduxProcess::launch(&config).expect("Redux launches");
     redux.handshake(HANDSHAKE_TIMEOUT).expect("handshake");
