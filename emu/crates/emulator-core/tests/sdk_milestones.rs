@@ -433,23 +433,19 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-text" => Some(SdkGolden {
             example: "showcase-text",
             vblanks: 4,
-            // Refreshed 2026-04-19-h after switching to the
-            // `FrameBuffer` double-buffered path. Text rendering
-            // was single-buffered before and visibly flickered as
-            // dense draws (~870 GP0 words / frame) crossed into
-            // the TV's active scanout. Double-buffer swaps show a
-            // stable buffer while we draw into the other.
-            //
-            // VRAM + display hashes shift (displayed buffer
-            // alternates A/B per frame now); final_pc shifts from
-            // the extra swap/clear code. Rotation angle at the
-            // 4-VBlank checkpoint is unchanged.
-            vram_hash: 0x3c0a_b554_b68e_a0e2,
-            display_hash: 0x7cfc_87d6_c36a_4ab1,
+            // Refreshed 2026-04-19-i after adding a second font
+            // atlas (`BASIC_8X16`) and re-laying-out the demo to
+            // use it for the title / rotation / affine sections.
+            // The 8×8 atlas still powers the size ladder, tint
+            // palette, gradient row, and footer. Two atlases live
+            // at separate tpages (320, 0, Bit4) and (384, 0,
+            // Bit4); CLUTs at (320, 256) and (384, 256).
+            vram_hash: 0x0b58_eb3a_1e82_000b,
+            display_hash: 0x5dda_be7d_5429_569c,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0ac0,
+            final_pc: 0x8001_0b40,
             redux_display_hash: None,
         }),
         _ => None,
