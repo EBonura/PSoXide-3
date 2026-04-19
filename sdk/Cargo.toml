@@ -9,6 +9,7 @@ members = [
     "crates/psx-sdk",
     "crates/psx-vram",
     "crates/psx-font",
+    "crates/psx-math",
 ]
 
 # The examples are built against the MIPS target via a separate
@@ -32,3 +33,4 @@ psx-pad = { path = "crates/psx-pad" }
 psx-sdk = { path = "crates/psx-sdk" }
 psx-vram = { path = "crates/psx-vram" }
 psx-font = { path = "crates/psx-font" }
+psx-math = { path = "crates/psx-math" }
