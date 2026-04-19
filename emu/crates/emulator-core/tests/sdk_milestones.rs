@@ -442,6 +442,20 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_0ce8,
             redux_display_hash: None,
         }),
+        // First mini-game. At the 8-VBlank checkpoint the ball
+        // has bounced off the right paddle and is coming back
+        // left; AI paddle is tracking. Nothing scored yet.
+        "pong" => Some(SdkGolden {
+            example: "pong",
+            vblanks: 8,
+            vram_hash: 0x9a79_14eb_0915_3cfd,
+            display_hash: 0x7da9_7577_f30c_22fe,
+            display_size: (320, 240),
+            vblank_raises: 8,
+            spu_samples: 5145,
+            final_pc: 0x8001_1030,
+            redux_display_hash: None,
+        }),
         _ => None,
     }
 }
@@ -506,6 +520,16 @@ fn milestone_c_hello_audio() {
     // sequence to fully complete and for a handful of audio-pump
     // ticks to advance the `samples_produced` counter.
     run_sdk_milestone("hello-audio", 3);
+}
+
+#[test]
+#[ignore = "SDK milestone: pong roundtrip"]
+fn milestone_c_pong() {
+    // 8 VBlanks exercises the game loop through its first paddle
+    // bounce. The ball starts at centre moving right at (2, 1);
+    // after 8 frames it's hit the right paddle area, triggered
+    // the paddle-hit SFX, and the AI has begun tracking.
+    run_sdk_milestone("pong", 8);
 }
 
 #[test]

@@ -14,7 +14,8 @@
         examples hello-tri hello-input hello-ot hello-tex hello-gte hello-audio \
         run-tri run-input run-ot run-tex run-gte run-audio \
         showcase-textured-sprite run-showcase-textured-sprite \
-        showcase-text run-showcase-text
+        showcase-text run-showcase-text \
+        pong run-pong
 
 help:
 	@echo "PSoXide-3 targets:"
@@ -43,6 +44,7 @@ help:
 	@echo "                      - build the polished textured-sprite showcase"
 	@echo "    make showcase-text"
 	@echo "                      - build the text / font capabilities showcase"
+	@echo "    make pong         - build the Pong mini-game"
 	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
 	@echo "    make run-input    - build + side-load hello-input into the frontend"
 	@echo "    make run-ot       - build + side-load hello-ot into the frontend"
@@ -53,6 +55,7 @@ help:
 	@echo "                      - build + side-load the textured-sprite showcase"
 	@echo "    make run-showcase-text"
 	@echo "                      - build + side-load the text capabilities showcase"
+	@echo "    make run-pong     - build + side-load the Pong mini-game"
 
 run:
 	cd emu && cargo run -p frontend --release
@@ -130,7 +133,10 @@ showcase-textured-sprite:
 showcase-text:
 	cd sdk/examples/showcase-text && cargo build --release
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text
+pong:
+	cd sdk/examples/pong && cargo build --release
+
+examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text pong
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -162,3 +168,6 @@ run-showcase-textured-sprite: showcase-textured-sprite
 
 run-showcase-text: showcase-text
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-text.exe cargo run -p frontend --release
+
+run-pong: pong
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/pong.exe cargo run -p frontend --release
