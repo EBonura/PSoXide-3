@@ -813,10 +813,6 @@ impl Bus {
             addr = addr.wrapping_add(step);
         }
         self.mdec.dma_write_in(&words);
-        // Clear the start bit to match Redux — see `run_dma_gpu` for
-        // the full story. Without this, a subsequent DMA-register write
-        // would re-run the transfer.
-        self.dma.channels[0].channel_control &= !(1 << 24);
         Some(total_words)
     }
 
@@ -854,8 +850,6 @@ impl Bus {
             }
             addr = addr.wrapping_add(step);
         }
-        // Clear start bit to match Redux.
-        self.dma.channels[1].channel_control &= !(1 << 24);
         Some(total_words)
     }
 
@@ -932,8 +926,6 @@ impl Bus {
                 addr = addr.wrapping_add(step);
             }
         }
-        // Clear start bit to match Redux.
-        self.dma.channels[4].channel_control &= !(1 << 24);
         Some(total_words)
     }
 
@@ -1002,8 +994,6 @@ impl Bus {
             }
             addr = addr.wrapping_add(step);
         }
-        // Clear start bit to match Redux.
-        self.dma.channels[3].channel_control &= !(1 << 24);
         Some(total_words)
     }
 
@@ -1049,16 +1039,10 @@ impl Bus {
             _ => 0, // Manual (0) + prohibited (3) — nothing standard uses
                     // them for the GPU channel. Drop the trigger silently.
         };
-        // Clear the start bit NOW, mirroring Redux's `dma2`: the data
-        // movement and CHCR stop-bit-clear happen instantly, only the
-        // completion IRQ is scheduled for later. Without this, every
-        // subsequent write to ANY DMA register re-enters `maybe_run_dma`,
-        // the start bit is still set, and we re-run the same DMA —
-        // re-pushing its GP0 commands and overwriting the scheduled
-        // completion target. Diagnosed from `probe_dma_schedules`
-        // showing 7+ identical-delta schedules for what should have
-        // been a single DMA.
-        self.dma.channels[2].channel_control &= !(1 << 24);
+        // Start bit stays set until the scheduled completion event
+        // fires — Redux's `gpuInterrupt` is where `clearDMABusy<2>()`
+        // is called. BIOS polling of CHCR bit 24 during the transfer
+        // window must read 1 until the IRQ fires.
         Some(completion)
     }
 
@@ -1454,9 +1438,21 @@ impl Bus {
         }
         if Dma::contains(phys) {
             self.dma.write32(phys, value);
-            // A CHCR write can request a transfer; run whatever we
-            // can self-contain right now (OTC only, so far).
-            self.maybe_run_dma();
+            // Only a CHCR write with bit 24 set starts a transfer —
+            // matches Redux's `dmaExec` dispatcher in `psxhw.cc`,
+            // which runs ONLY from the `case 0x1f80_1088/98/a8/b8/c8/e8`
+            // (each CHCR register) paths, not from MADR/BCR writes.
+            // Running on every DMA-register write re-entered the same
+            // transfer multiple times (once per MADR+BCR+CHCR) and
+            // pushed the IRQ completion further out each time. See
+            // `probe_dma_schedules` for the diagnosis.
+            let offset = phys.wrapping_sub(Dma::BASE);
+            let field = offset & 0xF;
+            let is_chcr_write = field == 0x8;
+            let start_bit_set = value & (1 << 24) != 0;
+            if is_chcr_write && start_bit_set {
+                self.maybe_run_dma();
+            }
             return;
         }
         if self.gpu.write32(phys, value) {

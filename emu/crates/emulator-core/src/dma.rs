@@ -275,11 +275,6 @@ impl Dma {
             ram[offset..offset + 4].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
         }
 
-        // Clear start bit immediately (Redux pattern) — the
-        // completion IRQ still schedules for later via the caller,
-        // but subsequent DMA-register writes won't re-run the same
-        // OTC chain.
-        self.channels[6].channel_control &= !(1 << 24);
         count
     }
 }
@@ -417,30 +412,25 @@ mod tests {
     }
 
     #[test]
-    fn otc_clears_start_bit_synchronously_matching_redux() {
-        // Redux clears CHCR's start bit (bit 24) in the same function
-        // that moves the data (`dma6` path via HW::dmaExec). Leaving
-        // it set is a specific bug: any subsequent write to a DMA
-        // register re-enters `maybe_run_dma`, sees the start bit is
-        // still on, and runs the transfer AGAIN. The probe
-        // `probe_dma_schedules` caught this in the wild — 7 identical
-        // linked-list GPU DMAs with the same delta got scheduled back
-        // to back during a single CHCR trigger, making our DMA IRQ
-        // fire ~2500 cycles after Redux's.
+    fn otc_does_not_clear_start_and_busy_bits_synchronously() {
+        // Bus is responsible for clearing the busy bits at the
+        // scheduled completion cycle (Redux's `gpuotcInterrupt`); the
+        // DMA module itself just transfers data. Start AND busy bits
+        // both stay set during the "virtual transfer window" so BIOS
+        // polling of CHCR sees the same sequence Redux produces.
         //
-        // We do still emit a scheduled completion event for the IRQ
-        // side (bus sets up `EventSlot::GpuOtcDma`); that's what
-        // clears the BUSY bit 28 at completion time. So after
-        // `run_otc`, only the start bit should be off — the busy bit
-        // stays set until the bus fires the scheduler event.
+        // Preventing duplicate runs is done at the bus level via the
+        // CHCR-write-only trigger — only a CHCR write with bit 24 set
+        // enters `maybe_run_dma`. See `bus.rs:write32` handling of the
+        // DMA region.
         let mut dma = Dma::new();
         let mut ram = vec![0u8; 2 * 1024 * 1024];
         set_otc(&mut dma, 0x0000_0100, 1);
         assert_eq!(dma.run_otc(&mut ram), 1);
 
         let chcr = dma.channels[6].channel_control;
-        assert_eq!(chcr & (1 << 24), 0, "start bit must be cleared synchronously");
-        assert_ne!(chcr & (1 << 28), 0, "busy bit stays set until scheduler fires completion");
+        assert_ne!(chcr & (1 << 24), 0, "start bit must remain set");
+        assert_ne!(chcr & (1 << 28), 0, "busy bit must remain set");
     }
 
     #[test]
