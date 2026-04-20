@@ -158,7 +158,7 @@ showcase-text:
 	cd sdk/examples/showcase-text && cargo build --release
 
 game-pong:
-	cd sdk/examples/game-pong && cargo build --release
+	cd engine/examples/game-pong && cargo build --release
 
 game-breakout:
 	cd sdk/examples/game-breakout && cargo build --release

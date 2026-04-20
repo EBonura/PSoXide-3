@@ -451,6 +451,15 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // First mini-game. At the 8-VBlank checkpoint the ball
         // has bounced off the right paddle and is coming back
         // left; AI paddle is tracking. Nothing scored yet.
+        // First mini-game. At the 8-VBlank checkpoint the ball
+        // has bounced off the right paddle and is coming back
+        // left; AI paddle is tracking. Nothing scored yet.
+        //
+        // Ported to the engine framework (commit after 964f022).
+        // VRAM + display hashes match the pre-engine build exactly —
+        // proof that `App::run` + `Scene` perfectly replace the
+        // hand-rolled main loop. Only `final_pc` shifted, because
+        // the engine's code went into the text section.
         "game-pong" => Some(SdkGolden {
             example: "game-pong",
             vblanks: 8,
@@ -459,7 +468,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 8,
             spu_samples: 5145,
-            final_pc: 0x8001_1030,
+            final_pc: 0x8001_179c,
             redux_display_hash: None,
         }),
         // Second mini-game. 60 VBlanks captures one serve-arc +

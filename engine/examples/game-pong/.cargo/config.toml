@@ -8,6 +8,6 @@ target-dir = "../../../build/examples"
 
 [target.mipsel-sony-psx]
 rustflags = [
-    "-Clink-arg=-T../../psoxide.ld",
+    "-Clink-arg=-T../../../sdk/psoxide.ld",
     "-Clink-arg=--oformat=binary",
 ]
