@@ -507,15 +507,20 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // OT with back-face culling. ~200 rendered triangles per
         // frame (~400 pre-cull). 60 VBlanks pins a non-trivial
         // tumble angle.
+        // Now lit via the GTE's NCCS pipeline — 3 directional
+        // world-space lights rotated per-object into local
+        // frames, per-vertex `project_lit` computes both screen
+        // coords (RTPS) and lit colour (NCCS → RGB2). Triangles
+        // emit as `TriGouraud` with per-vertex colours.
         "showcase-3d" => Some(SdkGolden {
             example: "showcase-3d",
             vblanks: 60,
-            vram_hash: 0xc516_74ff_f5cb_ca88,
-            display_hash: 0x2b33_56e6_b126_3940,
+            vram_hash: 0xf54a_3f2e_db7f_c950,
+            display_hash: 0x5dde_480e_622f_d1a2,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_15b0,
+            final_pc: 0x8001_2ae8,
             redux_display_hash: None,
         }),
         _ => None,

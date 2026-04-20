@@ -49,6 +49,7 @@
 #![warn(missing_docs)]
 #![cfg_attr(target_arch = "mips", feature(asm_experimental_arch))]
 
+pub mod lighting;
 pub mod math;
 pub mod regs;
 pub mod scene;
