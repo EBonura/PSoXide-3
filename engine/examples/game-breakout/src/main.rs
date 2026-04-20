@@ -28,12 +28,12 @@
 
 extern crate psx_rt;
 
-use psx_engine::{App, Config, Ctx, Scene, button};
+use psx_engine::{App, Config, Ctx, Scene, button, sfx};
 use psx_font::{FontAtlas, fonts::BASIC_8X16};
 use psx_fx::{LcgRng, ParticlePool, ShakeState};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat};
-use psx_spu::{self as spu, Adsr, Pitch, SpuAddr, Voice, Volume, tones};
+use psx_spu::{self as spu, Pitch, SpuAddr, Voice, tones};
 use psx_vram::{Clut, TexDepth, Tpage};
 
 // ----------------------------------------------------------------------
@@ -271,7 +271,7 @@ impl Breakout {
                     PARTICLE_TTL,
                 );
                 self.shake.trigger(SHAKE_FRAMES_ON_BREAK);
-                play_sfx(VOICE_BRICK);
+                sfx::play(VOICE_BRICK);
                 return;
             }
         }
@@ -299,21 +299,6 @@ static mut BG_QUAD: QuadGouraud = QuadGouraud {
 };
 
 // ----------------------------------------------------------------------
-// SFX helpers (same shape as pong)
-// ----------------------------------------------------------------------
-
-fn configure_sfx_voice(v: Voice, addr: SpuAddr, pitch: Pitch) {
-    v.set_volume(Volume::HALF, Volume::HALF);
-    v.set_pitch(pitch);
-    v.set_start_addr(addr);
-    v.set_adsr(Adsr::percussive());
-}
-
-fn play_sfx(v: Voice) {
-    Voice::key_on(v.mask());
-}
-
-// ----------------------------------------------------------------------
 // Scene impl
 // ----------------------------------------------------------------------
 
@@ -324,10 +309,10 @@ impl Scene for Breakout {
         spu::upload_adpcm(SPU_PADDLE, tones::SQUARE);
         spu::upload_adpcm(SPU_BRICK, tones::TRIANGLE);
         spu::upload_adpcm(SPU_LOSE, tones::SAWTOOTH);
-        configure_sfx_voice(VOICE_WALL, SPU_WALL, Pitch::raw(0x1200));
-        configure_sfx_voice(VOICE_PADDLE, SPU_PADDLE, Pitch::raw(0x0E00));
-        configure_sfx_voice(VOICE_BRICK, SPU_BRICK, Pitch::raw(0x1600));
-        configure_sfx_voice(VOICE_LOSE, SPU_LOSE, Pitch::raw(0x0600));
+        sfx::configure_voice(VOICE_WALL, SPU_WALL, Pitch::raw(0x1200));
+        sfx::configure_voice(VOICE_PADDLE, SPU_PADDLE, Pitch::raw(0x0E00));
+        sfx::configure_voice(VOICE_BRICK, SPU_BRICK, Pitch::raw(0x1600));
+        sfx::configure_voice(VOICE_LOSE, SPU_LOSE, Pitch::raw(0x0600));
 
         self.font = Some(FontAtlas::upload(&BASIC_8X16, FONT_TPAGE, FONT_CLUT));
 
@@ -372,16 +357,16 @@ impl Scene for Breakout {
         if self.ball_x <= BORDER_W as i16 {
             self.ball_x = BORDER_W as i16;
             self.ball_vx = self.ball_vx.abs();
-            play_sfx(VOICE_WALL);
+            sfx::play(VOICE_WALL);
         } else if self.ball_x + BALL_SIZE as i16 >= SCREEN_W - BORDER_W as i16 {
             self.ball_x = SCREEN_W - BORDER_W as i16 - BALL_SIZE as i16;
             self.ball_vx = -self.ball_vx.abs();
-            play_sfx(VOICE_WALL);
+            sfx::play(VOICE_WALL);
         }
         if self.ball_y <= 2 {
             self.ball_y = 2;
             self.ball_vy = self.ball_vy.abs();
-            play_sfx(VOICE_WALL);
+            sfx::play(VOICE_WALL);
         }
 
         // Paddle collision.
@@ -400,13 +385,13 @@ impl Scene for Breakout {
                 self.ball_vx = 1;
             }
             self.paddle_flash_frames = PADDLE_FLASH_FRAMES_ON_HIT;
-            play_sfx(VOICE_PADDLE);
+            sfx::play(VOICE_PADDLE);
         }
 
         // Ball fell past the paddle?
         if self.ball_y >= FLOOR_Y {
             self.lives = self.lives.saturating_sub(1);
-            play_sfx(VOICE_LOSE);
+            sfx::play(VOICE_LOSE);
             if self.lives == 0 {
                 self.phase = Phase::Lost;
                 return;

@@ -24,12 +24,12 @@
 
 extern crate psx_rt;
 
-use psx_engine::{App, Config, Ctx, Scene, button};
+use psx_engine::{App, Config, Ctx, Scene, button, sfx};
 use psx_font::{FontAtlas, fonts::BASIC_8X16};
 use psx_fx::{LcgRng, ParticlePool, ShakeState};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat};
-use psx_spu::{self as spu, Adsr, Pitch, SpuAddr, Voice, Volume, tones};
+use psx_spu::{self as spu, Pitch, SpuAddr, Voice, tones};
 use psx_vram::{Clut, TexDepth, Tpage};
 
 // ----------------------------------------------------------------------
@@ -246,7 +246,7 @@ impl Invaders {
                 y: SHIP_Y - BULLET_H as i16,
                 alive: true,
             };
-            play_sfx(VOICE_SHOOT);
+            sfx::play(VOICE_SHOOT);
         }
     }
 
@@ -314,7 +314,7 @@ impl Invaders {
         } else {
             self.grid_offset_x += self.march_direction * MARCH_STEP_X;
         }
-        play_sfx(VOICE_MARCH);
+        sfx::play(VOICE_MARCH);
     }
 
     /// Every 40 frames, a random surviving column's lowest alien
@@ -375,7 +375,7 @@ impl Invaders {
                     PARTICLE_TTL,
                 );
                 self.shake.trigger(SHAKE_FRAMES_ON_HIT);
-                play_sfx(VOICE_KILL);
+                sfx::play(VOICE_KILL);
                 return;
             }
         }
@@ -419,7 +419,7 @@ impl Invaders {
         self.shake.trigger(SHAKE_FRAMES_ON_HIT * 2);
         self.ship_flash_frames = SHIP_FLASH_FRAMES;
         self.lives = self.lives.saturating_sub(hit_count);
-        play_sfx(VOICE_LOSE);
+        sfx::play(VOICE_LOSE);
         if self.lives == 0 {
             self.phase = Phase::Lost;
         }
@@ -464,21 +464,6 @@ static mut BG_QUAD: QuadGouraud = QuadGouraud {
 };
 
 // ----------------------------------------------------------------------
-// SFX helpers
-// ----------------------------------------------------------------------
-
-fn configure_sfx_voice(v: Voice, addr: SpuAddr, pitch: Pitch) {
-    v.set_volume(Volume::HALF, Volume::HALF);
-    v.set_pitch(pitch);
-    v.set_start_addr(addr);
-    v.set_adsr(Adsr::percussive());
-}
-
-fn play_sfx(v: Voice) {
-    Voice::key_on(v.mask());
-}
-
-// ----------------------------------------------------------------------
 // Scene impl
 // ----------------------------------------------------------------------
 
@@ -489,10 +474,10 @@ impl Scene for Invaders {
         spu::upload_adpcm(SPU_KILL, tones::SQUARE);
         spu::upload_adpcm(SPU_MARCH, tones::TRIANGLE);
         spu::upload_adpcm(SPU_LOSE, tones::SINE);
-        configure_sfx_voice(VOICE_SHOOT, SPU_SHOOT, Pitch::raw(0x1800));
-        configure_sfx_voice(VOICE_KILL, SPU_KILL, Pitch::raw(0x1200));
-        configure_sfx_voice(VOICE_MARCH, SPU_MARCH, Pitch::raw(0x0A00));
-        configure_sfx_voice(VOICE_LOSE, SPU_LOSE, Pitch::raw(0x0500));
+        sfx::configure_voice(VOICE_SHOOT, SPU_SHOOT, Pitch::raw(0x1800));
+        sfx::configure_voice(VOICE_KILL, SPU_KILL, Pitch::raw(0x1200));
+        sfx::configure_voice(VOICE_MARCH, SPU_MARCH, Pitch::raw(0x0A00));
+        sfx::configure_voice(VOICE_LOSE, SPU_LOSE, Pitch::raw(0x0500));
 
         self.font = Some(FontAtlas::upload(&BASIC_8X16, FONT_TPAGE, FONT_CLUT));
 

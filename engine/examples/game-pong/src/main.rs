@@ -32,11 +32,11 @@
 
 extern crate psx_rt;
 
-use psx_engine::{App, Config, Ctx, Scene, button};
+use psx_engine::{App, Config, Ctx, Scene, button, sfx};
 use psx_font::{FontAtlas, fonts::BASIC_8X16};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::RectFlat;
-use psx_spu::{self as spu, Adsr, Pitch, SpuAddr, Voice, Volume, tones};
+use psx_spu::{self as spu, Pitch, SpuAddr, Voice, tones};
 use psx_vram::{Clut, TexDepth, Tpage};
 
 // ----------------------------------------------------------------------
@@ -208,24 +208,6 @@ fn spin_from_paddle(ball_y: i16, paddle_y: i16, prev_vy: i16) -> i16 {
 }
 
 // ----------------------------------------------------------------------
-// SFX helpers
-// ----------------------------------------------------------------------
-
-/// Configure a sample-playback voice: half volume, percussive
-/// ADSR, fixed pitch. No sound until `Voice::key_on`.
-fn configure_sfx_voice(v: Voice, addr: SpuAddr, pitch: Pitch) {
-    v.set_volume(Volume::HALF, Volume::HALF);
-    v.set_pitch(pitch);
-    v.set_start_addr(addr);
-    v.set_adsr(Adsr::percussive());
-}
-
-/// Fire an SFX — re-attacks the voice's ADSR.
-fn play_sfx(v: Voice) {
-    Voice::key_on(v.mask());
-}
-
-// ----------------------------------------------------------------------
 // Scene impl
 // ----------------------------------------------------------------------
 
@@ -235,9 +217,9 @@ impl Scene for Pong {
         spu::upload_adpcm(SPU_WALL, tones::SINE);
         spu::upload_adpcm(SPU_PADDLE, tones::SQUARE);
         spu::upload_adpcm(SPU_SCORE, tones::TRIANGLE);
-        configure_sfx_voice(VOICE_WALL, SPU_WALL, Pitch::raw(0x1400));
-        configure_sfx_voice(VOICE_PADDLE, SPU_PADDLE, Pitch::raw(0x0E00));
-        configure_sfx_voice(VOICE_SCORE, SPU_SCORE, Pitch::raw(0x0800));
+        sfx::configure_voice(VOICE_WALL, SPU_WALL, Pitch::raw(0x1400));
+        sfx::configure_voice(VOICE_PADDLE, SPU_PADDLE, Pitch::raw(0x0E00));
+        sfx::configure_voice(VOICE_SCORE, SPU_SCORE, Pitch::raw(0x0800));
 
         self.font = Some(FontAtlas::upload(&BASIC_8X16, FONT_TPAGE, FONT_CLUT));
 
@@ -281,11 +263,11 @@ impl Scene for Pong {
         if self.ball_y <= PLAYFIELD_TOP {
             self.ball_y = PLAYFIELD_TOP;
             self.ball_vy = self.ball_vy.abs();
-            play_sfx(VOICE_WALL);
+            sfx::play(VOICE_WALL);
         } else if self.ball_y + BALL_SIZE as i16 >= PLAYFIELD_BOT {
             self.ball_y = PLAYFIELD_BOT - BALL_SIZE as i16;
             self.ball_vy = -self.ball_vy.abs();
-            play_sfx(VOICE_WALL);
+            sfx::play(VOICE_WALL);
         }
 
         // Left paddle bounce (ball moving left).
@@ -299,7 +281,7 @@ impl Scene for Pong {
             self.ball_x = left_face;
             self.ball_vx = bounce_speed(-self.ball_vx);
             self.ball_vy = spin_from_paddle(self.ball_y, self.p1_y, self.ball_vy);
-            play_sfx(VOICE_PADDLE);
+            sfx::play(VOICE_PADDLE);
         }
 
         // Right paddle bounce.
@@ -313,19 +295,19 @@ impl Scene for Pong {
             self.ball_x = right_face - BALL_SIZE as i16;
             self.ball_vx = -bounce_speed(self.ball_vx);
             self.ball_vy = spin_from_paddle(self.ball_y, self.p2_y, self.ball_vy);
-            play_sfx(VOICE_PADDLE);
+            sfx::play(VOICE_PADDLE);
         }
 
         // Score: ball fell off either end.
         if (self.ball_x + BALL_SIZE as i16) < 0 {
             self.p2_score = self.p2_score.saturating_add(1);
             self.serve_dir = -1;
-            play_sfx(VOICE_SCORE);
+            sfx::play(VOICE_SCORE);
             self.check_win_and_reset();
         } else if self.ball_x > SCREEN_W {
             self.p1_score = self.p1_score.saturating_add(1);
             self.serve_dir = 1;
-            play_sfx(VOICE_SCORE);
+            sfx::play(VOICE_SCORE);
             self.check_win_and_reset();
         }
     }

@@ -19,9 +19,13 @@ use psx_pad::{ButtonState, button};
 /// [`Scene::render`]. The engine owns and updates this between
 /// frames; the scene reads from it and draws through it.
 pub struct Ctx {
-    /// Monotonic frame counter since boot. Wraps at `u32::MAX`
-    /// (~828 days at 60 fps — not a concern in practice, but the
-    /// wrap is still well-defined).
+    /// Monotonic visible-frame counter. Both `update` and `render`
+    /// see the same value on a given iteration; the engine
+    /// advances it once per end-of-loop. Wraps at `u32::MAX`
+    /// (≈828 days at 60 fps). Engine APIs that want the type-
+    /// safe variant take [`crate::Frames`]; `ctx.frame` stays a
+    /// raw `u32` so the common `frame % N` / `frame & N` cases
+    /// compose without unwrap ceremony.
     pub frame: u32,
     /// Port-1 pad state this frame.
     pub pad: ButtonState,

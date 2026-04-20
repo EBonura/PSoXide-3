@@ -22,4 +22,5 @@ psx-gte   = { path = "../sdk/crates/psx-gte" }
 psx-math  = { path = "../sdk/crates/psx-math" }
 psx-pad   = { path = "../sdk/crates/psx-pad" }
 psx-rt    = { path = "../sdk/crates/psx-rt" }
+psx-spu   = { path = "../sdk/crates/psx-spu" }
 psx-vram  = { path = "../sdk/crates/psx-vram" }

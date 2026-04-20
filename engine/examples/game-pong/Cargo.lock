@@ -28,6 +28,7 @@ dependencies = [
  "psx-gte",
  "psx-math",
  "psx-pad",
+ "psx-spu",
  "psx-vram",
 ]
 

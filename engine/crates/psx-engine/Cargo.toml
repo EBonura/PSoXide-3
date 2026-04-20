@@ -11,6 +11,7 @@ psx-gpu  = { workspace = true }
 psx-gte  = { workspace = true }
 psx-math = { workspace = true }
 psx-pad  = { workspace = true }
+psx-spu  = { workspace = true }
 psx-vram = { workspace = true }
 
 [lints.rust]

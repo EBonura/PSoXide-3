@@ -46,10 +46,13 @@
 
 pub mod angle;
 pub mod app;
+pub mod frames;
 pub mod scene;
+pub mod sfx;
 
 pub use angle::Angle;
 pub use app::{App, Config};
+pub use frames::{Frames, Ticks};
 pub use scene::{Ctx, Scene};
 
 /// Button-mask constants (UP, DOWN, CROSS, START, …) re-exported
