@@ -501,6 +501,23 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_5fe8,
             redux_display_hash: None,
         }),
+        // Flagship 3D showcase. Starfield + 3 tumbling meshes
+        // (gouraud cube, flat pyramid, flat octahedron) driven
+        // by GTE projection into an OT, plus psx-fx sparks and
+        // HUD. 60 VBlanks captures the meshes at a non-trivial
+        // tumble angle with the starfield flowed through multiple
+        // spawn cycles.
+        "scene-lab" => Some(SdkGolden {
+            example: "scene-lab",
+            vblanks: 60,
+            vram_hash: 0xccb7_352b_ebb8_f424,
+            display_hash: 0xe5f9_79d3_d8a3_490e,
+            display_size: (320, 240),
+            vblank_raises: 60,
+            spu_samples: 44100,
+            final_pc: 0x8001_270c,
+            redux_display_hash: None,
+        }),
         _ => None,
     }
 }
@@ -596,6 +613,16 @@ fn milestone_c_invaders() {
     // in flight. Exercises the 50+-primitive OT path + the
     // march / bullet / particle state machines.
     run_sdk_milestone("invaders", 120);
+}
+
+#[test]
+#[ignore = "SDK milestone: scene-lab roundtrip"]
+fn milestone_c_scene_lab() {
+    // 60 VBlanks locks a frame where all three meshes have
+    // rotated to an interesting angle + the starfield is fully
+    // flowing. Covers the complete 3D pipeline: GTE projection
+    // → back-face cull → OT depth-slot insert → DMA submit.
+    run_sdk_milestone("scene-lab", 60);
 }
 
 #[test]
