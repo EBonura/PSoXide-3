@@ -18,7 +18,7 @@
         pong run-pong \
         breakout run-breakout \
         invaders run-invaders \
-        scene-lab run-scene-lab
+        showcase-3d run-showcase-3d
 
 help:
 	@echo "PSoXide targets:"
@@ -50,7 +50,7 @@ help:
 	@echo "    make pong         - build the Pong mini-game"
 	@echo "    make breakout     - build the Breakout mini-game"
 	@echo "    make invaders     - build the Space Invaders mini-game"
-	@echo "    make scene-lab    - build the 3D geometry showcase"
+	@echo "    make showcase-3d    - build the 3D geometry showcase"
 	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
 	@echo "    make run-input    - build + side-load hello-input into the frontend"
 	@echo "    make run-ot       - build + side-load hello-ot into the frontend"
@@ -64,7 +64,7 @@ help:
 	@echo "    make run-pong     - build + side-load the Pong mini-game"
 	@echo "    make run-breakout - build + side-load the Breakout mini-game"
 	@echo "    make run-invaders - build + side-load the Space Invaders mini-game"
-	@echo "    make run-scene-lab - build + side-load the 3D geometry showcase"
+	@echo "    make run-showcase-3d - build + side-load the 3D geometry showcase"
 
 run:
 	cd emu && cargo run -p frontend --release
@@ -151,10 +151,10 @@ breakout:
 invaders:
 	cd sdk/examples/invaders && cargo build --release
 
-scene-lab:
-	cd sdk/examples/scene-lab && cargo build --release
+showcase-3d:
+	cd sdk/examples/showcase-3d && cargo build --release
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text pong breakout invaders scene-lab
+examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text pong breakout invaders showcase-3d
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -196,5 +196,5 @@ run-breakout: breakout
 run-invaders: invaders
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/invaders.exe cargo run -p frontend --release
 
-run-scene-lab: scene-lab
-	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/scene-lab.exe cargo run -p frontend --release
+run-showcase-3d: showcase-3d
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-3d.exe cargo run -p frontend --release

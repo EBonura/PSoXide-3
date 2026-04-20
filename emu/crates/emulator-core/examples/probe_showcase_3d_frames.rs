@@ -1,4 +1,4 @@
-//! Dump scene-lab frames spaced across the rotation cycle so we
+//! Dump showcase-3d frames spaced across the rotation cycle so we
 //! can eyeball the meshes tumbling + starfield flowing.
 use emulator_core::{Bus, Cpu};
 use psx_iso::Exe;
@@ -7,9 +7,9 @@ use std::io::Write;
 fn main() {
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("bios");
     let exe_bytes = std::fs::read(
-        "/Users/ebonura/Desktop/repos/PSoXide/build/examples/mipsel-sony-psx/release/scene-lab.exe",
+        "/Users/ebonura/Desktop/repos/PSoXide/build/examples/mipsel-sony-psx/release/showcase-3d.exe",
     )
-    .expect("scene-lab.exe");
+    .expect("showcase-3d.exe");
     let exe = Exe::parse(&exe_bytes).expect("parse");
 
     let mut bus = Bus::new(bios).expect("bus");
@@ -37,7 +37,7 @@ fn main() {
 
 fn dump_ppm(bus: &Bus, frame: u64) {
     let da = bus.gpu.display_area();
-    let path = format!("/tmp/scene-lab-f{:03}.ppm", frame);
+    let path = format!("/tmp/showcase-3d-f{:03}.ppm", frame);
     let mut f = std::fs::File::create(&path).unwrap();
     writeln!(f, "P6\n{} {}\n255", da.width, da.height).unwrap();
     let mut buf = Vec::with_capacity((da.width as usize) * (da.height as usize) * 3);

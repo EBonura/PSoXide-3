@@ -73,7 +73,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "scene-lab"
+name = "showcase-3d"
 version = "0.1.0"
 dependencies = [
  "psx-font",

@@ -1,12 +1,12 @@
 [package]
-name    = "scene-lab"
+name    = "showcase-3d"
 version = "0.1.0"
 edition = "2021"
 
 [workspace]
 
 [[bin]]
-name = "scene-lab"
+name = "showcase-3d"
 path = "src/main.rs"
 
 [profile.release]

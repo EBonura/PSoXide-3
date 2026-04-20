@@ -501,21 +501,21 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_5fe8,
             redux_display_hash: None,
         }),
-        // Flagship 3D showcase. Starfield + 3 tumbling meshes
-        // (gouraud cube, flat pyramid, flat octahedron) driven
-        // by GTE projection into an OT, plus psx-fx sparks and
-        // HUD. 60 VBlanks captures the meshes at a non-trivial
-        // tumble angle with the starfield flowed through multiple
-        // spawn cycles.
-        "scene-lab" => Some(SdkGolden {
-            example: "scene-lab",
+        // Flagship 3D showcase. Starfield + Suzanne (Blender
+        // monkey) + Utah teapot (Martin Newell), each decimated
+        // to PSX poly budget and driven by GTE projection into an
+        // OT with back-face culling. ~200 rendered triangles per
+        // frame (~400 pre-cull). 60 VBlanks pins a non-trivial
+        // tumble angle.
+        "showcase-3d" => Some(SdkGolden {
+            example: "showcase-3d",
             vblanks: 60,
-            vram_hash: 0xccb7_352b_ebb8_f424,
-            display_hash: 0xe5f9_79d3_d8a3_490e,
+            vram_hash: 0xc788_2b8f_07f7_87c4,
+            display_hash: 0x895c_a74d_0802_fe8c,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_270c,
+            final_pc: 0x8001_1c24,
             redux_display_hash: None,
         }),
         _ => None,
@@ -616,13 +616,13 @@ fn milestone_c_invaders() {
 }
 
 #[test]
-#[ignore = "SDK milestone: scene-lab roundtrip"]
-fn milestone_c_scene_lab() {
+#[ignore = "SDK milestone: showcase-3d roundtrip"]
+fn milestone_c_showcase_3d() {
     // 60 VBlanks locks a frame where all three meshes have
     // rotated to an interesting angle + the starfield is fully
     // flowing. Covers the complete 3D pipeline: GTE projection
     // → back-face cull → OT depth-slot insert → DMA submit.
-    run_sdk_milestone("scene-lab", 60);
+    run_sdk_milestone("showcase-3d", 60);
 }
 
 #[test]
