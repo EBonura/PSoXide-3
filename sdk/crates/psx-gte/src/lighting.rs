@@ -189,6 +189,42 @@ impl LightRig {
             ambient: self.ambient,
         }
     }
+
+    /// Return a new rig with every light's direction rotated by
+    /// `rotation` (direct `R × dir`, not the transpose).
+    ///
+    /// Used to animate world-space lights over time — e.g. an
+    /// orbiting key light. Compose this BEFORE [`for_object`] so
+    /// the per-object transpose applies on top of the animation.
+    pub fn rotated(&self, rotation: &Mat3I16) -> LightRig {
+        let rotate = |dir: Vec3I16| {
+            // R × dir: standard row-major matrix-vector product.
+            let mut out = [0i32; 3];
+            for i in 0..3 {
+                out[i] = ((rotation.m[i][0] as i32) * (dir.x as i32)
+                    + (rotation.m[i][1] as i32) * (dir.y as i32)
+                    + (rotation.m[i][2] as i32) * (dir.z as i32))
+                    >> 12;
+            }
+            Vec3I16::new(
+                out[0].clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                out[1].clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                out[2].clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            )
+        };
+        let rot_light = |l: &Light| Light {
+            direction: rotate(l.direction),
+            colour: l.colour,
+        };
+        LightRig {
+            lights: [
+                rot_light(&self.lights[0]),
+                rot_light(&self.lights[1]),
+                rot_light(&self.lights[2]),
+            ],
+            ambient: self.ambient,
+        }
+    }
 }
 
 /// Result of [`project_lit`]: screen-space vertex + its computed

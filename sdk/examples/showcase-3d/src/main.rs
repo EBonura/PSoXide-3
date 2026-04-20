@@ -87,29 +87,37 @@ const TEAPOT_POS: Vec3I32 = Vec3I32::new(0x1400, 0, WORLD_Z);
 /// Directions are Q3.12 unit-ish vectors pointing FROM the surface
 /// TO the light. They're `const`-evaluated so the rig lives in
 /// .rodata — no per-frame rebuild cost.
-const SCENE_LIGHTS: LightRig = LightRig::new(
+/// "Studio" rig in its REFERENCE frame (facing -Z, camera-front).
+/// Per frame we rotate this around Y so lights orbit the scene,
+/// ensuring both Suzanne and the teapot see every lighting angle
+/// across a full rotation.
+const BASE_LIGHTS: LightRig = LightRig::new(
     [
-        // Key — warm light coming from the upper-right.
+        // Key — warm, from upper-right at reference angle.
         Light {
-            direction: Vec3I16::new(0x0B00, 0x0B00, 0x0400),
-            colour: (0x0E00, 0x0A00, 0x0600),
+            direction: Vec3I16::new(0x0B00, 0x0900, -0x0300),
+            colour: (0x0E00, 0x0A80, 0x0700),
         },
-        // Fill — cool, from upper-left, softer.
+        // Fill — cool, opposite side.
         Light {
-            direction: Vec3I16::new(-0x0B00, 0x0B00, 0x0400),
-            colour: (0x0500, 0x0700, 0x0A00),
+            direction: Vec3I16::new(-0x0B00, 0x0800, -0x0300),
+            colour: (0x0600, 0x0800, 0x0B00),
         },
-        // Rim — from behind, picks out the silhouette.
+        // Rim — from behind, narrow highlight.
         Light {
-            direction: Vec3I16::new(0, -0x0300, -0x0F00),
-            colour: (0x0400, 0x0400, 0x0600),
+            direction: Vec3I16::new(0, -0x0200, 0x0F00),
+            colour: (0x0500, 0x0500, 0x0800),
         },
     ],
-    // Ambient term — gentle dark navy so shadowed faces aren't
-    // pure black. i32 in 20-bit range; ~0x300 per channel reads
-    // as "dim but not opaque".
-    (0x0200, 0x0200, 0x0300),
+    // Ambient — lifted so shadowed faces stay readable.
+    (0x0400, 0x0400, 0x0600),
 );
+
+/// How fast the light rig orbits the scene Y axis, in Q0.12 units
+/// per frame. 32 units/frame → 4096/32 = 128 frames per full
+/// revolution ≈ 2.1 s at 60 Hz. Slow enough to track, fast enough
+/// to see both meshes lit from every side within a few seconds.
+const LIGHT_ORBIT_PER_FRAME: u16 = 32;
 
 // ----------------------------------------------------------------------
 // Font + VRAM
@@ -360,13 +368,23 @@ fn build_frame_ot() {
     let suzanne = Mesh::from_bytes(SUZANNE_BLOB).expect("suzanne blob");
     let teapot = Mesh::from_bytes(TEAPOT_BLOB).expect("teapot blob");
 
+    // World-space light rig for this frame — base rig rotated
+    // around Y at the configured orbit rate so both meshes
+    // eventually see every lighting angle. Compose this once per
+    // frame; each object's `for_object` applies on top to take us
+    // into local space.
+    let light_orbit = Mat3I16::rotate_y(
+        ((s.frame as u32).wrapping_mul(LIGHT_ORBIT_PER_FRAME as u32) & 0xFFFF) as u16,
+    );
+    let scene_lights = BASE_LIGHTS.rotated(&light_orbit);
+
     // --- SUZANNE (slot 5) — two-axis tumble, lit by scene rig ---
     let suz_rot = Mat3I16::rotate_y((s.frame.wrapping_mul(3) & 0xFFFF) as u16)
         .mul(&Mat3I16::rotate_x((s.frame.wrapping_mul(2) & 0xFFFF) as u16));
     scene::load_rotation(&suz_rot);
     scene::load_translation(SUZANNE_POS);
     // Rotate world-space lights into Suzanne's local frame + upload.
-    SCENE_LIGHTS.for_object(&suz_rot).load();
+    scene_lights.for_object(&suz_rot).load();
     let suz_proj = unsafe { &mut SUZANNE_PROJ };
     for i in 0..suzanne.vert_count() {
         let v = suzanne.vertex(i as u8);
@@ -412,7 +430,7 @@ fn build_frame_ot() {
         .mul(&Mat3I16::rotate_z((s.frame.wrapping_mul(2) & 0xFFFF) as u16));
     scene::load_rotation(&tea_rot);
     scene::load_translation(TEAPOT_POS);
-    SCENE_LIGHTS.for_object(&tea_rot).load();
+    scene_lights.for_object(&tea_rot).load();
     let tea_proj = unsafe { &mut TEAPOT_PROJ };
     for i in 0..teapot.vert_count() {
         let v = teapot.vertex(i as u8);

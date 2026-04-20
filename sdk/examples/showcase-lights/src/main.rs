@@ -54,7 +54,11 @@ const SCREEN_H: i16 = 240;
 const OT_DEPTH: usize = 8;
 
 const PROJ_H: u16 = 280;
-const WORLD_Z: i32 = 0x3800;
+/// Camera setback — tuned so the cubes sit comfortably in the
+/// middle distance rather than crowding the screen. Kept just
+/// under `i16::MAX / 2` so light orbits ±0x2C00 around it still
+/// fit in Vec3I16 (the GTE's native vertex type).
+const WORLD_Z: i32 = 0x5000;
 
 const FONT_TPAGE: Tpage = Tpage::new(320, 0, TexDepth::Bit4);
 const FONT_CLUT: Clut = Clut::new(320, 256);
@@ -70,16 +74,17 @@ static CUBE_BLOB: &[u8] = include_bytes!("../assets/cube.psxm");
 
 const NUM_LIGHTS: usize = 4;
 
-/// Tighter radius so each light dominates a smaller region —
-/// distinct coloured zones rather than four lights additively
-/// whiting-out the whole scene.
-const LIGHT_RADIUS_SQ: i32 = 0x0500_0000;
+/// Radius large enough to reach every cube from any orbit
+/// position, small enough that distant cubes fall off visibly.
+/// Cubes span ±0x2200 on X and sit near z ≈ WORLD_Z; lights
+/// orbit at radii up to 0x2C00 around scene centre.
+const LIGHT_RADIUS_SQ: i32 = 0x1800_0000;
 
-/// Tuned to match `sqrt(LIGHT_RADIUS_SQ) ≈ 0x2400`. Used as the
+/// Tuned to match `sqrt(LIGHT_RADIUS_SQ) ≈ 0x4E00`. Used as the
 /// "reference distance" the dot product divides by to turn its
 /// N · D magnitude (which carries distance) into a rough
 /// direction-only scalar.
-const RADIUS_LINEAR: i64 = 0x2400;
+const RADIUS_LINEAR: i64 = 0x4E00;
 
 /// Per-channel ambient term, added before clamping. Dim blueish
 /// so shadowed faces read as "in the dark room" rather than
@@ -106,12 +111,12 @@ impl PointLight {
 // Cube instances
 // ----------------------------------------------------------------------
 
-const NUM_CUBES: usize = 6;
+const NUM_CUBES: usize = 4;
 
 /// One cube placed in the room. `scale` is a Q3.12 factor
 /// applied to each vertex before rotation; the cube mesh has
-/// unit-side verts at ±0x0E00, so `scale = 0x1000` renders a
-/// 1.0×1.0×1.0 cube and `scale = 0x2000` renders 2.0×2.0×2.0.
+/// unit-side verts at ±0x0800, so `scale = 0x1000` renders a
+/// 1.0×1.0×1.0 cube and `scale = 0x0800` renders 0.5×0.5×0.5.
 #[derive(Copy, Clone)]
 struct CubeInstance {
     position: Vec3I32,
@@ -120,38 +125,37 @@ struct CubeInstance {
     y_spin_per_frame: u16,
 }
 
-/// Hand-placed so cubes form a loose arc on the floor, varied
-/// sizes suggesting stacked columns.
+/// Gallery-style layout: 4 cubes in a gentle arc left-to-right
+/// with staggered depth + height so each one is clearly
+/// independent in the frame. Sizes vary so the scene reads as a
+/// "collection of objects" rather than a uniform grid.
+///
+/// Positions are relative to WORLD_Z — the `z` component is the
+/// additional depth offset from the camera plane.
 const CUBE_LAYOUT: [CubeInstance; NUM_CUBES] = [
+    // Far-left, low, medium-large, slow spin.
     CubeInstance {
-        position: Vec3I32::new(-0x1800, 0x0600, WORLD_Z + 0x0800),
-        scale: 0x0A00,
-        y_spin_per_frame: 20,
+        position: Vec3I32::new(-0x2000, -0x0400, WORLD_Z + 0x0600),
+        scale: 0x0B00,
+        y_spin_per_frame: 3,
     },
+    // Mid-left, higher, smaller, slightly faster.
     CubeInstance {
-        position: Vec3I32::new(-0x0A00, 0x0400, WORLD_Z),
-        scale: 0x0C00,
-        y_spin_per_frame: 14,
-    },
-    CubeInstance {
-        position: Vec3I32::new(0x0000, 0x0200, WORLD_Z - 0x0400),
-        scale: 0x1000,
-        y_spin_per_frame: 9,
-    },
-    CubeInstance {
-        position: Vec3I32::new(0x0A00, 0x0500, WORLD_Z + 0x0200),
+        position: Vec3I32::new(-0x0A00, 0x0400, WORLD_Z - 0x0400),
         scale: 0x0800,
-        y_spin_per_frame: 28,
+        y_spin_per_frame: 5,
     },
+    // Mid-right, low, medium, different rate.
     CubeInstance {
-        position: Vec3I32::new(0x1800, 0x0700, WORLD_Z + 0x0800),
-        scale: 0x0700,
-        y_spin_per_frame: 36,
+        position: Vec3I32::new(0x0A00, -0x0600, WORLD_Z - 0x0200),
+        scale: 0x0900,
+        y_spin_per_frame: 4,
     },
+    // Far-right, mid-height, largest, slowest.
     CubeInstance {
-        position: Vec3I32::new(0x0500, 0x1100, WORLD_Z + 0x0C00),
-        scale: 0x0600,
-        y_spin_per_frame: 44,
+        position: Vec3I32::new(0x2200, 0, WORLD_Z + 0x0400),
+        scale: 0x0D00,
+        y_spin_per_frame: 2,
     },
 ];
 
@@ -290,13 +294,15 @@ fn update_scene() {
 
     // Each light orbits in the XZ plane at a slightly different
     // radius + speed + Y height + phase. All four together give
-    // the sense of "lights dancing" through the room.
+    // the sense of "lights dancing" through the room. Orbits
+    // sized to sweep past all 4 cubes over their cycle so every
+    // cube sees every colour at some point.
     let phases: [(i16, u16, i16, u16); NUM_LIGHTS] = [
         // (orbit_radius, frames_per_rev_scale, y_height, phase_deg)
-        (0x1200, 36, 0x0800, 0),
-        (0x1500, 48, 0x1200, 1024), // 90°
-        (0x0E00, 52, 0x0600, 2048), // 180°
-        (0x1700, 42, 0x0F00, 3072), // 270°
+        (0x2400, 16, 0x0400, 0),
+        (0x2800, 20, 0x0C00, 1024), // 90°
+        (0x1E00, 24, -0x0400, 2048), // 180°
+        (0x2C00, 18, 0x0800, 3072), // 270°
     ];
     for i in 0..NUM_LIGHTS {
         let (r, speed, y, phase) = phases[i];
