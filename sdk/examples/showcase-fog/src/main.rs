@@ -123,13 +123,13 @@ const FOG_CLEAR: (u8, u8, u8) = (
 ///   IR0     = saturate(MAC0 >> 12, 0..0x1000)
 ///
 /// With PROJ_H=280: divisor_near ≈ 0x1F1C, divisor_far ≈ 0x0350.
-/// DQA = -0x0500 gives ~0% fog at ring 0 and ~55% at the far
-/// ring — a gentle gradient that keeps wall materials legible
-/// all the way down the corridor rather than slamming everything
-/// to fog-blue past ring 2. DQB = -DQA × divisor_near zeros MAC0
-/// at ring 0.
-const DQA: i16 = -0x0500;
-const DQB: i32 = 0x009C_0000;
+/// DQA = -0x0780 gives ~0% fog at ring 0 and ~82% at the far
+/// ring — strong enough that the far end really dissolves into
+/// the fog colour (iconic PS1 atmospheric look), gentle enough
+/// that the middle rings keep their wall tint. DQB = -DQA ×
+/// divisor_near zeros MAC0 at ring 0.
+const DQA: i16 = -0x0780;
+const DQB: i32 = 0x00E8_3E00;
 
 /// ZSF3 = 1/3 × 0x1000 in Q1.12; averages SZ1+SZ2+SZ3.
 const ZSF3: i16 = 0x0555;
@@ -158,9 +158,16 @@ const BASE_RIG: LightRig = LightRig::new(
     (0x0200, 0x0200, 0x0280),
 );
 
-/// Light-orbit speed, Q0.16 per frame. `0x00A0` = one revolution
-/// every ~655 frames (~11 s at 60 fps).
-const LIGHT_ORBIT_PER_FRAME: u32 = 0x00A0;
+/// Light-orbit speed, in the same 256-per-revolution units that
+/// [`Mat3I16::rotate_y`] consumes. Because the sin/cos LUT masks
+/// `angle & 0xFF` internally, values bigger than ~4 alias wildly
+/// across consecutive frames and produce chaotic lighting flips.
+///
+/// We use `s.frame >> LIGHT_ORBIT_SHIFT` as the angle: 1 unit
+/// every 4 frames = 256 × 4 = 1024 frames per revolution ≈ 17 s
+/// at 60 fps. Slow enough to read as a smooth sweep, fast enough
+/// that the lit-wall change is visible within a few seconds.
+const LIGHT_ORBIT_SHIFT: u32 = 2;
 
 // ----------------------------------------------------------------------
 // Wall-face definitions
@@ -395,9 +402,11 @@ fn build_frame_ot() {
     // `rotated` applies R × dir to every light; the result is
     // already in the same frame as our wall normals, so `load`
     // uploads it directly — no `for_object` needed.
-    let light_rot = Mat3I16::rotate_y(
-        (s.frame.wrapping_mul(LIGHT_ORBIT_PER_FRAME) & 0xFFFF) as u16,
-    );
+    //
+    // `rotate_y`'s angle is 256-per-revolution and it masks & 0xFF
+    // internally — using `frame >> N` makes the per-frame angle
+    // delta a fraction of a unit, not hundreds of degrees.
+    let light_rot = Mat3I16::rotate_y((s.frame >> LIGHT_ORBIT_SHIFT) as u16);
     BASE_RIG.rotated(&light_rot).load();
 
     let mut tri_idx = 0;

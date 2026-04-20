@@ -1,5 +1,10 @@
-//! Dump showcase-fog frames so we can verify the corridor scrolls
-//! forward smoothly with fog closing the far end.
+//! Dump two consecutive showcase-fog frames across the ring-wrap
+//! boundary so we can see exactly what changes frame-to-frame.
+//!
+//! Ring wrap period = RING_SPACING / SCROLL_SPEED = 0x500 / 0x20 =
+//! 40 frames. So wraps happen at frames 40, 80, 120, ... We dump
+//! frames around frame 40 (both sides) plus two deep mid-run frames
+//! to confirm non-wrap frames are continuous.
 use emulator_core::{Bus, Cpu};
 use psx_iso::Exe;
 use std::io::Write;
@@ -18,10 +23,8 @@ fn main() {
     let mut cpu = Cpu::new();
     cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
 
-    // Light-orbit period is ~1024 frames (frame >> 2 → 256 angle
-    // units per full turn). Sample at ~1/8 revolution intervals so
-    // we can see the light sweep across the walls.
-    let sample_targets: &[u64] = &[16, 128, 256, 384, 512, 640, 768, 900];
+    // Around the first wrap (frame 40) + a non-wrap neighbourhood.
+    let sample_targets: &[u64] = &[30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42];
     let mut cycles_at_last_pump = 0u64;
     for &target in sample_targets {
         while bus.irq().raise_counts()[0] < target {
@@ -40,7 +43,7 @@ fn main() {
 
 fn dump_ppm(bus: &Bus, frame: u64) {
     let da = bus.gpu.display_area();
-    let path = format!("/tmp/showcase-fog-f{:03}.ppm", frame);
+    let path = format!("/tmp/showcase-fog-adj-f{:03}.ppm", frame);
     let mut f = std::fs::File::create(&path).unwrap();
     writeln!(f, "P6\n{} {}\n255", da.width, da.height).unwrap();
     let mut buf = Vec::with_capacity((da.width as usize) * (da.height as usize) * 3);
