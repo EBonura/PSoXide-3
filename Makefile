@@ -166,9 +166,9 @@ showcase-3d: assets
 showcase-lights: assets
 	cd sdk/examples/showcase-lights && cargo build --release
 
-# showcase-fog uses only procedural geometry (corridor built from
-# constants at build time), so it has no asset-dependency.
-showcase-fog:
+# showcase-fog uses two cooked textures (brick wall + cobblestone
+# floor) on its corridor walls + floor, plus procedural geometry.
+showcase-fog: assets
 	cd sdk/examples/showcase-fog && cargo build --release
 
 # --- Content pipeline (host-side editor tooling) ------------------------
@@ -186,6 +186,7 @@ psxed:
 # runtime input available without having to run the editor.
 SHOWCASE_3D := sdk/examples/showcase-3d
 SHOWCASE_LIGHTS := sdk/examples/showcase-lights
+SHOWCASE_FOG := sdk/examples/showcase-fog
 HELLO_TEX := sdk/examples/hello-tex
 
 # Texture sources (.jpg / .png) are gitignored because they're
@@ -212,8 +213,11 @@ assets: psxed
 	@$(PSXED) obj $(SHOWCASE_LIGHTS)/vendor/cube.obj \
 	    -o $(SHOWCASE_LIGHTS)/assets/cube.psxm \
 	    --compute-normals --no-colors
+	@mkdir -p $(SHOWCASE_FOG)/assets
 	$(call cook_texture,$(HELLO_TEX)/vendor/brick-wall.jpg,$(HELLO_TEX)/assets/brick-wall.psxt,64x64,4)
 	$(call cook_texture,$(HELLO_TEX)/vendor/floor.jpg,$(HELLO_TEX)/assets/floor.psxt,64x64,4)
+	$(call cook_texture,$(SHOWCASE_FOG)/vendor/brick-wall.jpg,$(SHOWCASE_FOG)/assets/brick-wall.psxt,64x64,4)
+	$(call cook_texture,$(SHOWCASE_FOG)/vendor/floor.jpg,$(SHOWCASE_FOG)/assets/floor.psxt,64x64,4)
 
 examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-lights showcase-fog
 	@echo ""

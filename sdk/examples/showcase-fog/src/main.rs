@@ -1,5 +1,5 @@
-//! `showcase-fog` — the full PS1-commercial GTE triangle pipeline
-//! in one demo.
+//! `showcase-fog` — the full PS1-commercial GTE + textured-poly
+//! pipeline in one demo.
 //!
 //! Every frame, for every triangle, the GTE executes:
 //!
@@ -8,10 +8,12 @@
 //!   AVSZ3 → average-Z key for ordering-table insertion
 //!   NCDT  → lit + depth-cue colour for all 3 vertices
 //!
-//! Wrapped up in [`psx_gte::lighting::project_triangle_fogged`]. No
-//! CPU cross-product for culling, no hard-coded OT slots, no per-
-//! vertex `RTPS` + `NCCS` — everything runs on the hardware's
-//! native batched triangle path.
+//! The three NCDT-produced per-vertex colours become the per-vertex
+//! *tint* on a **textured Gouraud** triangle (GP0 0x34), so the GPU
+//! multiplies each sampled texel by its interpolated NCDT colour.
+//! Result: textures that properly light and fog — near walls show
+//! crisp brick, far walls dissolve into the fog colour — the
+//! Silent-Hill-era look achieved through hardware ops only.
 //!
 //! # Scene
 //!
@@ -21,17 +23,23 @@
 //! end. A single warm directional light orbits slowly around the
 //! Y axis so each wall sees the highlight sweep past.
 //!
-//! The far end fades into a deep-blue fog colour (FC). DQA / DQB
-//! are tuned so the nearest ring has ~0% fog and the farthest
-//! approaches 100%, with a smooth per-triangle interpolation
-//! between. The result is the iconic PS1 atmospheric-distance
-//! effect — *Silent Hill*, *Final Fantasy VII*'s world map,
-//! *Wipeout*'s tunnels all use this same NCDS/NCDT + FC chain.
+//! # Textures
+//!
+//! Two 64×64 4bpp CLUT textures live in a shared tpage at VRAM
+//! (640, 0):
+//!
+//!   - **brick-wall** at U = 0..63. Ceiling + left + right walls.
+//!   - **floor**      at U = 64..127. Floor only.
+//!
+//! Each has its own 16-entry CLUT. Both are cooked by `psxed tex`
+//! from a `vendor/*.jpg` source (see `vendor/README.md`). Every
+//! wall segment between two rings maps the full 64×64 texture, so
+//! the pattern tiles once per segment along the corridor length.
 //!
 //! # Triangle budget
 //!
 //! 15 ring-gaps × 4 walls × 2 tris = **120 triangles / frame** —
-//! a comfortable PSX workload that leaves plenty of GTE headroom.
+//! each a `TriTexturedGouraud` (9 data words per primitive).
 
 #![no_std]
 #![no_main]
@@ -39,15 +47,16 @@
 
 extern crate psx_rt;
 
+use psx_asset::Texture;
 use psx_font::{FontAtlas, fonts::BASIC_8X16};
 use psx_gpu::framebuf::FrameBuffer;
 use psx_gpu::ot::OrderingTable;
-use psx_gpu::prim::{QuadGouraud, TriGouraud};
+use psx_gpu::prim::{QuadGouraud, TriTexturedGouraud};
 use psx_gpu::{self as gpu, Resolution, VideoMode};
 use psx_gte::lighting::{Light, LightRig, project_triangle_fogged};
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene;
-use psx_vram::{Clut, TexDepth, Tpage};
+use psx_vram::{Clut, TexDepth, Tpage, VramRect, upload_bytes};
 
 // ----------------------------------------------------------------------
 // Screen + projection constants
@@ -68,82 +77,42 @@ const OT_DEPTH: usize = 32;
 // Corridor geometry
 // ----------------------------------------------------------------------
 
-/// How many Z-rings define the corridor. 16 rings → 15 wall segments.
 const NUM_RINGS: usize = 16;
 
 /// World-space half-dimensions of the corridor cross-section.
 /// Chosen so near-ring walls extend off-screen (the camera is
 /// inside the corridor), while far-ring walls shrink to a small
-/// rectangle in the centre — the receding-perspective effect.
+/// rectangle in the centre.
 const CORR_HALF_W: i16 = 0x0780;
-/// A little shorter than wide to feel like a hallway.
 const CORR_HALF_H: i16 = 0x0500;
 
-/// Z distance between adjacent rings. Small enough that the far
-/// ring fits inside `i16` even with 16 rings.
 const RING_SPACING: i32 = 0x0500;
-
-/// Near clip — when a ring's effective Z drops below this it wraps
-/// to the far end.
 const NEAR_CAM_Z: i32 = 0x0400;
-
-/// Z of the first ring relative to the camera (after wrap). Chosen
-/// so `(NUM_RINGS-1) * RING_SPACING + FIRST_RING_Z < i16::MAX`.
 const FIRST_RING_Z: i32 = NEAR_CAM_Z + RING_SPACING;
-
-/// Forward camera speed in Z units per frame. Ring-cross period =
-/// RING_SPACING / SCROLL_SPEED = 0x0500 / 0x20 = 40 frames,
-/// ~2/3 s at 60 fps — slow enough that per-frame geometry motion
-/// is smooth, fast enough that depth progression is obvious.
 const SCROLL_SPEED: i32 = 0x0020;
 
 // ----------------------------------------------------------------------
-// Fog parameters (far-colour + depth-cue coefficients)
+// Fog parameters
 // ----------------------------------------------------------------------
 
-/// Depth-cue fog colour — deep space-blue in Q0.12.
-/// Converting to an 8-bit frame-buffer clear: FC >> 4 per channel
-/// gives (0x20, 0x40, 0xA0) — the match means the corridor's far
-/// end blends seamlessly into the clear.
 const FOG_FC: Vec3I32 = Vec3I32::new(0x0200, 0x0400, 0x0A00);
 
-/// Frame-buffer clear RGB, pre-computed from [`FOG_FC`]. Kept as a
-/// const so the clear + the GTE fog output are guaranteed to match.
 const FOG_CLEAR: (u8, u8, u8) = (
     (FOG_FC.x >> 4) as u8,
     (FOG_FC.y >> 4) as u8,
     (FOG_FC.z >> 4) as u8,
 );
 
-/// DQA/DQB are tuned for PROJ_H=280 and corridor Z range
-/// [FIRST_RING_Z=0x0900..=far≈0x5400]:
-///
-///   divisor = (H << 16) / SZ3
-///   MAC0    = divisor * DQA + DQB
-///   IR0     = saturate(MAC0 >> 12, 0..0x1000)
-///
-/// With PROJ_H=280: divisor_near ≈ 0x1F1C, divisor_far ≈ 0x0350.
-/// DQA = -0x0780 gives ~0% fog at ring 0 and ~82% at the far
-/// ring — strong enough that the far end really dissolves into
-/// the fog colour (iconic PS1 atmospheric look), gentle enough
-/// that the middle rings keep their wall tint. DQB = -DQA ×
-/// divisor_near zeros MAC0 at ring 0.
 const DQA: i16 = -0x0780;
 const DQB: i32 = 0x00E8_3E00;
 
-/// ZSF3 = 1/3 × 0x1000 in Q1.12; averages SZ1+SZ2+SZ3.
 const ZSF3: i16 = 0x0555;
-/// ZSF4 unused here; set to 1/4 × 0x1000 for completeness.
 const ZSF4: i16 = 0x0400;
 
 // ----------------------------------------------------------------------
 // Lighting
 // ----------------------------------------------------------------------
 
-/// Single directional key light that orbits the Y axis so every
-/// wall catches the highlight as the light sweeps through. Bright
-/// and warm — the strong colour difference vs. ambient/fog sells
-/// the effect when the light faces a wall.
 const BASE_RIG: LightRig = LightRig::new(
     [
         Light {
@@ -153,102 +122,125 @@ const BASE_RIG: LightRig = LightRig::new(
         Light::OFF,
         Light::OFF,
     ],
-    // Dim cool ambient — low enough that the lit side pops, high
-    // enough that the dark side is still readable.
     (0x0200, 0x0200, 0x0280),
 );
 
-/// Light-orbit speed, in the same 256-per-revolution units that
-/// [`Mat3I16::rotate_y`] consumes. Because the sin/cos LUT masks
-/// `angle & 0xFF` internally, values bigger than ~4 alias wildly
-/// across consecutive frames and produce chaotic lighting flips.
-///
-/// We use `s.frame >> LIGHT_ORBIT_SHIFT` as the angle: 1 unit
-/// every 4 frames = 256 × 4 = 1024 frames per revolution ≈ 17 s
-/// at 60 fps. Slow enough to read as a smooth sweep, fast enough
-/// that the lit-wall change is visible within a few seconds.
+/// `rotate_y`'s angle is 256-per-revolution and it masks `& 0xFF`
+/// internally. `frame >> 2` gives 1 angle unit every 4 frames =
+/// 1024 frames per revolution ≈ 17 s at 60 fps.
 const LIGHT_ORBIT_SHIFT: u32 = 2;
 
 // ----------------------------------------------------------------------
-// Wall-face definitions
+// Textures
 // ----------------------------------------------------------------------
 
-/// One of the four walls forming the corridor cross-section. The
-/// `normal` points INTO the corridor so the lit side faces the
-/// camera — with identity rotation, world space == view space and
-/// we can author these directly.
+/// Shared tpage for both textures — X=640 sits past the 640-wide
+/// double-buffered framebuffer region (two 320×240 buffers at
+/// Y=0..240 and 240..480). One 4bpp tpage holds up to 256 texels
+/// per row, so both 64×64 textures fit side-by-side.
+const TEX_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
+
+/// Brick wall — ceilings + left/right walls.
+static BRICK_BLOB: &[u8] = include_bytes!("../assets/brick-wall.psxt");
+/// Cobblestone floor.
+static FLOOR_BLOB: &[u8] = include_bytes!("../assets/floor.psxt");
+
+/// CLUT slots. X multiples of 16; Y=480/481 keeps them out of the
+/// font CLUT's row (256) and the framebuffer's rows (0..479).
+const BRICK_CLUT: Clut = Clut::new(0, 480);
+const FLOOR_CLUT: Clut = Clut::new(0, 481);
+
+/// U origin of each texture inside [`TEX_TPAGE`] (pixels). A 4bpp
+/// tpage is 256 texels wide; brick sits at U=0..63, floor at
+/// U=64..127, leaving 128..255 free for future additions.
+const BRICK_U: u8 = 0;
+const FLOOR_U: u8 = 64;
+
+/// Which texture a wall uses. Maps to the two U origins above.
+#[derive(Copy, Clone)]
+enum WallTex {
+    Brick,
+    Floor,
+}
+
+impl WallTex {
+    const fn u_origin(self) -> u8 {
+        match self {
+            WallTex::Brick => BRICK_U,
+            WallTex::Floor => FLOOR_U,
+        }
+    }
+    const fn clut_word(self) -> u16 {
+        match self {
+            WallTex::Brick => BRICK_CLUT.uv_clut_word(),
+            WallTex::Floor => FLOOR_CLUT.uv_clut_word(),
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Wall definitions
+// ----------------------------------------------------------------------
+
 #[derive(Copy, Clone)]
 struct Wall {
     /// XY position at either end of the wall's cross-section line.
-    /// `[a, b]` becomes the `v0` / `v1` of each segment quad at
-    /// whatever Z value we're at.
     corners: [(i16, i16); 2],
     /// Inward-facing normal in world space, Q3.12.
     normal: Vec3I16,
-    /// Per-wall base material colour. Modulated by the GTE lit
-    /// output + fog.
-    material: (u8, u8, u8),
+    /// Texture slot for this wall.
+    tex: WallTex,
 }
 
-/// Ceiling / floor / left / right. Materials are deliberately
-/// distinct (warm vs. cool on opposing faces) so the corridor's
-/// volume reads at a glance — even before lighting or fog
-/// differentiate them further.
 const WALLS: [Wall; 4] = [
-    // Ceiling — warm sandy gray. Normal points DOWN in screen-
-    // space convention (+Y is down).
+    // Ceiling — brick overhead.
     Wall {
         corners: [(-CORR_HALF_W, -CORR_HALF_H), (CORR_HALF_W, -CORR_HALF_H)],
         normal: Vec3I16::new(0, 0x1000, 0),
-        material: (0xB0, 0xA0, 0x80),
+        tex: WallTex::Brick,
     },
-    // Floor — red-orange, strong contrast vs. ceiling.
+    // Floor — cobblestone.
     Wall {
         corners: [(CORR_HALF_W, CORR_HALF_H), (-CORR_HALF_W, CORR_HALF_H)],
         normal: Vec3I16::new(0, -0x1000, 0),
-        material: (0xC0, 0x60, 0x30),
+        tex: WallTex::Floor,
     },
-    // Left wall — cool teal-green. Normal points right (+X) so
-    // the light lights it when it's pointing that way.
+    // Left wall — brick.
     Wall {
         corners: [(-CORR_HALF_W, CORR_HALF_H), (-CORR_HALF_W, -CORR_HALF_H)],
         normal: Vec3I16::new(0x1000, 0, 0),
-        material: (0x60, 0xA8, 0x90),
+        tex: WallTex::Brick,
     },
-    // Right wall — purple-magenta, obvious contrast vs. the left.
+    // Right wall — brick.
     Wall {
         corners: [(CORR_HALF_W, -CORR_HALF_H), (CORR_HALF_W, CORR_HALF_H)],
         normal: Vec3I16::new(-0x1000, 0, 0),
-        material: (0xA0, 0x60, 0xB0),
+        tex: WallTex::Brick,
     },
 ];
 
 // ----------------------------------------------------------------------
-// Primitive arena — all static so DMA sees stable addresses
+// Primitive arena
 // ----------------------------------------------------------------------
 
-/// 15 gaps × 4 walls × 2 tris = 120 triangles max per frame.
 const MAX_TRIS: usize = (NUM_RINGS - 1) * 4 * 2;
 
 static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
 
-/// Zero-init TriGouraud literal used to seed the `TRIS` array. Every
-/// triangle is overwritten every frame before DMA sees it — this is
-/// just the initial `.bss` pattern.
-const TRI_ZERO: TriGouraud = TriGouraud {
+const TRI_ZERO: TriTexturedGouraud = TriTexturedGouraud {
     tag: 0,
     color0_cmd: 0,
     v0: 0,
+    uv0_clut: 0,
     color1: 0,
     v1: 0,
+    uv1_tpage: 0,
     color2: 0,
     v2: 0,
+    uv2: 0,
 };
-static mut TRIS: [TriGouraud; MAX_TRIS] = [const { TRI_ZERO }; MAX_TRIS];
+static mut TRIS: [TriTexturedGouraud; MAX_TRIS] = [const { TRI_ZERO }; MAX_TRIS];
 
-/// Back-most slot: a fog-coloured quad covering the whole screen.
-/// Normally invisible because the corridor fills the view, but it
-/// closes any gap where fog geometry doesn't quite meet the edge.
 static mut BG_QUAD: QuadGouraud = QuadGouraud {
     tag: 0,
     color0_cmd: 0,
@@ -274,9 +266,6 @@ const FONT_CLUT: Clut = Clut::new(320, 256);
 
 struct Scene {
     frame: u32,
-    /// How far the "camera" has travelled forward since the last
-    /// ring-wrap, in Z units. Stays in `[0, RING_SPACING)` — when it
-    /// overflows, we wrap it to effectively "consume" a ring.
     camera_offset: i32,
     tri_count: u16,
     culled_count: u16,
@@ -306,21 +295,46 @@ fn main() {
     scene::load_far_colour(FOG_FC);
     scene::set_depth_cue(DQA, DQB);
 
+    // --- Upload both wall textures + CLUTs ---
+    let brick = Texture::from_bytes(BRICK_BLOB).expect("brick.psxt");
+    let floor = Texture::from_bytes(FLOOR_BLOB).expect("floor.psxt");
+    // Brick at U=0..63 (halfwords 0..16 of the tpage).
+    upload_bytes(
+        VramRect::new(
+            TEX_TPAGE.x(),
+            TEX_TPAGE.y(),
+            brick.halfwords_per_row(),
+            brick.height(),
+        ),
+        brick.pixel_bytes(),
+    );
+    upload_bytes(
+        VramRect::new(BRICK_CLUT.x(), BRICK_CLUT.y(), brick.clut_entries(), 1),
+        brick.clut_bytes(),
+    );
+    // Floor at U=64..127 (halfwords 16..32).
+    upload_bytes(
+        VramRect::new(
+            TEX_TPAGE.x() + brick.halfwords_per_row(),
+            TEX_TPAGE.y(),
+            floor.halfwords_per_row(),
+            floor.height(),
+        ),
+        floor.pixel_bytes(),
+    );
+    upload_bytes(
+        VramRect::new(FLOOR_CLUT.x(), FLOOR_CLUT.y(), floor.clut_entries(), 1),
+        floor.clut_bytes(),
+    );
+
     let font = FontAtlas::upload(&BASIC_8X16, FONT_TPAGE, FONT_CLUT);
 
     loop {
         update_scene();
-
-        // Clear to the fog colour — the far end of the corridor
-        // will converge to this exact RGB, so geometry fades into
-        // the background without a visible seam.
         fb.clear(FOG_CLEAR.0, FOG_CLEAR.1, FOG_CLEAR.2);
-
         build_frame_ot();
         submit_frame_ot();
-
         draw_hud(&font);
-
         gpu::draw_sync();
         gpu::vsync();
         fb.swap();
@@ -346,25 +360,13 @@ fn update_scene() {
 // Render — build OT
 // ----------------------------------------------------------------------
 
-/// Z of ring `i` after camera scroll. Ring 0 sits just past the
-/// near plane; ring NUM_RINGS-1 is at the far end. As
-/// `camera_offset` ticks up every ring's Z shrinks; when it crosses
-/// `RING_SPACING`, [`update_scene`] wraps it so that ring 0
-/// conceptually becomes ring 1 and a fresh ring appears far away.
 #[inline]
 fn ring_z(i: usize, camera_offset: i32) -> i32 {
     FIRST_RING_Z + (i as i32) * RING_SPACING - camera_offset
 }
 
-/// Map AVSZ3's OTZ into an ordering-table slot. OTZ grows with
-/// depth, so nearer triangles → smaller slot → drawn on top.
 #[inline]
 fn ot_slot(otz: u16) -> usize {
-    // ZSF3 = 0x0555 (1/3 in Q1.12) means OTZ after AVSZ3 is
-    // essentially the average-Z of the triangle's three vertices.
-    // Our corridor spans Z = 0x0800..0x5400, so shifting right by
-    // 10 bits spreads that range into slots 2..21 — well within
-    // the OT and leaving the back slot reserved for the BG quad.
     let slot = (otz as usize) >> 10;
     if slot >= OT_DEPTH - 1 {
         OT_DEPTH - 2
@@ -393,25 +395,23 @@ fn build_frame_ot() {
     ot.add(OT_DEPTH - 1, bg, QuadGouraud::WORDS);
 
     // --- Scene setup for this frame ---
-    // Corridor vertices are authored in world space; identity rotation
-    // means they're already in view space.
     scene::load_rotation(&Mat3I16::IDENTITY);
     scene::load_translation(Vec3I32::new(0, 0, 0));
-
-    // Orbit the light around Y in world space (== view space here).
-    // `rotated` applies R × dir to every light; the result is
-    // already in the same frame as our wall normals, so `load`
-    // uploads it directly — no `for_object` needed.
-    //
-    // `rotate_y`'s angle is 256-per-revolution and it masks & 0xFF
-    // internally — using `frame >> N` makes the per-frame angle
-    // delta a fraction of a unit, not hundreds of degrees.
     let light_rot = Mat3I16::rotate_y((s.frame >> LIGHT_ORBIT_SHIFT) as u16);
     BASE_RIG.rotated(&light_rot).load();
 
+    // Tpage word embeds in every textured primitive's vertex-1 UV
+    // slot. Semi-transparency bit = 0 (opaque).
+    let tpage_word = TEX_TPAGE.uv_tpage_word(0);
+
+    // Material `(128, 128, 128)` makes NCDT produce "identity" vertex
+    // tints at full light — the textured-Gouraud primitive's
+    // tint-multiply then passes texels unmodulated. At deep fog the
+    // NCDT vertex tint approaches FC (fog colour), darkening and
+    // blue-shifting texels so the far end fades into the clear.
+    const MAT: (u8, u8, u8) = (0x80, 0x80, 0x80);
+
     let mut tri_idx = 0;
-    // --- Walk each pair of adjacent rings, emitting 2 tris per
-    //     wall between them. ---
     for ring in 0..NUM_RINGS - 1 {
         let z_near = ring_z(ring, s.camera_offset);
         let z_far = ring_z(ring + 1, s.camera_offset);
@@ -420,33 +420,34 @@ fn build_frame_ot() {
             let (x0, y0) = wall.corners[0];
             let (x1, y1) = wall.corners[1];
 
-            // Four corners of this wall segment:
-            //
-            //     a -------- b      (at z_near)
-            //     |          |
-            //     d -------- c      (at z_far)
-            //
-            // Two triangles: (a, b, c) + (a, c, d). Winding is CCW
-            // when viewed from inside the corridor, which matches
-            // `wall.normal` (inward). NCLIP cross-product therefore
-            // comes out positive and the hardware draws the face.
+            // Four corners:
+            //   a -------- b   (at z_near)
+            //   |          |
+            //   d -------- c   (at z_far)
             let a = Vec3I16::new(x0, y0, z_near as i16);
             let b = Vec3I16::new(x1, y1, z_near as i16);
             let c = Vec3I16::new(x1, y1, z_far as i16);
             let d = Vec3I16::new(x0, y0, z_far as i16);
 
-            let tri_a = project_triangle_fogged(
-                [a, b, c],
-                [wall.normal, wall.normal, wall.normal],
-                wall.material,
-            );
-            let tri_b = project_triangle_fogged(
-                [a, c, d],
-                [wall.normal, wall.normal, wall.normal],
-                wall.material,
-            );
+            let u_lo = wall.tex.u_origin();
+            let u_hi = u_lo + 63;
+            let clut_word = wall.tex.clut_word();
 
-            for ft in &[tri_a, tri_b] {
+            // UV per corner — same mapping regardless of wall
+            // orientation, because the cooker's centre-square
+            // crop means the texture has no "up" direction:
+            //   a → (u_lo, 0)     near left/top
+            //   b → (u_hi, 0)     near right/top
+            //   c → (u_hi, 63)    far right/bottom
+            //   d → (u_lo, 63)    far left/bottom
+
+            let tri_a = project_triangle_fogged([a, b, c], [wall.normal; 3], MAT);
+            let tri_b = project_triangle_fogged([a, c, d], [wall.normal; 3], MAT);
+
+            let uvs_a = [(u_lo, 0), (u_hi, 0), (u_hi, 63)];
+            let uvs_b = [(u_lo, 0), (u_hi, 63), (u_lo, 63)];
+
+            for (ft, uvs) in [(tri_a, uvs_a), (tri_b, uvs_b)].iter() {
                 if !ft.front_facing {
                     s.culled_count = s.culled_count.wrapping_add(1);
                     continue;
@@ -455,15 +456,18 @@ fn build_frame_ot() {
                     break;
                 }
                 let v = ft.verts;
-                tris[tri_idx] = TriGouraud::new(
+                tris[tri_idx] = TriTexturedGouraud::new(
                     [(v[0].sx, v[0].sy), (v[1].sx, v[1].sy), (v[2].sx, v[2].sy)],
+                    *uvs,
                     [
                         (v[0].r, v[0].g, v[0].b),
                         (v[1].r, v[1].g, v[1].b),
                         (v[2].r, v[2].g, v[2].b),
                     ],
+                    clut_word,
+                    tpage_word,
                 );
-                ot.add(ot_slot(ft.otz), &mut tris[tri_idx], TriGouraud::WORDS);
+                ot.add(ot_slot(ft.otz), &mut tris[tri_idx], TriTexturedGouraud::WORDS);
                 tri_idx += 1;
                 s.tri_count = s.tri_count.wrapping_add(1);
             }
@@ -504,7 +508,7 @@ fn draw_hud(font: &FontAtlas) {
 }
 
 // ----------------------------------------------------------------------
-// no_std hex formatter — same pattern as showcase-3d
+// no_std hex formatter
 // ----------------------------------------------------------------------
 
 fn u16_hex(v: u16) -> HexU16 {

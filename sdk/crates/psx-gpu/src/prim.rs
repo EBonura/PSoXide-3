@@ -281,6 +281,71 @@ impl TriTextured {
     }
 }
 
+/// Textured **Gouraud-shaded** triangle. 10 words (tag + 9 data).
+///
+/// Per-vertex tint: the GPU multiplies each texel by the
+/// interpolated vertex colour, so GTE-lit-and-fogged per-vertex
+/// colours from `NCDT` drive the final shade smoothly across the
+/// triangle. Same CLUT + tpage embedding as [`TriTextured`]: CLUT
+/// rides in v0's UV high word, tpage in v1's UV high word (PSX-SPX
+/// convention for GP0 0x34).
+#[repr(C, align(4))]
+pub struct TriTexturedGouraud {
+    /// OT linkage.
+    pub tag: u32,
+    /// `0x34000000 | color0` header — v0's RGB is packed into the
+    /// same word as the polygon opcode.
+    pub color0_cmd: u32,
+    /// Vertex 0 position.
+    pub v0: u32,
+    /// `(u0, v0, clut)` packed.
+    pub uv0_clut: u32,
+    /// Vertex 1 colour (RGB in low 24 bits; top byte ignored).
+    pub color1: u32,
+    /// Vertex 1 position.
+    pub v1: u32,
+    /// `(u1, v1, tpage)` packed.
+    pub uv1_tpage: u32,
+    /// Vertex 2 colour.
+    pub color2: u32,
+    /// Vertex 2 position.
+    pub v2: u32,
+    /// `(u2, v2, 0)` packed.
+    pub uv2: u32,
+}
+
+impl TriTexturedGouraud {
+    /// Data-word count.
+    pub const WORDS: u8 = 9;
+
+    /// Build a textured Gouraud triangle. Each vertex carries its
+    /// own RGB (the NCDT-lit-and-fogged colour in the typical
+    /// commercial-game path) which modulates the sampled texel.
+    pub const fn new(
+        verts: [(i16, i16); 3],
+        uvs: [(u8, u8); 3],
+        colors: [(u8, u8, u8); 3],
+        clut: u16,
+        tpage: u16,
+    ) -> Self {
+        let (r0, g0, b0) = colors[0];
+        let (r1, g1, b1) = colors[1];
+        let (r2, g2, b2) = colors[2];
+        Self {
+            tag: 0,
+            color0_cmd: 0x3400_0000 | pack_color(r0, g0, b0),
+            v0: pack_vertex(verts[0].0, verts[0].1),
+            uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, clut),
+            color1: pack_color(r1, g1, b1),
+            v1: pack_vertex(verts[1].0, verts[1].1),
+            uv1_tpage: pack_texcoord(uvs[1].0, uvs[1].1, tpage),
+            color2: pack_color(r2, g2, b2),
+            v2: pack_vertex(verts[2].0, verts[2].1),
+            uv2: pack_texcoord(uvs[2].0, uvs[2].1, 0),
+        }
+    }
+}
+
 /// Textured quad with a single flat tint. 10 words (tag + 9 data).
 ///
 /// Same CLUT + tpage embedding as [`TriTextured`], extended by

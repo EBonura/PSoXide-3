@@ -546,21 +546,22 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_2f6c,
             redux_display_hash: None,
         }),
-        // Full PS1-commercial GTE triangle path: RTPT (batched
-        // projection) + NCLIP (HW back-face cull) + AVSZ3 (OT-slot
-        // from average depth) + NCDT (lit + depth-cue colour).
-        // Exercises the fog / depth-cue pipeline that no other
-        // example touches — FC, DQA/DQB, per-triangle IR0 fog
-        // weight, far-colour interpolation.
+        // Full PS1-commercial textured-Gouraud pipeline: RTPT +
+        // NCLIP + AVSZ3 + NCDT feeds per-vertex lit+fogged colours
+        // into textured-Gouraud triangles (GP0 0x34). Brick walls
+        // + cobblestone floor sampled from two cooked PSXT
+        // textures in a shared tpage, tiled per ring, modulated by
+        // NCDT's fog gradient. The Silent-Hill-era look, rendered
+        // through hardware ops only.
         "showcase-fog" => Some(SdkGolden {
             example: "showcase-fog",
             vblanks: 60,
-            vram_hash: 0xb7bd_2868_889e_69db,
-            display_hash: 0x3dd2_fef9_5389_61f7,
+            vram_hash: 0xa7bc_561f_e318_69d6,
+            display_hash: 0xf793_859a_092a_0349,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_0e54,
+            final_pc: 0x8001_1da0,
             redux_display_hash: None,
         }),
         _ => None,
