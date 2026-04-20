@@ -232,6 +232,17 @@ pub struct CdRom {
     /// Acknowledge/DataReady/Complete/Error counts apart when the
     /// aggregate CDROM raise count looks suspicious.
     pub irq_type_counts: [u64; 6],
+    /// Per-raise log of `(cycle_when_raised, irq_type_discriminant)`
+    /// tuples. Populated only when `cdrom_irq_log_cap > 0`, capped
+    /// at that length to keep memory bounded in long runs. Probes
+    /// compare this sequence against Redux's silent-run CDROM-IRQ
+    /// log to pinpoint which specific IRQ fires at a divergent
+    /// cycle.
+    pub cdrom_irq_log: Vec<(u64, u8)>,
+    /// Max length of `cdrom_irq_log` — 0 disables logging (the
+    /// default, to avoid the per-raise allocation in production
+    /// runs). Probes set this via [`CdRom::enable_irq_log`].
+    cdrom_irq_log_cap: usize,
     /// Count of `schedule_sector_event_at` calls. Diagnostic only —
     /// the BIOS should see one DataReady per sector read at
     /// ~451 K cycles apart, so this should match the sector count
@@ -302,6 +313,8 @@ impl CdRom {
             data_fifo_pops: 0,
             scheduling_cycle: 0,
             irq_type_counts: [0; 6],
+            cdrom_irq_log: Vec::new(),
+            cdrom_irq_log_cap: 0,
             sector_events_scheduled: 0,
             disc: None,
             data_fifo: VecDeque::new(),
@@ -1039,6 +1052,11 @@ impl CdRom {
                 self.irq_type_counts[ty] =
                     self.irq_type_counts[ty].saturating_add(1);
             }
+            // Per-raise log for divergence probes. Cap-guarded so
+            // long production runs don't bloat memory.
+            if self.cdrom_irq_log.len() < self.cdrom_irq_log_cap {
+                self.cdrom_irq_log.push((cycles_now, ev.irq as u8));
+            }
             raised = true;
             // Hardware can only latch one IRQ at a time; subsequent
             // due events wait until this one is acked.
@@ -1062,6 +1080,52 @@ impl CdRom {
     /// Current raw IRQ-flag (for diagnostics).
     pub fn irq_flag(&self) -> u8 {
         self.irq_flag
+    }
+
+    /// Current CDROM controller INDEX (bits 0-1 of the status
+    /// register at 0x1F801800). Low-level writes to 0x1F801801-3
+    /// are routed through this index — reading 0x1F801803 with
+    /// index=0 returns the IRQ mask, with index=1 returns the
+    /// IRQ flag. Probes compare this against Redux's to catch
+    /// index-tracking drift.
+    pub fn index_value(&self) -> u8 {
+        self.index
+    }
+
+    /// Current CDROM IRQ mask (the per-IRQ-type enable bits — the
+    /// CPU-level I_MASK is separate). Written via 0x1F801802
+    /// index=1. `setIrq` in Redux (and our raise-gate) checks
+    /// `irq_flag & irq_mask` before waking the CPU.
+    pub fn irq_mask_value(&self) -> u8 {
+        self.irq_mask
+    }
+
+    /// Redux-equivalent `setIrq()` gate: the CDROM only escalates
+    /// a latched IRQ to the PSX IRQ controller (I_STAT bit 2) when
+    /// `irq_flag & irq_mask` is nonzero. When it's zero the
+    /// response stays latched for polled access via 0x1F801803
+    /// idx=1, but no CPU interrupt is dispatched. MGS (and other
+    /// games) poll the flag with bits 0-2 of `irq_mask` cleared —
+    /// relying on this gate to keep CDROM acks from firing the
+    /// ISR while the BIOS's loader code walks the response
+    /// manually. Skipping the gate (our pre-fix behaviour) caused
+    /// the BIOS to run an ISR it didn't expect, stomping state
+    /// the MGS boot loop needed.
+    pub fn should_wake_cpu(&self) -> bool {
+        (self.irq_flag & self.irq_mask) != 0
+    }
+
+    /// Number of pending events queued. 0 means the CDROM has
+    /// nothing scheduled to fire.
+    pub fn pending_queue_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Enable per-raise logging up to `cap` entries. Probes call
+    /// this once before running; afterward, read `cdrom_irq_log`.
+    pub fn enable_irq_log(&mut self, cap: usize) {
+        self.cdrom_irq_log_cap = cap;
+        self.cdrom_irq_log.reserve(cap);
     }
 
     /// Current IRQ-enable mask (for diagnostics).

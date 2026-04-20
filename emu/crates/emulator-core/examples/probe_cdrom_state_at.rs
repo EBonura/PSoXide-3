@@ -13,6 +13,7 @@ fn main() {
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
+    bus.cdrom.enable_irq_log(200);
     if let Some(ref p) = disc_path {
         let disc_bytes = std::fs::read(p).expect("disc");
         bus.cdrom
@@ -31,8 +32,19 @@ fn main() {
 
     println!("=== CDROM state at step {n} (cycles={}) ===", bus.cycles());
     println!("irq_flag         : {}", bus.cdrom.irq_flag());
+    println!("index            : {}", bus.cdrom.index_value());
+    println!("irq_mask         : 0x{:02x}", bus.cdrom.irq_mask_value());
     println!("data_fifo_pops   : {}", bus.cdrom.data_fifo_pops());
     println!("sector_events    : {}", bus.cdrom.sector_events_scheduled);
+    println!("pending_queue_len: {}", bus.cdrom.pending_queue_len());
+
+    println!();
+    println!("=== CDROM IRQ log ({} entries) ===", bus.cdrom.cdrom_irq_log.len());
+    let names = ["None", "DataReady", "Complete", "Acknowledge", "DataEnd", "Error"];
+    for (i, &(cyc, ty)) in bus.cdrom.cdrom_irq_log.iter().enumerate() {
+        let name = names.get(ty as usize).copied().unwrap_or("?");
+        println!("  #{i:>3} cyc={cyc:>12} type={ty} ({name})");
+    }
     let cmd_hist = bus.cdrom.command_histogram();
     println!();
     println!("command histogram:");

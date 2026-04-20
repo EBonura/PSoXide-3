@@ -445,7 +445,7 @@ impl Bus {
     pub fn tick(&mut self, n: u32) {
         self.advance_cycles(n);
         self.drain_scheduler_events();
-        if self.cdrom.tick(self.cycles) {
+        if self.cdrom.tick(self.cycles) && self.cdrom.should_wake_cpu() {
             self.irq.raise(IrqSource::Cdrom);
         }
     }
@@ -459,7 +459,7 @@ impl Bus {
     /// `branchTest` → `counters->update()`.
     pub fn drain_scheduler_events_post_op(&mut self) {
         self.drain_scheduler_events();
-        if self.cdrom.tick(self.cycles) {
+        if self.cdrom.tick(self.cycles) && self.cdrom.should_wake_cpu() {
             self.irq.raise(IrqSource::Cdrom);
         }
     }
