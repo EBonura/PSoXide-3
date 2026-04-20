@@ -265,20 +265,47 @@ pub struct FoggedTri {
     pub front_facing: bool,
 }
 
-/// Run the full PS1-commercial triangle pipeline in one helper:
+/// Run the full PS1-commercial triangle pipeline with **per-vertex
+/// fog**. Three interleaved RTPS + NCDS pairs give each vertex its
+/// own `IR0` (its own depth-cue weight), then `NCLIP` + `AVSZ3`
+/// finish the bookkeeping.
 ///
-/// 1. `RTPT` — project all three vertices (one GTE op instead of
-///    three `RTPS` calls).
-/// 2. `NCLIP` — hardware back-face cull; the CPU no longer needs
-///    to compute its own 2D cross-product.
-/// 3. `AVSZ3` — compute the average Z for ordering-table sorting.
-/// 4. `NCDT` — lit + depth-cue colour for all three vertices.
+/// # Why per-vertex, not batched
 ///
-/// Uses the passed `material` RGB as the GTE's RGBC across the
-/// whole triangle. Fog weight is taken from the last vertex's IR0
-/// (set by RTPT via DQA/DQB), so per-triangle uniform rather than
-/// per-vertex. Short / densely-tessellated geometry won't show
-/// banding; long receding surfaces should be subdivided.
+/// `RTPT + NCDT` is faster (4 GTE ops vs 8) but produces **uniform**
+/// fog across each triangle — `RTPT` only writes `IR0` for the last
+/// vertex, and `NCDT` then reuses that single `IR0` for each
+/// vertex's stage-3 blend. The visible result is stepped shading:
+/// every triangle has one flat fog tint, and seams between
+/// triangles are obvious.
+///
+/// `3× RTPS + 3× NCDS` sets `IR0` per vertex, so `NCDS` blends
+/// each vertex's material toward `FC` by that vertex's own depth
+/// weight. `GP0 0x34` Gouraud-interpolates the three vertex tints
+/// across the triangle, giving a smooth per-pixel gradient with
+/// no inter-triangle seam.
+///
+/// Cost is about 2× the GTE work per triangle vs the batched path.
+/// Still well under budget for PSX-scale scenes (~100 tris/frame).
+///
+/// # Pipeline
+///
+/// For each vertex `i = 0, 1, 2`:
+///   1. Load `verts[i]` into V0.
+///   2. `RTPS` — projects V0, pushes SXY + SZ FIFOs, sets `IR0`
+///      from DQA/DQB × the perspective divisor.
+///   3. Load `normals[i]` into V0 (overwriting the position —
+///      `RTPS` already consumed it).
+///   4. `NCDS` — computes lit + fogged colour using the current
+///      `IR0`, pushes RGB FIFO.
+///
+/// After the loop:
+///   5. `NCLIP` — reads SXY0/1/2 from the FIFO, flags back-face.
+///   6. `AVSZ3` — reads SZ1/2/3, computes the OT-slot key.
+///
+/// `NCDS` doesn't touch the SXY or SZ FIFOs, so they still hold
+/// the three per-vertex projection results when NCLIP and AVSZ3
+/// run at the end.
 ///
 /// # Prerequisites
 /// All scene state must be loaded by the caller:
@@ -295,60 +322,51 @@ pub fn project_triangle_fogged(
     normals: [Vec3I16; 3],
     material: (u8, u8, u8),
 ) -> FoggedTri {
-    // --- RTPT: project positions into SXY / SZ FIFOs ---
-    mtc2!(0, verts[0].xy_packed());
-    mtc2!(1, verts[0].z_packed());
-    mtc2!(2, verts[1].xy_packed());
-    mtc2!(3, verts[1].z_packed());
-    mtc2!(4, verts[2].xy_packed());
-    mtc2!(5, verts[2].z_packed());
-    // SAFETY: V0/V1/V2 are loaded; scene setup is caller-supplied.
-    unsafe { ops::rtpt() };
+    // Material goes into RGBC once — NCDS reads RGBC on every call
+    // and it doesn't change per-vertex.
+    let rgbc = (material.0 as u32) | ((material.1 as u32) << 8) | ((material.2 as u32) << 16);
+    mtc2!(6, rgbc);
 
-    let sxy0 = mfc2!(12);
-    let sxy1 = mfc2!(13);
-    let sxy2 = mfc2!(14);
-    let sz1 = mfc2!(17) as u16;
-    let sz2 = mfc2!(18) as u16;
-    let sz3 = mfc2!(19) as u16;
+    // Per-vertex RTPS → NCDS, interleaved so each vertex's NCDS
+    // uses the IR0 just written by its RTPS. Collect results
+    // one at a time to keep the RGB-FIFO semantics straightforward
+    // (NCDS pushes newest → slot 2; we read slot 2 immediately).
+    let mut verts_out = [ProjectedLit::default(); 3];
+    for i in 0..3 {
+        // --- RTPS: project verts[i] ---
+        mtc2!(0, verts[i].xy_packed());
+        mtc2!(1, verts[i].z_packed());
+        // SAFETY: V0 loaded; scene setup is caller-supplied.
+        unsafe { ops::rtps() };
+        let sxy = mfc2!(14); // SXY2 (latest)
+        let sz = mfc2!(19) as u16; // SZ3 (latest)
 
-    // --- NCLIP: back-face cull. Reads SXY0/1/2 implicitly. ---
-    // SAFETY: SXY FIFO was just populated by RTPT.
+        // --- NCDS: lit + fogged colour for normals[i], using the
+        // IR0 just written by the RTPS above. ---
+        mtc2!(0, normals[i].xy_packed());
+        mtc2!(1, normals[i].z_packed());
+        // SAFETY: V0 holds the normal; RGBC is loaded; scene
+        // matrices / DQA / DQB / FC / IR0 come from the caller.
+        unsafe { ops::ncds() };
+        let rgb = mfc2!(22); // RGB2 (latest)
+
+        verts_out[i] = unpack_projected(sxy, sz, rgb);
+    }
+
+    // --- NCLIP: back-face cull via the SXY FIFO, which now holds
+    // the three vertex projections in slots 0/1/2. ---
+    // SAFETY: three RTPS calls populated the SXY FIFO.
     unsafe { ops::nclip() };
     let mac0 = mfc2!(24) as i32;
     let front_facing = mac0 > 0;
 
-    // --- AVSZ3: OT-slot key from SZ1/2/3 (weighted by ZSF3). ---
-    // SAFETY: SZ FIFO was just populated by RTPT.
+    // --- AVSZ3: OT key from SZ1/2/3, weighted by ZSF3. ---
+    // SAFETY: three RTPS calls populated the SZ FIFO.
     unsafe { ops::avsz3() };
     let otz = mfc2!(7) as u16;
 
-    // --- NCDT: lit + depth-cue colour for all three normals. ---
-    // The normals overwrite V0/V1/V2; material goes into RGBC.
-    mtc2!(0, normals[0].xy_packed());
-    mtc2!(1, normals[0].z_packed());
-    mtc2!(2, normals[1].xy_packed());
-    mtc2!(3, normals[1].z_packed());
-    mtc2!(4, normals[2].xy_packed());
-    mtc2!(5, normals[2].z_packed());
-    let rgbc = (material.0 as u32) | ((material.1 as u32) << 8) | ((material.2 as u32) << 16);
-    mtc2!(6, rgbc);
-    // SAFETY: normals + RGBC loaded; LLM/LCM/BK/FC/IR0 come from
-    // the caller's scene setup.
-    unsafe { ops::ncdt() };
-
-    // RGB FIFO slots 0/1/2 = data regs 20/21/22; NCDT pushed them
-    // in V0/V1/V2 order.
-    let c0 = mfc2!(20);
-    let c1 = mfc2!(21);
-    let c2 = mfc2!(22);
-
     FoggedTri {
-        verts: [
-            unpack_projected(sxy0, sz1, c0),
-            unpack_projected(sxy1, sz2, c1),
-            unpack_projected(sxy2, sz3, c2),
-        ],
+        verts: verts_out,
         otz,
         front_facing,
     }

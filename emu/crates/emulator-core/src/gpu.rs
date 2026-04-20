@@ -1205,7 +1205,11 @@ impl Gpu {
         let u0 = (uv_clut & 0xFF) as u16;
         let v0 = ((uv_clut >> 8) & 0xFF) as u16;
         let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
-        let tint = if cmd & 1 != 0 {
+        // Raw-texture flag is bit 0 of the *opcode byte* (bit 24 of
+        // the full cmd word), per PSX-SPX. Testing `cmd & 1` reads
+        // bit 0 of the R channel of the embedded colour instead —
+        // so odd-R tints like 0xFF would be mis-flagged raw.
+        let tint = if (cmd >> 24) & 1 != 0 {
             RAW_TEXTURE_TINT
         } else {
             split_tint(cmd & 0x00FF_FFFF)
@@ -1228,7 +1232,11 @@ impl Gpu {
         let u0 = (uv_clut & 0xFF) as u16;
         let v0 = ((uv_clut >> 8) & 0xFF) as u16;
         let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
-        let tint = if cmd & 1 != 0 {
+        // Raw-texture flag is bit 0 of the *opcode byte* (bit 24 of
+        // the full cmd word), per PSX-SPX. Testing `cmd & 1` reads
+        // bit 0 of the R channel of the embedded colour instead —
+        // so odd-R tints like 0xFF would be mis-flagged raw.
+        let tint = if (cmd >> 24) & 1 != 0 {
             RAW_TEXTURE_TINT
         } else {
             split_tint(cmd & 0x00FF_FFFF)
@@ -1469,7 +1477,11 @@ impl Gpu {
         let t0 = ((uv0 & 0xFF) as u16, ((uv0 >> 8) & 0xFF) as u16);
         let t1 = ((uv1 & 0xFF) as u16, ((uv1 >> 8) & 0xFF) as u16);
         let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
-        let tint = if cmd & 1 != 0 {
+        // Raw-texture flag is bit 0 of the *opcode byte* (bit 24 of
+        // the full cmd word), per PSX-SPX. Testing `cmd & 1` reads
+        // bit 0 of the R channel of the embedded colour instead —
+        // so odd-R tints like 0xFF would be mis-flagged raw.
+        let tint = if (cmd >> 24) & 1 != 0 {
             RAW_TEXTURE_TINT
         } else {
             split_tint(cmd & 0x00FF_FFFF)
@@ -1506,7 +1518,11 @@ impl Gpu {
         let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
         let t3 = ((uv3 & 0xFF) as u16, ((uv3 >> 8) & 0xFF) as u16);
         let semi = prim_is_semi_trans(cmd);
-        let tint = if cmd & 1 != 0 {
+        // Raw-texture flag is bit 0 of the *opcode byte* (bit 24 of
+        // the full cmd word), per PSX-SPX. Testing `cmd & 1` reads
+        // bit 0 of the R channel of the embedded colour instead —
+        // so odd-R tints like 0xFF would be mis-flagged raw.
+        let tint = if (cmd >> 24) & 1 != 0 {
             RAW_TEXTURE_TINT
         } else {
             split_tint(cmd & 0x00FF_FFFF)
@@ -1537,7 +1553,10 @@ impl Gpu {
         let t0 = ((uv0 & 0xFF) as u16, ((uv0 >> 8) & 0xFF) as u16);
         let t1 = ((uv1 & 0xFF) as u16, ((uv1 >> 8) & 0xFF) as u16);
         let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
-        let raw = cmd & 1 != 0;
+        // See comment on the other textured primitives: raw-texture
+        // flag is bit 0 of the opcode byte (= bit 24 of the cmd word),
+        // not bit 0 of the full cmd word.
+        let raw = (cmd >> 24) & 1 != 0;
         self.rasterize_textured_shaded_triangle(
             v0,
             v1,
@@ -1579,7 +1598,10 @@ impl Gpu {
         let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
         let t3 = ((uv3 & 0xFF) as u16, ((uv3 >> 8) & 0xFF) as u16);
         let semi = prim_is_semi_trans(cmd);
-        let raw = cmd & 1 != 0;
+        // See comment on the other textured primitives: raw-texture
+        // flag is bit 0 of the opcode byte (= bit 24 of the cmd word),
+        // not bit 0 of the full cmd word.
+        let raw = (cmd >> 24) & 1 != 0;
         self.rasterize_textured_shaded_triangle(
             v0, v1, v2, t0, t1, t2, c0, c1, c2, clut_word, semi, raw,
         );

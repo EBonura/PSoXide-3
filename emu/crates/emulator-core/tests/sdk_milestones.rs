@@ -422,8 +422,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-text" => Some(SdkGolden {
             example: "showcase-text",
             vblanks: 4,
-            vram_hash: 0x6d07_cc0c_c747_9433,
-            display_hash: 0x6bf5_0168_dd6e_c8ff,
+            vram_hash: 0x79ec_03dd_8745_96cb,
+            display_hash: 0x92bb_ba4e_4c01_3e05,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
@@ -561,15 +561,21 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // gradient. Pure ambient lighting (no directional or
         // orbit) — the fog is the only visual variable. Static
         // corridor — no camera scroll, so no ring-wrap discontinuity.
+        // Per-vertex fog via 3× RTPS + 3× NCDS + NCLIP + AVSZ3.
+        // Each vertex gets its own IR0 (depth-cue weight) so the
+        // texture-Gouraud tint interpolates smoothly across each
+        // wall. Two rings (no intermediate segments) → walls are
+        // single continuous quads from near to far, no seams at
+        // tile boundaries.
         "showcase-fog" => Some(SdkGolden {
             example: "showcase-fog",
             vblanks: 60,
-            vram_hash: 0x4819_1e6d_5892_1d0f,
-            display_hash: 0x2243_5262_7bec_e521,
+            vram_hash: 0xb903_74ab_f401_4283,
+            display_hash: 0xc110_4183_108c_fa1d,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_184c,
+            final_pc: 0x8001_1ef0,
             redux_display_hash: None,
         }),
         _ => None,

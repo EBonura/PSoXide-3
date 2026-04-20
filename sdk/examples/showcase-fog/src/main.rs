@@ -77,7 +77,15 @@ const OT_DEPTH: usize = 32;
 // Corridor geometry
 // ----------------------------------------------------------------------
 
-const NUM_RINGS: usize = 16;
+/// Two rings — one at the near plane, one at the far end. The
+/// whole corridor is drawn as 4 big textured quads (one per side
+/// + floor + ceiling), each spanning the full length. This
+/// trades affine-texture "wobble" (the classic PS1 look on long
+/// polys) for **zero segment seams** — a single texture from
+/// near to far per wall, no restart points for banding to form
+/// at. Per-vertex fog then interpolates smoothly across the
+/// whole wall: bright brick near, dissolves into fog at far.
+const NUM_RINGS: usize = 2;
 
 /// World-space half-dimensions of the corridor cross-section.
 /// Chosen so near-ring walls extend off-screen (the camera is
@@ -86,17 +94,13 @@ const NUM_RINGS: usize = 16;
 const CORR_HALF_W: i16 = 0x0780;
 const CORR_HALF_H: i16 = 0x0500;
 
-const RING_SPACING: i32 = 0x0500;
-/// Camera Z. Fixed — the corridor doesn't scroll. Scrolling would
-/// require per-frame ring-wrap (walls disappear from the near
-/// plane, new ones appear at the far end), and the PSX GTE has no
-/// native perspective clipping to make that smooth. The resulting
-/// pop on each wrap reads as a flicker; dropping the scroll
-/// removes the flicker entirely. A static corridor is the
-/// cleanest demonstration of the fog effect — camera sits, walls
-/// recede, fog fills the distance.
-const NEAR_CAM_Z: i32 = 0x0700;
-const FIRST_RING_Z: i32 = NEAR_CAM_Z + RING_SPACING;
+/// Z of the corridor's near wall edge and its far wall edge.
+/// With 2 rings, `RING_Z = [NEAR, FAR]` and every wall becomes
+/// one giant quad spanning the full corridor length.
+const NEAR_CAM_Z: i32 = 0x0800;
+const FAR_CAM_Z: i32 = 0x5400;
+const FIRST_RING_Z: i32 = NEAR_CAM_Z;
+const RING_SPACING: i32 = FAR_CAM_Z - NEAR_CAM_Z;
 
 // ----------------------------------------------------------------------
 // Fog parameters
@@ -128,25 +132,22 @@ const FOG_CLEAR: (u8, u8, u8) = (
 
 /// Fog gradient tuning.
 ///
-/// With PROJ_H=280, corridor Z in [0x0C00..0x5700]:
-///   divisor_near = (H << 16) / 0x0C00 ≈ 0x1755
-///   divisor_far  = (H << 16) / 0x5700 ≈ 0x0323
+/// With PROJ_H=280, corridor Z in [0x0800..0x5400]:
+///   divisor_near = (H << 16) / 0x0800 ≈ 0x2300
+///   divisor_far  = (H << 16) / 0x5400 ≈ 0x0350
 ///
-/// Target: **35% fog at the near plane, 100% at the far plane.**
-/// The heavy near-side baseline serves two purposes: (1) it sells
-/// the atmospheric-haze effect across the whole screen rather
-/// than just at the vanishing point; (2) it hides the ring-wrap
-/// discontinuity — the nearest wall is already substantially
-/// tinted toward FC when it wraps off-screen, so its
-/// disappearance (and a fresh far-end ring's appearance, at 100%
-/// fog) is visually subtle.
+/// Target: **0% fog at the near plane, 100% at the far plane.**
+/// With only a single wall quad per side (no segment seams), the
+/// gradient reads as continuous atmospheric haze; the near edge
+/// of each wall can be fully crisp since per-vertex Gouraud
+/// interpolation smoothly blends to full fog at the far edge.
 ///
 /// Solving:
-///   0x1755 * DQA + DQB = 0x0600_000    (IR0 = 0x600 = 37.5% at near)
-///   0x0323 * DQA + DQB = 0x1000_000    (IR0 = 0x1000 = 100% at far)
-///   → DQA = -0x0800, DQB = 0x115_AA00
-const DQA: i16 = -0x0800;
-const DQB: i32 = 0x0115_AA00;
+///   0x2300 * DQA + DQB = 0          (IR0 = 0 at near)
+///   0x0350 * DQA + DQB = 0x1000_000 (IR0 = 0x1000 at far)
+///   → DQA = -0x0840, DQB = 0x0122_2000 (approximately)
+const DQA: i16 = -0x0840;
+const DQB: i32 = 0x0122_2000;
 
 const ZSF3: i16 = 0x0555;
 const ZSF4: i16 = 0x0400;
@@ -524,6 +525,7 @@ fn build_frame_ot() {
                     clut_word,
                     tpage_word,
                 );
+
                 ot.add(ot_slot(ft.otz), &mut tris[tri_idx], TriTexturedGouraud::WORDS);
                 tri_idx += 1;
                 s.tri_count = s.tri_count.wrapping_add(1);
