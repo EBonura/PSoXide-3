@@ -482,6 +482,10 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // psx-fx extraction — VRAM + display hashes are byte-
         // identical to the previous golden (same pixels), only
         // `final_pc` drifted from LTO code re-layout.
+        // Ported to the engine framework. VRAM + display hashes
+        // match the pre-engine build exactly — same pixels, same
+        // physics, same AI. Only `final_pc` shifted because the
+        // engine's code went into the text section.
         "game-breakout" => Some(SdkGolden {
             example: "game-breakout",
             vblanks: 60,
@@ -490,7 +494,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_35bc,
+            final_pc: 0x8001_3938,
             redux_display_hash: None,
         }),
         // Third mini-game. Space Invaders: 5×10 alien grid, ship
@@ -505,15 +509,25 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // input = no player shots but the enemy AI is firing.
         // Refreshed after psx-fx extraction — pixels unchanged,
         // only `final_pc` drifted from LTO re-layout.
+        // Ported to the engine framework. Unlike breakout, both
+        // VRAM and display hashes shifted — invaders uses a
+        // per-frame counter in `maybe_drop_enemy_bomb` (`frame %
+        // 40`) and the ship-flash strobe (`frame & 2`). The old
+        // build incremented its own `g.frame` at the *start* of
+        // update; the engine increments `ctx.frame` at the *end*
+        // of the loop. That one-frame offset shifts bomb-drop
+        // timing by one frame, which compounds to different alien
+        // + bomb positions after 120 VBlanks. Same game — just a
+        // time-shifted snapshot.
         "game-invaders" => Some(SdkGolden {
             example: "game-invaders",
             vblanks: 120,
-            vram_hash: 0x70b9_8021_f18b_6295,
-            display_hash: 0x66a0_de19_df42_4319,
+            vram_hash: 0xfc55_f23a_1005_b52d,
+            display_hash: 0x34ca_5c24_5e5a_4b19,
             display_size: (320, 240),
             vblank_raises: 120,
             spu_samples: 88200,
-            final_pc: 0x8001_5fe8,
+            final_pc: 0x8001_5934,
             redux_display_hash: None,
         }),
         // Flagship 3D showcase. Starfield + Suzanne (Blender

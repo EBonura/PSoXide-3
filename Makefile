@@ -161,10 +161,10 @@ game-pong:
 	cd engine/examples/game-pong && cargo build --release
 
 game-breakout:
-	cd sdk/examples/game-breakout && cargo build --release
+	cd engine/examples/game-breakout && cargo build --release
 
 game-invaders:
-	cd sdk/examples/game-invaders && cargo build --release
+	cd engine/examples/game-invaders && cargo build --release
 
 showcase-3d: assets
 	cd sdk/examples/showcase-3d && cargo build --release

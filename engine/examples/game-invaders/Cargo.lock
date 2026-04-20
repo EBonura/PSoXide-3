@@ -12,12 +12,23 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 name = "game-invaders"
 version = "0.1.0"
 dependencies = [
+ "psx-engine",
  "psx-font",
  "psx-fx",
  "psx-gpu",
- "psx-pad",
  "psx-rt",
  "psx-spu",
+ "psx-vram",
+]
+
+[[package]]
+name = "psx-engine"
+version = "0.1.0"
+dependencies = [
+ "psx-gpu",
+ "psx-gte",
+ "psx-math",
+ "psx-pad",
  "psx-vram",
 ]
 
@@ -46,6 +57,10 @@ dependencies = [
  "psx-hw",
  "psx-io",
 ]
+
+[[package]]
+name = "psx-gte"
+version = "0.1.0"
 
 [[package]]
 name = "psx-hw"
