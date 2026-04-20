@@ -15,9 +15,9 @@
         run-tri run-input run-ot run-tex run-gte run-audio \
         showcase-textured-sprite run-showcase-textured-sprite \
         showcase-text run-showcase-text \
-        pong run-pong \
-        breakout run-breakout \
-        invaders run-invaders \
+        game-pong run-game-pong \
+        game-breakout run-game-breakout \
+        game-invaders run-game-invaders \
         showcase-3d run-showcase-3d
 
 help:
@@ -47,9 +47,9 @@ help:
 	@echo "                      - build the polished textured-sprite showcase"
 	@echo "    make showcase-text"
 	@echo "                      - build the text / font capabilities showcase"
-	@echo "    make pong         - build the Pong mini-game"
-	@echo "    make breakout     - build the Breakout mini-game"
-	@echo "    make invaders     - build the Space Invaders mini-game"
+	@echo "    make game-pong     - build the Pong mini-game"
+	@echo "    make game-breakout - build the Breakout mini-game"
+	@echo "    make game-invaders - build the Space Invaders mini-game"
 	@echo "    make showcase-3d    - build the 3D geometry showcase"
 	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
 	@echo "    make run-input    - build + side-load hello-input into the frontend"
@@ -61,9 +61,9 @@ help:
 	@echo "                      - build + side-load the textured-sprite showcase"
 	@echo "    make run-showcase-text"
 	@echo "                      - build + side-load the text capabilities showcase"
-	@echo "    make run-pong     - build + side-load the Pong mini-game"
-	@echo "    make run-breakout - build + side-load the Breakout mini-game"
-	@echo "    make run-invaders - build + side-load the Space Invaders mini-game"
+	@echo "    make run-game-pong     - build + side-load the Pong mini-game"
+	@echo "    make run-game-breakout - build + side-load the Breakout mini-game"
+	@echo "    make run-game-invaders - build + side-load the Space Invaders mini-game"
 	@echo "    make run-showcase-3d - build + side-load the 3D geometry showcase"
 
 run:
@@ -142,19 +142,19 @@ showcase-textured-sprite:
 showcase-text:
 	cd sdk/examples/showcase-text && cargo build --release
 
-pong:
-	cd sdk/examples/pong && cargo build --release
+game-pong:
+	cd sdk/examples/game-pong && cargo build --release
 
-breakout:
-	cd sdk/examples/breakout && cargo build --release
+game-breakout:
+	cd sdk/examples/game-breakout && cargo build --release
 
-invaders:
-	cd sdk/examples/invaders && cargo build --release
+game-invaders:
+	cd sdk/examples/game-invaders && cargo build --release
 
 showcase-3d:
 	cd sdk/examples/showcase-3d && cargo build --release
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text pong breakout invaders showcase-3d
+examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -187,14 +187,14 @@ run-showcase-textured-sprite: showcase-textured-sprite
 run-showcase-text: showcase-text
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-text.exe cargo run -p frontend --release
 
-run-pong: pong
-	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/pong.exe cargo run -p frontend --release
+run-game-pong: game-pong
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/game-pong.exe cargo run -p frontend --release
 
-run-breakout: breakout
-	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/breakout.exe cargo run -p frontend --release
+run-game-breakout: game-breakout
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/game-breakout.exe cargo run -p frontend --release
 
-run-invaders: invaders
-	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/invaders.exe cargo run -p frontend --release
+run-game-invaders: game-invaders
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/game-invaders.exe cargo run -p frontend --release
 
 run-showcase-3d: showcase-3d
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-3d.exe cargo run -p frontend --release

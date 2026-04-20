@@ -445,8 +445,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // First mini-game. At the 8-VBlank checkpoint the ball
         // has bounced off the right paddle and is coming back
         // left; AI paddle is tracking. Nothing scored yet.
-        "pong" => Some(SdkGolden {
-            example: "pong",
+        "game-pong" => Some(SdkGolden {
+            example: "game-pong",
             vblanks: 8,
             vram_hash: 0x9a79_14eb_0915_3cfd,
             display_hash: 0x7da9_7577_f30c_22fe,
@@ -467,8 +467,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // psx-fx extraction — VRAM + display hashes are byte-
         // identical to the previous golden (same pixels), only
         // `final_pc` drifted from LTO code re-layout.
-        "breakout" => Some(SdkGolden {
-            example: "breakout",
+        "game-breakout" => Some(SdkGolden {
+            example: "game-breakout",
             vblanks: 60,
             vram_hash: 0x287c_bcfb_0959_e891,
             display_hash: 0x96c6_0f48_bdd3_5cd3,
@@ -490,8 +490,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // input = no player shots but the enemy AI is firing.
         // Refreshed after psx-fx extraction — pixels unchanged,
         // only `final_pc` drifted from LTO re-layout.
-        "invaders" => Some(SdkGolden {
-            example: "invaders",
+        "game-invaders" => Some(SdkGolden {
+            example: "game-invaders",
             vblanks: 120,
             vram_hash: 0x70b9_8021_f18b_6295,
             display_hash: 0x66a0_de19_df42_4319,
@@ -586,33 +586,33 @@ fn milestone_c_hello_audio() {
 
 #[test]
 #[ignore = "SDK milestone: pong roundtrip"]
-fn milestone_c_pong() {
+fn milestone_c_game_pong() {
     // 8 VBlanks exercises the game loop through its first paddle
     // bounce. The ball starts at centre moving right at (2, 1);
     // after 8 frames it's hit the right paddle area, triggered
     // the paddle-hit SFX, and the AI has begun tracking.
-    run_sdk_milestone("pong", 8);
+    run_sdk_milestone("game-pong", 8);
 }
 
 #[test]
 #[ignore = "SDK milestone: breakout roundtrip"]
-fn milestone_c_breakout() {
+fn milestone_c_game_breakout() {
     // 60 VBlanks covers one serve arc + first brick break. Serve
     // auto-launches at frame 30 (no pad in harness), ball climbs
     // and hits a blue brick around frame 85-90 in the probe —
     // we leave 60 frames here so the test captures the ball
     // mid-flight on the way up with all 40 bricks still in place.
     // Still exercises the 44-primitive OT path every frame.
-    run_sdk_milestone("breakout", 60);
+    run_sdk_milestone("game-breakout", 60);
 }
 
 #[test]
 #[ignore = "SDK milestone: invaders roundtrip"]
-fn milestone_c_invaders() {
+fn milestone_c_game_invaders() {
     // 120 VBlanks captures the grid mid-march with enemy bombs
     // in flight. Exercises the 50+-primitive OT path + the
     // march / bullet / particle state machines.
-    run_sdk_milestone("invaders", 120);
+    run_sdk_milestone("game-invaders", 120);
 }
 
 #[test]

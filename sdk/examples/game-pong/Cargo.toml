@@ -1,12 +1,12 @@
 [package]
-name    = "pong"
+name    = "game-pong"
 version = "0.1.0"
 edition = "2021"
 
 [workspace]
 
 [[bin]]
-name = "pong"
+name = "game-pong"
 path = "src/main.rs"
 
 [profile.release]

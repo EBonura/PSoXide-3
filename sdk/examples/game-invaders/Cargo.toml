@@ -1,12 +1,12 @@
 [package]
-name    = "invaders"
+name    = "game-invaders"
 version = "0.1.0"
 edition = "2021"
 
 [workspace]
 
 [[bin]]
-name = "invaders"
+name = "game-invaders"
 path = "src/main.rs"
 
 [profile.release]

@@ -1,12 +1,12 @@
 [package]
-name    = "breakout"
+name    = "game-breakout"
 version = "0.1.0"
 edition = "2021"
 
 [workspace]
 
 [[bin]]
-name = "breakout"
+name = "game-breakout"
 path = "src/main.rs"
 
 [profile.release]
