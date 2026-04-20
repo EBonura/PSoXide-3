@@ -187,6 +187,20 @@ psxed:
 SHOWCASE_3D := sdk/examples/showcase-3d
 SHOWCASE_LIGHTS := sdk/examples/showcase-lights
 HELLO_TEX := sdk/examples/hello-tex
+
+# Texture sources (.jpg / .png) are gitignored because they're
+# multi-MB photographs; the small cooked .psxt blobs in assets/
+# are the repo artifact. `make assets` cooks only when the source
+# is present, so fresh clones — which lack the sources — finish
+# without errors and the committed .psxt blobs remain valid.
+define cook_texture
+	@if [ -f "$(1)" ]; then \
+	    $(PSXED) tex "$(1)" -o "$(2)" --size $(3) --depth $(4) --resample lanczos3 ; \
+	else \
+	    echo "[psxed tex] skip: source $(1) not present (using committed $(2))" ; \
+	fi
+endef
+
 assets: psxed
 	@mkdir -p $(SHOWCASE_3D)/assets $(SHOWCASE_LIGHTS)/assets $(HELLO_TEX)/assets
 	@$(PSXED) obj $(SHOWCASE_3D)/vendor/suzanne.obj \
@@ -198,9 +212,8 @@ assets: psxed
 	@$(PSXED) obj $(SHOWCASE_LIGHTS)/vendor/cube.obj \
 	    -o $(SHOWCASE_LIGHTS)/assets/cube.psxm \
 	    --compute-normals --no-colors
-	@$(PSXED) tex $(HELLO_TEX)/vendor/brick-wall.jpg \
-	    -o $(HELLO_TEX)/assets/brick-wall.psxt \
-	    --size 64x64 --depth 4 --resample lanczos3
+	$(call cook_texture,$(HELLO_TEX)/vendor/brick-wall.jpg,$(HELLO_TEX)/assets/brick-wall.psxt,64x64,4)
+	$(call cook_texture,$(HELLO_TEX)/vendor/floor.jpg,$(HELLO_TEX)/assets/floor.psxt,64x64,4)
 
 examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-lights showcase-fog
 	@echo ""

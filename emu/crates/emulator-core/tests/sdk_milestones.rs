@@ -354,20 +354,21 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_0470,
             redux_display_hash: None,
         }),
-        // Now uses a 4bpp CLUT brick-wall texture cooked by
-        // `psxed tex` from a source JPG. Exercises the full host +
-        // runtime texture pipeline: PNG/JPG → crop → resample →
-        // median-cut quantise → pack 4bpp → PSXT → include_bytes! →
-        // Texture::from_bytes → upload_bytes × 2 → GP0 0x64.
+        // Two 4bpp CLUT textures cooked by `psxed tex` from source
+        // JPGs — a brick wall and a cobblestone floor — sharing
+        // one tpage with distinct CLUTs. Exercises the full host +
+        // runtime texture pipeline and proves that multiple
+        // textures can coexist in VRAM without stepping on each
+        // other.
         "hello-tex" => Some(SdkGolden {
             example: "hello-tex",
             vblanks: 2,
-            vram_hash: 0x6283_ecc7_dca4_e1fa,
-            display_hash: 0x66da_5fe5_c1bb_096c,
+            vram_hash: 0xf139_f9ae_3e19_65df,
+            display_hash: 0xc83c_64bf_158d_af22,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_0548,
+            final_pc: 0x8001_1324,
             redux_display_hash: None,
         }),
         "hello-ot" => Some(SdkGolden {
