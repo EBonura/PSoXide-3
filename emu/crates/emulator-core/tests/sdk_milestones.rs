@@ -507,6 +507,23 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // OT with back-face culling. ~200 rendered triangles per
         // frame (~400 pre-cull). 60 VBlanks pins a non-trivial
         // tumble angle.
+        // Companion to `showcase-3d`: 4 moving coloured point
+        // lights illuminating 6 scaled cubes via CPU-side per-
+        // vertex shading (point lights aren't native to the
+        // GTE). Validates the full normals→lighting→TriGouraud
+        // pipeline + multi-light colour blending.
+        "showcase-lights" => Some(SdkGolden {
+            example: "showcase-lights",
+            vblanks: 60,
+            vram_hash: 0xdbb7_f14e_dca2_bed5,
+            display_hash: 0xeb4d_ab2f_bcac_ecfd,
+            display_size: (320, 240),
+            vblank_raises: 60,
+            spu_samples: 44100,
+            final_pc: 0x8001_0c9c,
+            redux_display_hash: None,
+        }),
+
         // Now lit via the GTE's NCCS pipeline — 3 directional
         // world-space lights rotated per-object into local
         // frames, per-vertex `project_lit` computes both screen
@@ -618,6 +635,15 @@ fn milestone_c_game_invaders() {
     // in flight. Exercises the 50+-primitive OT path + the
     // march / bullet / particle state machines.
     run_sdk_milestone("game-invaders", 120);
+}
+
+#[test]
+#[ignore = "SDK milestone: showcase-lights roundtrip"]
+fn milestone_c_showcase_lights() {
+    // 60 VBlanks puts the 4 orbiting lights at a mid-cycle
+    // position — cubes visibly tinted by nearby lights, 72
+    // Gouraud triangles, 4 light markers on screen.
+    run_sdk_milestone("showcase-lights", 60);
 }
 
 #[test]

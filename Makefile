@@ -19,7 +19,8 @@
         game-pong run-game-pong \
         game-breakout run-game-breakout \
         game-invaders run-game-invaders \
-        showcase-3d run-showcase-3d
+        showcase-3d run-showcase-3d \
+        showcase-lights run-showcase-lights
 
 help:
 	@echo "PSoXide targets:"
@@ -54,6 +55,7 @@ help:
 	@echo "    make game-breakout - build the Breakout mini-game"
 	@echo "    make game-invaders - build the Space Invaders mini-game"
 	@echo "    make showcase-3d    - build the 3D geometry showcase"
+	@echo "    make showcase-lights - build the 4-point-light demo"
 	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
 	@echo "    make run-input    - build + side-load hello-input into the frontend"
 	@echo "    make run-ot       - build + side-load hello-ot into the frontend"
@@ -68,6 +70,7 @@ help:
 	@echo "    make run-game-breakout - build + side-load the Breakout mini-game"
 	@echo "    make run-game-invaders - build + side-load the Space Invaders mini-game"
 	@echo "    make run-showcase-3d - build + side-load the 3D geometry showcase"
+	@echo "    make run-showcase-lights - build + side-load the 4-point-light demo"
 
 run:
 	cd emu && cargo run -p frontend --release
@@ -157,6 +160,9 @@ game-invaders:
 showcase-3d: assets
 	cd sdk/examples/showcase-3d && cargo build --release
 
+showcase-lights: assets
+	cd sdk/examples/showcase-lights && cargo build --release
+
 # --- Content pipeline (host-side editor tooling) ------------------------
 
 PSXED := editor/target/release/psxed
@@ -171,16 +177,20 @@ psxed:
 # next to the source under `assets/` so a repo clone has the
 # runtime input available without having to run the editor.
 SHOWCASE_3D := sdk/examples/showcase-3d
+SHOWCASE_LIGHTS := sdk/examples/showcase-lights
 assets: psxed
-	@mkdir -p $(SHOWCASE_3D)/assets
+	@mkdir -p $(SHOWCASE_3D)/assets $(SHOWCASE_LIGHTS)/assets
 	@$(PSXED) obj $(SHOWCASE_3D)/vendor/suzanne.obj \
 	    -o $(SHOWCASE_3D)/assets/suzanne.psxm \
 	    --palette warm --decimate-grid 6 --compute-normals
 	@$(PSXED) obj $(SHOWCASE_3D)/vendor/teapot.obj \
 	    -o $(SHOWCASE_3D)/assets/teapot.psxm \
 	    --palette cool --compute-normals
+	@$(PSXED) obj $(SHOWCASE_LIGHTS)/vendor/cube.obj \
+	    -o $(SHOWCASE_LIGHTS)/assets/cube.psxm \
+	    --compute-normals --no-colors
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d
+examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-lights
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -224,3 +234,6 @@ run-game-invaders: game-invaders
 
 run-showcase-3d: showcase-3d
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-3d.exe cargo run -p frontend --release
+
+run-showcase-lights: showcase-lights
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-lights.exe cargo run -p frontend --release
