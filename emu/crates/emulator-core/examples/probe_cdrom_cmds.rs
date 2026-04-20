@@ -9,9 +9,15 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(89_198_894);
+    let disc_path = std::env::args().nth(2);
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
+    if let Some(ref p) = disc_path {
+        let disc_bytes = std::fs::read(p).expect("disc readable");
+        bus.cdrom
+            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+    }
     let mut cpu = Cpu::new();
 
     let mut last_hist = *bus.cdrom.command_histogram();

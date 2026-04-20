@@ -22,7 +22,10 @@ use emulator_core::{Bus, Cpu};
 use parity_oracle::{OracleConfig, ReduxProcess};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Per-checkpoint timeout. Redux silent-run rate is ~0.5 M steps/s,
+/// so a 100 M-step interval can take ~3.5 min. Give it 10 min to
+/// cover slow-boot intervals (game intros do lots of FMV decoding).
+const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn main() {
     let n: u64 = std::env::args()
@@ -84,6 +87,7 @@ fn main() {
     let mut redux = ReduxProcess::launch(&config).expect("Redux launches");
     redux.handshake(HANDSHAKE_TIMEOUT).expect("handshake");
     let mut redux_checks: Vec<(u64, u64, u32)> = Vec::with_capacity((n / interval) as usize);
+    eprintln!("[redux] CHECKPOINT_TIMEOUT = {}s", CHECKPOINT_TIMEOUT.as_secs());
     redux
         .run_checkpoint(n, interval, CHECKPOINT_TIMEOUT, |step, tick, pc| {
             redux_checks.push((step, tick, pc));

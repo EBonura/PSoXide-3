@@ -520,6 +520,12 @@ impl CdRom {
             0x19 => self.cmd_test(&params),
             // GetID: "what kind of disc is this?"
             0x1A => self.cmd_getid(),
+            // ReadTOC: re-read the table of contents. The BIOS
+            // issues this during disc-boot to learn the track
+            // layout; without a response the BIOS hangs waiting
+            // for INT2 (Complete), stranding MGS / Crash at the
+            // Sony splash.
+            0x1E => self.cmd_read_toc(),
             _ => self.cmd_getstat(),
         }
     }
@@ -634,6 +640,29 @@ impl CdRom {
         self.schedule_first_response(vec![self.stat_byte()]);
         let stat = self.stat_byte();
         self.schedule_second_response(vec![stat], SEEK_SECOND_RESPONSE_CYCLES);
+    }
+
+    /// CdlReadToc (0x1E): re-scan the disc table-of-contents.
+    /// Two-part response:
+    /// - INT3 (Acknowledge) with stat, immediately.
+    /// - INT2 (Complete) with stat, ~20 M cycles later (Redux:
+    ///   `cdReadTime * 180 / 4 = 20_321_280`). No track data is
+    ///   returned in either response — the BIOS queries individual
+    ///   track info via GetTD after ReadTOC completes.
+    ///
+    /// The BIOS's disc-boot sequence blocks on the INT2 here; we
+    /// used to fall through to `cmd_getstat` on 0x1E, which only
+    /// emitted the INT3 and left the BIOS waiting forever on the
+    /// INT2. Surfaced as MGS + Crash hanging on the Sony splash
+    /// at step ~90 M.
+    fn cmd_read_toc(&mut self) {
+        let stat = self.stat_byte();
+        self.schedule_first_response(vec![stat]);
+        // Redux value: `cdReadTime * 180 / 4`. We inline the
+        // literal to avoid introducing a new named constant
+        // here.
+        const READ_TOC_SECOND_RESPONSE_CYCLES: u64 = 451_584 * 180 / 4;
+        self.schedule_second_response(vec![stat], READ_TOC_SECOND_RESPONSE_CYCLES);
     }
 
     fn cmd_init(&mut self) {
@@ -865,8 +894,25 @@ impl CdRom {
 
     fn cmd_getid(&mut self) {
         if self.disc_present {
-            // Licensed PS1 PAL disc placeholder. 8 bytes:
-            //   stat, flags, disc_type, 00, 'S','C','E','A'
+            // Licensed PS1 disc response: 8 bytes.
+            //   [0]: stat (0x02 = motor on)
+            //   [1]: flags (0x00 = licensed)
+            //   [2]: disc type (0x20 = mode-2 data)
+            //   [3]: reserved 0
+            //   [4..=7]: region code
+            //
+            // We return "SCEA" (US region) for disc-present even
+            // though the real region code should be derived from
+            // the disc image. This works because the BIOS accepts
+            // "SCEA" / "SCEE" / "SCEI" and the games we care
+            // about are mostly US releases. Redux replaces this
+            // with "PCSX" for legal distance from Sony, but our
+            // BIOS (SCPH-1001) validates the 4-char region
+            // strictly — swapping to "PCSX" hangs MGS on the
+            // Sony splash because the BIOS rejects the disc. Find
+            // a way to satisfy both validation AND parity
+            // (probably: BIOS HLE hook on the region-check code
+            // path) before revisiting this.
             let stat = self.stat_byte();
             self.schedule_first_response(vec![stat]);
             self.schedule_second_response(
