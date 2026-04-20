@@ -87,9 +87,16 @@ const CORR_HALF_W: i16 = 0x0780;
 const CORR_HALF_H: i16 = 0x0500;
 
 const RING_SPACING: i32 = 0x0500;
-const NEAR_CAM_Z: i32 = 0x0400;
+/// Camera Z. Fixed — the corridor doesn't scroll. Scrolling would
+/// require per-frame ring-wrap (walls disappear from the near
+/// plane, new ones appear at the far end), and the PSX GTE has no
+/// native perspective clipping to make that smooth. The resulting
+/// pop on each wrap reads as a flicker; dropping the scroll
+/// removes the flicker entirely. A static corridor is the
+/// cleanest demonstration of the fog effect — camera sits, walls
+/// recede, fog fills the distance.
+const NEAR_CAM_Z: i32 = 0x0700;
 const FIRST_RING_Z: i32 = NEAR_CAM_Z + RING_SPACING;
-const SCROLL_SPEED: i32 = 0x0020;
 
 // ----------------------------------------------------------------------
 // Fog parameters
@@ -105,24 +112,25 @@ const FOG_CLEAR: (u8, u8, u8) = (
 
 /// Fog gradient tuning.
 ///
-/// With PROJ_H=280, corridor Z in [0x0900..0x5400]:
-///   divisor_near = (H << 16) / 0x0900 ≈ 0x1F1C
-///   divisor_far  = (H << 16) / 0x5400 ≈ 0x0350
+/// With PROJ_H=280, corridor Z in [0x0C00..0x5700]:
+///   divisor_near = (H << 16) / 0x0C00 ≈ 0x1755
+///   divisor_far  = (H << 16) / 0x5700 ≈ 0x0323
 ///
-/// We want:
-///   IR0 at near = 0x0200  (12%  — atmospheric haze even on near walls,
-///                          so the fog reads everywhere on screen
-///                          rather than only in the central vanishing
-///                          point strip)
-///   IR0 at far  = 0x1000  (100% — far walls converge exactly to FC,
-///                          blending seamlessly into the fog-clear BG)
+/// Target: **35% fog at the near plane, 100% at the far plane.**
+/// The heavy near-side baseline serves two purposes: (1) it sells
+/// the atmospheric-haze effect across the whole screen rather
+/// than just at the vanishing point; (2) it hides the ring-wrap
+/// discontinuity — the nearest wall is already substantially
+/// tinted toward FC when it wraps off-screen, so its
+/// disappearance (and a fresh far-end ring's appearance, at 100%
+/// fog) is visually subtle.
 ///
 /// Solving:
-///   0x1F1C * DQA + DQB = 0x200_000
-///   0x0350 * DQA + DQB = 0x1000_000
-///   → DQA ≈ -0x0800, DQB = 0x118_E000
+///   0x1755 * DQA + DQB = 0x0600_000    (IR0 = 0x600 = 37.5% at near)
+///   0x0323 * DQA + DQB = 0x1000_000    (IR0 = 0x1000 = 100% at far)
+///   → DQA = -0x0800, DQB = 0x115_AA00
 const DQA: i16 = -0x0800;
-const DQB: i32 = 0x0118_E000;
+const DQB: i32 = 0x0115_AA00;
 
 const ZSF3: i16 = 0x0555;
 const ZSF4: i16 = 0x0400;
@@ -131,22 +139,27 @@ const ZSF4: i16 = 0x0400;
 // Lighting
 // ----------------------------------------------------------------------
 
+/// Purely-ambient light rig. No directional lights, no orbit.
+///
+/// The demo's point is to isolate the **fog** effect — every
+/// pixel's colour is driven by (material × ambient × fog), with
+/// no orbiting highlight to compete for the eye's attention.
+/// Adding directional lighting made the scene read as "randomly
+/// lit walls" rather than "foggy corridor". Pure ambient + fog
+/// reads unambiguously as atmospheric depth.
+///
+/// NCDT still runs on every triangle — it just computes the
+/// "lit" term as ambient-only (no directional contribution),
+/// then layers the depth-cue blend on top. The full
+/// RTPT → NCLIP → AVSZ3 → NCDT pipeline is still exercised.
+///
+/// BK is in **Q19.12**; `0x1000` is the "identity-brightness"
+/// value that leaves a `(128, 128, 128)` RGBC unmodulated at
+/// zero fog. Anything larger saturates; anything smaller dims.
 const BASE_RIG: LightRig = LightRig::new(
-    [
-        Light {
-            direction: Vec3I16::new(0x0E00, -0x0300, 0x0000),
-            colour: (0x1C00, 0x1600, 0x0C00),
-        },
-        Light::OFF,
-        Light::OFF,
-    ],
-    (0x0200, 0x0200, 0x0280),
+    [Light::OFF, Light::OFF, Light::OFF],
+    (0x1000, 0x1000, 0x1000),
 );
-
-/// `rotate_y`'s angle is 256-per-revolution and it masks `& 0xFF`
-/// internally. `frame >> 2` gives 1 angle unit every 4 frames =
-/// 1024 frames per revolution ≈ 17 s at 60 fps.
-const LIGHT_ORBIT_SHIFT: u32 = 2;
 
 // ----------------------------------------------------------------------
 // Textures
@@ -284,17 +297,34 @@ const FONT_CLUT: Clut = Clut::new(320, 256);
 
 struct Scene {
     frame: u32,
-    camera_offset: i32,
     tri_count: u16,
     culled_count: u16,
 }
 
 static mut SCENE: Scene = Scene {
     frame: 0,
-    camera_offset: 0,
     tri_count: 0,
     culled_count: 0,
 };
+
+/// Absolute Z of each ring, sorted ascending (index 0 = nearest
+/// the camera). Each frame every ring moves by `-SCROLL_SPEED`;
+/// when the nearest ring's Z drops below the near plane it's
+/// rotated to the far end while the remaining rings stay put in
+/// world space. That way only *one* ring's position jumps per
+/// wrap instead of all of them — no visible flicker as the
+/// corridor scrolls.
+static mut RING_Z: [i32; NUM_RINGS] = init_ring_z();
+
+const fn init_ring_z() -> [i32; NUM_RINGS] {
+    let mut z = [0i32; NUM_RINGS];
+    let mut i = 0;
+    while i < NUM_RINGS {
+        z[i] = FIRST_RING_Z + (i as i32) * RING_SPACING;
+        i += 1;
+    }
+    z
+}
 
 // ----------------------------------------------------------------------
 // Entry point
@@ -366,10 +396,6 @@ fn main() {
 fn update_scene() {
     let s = unsafe { &mut SCENE };
     s.frame = s.frame.wrapping_add(1);
-    s.camera_offset += SCROLL_SPEED;
-    if s.camera_offset >= RING_SPACING {
-        s.camera_offset -= RING_SPACING;
-    }
     s.tri_count = 0;
     s.culled_count = 0;
 }
@@ -377,11 +403,6 @@ fn update_scene() {
 // ----------------------------------------------------------------------
 // Render — build OT
 // ----------------------------------------------------------------------
-
-#[inline]
-fn ring_z(i: usize, camera_offset: i32) -> i32 {
-    FIRST_RING_Z + (i as i32) * RING_SPACING - camera_offset
-}
 
 #[inline]
 fn ot_slot(otz: u16) -> usize {
@@ -413,10 +434,11 @@ fn build_frame_ot() {
     ot.add(OT_DEPTH - 1, bg, QuadGouraud::WORDS);
 
     // --- Scene setup for this frame ---
+    // Static light rig — no orbit, no directional lighting. Just
+    // ambient + fog produces the entire colour variation on screen.
     scene::load_rotation(&Mat3I16::IDENTITY);
     scene::load_translation(Vec3I32::new(0, 0, 0));
-    let light_rot = Mat3I16::rotate_y((s.frame >> LIGHT_ORBIT_SHIFT) as u16);
-    BASE_RIG.rotated(&light_rot).load();
+    BASE_RIG.load();
 
     // Tpage word embeds in every textured primitive's vertex-1 UV
     // slot. Semi-transparency bit = 0 (opaque).
@@ -429,10 +451,11 @@ fn build_frame_ot() {
     // blue-shifting texels so the far end fades into the clear.
     const MAT: (u8, u8, u8) = (0x80, 0x80, 0x80);
 
+    let rings = unsafe { &RING_Z };
     let mut tri_idx = 0;
     for ring in 0..NUM_RINGS - 1 {
-        let z_near = ring_z(ring, s.camera_offset);
-        let z_far = ring_z(ring + 1, s.camera_offset);
+        let z_near = rings[ring];
+        let z_far = rings[ring + 1];
 
         for wall in &WALLS {
             let (x0, y0) = wall.corners[0];

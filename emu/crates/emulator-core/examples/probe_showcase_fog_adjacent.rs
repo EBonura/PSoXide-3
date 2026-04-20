@@ -24,7 +24,12 @@ fn main() {
     cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
 
     // Around the first wrap (frame 40) + a non-wrap neighbourhood.
-    let sample_targets: &[u64] = &[30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42];
+    // Wrap expected around frame 41 (ring_spacing / scroll_speed = 40 steps).
+    // Dump 20 consecutive frames spanning two potential wrap points.
+    let sample_targets: &[u64] = &[
+        35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+        75, 76, 77, 78, 79, 80, 81, 82, 83, 84,
+    ];
     let mut cycles_at_last_pump = 0u64;
     for &target in sample_targets {
         while bus.irq().raise_counts()[0] < target {

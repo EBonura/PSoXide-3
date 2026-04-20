@@ -553,15 +553,23 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // textures in a shared tpage, tiled per ring, modulated by
         // NCDT's fog gradient. The Silent-Hill-era look, rendered
         // through hardware ops only.
+        // PS1-commercial textured-Gouraud pipeline: RTPT + NCLIP +
+        // AVSZ3 + NCDT feeds per-vertex depth-cue-blended colours
+        // into textured-Gouraud triangles (GP0 0x34). Brick walls
+        // + cobblestone floor sampled from two cooked PSXT
+        // textures in a shared tpage, modulated by NCDT's fog
+        // gradient. Pure ambient lighting (no directional or
+        // orbit) — the fog is the only visual variable. Static
+        // corridor — no camera scroll, so no ring-wrap discontinuity.
         "showcase-fog" => Some(SdkGolden {
             example: "showcase-fog",
             vblanks: 60,
-            vram_hash: 0xcaad_fb89_f479_2489,
-            display_hash: 0xb863_281d_4680_b073,
+            vram_hash: 0x15f9_f90b_84c6_4778,
+            display_hash: 0xb992_a7ca_5694_243a,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_1da0,
+            final_pc: 0x8001_184c,
             redux_display_hash: None,
         }),
         _ => None,
