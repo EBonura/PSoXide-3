@@ -125,6 +125,71 @@ local function run()
             local tick = tonumber(PCSX.getCPUCycles())
             send(string.format("run ok tick=%d", tick))
 
+        elseif cmd == "log_cdrom_irqs" then
+            -- `log_cdrom_irqs N M` — run N user-side steps
+            -- silently, emitting one `cdrom_irq tick=... type=...`
+            -- line each time bit 2 of I_STAT (CDROM) transitions
+            -- from clear to set, up to M entries. Lets a probe
+            -- compare every CDROM IRQ's cycle between emulators
+            -- and pinpoint the first one that fires at a different
+            -- time.
+            --
+            -- Per-step poll cost is one FFI read of a stable host
+            -- address (I_STAT mirror at the hw-regs base); trivial
+            -- next to stepIn()+runExecute().
+            local n_str, m_str = line:match("^log_cdrom_irqs%s+(%d+)%s+(%d+)$")
+            local n = tonumber(n_str) or 0
+            local m_max = tonumber(m_str) or 100
+            if n == 0 then
+                send("err log_cdrom_irqs: bad args")
+            else
+                local hw_ptr
+                for _, name in ipairs({
+                    "getHardwareRegisters", "getHardwareRegistersPtr",
+                    "getHWPtr", "getHardwarePtr", "getHwRegPtr",
+                    "getIOPtr", "getIoPtr",
+                }) do
+                    local fn = PCSX[name]
+                    if type(fn) == "function" then
+                        local ok, p = pcall(fn)
+                        if ok and p then hw_ptr = p; break end
+                    end
+                end
+                if not hw_ptr then
+                    send("err log_cdrom_irqs: no hw-regs accessor")
+                else
+                    -- I_STAT is at phys 0x1F801070, offset 0x70
+                    -- inside the 8 K io[] mirror.
+                    local istat_ptr = ffi.cast("uint32_t*", hw_ptr + 0x70)
+                    -- CDROM IRQ flag at phys 0x1F801803 idx=1; bits
+                    -- 0-2 carry the IRQ type (1=DataReady, 2=Complete,
+                    -- 3=Acknowledge, 4=DataEnd, 5=Error). Redux keeps
+                    -- the live value at offset 0x803 of the same
+                    -- mirror, so we can read it with no index dance.
+                    local cdirq_ptr = ffi.cast("uint8_t*", hw_ptr + 0x803)
+                    local prev = bit.band(istat_ptr[0], 0x4)
+                    local emitted = 0
+                    for i = 1, n do
+                        PCSX.stepIn()
+                        PCSX.runExecute()
+                        local cur = bit.band(istat_ptr[0], 0x4)
+                        if cur ~= 0 and prev == 0 then
+                            local tick = tonumber(PCSX.getCPUCycles())
+                            local ty = bit.band(cdirq_ptr[0], 0x7)
+                            send_nowait(string.format(
+                                "cdrom_irq step=%d tick=%d type=%d", i, tick, ty))
+                            emitted = emitted + 1
+                            if emitted % 32 == 0 then io.flush() end
+                            if emitted >= m_max then break end
+                        end
+                        prev = cur
+                    end
+                    io.flush()
+                    send(string.format(
+                        "log_cdrom_irqs ok emitted=%d", emitted))
+                end
+            end
+
         elseif cmd == "run_checkpoint" then
             -- `run_checkpoint N M` — run N user-side steps silently,
             -- emitting one `chk step=X tick=Y pc=Z` line every M

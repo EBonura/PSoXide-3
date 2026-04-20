@@ -294,6 +294,58 @@ impl ReduxProcess {
         Ok(())
     }
 
+    /// Run `n` user-side steps silently while capturing every
+    /// CDROM IRQ's `(step, tick, type)` as it latches. Used by the
+    /// probe that walks the first K CDROM IRQs side-by-side
+    /// between ours and Redux to find which specific IRQ fires at
+    /// a divergent cycle.
+    ///
+    /// `max_log` bounds the number of entries returned — the Lua
+    /// loop stops emitting past that but keeps running to `n`.
+    pub fn log_cdrom_irqs(
+        &mut self,
+        n: u64,
+        max_log: u32,
+        timeout: Duration,
+    ) -> Result<Vec<(u64, u64, u8)>, OracleError> {
+        self.send_command(&format!("log_cdrom_irqs {n} {max_log}"))?;
+        let mut out = Vec::with_capacity(max_log as usize);
+        loop {
+            let line = self.wait_for_response(timeout)?;
+            if let Some(rest) = line.strip_prefix("log_cdrom_irqs ok ") {
+                let _ = rest; // emitted=... sugar, ignored
+                return Ok(out);
+            }
+            if let Some(rest) = line.strip_prefix("cdrom_irq ") {
+                let mut step = 0u64;
+                let mut tick = 0u64;
+                let mut ty = 0u8;
+                for part in rest.split_whitespace() {
+                    if let Some(v) = part.strip_prefix("step=") {
+                        step = v.parse().unwrap_or(0);
+                    } else if let Some(v) = part.strip_prefix("tick=") {
+                        tick = v.parse().unwrap_or(0);
+                    } else if let Some(v) = part.strip_prefix("type=") {
+                        ty = v.parse().unwrap_or(0);
+                    }
+                }
+                out.push((step, tick, ty));
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("err log_cdrom_irqs") {
+                return Err(OracleError::Protocol {
+                    expected: "log_cdrom_irqs ok".to_string(),
+                    got: format!("err log_cdrom_irqs{rest}"),
+                });
+            }
+            // Unknown line — protocol error.
+            return Err(OracleError::Protocol {
+                expected: "cdrom_irq ... or log_cdrom_irqs ok".to_string(),
+                got: line,
+            });
+        }
+    }
+
     /// Coarse-grained divergence probe: run `n` user-side steps
     /// silently, invoking `on_checkpoint(step, tick, pc)` every
     /// `interval` steps. Returns the final Redux tick.

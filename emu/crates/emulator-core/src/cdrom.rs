@@ -301,7 +301,16 @@ impl CdRom {
             drive_status: 0,
             params: VecDeque::with_capacity(PARAM_FIFO_DEPTH),
             responses: VecDeque::with_capacity(RESPONSE_FIFO_DEPTH),
-            irq_mask: 0,
+            // Redux initializes m_reg2 (the CDROM IRQ mask) to 0x1F on
+            // reset (cdrom.cc:1562) so all five IRQ types are enabled
+            // out of the gate. We used to start at 0, which blocked every
+            // CDROM IRQ from reaching the CPU at boot. That was masked in
+            // earlier runs because we also ignored the mask when raising
+            // (see `should_wake_cpu`); after adding the mask gate, our 0
+            // initial value caused CDROM IRQs to silently latch without
+            // waking CPU — BIOS boot then polled the latched flag instead
+            // of getting its usual ISR-driven ack, drifting from Redux.
+            irq_mask: 0x1F,
             irq_flag: 0,
             pending: VecDeque::new(),
             motor_on: false,
