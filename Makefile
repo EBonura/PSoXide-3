@@ -21,7 +21,8 @@
         game-invaders run-game-invaders \
         showcase-3d run-showcase-3d \
         showcase-lights run-showcase-lights \
-        showcase-fog run-showcase-fog
+        showcase-fog run-showcase-fog \
+        hello-engine run-hello-engine
 
 help:
 	@echo "PSoXide targets:"
@@ -136,6 +137,11 @@ hello-input:
 hello-ot:
 	cd sdk/examples/hello-ot && cargo build --release
 
+# engine/ examples live outside sdk/examples/ — the engine is its
+# own domain and its demos exercise the engine framework.
+hello-engine:
+	cd engine/examples/hello-engine && cargo build --release
+
 hello-tex: assets
 	cd sdk/examples/hello-tex && cargo build --release
 
@@ -219,7 +225,7 @@ assets: psxed
 	$(call cook_texture,$(SHOWCASE_FOG)/vendor/brick-wall.jpg,$(SHOWCASE_FOG)/assets/brick-wall.psxt,64x64,4)
 	$(call cook_texture,$(SHOWCASE_FOG)/vendor/floor.jpg,$(SHOWCASE_FOG)/assets/floor.psxt,64x64,4)
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-lights showcase-fog
+examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-lights showcase-fog hello-engine
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -269,3 +275,6 @@ run-showcase-lights: showcase-lights
 
 run-showcase-fog: showcase-fog
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-fog.exe cargo run -p frontend --release
+
+run-hello-engine: hello-engine
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/hello-engine.exe cargo run -p frontend --release

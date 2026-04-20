@@ -578,6 +578,20 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_1ef0,
             redux_display_hash: None,
         }),
+        // First engine-domain example. Exercises `App::run`'s
+        // main loop, the `Scene` trait, `Ctx` frame counter, and
+        // `Angle`'s `per_frames` / `sin_q12_arg` conversions.
+        "hello-engine" => Some(SdkGolden {
+            example: "hello-engine",
+            vblanks: 4,
+            vram_hash: 0xf7c6_35c6_c967_2d25,
+            display_hash: 0xb2d4_083b_0bd1_1125,
+            display_size: (320, 240),
+            vblank_raises: 4,
+            spu_samples: 2205,
+            final_pc: 0x8001_0770,
+            redux_display_hash: None,
+        }),
         _ => None,
     }
 }
@@ -721,4 +735,14 @@ fn milestone_c_showcase_fog() {
     // amount, fog gradient fully lit across all rings. Covers
     // RTPT + NCLIP + AVSZ3 + NCDT end-to-end.
     run_sdk_milestone("showcase-fog", 60);
+}
+
+#[test]
+#[ignore = "SDK milestone: hello-engine — smallest Scene/App round-trip"]
+fn milestone_c_hello_engine() {
+    // 4 VBlanks lands the drifting quad at a non-zero sine offset
+    // from centre. Pins the engine's main-loop cadence
+    // (poll/update/clear/render/sync/vsync/swap) plus the Angle →
+    // sin_q12 conversion path.
+    run_sdk_milestone("hello-engine", 4);
 }

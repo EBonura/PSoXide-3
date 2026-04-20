@@ -1,0 +1,21 @@
+[package]
+name    = "hello-engine"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "hello-engine"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[dependencies]
+psx-engine = { path = "../../crates/psx-engine" }
+psx-gpu    = { path = "../../../sdk/crates/psx-gpu" }
+psx-math   = { path = "../../../sdk/crates/psx-math" }
+psx-rt     = { path = "../../../sdk/crates/psx-rt" }

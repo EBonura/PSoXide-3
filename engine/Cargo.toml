@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/psx-engine",
+]
+
+[workspace.package]
+edition    = "2021"
+license    = "GPL-2.0-or-later"
+repository = "https://github.com/EBonura/PSoXide"
+
+[workspace.dependencies]
+# The engine runs on the MIPS target — it depends on the SDK
+# crates, not on host-side editor crates. Paths are relative to
+# the workspace root. Every SDK crate we reach for gets listed
+# here once; engine crates inherit them via `{ workspace = true }`
+# so version pinning stays in one place.
+psx-asset = { path = "../sdk/crates/psx-asset" }
+psx-gpu   = { path = "../sdk/crates/psx-gpu" }
+psx-gte   = { path = "../sdk/crates/psx-gte" }
+psx-math  = { path = "../sdk/crates/psx-math" }
+psx-pad   = { path = "../sdk/crates/psx-pad" }
+psx-rt    = { path = "../sdk/crates/psx-rt" }
+psx-vram  = { path = "../sdk/crates/psx-vram" }
