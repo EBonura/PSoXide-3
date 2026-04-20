@@ -564,8 +564,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-fog" => Some(SdkGolden {
             example: "showcase-fog",
             vblanks: 60,
-            vram_hash: 0x15f9_f90b_84c6_4778,
-            display_hash: 0xb992_a7ca_5694_243a,
+            vram_hash: 0x4819_1e6d_5892_1d0f,
+            display_hash: 0x2243_5262_7bec_e521,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,

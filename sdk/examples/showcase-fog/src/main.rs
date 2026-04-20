@@ -102,7 +102,23 @@ const FIRST_RING_Z: i32 = NEAR_CAM_Z + RING_SPACING;
 // Fog parameters
 // ----------------------------------------------------------------------
 
-const FOG_FC: Vec3I32 = Vec3I32::new(0x0200, 0x0400, 0x0A00);
+/// Fog colour. Near-black — critical, because `TriTexturedGouraud`
+/// uses **multiplicative** tint (`final = texel × tint / 128`), not
+/// additive blending toward a target colour. If FC were a bright
+/// blue, full-fog tint `(0x20, 0x40, 0xA0)` multiplied with a
+/// bright brick texel `(0xE0, 0x60, 0x20)` would give a **dark
+/// brown-grey**, not fog blue — so the BG quad (at pure fog blue)
+/// and the far-wall pixels wouldn't match, and a hard seam
+/// appeared at the vanishing point.
+///
+/// With FC near black, "full fog" = "near black", and brick × near
+/// black = also near black — so far walls blend seamlessly into
+/// the black BG. Classic "tunnel fades into darkness" fog, as used
+/// in Silent Hill caves, Wipeout night tunnels, etc.
+///
+/// A tiny blue tint keeps the darkness from reading as "scene
+/// turned off" — gives it atmospheric depth.
+const FOG_FC: Vec3I32 = Vec3I32::new(0x0040, 0x0060, 0x00C0);
 
 const FOG_CLEAR: (u8, u8, u8) = (
     (FOG_FC.x >> 4) as u8,
