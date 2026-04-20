@@ -227,6 +227,17 @@ pub struct CdRom {
     /// deadlines without threading `now` through every command
     /// handler.
     scheduling_cycle: u64,
+    /// Per-IrqType raise histogram — indexed by `IrqType`
+    /// discriminant (0..=5). Probes read this to tell
+    /// Acknowledge/DataReady/Complete/Error counts apart when the
+    /// aggregate CDROM raise count looks suspicious.
+    pub irq_type_counts: [u64; 6],
+    /// Count of `schedule_sector_event_at` calls. Diagnostic only —
+    /// the BIOS should see one DataReady per sector read at
+    /// ~451 K cycles apart, so this should match the sector count
+    /// the game requested. A blown-out number means we're chaining
+    /// extra events somewhere.
+    pub sector_events_scheduled: u64,
     /// Loaded disc image, if any. When `Some`, `disc_present` is also
     /// true and GetID / ReadN follow the disc-present paths; when
     /// `None`, they fall back to the "please insert disc" path.
@@ -290,6 +301,8 @@ impl CdRom {
             last_command: 0,
             data_fifo_pops: 0,
             scheduling_cycle: 0,
+            irq_type_counts: [0; 6],
+            sector_events_scheduled: 0,
             disc: None,
             data_fifo: VecDeque::new(),
             reading: false,
@@ -703,13 +716,22 @@ impl CdRom {
         }
         // First response: ack with READING set.
         self.schedule_first_response(vec![self.stat_byte() | drive_status_bit::READING]);
-        // Kick off sector delivery.
+        let was_reading = self.reading;
         self.reading = true;
         let (m, s, f) = self.setloc_msf;
         self.read_lba = msf_to_lba(m, s, f);
-        // Schedule the first DataReady event. Subsequent sectors are
-        // chained in `tick` so the BIOS sees a steady stream.
-        self.schedule_sector_event();
+        // Only seed a fresh DataReady chain if we weren't already
+        // streaming. Real hardware treats cmd_read-while-reading as
+        // "retarget the same drive to a new LBA" — the running
+        // stream continues from the new location, one chain total.
+        // Our earlier impl scheduled a fresh DataReady on every
+        // cmd_read, which turned MGS's 1663 back-to-back reads into
+        // 1663 parallel sector chains firing concurrently (hundreds
+        // of thousands of DataReady events, burning ISR cycles and
+        // preventing the game from ever finishing its loader).
+        if !was_reading {
+            self.schedule_sector_event();
+        }
     }
 
     /// Enqueue the next DataReady event for the in-flight read. The
@@ -732,6 +754,7 @@ impl CdRom {
             irq: IrqType::DataReady,
             bytes: vec![stat],
         });
+        self.sector_events_scheduled = self.sector_events_scheduled.saturating_add(1);
     }
 
     /// On DataReady event firing: populate the data FIFO with the
@@ -950,6 +973,35 @@ impl CdRom {
             if front.deadline > cycles_now {
                 break;
             }
+
+            // Check IRQ-flag gate BEFORE popping or running the
+            // event. Hardware holds a latched IRQ until software
+            // acks via 0x1F801803 idx=1; if we already have an
+            // unacked IRQ, leave the front event in the queue.
+            //
+            // If we popped first and then re-queued on flag-set
+            // (as the previous implementation did), we'd also run
+            // the event's side effects (notably
+            // `load_next_sector` + chained
+            // `schedule_sector_event_at`) on every failed attempt.
+            // MGS triggered that tight loop: 46.9 M sector events
+            // scheduled and 11.7 M DataReady pops — enough
+            // load_next_sector re-entries to bury the emulator in
+            // ISR dispatch cycles (16.7 cyc/step vs 2.4 baseline),
+            // stranding MGS at the PlayStation splash.
+            if self.irq_flag != 0 {
+                // Bump the front event's deadline slightly so the
+                // next tick re-checks, rather than spinning on an
+                // already-due event every tick until the ack lands.
+                // Matches the prior "check again in ~200 cycles"
+                // cadence without ever re-running the event body.
+                let delay = FIRST_RESPONSE_CYCLES / 10;
+                if let Some(front_mut) = self.pending.front_mut() {
+                    front_mut.deadline = cycles_now.saturating_add(delay);
+                }
+                break;
+            }
+
             let ev = self.pending.pop_front().unwrap();
 
             // If the drive was paused/reset between this event's
@@ -979,19 +1031,18 @@ impl CdRom {
                     self.schedule_sector_event_at(cycles_now);
                 }
             }
-            // Only fire IRQ if none is currently pending — hardware
-            // holds the latched IRQ until software acks.
-            if self.irq_flag == 0 {
-                self.irq_flag = ev.irq as u8;
-                raised = true;
-            } else {
-                // Re-enqueue at the front with a tiny delay; the
-                // BIOS will ack eventually.
-                let mut re = ev;
-                re.deadline = cycles_now + FIRST_RESPONSE_CYCLES / 10;
-                self.pending.push_front(re);
-                break;
+            // Raise IRQ. The flag-gate above already guaranteed
+            // irq_flag was 0 on entry.
+            self.irq_flag = ev.irq as u8;
+            let ty = ev.irq as usize;
+            if ty < self.irq_type_counts.len() {
+                self.irq_type_counts[ty] =
+                    self.irq_type_counts[ty].saturating_add(1);
             }
+            raised = true;
+            // Hardware can only latch one IRQ at a time; subsequent
+            // due events wait until this one is acked.
+            break;
         }
 
         raised
