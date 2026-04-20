@@ -18,14 +18,14 @@
 //! # Usage
 //!
 //! ```ignore
-//! use psxed_tex::{Config, Depth, Resampler, convert};
+//! use psxed_tex::{Config, CropMode, Depth, Resampler, convert};
 //!
 //! let src = std::fs::read("brick-wall.jpg").unwrap();
 //! let cfg = Config {
 //!     width: 64,
 //!     height: 64,
 //!     depth: Depth::Bit4,
-//!     crop: None,
+//!     crop: CropMode::CentreSquare,
 //!     resampler: Resampler::Lanczos3,
 //! };
 //! let psxt = convert(&src, &cfg).unwrap();
@@ -47,6 +47,23 @@ pub struct CropRect {
     pub w: u32,
     /// Height.
     pub h: u32,
+}
+
+impl CropRect {
+    /// Compute the centred square crop of a `src_w × src_h` image
+    /// — the largest square that fits, positioned in the middle.
+    /// Used as the default when the caller hasn't specified an
+    /// explicit crop, so arbitrary-aspect sources don't get
+    /// distorted by the resize step.
+    pub const fn centred_square(src_w: u32, src_h: u32) -> Self {
+        let size = if src_w < src_h { src_w } else { src_h };
+        Self {
+            x: (src_w - size) / 2,
+            y: (src_h - size) / 2,
+            w: size,
+            h: size,
+        }
+    }
 }
 
 /// Resampling kernel used for the resize step.
@@ -73,10 +90,35 @@ pub struct Config {
     /// PSX colour depth. 4bpp is the default; 8bpp for detail;
     /// 15bpp for true-colour reference images.
     pub depth: Depth,
-    /// Optional crop window into the source image.
-    pub crop: Option<CropRect>,
+    /// Source-side crop behaviour. Default
+    /// [`CropMode::CentreSquare`] centre-crops to a square so
+    /// arbitrary-aspect sources don't get distorted by the resize
+    /// step; [`CropMode::Explicit`] locks to a specific rect;
+    /// [`CropMode::None`] stretches the full source to the target
+    /// aspect ratio (rarely what you want, but useful for
+    /// previously-cropped sources and UI sprites).
+    pub crop: CropMode,
     /// Resampling kernel. `Lanczos3` is a good default.
     pub resampler: Resampler,
+}
+
+/// How the cooker should handle source aspect vs target aspect.
+#[derive(Copy, Clone, Debug)]
+pub enum CropMode {
+    /// Centre-crop to the largest square that fits — the default.
+    /// Guarantees no aspect distortion for arbitrary-aspect sources.
+    CentreSquare,
+    /// Use the caller-specified rect.
+    Explicit(CropRect),
+    /// No crop — resize-stretch the full source. Produces distorted
+    /// output for non-square sources.
+    None,
+}
+
+impl Default for CropMode {
+    fn default() -> Self {
+        CropMode::CentreSquare
+    }
 }
 
 /// Errors the cooker can surface.
@@ -124,13 +166,20 @@ pub fn convert(src: &[u8], cfg: &Config) -> Result<Vec<u8>, Error> {
     }
     let img = image::load_from_memory(src).map_err(Error::Decode)?;
     let (sw, sh) = img.dimensions();
-    let cropped = if let Some(c) = cfg.crop {
-        if c.x + c.w > sw || c.y + c.h > sh {
-            return Err(Error::CropOutOfBounds {
-                crop: c,
-                source: (sw, sh),
-            });
+    let crop_rect = match cfg.crop {
+        CropMode::Explicit(c) => {
+            if c.x + c.w > sw || c.y + c.h > sh {
+                return Err(Error::CropOutOfBounds {
+                    crop: c,
+                    source: (sw, sh),
+                });
+            }
+            Some(c)
         }
+        CropMode::CentreSquare => Some(CropRect::centred_square(sw, sh)),
+        CropMode::None => None,
+    };
+    let cropped = if let Some(c) = crop_rect {
         DynamicImage::ImageRgba8(imageops::crop_imm(&img, c.x, c.y, c.w, c.h).to_image())
     } else {
         img
@@ -421,6 +470,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn centred_square_landscape() {
+        // 3:2 landscape source → square is the short side (height),
+        // centred horizontally.
+        let c = CropRect::centred_square(6000, 4000);
+        assert_eq!(c.w, 4000);
+        assert_eq!(c.h, 4000);
+        assert_eq!(c.x, 1000);
+        assert_eq!(c.y, 0);
+    }
+
+    #[test]
+    fn centred_square_portrait() {
+        // 3:4 portrait → square is the short side (width), centred
+        // vertically.
+        let c = CropRect::centred_square(3000, 4000);
+        assert_eq!(c.w, 3000);
+        assert_eq!(c.h, 3000);
+        assert_eq!(c.x, 0);
+        assert_eq!(c.y, 500);
+    }
+
+    #[test]
+    fn centred_square_already_square_is_identity() {
+        let c = CropRect::centred_square(512, 512);
+        assert_eq!(c.w, 512);
+        assert_eq!(c.h, 512);
+        assert_eq!(c.x, 0);
+        assert_eq!(c.y, 0);
+    }
+
+    #[test]
     fn rgb_conversion_full_scale() {
         assert_eq!(rgb_to_555(0, 0, 0), 0);
         assert_eq!(rgb_to_555(255, 255, 255), 0x7FFF);
@@ -474,7 +554,7 @@ mod tests {
             width: 4,
             height: 4,
             depth: Depth::Bit4,
-            crop: None,
+            crop: CropMode::None,
             resampler: Resampler::Nearest,
         };
         let psxt = convert(&buf, &cfg).unwrap();

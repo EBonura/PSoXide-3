@@ -35,20 +35,14 @@ bios/
 roms/
 discs/
 
-# Source-image assets for texture cooking. Small cooked PSXT blobs
-# live in sibling `assets/` directories and ARE committed; raw
-# JPG/PNG sources are typically 5-20 MB each and would balloon the
-# repo size. Devs re-cooking textures drop the source into vendor/
-# locally — `make assets` cooks only when the source file is
-# present, so fresh clones build cleanly against the committed
-# `.psxt` blobs without needing to redownload anything.
-#
-# Small sources (OBJ meshes, shader source) stay committed — they're
-# KB-range and reproducibility of the cook matters there.
-/sdk/examples/*/vendor/*.jpg
-/sdk/examples/*/vendor/*.jpeg
-/sdk/examples/*/vendor/*.png
-/sdk/examples/*/vendor/*.bmp
+# Texture sources under `sdk/examples/*/vendor/` ARE committed —
+# but only as pre-cropped 512×512 JPGs, ~50-150 KB each. The
+# cooker's centre-square-crop default means feeding it the full
+# multi-MB original produces the same byte-for-byte output, so
+# there's no reproducibility loss; keeping only the pre-crop
+# avoids the 50× size penalty of committing multi-megapixel
+# originals. Mesh sources (OBJ) are committed as-is — they're
+# KB-range and deterministic from the original.
 
 # Run artifacts
 run/

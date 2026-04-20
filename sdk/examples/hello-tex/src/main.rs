@@ -33,6 +33,7 @@ use psx_asset::Texture;
 use psx_gpu::{self as gpu, Resolution, VideoMode, framebuf::FrameBuffer};
 use psx_hw::gpu::{pack_color, pack_texcoord, pack_vertex, pack_xy};
 use psx_io::gpu::{wait_cmd_ready, write_gp0};
+use psx_math::sincos;
 use psx_vram::{Clut, TexDepth, Tpage, VramRect, upload_bytes};
 
 /// Wall (brick) — cooked by `make assets` from
@@ -107,22 +108,29 @@ fn main() {
     let brick_clut_word = BRICK_CLUT.uv_clut_word();
     let floor_clut_word = FLOOR_CLUT.uv_clut_word();
 
-    let mut frame: u16 = 0;
+    // Sine-oscillating centres — same Q0.12 phase pattern as
+    // hello-ot's triangles. Modulo arithmetic would create a
+    // sawtooth snap-back every N frames; `sincos::sin_q12`
+    // gives a smooth back-and-forth drift.
+    let mut frame: u32 = 0;
     loop {
         fb.clear(16, 16, 32);
 
-        // Brick bounces in the upper half.
-        let t = frame as i16;
-        let bx = 20 + (t * 2) % 240;
-        let by = 20 + ((t / 3) % 50);
+        // Brick in the upper half: anchor at (100, 40), drifts
+        // horizontally ±80 px and vertically ±20 px at slightly
+        // different rates so the motion is a Lissajous curve.
+        let brick_phase_x = (frame.wrapping_mul(48) & 0xFFF) as u16;
+        let brick_phase_y = (frame.wrapping_mul(64) & 0xFFF) as u16;
+        let bx = 100 + drift(brick_phase_x, 80);
+        let by = 40 + drift(brick_phase_y, 20);
         draw_sprite(bx, by, TEX_W, TEX_H, (BRICK_U, 0), brick_clut_word);
 
-        // Floor bounces in the lower half, at a different speed so
-        // the two sprites aren't in lockstep — demonstrates both
-        // textures are genuinely live in VRAM, not a pre-rendered
-        // composite.
-        let fx = 240 - ((t * 3) % 240);
-        let fy = 140 + ((t / 4) % 50);
+        // Floor in the lower half: faster, opposite phase, so the
+        // two sprites cross each other without colliding.
+        let floor_phase_x = (frame.wrapping_mul(72).wrapping_add(2048) & 0xFFF) as u16;
+        let floor_phase_y = (frame.wrapping_mul(56).wrapping_add(1024) & 0xFFF) as u16;
+        let fx = 160 + drift(floor_phase_x, 80);
+        let fy = 140 + drift(floor_phase_y, 20);
         draw_sprite(fx, fy, TEX_W, TEX_H, (FLOOR_U, 0), floor_clut_word);
 
         gpu::draw_sync();
@@ -130,6 +138,15 @@ fn main() {
         fb.swap();
         frame = frame.wrapping_add(1);
     }
+}
+
+/// Pixel displacement from a Q0.12 phase. `sin_q12` returns Q1.12
+/// in `[-0x1000, 0x1000]`; multiplying by `amp_px` and shifting 12
+/// rescales back to pixels — smooth ±`amp_px` drift with no
+/// sawtooth wrap.
+#[inline]
+fn drift(phase_q12: u16, amp_px: i16) -> i16 {
+    ((sincos::sin_q12(phase_q12) * amp_px as i32) >> 12) as i16
 }
 
 /// Issue GP0 0x64 (variable-size textured rectangle) with the

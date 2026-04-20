@@ -85,8 +85,14 @@ TEX SUBCOMMAND:
     psxed tex <input.png|.jpg|.bmp> -o <output.psxt>
                           [--size WxH]            (default 64x64)
                           [--depth 4|8|15]        (default 4)
-                          [--crop X,Y,W,H]
+                          [--crop X,Y,W,H]        (overrides centre-square)
+                          [--no-crop]             (resize-stretch the full source)
                           [--resample nearest|triangle|lanczos3]
+
+    The default crop is centre-square: the largest square that
+    fits in the source, positioned at its centre. This avoids
+    aspect distortion on arbitrary-aspect photographs. Pass
+    --crop X,Y,W,H for manual control, or --no-crop to disable.
 
 EXAMPLES:
     psxed obj vendor/teapot.obj -o build/teapot.psxm --palette cool
@@ -191,7 +197,7 @@ fn run_tex(args: &[String]) -> Result<(), String> {
     let mut width: u16 = 64;
     let mut height: u16 = 64;
     let mut depth = psxed_format::texture::Depth::Bit4;
-    let mut crop: Option<psxed_tex::CropRect> = None;
+    let mut crop = psxed_tex::CropMode::CentreSquare;
     let mut resampler = psxed_tex::Resampler::Lanczos3;
 
     let mut i = 0;
@@ -244,12 +250,15 @@ fn run_tex(args: &[String]) -> Result<(), String> {
                         .parse()
                         .map_err(|_| format!("invalid crop component: {p}"))?;
                 }
-                crop = Some(psxed_tex::CropRect {
+                crop = psxed_tex::CropMode::Explicit(psxed_tex::CropRect {
                     x: nums[0],
                     y: nums[1],
                     w: nums[2],
                     h: nums[3],
                 });
+            }
+            "--no-crop" => {
+                crop = psxed_tex::CropMode::None;
             }
             "--resample" => {
                 i += 1;

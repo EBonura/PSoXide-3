@@ -19,5 +19,6 @@ psx-asset = { path = "../../crates/psx-asset" }
 psx-gpu   = { path = "../../crates/psx-gpu" }
 psx-hw    = { path = "../../../crates/psx-hw" }
 psx-io    = { path = "../../crates/psx-io" }
+psx-math  = { path = "../../crates/psx-math" }
 psx-rt    = { path = "../../crates/psx-rt" }
 psx-vram  = { path = "../../crates/psx-vram" }
