@@ -103,8 +103,26 @@ const FOG_CLEAR: (u8, u8, u8) = (
     (FOG_FC.z >> 4) as u8,
 );
 
-const DQA: i16 = -0x0780;
-const DQB: i32 = 0x00E8_3E00;
+/// Fog gradient tuning.
+///
+/// With PROJ_H=280, corridor Z in [0x0900..0x5400]:
+///   divisor_near = (H << 16) / 0x0900 ≈ 0x1F1C
+///   divisor_far  = (H << 16) / 0x5400 ≈ 0x0350
+///
+/// We want:
+///   IR0 at near = 0x0200  (12%  — atmospheric haze even on near walls,
+///                          so the fog reads everywhere on screen
+///                          rather than only in the central vanishing
+///                          point strip)
+///   IR0 at far  = 0x1000  (100% — far walls converge exactly to FC,
+///                          blending seamlessly into the fog-clear BG)
+///
+/// Solving:
+///   0x1F1C * DQA + DQB = 0x200_000
+///   0x0350 * DQA + DQB = 0x1000_000
+///   → DQA ≈ -0x0800, DQB = 0x118_E000
+const DQA: i16 = -0x0800;
+const DQB: i32 = 0x0118_E000;
 
 const ZSF3: i16 = 0x0555;
 const ZSF4: i16 = 0x0400;

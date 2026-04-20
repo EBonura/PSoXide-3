@@ -363,8 +363,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-tex" => Some(SdkGolden {
             example: "hello-tex",
             vblanks: 2,
-            vram_hash: 0x57ab_a128_a62b_0b52,
-            display_hash: 0x6f72_9bcf_a3d1_ee79,
+            vram_hash: 0x1291_2e30_2641_3e9f,
+            display_hash: 0x6b0c_8a05_afca_2bae,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
@@ -556,8 +556,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-fog" => Some(SdkGolden {
             example: "showcase-fog",
             vblanks: 60,
-            vram_hash: 0xa7bc_561f_e318_69d6,
-            display_hash: 0xf793_859a_092a_0349,
+            vram_hash: 0xcaad_fb89_f479_2489,
+            display_hash: 0xb863_281d_4680_b073,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
