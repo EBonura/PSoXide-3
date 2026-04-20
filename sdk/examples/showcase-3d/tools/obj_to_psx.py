@@ -34,7 +34,11 @@ OUT = ROOT / "src" / "meshes.rs"
 
 # Each entry: (obj_file, mod_name, CONST_PREFIX, grid_size, palette_name, doc)
 #
-# `grid_size` = N means vertex quantisation to N × N × N cells;
+# `grid_size = None` skips decimation — for meshes that were
+# authored natively low-poly, clustering would just destroy
+# carefully-placed vertices.
+#
+# `grid_size = N` means vertex quantisation to N × N × N cells;
 # higher N retains more detail but more triangles. Tune per-mesh
 # for a ~60-120 triangle target on PSX.
 MESHES = [
@@ -52,11 +56,12 @@ MESHES = [
         "teapot.obj",
         "teapot",
         "TEAPOT",
-        6,
+        None,  # natively low-poly, no decimation
         "COOL",
-        "Utah teapot (Martin Newell, 1975). Decimated from the "
-        "6320-tri canonical OBJ down to PSX-manageable poly count. "
-        "Silhouette + spout + handle all readable.",
+        "Utah teapot (Martin Newell, 1975) — low-poly hand-modeled "
+        "approximation by the QDOS project, preserved intact. Clean "
+        "silhouette with body + lid + knob + spout + handle, no "
+        "decimation gaps.",
     ),
 ]
 
@@ -203,7 +208,8 @@ def emit_mesh_module(entry):
     path = VENDOR / obj_file
     verts, faces = parse_obj(path)
     verts = normalise(verts)
-    verts, faces = cluster_decimate(verts, faces, grid)
+    if grid is not None:
+        verts, faces = cluster_decimate(verts, faces, grid)
 
     # Quantise.
     q_verts = [(to_q3_12(v[0]), to_q3_12(v[1]), to_q3_12(v[2])) for v in verts]
@@ -225,11 +231,17 @@ def emit_mesh_module(entry):
     for line in doc.split("\n"):
         buf.append(f"/// {line.strip()}\n")
     buf.append(f"///\n")
-    buf.append(
-        f"/// Cluster-decimated at grid size {grid} → "
-        f"{vert_count} verts, {face_count} triangles. Values are\n"
-    )
-    buf.append(f"/// Q3.12 fixed-point; `0x1000` = 1.0.\n")
+    if grid is None:
+        buf.append(
+            f"/// Preserved intact (no decimation): "
+            f"{vert_count} verts, {face_count} triangles.\n"
+        )
+    else:
+        buf.append(
+            f"/// Cluster-decimated at grid size {grid} → "
+            f"{vert_count} verts, {face_count} triangles.\n"
+        )
+    buf.append(f"/// Values are Q3.12 fixed-point; `0x1000` = 1.0.\n")
 
     # Vertices.
     buf.append(f"pub const {const_prefix}_VERTS: [Vec3I16; {vert_count}] = [\n")
