@@ -246,6 +246,129 @@ pub struct ProjectedLit {
     pub b: u8,
 }
 
+/// Result of [`project_triangle_fogged`]: three projected + lit +
+/// fogged vertices, plus the AVSZ3 OT-slot key and the hardware-
+/// NCLIP back-face flag.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct FoggedTri {
+    /// The three vertices in draw-order, each carrying its own
+    /// projected position and lit+fogged colour.
+    pub verts: [ProjectedLit; 3],
+    /// AVSZ3 result — ZSF3-weighted average of the three projected
+    /// Z values. Commercial games scale this into an OT slot so
+    /// nearer triangles sort in front.
+    pub otz: u16,
+    /// `true` if MAC0 from NCLIP came out positive — the triangle
+    /// is front-facing and should be drawn. `false` = back-face,
+    /// skip.
+    pub front_facing: bool,
+}
+
+/// Run the full PS1-commercial triangle pipeline in one helper:
+///
+/// 1. `RTPT` — project all three vertices (one GTE op instead of
+///    three `RTPS` calls).
+/// 2. `NCLIP` — hardware back-face cull; the CPU no longer needs
+///    to compute its own 2D cross-product.
+/// 3. `AVSZ3` — compute the average Z for ordering-table sorting.
+/// 4. `NCDT` — lit + depth-cue colour for all three vertices.
+///
+/// Uses the passed `material` RGB as the GTE's RGBC across the
+/// whole triangle. Fog weight is taken from the last vertex's IR0
+/// (set by RTPT via DQA/DQB), so per-triangle uniform rather than
+/// per-vertex. Short / densely-tessellated geometry won't show
+/// banding; long receding surfaces should be subdivided.
+///
+/// # Prerequisites
+/// All scene state must be loaded by the caller:
+/// - Rotation matrix ([`scene::load_rotation`])
+/// - Translation ([`scene::load_translation`])
+/// - Projection plane + screen offset
+///   ([`scene::set_projection_plane`], [`scene::set_screen_offset`])
+/// - Light rig ([`LightRig::load`], `for_object` applied)
+/// - Far colour ([`scene::load_far_colour`])
+/// - Depth-cue coefficients ([`scene::set_depth_cue`])
+/// - AVSZ weights ([`scene::set_avsz_weights`])
+pub fn project_triangle_fogged(
+    verts: [Vec3I16; 3],
+    normals: [Vec3I16; 3],
+    material: (u8, u8, u8),
+) -> FoggedTri {
+    // --- RTPT: project positions into SXY / SZ FIFOs ---
+    mtc2!(0, verts[0].xy_packed());
+    mtc2!(1, verts[0].z_packed());
+    mtc2!(2, verts[1].xy_packed());
+    mtc2!(3, verts[1].z_packed());
+    mtc2!(4, verts[2].xy_packed());
+    mtc2!(5, verts[2].z_packed());
+    // SAFETY: V0/V1/V2 are loaded; scene setup is caller-supplied.
+    unsafe { ops::rtpt() };
+
+    let sxy0 = mfc2!(12);
+    let sxy1 = mfc2!(13);
+    let sxy2 = mfc2!(14);
+    let sz1 = mfc2!(17) as u16;
+    let sz2 = mfc2!(18) as u16;
+    let sz3 = mfc2!(19) as u16;
+
+    // --- NCLIP: back-face cull. Reads SXY0/1/2 implicitly. ---
+    // SAFETY: SXY FIFO was just populated by RTPT.
+    unsafe { ops::nclip() };
+    let mac0 = mfc2!(24) as i32;
+    let front_facing = mac0 > 0;
+
+    // --- AVSZ3: OT-slot key from SZ1/2/3 (weighted by ZSF3). ---
+    // SAFETY: SZ FIFO was just populated by RTPT.
+    unsafe { ops::avsz3() };
+    let otz = mfc2!(7) as u16;
+
+    // --- NCDT: lit + depth-cue colour for all three normals. ---
+    // The normals overwrite V0/V1/V2; material goes into RGBC.
+    mtc2!(0, normals[0].xy_packed());
+    mtc2!(1, normals[0].z_packed());
+    mtc2!(2, normals[1].xy_packed());
+    mtc2!(3, normals[1].z_packed());
+    mtc2!(4, normals[2].xy_packed());
+    mtc2!(5, normals[2].z_packed());
+    let rgbc = (material.0 as u32) | ((material.1 as u32) << 8) | ((material.2 as u32) << 16);
+    mtc2!(6, rgbc);
+    // SAFETY: normals + RGBC loaded; LLM/LCM/BK/FC/IR0 come from
+    // the caller's scene setup.
+    unsafe { ops::ncdt() };
+
+    // RGB FIFO slots 0/1/2 = data regs 20/21/22; NCDT pushed them
+    // in V0/V1/V2 order.
+    let c0 = mfc2!(20);
+    let c1 = mfc2!(21);
+    let c2 = mfc2!(22);
+
+    FoggedTri {
+        verts: [
+            unpack_projected(sxy0, sz1, c0),
+            unpack_projected(sxy1, sz2, c1),
+            unpack_projected(sxy2, sz3, c2),
+        ],
+        otz,
+        front_facing,
+    }
+}
+
+/// Shared unpack — turns raw SXY / SZ / RGB register reads into a
+/// [`ProjectedLit`]. Factored out so both the per-vertex and batch
+/// paths agree on byte/field layout.
+#[inline]
+fn unpack_projected(sxy: u32, sz: u16, rgb: u32) -> ProjectedLit {
+    ProjectedLit {
+        sx: sxy as i16,
+        sy: (sxy >> 16) as i16,
+        sz,
+        r: (rgb & 0xFF) as u8,
+        g: ((rgb >> 8) & 0xFF) as u8,
+        b: ((rgb >> 16) & 0xFF) as u8,
+    }
+}
+
 /// Project a vertex AND compute its lit colour in one call.
 ///
 /// Does RTPS on `vert` + NCCS on `normal`, with a per-vertex

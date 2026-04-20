@@ -540,6 +540,23 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_2f6c,
             redux_display_hash: None,
         }),
+        // Full PS1-commercial GTE triangle path: RTPT (batched
+        // projection) + NCLIP (HW back-face cull) + AVSZ3 (OT-slot
+        // from average depth) + NCDT (lit + depth-cue colour).
+        // Exercises the fog / depth-cue pipeline that no other
+        // example touches — FC, DQA/DQB, per-triangle IR0 fog
+        // weight, far-colour interpolation.
+        "showcase-fog" => Some(SdkGolden {
+            example: "showcase-fog",
+            vblanks: 60,
+            vram_hash: 0xeb66_70ca_c559_cc28,
+            display_hash: 0x1254_163f_4f80_5b90,
+            display_size: (320, 240),
+            vblank_raises: 60,
+            spu_samples: 44100,
+            final_pc: 0x8001_0e10,
+            redux_display_hash: None,
+        }),
         _ => None,
     }
 }
@@ -673,4 +690,14 @@ fn milestone_c_showcase_text() {
     // angle (4 × 96 = 384 Q0.12 ≈ 33.75°) — pins both the
     // rotating quad path and the static sections in one shot.
     run_sdk_milestone("showcase-text", 4);
+}
+
+#[test]
+#[ignore = "SDK milestone: showcase-fog roundtrip"]
+fn milestone_c_showcase_fog() {
+    // 60 VBlanks captures the corridor after ~1 s of forward
+    // dolly — multiple ring-wraps in, light rig orbited a visible
+    // amount, fog gradient fully lit across all rings. Covers
+    // RTPT + NCLIP + AVSZ3 + NCDT end-to-end.
+    run_sdk_milestone("showcase-fog", 60);
 }

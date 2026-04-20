@@ -20,7 +20,8 @@
         game-breakout run-game-breakout \
         game-invaders run-game-invaders \
         showcase-3d run-showcase-3d \
-        showcase-lights run-showcase-lights
+        showcase-lights run-showcase-lights \
+        showcase-fog run-showcase-fog
 
 help:
 	@echo "PSoXide targets:"
@@ -56,6 +57,7 @@ help:
 	@echo "    make game-invaders - build the Space Invaders mini-game"
 	@echo "    make showcase-3d    - build the 3D geometry showcase"
 	@echo "    make showcase-lights - build the 4-point-light demo"
+	@echo "    make showcase-fog   - build the fog / full-GTE-pipeline demo"
 	@echo "    make run-tri      - build + side-load hello-tri into the frontend"
 	@echo "    make run-input    - build + side-load hello-input into the frontend"
 	@echo "    make run-ot       - build + side-load hello-ot into the frontend"
@@ -71,6 +73,7 @@ help:
 	@echo "    make run-game-invaders - build + side-load the Space Invaders mini-game"
 	@echo "    make run-showcase-3d - build + side-load the 3D geometry showcase"
 	@echo "    make run-showcase-lights - build + side-load the 4-point-light demo"
+	@echo "    make run-showcase-fog - build + side-load the fog demo"
 
 run:
 	cd emu && cargo run -p frontend --release
@@ -163,6 +166,11 @@ showcase-3d: assets
 showcase-lights: assets
 	cd sdk/examples/showcase-lights && cargo build --release
 
+# showcase-fog uses only procedural geometry (corridor built from
+# constants at build time), so it has no asset-dependency.
+showcase-fog:
+	cd sdk/examples/showcase-fog && cargo build --release
+
 # --- Content pipeline (host-side editor tooling) ------------------------
 
 PSXED := editor/target/release/psxed
@@ -190,7 +198,7 @@ assets: psxed
 	    -o $(SHOWCASE_LIGHTS)/assets/cube.psxm \
 	    --compute-normals --no-colors
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-lights
+examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-lights showcase-fog
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true

@@ -129,6 +129,51 @@ pub mod ops {
     pub unsafe fn mvmva_rt_v0_tr_sf1() {
         panic!("psx-gte::mvmva_rt_v0_tr_sf1 only runs on target_arch = mips")
     }
+    /// Host stub — real implementation targets MIPS only.
+    #[cold]
+    pub unsafe fn ncdt() {
+        panic!("psx-gte::ncdt only runs on target_arch = mips")
+    }
+    /// Host stub — real implementation targets MIPS only.
+    #[cold]
+    pub unsafe fn nct() {
+        panic!("psx-gte::nct only runs on target_arch = mips")
+    }
+    /// Host stub — real implementation targets MIPS only.
+    #[cold]
+    pub unsafe fn ncct() {
+        panic!("psx-gte::ncct only runs on target_arch = mips")
+    }
+    /// Host stub — real implementation targets MIPS only.
+    #[cold]
+    pub unsafe fn dpcs() {
+        panic!("psx-gte::dpcs only runs on target_arch = mips")
+    }
+    /// Host stub — real implementation targets MIPS only.
+    #[cold]
+    pub unsafe fn dpct() {
+        panic!("psx-gte::dpct only runs on target_arch = mips")
+    }
+    /// Host stub — real implementation targets MIPS only.
+    #[cold]
+    pub unsafe fn intpl() {
+        panic!("psx-gte::intpl only runs on target_arch = mips")
+    }
+    /// Host stub — real implementation targets MIPS only.
+    #[cold]
+    pub unsafe fn dcpl() {
+        panic!("psx-gte::dcpl only runs on target_arch = mips")
+    }
+    /// Host stub — real implementation targets MIPS only.
+    #[cold]
+    pub unsafe fn cc() {
+        panic!("psx-gte::cc only runs on target_arch = mips")
+    }
+    /// Host stub — real implementation targets MIPS only.
+    #[cold]
+    pub unsafe fn cdp() {
+        panic!("psx-gte::cdp only runs on target_arch = mips")
+    }
 }
 
 pub use ops::*;

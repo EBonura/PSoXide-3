@@ -128,6 +128,104 @@ pub unsafe fn ncs() {
     unsafe { asm!(".word 0x4A08001E", options(nostack, preserves_flags)) }
 }
 
+/// NCDT — NCDS for V0, V1, V2 in one op. Produces three entries in
+/// the RGB FIFO. `sf=1, lm=0`.
+///
+/// This is the classic commercial-game fogged-triangle primitive:
+/// three vertices projected (via a preceding `RTPT`) and three lit
+/// + depth-cue-blended colours emitted in the FIFO for rasterisation
+/// as a Gouraud triangle with per-vertex fog attenuation.
+///
+/// # Safety
+/// See [`rtps`].
+#[inline(always)]
+pub unsafe fn ncdt() {
+    unsafe { asm!(".word 0x4A080016", options(nostack, preserves_flags)) }
+}
+
+/// NCT — NCS for V0, V1, V2. Lit colour, no depth cue.
+///
+/// # Safety
+/// See [`rtps`].
+#[inline(always)]
+pub unsafe fn nct() {
+    unsafe { asm!(".word 0x4A080020", options(nostack, preserves_flags)) }
+}
+
+/// NCCT — NCCS for V0, V1, V2. Lit colour multiplied by RGBC, emits
+/// three FIFO colours.
+///
+/// # Safety
+/// See [`rtps`].
+#[inline(always)]
+pub unsafe fn ncct() {
+    unsafe { asm!(".word 0x4A08003F", options(nostack, preserves_flags)) }
+}
+
+/// DPCS — depth-cue single. Interpolates RGBC toward FC using IR0,
+/// pushing the result into the RGB FIFO. No lighting, no normal —
+/// pure fog on the current base colour.
+///
+/// Inputs: RGBC (data 6), FC (control 21..=23), IR0 (data 8).
+///
+/// # Safety
+/// See [`rtps`].
+#[inline(always)]
+pub unsafe fn dpcs() {
+    unsafe { asm!(".word 0x4A080010", options(nostack, preserves_flags)) }
+}
+
+/// DPCT — DPCS run three times against the RGB FIFO slots. Depth-cue
+/// the three most-recent colours in place.
+///
+/// # Safety
+/// See [`rtps`].
+#[inline(always)]
+pub unsafe fn dpct() {
+    unsafe { asm!(".word 0x4A08002A", options(nostack, preserves_flags)) }
+}
+
+/// INTPL — interpolate the current IR vector toward FC by IR0 and
+/// push the result as an RGB FIFO entry.
+///
+/// # Safety
+/// See [`rtps`].
+#[inline(always)]
+pub unsafe fn intpl() {
+    unsafe { asm!(".word 0x4A080011", options(nostack, preserves_flags)) }
+}
+
+/// DCPL — depth-cue colour light. Interpolates `RGBC * IR` toward
+/// FC using IR0, FIFO-push.
+///
+/// # Safety
+/// See [`rtps`].
+#[inline(always)]
+pub unsafe fn dcpl() {
+    unsafe { asm!(".word 0x4A080029", options(nostack, preserves_flags)) }
+}
+
+/// CC — colour-colour. Blend RGBC against IR using the LCM; no FC
+/// interpolation. Useful for applying a light colour to an already-
+/// lit base.
+///
+/// # Safety
+/// See [`rtps`].
+#[inline(always)]
+pub unsafe fn cc() {
+    unsafe { asm!(".word 0x4A08001C", options(nostack, preserves_flags)) }
+}
+
+/// CDP — colour depth queue. Like `CC` but with FC interpolation
+/// layered on top. Used for coloured fogging of pre-lit surfaces.
+///
+/// # Safety
+/// See [`rtps`].
+#[inline(always)]
+pub unsafe fn cdp() {
+    unsafe { asm!(".word 0x4A080014", options(nostack, preserves_flags)) }
+}
+
 /// GPF — general-purpose interpolation `MAC = IR * IR0` (sf=1).
 /// Pushes the result into the RGB FIFO. Used for flat-shaded prim
 /// colour computation.
