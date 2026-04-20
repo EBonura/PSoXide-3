@@ -59,13 +59,14 @@ pub enum ParseError {
 /// A parsed 3D mesh backed by slices into the caller's cooked blob.
 ///
 /// Cheap to construct (just bounds-checks the header + computes
-/// sub-slice offsets). Cheap to pass around — three `&[u8]` slices
-/// + a flags `u16` + the face count.
+/// sub-slice offsets). Cheap to pass around — four `&[u8]` slices
+/// + a flags `u16` + the counts.
 #[derive(Copy, Clone, Debug)]
 pub struct Mesh<'a> {
     verts: &'a [u8],
     indices: &'a [u8],
     face_colors: Option<&'a [u8]>,
+    vertex_normals: Option<&'a [u8]>,
     vert_count: u16,
     face_count: u16,
     flags: u16,
@@ -129,6 +130,18 @@ impl<'a> Mesh<'a> {
                 return Err(ParseError::TableOverflow);
             }
             let slice = &bytes[off..off + color_bytes];
+            off += color_bytes;
+            Some(slice)
+        } else {
+            None
+        };
+
+        let vertex_normals = if flags & psxed_format::mesh::flags::HAS_NORMALS != 0 {
+            let normal_bytes = (vert_count as usize) * 6;
+            if off + normal_bytes > bytes.len() {
+                return Err(ParseError::TableOverflow);
+            }
+            let slice = &bytes[off..off + normal_bytes];
             Some(slice)
         } else {
             None
@@ -138,6 +151,7 @@ impl<'a> Mesh<'a> {
             verts,
             indices,
             face_colors,
+            vertex_normals,
             vert_count,
             face_count,
             flags,
@@ -166,6 +180,13 @@ impl<'a> Mesh<'a> {
     #[inline]
     pub fn has_face_colors(&self) -> bool {
         self.flags & psxed_format::mesh::flags::HAS_FACE_COLORS != 0
+    }
+
+    /// Does the blob carry per-vertex normals? Required for any
+    /// GTE- or CPU-lit rendering path.
+    #[inline]
+    pub fn has_normals(&self) -> bool {
+        self.flags & psxed_format::mesh::flags::HAS_NORMALS != 0
     }
 
     /// Decode vertex `i` as a Q3.12 [`Vec3I16`]. Returns
@@ -212,6 +233,25 @@ impl<'a> Mesh<'a> {
         }
         let base = idx * 3;
         Some((colors[base], colors[base + 1], colors[base + 2]))
+    }
+
+    /// Per-vertex Q3.12 normal. Returns `None` if the blob lacks
+    /// a normal table (`HAS_NORMALS` flag clear) or `i` is out of
+    /// range. Components are unit-length-ish (Q3.12 quantisation
+    /// introduces sub-ULP error but the GTE lighting path is
+    /// tolerant).
+    #[inline]
+    pub fn vertex_normal(&self, i: u8) -> Option<Vec3I16> {
+        let normals = self.vertex_normals?;
+        let idx = i as usize;
+        if idx >= self.vert_count as usize {
+            return None;
+        }
+        let base = idx * 6;
+        let x = i16::from_le_bytes([normals[base], normals[base + 1]]);
+        let y = i16::from_le_bytes([normals[base + 2], normals[base + 3]]);
+        let z = i16::from_le_bytes([normals[base + 4], normals[base + 5]]);
+        Some(Vec3I16::new(x, y, z))
     }
 }
 

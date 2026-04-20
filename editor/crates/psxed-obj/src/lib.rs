@@ -40,6 +40,10 @@ pub struct Config {
     /// Include per-face colour table in the output. Caller can
     /// skip it for meshes that will be tinted at runtime.
     pub include_face_colors: bool,
+    /// Compute per-vertex normals (area-weighted averages of
+    /// adjacent face normals) and include them in the output.
+    /// Required for any GTE- or CPU-lit rendering path.
+    pub include_normals: bool,
 }
 
 /// Built-in colour palettes that cycle through face indices.
@@ -148,7 +152,14 @@ pub fn convert(obj_bytes: &[u8], cfg: &Config) -> Result<Vec<u8>, Error> {
     } else {
         (verts, faces)
     };
-    encode_psxm(&verts, &faces, cfg)
+    // Compute normals AFTER decimation — on the final vertex set.
+    let normals_vec = if cfg.include_normals {
+        Some(compute_vertex_normals(&verts, &faces))
+    } else {
+        None
+    };
+    let normals_ref: Option<&[[f32; 3]]> = normals_vec.as_deref();
+    encode_psxm(&verts, &faces, normals_ref, cfg)
 }
 
 // ----------------------------------------------------------------------
@@ -361,10 +372,76 @@ fn to_q3_12(v: f32) -> i16 {
     q.clamp(-0x1000, 0x0FFF) as i16
 }
 
-/// Encode a vertex/face/colour set into `.psxm` bytes.
+/// Quantise a normal's `[-1, +1]` component to Q3.12 `i16`.
+/// Normals use the exact `0x1000` = 1.0 mapping (no headroom
+/// reduction) because the GTE's lighting pipeline expects unit
+/// vectors exactly at the `0x1000` reference, and lights don't
+/// animate via scale-up so overflow headroom isn't a concern.
+fn normal_to_q3_12(v: f32) -> i16 {
+    let q = (v * 0x1000 as f32).round() as i32;
+    q.clamp(-0x1000, 0x0FFF) as i16
+}
+
+/// Compute a per-vertex normal table by averaging adjacent face
+/// normals, weighted by face area.
+///
+/// For each triangle `(v0, v1, v2)`:
+///   face_normal = cross(v1 - v0, v2 - v0)  — magnitude is 2× area
+///   each vertex accumulates this unnormalised face_normal
+///
+/// At the end, normalise each vertex sum. Area-weighting is free
+/// — we don't normalise per-face, so big faces contribute more.
+/// This matches the standard practice for smooth shading of
+/// low-poly meshes.
+pub fn compute_vertex_normals(
+    verts: &[[f32; 3]],
+    faces: &[[usize; 3]],
+) -> Vec<[f32; 3]> {
+    let mut accum: Vec<[f32; 3]> = vec![[0.0; 3]; verts.len()];
+    for f in faces {
+        let v0 = verts[f[0]];
+        let v1 = verts[f[1]];
+        let v2 = verts[f[2]];
+        // Edge vectors.
+        let ex = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+        let fx = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+        // Cross product — magnitude is 2× area, direction is face normal.
+        let n = [
+            ex[1] * fx[2] - ex[2] * fx[1],
+            ex[2] * fx[0] - ex[0] * fx[2],
+            ex[0] * fx[1] - ex[1] * fx[0],
+        ];
+        for &idx in f {
+            accum[idx][0] += n[0];
+            accum[idx][1] += n[1];
+            accum[idx][2] += n[2];
+        }
+    }
+    // Normalise.
+    for v in accum.iter_mut() {
+        let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if m > 1e-6 {
+            v[0] /= m;
+            v[1] /= m;
+            v[2] /= m;
+        } else {
+            // Isolated vertex — give it a plausible up normal so
+            // lighting doesn't produce garbage colours for it.
+            *v = [0.0, 1.0, 0.0];
+        }
+    }
+    accum
+}
+
+/// Encode a vertex/face/colour/normal set into `.psxm` bytes.
+///
+/// `normals` is optional — pass `Some(&[..])` to include a normal
+/// table with the matching `HAS_NORMALS` flag; pass `None` to
+/// skip. The slice must have the same length as `verts`.
 pub fn encode_psxm(
     verts: &[[f32; 3]],
     faces: &[[usize; 3]],
+    normals: Option<&[[f32; 3]]>,
     cfg: &Config,
 ) -> Result<Vec<u8>, Error> {
     if faces.is_empty() {
@@ -376,11 +453,14 @@ pub fn encode_psxm(
     if faces.len() > u16::MAX as usize {
         return Err(Error::TooManyFaces { count: faces.len() });
     }
+    if let Some(n) = normals {
+        assert_eq!(n.len(), verts.len(), "normals must match vert count");
+    }
 
     let vert_count = verts.len() as u16;
     let face_count = faces.len() as u16;
 
-    // Compute payload size.
+    // Compute payload size + flag bits.
     let vert_bytes = (vert_count as usize) * 6;
     let index_bytes = (face_count as usize) * 3;
     let color_bytes = if cfg.include_face_colors {
@@ -388,18 +468,30 @@ pub fn encode_psxm(
     } else {
         0
     };
-    let payload_len = psxed_format::mesh::MeshHeader::SIZE + vert_bytes + index_bytes + color_bytes;
+    let normal_bytes = if normals.is_some() {
+        (vert_count as usize) * 6
+    } else {
+        0
+    };
+    let payload_len = psxed_format::mesh::MeshHeader::SIZE
+        + vert_bytes
+        + index_bytes
+        + color_bytes
+        + normal_bytes;
+
+    let mut flags: u16 = 0;
+    if cfg.include_face_colors {
+        flags |= psxed_format::mesh::flags::HAS_FACE_COLORS;
+    }
+    if normals.is_some() {
+        flags |= psxed_format::mesh::flags::HAS_NORMALS;
+    }
 
     let mut buf = Vec::with_capacity(psxed_format::AssetHeader::SIZE + payload_len);
 
     // AssetHeader.
     buf.extend_from_slice(&psxed_format::mesh::MAGIC);
     buf.extend_from_slice(&psxed_format::mesh::VERSION.to_le_bytes());
-    let flags = if cfg.include_face_colors {
-        psxed_format::mesh::flags::HAS_FACE_COLORS
-    } else {
-        0
-    };
     buf.extend_from_slice(&flags.to_le_bytes());
     buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
 
@@ -432,6 +524,15 @@ pub fn encode_psxm(
         }
     }
 
+    // Normal table.
+    if let Some(ns) = normals {
+        for n in ns {
+            buf.extend_from_slice(&normal_to_q3_12(n[0]).to_le_bytes());
+            buf.extend_from_slice(&normal_to_q3_12(n[1]).to_le_bytes());
+            buf.extend_from_slice(&normal_to_q3_12(n[2]).to_le_bytes());
+        }
+    }
+
     Ok(buf)
 }
 
@@ -461,6 +562,7 @@ f 1 2 3
                 decimate_grid: None,
                 palette: Palette::Warm,
                 include_face_colors: true,
+                include_normals: false,
             },
         )
         .unwrap();
@@ -471,6 +573,37 @@ f 1 2 3
             u16::from_le_bytes([bytes[6], bytes[7]]),
             psxed_format::mesh::flags::HAS_FACE_COLORS
         );
+    }
+
+    #[test]
+    fn normals_are_included_when_requested() {
+        let bytes = convert(
+            TRI_OBJ.as_bytes(),
+            &Config {
+                decimate_grid: None,
+                palette: Palette::Warm,
+                include_face_colors: false,
+                include_normals: true,
+            },
+        )
+        .unwrap();
+        let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+        assert!(flags & psxed_format::mesh::flags::HAS_NORMALS != 0);
+    }
+
+    #[test]
+    fn computed_normals_point_in_face_direction() {
+        // Unit-triangle in XY plane — all vertex normals should
+        // equal the face normal (0, 0, 1) after averaging.
+        let verts: Vec<[f32; 3]> =
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces: Vec<[usize; 3]> = vec![[0, 1, 2]];
+        let normals = compute_vertex_normals(&verts, &faces);
+        for n in &normals {
+            assert!((n[0]).abs() < 1e-5);
+            assert!((n[1]).abs() < 1e-5);
+            assert!((n[2] - 1.0).abs() < 1e-5, "n={n:?}");
+        }
     }
 
     #[test]

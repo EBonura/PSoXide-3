@@ -24,10 +24,14 @@
 //!
 //!   Face-colour table: face_count × 3 bytes  (only if FLAG_HAS_FACE_COLORS set)
 //!     r, g, b: u8 each
+//!
+//!   Vertex-normal table: vert_count × 6 bytes  (only if FLAG_HAS_NORMALS set)
+//!     nx, ny, nz: i16 LE  (Q3.12 unit vector)
 //! ```
 //!
 //! Total file size: `12 + 8 + (vert_count * 6) + (face_count * 3)
-//! [ + (face_count * 3) if has_face_colors ]`.
+//! [ + (face_count * 3) if has_face_colors ]
+//! [ + (vert_count * 6) if has_normals ]`.
 //!
 //! Every multi-byte integer is little-endian; bytes are tightly
 //! packed (no alignment padding). That lets the runtime parser
@@ -44,10 +48,12 @@ pub const VERSION: u16 = 1;
 pub mod flags {
     /// Face-colour table is present after the index table.
     pub const HAS_FACE_COLORS: u16 = 1 << 0;
+    /// Per-vertex normal table is present — enables GTE-lit or
+    /// CPU-lit rendering paths. Values are Q3.12 unit vectors.
+    pub const HAS_NORMALS: u16 = 1 << 1;
     // Reserved bits:
-    //   1 — HAS_NORMALS     (future: per-vertex normals for lighting)
     //   2 — HAS_UVS         (future: per-vertex UV for textured meshes)
-    //   3 — HAS_VERT_COLORS (future: per-vertex Gouraud colours)
+    //   3 — HAS_VERT_COLORS (future: baked per-vertex Gouraud colours)
 }
 
 /// Byte layout of the mesh payload header that immediately

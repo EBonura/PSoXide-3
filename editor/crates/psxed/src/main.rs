@@ -15,6 +15,7 @@
 //!   --decimate-grid N   Vertex-cluster to N^3 cells. Omit for no decimation.
 //!   --palette NAME      Face-colour palette: warm (default), cool, green.
 //!   --no-colors         Skip the face-colour table.
+//!   --compute-normals   Add per-vertex normals for lit rendering.
 //! ```
 //!
 //! ## Future subcommands
@@ -65,6 +66,7 @@ OBJ SUBCOMMAND:
                           [--decimate-grid N]
                           [--palette warm|cool|green]
                           [--no-colors]
+                          [--compute-normals]
 
 EXAMPLE:
     psxed obj vendor/teapot.obj -o build/teapot.psxm --palette cool
@@ -76,6 +78,7 @@ fn run_obj(args: &[String]) -> Result<(), String> {
     let mut decimate_grid: Option<u32> = None;
     let mut palette = psxed_obj::Palette::Warm;
     let mut include_face_colors = true;
+    let mut include_normals = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -112,6 +115,9 @@ fn run_obj(args: &[String]) -> Result<(), String> {
             "--no-colors" => {
                 include_face_colors = false;
             }
+            "--compute-normals" => {
+                include_normals = true;
+            }
             a if a.starts_with('-') => {
                 return Err(format!("unknown flag: {a}\n\n{USAGE}"));
             }
@@ -136,6 +142,7 @@ fn run_obj(args: &[String]) -> Result<(), String> {
         decimate_grid,
         palette,
         include_face_colors,
+        include_normals,
     };
     let psxm =
         psxed_obj::convert(&obj_bytes, &cfg).map_err(|e| format!("convert: {e}"))?;

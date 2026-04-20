@@ -175,10 +175,10 @@ assets: psxed
 	@mkdir -p $(SHOWCASE_3D)/assets
 	@$(PSXED) obj $(SHOWCASE_3D)/vendor/suzanne.obj \
 	    -o $(SHOWCASE_3D)/assets/suzanne.psxm \
-	    --palette warm --decimate-grid 6
+	    --palette warm --decimate-grid 6 --compute-normals
 	@$(PSXED) obj $(SHOWCASE_3D)/vendor/teapot.obj \
 	    -o $(SHOWCASE_3D)/assets/teapot.psxm \
-	    --palette cool
+	    --palette cool --compute-normals
 
 examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d
 	@echo ""
