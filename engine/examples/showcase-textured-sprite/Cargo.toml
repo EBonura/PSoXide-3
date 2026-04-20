@@ -1,0 +1,23 @@
+[package]
+name    = "showcase-textured-sprite"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "showcase-textured-sprite"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[dependencies]
+psx-engine = { path = "../../crates/psx-engine" }
+psx-gpu    = { path = "../../../sdk/crates/psx-gpu" }
+psx-hw     = { path = "../../../crates/psx-hw" }
+psx-io     = { path = "../../../sdk/crates/psx-io" }
+psx-rt     = { path = "../../../sdk/crates/psx-rt" }
+psx-vram   = { path = "../../../sdk/crates/psx-vram" }

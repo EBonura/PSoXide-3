@@ -152,10 +152,10 @@ hello-audio:
 	cd sdk/examples/hello-audio && cargo build --release
 
 showcase-textured-sprite:
-	cd sdk/examples/showcase-textured-sprite && cargo build --release
+	cd engine/examples/showcase-textured-sprite && cargo build --release
 
 showcase-text:
-	cd sdk/examples/showcase-text && cargo build --release
+	cd engine/examples/showcase-text && cargo build --release
 
 game-pong:
 	cd engine/examples/game-pong && cargo build --release
@@ -167,15 +167,15 @@ game-invaders:
 	cd engine/examples/game-invaders && cargo build --release
 
 showcase-3d: assets
-	cd sdk/examples/showcase-3d && cargo build --release
+	cd engine/examples/showcase-3d && cargo build --release
 
 showcase-lights: assets
-	cd sdk/examples/showcase-lights && cargo build --release
+	cd engine/examples/showcase-lights && cargo build --release
 
 # showcase-fog uses two cooked textures (brick wall + cobblestone
 # floor) on its corridor walls + floor, plus procedural geometry.
 showcase-fog: assets
-	cd sdk/examples/showcase-fog && cargo build --release
+	cd engine/examples/showcase-fog && cargo build --release
 
 # --- Content pipeline (host-side editor tooling) ------------------------
 
@@ -190,9 +190,9 @@ psxed:
 # include_bytes!. Re-runs whenever an .obj changes. Targets go
 # next to the source under `assets/` so a repo clone has the
 # runtime input available without having to run the editor.
-SHOWCASE_3D := sdk/examples/showcase-3d
-SHOWCASE_LIGHTS := sdk/examples/showcase-lights
-SHOWCASE_FOG := sdk/examples/showcase-fog
+SHOWCASE_3D := engine/examples/showcase-3d
+SHOWCASE_LIGHTS := engine/examples/showcase-lights
+SHOWCASE_FOG := engine/examples/showcase-fog
 HELLO_TEX := sdk/examples/hello-tex
 
 # Texture sources (.jpg / .png) are gitignored because they're

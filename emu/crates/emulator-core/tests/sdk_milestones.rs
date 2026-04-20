@@ -412,7 +412,10 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
-            final_pc: 0x8001_055c,
+            // 0x55c -> 0x7ec after Phase 3e: `App::run` + `Scene`
+            // plumbing shifts `main`'s return site. Bytes-identical
+            // VRAM + display confirm the port is pure plumbing.
+            final_pc: 0x8001_07ec,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:
@@ -427,7 +430,11 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0b40,
+            // 0xb40 -> 0xe70 after Phase 3e: `App::run` + `Scene`
+            // plumbing adds ~816 bytes of text-section code, so
+            // `main`'s final `lw ra / jr ra` sits further on. VRAM
+            // + display bytes-identical — port is pure plumbing.
+            final_pc: 0x8001_0e70,
             redux_display_hash: None,
         }),
         // hello-audio: SPU init + 4 voices configured + ADPCM
@@ -541,15 +548,20 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // vertex shading (point lights aren't native to the
         // GTE). Validates the full normals→lighting→TriGouraud
         // pipeline + multi-light colour blending.
+        // Refreshed in Phase 3e after port to `psx-engine`. Both
+        // geometry (per-frame cube Y-spin + light orbits) and HUD
+        // (displayed frame counter) read `ctx.frame`, so the one-
+        // frame phase shift relative to the pre-engine loop moves
+        // every pixel hash.
         "showcase-lights" => Some(SdkGolden {
             example: "showcase-lights",
             vblanks: 60,
-            vram_hash: 0x07cb_76cf_30da_0979,
-            display_hash: 0x5b0b_fa4a_fd51_39b1,
+            vram_hash: 0x4058_93e4_75f3_5230,
+            display_hash: 0xc6dc_b875_f7e6_0798,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_0dd4,
+            final_pc: 0x8001_2ba8,
             redux_display_hash: None,
         }),
 
@@ -558,15 +570,21 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // frames, per-vertex `project_lit` computes both screen
         // coords (RTPS) and lit colour (NCCS → RGB2). Triangles
         // emit as `TriGouraud` with per-vertex colours.
+        // Refreshed in Phase 3e after port to `psx-engine`. Both
+        // mesh tumbles (frame×3, frame×2, frame×4) and HUD read
+        // `ctx.frame`, so every pixel on screen shifts with the
+        // end-of-loop frame-counter advance. `spawn_burst` also
+        // pulls from the shared `LcgRng` on a modulo of `frame`
+        // — rebaked wholesale.
         "showcase-3d" => Some(SdkGolden {
             example: "showcase-3d",
             vblanks: 60,
-            vram_hash: 0xb54c_204b_c7a3_cda2,
-            display_hash: 0xccf1_5e03_283c_d4b9,
+            vram_hash: 0x22e2_d410_00a2_32c1,
+            display_hash: 0x3daf_a742_b90a_65cb,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_2f6c,
+            final_pc: 0x8001_3170,
             redux_display_hash: None,
         }),
         // Full PS1-commercial textured-Gouraud pipeline: RTPT +
@@ -590,15 +608,20 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // wall. Two rings (no intermediate segments) → walls are
         // single continuous quads from near to far, no seams at
         // tile boundaries.
+        // Refreshed in Phase 3e after port to `psx-engine`. The HUD
+        // reads `ctx.frame` directly, so the displayed hex frame #
+        // is off-by-one from the pre-engine demo (which incremented
+        // at start-of-update rather than end-of-loop). Geometry is
+        // identical — the hash drift is confined to the HUD row.
         "showcase-fog" => Some(SdkGolden {
             example: "showcase-fog",
             vblanks: 60,
-            vram_hash: 0xb903_74ab_f401_4283,
-            display_hash: 0xc110_4183_108c_fa1d,
+            vram_hash: 0xb370_c6da_8371_68e5,
+            display_hash: 0x2b4d_221d_5825_016b,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_1ef0,
+            final_pc: 0x8001_1988,
             redux_display_hash: None,
         }),
         // First engine-domain example. Exercises `App::run`'s
