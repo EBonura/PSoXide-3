@@ -245,3 +245,6 @@ run-showcase-3d: showcase-3d
 
 run-showcase-lights: showcase-lights
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-lights.exe cargo run -p frontend --release
+
+run-showcase-fog: showcase-fog
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-fog.exe cargo run -p frontend --release
