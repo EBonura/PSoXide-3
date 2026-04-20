@@ -1,0 +1,13 @@
+[package]
+name         = "psx-fx"
+version      = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description  = "Arcade-style visual effects for the PS1 SDK: particle pools, screen shake, lightweight deterministic RNG."
+
+[dependencies]
+psx-gpu = { path = "../psx-gpu" }
+
+[lints.rust]
+missing_docs = "warn"

@@ -460,6 +460,13 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // brick-break region with effects active (gradient BG,
         // ball trail, particles, potentially screen shake).
         // Exercises ~50-primitive OT path during effect bursts.
+        // Second mini-game. 60 VBlanks captures one serve-arc +
+        // brick-break region with effects active (gradient BG,
+        // ball trail, particles via psx-fx ParticlePool, screen
+        // shake via psx-fx ShakeState). Refreshed after the
+        // psx-fx extraction — VRAM + display hashes are byte-
+        // identical to the previous golden (same pixels), only
+        // `final_pc` drifted from LTO code re-layout.
         "breakout" => Some(SdkGolden {
             example: "breakout",
             vblanks: 60,
@@ -468,7 +475,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_30f4,
+            final_pc: 0x8001_35bc,
             redux_display_hash: None,
         }),
         // Third mini-game. Space Invaders: 5×10 alien grid, ship
@@ -476,6 +483,13 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // the 120 VBlank checkpoint the aliens have marched a
         // couple of steps + dropped their first bombs; no pad
         // input = no player shots but the enemy AI is firing.
+        // Third mini-game. Space Invaders: 5×10 alien grid, ship
+        // at bottom, bullet + bomb pools, wave progression. At
+        // the 120 VBlank checkpoint the aliens have marched a
+        // couple of steps + dropped their first bombs; no pad
+        // input = no player shots but the enemy AI is firing.
+        // Refreshed after psx-fx extraction — pixels unchanged,
+        // only `final_pc` drifted from LTO re-layout.
         "invaders" => Some(SdkGolden {
             example: "invaders",
             vblanks: 120,
@@ -484,7 +498,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 120,
             spu_samples: 88200,
-            final_pc: 0x8001_5338,
+            final_pc: 0x8001_5fe8,
             redux_display_hash: None,
         }),
         _ => None,

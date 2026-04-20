@@ -29,6 +29,7 @@
 extern crate psx_rt;
 
 use psx_font::{FontAtlas, fonts::BASIC_8X16};
+use psx_fx::{LcgRng, ParticlePool, ShakeState};
 use psx_gpu::framebuf::FrameBuffer;
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat};
@@ -117,26 +118,12 @@ const VOICE_LOSE: Voice = Voice::V3;
 const MAX_PARTICLES: usize = 48;
 const PARTICLES_PER_KILL: usize = 8;
 const PARTICLE_TTL: u8 = 26;
+/// Q4.4 velocity spread for explosion scatter.
+const PARTICLE_SPREAD: i16 = 48;
+/// Q4.4 gravity per frame (1 = 0.0625 px/frame²).
+const PARTICLE_GRAVITY: i16 = 1;
 const SHAKE_FRAMES_ON_HIT: u8 = 6;
 const SHIP_FLASH_FRAMES: u8 = 10;
-
-#[derive(Copy, Clone)]
-struct Particle {
-    x: i16,
-    y: i16,
-    vx: i16,
-    vy: i16,
-    r: u8,
-    g: u8,
-    b: u8,
-    ttl: u8,
-}
-
-impl Particle {
-    const fn empty() -> Self {
-        Self { x: 0, y: 0, vx: 0, vy: 0, r: 0, g: 0, b: 0, ttl: 0 }
-    }
-}
 
 #[derive(Copy, Clone)]
 struct Bullet {
@@ -192,11 +179,11 @@ struct Game {
     /// Counter for Serve phase's auto-start-when-idle.
     serve_wait: u16,
     /// Deterministic LCG for enemy shot picking + particle spread.
-    rng: u32,
-    /// Effects state.
-    shake_frames: u8,
+    rng: LcgRng,
+    /// Shared SDK effects state.
+    shake: ShakeState,
     ship_flash_frames: u8,
-    particles: [Particle; MAX_PARTICLES],
+    particles: ParticlePool<MAX_PARTICLES>,
 }
 
 static mut GAME: Game = Game {
@@ -216,10 +203,10 @@ static mut GAME: Game = Game {
     enemy_bombs: [Bullet::dead(); MAX_ENEMY_BOMBS],
     frame: 0,
     serve_wait: 0,
-    rng: 0xC0DE_F00D,
-    shake_frames: 0,
+    rng: LcgRng::new(0xC0DE_F00D),
+    shake: ShakeState::new(),
     ship_flash_frames: 0,
-    particles: [Particle::empty(); MAX_PARTICLES],
+    particles: ParticlePool::new(),
 };
 
 static mut OT: OrderingTable<8> = OrderingTable::new();
@@ -318,59 +305,11 @@ fn reset_wave(full: bool) {
     g.player_bullet = Bullet::dead();
     g.enemy_bombs = [Bullet::dead(); MAX_ENEMY_BOMBS];
     g.serve_wait = 0;
-    g.shake_frames = 0;
+    g.shake = ShakeState::new();
     g.ship_flash_frames = 0;
-    g.particles = [Particle::empty(); MAX_PARTICLES];
+    g.particles.clear();
     // Seed RNG from wave so each wave's enemy-shot pattern differs.
-    g.rng = 0xC0DE_F00D ^ (g.wave as u32 * 0x9E37_79B1);
-}
-
-fn next_rand(g: &mut Game) -> u32 {
-    g.rng = g.rng.wrapping_mul(1_103_515_245).wrapping_add(12345);
-    g.rng
-}
-
-fn rand_sign(g: &mut Game, range: i16) -> i16 {
-    let r = next_rand(g);
-    let raw = ((r >> 16) & 0x1F) as i16;
-    (raw - 16) * range / 16
-}
-
-fn spawn_explosion_particles(g: &mut Game, cx: i16, cy: i16, color: (u8, u8, u8)) {
-    let mut spawned = 0;
-    for slot in 0..MAX_PARTICLES {
-        if g.particles[slot].ttl != 0 {
-            continue;
-        }
-        let vx = rand_sign(g, 48);
-        let vy = rand_sign(g, 48);
-        g.particles[slot] = Particle {
-            x: cx,
-            y: cy,
-            vx,
-            vy,
-            r: color.0,
-            g: color.1,
-            b: color.2,
-            ttl: PARTICLE_TTL,
-        };
-        spawned += 1;
-        if spawned >= PARTICLES_PER_KILL {
-            break;
-        }
-    }
-}
-
-fn update_particles(g: &mut Game) {
-    for p in &mut g.particles {
-        if p.ttl == 0 {
-            continue;
-        }
-        p.x = p.x.wrapping_add(p.vx / 16);
-        p.y = p.y.wrapping_add(p.vy / 16);
-        p.vy = p.vy.saturating_add(1);
-        p.ttl -= 1;
-    }
+    g.rng = LcgRng::new(0xC0DE_F00D ^ (g.wave as u32 * 0x9E37_79B1));
 }
 
 fn alien_bbox(g: &Game, row: usize, col: usize) -> (i16, i16, i16, i16) {
@@ -387,13 +326,12 @@ fn update_game(pad: ButtonState) {
     let g = unsafe { &mut GAME };
 
     g.frame = g.frame.wrapping_add(1);
-    if g.shake_frames > 0 {
-        g.shake_frames -= 1;
-    }
+    // `shake.tick()` is called in the render path — decrementing
+    // there keeps the offset read + consumption coupled.
     if g.ship_flash_frames > 0 {
         g.ship_flash_frames -= 1;
     }
-    update_particles(g);
+    g.particles.update(PARTICLE_GRAVITY);
 
     match g.phase {
         Phase::Lost => {
@@ -546,8 +484,7 @@ fn maybe_drop_enemy_bomb(g: &mut Game) {
         None => return,
     };
     // Pick a random surviving column.
-    let r = next_rand(g);
-    let col = (r as usize) % COLS;
+    let col = (g.rng.next() as usize) % COLS;
     // Lowest live alien in that column.
     for row in (0..ROWS).rev() {
         if g.aliens[row * COLS + col] {
@@ -590,8 +527,15 @@ fn resolve_player_bullet(g: &mut Game) {
             g.player_bullet.alive = false;
             let cx = (ax0 + ax1) / 2;
             let cy = (ay0 + ay1) / 2;
-            spawn_explosion_particles(g, cx, cy, ROW_COLORS[row]);
-            g.shake_frames = SHAKE_FRAMES_ON_HIT;
+            g.particles.spawn_burst(
+                &mut g.rng,
+                (cx, cy),
+                ROW_COLORS[row],
+                PARTICLES_PER_KILL,
+                PARTICLE_SPREAD,
+                PARTICLE_TTL,
+            );
+            g.shake.trigger(SHAKE_FRAMES_ON_HIT);
             play_sfx(VOICE_KILL);
             return;
         }
@@ -631,8 +575,15 @@ fn resolve_enemy_bombs(g: &mut Game) {
     // Second pass — effects.
     let cx = (ship_x0 + ship_x1) / 2;
     let cy = (ship_y0 + ship_y1) / 2;
-    spawn_explosion_particles(g, cx, cy, (255, 180, 80));
-    g.shake_frames = SHAKE_FRAMES_ON_HIT * 2;
+    g.particles.spawn_burst(
+        &mut g.rng,
+        (cx, cy),
+        (255, 180, 80),
+        PARTICLES_PER_KILL,
+        PARTICLE_SPREAD,
+        PARTICLE_TTL,
+    );
+    g.shake.trigger(SHAKE_FRAMES_ON_HIT * 2);
     g.ship_flash_frames = SHIP_FLASH_FRAMES;
     g.lives = g.lives.saturating_sub(hit_count);
     play_sfx(VOICE_LOSE);
@@ -668,16 +619,10 @@ fn build_frame_ot() {
     let bg = unsafe { &mut BG_QUAD };
     ot.clear();
 
-    let g = unsafe { &GAME };
+    let g = unsafe { &mut GAME };
 
     // Shake offset (applied to game-field primitives only).
-    let (shake_dx, shake_dy) = if g.shake_frames > 0 {
-        let s = g.shake_frames as i16;
-        let sign = if s & 1 == 0 { 1 } else { -1 };
-        ((s / 2) * sign, ((s + 1) / 2) * -sign)
-    } else {
-        (0, 0)
-    };
+    let (shake_dx, shake_dy) = g.shake.tick();
 
     // OT convention: slot N-1 = back, slot 0 = front. Gradient
     // goes to slot 7, ship to slot 0.
@@ -727,26 +672,14 @@ fn build_frame_ot() {
         }
     }
 
-    // Slot 3 — particles, in front of aliens, behind bullets/ship.
-    for p in &g.particles {
-        if p.ttl == 0 {
-            continue;
-        }
-        let scale = p.ttl as u16;
-        let denom = PARTICLE_TTL as u16;
-        let r = ((p.r as u16 * scale) / denom) as u8;
-        let gc = ((p.g as u16 * scale) / denom) as u8;
-        let b = ((p.b as u16 * scale) / denom) as u8;
-        let size = if p.ttl > PARTICLE_TTL / 2 { 3 } else { 2 };
-        rects[idx] = RectFlat::new(p.x + shake_dx, p.y + shake_dy, size, size, r, gc, b);
-        unsafe {
-            ot.add(3, &mut rects[idx], RectFlat::WORDS);
-        }
-        idx += 1;
-        if idx >= rects.len() - 6 {
-            break;
-        }
-    }
+    // Slot 3 — particles (front-of-aliens, behind-bullets/ship).
+    // Reserve 6 trailing slots for bullets + ship so the write
+    // can't starve them.
+    let particle_budget = rects.len().saturating_sub(idx + 6);
+    let wrote = g
+        .particles
+        .render_into_ot(ot, &mut rects[idx..idx + particle_budget], 3, (shake_dx, shake_dy));
+    idx += wrote;
 
     // Slot 2 — enemy bombs.
     for bomb in &g.enemy_bombs {
