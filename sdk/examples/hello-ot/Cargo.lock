@@ -13,6 +13,7 @@ name = "hello-ot"
 version = "0.1.0"
 dependencies = [
  "psx-gpu",
+ "psx-math",
  "psx-rt",
 ]
 
@@ -37,6 +38,10 @@ version = "0.1.0"
 dependencies = [
  "psx-hw",
 ]
+
+[[package]]
+name = "psx-math"
+version = "0.1.0"
 
 [[package]]
 name = "psx-rt"

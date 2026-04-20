@@ -15,5 +15,6 @@ codegen-units = 1
 lto = true
 
 [dependencies]
-psx-gpu = { path = "../../crates/psx-gpu" }
-psx-rt  = { path = "../../crates/psx-rt" }
+psx-gpu  = { path = "../../crates/psx-gpu" }
+psx-math = { path = "../../crates/psx-math" }
+psx-rt   = { path = "../../crates/psx-rt" }

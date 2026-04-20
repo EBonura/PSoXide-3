@@ -368,12 +368,12 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-ot" => Some(SdkGolden {
             example: "hello-ot",
             vblanks: 2,
-            vram_hash: 0x1221_829d_adad_9c40,
-            display_hash: 0x6a96_cd01_9d5b_98b9,
+            vram_hash: 0xa8fc_3c26_d9a2_ee80,
+            display_hash: 0xdb22_e03e_82dc_86be,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_0548,
+            final_pc: 0x8001_05a0,
             redux_display_hash: None,
         }),
         "hello-input" => Some(SdkGolden {
