@@ -26,13 +26,18 @@
 
 extern crate psx_rt;
 
-mod meshes;
-
+use psx_asset::Mesh;
 use psx_font::{FontAtlas, fonts::BASIC_8X16};
 use psx_fx::{LcgRng, ParticlePool, ShakeState};
 use psx_gpu::framebuf::FrameBuffer;
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat, TriFlat};
+
+/// Cooked mesh blobs — produced at build time by `psxed` from
+/// `vendor/*.obj`, embedded here so the homebrew is self-
+/// contained. Runtime just `Mesh::from_bytes` + index accessors.
+static SUZANNE_BLOB: &[u8] = include_bytes!("../assets/suzanne.psxm");
+static TEAPOT_BLOB: &[u8] = include_bytes!("../assets/teapot.psxm");
 use psx_gpu::{self as gpu, Resolution, VideoMode};
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene;
@@ -300,29 +305,37 @@ fn build_frame_ot() {
     // avoids 4-6× repeated GTE loads per vertex.
     let mut flat_idx = 0;
 
+    // Parse both meshes at frame-start. Parsing is effectively
+    // free (zero-copy, just bounds-checks + slice arithmetic on
+    // the `static` blobs). We could cache these but the savings
+    // are below the noise floor.
+    let suzanne = Mesh::from_bytes(SUZANNE_BLOB).expect("suzanne blob");
+    let teapot = Mesh::from_bytes(TEAPOT_BLOB).expect("teapot blob");
+
     // --- SUZANNE (slot 5) — two-axis tumble ---
     let suz_rot = Mat3I16::rotate_y((s.frame.wrapping_mul(3) & 0xFFFF) as u16)
         .mul(&Mat3I16::rotate_x((s.frame.wrapping_mul(2) & 0xFFFF) as u16));
     scene::load_rotation(&suz_rot);
     scene::load_translation(SUZANNE_POS);
     let suz_proj = unsafe { &mut SUZANNE_PROJ };
-    for i in 0..meshes::SUZANNE_VERTS.len() {
-        let p = scene::project_vertex(meshes::SUZANNE_VERTS[i]);
-        suz_proj[i] = (p.sx + shake_dx, p.sy + shake_dy, p.sz);
+    for i in 0..suzanne.vert_count() {
+        let p = scene::project_vertex(suzanne.vertex(i as u8));
+        suz_proj[i as usize] = (p.sx + shake_dx, p.sy + shake_dy, p.sz);
     }
-    for (face_idx, tri) in meshes::SUZANNE_TRIS.iter().enumerate() {
+    for face_idx in 0..suzanne.face_count() {
         if flat_idx >= flats.len() {
             break;
         }
+        let (ia, ib, ic) = suzanne.face(face_idx);
         let (v0, v1, v2) = (
-            suz_proj[tri[0] as usize],
-            suz_proj[tri[1] as usize],
-            suz_proj[tri[2] as usize],
+            suz_proj[ia as usize],
+            suz_proj[ib as usize],
+            suz_proj[ic as usize],
         );
         if back_facing(v0, v1, v2) {
             continue;
         }
-        let (r, g, b) = meshes::SUZANNE_FACE_COLORS[face_idx];
+        let (r, g, b) = suzanne.face_color(face_idx).unwrap_or((200, 200, 200));
         flats[flat_idx] = TriFlat::new([(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)], r, g, b);
         ot.add(5, &mut flats[flat_idx], TriFlat::WORDS);
         flat_idx += 1;
@@ -335,23 +348,24 @@ fn build_frame_ot() {
     scene::load_rotation(&tea_rot);
     scene::load_translation(TEAPOT_POS);
     let tea_proj = unsafe { &mut TEAPOT_PROJ };
-    for i in 0..meshes::TEAPOT_VERTS.len() {
-        let p = scene::project_vertex(meshes::TEAPOT_VERTS[i]);
-        tea_proj[i] = (p.sx + shake_dx, p.sy + shake_dy, p.sz);
+    for i in 0..teapot.vert_count() {
+        let p = scene::project_vertex(teapot.vertex(i as u8));
+        tea_proj[i as usize] = (p.sx + shake_dx, p.sy + shake_dy, p.sz);
     }
-    for (face_idx, tri) in meshes::TEAPOT_TRIS.iter().enumerate() {
+    for face_idx in 0..teapot.face_count() {
         if flat_idx >= flats.len() {
             break;
         }
+        let (ia, ib, ic) = teapot.face(face_idx);
         let (v0, v1, v2) = (
-            tea_proj[tri[0] as usize],
-            tea_proj[tri[1] as usize],
-            tea_proj[tri[2] as usize],
+            tea_proj[ia as usize],
+            tea_proj[ib as usize],
+            tea_proj[ic as usize],
         );
         if back_facing(v0, v1, v2) {
             continue;
         }
-        let (r, g, b) = meshes::TEAPOT_FACE_COLORS[face_idx];
+        let (r, g, b) = teapot.face_color(face_idx).unwrap_or((200, 200, 200));
         flats[flat_idx] = TriFlat::new([(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)], r, g, b);
         ot.add(4, &mut flats[flat_idx], TriFlat::WORDS);
         flat_idx += 1;

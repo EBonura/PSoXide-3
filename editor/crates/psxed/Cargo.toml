@@ -1,0 +1,15 @@
+[package]
+name    = "psxed"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PSoXide content-pipeline CLI. Cooks source assets (OBJ meshes, and later: PNG textures, WAV audio) into binary blobs the runtime consumes."
+
+[[bin]]
+name = "psxed"
+path = "src/main.rs"
+
+[dependencies]
+psxed-format = { workspace = true }
+psxed-obj    = { workspace = true }

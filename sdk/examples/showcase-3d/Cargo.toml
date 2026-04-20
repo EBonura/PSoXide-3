@@ -15,9 +15,10 @@ codegen-units = 1
 lto = true
 
 [dependencies]
-psx-font = { path = "../../crates/psx-font" }
-psx-fx   = { path = "../../crates/psx-fx" }
-psx-gpu  = { path = "../../crates/psx-gpu" }
-psx-gte  = { path = "../../crates/psx-gte" }
-psx-rt   = { path = "../../crates/psx-rt" }
-psx-vram = { path = "../../crates/psx-vram" }
+psx-asset = { path = "../../crates/psx-asset" }
+psx-font  = { path = "../../crates/psx-font" }
+psx-fx    = { path = "../../crates/psx-fx" }
+psx-gpu   = { path = "../../crates/psx-gpu" }
+psx-gte   = { path = "../../crates/psx-gte" }
+psx-rt    = { path = "../../crates/psx-rt" }
+psx-vram  = { path = "../../crates/psx-vram" }

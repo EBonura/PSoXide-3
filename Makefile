@@ -11,6 +11,7 @@
 
 .PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke parity run \
         test-sdk \
+        psxed assets \
         examples hello-tri hello-input hello-ot hello-tex hello-gte hello-audio \
         run-tri run-input run-ot run-tex run-gte run-audio \
         showcase-textured-sprite run-showcase-textured-sprite \
@@ -37,6 +38,8 @@ help:
 	@echo ""
 	@echo "  SDK examples (build mipsel-sony-psx binaries):"
 	@echo "    make examples     - build every example"
+	@echo "    make psxed        - build the content-pipeline CLI"
+	@echo "    make assets       - cook source assets via psxed"
 	@echo "    make hello-tri    - build the direct-GP0 triangle demo"
 	@echo "    make hello-input  - build the pad-poll demo"
 	@echo "    make hello-ot     - build the DMA linked-list demo"
@@ -151,8 +154,31 @@ game-breakout:
 game-invaders:
 	cd sdk/examples/game-invaders && cargo build --release
 
-showcase-3d:
+showcase-3d: assets
 	cd sdk/examples/showcase-3d && cargo build --release
+
+# --- Content pipeline (host-side editor tooling) ------------------------
+
+PSXED := editor/target/release/psxed
+
+# Build the content-pipeline CLI. Independent host workspace —
+# always builds fast, no MIPS toolchain needed.
+psxed:
+	cd editor && cargo build --release --bin psxed
+
+# Cook source assets into the binary blobs examples embed via
+# include_bytes!. Re-runs whenever an .obj changes. Targets go
+# next to the source under `assets/` so a repo clone has the
+# runtime input available without having to run the editor.
+SHOWCASE_3D := sdk/examples/showcase-3d
+assets: psxed
+	@mkdir -p $(SHOWCASE_3D)/assets
+	@$(PSXED) obj $(SHOWCASE_3D)/vendor/suzanne.obj \
+	    -o $(SHOWCASE_3D)/assets/suzanne.psxm \
+	    --palette warm --decimate-grid 6
+	@$(PSXED) obj $(SHOWCASE_3D)/vendor/teapot.obj \
+	    -o $(SHOWCASE_3D)/assets/teapot.psxm \
+	    --palette cool
 
 examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d
 	@echo ""

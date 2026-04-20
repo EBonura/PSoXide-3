@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/psxed-format",
+    "crates/psxed-obj",
+    "crates/psxed",
+]
+
+[workspace.package]
+edition    = "2021"
+license    = "GPL-2.0-or-later"
+repository = "https://github.com/EBonura/PSoXide"
+
+[workspace.dependencies]
+psxed-format = { path = "crates/psxed-format" }
+psxed-obj    = { path = "crates/psxed-obj" }
