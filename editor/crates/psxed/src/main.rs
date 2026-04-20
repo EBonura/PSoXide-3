@@ -18,9 +18,20 @@
 //!   --compute-normals   Add per-vertex normals for lit rendering.
 //! ```
 //!
+//! ## `tex` — PNG/JPG → `.psxt`
+//!
+//! ```bash
+//! psxed tex SRC.{png,jpg,bmp} -o DST.psxt [options]
+//!
+//! Options:
+//!   --size WxH           Target texel dimensions (default 64x64).
+//!   --depth 4|8|15       Bits per texel (default 4 = 16-colour CLUT).
+//!   --crop X,Y,W,H       Crop window on the source, pre-resize.
+//!   --resample nearest|triangle|lanczos3  (default lanczos3)
+//! ```
+//!
 //! ## Future subcommands
 //!
-//! - `tim`   — PNG/BMP → PSX TIM texture
 //! - `vag`   — WAV → PSX VAG ADPCM audio
 //! - `font`  — TTF or bitmap → psx-font atlas
 //! - `scene` — edit a .pscene JSON and cook it into runtime format
@@ -36,6 +47,7 @@ fn main() -> ExitCode {
     }
     let result = match args[1].as_str() {
         "obj" => run_obj(&args[2..]),
+        "tex" => run_tex(&args[2..]),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -59,6 +71,7 @@ USAGE:
 
 SUBCOMMANDS:
     obj     Convert a Wavefront .obj mesh to .psxm format
+    tex     Convert a PNG/JPG/BMP image to .psxt format
     help    Show this message
 
 OBJ SUBCOMMAND:
@@ -68,8 +81,17 @@ OBJ SUBCOMMAND:
                           [--no-colors]
                           [--compute-normals]
 
-EXAMPLE:
+TEX SUBCOMMAND:
+    psxed tex <input.png|.jpg|.bmp> -o <output.psxt>
+                          [--size WxH]            (default 64x64)
+                          [--depth 4|8|15]        (default 4)
+                          [--crop X,Y,W,H]
+                          [--resample nearest|triangle|lanczos3]
+
+EXAMPLES:
     psxed obj vendor/teapot.obj -o build/teapot.psxm --palette cool
+    psxed tex ~/Downloads/brick.jpg -o assets/brick.psxt \\
+        --size 128x128 --depth 4 --resample lanczos3
 ";
 
 fn run_obj(args: &[String]) -> Result<(), String> {
@@ -159,6 +181,134 @@ fn run_obj(args: &[String]) -> Result<(), String> {
         input.display(),
         output.display(),
         psxm.len()
+    );
+    Ok(())
+}
+
+fn run_tex(args: &[String]) -> Result<(), String> {
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut width: u16 = 64;
+    let mut height: u16 = 64;
+    let mut depth = psxed_format::texture::Depth::Bit4;
+    let mut crop: Option<psxed_tex::CropRect> = None;
+    let mut resampler = psxed_tex::Resampler::Lanczos3;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "-o" | "--output" => {
+                i += 1;
+                output = Some(PathBuf::from(
+                    args.get(i).ok_or_else(|| "expected path after -o".to_string())?,
+                ));
+            }
+            "--size" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "expected WxH after --size".to_string())?;
+                let (w, h) = val
+                    .split_once('x')
+                    .ok_or_else(|| format!("--size expects WxH, got: {val}"))?;
+                width = w.parse().map_err(|_| format!("invalid width: {w}"))?;
+                height = h.parse().map_err(|_| format!("invalid height: {h}"))?;
+            }
+            "--depth" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "expected bit-depth".to_string())?;
+                depth = match val.as_str() {
+                    "4" => psxed_format::texture::Depth::Bit4,
+                    "8" => psxed_format::texture::Depth::Bit8,
+                    "15" => psxed_format::texture::Depth::Bit15,
+                    other => {
+                        return Err(format!("invalid --depth: {other} (expected 4, 8, 15)"));
+                    }
+                };
+            }
+            "--crop" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "expected X,Y,W,H after --crop".to_string())?;
+                let parts: Vec<&str> = val.split(',').collect();
+                if parts.len() != 4 {
+                    return Err(format!("--crop expects X,Y,W,H, got: {val}"));
+                }
+                let mut nums = [0u32; 4];
+                for (j, p) in parts.iter().enumerate() {
+                    nums[j] = p
+                        .parse()
+                        .map_err(|_| format!("invalid crop component: {p}"))?;
+                }
+                crop = Some(psxed_tex::CropRect {
+                    x: nums[0],
+                    y: nums[1],
+                    w: nums[2],
+                    h: nums[3],
+                });
+            }
+            "--resample" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "expected resampler name".to_string())?;
+                resampler = match val.as_str() {
+                    "nearest" => psxed_tex::Resampler::Nearest,
+                    "triangle" => psxed_tex::Resampler::Triangle,
+                    "lanczos3" => psxed_tex::Resampler::Lanczos3,
+                    other => {
+                        return Err(format!(
+                            "invalid --resample: {other} (expected nearest|triangle|lanczos3)"
+                        ));
+                    }
+                };
+            }
+            a if a.starts_with('-') => {
+                return Err(format!("unknown flag: {a}\n\n{USAGE}"));
+            }
+            _ => {
+                if input.is_none() {
+                    input = Some(PathBuf::from(a));
+                } else {
+                    return Err(format!("unexpected positional argument: {a}"));
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let input = input.ok_or("missing input image path")?;
+    let output = output.ok_or("missing -o output path")?;
+
+    let src_bytes = std::fs::read(&input)
+        .map_err(|e| format!("read {}: {e}", input.display()))?;
+    let cfg = psxed_tex::Config {
+        width,
+        height,
+        depth,
+        crop,
+        resampler,
+    };
+    let psxt = psxed_tex::convert(&src_bytes, &cfg).map_err(|e| format!("convert: {e}"))?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&output, &psxt)
+        .map_err(|e| format!("write {}: {e}", output.display()))?;
+
+    eprintln!(
+        "[psxed tex] {} → {} ({}×{} {}bpp, {} bytes)",
+        input.display(),
+        output.display(),
+        width,
+        height,
+        depth as u8,
+        psxt.len(),
     );
     Ok(())
 }

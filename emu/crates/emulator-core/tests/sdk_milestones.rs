@@ -354,15 +354,20 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_0470,
             redux_display_hash: None,
         }),
+        // Now uses a 4bpp CLUT brick-wall texture cooked by
+        // `psxed tex` from a source JPG. Exercises the full host +
+        // runtime texture pipeline: PNG/JPG → crop → resample →
+        // median-cut quantise → pack 4bpp → PSXT → include_bytes! →
+        // Texture::from_bytes → upload_bytes × 2 → GP0 0x64.
         "hello-tex" => Some(SdkGolden {
             example: "hello-tex",
             vblanks: 2,
-            vram_hash: 0x7804_338e_66fb_9425,
-            display_hash: 0x09ee_8c6c_72b2_f825,
+            vram_hash: 0x6283_ecc7_dca4_e1fa,
+            display_hash: 0x66da_5fe5_c1bb_096c,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_041c,
+            final_pc: 0x8001_0548,
             redux_display_hash: None,
         }),
         "hello-ot" => Some(SdkGolden {

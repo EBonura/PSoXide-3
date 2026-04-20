@@ -136,7 +136,7 @@ hello-input:
 hello-ot:
 	cd sdk/examples/hello-ot && cargo build --release
 
-hello-tex:
+hello-tex: assets
 	cd sdk/examples/hello-tex && cargo build --release
 
 hello-gte:
@@ -186,8 +186,9 @@ psxed:
 # runtime input available without having to run the editor.
 SHOWCASE_3D := sdk/examples/showcase-3d
 SHOWCASE_LIGHTS := sdk/examples/showcase-lights
+HELLO_TEX := sdk/examples/hello-tex
 assets: psxed
-	@mkdir -p $(SHOWCASE_3D)/assets $(SHOWCASE_LIGHTS)/assets
+	@mkdir -p $(SHOWCASE_3D)/assets $(SHOWCASE_LIGHTS)/assets $(HELLO_TEX)/assets
 	@$(PSXED) obj $(SHOWCASE_3D)/vendor/suzanne.obj \
 	    -o $(SHOWCASE_3D)/assets/suzanne.psxm \
 	    --palette warm --decimate-grid 6 --compute-normals
@@ -197,6 +198,9 @@ assets: psxed
 	@$(PSXED) obj $(SHOWCASE_LIGHTS)/vendor/cube.obj \
 	    -o $(SHOWCASE_LIGHTS)/assets/cube.psxm \
 	    --compute-normals --no-colors
+	@$(PSXED) tex $(HELLO_TEX)/vendor/brick-wall.jpg \
+	    -o $(HELLO_TEX)/assets/brick-wall.psxt \
+	    --size 64x64 --depth 4 --resample lanczos3
 
 examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-lights showcase-fog
 	@echo ""

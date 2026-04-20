@@ -1,0 +1,17 @@
+[package]
+name    = "psxed-tex"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PNG/JPG → PSXT texture cooker for PSoXide's content pipeline. Crops, resamples, quantises to 4/8-bit CLUT, packs for VRAM upload."
+
+[dependencies]
+psxed-format = { workspace = true }
+# Only widely-used PSX-era source formats. JPG + PNG covers 99% of
+# sources; BMP / TGA round out the rest. Default `image` features
+# are heavier than we need, so we pin the codecs explicitly.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+
+[lints.rust]
+missing_docs = "warn"

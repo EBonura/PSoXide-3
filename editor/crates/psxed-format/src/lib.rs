@@ -44,6 +44,7 @@
 #![warn(missing_docs)]
 
 pub mod mesh;
+pub mod texture;
 
 /// Shared header that prefixes every cooked asset file.
 ///

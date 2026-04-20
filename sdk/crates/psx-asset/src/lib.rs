@@ -255,6 +255,139 @@ impl<'a> Mesh<'a> {
     }
 }
 
+/// A parsed 2D texture backed by slices into the caller's cooked
+/// blob. Pixel data is already packed into the halfword-nibble
+/// layout the PSX GPU reads; the CLUT (if any) is a slice of
+/// RGB555 halfwords.
+///
+/// Construct by `Texture::from_bytes(&blob)`; upload to VRAM via
+/// [`Texture::upload`], which returns the matching `Tpage` + `Clut`
+/// handles ready to feed into primitive constructors.
+#[derive(Copy, Clone, Debug)]
+pub struct Texture<'a> {
+    /// Packed pixel halfwords — 4 texels per u16 at 4bpp,
+    /// 2 at 8bpp, 1 Color555 at 15bpp.
+    pixel_data: &'a [u8],
+    /// CLUT halfwords, or empty for 15bpp.
+    clut_data: &'a [u8],
+    width_px: u16,
+    height_px: u16,
+    depth: psxed_format::texture::Depth,
+    clut_entries: u16,
+}
+
+impl<'a> Texture<'a> {
+    /// Parse a cooked `.psxt` blob. Returns a `Texture` view that
+    /// borrows into `bytes`. Cheap — header decode + two slice
+    /// computations.
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, ParseError> {
+        use psxed_format::texture::{Depth, TextureHeader, MAGIC, VERSION};
+
+        // AssetHeader.
+        if bytes.len() < psxed_format::AssetHeader::SIZE {
+            return Err(ParseError::Truncated);
+        }
+        let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if magic != MAGIC {
+            return Err(ParseError::WrongMagic);
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != VERSION {
+            return Err(ParseError::UnsupportedVersion(version));
+        }
+        let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let payload_start = psxed_format::AssetHeader::SIZE;
+        let actual_payload = bytes.len().saturating_sub(payload_start);
+        if (payload_len as usize) != actual_payload {
+            return Err(ParseError::InvalidPayloadLen {
+                declared: payload_len,
+                actual: actual_payload,
+            });
+        }
+
+        // TextureHeader.
+        if actual_payload < TextureHeader::SIZE {
+            return Err(ParseError::Truncated);
+        }
+        let th = &bytes[payload_start..];
+        let depth = Depth::from_byte(th[0]).ok_or(ParseError::TableOverflow)?;
+        // th[1] is _pad; skip.
+        let width_px = u16::from_le_bytes([th[2], th[3]]);
+        let height_px = u16::from_le_bytes([th[4], th[5]]);
+        let clut_entries = u16::from_le_bytes([th[6], th[7]]);
+        let pixel_bytes = u32::from_le_bytes([th[8], th[9], th[10], th[11]]) as usize;
+        let clut_bytes = u32::from_le_bytes([th[12], th[13], th[14], th[15]]) as usize;
+
+        let mut off = payload_start + TextureHeader::SIZE;
+        if off + pixel_bytes > bytes.len() {
+            return Err(ParseError::TableOverflow);
+        }
+        let pixel_data = &bytes[off..off + pixel_bytes];
+        off += pixel_bytes;
+
+        if off + clut_bytes > bytes.len() {
+            return Err(ParseError::TableOverflow);
+        }
+        let clut_data = &bytes[off..off + clut_bytes];
+
+        Ok(Self {
+            pixel_data,
+            clut_data,
+            width_px,
+            height_px,
+            depth,
+            clut_entries,
+        })
+    }
+
+    /// Width in texels.
+    #[inline]
+    pub fn width(&self) -> u16 {
+        self.width_px
+    }
+
+    /// Height in texels.
+    #[inline]
+    pub fn height(&self) -> u16 {
+        self.height_px
+    }
+
+    /// Colour depth.
+    #[inline]
+    pub fn depth(&self) -> psxed_format::texture::Depth {
+        self.depth
+    }
+
+    /// Number of CLUT entries (16, 256, or 0 for 15bpp).
+    #[inline]
+    pub fn clut_entries(&self) -> u16 {
+        self.clut_entries
+    }
+
+    /// Raw packed pixel halfwords, as bytes. Suitable for
+    /// halfword-level DMA upload; caller pairs this with a `VramRect`
+    /// describing the *halfword footprint*, not the texel width.
+    #[inline]
+    pub fn pixel_bytes(&self) -> &'a [u8] {
+        self.pixel_data
+    }
+
+    /// Raw CLUT halfwords, as bytes. Empty for 15bpp.
+    #[inline]
+    pub fn clut_bytes(&self) -> &'a [u8] {
+        self.clut_data
+    }
+
+    /// Halfwords-per-row at this texture's depth (rows padded up to
+    /// a full halfword). Needed when computing the VRAM rect for
+    /// upload: VRAM measures in halfwords regardless of the texel
+    /// depth the GPU will fetch them at.
+    #[inline]
+    pub fn halfwords_per_row(&self) -> u16 {
+        psxed_format::texture::TextureHeader::halfwords_per_row(self.depth, self.width_px)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +418,56 @@ mod tests {
         assert!(matches!(
             Mesh::from_bytes(&bad),
             Err(ParseError::UnsupportedVersion(999))
+        ));
+    }
+
+    #[test]
+    fn texture_round_trip_4bpp() {
+        use psxed_format::texture::Depth;
+        // 12 AssetHeader + 16 TextureHeader + 8 pixels + 32 CLUT = 68 bytes.
+        let pixel_bytes: u32 = 8;
+        let clut_bytes: u32 = 32;
+        let payload_len = 16 + pixel_bytes + clut_bytes;
+        let mut buf = [0u8; 68];
+        buf[0..4].copy_from_slice(b"PSXT");
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[6..8].copy_from_slice(&0u16.to_le_bytes());
+        buf[8..12].copy_from_slice(&payload_len.to_le_bytes());
+        // TextureHeader @ offset 12.
+        buf[12] = 4; // depth
+        buf[13] = 0;
+        buf[14..16].copy_from_slice(&4u16.to_le_bytes()); // width
+        buf[16..18].copy_from_slice(&4u16.to_le_bytes()); // height
+        buf[18..20].copy_from_slice(&16u16.to_le_bytes()); // clut_entries
+        buf[20..24].copy_from_slice(&pixel_bytes.to_le_bytes());
+        buf[24..28].copy_from_slice(&clut_bytes.to_le_bytes());
+        // 4 rows × 1 halfword = 4 halfwords = 8 bytes @ offset 28.
+        for row in 0..4u16 {
+            let off = 28 + (row as usize) * 2;
+            buf[off..off + 2].copy_from_slice(&(row * 0x1111).to_le_bytes());
+        }
+        // 16 CLUT entries @ offset 36.
+        for i in 0..16u16 {
+            let off = 36 + (i as usize) * 2;
+            buf[off..off + 2].copy_from_slice(&(i * 0x0123).to_le_bytes());
+        }
+
+        let t = Texture::from_bytes(&buf).expect("parse");
+        assert_eq!(t.width(), 4);
+        assert_eq!(t.height(), 4);
+        assert_eq!(t.depth(), Depth::Bit4);
+        assert_eq!(t.clut_entries(), 16);
+        assert_eq!(t.halfwords_per_row(), 1);
+        assert_eq!(t.pixel_bytes().len(), 8);
+        assert_eq!(t.clut_bytes().len(), 32);
+    }
+
+    #[test]
+    fn texture_rejects_wrong_magic() {
+        let bad = [b'N', b'O', b'P', b'E', 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(matches!(
+            Texture::from_bytes(&bad),
+            Err(ParseError::WrongMagic)
         ));
     }
 

@@ -395,6 +395,44 @@ pub fn upload_16bpp(rect: VramRect, pixels: &[u16]) {
     }
 }
 
+/// Upload raw byte-stream pixel data, interpreted as halfwords in
+/// little-endian order. Same semantics as [`upload_16bpp`] but
+/// accepts a `&[u8]` — useful when the data comes from
+/// `include_bytes!` of a cooked asset blob, where the returned
+/// byte array has alignment 1 and a direct `&[u16]` reinterpret
+/// would be undefined behaviour.
+///
+/// `rect.w` still measures *halfwords* (the VRAM native unit).
+/// The byte length must be exactly `2 × rect.w × rect.h`.
+pub fn upload_bytes(rect: VramRect, bytes: &[u8]) {
+    let expected = (rect.pixel_count() as usize) * 2;
+    assert_eq!(
+        bytes.len(),
+        expected,
+        "upload_bytes: bytes.len() ({}) != 2 × rect.w × rect.h ({})",
+        bytes.len(),
+        expected,
+    );
+    assert!(
+        bytes.len() >= 4 && bytes.len() % 4 == 0,
+        "upload_bytes: byte count must be a positive multiple of 4"
+    );
+
+    wait_cmd_ready();
+    write_gp0(gp0::COPY_CPU_TO_VRAM);
+    write_gp0(pack_xy(rect.x, rect.y));
+    write_gp0(pack_xy(rect.w, rect.h));
+    // Two halfwords per FIFO word, low half first — matches
+    // upload_16bpp's packing convention.
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let w = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        wait_cmd_ready();
+        write_gp0(w);
+        i += 4;
+    }
+}
+
 /// Upload typed [`Color555`] pixels — sugar over [`upload_16bpp`]
 /// for direct-color textures.
 pub fn upload_15bpp(rect: VramRect, pixels: &[Color555]) {
