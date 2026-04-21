@@ -235,8 +235,12 @@ impl ApplicationHandler for Shell {
                         }
                     }
                 }
-                // The Menu only reacts to presses, not releases.
-                if state == ElementState::Pressed && !repeat {
+                // The Menu *does* honour OS-level key-repeat: holding
+                // down-arrow scrolls through a long Examples list one
+                // row per repeat tick, matching GUI-standard behaviour.
+                // Only press events (including repeats) trigger menu
+                // navigation; releases don't.
+                if state == ElementState::Pressed {
                     self.pending_input = merge_key(self.pending_input, &logical_key);
                 }
                 gfx.window.request_redraw();
