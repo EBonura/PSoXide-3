@@ -49,11 +49,13 @@ pub mod app;
 pub mod frames;
 pub mod scene;
 pub mod sfx;
+pub mod transform;
 
 pub use angle::Angle;
 pub use app::{App, Config};
 pub use frames::{Frames, Ticks};
 pub use scene::{Ctx, Scene};
+pub use transform::{ActorTransform, Vec3World};
 
 /// Button-mask constants (UP, DOWN, CROSS, START, …) re-exported
 /// from `psx_pad::button` so games using `Ctx::just_pressed` /
