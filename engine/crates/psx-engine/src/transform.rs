@@ -199,6 +199,20 @@ impl ActorTransform {
         self
     }
 
+    /// The rotation matrix after folding in the uniform scale — the
+    /// exact matrix [`load_gte`][Self::load_gte] will upload to the
+    /// GTE's RT control registers.
+    ///
+    /// Exposed for callers that also need to do CPU-side transform
+    /// math alongside the GTE pipeline — e.g. a CPU point-light
+    /// shader computing world-space positions via the same scaled
+    /// rotation the GTE uses. Reusing this accessor guarantees the
+    /// CPU and GTE paths see bit-identical matrices.
+    #[inline]
+    pub fn scaled_rotation(&self) -> Mat3I16 {
+        scale_mat_uniform(&self.rotation, self.scale as i32)
+    }
+
     /// Compose `rotation × uniform_scale` and upload along with the
     /// world translation to the GTE. After this, each
     /// [`psx_gte::scene::project_vertex`] call transforms a mesh-
@@ -210,7 +224,7 @@ impl ActorTransform {
     /// that the SDK's [`load_rotation`][scene::load_rotation] and
     /// [`load_translation`][scene::load_translation] helpers do.
     pub fn load_gte(&self) {
-        scene::load_rotation(&scale_mat_uniform(&self.rotation, self.scale as i32));
+        scene::load_rotation(&self.scaled_rotation());
         scene::load_translation(self.position.as_gte_translation());
     }
 }
@@ -311,6 +325,28 @@ mod tests {
         assert_eq!(t.position, p);
         assert_eq!(t.rotation, Mat3I16::IDENTITY);
         assert_eq!(t.scale, 0x1000);
+    }
+
+    #[test]
+    fn actor_transform_scaled_rotation_matches_manual_compose() {
+        let rot = Mat3I16::rotate_y(32);
+        let t = ActorTransform::at(Vec3World::ZERO)
+            .with_rotation(rot)
+            .with_scale_q12(0x0800);
+        // `scaled_rotation` must return exactly what `load_gte`
+        // would upload — i.e. the same byte output the old hand-
+        // rolled `scale_mat` helpers produced.
+        assert_eq!(t.scaled_rotation(), scale_mat_uniform(&rot, 0x0800));
+    }
+
+    #[test]
+    fn actor_transform_scaled_rotation_identity_scale_noop() {
+        // A scale of 1.0× must leave the rotation matrix bytewise
+        // unchanged — critical for the showcase-3d migration where
+        // meshes don't use scale but still go through `load_gte`.
+        let rot = Mat3I16::rotate_z(96);
+        let t = ActorTransform::at(Vec3World::ZERO).with_rotation(rot);
+        assert_eq!(t.scaled_rotation(), rot);
     }
 
     #[test]

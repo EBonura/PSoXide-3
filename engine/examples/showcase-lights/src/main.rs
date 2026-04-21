@@ -41,7 +41,7 @@
 extern crate psx_rt;
 
 use psx_asset::Mesh;
-use psx_engine::{App, Config, Ctx, Scene};
+use psx_engine::{ActorTransform, App, Config, Ctx, Scene, Vec3World};
 use psx_font::{FontAtlas, fonts::BASIC_8X16};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat, TriFlat, TriGouraud};
@@ -122,10 +122,13 @@ const NUM_CUBES: usize = 4;
 /// applied to each vertex before rotation; the cube mesh has
 /// unit-side verts at ±0x0800, so `scale = 0x1000` renders a
 /// 1.0×1.0×1.0 cube and `scale = 0x0800` renders 0.5×0.5×0.5.
+/// Position uses the engine's `Vec3World` so the type system
+/// catches "wrong coord space" bugs that the old raw `Vec3I32`
+/// layout couldn't.
 #[derive(Copy, Clone)]
 struct CubeInstance {
-    position: Vec3I32,
-    scale: i32,
+    position: Vec3World,
+    scale: i16,
     /// Angular velocity per frame (Q0.12 units), for Y-axis spin.
     y_spin_per_frame: u16,
 }
@@ -136,29 +139,31 @@ struct CubeInstance {
 /// "collection of objects" rather than a uniform grid.
 ///
 /// Positions are relative to WORLD_Z — the `z` component is the
-/// additional depth offset from the camera plane.
+/// additional depth offset from the camera plane. Raw Q19.12
+/// coordinates (not the `from_units` constructor) because the
+/// original values were hand-tuned in that scale.
 const CUBE_LAYOUT: [CubeInstance; NUM_CUBES] = [
     // Far-left, low, medium-large, slow spin.
     CubeInstance {
-        position: Vec3I32::new(-0x2000, -0x0400, WORLD_Z + 0x0600),
+        position: Vec3World::from_raw(-0x2000, -0x0400, WORLD_Z + 0x0600),
         scale: 0x0B00,
         y_spin_per_frame: 3,
     },
     // Mid-left, higher, smaller, slightly faster.
     CubeInstance {
-        position: Vec3I32::new(-0x0A00, 0x0400, WORLD_Z - 0x0400),
+        position: Vec3World::from_raw(-0x0A00, 0x0400, WORLD_Z - 0x0400),
         scale: 0x0800,
         y_spin_per_frame: 5,
     },
     // Mid-right, low, medium, different rate.
     CubeInstance {
-        position: Vec3I32::new(0x0A00, -0x0600, WORLD_Z - 0x0200),
+        position: Vec3World::from_raw(0x0A00, -0x0600, WORLD_Z - 0x0200),
         scale: 0x0900,
         y_spin_per_frame: 4,
     },
     // Far-right, mid-height, largest, slowest.
     CubeInstance {
-        position: Vec3I32::new(0x2200, 0, WORLD_Z + 0x0400),
+        position: Vec3World::from_raw(0x2200, 0, WORLD_Z + 0x0400),
         scale: 0x0D00,
         y_spin_per_frame: 2,
     },
@@ -409,17 +414,22 @@ impl Lighting {
             let angle = (frame.wrapping_mul(instance.y_spin_per_frame as u32) & 0xFFFF) as u16;
             let rot = Mat3I16::rotate_y(angle);
 
-            // GTE prep: rotation handles per-instance Y-spin, the
-            // vertex scale is folded into the rotation matrix
-            // (we multiply a uniform-scale matrix into `rot` so the
-            // GTE does scale + rotate in one RTPS pass).
-            let rot_scaled = scale_mat(&rot, instance.scale);
-            scene::load_rotation(&rot_scaled);
-            scene::load_translation(instance.position);
+            // Build the full actor pose and upload — one call
+            // replaces the old hand-rolled "scale rotation → load
+            // rotation → load translation" three-step. The scale
+            // folds into the rotation matrix so the GTE's RTPS
+            // pass does scale + rotate + translate in one go.
+            let actor = ActorTransform::at(instance.position)
+                .with_rotation(rot)
+                .with_scale_q12(instance.scale);
+            actor.load_gte();
 
-            // CPU path: we duplicate position + normal math to get
-            // world-space values for lighting. The GTE isn't involved
-            // in that computation — we only use it for projection.
+            // CPU path also wants the *same* scaled rotation matrix
+            // the GTE is using — `actor.scaled_rotation()` returns
+            // exactly what `load_gte` uploaded, so the CPU world-
+            // space positions line up bit-for-bit with the GTE's
+            // projected screen-space output.
+            let rot_scaled = actor.scaled_rotation();
             let cube_proj = unsafe { &mut CUBE_PROJ };
             for vi in 0..cube.vert_count() {
                 let vl = cube.vertex(vi as u8);
@@ -450,8 +460,7 @@ impl Lighting {
 
                 let (r, g, b) = light_vertex(&self.lights, world_pos, nrot);
 
-                // Project via GTE (the rot_scaled + translation are
-                // already loaded).
+                // Project via GTE (actor transform already loaded).
                 let p = scene::project_vertex(vl);
                 cube_proj[vi as usize] = (p.sx, p.sy, p.sz, r, g, b);
             }
@@ -544,19 +553,11 @@ impl Lighting {
 // Helpers
 // ----------------------------------------------------------------------
 
-/// Apply a uniform scale factor to a rotation matrix. Because
-/// Mat3I16 is Q3.12 and scale is Q3.12, the product is Q3.12 too
-/// after the shared `>> 12` shift.
-fn scale_mat(m: &Mat3I16, scale_q12: i32) -> Mat3I16 {
-    let mut out = [[0i16; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            let v = ((m.m[i][j] as i32) * scale_q12) >> 12;
-            out[i][j] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        }
-    }
-    Mat3I16 { m: out }
-}
+// The uniform-scale matrix helper that used to live here is now
+// engine-owned as `ActorTransform::scaled_rotation()` — call sites
+// building their own scaled rotation should go through the actor
+// type, which guarantees the CPU and GTE paths see bit-identical
+// matrices.
 
 /// Dot product of matrix row `r` with vector `v` in Q3.12; result
 /// in i32 (un-truncated range).

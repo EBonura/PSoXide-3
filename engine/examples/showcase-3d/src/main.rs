@@ -32,7 +32,7 @@
 extern crate psx_rt;
 
 use psx_asset::Mesh;
-use psx_engine::{App, Config, Ctx, Scene};
+use psx_engine::{ActorTransform, App, Config, Ctx, Scene, Vec3World};
 use psx_font::{FontAtlas, fonts::BASIC_8X16};
 use psx_fx::{LcgRng, ParticlePool, ShakeState};
 use psx_gpu::ot::OrderingTable;
@@ -76,8 +76,8 @@ static mut STARS: [Vec3I16; STAR_COUNT] = [Vec3I16::ZERO; STAR_COUNT];
 // Mesh placement
 // ----------------------------------------------------------------------
 
-const SUZANNE_POS: Vec3I32 = Vec3I32::new(-0x1300, 0, WORLD_Z);
-const TEAPOT_POS: Vec3I32 = Vec3I32::new(0x1400, 0, WORLD_Z);
+const SUZANNE_POS: Vec3World = Vec3World::from_raw(-0x1300, 0, WORLD_Z);
+const TEAPOT_POS: Vec3World = Vec3World::from_raw(0x1400, 0, WORLD_Z);
 
 // ----------------------------------------------------------------------
 // Light rig (world-space)
@@ -375,8 +375,13 @@ impl Showcase3D {
         // --- SUZANNE (slot 5) — two-axis tumble, lit by scene rig ---
         let suz_rot = Mat3I16::rotate_y((frame.wrapping_mul(3) & 0xFFFF) as u16)
             .mul(&Mat3I16::rotate_x((frame.wrapping_mul(2) & 0xFFFF) as u16));
-        scene::load_rotation(&suz_rot);
-        scene::load_translation(SUZANNE_POS);
+        // No per-actor scale (meshes authored at their intended
+        // size), so `ActorTransform::at(pos).with_rotation(rot)`
+        // leaves scale at 1.0× and `load_gte` folds that identity
+        // multiply into the rotation upload in one step.
+        ActorTransform::at(SUZANNE_POS)
+            .with_rotation(suz_rot)
+            .load_gte();
         // Rotate world-space lights into Suzanne's local frame + upload.
         scene_lights.for_object(&suz_rot).load();
         let suz_proj = unsafe { &mut SUZANNE_PROJ };
@@ -424,8 +429,9 @@ impl Showcase3D {
             (frame.wrapping_mul(4) & 0xFFFF).wrapping_neg() as u16,
         )
         .mul(&Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16));
-        scene::load_rotation(&tea_rot);
-        scene::load_translation(TEAPOT_POS);
+        ActorTransform::at(TEAPOT_POS)
+            .with_rotation(tea_rot)
+            .load_gte();
         scene_lights.for_object(&tea_rot).load();
         let tea_proj = unsafe { &mut TEAPOT_PROJ };
         for i in 0..teapot.vert_count() {

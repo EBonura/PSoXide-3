@@ -548,11 +548,11 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // vertex shading (point lights aren't native to the
         // GTE). Validates the full normals→lighting→TriGouraud
         // pipeline + multi-light colour blending.
-        // Refreshed in Phase 3e after port to `psx-engine`. Both
-        // geometry (per-frame cube Y-spin + light orbits) and HUD
-        // (displayed frame counter) read `ctx.frame`, so the one-
-        // frame phase shift relative to the pre-engine loop moves
-        // every pixel hash.
+        // Phase 3e rebake: port to `psx-engine`. Phase 3f-followup:
+        // cube render loop now uses `ActorTransform::load_gte()` —
+        // byte-identical VRAM + display (the new helper produces
+        // the same scaled-rotation matrix the old inline `scale_mat`
+        // did), only `final_pc` shifted as code layout changed.
         "showcase-lights" => Some(SdkGolden {
             example: "showcase-lights",
             vblanks: 60,
@@ -561,7 +561,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_2ba8,
+            final_pc: 0x8001_2f0c,
             redux_display_hash: None,
         }),
 
