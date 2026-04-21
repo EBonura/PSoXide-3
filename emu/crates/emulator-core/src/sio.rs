@@ -81,7 +81,14 @@ impl Sio0 {
     /// Size of the register window (`DATA..=BAUD` plus padding).
     pub const SIZE: u32 = 0x10;
 
-    /// All registers zero, both ports empty. Matches cold power-on.
+    /// All registers zero, port 1 pre-populated with a digital pad,
+    /// port 2 left empty. Matches the "controller is plugged in,
+    /// nothing in slot 2" default most games assume on boot — the
+    /// same default our frontend wires up when the user runs a
+    /// disc. Without this, `set_port1_buttons` was a silent no-op
+    /// (no `DigitalPad` to route the button mask to) and every
+    /// game's SIO poll returned 0xFF regardless of what the player
+    /// pressed on the keyboard or host gamepad.
     pub fn new() -> Self {
         Self {
             mode: 0,
@@ -89,7 +96,8 @@ impl Sio0 {
             baud: 0,
             rx: None,
             pending_irq: false,
-            port1: crate::pad::PortDevice::empty(),
+            port1: crate::pad::PortDevice::empty()
+                .with_pad(crate::pad::DigitalPad::new()),
             port2: crate::pad::PortDevice::empty(),
             last_joyn: false,
         }
@@ -299,7 +307,10 @@ mod tests {
 
     #[test]
     fn data_read_returns_ff_no_device() {
+        // Unseat the default pad so we can verify the no-device path
+        // stays correct (TX ignored, DATA reads 0xFF).
         let mut sio = Sio0::new();
+        sio.attach_port1(crate::pad::PortDevice::empty());
         assert_eq!(sio.read8(Sio0::BASE).unwrap(), 0xFF);
         assert_eq!(sio.read16(Sio0::BASE).unwrap(), 0x00FF);
     }
@@ -312,7 +323,10 @@ mod tests {
 
     #[test]
     fn tx_fills_rx_with_ff_and_sets_stat_bit() {
+        // Test the no-device path explicitly — with the default pad
+        // attached, TX 0x01 now selects the pad and returns 0x41.
         let mut sio = Sio0::new();
+        sio.attach_port1(crate::pad::PortDevice::empty());
         sio.write8(Sio0::BASE, 0x01);
         let s = sio.read32(Sio0::BASE + 0x4).unwrap();
         assert_eq!(s & 0x2, 0x2, "RX_NOT_EMPTY must be set after TX");
