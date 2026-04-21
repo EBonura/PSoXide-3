@@ -13,9 +13,9 @@ mod app;
 mod audio;
 mod cli;
 mod disasm;
-mod gamepad;
 mod gfx;
 mod icons;
+mod input;
 mod theme;
 mod ui;
 
@@ -87,10 +87,13 @@ struct Shell {
     /// (headless CI, devices that can't open a stereo stream).
     /// Emulation keeps running regardless — silence is fine.
     audio: Option<audio::AudioOut>,
-    /// Host gamepad input. Always constructible; a missing pad
-    /// or failed gilrs init just produces empty button masks so
-    /// the keyboard path keeps working.
-    gamepad: gamepad::Gamepad,
+    /// Host input router — tracks every connected gamepad, emits
+    /// merged PSX pad-1 masks, detects the Select+Start chord
+    /// that opens the Menu, and logs connect / disconnect events
+    /// for diagnosing missing controllers. Always constructible;
+    /// a failed gilrs init just produces empty frames so the
+    /// keyboard path keeps working.
+    input: input::InputRouter,
 }
 
 impl Default for Shell {
@@ -110,9 +113,11 @@ impl Shell {
         } else {
             eprintln!("[audio] no host output device available — running silent");
         }
-        let gamepad = gamepad::Gamepad::new();
-        if gamepad.is_connected() {
-            eprintln!("[gamepad] {} connected", gamepad.name());
+        let input = input::InputRouter::new();
+        if input.is_connected() {
+            eprintln!("[input] already-connected pads: {}", input.connected_names());
+        } else {
+            eprintln!("[input] no pads connected at startup — watching for hot-plug");
         }
         Self {
             graphics: None,
@@ -122,7 +127,7 @@ impl Shell {
             pad1_mask: 0,
             fullscreen,
             audio,
-            gamepad,
+            input,
         }
     }
 }
@@ -252,12 +257,40 @@ impl ApplicationHandler for Shell {
 
                 let mut input = std::mem::take(&mut self.pending_input);
 
+                // Poll the gamepad router BEFORE doing anything
+                // else for this frame: the event drain is what
+                // lets gilrs notice hot-plugged Bluetooth pads, so
+                // we can't gate it on run state. We then merge the
+                // frame's edges into `MenuInput` and keep the merged
+                // mask handy for the run branch further down.
+                let pad_frame = self.input.poll();
+                if pad_frame.toggle_menu {
+                    // Select+Start is the gamepad equivalent of
+                    // Escape — route it into the same `toggle_open`
+                    // path so there's exactly one place that decides
+                    // what "PS button" does based on current state.
+                    input.toggle_open = true;
+                }
+                // When the Menu is open OR currently paused, the
+                // gamepad doubles as the menu navigator. D-pad /
+                // left-stick edges become up/down/left/right, Cross
+                // is Enter, Circle is Back. `|=` so keyboard and
+                // pad can both contribute — last-one-wins semantics
+                // don't matter at this granularity.
+                input.up |= pad_frame.menu_up;
+                input.down |= pad_frame.menu_down;
+                input.left |= pad_frame.menu_left;
+                input.right |= pad_frame.menu_right;
+                input.confirm |= pad_frame.menu_confirm;
+                input.back |= pad_frame.menu_back;
+
                 // Escape is the "PS button" — it toggles between
                 // "game running" and "game paused + menu open".
                 // Intercept it here so the Menu doesn't also interpret
                 // it as a navigation input. The user pressed Escape
-                // to swap contexts, not to press "back" on whatever
-                // menu item happened to be highlighted.
+                // (or Select+Start, now) to swap contexts, not to
+                // press "back" on whatever menu item happened to
+                // be highlighted.
                 if input.toggle_open {
                     input.toggle_open = false;
                     input.back = false;
@@ -303,10 +336,13 @@ impl ApplicationHandler for Shell {
                 if self.state.running {
                     // Merge the current keyboard-derived pad mask with
                     // gamepad input before stepping, so the game/homebrew
-                    // sees fresh input this frame.
-                    let pad_mask = self.pad1_mask | self.gamepad.poll_buttons();
-                    let (rx, ry) = self.gamepad.right_stick();
-                    let (lx, ly) = self.gamepad.left_stick();
+                    // sees fresh input this frame. `pad_frame.pad1_mask`
+                    // already has the Select+Start chord stripped for
+                    // the frame the chord fires — prevents in-game
+                    // handlers from seeing the "open menu" combo.
+                    let pad_mask = self.pad1_mask | pad_frame.pad1_mask;
+                    let (rx, ry) = pad_frame.right_stick;
+                    let (lx, ly) = pad_frame.left_stick;
                     if let Some(bus) = self.state.bus.as_mut() {
                         bus.set_port1_buttons(emulator_core::ButtonState::from_bits(pad_mask));
                         // Forward analog sticks to the pad's analog
