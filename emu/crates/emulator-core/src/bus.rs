@@ -442,12 +442,20 @@ impl Bus {
     /// Advance the cycle counter by `n` cycles and run any scheduled
     /// peripheral events that have come due. Called once per
     /// instruction from `Cpu::step` (charging BIAS before the opcode).
+    ///
+    /// CDROM is deliberately NOT processed here — only at
+    /// `drain_scheduler_events_post_op`, which the CPU calls at
+    /// branch-delay-slot boundaries. That matches Redux's
+    /// `branchTest` timing (psxinterpreter.cc:1650) where CDROM
+    /// `interrupt()` fires at end-of-delay-slot, not on every
+    /// instruction. Ticking CDROM on every BIAS makes our ACK
+    /// land one or two instructions earlier than Redux's — long
+    /// enough for a CDROM-polling spin-wait (e.g. MGS's BIOS
+    /// ReadTOC-Ack wait at step ~90M) to see a different register
+    /// byte than Redux and exit the loop early.
     pub fn tick(&mut self, n: u32) {
         self.advance_cycles(n);
         self.drain_scheduler_events();
-        if self.cdrom.tick(self.cycles) && self.cdrom.should_wake_cpu() {
-            self.irq.raise(IrqSource::Cdrom);
-        }
     }
 
     /// Public entry point that the CPU calls between the opcode's
