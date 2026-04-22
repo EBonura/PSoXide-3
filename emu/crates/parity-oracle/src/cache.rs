@@ -12,9 +12,10 @@
 //!
 //! The file format is intentionally simple — raw little-endian
 //! `InstructionRecord`s with a header. No compression yet; a 50M
-//! step cache is ~7 GiB. When this starts hurting we swap in zstd
-//! streaming; the header carries a version so older caches get
-//! invalidated automatically.
+//! step cache is ~20 GiB at v2 (was ~7 GiB at v1, before COP2
+//! capture). When this starts hurting we swap in zstd streaming;
+//! the header carries a version so older caches get invalidated
+//! automatically.
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -28,10 +29,12 @@ use psx_trace::InstructionRecord;
 /// Magic bytes at the start of every cache file.
 const MAGIC: &[u8; 8] = b"PSXTRACE";
 /// Current cache-file format version. Bump whenever the on-disk
-/// layout changes in an incompatible way.
-const VERSION: u32 = 1;
-/// Bytes per record: `tick(8) + pc(4) + instr(4) + gprs(32*4) = 144`.
-const RECORD_BYTES: usize = 8 + 4 + 4 + 32 * 4;
+/// layout changes in an incompatible way. v2 added the GTE register
+/// snapshot (`cop2_data` + `cop2_ctl`) — 256 bytes per record.
+const VERSION: u32 = 2;
+/// Bytes per record:
+///   `tick(8) + pc(4) + instr(4) + gprs(32*4) + cop2_data(32*4) + cop2_ctl(32*4) = 400`.
+const RECORD_BYTES: usize = 8 + 4 + 4 + 32 * 4 + 32 * 4 + 32 * 4;
 
 /// Cache location — environment-overridable, so CI machines can
 /// stash caches under a different volume. Defaults to
@@ -310,31 +313,53 @@ impl StreamingWriter {
     }
 }
 
+/// Layout (all little-endian):
+///   `[0..8) tick | [8..12) pc | [12..16) instr | [16..144) gprs |`
+///   `[144..272) cop2_data | [272..400) cop2_ctl`.
+const GPRS_OFF: usize = 16;
+const COP2_DATA_OFF: usize = GPRS_OFF + 32 * 4;
+const COP2_CTL_OFF: usize = COP2_DATA_OFF + 32 * 4;
+
 fn encode_record(r: &InstructionRecord, buf: &mut [u8; RECORD_BYTES]) {
     buf[0..8].copy_from_slice(&r.tick.to_le_bytes());
     buf[8..12].copy_from_slice(&r.pc.to_le_bytes());
     buf[12..16].copy_from_slice(&r.instr.to_le_bytes());
-    for (i, g) in r.gprs.iter().enumerate() {
-        let off = 16 + i * 4;
-        buf[off..off + 4].copy_from_slice(&g.to_le_bytes());
-    }
+    encode_u32_block(&r.gprs, &mut buf[GPRS_OFF..COP2_DATA_OFF]);
+    encode_u32_block(&r.cop2_data, &mut buf[COP2_DATA_OFF..COP2_CTL_OFF]);
+    encode_u32_block(&r.cop2_ctl, &mut buf[COP2_CTL_OFF..]);
 }
 
 fn decode_record(buf: &[u8; RECORD_BYTES]) -> InstructionRecord {
     let tick = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let pc = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let instr = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-    let mut gprs = [0u32; 32];
-    for i in 0..32 {
-        let off = 16 + i * 4;
-        gprs[i] = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-    }
+    let gprs = decode_u32_block(&buf[GPRS_OFF..COP2_DATA_OFF]);
+    let cop2_data = decode_u32_block(&buf[COP2_DATA_OFF..COP2_CTL_OFF]);
+    let cop2_ctl = decode_u32_block(&buf[COP2_CTL_OFF..]);
     InstructionRecord {
         tick,
         pc,
         instr,
         gprs,
+        cop2_data,
+        cop2_ctl,
     }
+}
+
+fn encode_u32_block(src: &[u32; 32], dst: &mut [u8]) {
+    for (i, v) in src.iter().enumerate() {
+        let off = i * 4;
+        dst[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn decode_u32_block(src: &[u8]) -> [u32; 32] {
+    let mut out = [0u32; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let off = i * 4;
+        *slot = u32::from_le_bytes(src[off..off + 4].try_into().unwrap());
+    }
+    out
 }
 
 /// Cheap non-cryptographic hash: FNV-1a 64. Good enough to
@@ -357,11 +382,18 @@ mod tests {
     fn sample_record(tick: u64) -> InstructionRecord {
         let mut gprs = [0u32; 32];
         gprs[3] = tick as u32;
+        let mut cop2_data = [0u32; 32];
+        cop2_data[7] = tick as u32; // OTZ
+        cop2_data[24] = (tick as u32).wrapping_mul(7); // MAC0
+        let mut cop2_ctl = [0u32; 32];
+        cop2_ctl[31] = 0x8000_F000; // FLAG sentinel
         InstructionRecord {
             tick,
             pc: 0xBFC0_0000 + (tick as u32) * 4,
             instr: 0xDEAD_BEEF,
             gprs,
+            cop2_data,
+            cop2_ctl,
         }
     }
 

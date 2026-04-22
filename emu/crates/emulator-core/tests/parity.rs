@@ -62,8 +62,17 @@ fn our_trace(
             while cpu.in_irq_handler() {
                 match cpu.step(&mut bus) {
                     Ok(r) => {
+                        // Fold post-IRQ state forward as if the
+                        // handler ran atomically. COP2 must come
+                        // along too — a GTE op tucked inside an
+                        // IRQ handler is rare on real games but
+                        // the BIOS does poke COP0/MTC2-style ops
+                        // during init, and dropping the snapshot
+                        // would mask divergences in those slots.
                         rec.tick = r.tick;
                         rec.gprs = r.gprs;
+                        rec.cop2_data = r.cop2_data;
+                        rec.cop2_ctl = r.cop2_ctl;
                     }
                     Err(e) => {
                         records.push(rec);
@@ -132,6 +141,22 @@ fn redux_trace_cached(n: usize) -> Vec<InstructionRecord> {
     records
 }
 
+/// Software-visible names for the 32 COP2 (GTE) data registers,
+/// in `MFC2` index order. Used only for divergence diagnostics.
+const COP2_DATA_NAMES: [&str; 32] = [
+    "VXY0", "VZ0", "VXY1", "VZ1", "VXY2", "VZ2", "RGBC", "OTZ", "IR0", "IR1", "IR2", "IR3",
+    "SXY0", "SXY1", "SXY2", "SXYP", "SZ0", "SZ1", "SZ2", "SZ3", "RGB0", "RGB1", "RGB2", "RES1",
+    "MAC0", "MAC1", "MAC2", "MAC3", "IRGB", "ORGB", "LZCS", "LZCR",
+];
+
+/// Software-visible names for the 32 COP2 (GTE) control registers,
+/// in `CFC2` index order. Used only for divergence diagnostics.
+const COP2_CTL_NAMES: [&str; 32] = [
+    "R11R12", "R13R21", "R22R23", "R31R32", "R33", "TRX", "TRY", "TRZ", "L11L12", "L13L21",
+    "L22L23", "L31L32", "L33", "RBK", "GBK", "BBK", "LR1LR2", "LR3LG1", "LG2LG3", "LB1LB2", "LB3",
+    "RFC", "GFC", "BFC", "OFX", "OFY", "H", "DQA", "DQB", "ZSF3", "ZSF4", "FLAG",
+];
+
 /// Compare trace by trace. Return the index of the first mismatch,
 /// if any.
 ///
@@ -144,7 +169,12 @@ fn first_divergence(
     let pairs = ours.len().min(theirs.len());
     for i in 0..pairs {
         let (us, them) = (&ours[i], &theirs[i]);
-        if us.pc == them.pc && us.instr == them.instr && us.gprs == them.gprs {
+        if us.pc == them.pc
+            && us.instr == them.instr
+            && us.gprs == them.gprs
+            && us.cop2_data == them.cop2_data
+            && us.cop2_ctl == them.cop2_ctl
+        {
             continue;
         }
 
@@ -193,6 +223,26 @@ fn first_divergence(
                 lines.push(format!(
                     "  $r{:<2}:  ours=0x{:08x}  theirs=0x{:08x}",
                     r, us.gprs[r], them.gprs[r]
+                ));
+            }
+        }
+        for r in 0..32 {
+            if us.cop2_data[r] != them.cop2_data[r] {
+                lines.push(format!(
+                    "  cop2d[{r:<2}] {name:<5}: ours=0x{:08x}  theirs=0x{:08x}",
+                    us.cop2_data[r],
+                    them.cop2_data[r],
+                    name = COP2_DATA_NAMES[r],
+                ));
+            }
+        }
+        for r in 0..32 {
+            if us.cop2_ctl[r] != them.cop2_ctl[r] {
+                lines.push(format!(
+                    "  cop2c[{r:<2}] {name:<7}: ours=0x{:08x}  theirs=0x{:08x}",
+                    us.cop2_ctl[r],
+                    them.cop2_ctl[r],
+                    name = COP2_CTL_NAMES[r],
                 ));
             }
         }

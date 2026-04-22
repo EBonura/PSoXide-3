@@ -125,6 +125,11 @@ pub struct Gte {
     mac: [i32; 3],
     /// LZCS / LZCR — leading-zero counter input / result. Writing
     /// LZCS recomputes LZCR; reads of LZCR return the cached value.
+    /// At reset both are zero — LZCR is *not* eagerly seeded to 32
+    /// (the canonical lzcnt of LZCS=0). Real software always writes
+    /// LZCS before reading LZCR, but the parity oracle (PCSX-Redux)
+    /// snapshots raw register storage which is `memset(0)` on boot,
+    /// so we must match that to keep step-0 traces identical.
     lzcs: u32,
     lzcr: u32,
 
@@ -180,7 +185,7 @@ impl Gte {
             mac0: 0,
             mac: [0; 3],
             lzcs: 0,
-            lzcr: 32,
+            lzcr: 0,
             rotation: [[0; 3]; 3],
             translation: [0; 3],
             light: [[0; 3]; 3],
@@ -1327,10 +1332,10 @@ mod tests {
     fn reset_state_is_zero() {
         let g = Gte::new();
         for i in 0..32 {
-            // LZCR seeds to 32 — the leading-zero count of the zeroed
-            // LZCS input is "all 32 bits are leading zeros".
-            let expected = if i == 31 { 32 } else { 0 };
-            assert_eq!(g.read_data(i), expected, "data reg {i}");
+            // Including LZCR (reg 31): Redux memsets register storage
+            // to zero on boot and only updates LZCR when LZCS is
+            // written. We mirror that so step-0 parity traces match.
+            assert_eq!(g.read_data(i), 0, "data reg {i}");
         }
         for i in 0..31 {
             assert_eq!(g.read_control(i), 0, "ctrl reg {i} should reset to 0");

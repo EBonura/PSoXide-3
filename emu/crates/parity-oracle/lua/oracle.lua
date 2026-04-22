@@ -41,6 +41,13 @@ end
 -- addresses are stable for the life of the emulator.
 local ram_ptr, rom_ptr, regs
 
+-- COP2 (GTE) accessors resolved at startup. `regs.CP2D` and `regs.CP2C`
+-- are unions in `psxregisters.h` with a `r[32]` array view; the FFI
+-- binding exposes that array directly. If the build doesn't expose
+-- them we abort the harness loudly rather than silently emitting zeros
+-- that would defeat GTE parity comparison.
+local cop2d_ptr, cop2c_ptr
+
 -- Invocation counter for `run` — diagnostic aid: if this ever exceeds 1
 -- we know `PCSX.nextTick(run)` is firing more than once and can track
 -- down the cause. Sent as a tag on the `ready` message.
@@ -58,14 +65,87 @@ local function read_instruction(pc)
     return 0
 end
 
-local function encode_record(tick, pc, instr, gpr_ptr)
+-- Format `[v0,v1,...,v31]` from a 32-entry u32 cdata array. Used for
+-- GPRs and COP2 control regs where the raw `r[i]` view already
+-- matches the software-visible (CFC2) value.
+local function format_u32_array(ptr)
     local parts = {}
     for i = 0, 31 do
-        parts[i + 1] = tostring(tonumber(gpr_ptr[i]))
+        parts[i + 1] = tostring(tonumber(ptr[i]))
     end
+    return table.concat(parts, ",")
+end
+
+-- Sign-extend the low 16 bits of `v` to 32. Used to mirror Redux's
+-- `MFC2_internal` canonicalization for the half-word data registers.
+local function sext16(v)
+    local lo = bit.band(v, 0xFFFF)
+    if bit.band(lo, 0x8000) ~= 0 then
+        return bit.bor(lo, 0xFFFF0000)
+    end
+    return lo
+end
+
+-- Saturate `v` (treated as int32) to [0, 0x1F]. Used for IRGB packing
+-- where each component is `IR / 128` clamped to a 5-bit field.
+local function sat5(v)
+    if v < 0 then return 0 end
+    if v > 0x1F then return 0x1F end
+    return v
+end
+
+-- Mirror Redux's `MFC2_internal(reg)` semantics WITHOUT mutating
+-- Redux's storage. Returns the value software would observe via
+-- `mfc2 rt, $rd`. Necessary because between an MTC2 (which stores
+-- the raw 32-bit input into `r[reg]`) and the next MFC2 (which
+-- canonicalizes), `r[reg]` carries a stale high half for the
+-- half-word registers — a non-issue for software but a divergence
+-- against any emulator that returns the canonical view directly.
+--
+-- Cases mirror gte.cc:282-314.
+local function cop2_data_view(p, reg)
+    local raw = tonumber(p[reg])
+    if reg == 1 or reg == 3 or reg == 5
+        or reg == 8 or reg == 9 or reg == 10 or reg == 11 then
+        -- Sign-extend low halfword: VZ0, VZ1, VZ2, IR0, IR1, IR2, IR3.
+        return sext16(raw)
+    end
+    if reg == 7 or reg == 16 or reg == 17 or reg == 18 or reg == 19 then
+        -- Zero-extend low halfword: OTZ, SZ0..SZ3.
+        return bit.band(raw, 0xFFFF)
+    end
+    if reg == 15 then
+        -- SXYP mirrors SXY2 on read.
+        return tonumber(p[14])
+    end
+    if reg == 28 or reg == 29 then
+        -- IRGB/ORGB: pack `(IRn >> 7)` clamped to 5 bits, low to high.
+        local r5 = sat5(bit.arshift(sext16(tonumber(p[9])), 7))
+        local g5 = sat5(bit.arshift(sext16(tonumber(p[10])), 7))
+        local b5 = sat5(bit.arshift(sext16(tonumber(p[11])), 7))
+        return bit.bor(r5, bit.lshift(g5, 5), bit.lshift(b5, 10))
+    end
+    return raw
+end
+
+-- Format the COP2 data-register snapshot as a JSON array, applying
+-- the MFC2-canonical view to each register so output matches what
+-- the emulator's `read_data(idx)` returns.
+local function format_cop2_data(ptr)
+    local parts = {}
+    for i = 0, 31 do
+        parts[i + 1] = tostring(cop2_data_view(ptr, i))
+    end
+    return table.concat(parts, ",")
+end
+
+local function encode_record(tick, pc, instr, gpr_ptr)
     return string.format(
-        '{"tick":%d,"pc":%d,"instr":%d,"gprs":[%s]}',
-        tick, pc, instr, table.concat(parts, ",")
+        '{"tick":%d,"pc":%d,"instr":%d,"gprs":[%s],"cop2_data":[%s],"cop2_ctl":[%s]}',
+        tick, pc, instr,
+        format_u32_array(gpr_ptr),
+        format_cop2_data(cop2d_ptr),
+        format_u32_array(cop2c_ptr)
     )
 end
 
@@ -84,6 +164,21 @@ local function run()
     ram_ptr = PCSX.getMemPtr()
     rom_ptr = PCSX.getRomPtr()
     regs = PCSX.getRegisters()
+
+    -- COP2 register access via the unioned `r[32]` view. Both
+    -- `psxCP2Data` and `psxCP2Ctrl` carry the same shape — one or
+    -- both being absent means the Redux build's Lua bindings don't
+    -- expose the GTE registers, in which case we can't do GTE
+    -- parity at all and abort the harness loudly. Silently emitting
+    -- zeros would mask every real GTE divergence.
+    local ok_d, d_view = pcall(function() return regs.CP2D and regs.CP2D.r end)
+    local ok_c, c_view = pcall(function() return regs.CP2C and regs.CP2C.r end)
+    if not (ok_d and d_view and ok_c and c_view) then
+        send("err startup: COP2 (regs.CP2D.r / regs.CP2C.r) not exposed by this Redux build; rebuild with GTE Lua bindings")
+        return
+    end
+    cop2d_ptr = d_view
+    cop2c_ptr = c_view
 
     send("ready")
 

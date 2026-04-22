@@ -9,15 +9,13 @@
 //! - Reverb (work area regs are writable, but the mix path is
 //!   disabled — games that rely on reverb for mood will sound dry
 //!   but still play correctly).
-//! - Volume sweep (bit 15 of a volume reg). Very rare; we approximate
-//!   by taking the non-sweep portion as the static level.
-//! - Pitch modulation (FMod). Implemented as a pass-through — voices
-//!   with FMod enabled still play, just without the sibling voice's
-//!   sample modulating their frequency.
-//! - Noise generator. Voices flagged for noise play silence for now.
-//! - XA ADPCM streaming (CD-DA audio / in-game speech).
-//! - Gaussian / cubic sample interpolation. We use linear
-//!   interpolation — cheap, clean, and audibly fine.
+//! - XA ADPCM streaming (CD-DA audio / in-game speech) is decoded by
+//!   the CDROM module; the SPU exposes [`xa_decode_block`] for it but
+//!   does not call it from `tick_sample`.
+//!
+//! Already in: 1024-entry Gaussian sample interpolation (`GAUSS_TABLE`),
+//! per-voice volume-sweep envelopes animated each sample (matches
+//! Redux's rate tables).
 //!
 //! Reference implementations consulted:
 //! - PCSX-Redux `src/spu/{spu,adsr,registers,dma}.cc` (GPL-2+) for
@@ -755,36 +753,56 @@ impl Spu {
             last_sample_cycle: 0,
             samples_produced: 0,
             irq_pending: false,
-            noise_val: 0,
+            // Redux/hardware reset value — must be non-zero or the
+            // LFSR's NoiseWaveAdd lookup is stuck at index 0 forever.
+            noise_val: 1,
             noise_counter: 0,
         }
     }
 
-    /// Advance the noise generator by one SPU sample. Uses a
-    /// linear-feedback shift register (LFSR) equivalent to the
-    /// PSX hardware's noise tap. Called from `tick_sample` after
-    /// voices have been processed but before mix.
+    /// Advance the noise generator by one SPU sample. Port of
+    /// PCSX-Redux's `NoiseClock` (Dr. Hell / Xebra algorithm), which
+    /// in turn matches measurements from a real PSX SPU.
     ///
-    /// SPUCNT bits 8-13 control the rate: bits 8-9 = "step"
-    /// (0..3), bits 10-13 = "shift" (0..15). Higher shift → slower
-    /// update → lower-frequency noise. We use a simple linear
-    /// approximation: tick every `(1 + shift) * (1 + step)`
-    /// samples.
+    /// SPUCNT bits 13:8 form a single 6-bit `noise_clock` field
+    /// (high 4 bits = shift, low 2 bits = step). The threshold is
+    /// `(0x8000 >> (clock >> 2)) << 16`. Each sample we add `0x10000`
+    /// plus a fractional `NoiseFreqAdd[clock & 3]` to a 32-bit
+    /// counter; whenever it crosses the threshold the LFSR shifts
+    /// left and feeds in the new low bit from `NoiseWaveAdd[(val>>10) & 63]`.
     fn noise_tick(&mut self) {
-        let shift = ((self.spucnt >> 10) & 0xF) as u32;
-        let step = ((self.spucnt >> 8) & 0x3) as u32;
-        // Approximate period: small for low shift, large for high.
-        // Matches the relative rate PSX-SPX documents within ~10%
-        // — enough for the ear to hear the right octave of noise.
-        let period = (1u32 << shift) + step;
-        self.noise_counter = self.noise_counter.wrapping_add(1);
-        if self.noise_counter >= period {
-            self.noise_counter = 0;
-            // Fibonacci LFSR: taps at 15, 12, 11, 10 (Xorshift-ish,
-            // matches a common PSX noise approximation).
+        // Hardware "form" table — bit pattern injected into the
+        // LFSR low bit when it shifts.
+        const NOISE_WAVE_ADD: [u8; 64] = [
+            1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0,
+            1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0,
+            0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1,
+            0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1,
+        ];
+        // Hardware "fraction" table — sub-sample increment per
+        // step value (low 2 bits of clock); index 4 is the
+        // wraparound threshold.
+        const NOISE_FREQ_ADD: [u32; 5] = [0, 84, 140, 180, 210];
+
+        let clock = ((self.spucnt >> 8) & 0x3F) as u32;
+        let level = (0x8000u32 >> (clock >> 2)) << 16;
+
+        self.noise_counter = self.noise_counter.wrapping_add(0x10000);
+
+        let step_idx = (clock & 3) as usize;
+        self.noise_counter = self.noise_counter.wrapping_add(NOISE_FREQ_ADD[step_idx]);
+        if (self.noise_counter & 0xFFFF) >= NOISE_FREQ_ADD[4] {
+            self.noise_counter = self.noise_counter.wrapping_add(0x10000);
+            self.noise_counter = self.noise_counter.wrapping_sub(NOISE_FREQ_ADD[step_idx]);
+        }
+
+        if self.noise_counter >= level {
+            while self.noise_counter >= level {
+                self.noise_counter = self.noise_counter.wrapping_sub(level);
+            }
             let v = self.noise_val as u16;
-            let bit = ((v >> 15) ^ (v >> 12) ^ (v >> 11) ^ (v >> 10)) & 1;
-            self.noise_val = ((v << 1) | bit) as i16;
+            let new_bit = NOISE_WAVE_ADD[((v as u32 >> 10) & 63) as usize] as u16;
+            self.noise_val = ((v << 1) | new_bit) as i16;
         }
     }
 
@@ -1220,13 +1238,21 @@ impl Spu {
         self.reverb_vol_r.tick();
 
         // 2. For each voice, step envelope + ADPCM playback, accumulate
-        //    stereo contribution.
+        //    stereo contribution. Modulator voices (the N-1 voice when
+        //    PMon bit N is set) update `last_sample` for the modulated
+        //    voice's FMod read, but their own L/R contribution is
+        //    **suppressed** from the audible mix — matches Redux's
+        //    `if (FMod == 2) iFMod[ns] = sval; else { SSumL/R += ... }`
+        //    branch (`spu.cc:689`).
         let mut sum_l: i32 = 0;
         let mut sum_r: i32 = 0;
         for v in 0..NUM_VOICES {
             let (l, r) = self.tick_voice(v);
-            sum_l = sum_l.saturating_add(l as i32);
-            sum_r = sum_r.saturating_add(r as i32);
+            let is_modulator = v + 1 < NUM_VOICES && (self.pmon & (1 << (v + 1))) != 0;
+            if !is_modulator {
+                sum_l = sum_l.saturating_add(l as i32);
+                sum_r = sum_r.saturating_add(r as i32);
+            }
         }
 
         // 3. Mix CD audio input at CD_VOL_L/R. Source is the CDROM's
@@ -1311,11 +1337,16 @@ impl Spu {
             return 0;
         }
 
-        // Determine effective pitch. PMOn: voice N takes its pitch from
-        // voice N-1's most recent sample — we do the simple form that
-        // scales raw_pitch by (sample + 0x8000) / 0x8000. Exact Redux
-        // behaviour is more elaborate; this is a placeholder that at
-        // least doesn't corrupt playback.
+        // Determine effective pitch. PMOn: voice N takes its pitch
+        // from voice N-1's most recent post-ADSR sample. Formula is
+        // Redux's `FModChangeFrequency` (spu.cc:266):
+        //
+        //     NP = ((32768 + iFMod[ns]) * raw_pitch) / 32768
+        //     NP = clamp(NP, 1, 0x3FFF)
+        //
+        // Voice 0 cannot be modulated (no preceding voice). The
+        // modulator voice's own L/R output is suppressed from the
+        // audible mix in `tick_sample`.
         let mut pitch = self.voices[v].raw_pitch as u32;
         if v > 0 && self.pmon & (1 << v) != 0 {
             let prev = self.voices[v - 1].last_sample as i32;
@@ -2236,5 +2267,120 @@ mod tests {
             s.tick_sample(SAMPLE_CYCLES);
         }
         assert!(s.audio_queue_len() <= OUTPUT_BUFFER_CAP);
+    }
+
+    // -- Noise generator (Dr. Hell algorithm) --
+
+    #[test]
+    fn noise_seed_is_one() {
+        // The LFSR feedback table NoiseWaveAdd[0] = 1, so a zero
+        // seed would still flip the low bit on first step. But
+        // hardware/Redux start at 1 — keep the same so traces
+        // line up if/when we wire SPU into the parity oracle.
+        let s = Spu::new();
+        assert_eq!(s.noise_val, 1);
+    }
+
+    #[test]
+    fn noise_advances_when_clock_set() {
+        // noise_clock = (spucnt >> 8) & 0x3F. clock>>2 = bits 13:10
+        // of spucnt. Set those four bits to 0xF for the fastest
+        // shift rate: threshold = (0x8000 >> 15) << 16 = 0x10000.
+        // Per-sample increment is 0x10000 + NOISE_FREQ_ADD[step],
+        // so the LFSR shifts at least once per tick.
+        let mut s = Spu::new();
+        s.write16(SPUCNT, 0x3C00);
+        let v0 = s.noise_val;
+        s.noise_tick();
+        assert_ne!(s.noise_val, v0, "noise should shift at fastest rate");
+    }
+
+    #[test]
+    fn noise_period_grows_with_shift() {
+        // At shift=0 the LFSR shifts roughly once every 0x8000
+        // counter-units (0x8000 / 0x10000 per sample → many samples).
+        // Verify it does NOT shift in a single tick at slow rate.
+        let mut s = Spu::new();
+        s.write16(SPUCNT, 0x0000); // shift = 0
+        let v0 = s.noise_val;
+        s.noise_tick();
+        // Single tick adds 0x10000 < 0x8000_0000 — no shift.
+        assert_eq!(s.noise_val, v0);
+    }
+
+    // -- FMod / pitch modulation --
+
+    #[test]
+    fn fmod_modulator_voice_suppressed_from_lr_mix() {
+        // Voice 0 = modulator (its sample feeds voice 1's pitch).
+        // Voice 1 = modulated. Both are configured to emit a known
+        // non-zero sample; only voice 1 should reach the audible mix.
+        let mut s = Spu::new();
+        s.main_vol_l.write(0x3FFF);
+        s.main_vol_r.write(0x3FFF);
+
+        // Mark voice 1 as pitch-modulated by voice 0.
+        s.write16(PMON_LO, 0x0002);
+
+        // Configure both voices: full envelope, full volume,
+        // last_sample seeded directly so we don't depend on ADPCM.
+        for v in 0..2 {
+            let base = VOICE_BASE + (v as u32) * 16;
+            s.write16(base + voice_offset::VOLUME_L, 0x3FFF);
+            s.write16(base + voice_offset::VOLUME_R, 0x3FFF);
+            s.voices[v].phase = AdsrPhase::Sustain;
+            s.voices[v].envelope = 0x7FFF;
+            s.voices[v].last_sample = 0x4000;
+            // Block decode of zeros — voice mixes its envelope * sample.
+            s.voices[v].sample_buf = [0x4000; ADPCM_SAMPLES_PER_BLOCK];
+            s.voices[v].sample_index = 0;
+        }
+
+        s.tick_sample(SAMPLE_CYCLES);
+        let (l, r) = s.drain_audio()[0];
+
+        // Voice 0 (modulator) should NOT contribute. Voice 1 alone
+        // would produce one full-scale sample's worth of output.
+        // Bound it: total must be < 2× single-voice level.
+        let voice_only = (0x4000_i32 * 0x3FFF) >> 14;
+        assert!((l as i32) < voice_only * 3 / 2, "voice 0 leaked into L: l={l}");
+        assert!((r as i32) < voice_only * 3 / 2, "voice 0 leaked into R: r={r}");
+        // And greater than zero — voice 1 still played.
+        assert!(l > 0);
+        assert!(r > 0);
+    }
+
+    #[test]
+    fn fmod_modulator_still_updates_last_sample() {
+        // Even though voice 0's L/R is suppressed, its last_sample
+        // must still update so voice 1's FMod reads the right value.
+        let mut s = Spu::new();
+        s.write16(PMON_LO, 0x0002);
+        s.voices[0].phase = AdsrPhase::Sustain;
+        s.voices[0].envelope = 0x7FFF;
+        s.voices[0].sample_buf = [0x1234; ADPCM_SAMPLES_PER_BLOCK];
+        s.voices[0].sample_index = 0;
+        s.voices[1].raw_pitch = 0x1000;
+        s.voices[1].phase = AdsrPhase::Sustain;
+        s.voices[1].envelope = 0x7FFF;
+
+        s.tick_sample(SAMPLE_CYCLES);
+        // last_sample for voice 0 should be approximately envelope *
+        // sample (saturated), not zero.
+        assert!(s.voices[0].last_sample != 0, "modulator's last_sample was zeroed");
+    }
+
+    #[test]
+    fn noise_value_substitutes_for_voice_sample() {
+        // Voice 5 is in noise mode; fetch_voice_sample returns
+        // noise_val unchanged regardless of ADPCM state.
+        let mut s = Spu::new();
+        s.noise_on = 1 << 5;
+        s.noise_val = 0x1234;
+        // Must NOT touch ADPCM state — voice phase stays Off but
+        // we still get noise out (matches Redux: `iGetNoiseVal` is
+        // called regardless of ADSR state).
+        let out = s.fetch_voice_sample(5);
+        assert_eq!(out, 0x1234);
     }
 }

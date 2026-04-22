@@ -15,13 +15,17 @@ use serde::{Deserialize, Serialize};
 
 /// Format version. Bump whenever [`InstructionRecord`] gains or removes
 /// a field. Readers should reject records with an unexpected version.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// State snapshot after one instruction has executed.
 ///
-/// Fields marked "future" are omitted for now; JSON's schema flexibility
-/// lets us add them later without breaking old readers, so long as they
-/// default to a sensible value on the emitter side.
+/// `cop2_data` and `cop2_ctl` mirror the 32 GTE data + 32 GTE control
+/// registers as exposed by `MFC2` / `CFC2`. They are captured every
+/// step (not just on COP2 ops) so a divergence in GTE state surfaces
+/// at the instruction that produced it, not millions of cycles later
+/// when the bad value finally leaks into a GPR. The snapshot uses
+/// "software-visible" semantics (e.g. `H` reads back sign-extended,
+/// IRGB packs from IR1..3), not raw internal struct fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstructionRecord {
     /// Monotonically increasing cycle count since reset.
@@ -33,6 +37,22 @@ pub struct InstructionRecord {
     /// All 32 general-purpose registers after execution. `gprs[0]` must
     /// always be zero; emitters must not rely on the bus to maintain it.
     pub gprs: [u32; 32],
+    /// All 32 GTE data registers (`MFC2` view) after execution.
+    #[serde(default = "zero_regs")]
+    pub cop2_data: [u32; 32],
+    /// All 32 GTE control registers (`CFC2` view) after execution.
+    #[serde(default = "zero_regs")]
+    pub cop2_ctl: [u32; 32],
+}
+
+/// Default helper for `[u32; 32]` so older JSONL records (pre-v2)
+/// deserialize without the COP2 arrays — they show up as all-zero,
+/// which the parity comparator can treat as "no COP2 information
+/// available for this record". Lets us inspect a stray v1 JSONL line
+/// without crashing, even though normal cache invalidation throws v1
+/// caches away by file-format version.
+fn zero_regs() -> [u32; 32] {
+    [0; 32]
 }
 
 impl InstructionRecord {
@@ -51,17 +71,40 @@ impl InstructionRecord {
 mod tests {
     use super::*;
 
-    #[test]
-    fn jsonl_round_trips() {
-        let rec = InstructionRecord {
-            tick: 42,
+    fn sample(tick: u64) -> InstructionRecord {
+        let mut cop2_data = [0u32; 32];
+        cop2_data[6] = 0x8080_8080; // RGBC
+        cop2_data[8] = 0x0000_1234; // IR0
+        let mut cop2_ctl = [0u32; 32];
+        cop2_ctl[31] = 0x8000_F000; // FLAG
+        InstructionRecord {
+            tick,
             pc: 0xBFC0_0000,
             instr: 0x3C08_0013,
             gprs: [0; 32],
-        };
+            cop2_data,
+            cop2_ctl,
+        }
+    }
+
+    #[test]
+    fn jsonl_round_trips() {
+        let rec = sample(42);
         let line = rec.to_json_line();
         let parsed = InstructionRecord::from_json_line(&line).unwrap();
         assert_eq!(rec, parsed);
+    }
+
+    #[test]
+    fn v1_record_without_cop2_fields_parses_with_zero_defaults() {
+        // Pre-v2 records didn't carry cop2_data/cop2_ctl. The serde
+        // defaults must let the new schema parse them so a v1 cache
+        // can be inspected after upgrade — even though normal cache
+        // invalidation throws v1 caches away by file-format version.
+        let v1 = r#"{"tick":1,"pc":0,"instr":0,"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
+        let parsed = InstructionRecord::from_json_line(v1).unwrap();
+        assert_eq!(parsed.cop2_data, [0u32; 32]);
+        assert_eq!(parsed.cop2_ctl, [0u32; 32]);
     }
 
     #[test]
@@ -72,6 +115,8 @@ mod tests {
             pc: 0,
             instr: 0,
             gprs: [0; 32],
+            cop2_data: [0; 32],
+            cop2_ctl: [0; 32],
         };
         assert_eq!(rec.gprs[0], 0);
     }

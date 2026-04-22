@@ -1409,11 +1409,16 @@ impl Gpu {
     ) {
         // Wireframe debug mode: replace the filled fill with three
         // edge lines. Useful for visualising the geometry a game
-        // actually submits, independent of shading / texturing.
+        // actually submits, independent of shading / texturing —
+        // including over-sized triangles that would normally be
+        // dropped by the hardware extent check below.
         if self.wireframe_enabled {
             self.rasterize_line(v0, v1, color, color, mode, false);
             self.rasterize_line(v1, v2, color, color, mode, false);
             self.rasterize_line(v2, v0, color, color, mode, false);
+            return;
+        }
+        if triangle_exceeds_hw_extent(v0, v1, v2) {
             return;
         }
         // Flat triangles don't need Gouraud or UV interpolation, but
@@ -1641,6 +1646,9 @@ impl Gpu {
             let _ = (t0, t1, t2, clut_word, semi_trans, raw_texture);
             return;
         }
+        if triangle_exceeds_hw_extent(v0, v1, v2) {
+            return;
+        }
         let clut_x = (clut_word & 0x3F) * 16;
         let clut_y = (clut_word >> 6) & 0x1FF;
         let tpage_mode = self.tex_blend_mode;
@@ -1851,6 +1859,9 @@ impl Gpu {
             let _ = (t0, t1, t2, clut_word, semi_trans);
             return;
         }
+        if triangle_exceeds_hw_extent(v0, v1, v2) {
+            return;
+        }
         let clut_x = (clut_word & 0x3F) * 16;
         let clut_y = (clut_word >> 6) & 0x1FF;
         let tpage_mode = self.tex_blend_mode;
@@ -1943,6 +1954,9 @@ impl Gpu {
             self.rasterize_line_shaded(v0, v1, c0, c1, mode);
             self.rasterize_line_shaded(v1, v2, c1, c2, mode);
             self.rasterize_line_shaded(v2, v0, c2, c0, mode);
+            return;
+        }
+        if triangle_exceeds_hw_extent(v0, v1, v2) {
             return;
         }
         let min_x = v0.0.min(v1.0).min(v2.0).max(self.draw_area_left as i32);
@@ -2677,6 +2691,26 @@ fn shl10_idiv(x: i64, y: i64) -> i64 {
 }
 
 /// Core setup: sort 3 vertices by Y, pick which side has the pivot
+/// Hardware extent rule: any triangle whose vertex pairs span more
+/// than 1023 pixels horizontally or 511 vertically is silently
+/// dropped on real PS1 hardware. Off-screen geometry coming out of
+/// projection lands here constantly — without this gate it
+/// rasterises as a giant garbage smear instead of being culled.
+///
+/// The check is per-edge, not bounding-box: hardware compares each
+/// pair of vertices independently. Quads are already split into
+/// two triangles by the caller, so each half is gated separately —
+/// matching hardware behaviour where one half of a quad can survive
+/// while the other gets dropped.
+fn triangle_exceeds_hw_extent(v0: (i32, i32), v1: (i32, i32), v2: (i32, i32)) -> bool {
+    const MAX_DX: i32 = 1023;
+    const MAX_DY: i32 = 511;
+    let edges = [(v0, v1), (v1, v2), (v2, v0)];
+    edges
+        .iter()
+        .any(|(a, b)| (a.0 - b.0).abs() > MAX_DX || (a.1 - b.1).abs() > MAX_DY)
+}
+
 /// (the "middle" vertex v2), and seed left / right walks. Colour + UV
 /// are optional — pass zeros for the ones a particular primitive
 /// doesn't use. Returns the setup ready for the scanline loop, or
@@ -3839,5 +3873,91 @@ mod tests {
         assert_eq!(gpu.sample_texture(0, 0, 0, 0), None);
         gpu.vram.set_pixel(1, 0, 0x1234);
         assert_eq!(gpu.sample_texture(1, 0, 0, 0), Some(0x1234));
+    }
+
+    #[test]
+    fn extent_boundary_inclusive_keeps_triangle() {
+        // Exactly 1023 / 511 deltas are *kept* — only strictly greater
+        // is dropped. This matches the hardware spec that the punch
+        // list quotes ("|Δx| > 1023 or |Δy| > 511").
+        assert!(!triangle_exceeds_hw_extent(
+            (0, 0),
+            (1023, 0),
+            (0, 511),
+        ));
+    }
+
+    #[test]
+    fn extent_one_pixel_over_horizontal_drops() {
+        assert!(triangle_exceeds_hw_extent((0, 0), (1024, 0), (0, 0)));
+    }
+
+    #[test]
+    fn extent_one_pixel_over_vertical_drops() {
+        assert!(triangle_exceeds_hw_extent((0, 0), (0, 512), (0, 0)));
+    }
+
+    #[test]
+    fn extent_check_uses_absolute_value() {
+        // Negative deltas must trip the check too — typically a vertex
+        // at (-2000, 0) paired with (0, 0).
+        assert!(triangle_exceeds_hw_extent((-2000, 0), (0, 0), (0, 0)));
+        assert!(triangle_exceeds_hw_extent((0, 0), (0, 0), (0, -700)));
+    }
+
+    #[test]
+    fn extent_check_compares_every_edge() {
+        // First two vertices coincide (|Δ|=0), but v0→v2 is huge.
+        // A naive bounding-box check would still be 1024 wide and
+        // catch this; what we want to confirm is that edge pairs
+        // are visited even when one of them looks small.
+        assert!(triangle_exceeds_hw_extent((0, 0), (0, 0), (1024, 0)));
+        assert!(triangle_exceeds_hw_extent((1024, 0), (0, 0), (0, 0)));
+    }
+
+    #[test]
+    fn oversize_monochrome_triangle_is_dropped() {
+        // Submit a triangle whose v0→v1 edge is 1500px wide via the
+        // GP0 monochrome-tri command. Hardware drops it; we should
+        // too — VRAM stays untouched.
+        let mut gpu = Gpu::new();
+        gpu.write32(GP0_ADDR, 0x2000_00FF); // 0x20 cmd + red
+        gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
+        gpu.write32(GP0_ADDR, 0x0000_05DC); // v1 = (1500, 0) — 1500 > 1023
+        gpu.write32(GP0_ADDR, 0x0064_0064); // v2 = (100, 100)
+        // No pixel anywhere along the would-be triangle should be set.
+        for x in [0u16, 50, 100, 500, 1000, 1500] {
+            assert_eq!(
+                gpu.vram.get_pixel(x, 0),
+                0,
+                "pixel ({x}, 0) was written despite oversize triangle",
+            );
+        }
+    }
+
+    #[test]
+    fn oversize_quad_drops_only_the_oversize_half() {
+        // A four-vertex monochrome quad (GP0 0x28) splits into two
+        // triangles: (v0,v1,v2) and (v1,v2,v3). Build one where the
+        // first half is sane and the second half has v3 placed so
+        // its Δy from v1 exceeds 511 — only the bad half should be
+        // culled.
+        let mut gpu = Gpu::new();
+        gpu.write32(GP0_ADDR, 0x2800_00FF); // 0x28 + red
+        gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
+        gpu.write32(GP0_ADDR, 0x0000_0010); // v1 = (16, 0)
+        gpu.write32(GP0_ADDR, 0x0010_0000); // v2 = (0, 16)
+        // v3 = (16, 600) — |v3.y - v1.y| = 600 > 511, second triangle drops.
+        gpu.write32(GP0_ADDR, 0x0258_0010);
+        // Sane half wrote pixels.
+        assert_ne!(gpu.vram.get_pixel(1, 1), 0, "first half should rasterise");
+        // Oversize half left no pixels in the only place its
+        // bounding box could have reached (a row well below the
+        // sane half).
+        assert_eq!(
+            gpu.vram.get_pixel(8, 300),
+            0,
+            "oversize half should not rasterise",
+        );
     }
 }
