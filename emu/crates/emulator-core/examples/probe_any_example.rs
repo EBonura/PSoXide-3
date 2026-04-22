@@ -13,7 +13,7 @@ fn main() {
     let name = std::env::args().nth(1).expect("usage: probe_any_example <name>");
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("bios");
     let exe_path = format!(
-        "/Users/ebonura/Desktop/repos/PSoXide/build/examples/mipsel-sony-psx/release/{name}.exe"
+        "/Users/ebonura/Desktop/repos/psoxide/build/examples/mipsel-sony-psx/release/{name}.exe"
     );
     let exe_bytes = std::fs::read(&exe_path).expect("exe");
     let exe = Exe::parse(&exe_bytes).expect("parse");
