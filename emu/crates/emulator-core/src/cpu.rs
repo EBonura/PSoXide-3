@@ -421,6 +421,7 @@ impl Cpu {
     /// `MFC2`/`CFC2` accessors so the recorded values match what
     /// Redux's `regs.CP2D.r` / `regs.CP2C.r` expose. Pure read; no
     /// side effects.
+    #[cfg(feature = "trace-cop2")]
     fn snapshot_cop2(&self) -> ([u32; 32], [u32; 32]) {
         let mut data = [0u32; 32];
         let mut ctl = [0u32; 32];
@@ -429,6 +430,12 @@ impl Cpu {
             ctl[i as usize] = self.cop2.read_control(i);
         }
         (data, ctl)
+    }
+
+    #[cfg(not(feature = "trace-cop2"))]
+    #[inline(always)]
+    fn snapshot_cop2(&self) -> ([u32; 32], [u32; 32]) {
+        ([0u32; 32], [0u32; 32])
     }
 
     /// Decode and execute a single instruction. Does not advance PC
