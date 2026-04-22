@@ -7,8 +7,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use emulator_core::{Bus, Cpu};
-use psoxide_settings::{ConfigPaths, Library, LibraryEntry, Settings};
 use psoxide_settings::library::{GameKind, Region};
+use psoxide_settings::{ConfigPaths, Library, LibraryEntry, Settings};
 use psx_iso::{Disc, Exe, SECTOR_BYTES};
 use psx_trace::InstructionRecord;
 
@@ -248,8 +248,8 @@ impl AppState {
             eprintln!("[frontend] memcard flush before launch: {e}");
         }
         let bios_path = resolve_bios_path(&self.settings);
-        let bios = std::fs::read(&bios_path)
-            .map_err(|e| format!("BIOS {}: {e}", bios_path.display()))?;
+        let bios =
+            std::fs::read(&bios_path).map_err(|e| format!("BIOS {}: {e}", bios_path.display()))?;
         let mut bus = Bus::new(bios).map_err(|e| format!("BIOS rejected: {e}"))?;
         let mut cpu = Cpu::new();
 
@@ -296,10 +296,21 @@ impl AppState {
                 bus.attach_memcard_port1(mc_bytes);
             }
             GameKind::DiscCue => {
-                return Err("CUE handling is pending — point me at the BIN directly".into());
+                let disc = psoxide_settings::library::load_disc_from_cue(&entry.path)?;
+                bus.cdrom.insert_disc(Some(disc));
+                bus.attach_digital_pad_port1();
+                self.paths
+                    .ensure_game_tree(&entry.id)
+                    .map_err(|e| e.to_string())?;
+                let mc_path = self.paths.memcard_file(&entry.id, 1);
+                let mc_bytes = std::fs::read(&mc_path).unwrap_or_default();
+                bus.attach_memcard_port1(mc_bytes);
             }
             GameKind::Unknown => {
-                return Err(format!("unsupported game kind for {}", entry.path.display()));
+                return Err(format!(
+                    "unsupported game kind for {}",
+                    entry.path.display()
+                ));
             }
         }
 
@@ -327,49 +338,11 @@ impl AppState {
     /// it. The Menu dispatches [`MenuAction::LaunchGame`] with only
     /// the ID, and we resolve it here so the Menu never needs a
     /// reference to the full library.
-    ///
-    /// For CUE entries the Menu lists, the `id` is the CUE's own
-    /// stable ID. CUEs aren't bootable directly — we have to
-    /// re-read the CUE to find its data-track BIN and launch
-    /// that. The BIN keeps its own `LibraryEntry` (for size /
-    /// mtime tracking) but borrows the CUE's friendly title.
     pub fn launch_by_id(&mut self, id: &str) -> Result<(), String> {
         let Some(entry) = self.library.entries.iter().find(|e| e.id == id).cloned() else {
             return Err(format!("no library entry with id={id}"));
         };
-
-        match entry.kind {
-            GameKind::DiscCue => {
-                // Resolve the CUE's primary BIN, then look up
-                // *that* path in the library to get the BIN's
-                // LibraryEntry (so launch_entry's kind-dispatch
-                // takes the DiscBin branch).
-                let bin_path =
-                    psoxide_settings::library::primary_bin_from_cue(&entry.path)
-                        .ok_or_else(|| {
-                            format!(
-                                "could not find data-track BIN in CUE {}",
-                                entry.path.display()
-                            )
-                        })?;
-                let bin_entry = self
-                    .library
-                    .entries
-                    .iter()
-                    .find(|e| e.path == bin_path)
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "CUE {} references BIN {} but it's not in the library — \
-                             scan the directory first",
-                            entry.path.display(),
-                            bin_path.display()
-                        )
-                    })?;
-                self.launch_entry(&bin_entry)
-            }
-            _ => self.launch_entry(&entry),
-        }
+        self.launch_entry(&entry)
     }
 
     /// Walk the configured library root(s) and update the cache.
@@ -469,9 +442,8 @@ impl AppState {
     ///    audio rips (Track 2..N), prefer the CUE-linked title if
     ///    one exists, and skip BINs that map to the *same* CUE as
     ///    an earlier BIN (dedup). For CUE entries: hidden from the
-    ///    games list — they're not independently bootable and
-    ///    their BIN is already listed. For EXE entries: into
-    ///    Examples.
+    ///    games list because the owning BIN already appears there
+    ///    under the CUE's title/ID. For EXE entries: into Examples.
     /// 3. Alphabetise each column.
     ///
     /// Result: Crash Bandicoot shows once, under its friendly
@@ -506,7 +478,8 @@ impl AppState {
             // Audio tracks: any "(Track N)" filename where N != 1.
             // Multi-track CUE rips leave each audio track as a
             // standalone BIN; none of those boot, so hide them.
-            if label.contains("(Track ") && !label.contains("(Track 01)")
+            if label.contains("(Track ")
+                && !label.contains("(Track 01)")
                 && !label.contains("(Track 1)")
             {
                 continue;
@@ -521,8 +494,7 @@ impl AppState {
                     // *first* BIN of a CUE wins; subsequent BINs
                     // (multi-disc sets not yet modelled) are
                     // hidden to keep the list clean.
-                    let (title, id) = if let Some((cue_title, cue_id)) = cue_owns_bin.get(&e.path)
-                    {
+                    let (title, id) = if let Some((cue_title, cue_id)) = cue_owns_bin.get(&e.path) {
                         if !cue_already_listed.insert(cue_id.clone()) {
                             continue;
                         }
@@ -576,9 +548,8 @@ impl AppState {
             self.paths
                 .ensure_game_tree(&game)
                 .map_err(|e| e.to_string())?;
-            std::fs::write(&path, &bytes).map_err(|e| {
-                format!("save memcard {}: {e}", path.display())
-            })?;
+            std::fs::write(&path, &bytes)
+                .map_err(|e| format!("save memcard {}: {e}", path.display()))?;
             eprintln!(
                 "[frontend] persisted port-1 memcard → {} ({} bytes)",
                 path.display(),
@@ -755,27 +726,46 @@ fn load_exe() -> Option<Exe> {
     }
 }
 
-/// Read `PSOXIDE_DISC` → BIN file → `Disc`. Logs and returns `None` on
-/// any trouble so a misconfigured path doesn't wedge the frontend.
+/// Read `PSOXIDE_DISC` → disc image → `Disc`. Accepts raw BIN/ISO and
+/// CUE-backed multitrack images. Logs and returns `None` on any trouble
+/// so a misconfigured path doesn't wedge the frontend.
 fn load_disc() -> Option<Disc> {
     let var = std::env::var("PSOXIDE_DISC").ok()?;
     let path = PathBuf::from(&var);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("[frontend] PSOXIDE_DISC={} unreadable: {e}", path.display());
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let disc = if ext == "cue" {
+        match psoxide_settings::library::load_disc_from_cue(&path) {
+            Ok(disc) => disc,
+            Err(e) => {
+                eprintln!(
+                    "[frontend] PSOXIDE_DISC={} unreadable CUE: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        }
+    } else {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[frontend] PSOXIDE_DISC={} unreadable: {e}", path.display());
+                return None;
+            }
+        };
+        if bytes.len() < SECTOR_BYTES {
+            eprintln!(
+                "[frontend] PSOXIDE_DISC={} too small ({} bytes, need at least {SECTOR_BYTES})",
+                path.display(),
+                bytes.len()
+            );
             return None;
         }
+        Disc::from_bin(bytes)
     };
-    if bytes.len() < SECTOR_BYTES {
-        eprintln!(
-            "[frontend] PSOXIDE_DISC={} too small ({} bytes, need at least {SECTOR_BYTES})",
-            path.display(),
-            bytes.len()
-        );
-        return None;
-    }
-    let disc = Disc::from_bin(bytes);
     eprintln!(
         "[frontend] mounted disc {} ({} sectors)",
         path.display(),

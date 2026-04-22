@@ -26,6 +26,7 @@
 
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 pub mod exe;
@@ -42,39 +43,206 @@ pub const SECTOR_USER_DATA_OFFSET: usize = 24;
 /// User-data size per sector.
 pub const SECTOR_USER_DATA_BYTES: usize = 2048;
 
-/// A loaded disc image. Holds the raw BIN bytes and answers
-/// sector-read requests.
+/// PS1 track type from a CUE sheet / disc TOC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackType {
+    /// Mode-2 data track.
+    Data,
+    /// Red Book audio track.
+    Audio,
+}
+
+/// One track in a loaded disc image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Track {
+    /// 1-based track number.
+    pub number: u8,
+    /// Data vs audio.
+    pub track_type: TrackType,
+    /// Disc LBA where INDEX 01 begins.
+    pub start_lba: u32,
+    /// Number of addressable INDEX 01+ sectors in this track.
+    pub sector_count: u32,
+    /// Pregap sectors before INDEX 01.
+    pub pregap: u32,
+    /// Pregap sectors physically present at the start of `bytes`.
+    /// This differs from `pregap` when a CUE uses `PREGAP` to describe
+    /// silence that lives in disc space but not in the track file.
+    pub file_pregap: u32,
+    /// Raw 2352-byte sectors backing this track.
+    pub bytes: Vec<u8>,
+}
+
+/// Physical play position for `GetlocP`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackPosition {
+    /// 1-based track number.
+    pub track_number: u8,
+    /// 0 = pregap / index 00, 1 = INDEX 01+.
+    pub index_number: u8,
+    /// Position relative to the current track/index in binary MSF.
+    pub relative_msf: (u8, u8, u8),
+    /// Absolute disc position in binary MSF.
+    pub absolute_msf: (u8, u8, u8),
+}
+
+/// A loaded disc image. Holds the raw sector data plus enough TOC
+/// metadata to answer track and SubQ-style position queries.
 pub struct Disc {
-    bytes: Vec<u8>,
+    tracks: Vec<Track>,
 }
 
 impl Disc {
     /// Construct a disc from a raw BIN image.
     pub fn from_bin(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+        let pregap = detect_track1_pregap(&bytes);
+        let file_sectors = bytes.len() / SECTOR_BYTES;
+        let sector_count = file_sectors.saturating_sub(pregap as usize) as u32;
+        Self {
+            tracks: vec![Track {
+                number: 1,
+                track_type: TrackType::Data,
+                start_lba: 0,
+                sector_count,
+                pregap,
+                file_pregap: pregap,
+                bytes,
+            }],
+        }
     }
 
-    /// Total sector count = floor(size / 2352). Incomplete tail
-    /// sectors are ignored.
+    /// Construct a disc from explicit multi-track metadata.
+    pub fn from_tracks(mut tracks: Vec<Track>) -> Self {
+        tracks.sort_by_key(|track| track.number);
+        Self { tracks }
+    }
+
+    /// Total addressable sector count up to the disc lead-out.
     pub fn sector_count(&self) -> usize {
-        self.bytes.len() / SECTOR_BYTES
+        self.leadout_lba() as usize
+    }
+
+    /// Number of tracks on the disc.
+    pub fn track_count(&self) -> usize {
+        self.tracks.len()
+    }
+
+    /// First track number on the disc, if any.
+    pub fn first_track_number(&self) -> Option<u8> {
+        self.tracks.first().map(|track| track.number)
+    }
+
+    /// Last track number on the disc, if any.
+    pub fn last_track_number(&self) -> Option<u8> {
+        self.tracks.last().map(|track| track.number)
+    }
+
+    /// Lead-out LBA (first sector after the last track).
+    pub fn leadout_lba(&self) -> u32 {
+        self.tracks
+            .last()
+            .map(|track| track.start_lba.saturating_add(track.sector_count))
+            .unwrap_or(0)
+    }
+
+    /// Track metadata by 1-based track number.
+    pub fn track(&self, number: u8) -> Option<&Track> {
+        self.tracks.iter().find(|track| track.number == number)
+    }
+
+    /// Track start LBA by 1-based track number.
+    pub fn track_start_lba(&self, number: u8) -> Option<u32> {
+        self.track(number).map(|track| track.start_lba)
+    }
+
+    /// Physical play position for an absolute LBA.
+    pub fn track_position_for_lba(&self, lba: u32) -> Option<TrackPosition> {
+        let track = self
+            .tracks
+            .iter()
+            .find(|track| track_contains_lba(track, lba))?;
+        let absolute_msf = lba_to_msf(lba);
+        let (index_number, relative_msf) = if track.number != 1 && lba < track.start_lba {
+            let frames_until_index1 = track.start_lba.saturating_sub(lba).saturating_sub(1);
+            (0, frames_to_msf(frames_until_index1))
+        } else {
+            (1, frames_to_msf(lba.saturating_sub(track.start_lba)))
+        };
+        Some(TrackPosition {
+            track_number: track.number,
+            index_number,
+            relative_msf,
+            absolute_msf,
+        })
     }
 
     /// Read a raw 2352-byte sector. Returns `None` past end-of-disc.
     pub fn read_sector_raw(&self, lba: u32) -> Option<&[u8]> {
-        let start = (lba as usize).checked_mul(SECTOR_BYTES)?;
-        let end = start.checked_add(SECTOR_BYTES)?;
-        if end > self.bytes.len() {
-            return None;
+        for track in &self.tracks {
+            if !track_contains_lba(track, lba) {
+                continue;
+            }
+            let file_sector = if track.number == 1 {
+                lba.checked_sub(track.start_lba)?
+                    .checked_add(track.file_pregap)?
+            } else {
+                let file_start_lba = track.start_lba.saturating_sub(track.file_pregap);
+                if lba < file_start_lba {
+                    return None;
+                }
+                lba.checked_sub(file_start_lba)?
+            };
+            let start = (file_sector as usize).checked_mul(SECTOR_BYTES)?;
+            let end = start.checked_add(SECTOR_BYTES)?;
+            if end <= track.bytes.len() {
+                return Some(&track.bytes[start..end]);
+            }
         }
-        Some(&self.bytes[start..end])
+        None
     }
 
-    /// Read the 2048-byte user-data payload of a sector (mode 2 form 1).
+    /// Read the 2048-byte user-data payload of a sector.
     pub fn read_sector_user(&self, lba: u32) -> Option<&[u8]> {
         let sector = self.read_sector_raw(lba)?;
-        Some(&sector[SECTOR_USER_DATA_OFFSET..SECTOR_USER_DATA_OFFSET + SECTOR_USER_DATA_BYTES])
+        let start = if sector.get(15).copied().unwrap_or(2) == 1 {
+            16
+        } else {
+            SECTOR_USER_DATA_OFFSET
+        };
+        Some(&sector[start..start + SECTOR_USER_DATA_BYTES])
     }
+}
+
+fn detect_track1_pregap(bytes: &[u8]) -> u32 {
+    if bytes.len() < SECTOR_BYTES {
+        return 0;
+    }
+    let sector = &bytes[..SECTOR_BYTES];
+    if sector[0] != 0x00 || sector[11] != 0x00 || sector[1..11] != [0xFF; 10] {
+        return 0;
+    }
+    let m = bcd_to_bin(sector[12]);
+    let s = bcd_to_bin(sector[13]);
+    let f = bcd_to_bin(sector[14]);
+    if [m, s, f].contains(&0xFF) {
+        return 0;
+    }
+    let abs_frame = (m as u32) * 60 * 75 + (s as u32) * 75 + (f as u32);
+    150u32.saturating_sub(abs_frame)
+}
+
+fn track_pregap_start_lba(track: &Track) -> u32 {
+    if track.number == 1 {
+        track.start_lba
+    } else {
+        track.start_lba.saturating_sub(track.pregap)
+    }
+}
+
+fn track_contains_lba(track: &Track, lba: u32) -> bool {
+    let start = track_pregap_start_lba(track);
+    let end = track.start_lba.saturating_add(track.sector_count);
+    lba >= start && lba < end
 }
 
 /// Convert a BCD byte pair to binary (used for MSF fields in commands).
@@ -106,6 +274,15 @@ pub fn lba_to_msf(lba: u32) -> (u8, u8, u8) {
     let m = (abs / (60 * 75)) as u8;
     let s = ((abs / 75) % 60) as u8;
     let f = (abs % 75) as u8;
+    (m, s, f)
+}
+
+/// Convert a frame count (without the 2-second absolute disc pregap)
+/// into an MSF triple in binary form.
+pub fn frames_to_msf(total_frames: u32) -> (u8, u8, u8) {
+    let m = (total_frames / (60 * 75)) as u8;
+    let s = ((total_frames / 75) % 60) as u8;
+    let f = (total_frames % 75) as u8;
     (m, s, f)
 }
 
@@ -181,5 +358,130 @@ mod tests {
     fn read_past_end_returns_none() {
         let d = Disc::from_bin(vec![0u8; SECTOR_BYTES]);
         assert!(d.read_sector_raw(1).is_none());
+    }
+
+    #[test]
+    fn mode1_user_reads_from_offset_16() {
+        let mut bytes = vec![0u8; SECTOR_BYTES];
+        bytes[15] = 1;
+        bytes[16] = 0x5D;
+        bytes[SECTOR_USER_DATA_OFFSET] = 0xA7;
+        let d = Disc::from_bin(bytes);
+        assert_eq!(d.read_sector_user(0).unwrap()[0], 0x5D);
+    }
+
+    #[test]
+    fn track_position_reports_index0_for_pregap() {
+        let tracks = vec![
+            Track {
+                number: 1,
+                track_type: TrackType::Data,
+                start_lba: 0,
+                sector_count: 10,
+                pregap: 0,
+                file_pregap: 0,
+                bytes: vec![0u8; SECTOR_BYTES * 10],
+            },
+            Track {
+                number: 2,
+                track_type: TrackType::Audio,
+                start_lba: 12,
+                sector_count: 4,
+                pregap: 2,
+                file_pregap: 2,
+                bytes: vec![0u8; SECTOR_BYTES * 6],
+            },
+        ];
+        let disc = Disc::from_tracks(tracks);
+        let pos = disc.track_position_for_lba(10).unwrap();
+        assert_eq!(pos.track_number, 2);
+        assert_eq!(pos.index_number, 0);
+        assert_eq!(pos.relative_msf, (0, 0, 1));
+        assert_eq!(pos.absolute_msf, (0, 2, 10));
+    }
+
+    #[test]
+    fn track_position_reports_index1_after_pregap() {
+        let tracks = vec![
+            Track {
+                number: 1,
+                track_type: TrackType::Data,
+                start_lba: 0,
+                sector_count: 10,
+                pregap: 0,
+                file_pregap: 0,
+                bytes: vec![0u8; SECTOR_BYTES * 10],
+            },
+            Track {
+                number: 2,
+                track_type: TrackType::Audio,
+                start_lba: 12,
+                sector_count: 4,
+                pregap: 2,
+                file_pregap: 2,
+                bytes: vec![0u8; SECTOR_BYTES * 6],
+            },
+        ];
+        let disc = Disc::from_tracks(tracks);
+        let pos = disc.track_position_for_lba(12).unwrap();
+        assert_eq!(pos.track_number, 2);
+        assert_eq!(pos.index_number, 1);
+        assert_eq!(pos.relative_msf, (0, 0, 0));
+        assert_eq!(pos.absolute_msf, (0, 2, 12));
+    }
+
+    #[test]
+    fn multitrack_sector_reads_map_through_pregap() {
+        let mut track2 = vec![0u8; SECTOR_BYTES * 6];
+        track2[2 * SECTOR_BYTES] = 0xAB;
+        let disc = Disc::from_tracks(vec![
+            Track {
+                number: 1,
+                track_type: TrackType::Data,
+                start_lba: 0,
+                sector_count: 10,
+                pregap: 0,
+                file_pregap: 0,
+                bytes: vec![0u8; SECTOR_BYTES * 10],
+            },
+            Track {
+                number: 2,
+                track_type: TrackType::Audio,
+                start_lba: 12,
+                sector_count: 4,
+                pregap: 2,
+                file_pregap: 2,
+                bytes: track2,
+            },
+        ]);
+        assert_eq!(disc.read_sector_raw(12).unwrap()[0], 0xAB);
+    }
+
+    #[test]
+    fn multitrack_sector_reads_honor_pregap_not_present_in_file() {
+        let mut track2 = vec![0u8; SECTOR_BYTES * 4];
+        track2[0] = 0xCD;
+        let disc = Disc::from_tracks(vec![
+            Track {
+                number: 1,
+                track_type: TrackType::Data,
+                start_lba: 0,
+                sector_count: 10,
+                pregap: 0,
+                file_pregap: 0,
+                bytes: vec![0u8; SECTOR_BYTES * 10],
+            },
+            Track {
+                number: 2,
+                track_type: TrackType::Audio,
+                start_lba: 12,
+                sector_count: 4,
+                pregap: 2,
+                file_pregap: 0,
+                bytes: track2,
+            },
+        ]);
+        assert!(disc.read_sector_raw(10).is_none());
+        assert_eq!(disc.read_sector_raw(12).unwrap()[0], 0xCD);
     }
 }

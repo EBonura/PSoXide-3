@@ -6,12 +6,15 @@
 //! and the BIOS/game keeps clocking bytes until the device stops
 //! acknowledging (DSR goes high permanently).
 //!
-//! For a digital controller the full poll sequence is four bytes:
+//! For a digital controller the full wire-level poll sequence is five
+//! bytes: one select byte handled by the port, then four bytes spoken
+//! by the pad itself.
 //!
 //! | `TX` | `RX` | Meaning                                      |
 //! |------|------|----------------------------------------------|
-//! | `01` | `41` | Address byte (select controller); ID low     |
-//! | `42` | `5A` | Poll command; ID high                        |
+//! | `01` | `FF` | Address byte (select controller); dummy      |
+//! | `42` | `41` | Poll command; ID low                         |
+//! | `00` | `5A` | Fill byte; ID high                           |
 //! | `00` | `b0` | Fill byte; buttons group 1 (active-low)      |
 //! | `00` | `b1` | Fill byte; buttons group 2 (active-low)      |
 //!
@@ -112,6 +115,13 @@ pub struct PortDevice {
     /// to `Pad` or `Memcard` once the first byte picks one;
     /// cleared by [`PortDevice::deselect`].
     selected: Option<Selected>,
+    /// Histogram of address/select bytes observed at the start of a
+    /// transaction (`0x01` = controller, `0x81` = memcard, etc.).
+    first_byte_histogram: [u32; 256],
+    /// Rolling window of recent transaction-leading bytes.
+    recent_first_bytes: [u8; 16],
+    recent_first_head: usize,
+    recent_first_len: usize,
 }
 
 /// Which of the two sub-devices is active in the current SIO
@@ -129,6 +139,10 @@ impl PortDevice {
             pad: None,
             memcard: None,
             selected: None,
+            first_byte_histogram: [0; 256],
+            recent_first_bytes: [0; 16],
+            recent_first_head: 0,
+            recent_first_len: 0,
         }
     }
 
@@ -171,11 +185,17 @@ impl PortDevice {
             },
             None => {
                 // First byte decides the target.
+                self.record_first_byte(tx);
                 match tx {
                     0x01 => {
                         if let Some(pad) = self.pad.as_mut() {
                             self.selected = Some(Selected::Pad);
-                            pad.exchange(tx)
+                            pad.reset();
+                            // The initial select byte only chooses the
+                            // controller. Real hardware returns a
+                            // dummy/Hi-Z byte here; the actual ID bytes
+                            // start on the following command byte.
+                            (0xFF, true)
                         } else {
                             (0xFF, false)
                         }
@@ -192,6 +212,29 @@ impl PortDevice {
                 }
             }
         }
+    }
+
+    /// Histogram of transaction-leading bytes seen on this port.
+    pub fn first_byte_histogram(&self) -> &[u32; 256] {
+        &self.first_byte_histogram
+    }
+
+    /// Recent transaction-leading bytes, oldest first.
+    pub fn recent_first_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.recent_first_len);
+        if self.recent_first_len == 0 {
+            return out;
+        }
+        let start = if self.recent_first_len == self.recent_first_bytes.len() {
+            self.recent_first_head
+        } else {
+            0
+        };
+        for i in 0..self.recent_first_len {
+            let idx = (start + i) % self.recent_first_bytes.len();
+            out.push(self.recent_first_bytes[idx]);
+        }
+        out
     }
 
     /// Deselect (JOYN goes high) — every device drops back to idle
@@ -240,10 +283,29 @@ impl PortDevice {
         self.memcard.as_mut()
     }
 
+    /// `true` when the currently selected sub-device for this
+    /// transaction is the memory-card slot. SIO timing uses this to
+    /// pick the shorter memcard ACK delay after the address byte has
+    /// selected a target.
+    pub fn selected_is_memcard(&self) -> bool {
+        matches!(self.selected, Some(Selected::Memcard))
+    }
+
     /// Consume the port, extracting its pad (if any). Used when
     /// swapping memcards in while keeping the pad attached.
     pub fn into_pad(self) -> Option<DigitalPad> {
         self.pad
+    }
+
+    fn record_first_byte(&mut self, tx: u8) {
+        self.first_byte_histogram[tx as usize] =
+            self.first_byte_histogram[tx as usize].saturating_add(1);
+        self.recent_first_bytes[self.recent_first_head] = tx;
+        self.recent_first_head = (self.recent_first_head + 1) % self.recent_first_bytes.len();
+        self.recent_first_len = self
+            .recent_first_len
+            .saturating_add(1)
+            .min(self.recent_first_bytes.len());
     }
 }
 
@@ -256,6 +318,21 @@ impl Default for PortDevice {
 /// Default analog-stick reading — 0x80 (128) = centre, 0x00 = full
 /// negative, 0xFF = full positive. Matches real DualShock output.
 pub const STICK_CENTER: u8 = 0x80;
+
+/// One captured `0x42` poll transaction for diagnostics.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PollSnapshot {
+    /// `true` when the poll reached its natural final byte
+    /// (`ack=false` on the last response), `false` when the host
+    /// reset/deselected partway through.
+    pub complete: bool,
+    /// Number of valid bytes in `tx` / `rx`.
+    pub len: u8,
+    /// Host→pad bytes seen during the transaction.
+    pub tx: [u8; 8],
+    /// Pad→host bytes returned during the transaction.
+    pub rx: [u8; 8],
+}
 
 /// Pad operating mode.
 ///
@@ -304,11 +381,12 @@ pub struct DigitalPad {
     mode_before_config: PadMode,
     /// Which command byte the current transaction is running
     /// (`0x42` poll, `0x43` config-enter/exit, `0x44` set mode,
-    /// etc). Set at the second exchange of the transaction.
+    /// etc). Set on the first byte after the port-level select
+    /// byte has chosen the controller slot.
     cmd: u8,
-    /// Which byte of the current transaction we're on. 0 = host
-    /// just sent the address byte; 1 = sent command; 2..=N = payload
-    /// / response bytes.
+    /// Which byte of the current transaction we're on. 0 = waiting
+    /// for the command byte, 1 = waiting for the placeholder byte
+    /// that clocks out `0x5A`, 2..=N = payload / response bytes.
     step: u8,
     /// DualShock vibration-motor byte mapping. Set by command
     /// `0x4D` in Config mode. Each entry maps a byte position in
@@ -321,10 +399,35 @@ pub struct DigitalPad {
     /// Default state is `[0xFF; 6]` — no motors mapped — matching
     /// a fresh DualShock before a game has configured rumble.
     motor_mapping: [u8; 6],
+    /// Selector byte latched at step 2 for config-query commands
+    /// such as `0x46`, `0x47`, and `0x4C`. Later reply bytes depend
+    /// on this value.
+    config_param: u8,
+    /// Analog-mode lock set by command `0x44` step 3. Games use
+    /// this to stop the controller's physical Analog button from
+    /// toggling modes behind their back.
+    analog_locked: bool,
     /// Current small-motor state (binary on/off).
     motor_small: bool,
     /// Current big-motor strength (0..=255).
     motor_big: u8,
+    /// Histogram of command bytes observed at step 1 of each
+    /// transaction. Useful for diagnosing retail games that use the
+    /// BIOS pad driver instead of the SDK's raw `0x42` poll loop.
+    cmd_histogram: [u32; 256],
+    /// Rolling window of the most recent command bytes seen.
+    recent_cmds: [u8; 16],
+    recent_cmd_head: usize,
+    recent_cmd_len: usize,
+    /// Bytes of the currently active transaction, used to snapshot
+    /// complete `0x42` polls for debugging retail input issues.
+    current_tx_trace: [u8; 8],
+    current_rx_trace: [u8; 8],
+    current_trace_len: u8,
+    /// Rolling window of recent completed `0x42` polls.
+    recent_polls: [PollSnapshot; 8],
+    recent_poll_head: usize,
+    recent_poll_len: usize,
 }
 
 /// Zero-indexed step of the last byte in a transaction. Ack stays
@@ -355,8 +458,20 @@ impl DigitalPad {
             cmd: 0,
             step: 0,
             motor_mapping: [0xFF; 6],
+            config_param: 0,
+            analog_locked: false,
             motor_small: false,
             motor_big: 0,
+            cmd_histogram: [0; 256],
+            recent_cmds: [0; 16],
+            recent_cmd_head: 0,
+            recent_cmd_len: 0,
+            current_tx_trace: [0; 8],
+            current_rx_trace: [0; 8],
+            current_trace_len: 0,
+            recent_polls: [PollSnapshot::default(); 8],
+            recent_poll_head: 0,
+            recent_poll_len: 0,
         }
     }
 
@@ -370,9 +485,54 @@ impl DigitalPad {
         (self.motor_small, self.motor_big)
     }
 
+    /// Histogram of step-1 command bytes (`0x42`, `0x43`, `0x44`,
+    /// etc.) observed since power-on / reset.
+    pub fn command_histogram(&self) -> &[u32; 256] {
+        &self.cmd_histogram
+    }
+
+    /// Recent command bytes in chronological order (oldest first).
+    pub fn recent_commands(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.recent_cmd_len);
+        if self.recent_cmd_len == 0 {
+            return out;
+        }
+        let start = if self.recent_cmd_len == self.recent_cmds.len() {
+            self.recent_cmd_head
+        } else {
+            0
+        };
+        for i in 0..self.recent_cmd_len {
+            let idx = (start + i) % self.recent_cmds.len();
+            out.push(self.recent_cmds[idx]);
+        }
+        out
+    }
+
+    /// Recent completed `0x42` poll transactions, oldest first.
+    pub fn recent_polls(&self) -> Vec<PollSnapshot> {
+        let mut out = Vec::with_capacity(self.recent_poll_len);
+        if self.recent_poll_len == 0 {
+            return out;
+        }
+        let start = if self.recent_poll_len == self.recent_polls.len() {
+            self.recent_poll_head
+        } else {
+            0
+        };
+        for i in 0..self.recent_poll_len {
+            let idx = (start + i) % self.recent_polls.len();
+            out.push(self.recent_polls[idx]);
+        }
+        out
+    }
+
     fn reset(&mut self) {
+        self.snapshot_current_poll(false);
         self.cmd = 0;
         self.step = 0;
+        self.config_param = 0;
+        self.current_trace_len = 0;
     }
 
     /// Current operating mode. Diagnostic; games don't read this
@@ -421,23 +581,23 @@ impl DigitalPad {
     /// ack_is_low)` — ACK stays low (true) for all bytes except the
     /// final one of the transaction.
     fn exchange(&mut self, tx: u8) -> (u8, bool) {
-        // Step 0: host sent the address byte `0x01`. Reply with
-        // ID_low + hold ACK to invite the next byte.
+        // Step 0: host sent the command byte (`0x42`, `0x43`,
+        // `0x44`, ...). Reply with ID_low and hold ACK to invite the
+        // next byte.
         if self.step == 0 {
-            if tx != 0x01 {
-                // Spurious first byte — reset and report no-ack.
-                self.reset();
-                return (0xFF, false);
-            }
+            self.cmd = tx;
+            self.record_command(tx);
             self.step = 1;
-            return (self.id_low_byte(), true);
+            let rx = self.id_low_byte();
+            self.record_trace_byte(tx, rx);
+            return (rx, true);
         }
 
-        // Step 1: host sends the command byte. Store it and reply
-        // with ID_high (`0x5A`), holding ACK to continue.
+        // Step 1: host sends the mandatory zero / placeholder byte
+        // that clocks out ID_high (`0x5A`).
         if self.step == 1 {
-            self.cmd = tx;
             self.step = 2;
+            self.record_trace_byte(tx, 0x5A);
             return (0x5A, true);
         }
 
@@ -449,9 +609,11 @@ impl DigitalPad {
         let pre_step = self.step;
         let byte = self.payload_byte(tx);
         self.step = self.step.saturating_add(1);
+        self.record_trace_byte(tx, byte);
 
         let ack = pre_step < self.last_step_for_cmd(self.cmd);
         if !ack {
+            self.snapshot_current_poll(true);
             self.reset();
         }
         (byte, ack)
@@ -468,7 +630,7 @@ impl DigitalPad {
                 PadMode::Digital => DIGITAL_POLL_LAST,
                 PadMode::Analog | PadMode::Config => ANALOG_POLL_LAST,
             },
-            0x43 | 0x44 | 0x45 | 0x46..=0x4F => ANALOG_POLL_LAST,
+            0x43 | 0x44 | 0x45 | 0x46 | 0x47 | 0x4C | 0x4D => ANALOG_POLL_LAST,
             // Unknown command — abort after the ID bytes (steps
             // 0 + 1) have been exchanged.
             _ => 1,
@@ -518,10 +680,18 @@ impl DigitalPad {
             // the target into `mode_before_config` so the subsequent
             // `0x43`+`0x00` exit lands us in the right mode.
             0x44 => {
-                if self.mode == PadMode::Config && self.step == 2 {
-                    match tx {
-                        0x00 => self.mode_before_config = PadMode::Digital,
-                        0x01 => self.mode_before_config = PadMode::Analog,
+                if self.mode == PadMode::Config {
+                    match self.step {
+                        2 => match tx {
+                            0x00 => self.mode_before_config = PadMode::Digital,
+                            0x01 => self.mode_before_config = PadMode::Analog,
+                            _ => {}
+                        },
+                        3 => match tx {
+                            0x02 => self.analog_locked = false,
+                            0x03 => self.analog_locked = true,
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
@@ -563,14 +733,64 @@ impl DigitalPad {
                 }
             }
 
-            // 0x46..=0x4F (except 0x4D handled above) — other
-            // config commands (e.g. 0x46 = constant query,
-            // 0x47 = extended query, 0x4C = unknown). Not modelled;
-            // zero-fill matches a no-op reply that the BIOS
-            // tolerates.
-            0x46..=0x4C | 0x4E | 0x4F => 0x00,
+            // 0x46 / 0x47 / 0x4C — DualShock config queries. Retail
+            // games probe these exact constants during controller
+            // bring-up; replying with zeroes makes the pad look
+            // half-dead even though simple BIOS polls still work.
+            0x46 => {
+                if self.step == 2 {
+                    self.config_param = tx;
+                }
+                self.command_46_byte(self.step)
+            }
+            0x47 => {
+                if self.step == 2 {
+                    self.config_param = tx;
+                }
+                self.command_47_byte(self.step)
+            }
+            0x4C => {
+                if self.step == 2 {
+                    self.config_param = tx;
+                }
+                self.command_4c_byte(self.step)
+            }
 
             _ => 0xFF,
+        }
+    }
+
+    fn command_46_byte(&self, step: u8) -> u8 {
+        match (self.config_param, step) {
+            (_, 2 | 3) => 0x00,
+            (0x00 | 0x01, 4) => 0x01,
+            (0x00, 5) => 0x02,
+            (0x01, 5) => 0x01,
+            (0x00, 6) => 0x00,
+            (0x01, 6) => 0x01,
+            (0x00, 7) => 0x0A,
+            (0x01, 7) => 0x14,
+            _ => 0x00,
+        }
+    }
+
+    fn command_47_byte(&self, step: u8) -> u8 {
+        match (self.config_param, step) {
+            (_, 2 | 3) => 0x00,
+            (0x00, 4) => 0x02,
+            (0x00, 5) => 0x00,
+            (0x00, 6) => 0x01,
+            (0x00, 7) => 0x00,
+            _ => 0x00,
+        }
+    }
+
+    fn command_4c_byte(&self, step: u8) -> u8 {
+        match (self.config_param, step) {
+            (_, 2 | 3 | 4 | 6 | 7) => 0x00,
+            (0x00, 5) => 0x04,
+            (0x01, 5) => 0x07,
+            _ => 0x00,
         }
     }
 
@@ -600,6 +820,42 @@ impl DigitalPad {
             // Unmapped slot — ignore.
             _ => {}
         }
+    }
+
+    fn record_command(&mut self, cmd: u8) {
+        self.cmd_histogram[cmd as usize] =
+            self.cmd_histogram[cmd as usize].saturating_add(1);
+        self.recent_cmds[self.recent_cmd_head] = cmd;
+        self.recent_cmd_head = (self.recent_cmd_head + 1) % self.recent_cmds.len();
+        self.recent_cmd_len = self.recent_cmd_len.saturating_add(1).min(self.recent_cmds.len());
+    }
+
+    fn record_trace_byte(&mut self, tx: u8, rx: u8) {
+        let idx = self.current_trace_len as usize;
+        if idx < self.current_tx_trace.len() {
+            self.current_tx_trace[idx] = tx;
+            self.current_rx_trace[idx] = rx;
+        }
+        self.current_trace_len = self.current_trace_len.saturating_add(1).min(8);
+    }
+
+    fn snapshot_current_poll(&mut self, complete: bool) {
+        if self.cmd != 0x42 || self.current_trace_len == 0 {
+            return;
+        }
+        let slot = self.recent_poll_head;
+        self.recent_polls[slot] = PollSnapshot {
+            complete,
+            len: self.current_trace_len,
+            tx: self.current_tx_trace,
+            rx: self.current_rx_trace,
+        };
+        self.recent_poll_head = (self.recent_poll_head + 1) % self.recent_polls.len();
+        self.recent_poll_len = self
+            .recent_poll_len
+            .saturating_add(1)
+            .min(self.recent_polls.len());
+        self.current_trace_len = 0;
     }
 }
 
@@ -1047,11 +1303,11 @@ mod tests {
     #[test]
     fn full_digital_poll_all_released() {
         let mut pad = DigitalPad::new();
-        assert_eq!(pad.exchange(0x01), (0x41, true));
-        assert_eq!(pad.exchange(0x42), (0x5A, true));
+        assert_eq!(pad.exchange(0x42), (0x41, true));
+        assert_eq!(pad.exchange(0x00), (0x5A, true));
         assert_eq!(pad.exchange(0x00), (0xFF, true)); // all released → 0xFF
         assert_eq!(pad.exchange(0x00), (0xFF, false)); // last byte
-        // Transaction state should have reset.
+                                                       // Transaction state should have reset.
         assert_eq!(pad.step, 0);
         assert_eq!(pad.cmd, 0);
     }
@@ -1060,8 +1316,8 @@ mod tests {
     fn pressing_start_shows_in_byte1() {
         let mut pad = DigitalPad::new();
         pad.buttons.press(button::START);
-        let _ = pad.exchange(0x01);
         let _ = pad.exchange(0x42);
+        let _ = pad.exchange(0x00);
         let (b1, _) = pad.exchange(0x00);
         // START = bit 3; active-low on the wire: !0x08 = 0xF7.
         assert_eq!(b1, 0xF7);
@@ -1071,8 +1327,8 @@ mod tests {
     fn pressing_cross_shows_in_byte2() {
         let mut pad = DigitalPad::new();
         pad.buttons.press(button::CROSS);
-        let _ = pad.exchange(0x01);
         let _ = pad.exchange(0x42);
+        let _ = pad.exchange(0x00);
         let _ = pad.exchange(0x00);
         let (b2, _) = pad.exchange(0x00);
         // CROSS = bit 14; (bits >> 8) = bit 6 → !0x40 = 0xBF.
@@ -1080,21 +1336,21 @@ mod tests {
     }
 
     #[test]
-    fn spurious_first_byte_resets_immediately() {
+    fn direct_pad_starts_on_the_command_byte() {
         let mut pad = DigitalPad::new();
-        // Anything other than 0x01 as the first byte should abort
-        // without touching internal state.
-        assert_eq!(pad.exchange(0xFF), (0xFF, false));
-        assert_eq!(pad.step, 0);
+        // PortDevice already consumed the select byte, so the pad's
+        // first observed byte is the command itself.
+        assert_eq!(pad.exchange(0x42), (0x41, true));
+        assert_eq!(pad.exchange(0x00), (0x5A, true));
     }
 
     #[test]
     fn unknown_command_aborts_after_id_bytes() {
         let mut pad = DigitalPad::new();
-        assert_eq!(pad.exchange(0x01), (0x41, true));
-        // Hardware acks the command byte even when the command's
-        // unknown — it's the payload step that aborts.
-        assert_eq!(pad.exchange(0x99), (0x5A, true));
+        assert_eq!(pad.exchange(0x99), (0x41, true));
+        // Hardware still clocks out `0x5A`; the payload step is where
+        // the command actually aborts.
+        assert_eq!(pad.exchange(0x00), (0x5A, true));
         // Payload byte returns 0xFF + no ack.
         assert_eq!(pad.exchange(0x00), (0xFF, false));
         assert_eq!(pad.step, 0);
@@ -1104,18 +1360,18 @@ mod tests {
     fn dualshock_config_sequence_switches_to_analog_mode() {
         let mut pad = DigitalPad::new();
         assert_eq!(pad.mode(), PadMode::Digital);
-        // Enter config: 0x01, 0x43, 0x01, ... (8 bytes total).
-        let _ = pad.exchange(0x01);
+        // Enter config: 0x43, 0x00, 0x01, ... (8 bytes total).
         let _ = pad.exchange(0x43);
+        let _ = pad.exchange(0x00);
         let _ = pad.exchange(0x01);
         for _ in 3..8 {
             let _ = pad.exchange(0x00);
         }
         assert_eq!(pad.mode(), PadMode::Config);
 
-        // Switch to analog: 0x01, 0x44, 0x01, 0x02, 0, 0, 0, 0.
-        assert_eq!(pad.exchange(0x01), (0xF3, true)); // config ID
-        let _ = pad.exchange(0x44);
+        // Switch to analog: 0x44, 0x00, 0x01, 0x02, 0, 0, 0, 0.
+        assert_eq!(pad.exchange(0x44), (0xF3, true)); // config ID
+        let _ = pad.exchange(0x00);
         let _ = pad.exchange(0x01); // analog
         for _ in 3..8 {
             let _ = pad.exchange(0x00);
@@ -1123,9 +1379,9 @@ mod tests {
         // Still in Config mode until we exit it.
         assert_eq!(pad.mode(), PadMode::Config);
 
-        // Exit config: 0x01, 0x43, 0x00, ...
-        let _ = pad.exchange(0x01);
+        // Exit config: 0x43, 0x00, 0x00, ...
         let _ = pad.exchange(0x43);
+        let _ = pad.exchange(0x00);
         let _ = pad.exchange(0x00);
         for _ in 3..8 {
             let _ = pad.exchange(0x00);
@@ -1140,15 +1396,129 @@ mod tests {
         pad.mode = PadMode::Analog;
         pad.set_sticks(0x10, 0x20, 0x30, 0x40);
         // Poll in analog mode.
-        assert_eq!(pad.exchange(0x01), (0x73, true)); // analog ID
-        assert_eq!(pad.exchange(0x42), (0x5A, true));
+        assert_eq!(pad.exchange(0x42), (0x73, true)); // analog ID
+        assert_eq!(pad.exchange(0x00), (0x5A, true));
         assert_eq!(pad.exchange(0x00).0, 0xFF); // buttons low — all released
         assert_eq!(pad.exchange(0x00).0, 0xFF); // buttons high — all released
         assert_eq!(pad.exchange(0x00).0, 0x10); // right X
         assert_eq!(pad.exchange(0x00).0, 0x20); // right Y
         assert_eq!(pad.exchange(0x00).0, 0x30); // left X
-        // Last byte — no ack.
+                                                // Last byte — no ack.
         assert_eq!(pad.exchange(0x00), (0x40, false));
+    }
+
+    #[test]
+    fn config_query_0x46_matches_duckstation_constants() {
+        let mut pad = DigitalPad::new();
+        pad.mode = PadMode::Config;
+
+        let seq0 = [0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let expected0 = [
+            (0xF3, true),
+            (0x5A, true),
+            (0x00, true),
+            (0x00, true),
+            (0x01, true),
+            (0x02, true),
+            (0x00, true),
+            (0x0A, false),
+        ];
+        for (tx, expected) in seq0.into_iter().zip(expected0) {
+            assert_eq!(pad.exchange(tx), expected);
+        }
+
+        let seq1 = [0x46, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let expected1 = [
+            (0xF3, true),
+            (0x5A, true),
+            (0x00, true),
+            (0x00, true),
+            (0x01, true),
+            (0x01, true),
+            (0x01, true),
+            (0x14, false),
+        ];
+        for (tx, expected) in seq1.into_iter().zip(expected1) {
+            assert_eq!(pad.exchange(tx), expected);
+        }
+    }
+
+    #[test]
+    fn config_queries_0x47_and_0x4c_match_duckstation_constants() {
+        let mut pad = DigitalPad::new();
+        pad.mode = PadMode::Config;
+
+        let seq47 = [0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let expected47 = [
+            (0xF3, true),
+            (0x5A, true),
+            (0x00, true),
+            (0x00, true),
+            (0x02, true),
+            (0x00, true),
+            (0x01, true),
+            (0x00, false),
+        ];
+        for (tx, expected) in seq47.into_iter().zip(expected47) {
+            assert_eq!(pad.exchange(tx), expected);
+        }
+
+        let seq47_nonzero = [0x47, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let expected47_nonzero = [
+            (0xF3, true),
+            (0x5A, true),
+            (0x00, true),
+            (0x00, true),
+            (0x00, true),
+            (0x00, true),
+            (0x00, true),
+            (0x00, false),
+        ];
+        for (tx, expected) in seq47_nonzero.into_iter().zip(expected47_nonzero) {
+            assert_eq!(pad.exchange(tx), expected);
+        }
+
+        let seq4c0 = [0x4C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let expected4c0 = [
+            (0xF3, true),
+            (0x5A, true),
+            (0x00, true),
+            (0x00, true),
+            (0x00, true),
+            (0x04, true),
+            (0x00, true),
+            (0x00, false),
+        ];
+        for (tx, expected) in seq4c0.into_iter().zip(expected4c0) {
+            assert_eq!(pad.exchange(tx), expected);
+        }
+
+        let seq4c1 = [0x4C, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let expected4c1 = [
+            (0xF3, true),
+            (0x5A, true),
+            (0x00, true),
+            (0x00, true),
+            (0x00, true),
+            (0x07, true),
+            (0x00, true),
+            (0x00, false),
+        ];
+        for (tx, expected) in seq4c1.into_iter().zip(expected4c1) {
+            assert_eq!(pad.exchange(tx), expected);
+        }
+    }
+
+    #[test]
+    fn unsupported_config_command_aborts_after_id_bytes() {
+        let mut pad = DigitalPad::new();
+        pad.mode = PadMode::Config;
+
+        assert_eq!(pad.exchange(0x4E), (0xF3, true));
+        assert_eq!(pad.exchange(0x00), (0x5A, true));
+        assert_eq!(pad.exchange(0x00), (0xFF, false));
+        assert_eq!(pad.step, 0);
+        assert_eq!(pad.cmd, 0);
     }
 
     #[test]
@@ -1175,8 +1545,9 @@ mod tests {
         // After deselect, a fresh 0x01 should start from Idle again
         // and succeed.
         let (rx, ack) = port.exchange(0x01);
-        assert_eq!(rx, 0x41);
+        assert_eq!(rx, 0xFF);
         assert!(ack);
+        assert_eq!(port.exchange(0x42), (0x41, true));
     }
 
     #[test]
@@ -1193,8 +1564,8 @@ mod tests {
         pad.motor_mapping = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let mapping = [0x00u8, 0x01, 0xFF, 0xFF, 0xFF, 0xFF];
         // Run the 0x4D transaction.
-        assert_eq!(pad.exchange(0x01).0, 0x41); // ID low (Digital is fine for test)
-        assert_eq!(pad.exchange(0x4D).0, 0x5A);
+        assert_eq!(pad.exchange(0x4D).0, 0x41); // ID low (Digital is fine for test)
+        assert_eq!(pad.exchange(0x00).0, 0x5A);
         // Send 6 mapping bytes, one per payload slot; expect the
         // previous value in the response.
         for (i, &m) in mapping.iter().enumerate() {
@@ -1211,11 +1582,12 @@ mod tests {
         pad.mode = PadMode::Analog;
         // slot 0 -> small motor, slot 1 -> big motor.
         pad.motor_mapping = [0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF];
-        // Poll: 0x01, 0x42, then 6 TX bytes. First TX byte is the
+        // Poll: 0x42, then the placeholder byte, then 6 TX bytes.
+        // First TX byte is the
         // small-motor on/off (0xFF = on); second is big-motor
         // strength.
-        assert_eq!(pad.exchange(0x01).0, 0x73);
-        assert_eq!(pad.exchange(0x42).0, 0x5A);
+        assert_eq!(pad.exchange(0x42).0, 0x73);
+        assert_eq!(pad.exchange(0x00).0, 0x5A);
         // Payload step 2 — small motor slot. 0xFF turns it on.
         let _ = pad.exchange(0xFF);
         // Payload step 3 — big motor slot. 0x80 = half strength.
@@ -1228,14 +1600,32 @@ mod tests {
     }
 
     #[test]
+    fn recent_polls_capture_returned_button_bytes() {
+        let mut pad = DigitalPad::new();
+        pad.buttons = ButtonState::from_bits(button::START);
+
+        assert_eq!(pad.exchange(0x42), (0x41, true));
+        assert_eq!(pad.exchange(0x00), (0x5A, true));
+        assert_eq!(pad.exchange(0x00), (0xF7, true));
+        assert_eq!(pad.exchange(0x00), (0xFF, false));
+
+        let polls = pad.recent_polls();
+        assert_eq!(polls.len(), 1);
+        assert!(polls[0].complete);
+        assert_eq!(polls[0].len, 4);
+        assert_eq!(&polls[0].tx[..4], &[0x42, 0x00, 0x00, 0x00]);
+        assert_eq!(&polls[0].rx[..4], &[0x41, 0x5A, 0xF7, 0xFF]);
+    }
+
+    #[test]
     fn small_motor_turns_off_with_non_ff_tx() {
         let mut pad = DigitalPad::new();
         pad.mode = PadMode::Analog;
         pad.motor_mapping = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         pad.motor_small = true;
         // Poll.
-        let _ = pad.exchange(0x01);
         let _ = pad.exchange(0x42);
+        let _ = pad.exchange(0x00);
         // Any non-0xFF value turns the small motor off.
         let _ = pad.exchange(0x00);
         for _ in 3..=7 {
@@ -1251,7 +1641,7 @@ mod tests {
         let mut card = MemoryCard::new();
         // First byte: 0x81 (address). Card responds with flag byte.
         assert_eq!(card.exchange(0x81), (0x08, true)); // NEW flag set
-        // Second byte: 'S' (GetID).
+                                                       // Second byte: 'S' (GetID).
         assert_eq!(card.exchange(0x53), (0x5A, true));
         // Then the 8-byte ID sequence.
         let mut seq = vec![];

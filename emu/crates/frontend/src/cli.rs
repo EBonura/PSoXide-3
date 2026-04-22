@@ -124,9 +124,7 @@ fn resolve_paths(override_dir: Option<&std::path::Path>) -> Result<ConfigPaths, 
     match override_dir {
         Some(p) => {
             let paths = ConfigPaths::rooted(p);
-            paths
-                .ensure_dir(paths.root())
-                .map_err(|e| e.to_string())?;
+            paths.ensure_dir(paths.root()).map_err(|e| e.to_string())?;
             Ok(paths)
         }
         None => ConfigPaths::platform_default().map_err(|e| e.to_string()),
@@ -147,18 +145,12 @@ fn cmd_info(paths: &ConfigPaths) -> Result<(), String> {
     println!();
     println!("Settings:");
     println!("  version          : {}", settings.version);
-    println!(
-        "  paths.bios       : {}",
-        fmt_empty(&settings.paths.bios)
-    );
+    println!("  paths.bios       : {}", fmt_empty(&settings.paths.bios));
     println!(
         "  paths.library    : {}",
         fmt_empty(&settings.paths.game_library)
     );
-    println!(
-        "  video.int.scale  : {}",
-        settings.video.integer_scale
-    );
+    println!("  video.int.scale  : {}", settings.video.integer_scale);
     println!(
         "  emu.hle-bios-exe : {}",
         settings.emulator.hle_bios_for_side_load
@@ -173,19 +165,16 @@ fn cmd_info(paths: &ConfigPaths) -> Result<(), String> {
 fn cmd_scan(paths: &ConfigPaths, args: ScanArgs) -> Result<(), String> {
     let mut settings = Settings::load(&paths.settings_file()).unwrap_or_default();
     let explicit_root = args.root.clone();
-    let root = args
-        .root
-        .map(Ok)
-        .unwrap_or_else(|| {
-            if settings.paths.game_library.is_empty() {
-                Err(
-                    "No library root. Pass --root <dir> or set paths.game_library in settings.ron."
-                        .to_string(),
-                )
-            } else {
-                Ok(PathBuf::from(&settings.paths.game_library))
-            }
-        })?;
+    let root = args.root.map(Ok).unwrap_or_else(|| {
+        if settings.paths.game_library.is_empty() {
+            Err(
+                "No library root. Pass --root <dir> or set paths.game_library in settings.ron."
+                    .to_string(),
+            )
+        } else {
+            Ok(PathBuf::from(&settings.paths.game_library))
+        }
+    })?;
     if !root.exists() {
         return Err(format!("library root does not exist: {}", root.display()));
     }
@@ -193,8 +182,7 @@ fn cmd_scan(paths: &ConfigPaths, args: ScanArgs) -> Result<(), String> {
     let mut lib = Library::load_or_empty(&paths.library_file());
     let before = lib.entries.len();
     let changed = lib.scan(&root).map_err(|e| e.to_string())?;
-    lib.save(&paths.library_file())
-        .map_err(|e| e.to_string())?;
+    lib.save(&paths.library_file()).map_err(|e| e.to_string())?;
     println!(
         "scanned {} → {} entries ({} parsed / re-parsed, {} reused)",
         root.display(),
@@ -203,11 +191,7 @@ fn cmd_scan(paths: &ConfigPaths, args: ScanArgs) -> Result<(), String> {
         lib.entries.len().saturating_sub(changed),
     );
     if before != lib.entries.len() {
-        println!(
-            "(cache size changed: {} → {})",
-            before,
-            lib.entries.len()
-        );
+        println!("(cache size changed: {} → {})", before, lib.entries.len());
     }
 
     // Persist the root into settings.ron whenever `--root` was passed
@@ -223,7 +207,10 @@ fn cmd_scan(paths: &ConfigPaths, args: ScanArgs) -> Result<(), String> {
             if let Err(e) = settings.save(&paths.settings_file()) {
                 eprintln!("warning: could not save settings.ron: {e}");
             } else {
-                println!("settings.paths.game_library updated -> {}", new_root.display());
+                println!(
+                    "settings.paths.game_library updated -> {}",
+                    new_root.display()
+                );
             }
         }
     }
@@ -316,7 +303,9 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
             eprintln!("[cli] mounted disc {}", game_path.display());
         }
         "cue" => {
-            return Err("CUE parsing not implemented; point --path at the underlying BIN".into());
+            let disc = psoxide_settings::library::load_disc_from_cue(&game_path)?;
+            bus.cdrom.insert_disc(Some(disc));
+            eprintln!("[cli] mounted cue-backed disc {}", game_path.display());
         }
         other => {
             return Err(format!("unsupported file extension: .{other}"));
