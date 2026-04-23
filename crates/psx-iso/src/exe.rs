@@ -174,7 +174,10 @@ mod tests {
         raw[0x1C..0x20].copy_from_slice(&100u32.to_le_bytes());
         assert!(matches!(
             Exe::parse(&raw),
-            Err(ExeError::TruncatedPayload { expected: 100, actual: 0 })
+            Err(ExeError::TruncatedPayload {
+                expected: 100,
+                actual: 0
+            })
         ));
     }
 

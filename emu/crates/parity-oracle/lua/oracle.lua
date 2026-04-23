@@ -37,9 +37,81 @@ local function send_nowait(line)
     io.write("#PSX3:" .. line .. "\n")
 end
 
+local function get_hw_ptr()
+    return PCSX.getScratchPtr()
+end
+
+local function get_pad_slot(port)
+    local sio0 = PCSX.SIO0
+    if not sio0 or not sio0.slots then
+        return nil
+    end
+    local slot = sio0.slots[port]
+    if not slot or not slot.pads then
+        return nil
+    end
+    return slot.pads[1]
+end
+
+local function apply_pad_mask(port, mask)
+    local pad = get_pad_slot(port)
+    if not pad then
+        return false, "pad slot unavailable"
+    end
+    for button = 0, 15 do
+        if bit.band(mask, bit.lshift(1, button)) ~= 0 then
+            pad.setOverride(button)
+        else
+            pad.clearOverride(button)
+        end
+    end
+    return true
+end
+
+local function parse_pad_pulses(spec)
+    if spec == nil or spec == "" or spec == "-" then
+        return {}
+    end
+    local pulses = {}
+    for entry in string.gmatch(spec, "[^,]+") do
+        local mask_s, start_s, frames_s = entry:match("^(%d+)@(%d+)%+(%d+)$")
+        if not mask_s then
+            return nil, "bad pulse spec"
+        end
+        local frames = tonumber(frames_s)
+        if not frames or frames <= 0 then
+            return nil, "bad pulse frames"
+        end
+        pulses[#pulses + 1] = {
+            mask = tonumber(mask_s),
+            start_vblank = tonumber(start_s),
+            frames = frames,
+        }
+    end
+    return pulses
+end
+
+local function effective_pad_mask(base_mask, pulses, current_vblank)
+    local mask = base_mask
+    for _, pulse in ipairs(pulses) do
+        local end_vblank = pulse.start_vblank + pulse.frames
+        if current_vblank >= pulse.start_vblank and current_vblank < end_vblank then
+            mask = bit.bor(mask, pulse.mask)
+        end
+    end
+    return mask
+end
+
 -- Pointers resolved once in `run()` and closed over by helpers. These
 -- addresses are stable for the life of the emulator.
 local ram_ptr, rom_ptr, regs
+
+-- COP2 (GTE) accessors resolved at startup. `regs.CP2D` and `regs.CP2C`
+-- are unions in `psxregisters.h` with a `r[32]` array view; the FFI
+-- binding exposes that array directly. If the build doesn't expose
+-- them we abort the harness loudly rather than silently emitting zeros
+-- that would defeat GTE parity comparison.
+local cop2d_ptr, cop2c_ptr
 
 -- Invocation counter for `run` — diagnostic aid: if this ever exceeds 1
 -- we know `PCSX.nextTick(run)` is firing more than once and can track
@@ -58,14 +130,87 @@ local function read_instruction(pc)
     return 0
 end
 
-local function encode_record(tick, pc, instr, gpr_ptr)
+-- Format `[v0,v1,...,v31]` from a 32-entry u32 cdata array. Used for
+-- GPRs and COP2 control regs where the raw `r[i]` view already
+-- matches the software-visible (CFC2) value.
+local function format_u32_array(ptr)
     local parts = {}
     for i = 0, 31 do
-        parts[i + 1] = tostring(tonumber(gpr_ptr[i]))
+        parts[i + 1] = tostring(tonumber(ptr[i]))
     end
+    return table.concat(parts, ",")
+end
+
+-- Sign-extend the low 16 bits of `v` to 32. Used to mirror Redux's
+-- `MFC2_internal` canonicalization for the half-word data registers.
+local function sext16(v)
+    local lo = bit.band(v, 0xFFFF)
+    if bit.band(lo, 0x8000) ~= 0 then
+        return bit.bor(lo, 0xFFFF0000)
+    end
+    return lo
+end
+
+-- Saturate `v` (treated as int32) to [0, 0x1F]. Used for IRGB packing
+-- where each component is `IR / 128` clamped to a 5-bit field.
+local function sat5(v)
+    if v < 0 then return 0 end
+    if v > 0x1F then return 0x1F end
+    return v
+end
+
+-- Mirror Redux's `MFC2_internal(reg)` semantics WITHOUT mutating
+-- Redux's storage. Returns the value software would observe via
+-- `mfc2 rt, $rd`. Necessary because between an MTC2 (which stores
+-- the raw 32-bit input into `r[reg]`) and the next MFC2 (which
+-- canonicalizes), `r[reg]` carries a stale high half for the
+-- half-word registers — a non-issue for software but a divergence
+-- against any emulator that returns the canonical view directly.
+--
+-- Cases mirror gte.cc:282-314.
+local function cop2_data_view(p, reg)
+    local raw = tonumber(p[reg])
+    if reg == 1 or reg == 3 or reg == 5
+        or reg == 8 or reg == 9 or reg == 10 or reg == 11 then
+        -- Sign-extend low halfword: VZ0, VZ1, VZ2, IR0, IR1, IR2, IR3.
+        return sext16(raw)
+    end
+    if reg == 7 or reg == 16 or reg == 17 or reg == 18 or reg == 19 then
+        -- Zero-extend low halfword: OTZ, SZ0..SZ3.
+        return bit.band(raw, 0xFFFF)
+    end
+    if reg == 15 then
+        -- SXYP mirrors SXY2 on read.
+        return tonumber(p[14])
+    end
+    if reg == 28 or reg == 29 then
+        -- IRGB/ORGB: pack `(IRn >> 7)` clamped to 5 bits, low to high.
+        local r5 = sat5(bit.arshift(sext16(tonumber(p[9])), 7))
+        local g5 = sat5(bit.arshift(sext16(tonumber(p[10])), 7))
+        local b5 = sat5(bit.arshift(sext16(tonumber(p[11])), 7))
+        return bit.bor(r5, bit.lshift(g5, 5), bit.lshift(b5, 10))
+    end
+    return raw
+end
+
+-- Format the COP2 data-register snapshot as a JSON array, applying
+-- the MFC2-canonical view to each register so output matches what
+-- the emulator's `read_data(idx)` returns.
+local function format_cop2_data(ptr)
+    local parts = {}
+    for i = 0, 31 do
+        parts[i + 1] = tostring(cop2_data_view(ptr, i))
+    end
+    return table.concat(parts, ",")
+end
+
+local function encode_record(tick, pc, instr, gpr_ptr)
     return string.format(
-        '{"tick":%d,"pc":%d,"instr":%d,"gprs":[%s]}',
-        tick, pc, instr, table.concat(parts, ",")
+        '{"tick":%d,"pc":%d,"instr":%d,"gprs":[%s],"cop2_data":[%s],"cop2_ctl":[%s]}',
+        tick, pc, instr,
+        format_u32_array(gpr_ptr),
+        format_cop2_data(cop2d_ptr),
+        format_u32_array(cop2c_ptr)
     )
 end
 
@@ -84,6 +229,21 @@ local function run()
     ram_ptr = PCSX.getMemPtr()
     rom_ptr = PCSX.getRomPtr()
     regs = PCSX.getRegisters()
+
+    -- COP2 register access via the unioned `r[32]` view. Both
+    -- `psxCP2Data` and `psxCP2Ctrl` carry the same shape — one or
+    -- both being absent means the Redux build's Lua bindings don't
+    -- expose the GTE registers, in which case we can't do GTE
+    -- parity at all and abort the harness loudly. Silently emitting
+    -- zeros would mask every real GTE divergence.
+    local ok_d, d_view = pcall(function() return regs.CP2D and regs.CP2D.r end)
+    local ok_c, c_view = pcall(function() return regs.CP2C and regs.CP2C.r end)
+    if not (ok_d and d_view and ok_c and c_view) then
+        send("err startup: COP2 (regs.CP2D.r / regs.CP2C.r) not exposed by this Redux build; rebuild with GTE Lua bindings")
+        return
+    end
+    cop2d_ptr = d_view
+    cop2c_ptr = c_view
 
     send("ready")
 
@@ -124,6 +284,95 @@ local function run()
             end
             local tick = tonumber(PCSX.getCPUCycles())
             send(string.format("run ok tick=%d", tick))
+
+        elseif cmd == "run_audio_capture" then
+            -- `run_audio_capture N CHUNK_STEPS PATH` — run N user-side
+            -- steps silently and append mixed audio into PATH as raw
+            -- little-endian s16 stereo PCM.
+            --
+            -- Important: Redux's SPU mixing thread is host-driven and
+            -- can run ahead of emulated CPU time when the oracle is in
+            -- quiet stepped mode. So we do NOT drain "everything that's
+            -- buffered". Instead we drain only the number of frames
+            -- implied by the retired CPU cycles (`33868800 / 44100 =
+            -- 768 cycles/sample`) and let the queue back-pressure the
+            -- producer if it tries to outrun emulated time.
+            local n_str, chunk_str, path =
+                line:match("^run_audio_capture%s+(%d+)%s+(%d+)%s+(.+)$")
+            local n = tonumber(n_str) or 0
+            local chunk = tonumber(chunk_str) or 0
+            if n == 0 or chunk == 0 or not path then
+                send("err run_audio_capture: bad args")
+            else
+                local ok, result = pcall(function()
+                    local batch_frames = 2048
+                    local pcm = ffi.new("int16_t[?]", batch_frames * 2)
+                    local file = io.open(path, "wb")
+                    if not file then
+                        error("cannot open " .. path)
+                    end
+
+                    -- Drop audio that Redux's host-driven SPU thread
+                    -- prebuffered before the capture window. Without
+                    -- this, BIOS comparisons measure MiniAudio queue
+                    -- latency rather than emulated SPU time.
+                    local flushed = 0
+                    while flushed < 32768 do
+                        local frames = tonumber(PCSX.drainAudioFrames(pcm, batch_frames)) or 0
+                        if frames <= 0 then
+                            break
+                        end
+                        flushed = flushed + frames
+                    end
+
+                    local total_frames = 0
+                    local cycle_remainder = 0
+                    local prev_tick = tonumber(PCSX.getCPUCycles()) or 0
+                    local remaining = n
+                    while remaining > 0 do
+                        local take = math.min(remaining, chunk)
+                        for i = 1, take do
+                            PCSX.stepIn()
+                            PCSX.runExecute()
+                        end
+                        remaining = remaining - take
+
+                        local tick = tonumber(PCSX.getCPUCycles()) or 0
+                        local tick_delta = tick - prev_tick
+                        prev_tick = tick
+                        cycle_remainder = cycle_remainder + tick_delta
+
+                        local wanted = math.floor(cycle_remainder / 768)
+                        cycle_remainder = cycle_remainder % 768
+
+                        while wanted > 0 do
+                            local request = math.min(batch_frames, wanted)
+                            local frames = tonumber(PCSX.drainAudioFrames(pcm, request)) or 0
+                            if frames <= 0 then
+                                break
+                            end
+                            file:write(ffi.string(ffi.cast("char*", pcm), frames * 4))
+                            total_frames = total_frames + frames
+                            wanted = wanted - frames
+                        end
+                    end
+
+                    file:close()
+
+                    local meta = io.open(path .. ".txt", "w")
+                    if meta then
+                        meta:write(string.format("rate=44100 channels=2 format=s16le frames=%d\n", total_frames))
+                        meta:close()
+                    end
+                    local tick = tonumber(PCSX.getCPUCycles()) or 0
+                    return string.format("tick=%d frames=%d", tick, total_frames)
+                end)
+                if ok then
+                    send("run_audio_capture ok " .. result)
+                else
+                    send("err run_audio_capture: " .. tostring(result))
+                end
+            end
 
         elseif cmd == "log_cdrom_irqs" then
             -- `log_cdrom_irqs N M` — run N user-side steps
@@ -228,6 +477,74 @@ local function run()
                 local tick = tonumber(PCSX.getCPUCycles())
                 local pc = tonumber(regs.pc)
                 send(string.format("run_checkpoint ok step=%d tick=%d pc=%d", n, tick, pc))
+            end
+
+        elseif cmd == "run_checkpoint_pad" then
+            -- `run_checkpoint_pad N M PORT BASE_MASK PULSES` — same as
+            -- `run_checkpoint`, but also applies a VBlank-timed button
+            -- schedule to the given controller port. `PULSES` is either
+            -- `-` or a comma-separated list of
+            -- `<mask>@<start_vblank>+<frames>` entries, using decimal
+            -- integers only so the shell and protocol stay boring.
+            local n_str, m_str, port_str, base_mask_str, pulse_spec =
+                line:match("^run_checkpoint_pad%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%S+)$")
+            local n = tonumber(n_str) or 0
+            local m = tonumber(m_str) or 1
+            local port = tonumber(port_str) or 0
+            local base_mask = tonumber(base_mask_str) or 0
+            local pulses, pulse_err = parse_pad_pulses(pulse_spec)
+            if n == 0 or port == 0 or not pulses then
+                send("err run_checkpoint_pad: " .. tostring(pulse_err or "bad args"))
+            else
+                local hw_ptr = get_hw_ptr()
+                local istat_ptr = ffi.cast("uint32_t*", hw_ptr + 0x1070)
+                local prev_vblank = bit.band(istat_ptr[0], 0x1)
+                local vblank_count = 0
+                local current_mask = nil
+                local function sync_pad_mask()
+                    local next_mask = effective_pad_mask(base_mask, pulses, vblank_count)
+                    if current_mask ~= next_mask then
+                        local ok, err = apply_pad_mask(port, next_mask)
+                        if not ok then
+                            return false, err
+                        end
+                        current_mask = next_mask
+                    end
+                    return true
+                end
+                local ok, err = sync_pad_mask()
+                if not ok then
+                    send("err run_checkpoint_pad: " .. tostring(err))
+                else
+                    local emissions = 0
+                    for i = 1, n do
+                        PCSX.stepIn()
+                        PCSX.runExecute()
+                        local cur_vblank = bit.band(istat_ptr[0], 0x1)
+                        if cur_vblank ~= 0 and prev_vblank == 0 then
+                            vblank_count = vblank_count + 1
+                        end
+                        prev_vblank = cur_vblank
+                        ok, err = sync_pad_mask()
+                        if not ok then
+                            send("err run_checkpoint_pad: " .. tostring(err))
+                            break
+                        end
+                        if i % m == 0 then
+                            local tick = tonumber(PCSX.getCPUCycles())
+                            local pc = tonumber(regs.pc)
+                            send_nowait(string.format("chk step=%d tick=%d pc=%d", i, tick, pc))
+                            emissions = emissions + 1
+                            if emissions % 256 == 0 then io.flush() end
+                        end
+                    end
+                    io.flush()
+                    if ok then
+                        local tick = tonumber(PCSX.getCPUCycles())
+                        local pc = tonumber(regs.pc)
+                        send(string.format("run_checkpoint_pad ok step=%d tick=%d pc=%d", n, tick, pc))
+                    end
+                end
             end
 
         elseif cmd == "peek32" then

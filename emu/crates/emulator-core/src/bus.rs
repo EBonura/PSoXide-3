@@ -342,6 +342,40 @@ impl Bus {
             .unwrap_or((false, 0))
     }
 
+    /// Histogram of pad command bytes observed on port 1 since boot.
+    /// `None` when no controller is attached.
+    pub fn port1_pad_command_histogram(&self) -> Option<&[u32; 256]> {
+        self.sio0.port1().pad().map(|p| p.command_histogram())
+    }
+
+    /// Recent pad command bytes seen on port 1, oldest first.
+    pub fn port1_pad_recent_commands(&self) -> Vec<u8> {
+        self.sio0
+            .port1()
+            .pad()
+            .map(|p| p.recent_commands())
+            .unwrap_or_default()
+    }
+
+    /// Histogram of transaction-leading bytes seen on SIO0 port 1.
+    pub fn port1_first_byte_histogram(&self) -> &[u32; 256] {
+        self.sio0.port1().first_byte_histogram()
+    }
+
+    /// Recent transaction-leading bytes seen on SIO0 port 1.
+    pub fn port1_recent_first_bytes(&self) -> Vec<u8> {
+        self.sio0.port1().recent_first_bytes()
+    }
+
+    /// Recent completed `0x42` poll transactions seen on port 1.
+    pub fn port1_recent_polls(&self) -> Vec<crate::pad::PollSnapshot> {
+        self.sio0
+            .port1()
+            .pad()
+            .map(|p| p.recent_polls())
+            .unwrap_or_default()
+    }
+
     /// Plug a digital controller into port 2. Used by two-player
     /// games (Tekken VS, Bomberman, Street Fighter Alpha, etc.).
     /// SIO0 already multiplexes port 1 / port 2 internally via
@@ -430,6 +464,15 @@ impl Bus {
         }
     }
 
+    /// Advance the SIO0 byte/ACK timers to the current bus cycle and
+    /// forward any newly latched controller IRQ to `I_STAT`.
+    fn service_sio0(&mut self) {
+        self.sio0.tick(self.cycles);
+        if self.sio0.take_pending_irq() {
+            self.irq.raise(IrqSource::Controller);
+        }
+    }
+
     /// Cycle count at which the next VBlank is scheduled to fire.
     /// Exposed for diagnostics / the HUD. Reads through to the
     /// scheduler, which is the source of truth since Phase 5a.
@@ -470,6 +513,7 @@ impl Bus {
         if self.cdrom.tick(self.cycles) && self.cdrom.should_wake_cpu() {
             self.irq.raise(IrqSource::Cdrom);
         }
+        self.service_sio0();
     }
 
     /// Walk every scheduler slot whose deadline has passed and
@@ -1265,6 +1309,7 @@ impl Bus {
             return 0xFF;
         }
         if Sio0::contains(phys) {
+            self.service_sio0();
             return self.sio0.read8(phys).unwrap_or(0);
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
@@ -1343,6 +1388,7 @@ impl Bus {
             return self.spu.read16_at(phys, self.cycles);
         }
         if Sio0::contains(phys) {
+            self.service_sio0();
             return self.sio0.read16(phys).unwrap_or(0);
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
@@ -1437,6 +1483,7 @@ impl Bus {
             return self.spu.read32_at(phys, self.cycles);
         }
         if Sio0::contains(phys) {
+            self.service_sio0();
             return self.sio0.read32(phys).unwrap_or(0);
         }
         if CdRom::contains(phys) {
@@ -1532,10 +1579,9 @@ impl Bus {
             return;
         }
         if Sio0::contains(phys) {
-            self.sio0.write32(phys, value);
-            if self.sio0.take_pending_irq() {
-                self.irq.raise(IrqSource::Controller);
-            }
+            self.service_sio0();
+            self.sio0.write32_at(phys, value, self.cycles);
+            self.service_sio0();
             return;
         }
         if crate::mdec::Mdec::contains(phys) {
@@ -1616,10 +1662,9 @@ impl Bus {
             return;
         }
         if Sio0::contains(phys) {
-            self.sio0.write8(phys, value);
-            if self.sio0.take_pending_irq() {
-                self.irq.raise(IrqSource::Controller);
-            }
+            self.service_sio0();
+            self.sio0.write8_at(phys, value, self.cycles);
+            self.service_sio0();
             return;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {
@@ -1686,10 +1731,9 @@ impl Bus {
             return;
         }
         if Sio0::contains(phys) {
-            self.sio0.write16(phys, value);
-            if self.sio0.take_pending_irq() {
-                self.irq.raise(IrqSource::Controller);
-            }
+            self.service_sio0();
+            self.sio0.write16_at(phys, value, self.cycles);
+            self.service_sio0();
             return;
         }
         if (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys) {

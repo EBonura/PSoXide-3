@@ -210,7 +210,7 @@ impl Scheduler {
     }
 
     /// Remove and return the earliest-deadline slot whose target is
-    /// `<= now`, along with that original target cycle. `None` if
+    /// `< now`, along with that original target cycle. `None` if
     /// nothing's due. Callers invoke this in a loop to drain every
     /// due event on each tick; the returned target is what a
     /// periodic handler (VBlank, SPU async) uses to reschedule its
@@ -222,7 +222,13 @@ impl Scheduler {
     /// `lowestTarget` to pick the next event — important when two
     /// events share a target cycle and the handlers interact.
     pub fn take_due(&mut self, now: u64) -> Option<(EventSlot, u64)> {
-        if self.active == 0 || now < self.lowest_target {
+        // Redux's `branchTest` only enters the per-slot walk when
+        // `lowestTarget < cycle`, not `<=`. That one-cycle strictness
+        // matters: a DMA scheduled for cycle 46247457 must *not*
+        // latch its IRQ on the exact branch-test where the CPU cycle
+        // first equals 46247457. It becomes visible on the next
+        // branch-test after the CPU has moved past the target.
+        if self.active == 0 || now <= self.lowest_target {
             return None;
         }
 
@@ -250,7 +256,7 @@ impl Scheduler {
     /// Look at what the scheduler would fire next, without removing
     /// it. Useful for tests and diagnostic printouts.
     pub fn peek_due(&self, now: u64) -> Option<EventSlot> {
-        if self.active == 0 || now < self.lowest_target {
+        if self.active == 0 || now <= self.lowest_target {
             return None;
         }
         let mut best_idx: Option<u32> = None;
@@ -340,13 +346,17 @@ mod tests {
     }
 
     #[test]
-    fn take_due_at_or_past_deadline_fires_and_clears() {
+    fn take_due_strictly_after_deadline_fires_and_clears() {
         let mut s = Scheduler::new();
         s.schedule(EventSlot::Cdr, 100, 500);
-        assert_eq!(s.take_due(600), Some((EventSlot::Cdr, 600)));
+        assert!(
+            s.take_due(600).is_none(),
+            "exact target must wait one branchTest"
+        );
+        assert_eq!(s.take_due(601), Some((EventSlot::Cdr, 600)));
         assert!(!s.is_pending(EventSlot::Cdr));
         // Draining again returns None.
-        assert!(s.take_due(600).is_none());
+        assert!(s.take_due(601).is_none());
         assert_eq!(s.total_fired(), 1);
     }
 
@@ -394,7 +404,7 @@ mod tests {
     fn lowest_target_collapses_to_max_when_drained() {
         let mut s = Scheduler::new();
         s.schedule(EventSlot::VBlank, 0, 100);
-        s.take_due(100);
+        s.take_due(101);
         assert_eq!(s.lowest_target(), u64::MAX);
     }
 
@@ -402,6 +412,10 @@ mod tests {
     fn peek_due_does_not_mutate() {
         let mut s = Scheduler::new();
         s.schedule(EventSlot::GpuDma, 0, 50);
+        assert!(
+            s.peek_due(50).is_none(),
+            "exact target must still look pending"
+        );
         assert_eq!(s.peek_due(100), Some(EventSlot::GpuDma));
         // Still pending after peek.
         assert!(s.is_pending(EventSlot::GpuDma));
@@ -422,9 +436,10 @@ mod tests {
         let mut s = Scheduler::new();
         s.schedule(EventSlot::Sio, 0, 100);
         s.schedule(EventSlot::VBlank, 0, 100);
-        let first = s.take_due(100);
-        let second = s.take_due(100);
-        let third = s.take_due(100);
+        assert!(s.take_due(100).is_none(), "exact target must not fire yet");
+        let first = s.take_due(101);
+        let second = s.take_due(101);
+        let third = s.take_due(101);
         assert!(first.is_some() && second.is_some());
         assert!(third.is_none());
         // Order is irrelevant — both should have fired, and both

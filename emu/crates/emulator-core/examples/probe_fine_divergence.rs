@@ -16,6 +16,13 @@ use parity_oracle::{OracleConfig, ReduxProcess};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const TRACE_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PadPulse {
+    mask: u16,
+    start_vblank: u64,
+    frames: u64,
+}
+
 fn main() {
     let start: u64 = std::env::args()
         .nth(1)
@@ -26,6 +33,23 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
     let disc_path = std::env::args().nth(3);
+    let held_buttons = std::env::var("PSOXIDE_PAD1")
+        .ok()
+        .and_then(|s| parse_u16_mask(&s))
+        .unwrap_or(0);
+    let pad_pulses = std::env::var("PSOXIDE_PAD1_PULSES")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            parse_pad_pulses(&s).unwrap_or_else(|| {
+                panic!(
+                    "PSOXIDE_PAD1_PULSES must be comma-separated \
+                     <mask>@<start_vblank>+<frames> entries"
+                )
+            })
+        })
+        .unwrap_or_default();
+    let wants_pad = held_buttons != 0 || !pad_pulses.is_empty();
 
     let bios_path = PathBuf::from("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN");
 
@@ -39,13 +63,26 @@ fn main() {
         bus.cdrom
             .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
     }
+    if wants_pad {
+        bus.attach_digital_pad_port1();
+    }
     let mut cpu = Cpu::new();
+    let mut current_pad_mask = None;
+    if wants_pad {
+        sync_pad_mask(&mut bus, held_buttons, &pad_pulses, &mut current_pad_mask);
+    }
     for _ in 0..start {
         let was_in_isr = cpu.in_isr();
         cpu.step(&mut bus).expect("step");
+        if wants_pad {
+            sync_pad_mask(&mut bus, held_buttons, &pad_pulses, &mut current_pad_mask);
+        }
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
                 cpu.step(&mut bus).expect("isr step");
+                if wants_pad {
+                    sync_pad_mask(&mut bus, held_buttons, &pad_pulses, &mut current_pad_mask);
+                }
             }
         }
     }
@@ -65,9 +102,15 @@ fn main() {
     for _ in 0..window {
         let was_in_isr = cpu.in_isr();
         let mut rec = cpu.step(&mut bus).expect("step");
+        if wants_pad {
+            sync_pad_mask(&mut bus, held_buttons, &pad_pulses, &mut current_pad_mask);
+        }
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
                 let r = cpu.step(&mut bus).expect("isr step");
+                if wants_pad {
+                    sync_pad_mask(&mut bus, held_buttons, &pad_pulses, &mut current_pad_mask);
+                }
                 rec.tick = r.tick;
                 rec.gprs = r.gprs;
             }
@@ -87,14 +130,30 @@ fn main() {
     let mut redux = ReduxProcess::launch(&config).expect("Redux launches");
     redux.handshake(HANDSHAKE_TIMEOUT).expect("handshake");
     let ff_timeout = Duration::from_secs((start / 200_000).max(60));
-    redux.run(start, ff_timeout).expect("fast-forward");
+    if wants_pad && start > 0 {
+        let pulse_tuples = pad_pulses
+            .iter()
+            .map(|pulse| (pulse.mask, pulse.start_vblank, pulse.frames))
+            .collect::<Vec<_>>();
+        redux
+            .run_checkpoint_pad(
+                start,
+                start.max(1),
+                1,
+                held_buttons,
+                &pulse_tuples,
+                ff_timeout,
+                |_step, _tick, _pc| Ok(()),
+            )
+            .expect("fast-forward with pad");
+    } else if start > 0 {
+        redux.run(start, ff_timeout).expect("fast-forward");
+    }
     eprintln!(
         "[redux] ff done in {:.1}s, tracing {window} steps...",
         t0.elapsed().as_secs_f64()
     );
-    let trace = redux
-        .step(window, TRACE_STEP_TIMEOUT)
-        .expect("step");
+    let trace = redux.step(window, TRACE_STEP_TIMEOUT).expect("step");
     eprintln!("[redux] trace done, {} records", trace.len());
     redux.send_command("quit").ok();
     let _ = redux.wait_for_response(Duration::from_secs(2));
@@ -130,7 +189,9 @@ fn main() {
                 println!(
                     "{marker} idx={j:>5} step={:>10} pc=0x{:08x} instr=0x{:08x} tick={:>10}",
                     start + j as u64 + 1,
-                    o.pc, o.instr, o.tick,
+                    o.pc,
+                    o.instr,
+                    o.tick,
                 );
                 if o.gprs != r.gprs {
                     for reg in 0..32 {
@@ -151,4 +212,69 @@ fn main() {
             }
         }
     }
+}
+
+fn parse_u16_mask(text: &str) -> Option<u16> {
+    let s = text.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u16>().ok()
+    }
+}
+
+fn parse_pad_pulses(text: &str) -> Option<Vec<PadPulse>> {
+    let mut pulses = Vec::new();
+    for entry in text.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        pulses.push(parse_pad_pulse(entry)?);
+    }
+    Some(pulses)
+}
+
+fn parse_pad_pulse(text: &str) -> Option<PadPulse> {
+    let (mask_text, rest) = text.split_once('@')?;
+    let mask = parse_u16_mask(mask_text)?;
+    let (start_text, frames_text) = match rest.split_once('+') {
+        Some((start, frames)) => (start.trim(), frames.trim()),
+        None => (rest.trim(), "1"),
+    };
+    let start_vblank = start_text.parse().ok()?;
+    let frames = frames_text.parse().ok()?;
+    if frames == 0 {
+        return None;
+    }
+    Some(PadPulse {
+        mask,
+        start_vblank,
+        frames,
+    })
+}
+
+fn effective_pad_mask(base_mask: u16, pulses: &[PadPulse], current_vblank: u64) -> u16 {
+    let mut mask = base_mask;
+    for pulse in pulses {
+        let end_vblank = pulse.start_vblank.saturating_add(pulse.frames);
+        if current_vblank >= pulse.start_vblank && current_vblank < end_vblank {
+            mask |= pulse.mask;
+        }
+    }
+    mask
+}
+
+fn sync_pad_mask(
+    bus: &mut Bus,
+    base_mask: u16,
+    pulses: &[PadPulse],
+    current_mask: &mut Option<u16>,
+) {
+    let next_mask = effective_pad_mask(base_mask, pulses, bus.irq().raise_counts()[0]);
+    if current_mask.is_some_and(|mask| mask == next_mask) {
+        return;
+    }
+    bus.set_port1_buttons(emulator_core::ButtonState::from_bits(next_mask));
+    *current_mask = Some(next_mask);
 }

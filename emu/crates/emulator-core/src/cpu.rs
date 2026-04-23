@@ -302,6 +302,7 @@ impl Cpu {
                 self.committing_load = None;
                 bus.tick(2);
                 self.tick += 1;
+                let (cop2_data, cop2_ctl) = self.snapshot_cop2();
                 return Ok(InstructionRecord {
                     // Trace records report bus cycles (same unit Redux's
                     // `m_regs.cycle` uses). `self.tick` keeps counting
@@ -310,6 +311,8 @@ impl Cpu {
                     pc: self.pc,
                     instr: 0,
                     gprs: self.gprs,
+                    cop2_data,
+                    cop2_ctl,
                 });
             }
         }
@@ -397,6 +400,7 @@ impl Cpu {
         }
 
         self.tick += 1;
+        let (cop2_data, cop2_ctl) = self.snapshot_cop2();
         Ok(InstructionRecord {
             // Report bus cycles, not retired-instruction count — the
             // psx-trace docs call this field a "cycle count", Redux's
@@ -408,7 +412,30 @@ impl Cpu {
             pc: pc_before,
             instr,
             gprs: self.gprs,
+            cop2_data,
+            cop2_ctl,
         })
+    }
+
+    /// Snapshot all 64 GTE registers using the software-visible
+    /// `MFC2`/`CFC2` accessors so the recorded values match what
+    /// Redux's `regs.CP2D.r` / `regs.CP2C.r` expose. Pure read; no
+    /// side effects.
+    #[cfg(feature = "trace-cop2")]
+    fn snapshot_cop2(&self) -> ([u32; 32], [u32; 32]) {
+        let mut data = [0u32; 32];
+        let mut ctl = [0u32; 32];
+        for i in 0..32u8 {
+            data[i as usize] = self.cop2.read_data(i);
+            ctl[i as usize] = self.cop2.read_control(i);
+        }
+        (data, ctl)
+    }
+
+    #[cfg(not(feature = "trace-cop2"))]
+    #[inline(always)]
+    fn snapshot_cop2(&self) -> ([u32; 32], [u32; 32]) {
+        ([0u32; 32], [0u32; 32])
     }
 
     /// Decode and execute a single instruction. Does not advance PC
@@ -796,16 +823,22 @@ impl Cpu {
     /// stage the load in `pending_load`; [`Cpu::step`] commits it
     /// after the following instruction executes.
     fn op_lw(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
-        // Charge the memory-access cycle BEFORE the read so cycle-
-        // sensitive MMIO sees the post-increment cycle. Matches
-        // Redux's `psxmem.cc:read32`. Previously we charged after
-        // the read, which made Timer 1 counter reads lag by one
-        // cycle — caught at parity step 79,389,318.
-        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
+        // Word-aligned check first; Redux only charges the memory
+        // cycle if the access actually proceeds (`psxmem.cc:read32`
+        // increments after the alignment check in `psxLW` early-
+        // returns). The post-alignment cycle still lands BEFORE the
+        // bus read so cycle-sensitive MMIO sees the post-increment
+        // cycle — fix from the Timer 1 lag caught at parity step
+        // 79,389,318.
+        if addr & 3 != 0 {
+            self.raise_address_error(ExceptionCode::AddressErrorLoad, addr);
+            return Ok(());
+        }
+        bus.add_cycles(1);
         let value = bus.read32(addr);
         // Loads to $zero are no-ops; never queue a commit to it.
         if rt != 0 {
@@ -822,14 +855,22 @@ impl Cpu {
     /// model the side effect by simply dropping the write — matching
     /// PS1 hardware, which has no separate D-cache for us to populate.
     fn op_sw(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
-        bus.add_cycles(1);
-        if self.cache_isolated() {
-            return Ok(());
-        }
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
+        // Alignment trap before any cycle accounting — Redux's
+        // `psxSW` checks `_oB_ & 3` ahead of `m_mem->write32`, and
+        // the cycle is charged inside the bus write itself. A
+        // misaligned store costs zero cycles on this side.
+        if addr & 3 != 0 {
+            self.raise_address_error(ExceptionCode::AddressErrorStore, addr);
+            return Ok(());
+        }
+        bus.add_cycles(1);
+        if self.cache_isolated() {
+            return Ok(());
+        }
         bus.write32(addr, self.gpr(rt));
         Ok(())
     }
@@ -996,11 +1037,15 @@ impl Cpu {
     }
 
     fn op_lh(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
-        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
+        if addr & 1 != 0 {
+            self.raise_address_error(ExceptionCode::AddressErrorLoad, addr);
+            return Ok(());
+        }
+        bus.add_cycles(1);
         let value = bus.read16(addr) as i16 as i32 as u32;
         if rt != 0 {
             self.pending_load = Some((rt, value));
@@ -1009,11 +1054,15 @@ impl Cpu {
     }
 
     fn op_lhu(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
-        bus.add_cycles(1);
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
+        if addr & 1 != 0 {
+            self.raise_address_error(ExceptionCode::AddressErrorLoad, addr);
+            return Ok(());
+        }
+        bus.add_cycles(1);
         let value = bus.read16(addr) as u32;
         if rt != 0 {
             self.pending_load = Some((rt, value));
@@ -1035,14 +1084,18 @@ impl Cpu {
     }
 
     fn op_sh(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
-        bus.add_cycles(1);
-        if self.cache_isolated() {
-            return Ok(());
-        }
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
+        if addr & 1 != 0 {
+            self.raise_address_error(ExceptionCode::AddressErrorStore, addr);
+            return Ok(());
+        }
+        bus.add_cycles(1);
+        if self.cache_isolated() {
+            return Ok(());
+        }
         bus.write16(addr, self.gpr(rt) as u16);
         Ok(())
     }
@@ -1485,6 +1538,19 @@ impl Cpu {
         };
         self.pending_exception_pc = Some(vector);
     }
+
+    /// Raise an AdEL or AdES address-error exception. Stores the
+    /// offending virtual address in COP0 BadVaddr (cop0[8]) and
+    /// hands off to [`Cpu::enter_exception`] with the appropriate
+    /// code. `in_delay_slot` is recovered from `pending_pc` the
+    /// same way `op_addi` does for overflow — every load/store
+    /// reaches this helper from inside `execute()` where that
+    /// invariant holds.
+    fn raise_address_error(&mut self, code: ExceptionCode, addr: u32) {
+        let in_delay_slot = self.pending_pc.is_some();
+        self.cop0[8] = addr;
+        self.enter_exception(code, self.pc, in_delay_slot);
+    }
 }
 
 /// Cycle cost per instruction — matches PCSX-Redux's simple-interpreter
@@ -1512,6 +1578,15 @@ enum ExceptionCode {
     /// External interrupt — asserted by the IRQ controller. See
     /// [`Cpu::should_take_interrupt`] for the gating logic.
     Interrupt = 0,
+    /// AdEL — load-side address error. Raised by `LH`/`LHU` on a
+    /// halfword-misaligned address and by `LW` on a word-misaligned
+    /// one. Real BIOS code occasionally relies on this trap to
+    /// reject malformed pointers; silent "succeeds with garbage"
+    /// is the worst possible failure mode.
+    AddressErrorLoad = 4,
+    /// AdES — store-side address error. Raised by `SH`/`SW` for
+    /// the equivalent misalignment cases.
+    AddressErrorStore = 5,
     Syscall = 8,
     Break = 9,
     /// Integer arithmetic overflow — raised by `ADD`, `ADDI`, and
@@ -1921,5 +1996,93 @@ mod tests {
                 "SWR addr&3={aw}: got 0x{result:08x}, want 0x{:08x}", expected[aw as usize]
             );
         }
+    }
+
+    /// Step a single load/store at the BIOS reset vector with `$a0`
+    /// (rs=4) preset to `base`. Returns the post-step CPU + bus so
+    /// callers can inspect COP0 and cycle counters. The opcode word
+    /// must use rs=4 so this preset is the effective base register.
+    fn step_one_load_store(opword: u32, base: u32) -> (Cpu, Bus) {
+        let mut bus = Bus::new(synthetic_bios_with_first_word(opword)).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.gprs[4] = base;
+        cpu.step(&mut bus).expect("op decodes");
+        (cpu, bus)
+    }
+
+    fn assert_address_error(cpu: &Cpu, expected_code: u32, expected_bad: u32, lw_pc: u32) {
+        // CAUSE.ExcCode lives in bits 6..2.
+        let exc_code = (cpu.cop0[13] >> 2) & 0x1F;
+        assert_eq!(exc_code, expected_code, "ExcCode mismatch");
+        assert_eq!(cpu.cop0[8], expected_bad, "BadVaddr mismatch");
+        assert_eq!(cpu.cop0[14], lw_pc, "EPC mismatch");
+        // SR.BEV is 0 at reset (Cpu::new) — and Redux's r3000a.cc
+        // reset value `0x10900000` also leaves bit 22 clear despite
+        // a misleading "BEV = 1" comment. Both sides therefore land
+        // on the non-BEV vector for traps fired before SR gets
+        // explicitly configured.
+        assert_eq!(cpu.pc(), 0x8000_0080, "vector mismatch");
+    }
+
+    #[test]
+    fn op_lw_misaligned_addr_raises_adel() {
+        // LW $t1, 1($a0); base aligned so the +1 offset is what
+        // lands the address on a non-word boundary.
+        let (cpu, _bus) = step_one_load_store(0x8C89_0001, 0xBFC0_0000);
+        assert_address_error(&cpu, 4, 0xBFC0_0001, 0xBFC0_0000);
+        // No load delay should have been queued — the trap fires
+        // before the bus access. After one extra step the destination
+        // register must still be untouched.
+        assert_eq!(cpu.gprs[9], 0, "rt must remain unchanged on AdEL");
+    }
+
+    #[test]
+    fn op_lh_misaligned_addr_raises_adel() {
+        // LH $t1, 1($a0): odd halfword address.
+        let (cpu, _bus) = step_one_load_store(0x8489_0001, 0xBFC0_0000);
+        assert_address_error(&cpu, 4, 0xBFC0_0001, 0xBFC0_0000);
+    }
+
+    #[test]
+    fn op_lhu_misaligned_addr_raises_adel() {
+        // LHU $t1, 1($a0): odd halfword address.
+        let (cpu, _bus) = step_one_load_store(0x9489_0001, 0xBFC0_0000);
+        assert_address_error(&cpu, 4, 0xBFC0_0001, 0xBFC0_0000);
+    }
+
+    #[test]
+    fn op_sw_misaligned_addr_raises_ades() {
+        // SW $t1, 1($a0): word write to odd address. Use scratch RAM
+        // (0x0000_0000 .. 2 MiB) as the base so a non-trapping SW
+        // would actually land somewhere — proves the trap fired
+        // before the bus write rather than just being silently no-op.
+        let (cpu, _bus) = step_one_load_store(0xAC89_0001, 0x0000_0000);
+        assert_address_error(&cpu, 5, 0x0000_0001, 0xBFC0_0000);
+    }
+
+    #[test]
+    fn op_sh_misaligned_addr_raises_ades() {
+        let (cpu, _bus) = step_one_load_store(0xA489_0001, 0x0000_0000);
+        assert_address_error(&cpu, 5, 0x0000_0001, 0xBFC0_0000);
+    }
+
+    #[test]
+    fn aligned_lw_does_not_raise() {
+        // Sanity: aligned access leaves COP0 untouched.
+        let (cpu, _bus) = step_one_load_store(0x8C89_0000, 0xBFC0_0000);
+        assert_eq!(cpu.cop0[8], 0, "BadVaddr must not be touched");
+        assert_eq!(cpu.cop0[13], 0, "Cause must not be touched");
+        assert_eq!(cpu.pc(), 0xBFC0_0004, "should advance, not vector");
+    }
+
+    #[test]
+    fn misaligned_lw_does_not_charge_memory_cycle() {
+        // Redux's `psxLW` early-returns BEFORE `m_mem->read32` runs,
+        // and the +1 memory cycle lives inside `psxmem.cc:read32`.
+        // Our op_lw matches this by gating `add_cycles(1)` behind
+        // the alignment check, so a trapping LW should bill only
+        // the BIAS cycle for the instruction itself (= 2).
+        let (_cpu, bus) = step_one_load_store(0x8C89_0001, 0xBFC0_0000);
+        assert_eq!(bus.cycles(), BIAS as u64);
     }
 }

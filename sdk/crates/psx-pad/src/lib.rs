@@ -3,8 +3,8 @@
 //! Talks directly to the SIO0 hardware (no BIOS syscalls) so the
 //! same code works whether we side-load a homebrew (HLE BIOS) or
 //! boot through the real BIOS. The controller protocol is simple
-//! enough that a hand-rolled four-byte exchange beats opening
-//! events and waiting on them.
+//! enough that a hand-rolled select + four-byte exchange beats
+//! opening events and waiting on them.
 //!
 //! Typical use from a game loop:
 //!
@@ -21,8 +21,9 @@
 //!
 //! | `TX` | `RX` | Meaning                            |
 //! |------|------|------------------------------------|
-//! | `01` | `41` | Address byte / digital pad ID low  |
-//! | `42` | `5A` | Poll command / ID high             |
+//! | `01` | `FF` | Address byte / select controller   |
+//! | `42` | `41` | Poll command / digital pad ID low  |
+//! | `00` | `5A` | Fill byte / ID high                |
 //! | `00` | `b0` | Buttons group 1 (active-low)       |
 //! | `00` | `b1` | Buttons group 2 (active-low)       |
 //!
@@ -124,13 +125,14 @@ fn poll(port2: bool) -> ButtonState {
         psx_io::write16(sio::CTRL, CTRL_ACK);
         psx_io::write16(sio::CTRL, slot | CTRL_TXEN | CTRL_RXEN | CTRL_JOYN);
 
-        let id_lo = exchange(0x01);
+        let _select = exchange(0x01);
+        let id_lo = exchange(0x42);
         if id_lo != 0x41 {
             // No digital pad on this port.
             deselect();
             return ButtonState::NONE;
         }
-        let _id_hi = exchange(0x42);
+        let _id_hi = exchange(0x00);
         let b0 = exchange(0x00);
         let b1 = exchange(0x00);
         deselect();

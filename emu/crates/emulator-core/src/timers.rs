@@ -94,13 +94,21 @@ impl Timers {
     }
 
     /// Read a 32-bit word. `phys` must be inside `BASE..BASE+SIZE`.
-    pub fn read32(&self, phys: u32) -> u32 {
+    pub fn read32(&mut self, phys: u32) -> u32 {
         let (idx, off) = decode(phys);
-        let t = &self.timers[idx];
         match off {
-            0x0 => t.counter,
-            0x4 => t.mode,
-            0x8 => t.target,
+            0x0 => self.timers[idx].counter,
+            0x4 => {
+                let mode = self.timers[idx].mode;
+                // Hardware/Redux side effect: reading the mode register
+                // clears the sticky "reached target" / "reached 0xFFFF"
+                // bits (11 and 12). Leaving them latched forever makes
+                // timer-polling code think a wrap/target event is still
+                // pending long after software consumed it.
+                self.timers[idx].mode &= !(MODE_REACHED_TARGET | MODE_REACHED_WRAP);
+                mode
+            }
+            0x8 => self.timers[idx].target,
             _ => 0,
         }
     }
@@ -382,7 +390,7 @@ mod tests {
     fn timer0_system_clock_source_unaffected_by_divisor() {
         let mut t = Timers::new();
         t.write32(0x1F80_1104, 0, 0); // source 0 = system clock
-        // Divisor changes shouldn't matter at system-clock source.
+                                      // Divisor changes shouldn't matter at system-clock source.
         t.tick(100, 2146, 8);
         assert_eq!(t.read32(0x1F80_1100) & 0xFFFF, 100);
     }
@@ -428,5 +436,16 @@ mod tests {
         t.write32(0x1F80_1124, MODE_SYNC_ENABLE, 0);
         t.tick(100, 2146, 8);
         assert_eq!(t.read32(0x1F80_1120) & 0xFFFF, 100);
+    }
+
+    #[test]
+    fn reading_mode_clears_reached_flags() {
+        let mut t = Timers::new();
+        t.timers[1].mode = MODE_REACHED_TARGET | MODE_REACHED_WRAP | MODE_IRQ_ACTIVE_LOW;
+        assert_eq!(
+            t.read32(0x1F80_1114),
+            MODE_REACHED_TARGET | MODE_REACHED_WRAP | MODE_IRQ_ACTIVE_LOW
+        );
+        assert_eq!(t.timers[1].mode, MODE_IRQ_ACTIVE_LOW);
     }
 }

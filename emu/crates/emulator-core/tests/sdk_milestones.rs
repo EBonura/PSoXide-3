@@ -553,6 +553,10 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // byte-identical VRAM + display (the new helper produces
         // the same scaled-rotation matrix the old inline `scale_mat`
         // did), only `final_pc` shifted as code layout changed.
+        // Phase 3f SIO rebake: the stricter controller shifter model
+        // now keeps the visual/audio outputs byte-identical while the
+        // per-frame pad poll consumes a different amount of CPU time,
+        // so only the captured `final_pc` moved.
         "showcase-lights" => Some(SdkGolden {
             example: "showcase-lights",
             vblanks: 60,
@@ -561,7 +565,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_2f0c,
+            final_pc: 0x8001_10dc,
             redux_display_hash: None,
         }),
 

@@ -24,7 +24,7 @@ use std::io::Write;
 fn main() {
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("bios");
     let exe_bytes = std::fs::read(
-        "/Users/ebonura/Desktop/repos/PSoXide/build/examples/mipsel-sony-psx/release/hello-input.exe",
+        "/Users/ebonura/Desktop/repos/psoxide/build/examples/mipsel-sony-psx/release/hello-input.exe",
     )
     .expect("hello-input.exe");
     let exe = Exe::parse(&exe_bytes).expect("parse");

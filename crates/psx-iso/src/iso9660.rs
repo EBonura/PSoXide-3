@@ -174,7 +174,7 @@ impl IsoBuilder {
         pvd[0] = 0x01; // volume descriptor type = PVD
         pvd[1..6].copy_from_slice(b"CD001");
         pvd[6] = 0x01; // version
-        // pvd[7] = 0 (unused)
+                       // pvd[7] = 0 (unused)
         fill_ascii(&mut pvd[8..40], &self.system_id);
         fill_ascii(&mut pvd[40..72], &self.volume_id);
         // pvd[72..80] = 0
@@ -266,8 +266,8 @@ impl IsoBuilder {
             sector[13] = bin_to_bcd(second);
             sector[14] = bin_to_bcd(frame);
             sector[15] = 0x02; // Mode 2
-            // Subheader: FILE=0, CHAN=0, SUBMODE=0x08 (data), CI=0
-            // (repeated twice — Mode 2 requires the sub-header pair).
+                               // Subheader: FILE=0, CHAN=0, SUBMODE=0x08 (data), CI=0
+                               // (repeated twice — Mode 2 requires the sub-header pair).
             sector[16] = 0x00;
             sector[17] = 0x00;
             sector[18] = 0x08;

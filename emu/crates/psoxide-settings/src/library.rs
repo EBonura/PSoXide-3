@@ -232,10 +232,7 @@ impl Library {
         if !root.is_dir() {
             return Err(LibraryError::Io {
                 path: root.to_path_buf(),
-                source: io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "library root is not a directory",
-                ),
+                source: io::Error::new(io::ErrorKind::NotFound, "library root is not a directory"),
             });
         }
 
@@ -250,7 +247,9 @@ impl Library {
         let mut fresh: Vec<LibraryEntry> = Vec::new();
         let mut changed = 0usize;
         for path in walk(root) {
-            let Some(kind) = classify(&path) else { continue };
+            let Some(kind) = classify(&path) else {
+                continue;
+            };
             let meta = match fs::metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -322,7 +321,9 @@ impl Library {
             }
 
             for path in walk(root) {
-                let Some(kind) = classify(&path) else { continue };
+                let Some(kind) = classify(&path) else {
+                    continue;
+                };
                 let meta = match fs::metadata(&path) {
                     Ok(m) => m,
                     Err(_) => continue,
@@ -445,16 +446,7 @@ fn parse_entry(path: &Path, kind: GameKind, size: u64, mtime: u64) -> LibraryEnt
             // handle 2048-byte sectors — just not today.
             diagnostic: Some("ISO sector-size parsing not yet implemented".into()),
         },
-        GameKind::DiscCue => LibraryEntry {
-            id: fingerprint(&[fallback_title.as_bytes()]),
-            path: path.to_path_buf(),
-            kind,
-            title: fallback_title,
-            region: Region::Unknown,
-            size,
-            mtime,
-            diagnostic: Some("CUE resolve-to-BIN not yet implemented".into()),
-        },
+        GameKind::DiscCue => parse_cue(path, size, mtime, &fallback_title),
         GameKind::Exe => LibraryEntry {
             id: fingerprint(&[fallback_title.as_bytes(), b"exe"]),
             path: path.to_path_buf(),
@@ -544,6 +536,31 @@ fn parse_bin(path: &Path, size: u64, mtime: u64, fallback_title: &str) -> Librar
     }
 }
 
+fn parse_cue(path: &Path, size: u64, mtime: u64, fallback_title: &str) -> LibraryEntry {
+    let Some(bin_path) = primary_bin_from_cue(path) else {
+        return LibraryEntry {
+            id: fingerprint(&[fallback_title.as_bytes(), b"cue"]),
+            path: path.to_path_buf(),
+            kind: GameKind::DiscCue,
+            title: fallback_title.to_string(),
+            region: Region::Unknown,
+            size,
+            mtime,
+            diagnostic: Some("could not resolve a data-track BIN from CUE".into()),
+        };
+    };
+
+    let mut entry = parse_bin(&bin_path, size, mtime, fallback_title);
+    entry.id = fingerprint(&[entry.id.as_bytes(), b"cue"]);
+    entry.path = path.to_path_buf();
+    entry.kind = GameKind::DiscCue;
+    entry.title = fallback_title.to_string();
+    entry.size = size;
+    entry.mtime = mtime;
+    entry.diagnostic = None;
+    entry
+}
+
 /// Cheap region heuristic — look for any of the three canonical
 /// license strings anywhere in LBA 4's user data. The BIOS checks
 /// for these too; if none match, we say `Unknown` rather than
@@ -574,10 +591,7 @@ fn pvd_volume_identifier(user_data: &[u8]) -> Option<String> {
     }
     // Must be a Primary Volume Descriptor: type=1, magic "CD001",
     // version=1. Otherwise this isn't a valid ISO9660 PVD sector.
-    if user_data[0] != 1
-        || &user_data[1..6] != b"CD001"
-        || user_data[6] != 1
-    {
+    if user_data[0] != 1 || &user_data[1..6] != b"CD001" || user_data[6] != 1 {
         return None;
     }
     let raw = &user_data[40..72];
@@ -594,48 +608,186 @@ fn pvd_volume_identifier(user_data: &[u8]) -> Option<String> {
     Some(cleaned.trim().to_string())
 }
 
-/// Parse a CUE sheet to find the path of its first (data) track's
-/// BIN file. Used to collapse CUE + BIN pairs in the UI — the
-/// same physical disc shouldn't show up twice in the library.
-///
-/// CUE format is plain text; we only care about:
-///
-/// ```text
-/// FILE "some_game (Track 01).bin" BINARY
-///   TRACK 01 MODE2/2352
-///     INDEX 01 00:00:00
-/// ...
-/// ```
-///
-/// The first `FILE` entry is by convention the data track on
-/// PSX discs (MODE2/2352). Audio tracks follow but aren't the
-/// primary boot source. Returned path is resolved relative to
-/// the CUE's directory, so the caller can match it against
-/// scanner-discovered BIN absolute paths.
-///
-/// Returns `None` on:
-/// - CUE unreadable
-/// - No `FILE "…"` line found
-/// - Parent directory couldn't be resolved (shouldn't happen for
-///   scanned-from-root entries)
-pub fn primary_bin_from_cue(cue_path: &Path) -> Option<PathBuf> {
-    let contents = std::fs::read_to_string(cue_path).ok()?;
-    let dir = cue_path.parent()?;
-    for line in contents.lines() {
-        let trimmed = line.trim_start();
-        // CUE keywords are case-insensitive in practice.
-        if trimmed.len() < 5 || !trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"FILE") {
-            continue;
-        }
-        let after_file = trimmed.get(4..)?.trim_start();
-        // The filename is quoted: FILE "name.bin" BINARY
-        let q1 = after_file.find('"')?;
-        let rest = &after_file[q1 + 1..];
-        let q2 = rest.find('"')?;
-        let filename = &rest[..q2];
-        return Some(dir.join(filename));
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CueTrackSpec {
+    number: u8,
+    track_type: psx_iso::TrackType,
+    path: PathBuf,
+    /// Pregap sectors in disc space before INDEX 01.
+    pregap: u32,
+    /// Pregap sectors physically present at the start of the track file.
+    file_pregap: u32,
+}
+
+fn starts_with_keyword(line: &str, keyword: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() >= keyword.len() && bytes[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+}
+
+fn parse_cue_filename(rest: &str) -> Option<&str> {
+    if let Some(rest) = rest.strip_prefix('"') {
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    } else {
+        rest.split_whitespace().next()
     }
-    None
+}
+
+fn parse_cue_msf(s: &str) -> u32 {
+    let mut parts = s.split(':');
+    let m = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    let s = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    let f = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    if parts.next().is_some() {
+        return 0;
+    }
+    m * 60 * 75 + s * 75 + f
+}
+
+fn detect_track1_embedded_pregap(bytes: &[u8]) -> u32 {
+    if bytes.len() < psx_iso::SECTOR_BYTES {
+        return 0;
+    }
+    let sector = &bytes[..psx_iso::SECTOR_BYTES];
+    if sector[0] != 0x00 || sector[11] != 0x00 || sector[1..11] != [0xFF; 10] {
+        return 0;
+    }
+    let m = psx_iso::bcd_to_bin(sector[12]);
+    let s = psx_iso::bcd_to_bin(sector[13]);
+    let f = psx_iso::bcd_to_bin(sector[14]);
+    if [m, s, f].contains(&0xFF) {
+        return 0;
+    }
+    let abs_frame = (m as u32) * 60 * 75 + (s as u32) * 75 + (f as u32);
+    150u32.saturating_sub(abs_frame)
+}
+
+fn parse_cue_tracks(cue_path: &Path) -> Result<Vec<CueTrackSpec>, String> {
+    let contents =
+        fs::read_to_string(cue_path).map_err(|e| format!("{}: {e}", cue_path.display()))?;
+    let dir = cue_path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", cue_path.display()))?;
+
+    let mut tracks = Vec::new();
+    let mut current_file: Option<PathBuf> = None;
+    let mut current_track_num: Option<u8> = None;
+    let mut current_track_type = psx_iso::TrackType::Data;
+    let mut cue_pregap = 0u32;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if starts_with_keyword(trimmed, "FILE") {
+            let rest = trimmed.get(4..).unwrap_or("").trim_start();
+            let Some(filename) = parse_cue_filename(rest) else {
+                continue;
+            };
+            current_file = Some(dir.join(filename));
+        } else if starts_with_keyword(trimmed, "TRACK") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 3 {
+                current_track_num = parts[1].parse().ok();
+                current_track_type = if parts[2].eq_ignore_ascii_case("AUDIO") {
+                    psx_iso::TrackType::Audio
+                } else {
+                    psx_iso::TrackType::Data
+                };
+                cue_pregap = 0;
+            }
+        } else if starts_with_keyword(trimmed, "PREGAP") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if let Some(msf) = parts.get(1) {
+                cue_pregap = parse_cue_msf(msf);
+            }
+        } else if starts_with_keyword(trimmed, "INDEX 01") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            let file_pregap = parts.get(2).map(|msf| parse_cue_msf(msf)).unwrap_or(0);
+            let Some(path) = current_file.clone() else {
+                continue;
+            };
+            let Some(number) = current_track_num else {
+                continue;
+            };
+            tracks.push(CueTrackSpec {
+                number,
+                track_type: current_track_type,
+                path,
+                pregap: cue_pregap.saturating_add(file_pregap),
+                file_pregap,
+            });
+            cue_pregap = 0;
+        }
+    }
+
+    if tracks.is_empty() {
+        Err(format!(
+            "{} contains no INDEX 01 tracks",
+            cue_path.display()
+        ))
+    } else {
+        Ok(tracks)
+    }
+}
+
+/// Load a full multitrack disc model from a CUE sheet. Track timing
+/// comes from the CUE; per-track bytes come from the referenced files.
+pub fn load_disc_from_cue(cue_path: &Path) -> Result<psx_iso::Disc, String> {
+    let specs = parse_cue_tracks(cue_path)?;
+    let mut tracks = Vec::with_capacity(specs.len());
+
+    for spec in specs {
+        let bytes = fs::read(&spec.path).map_err(|e| format!("{}: {e}", spec.path.display()))?;
+        let file_sectors = bytes.len() / psx_iso::SECTOR_BYTES;
+        if file_sectors == 0 {
+            return Err(format!(
+                "{} is too small to contain a raw PS1 sector",
+                spec.path.display()
+            ));
+        }
+
+        let mut file_pregap = spec.file_pregap;
+        let mut pregap = spec.pregap;
+        if spec.number == 1 && file_pregap == 0 {
+            file_pregap = detect_track1_embedded_pregap(&bytes);
+            pregap = pregap.max(file_pregap);
+        }
+        let sector_count = file_sectors.saturating_sub(file_pregap as usize) as u32;
+        let start_lba = tracks
+            .last()
+            .map(|prev: &psx_iso::Track| prev.start_lba + prev.sector_count + pregap)
+            .unwrap_or(0);
+        tracks.push(psx_iso::Track {
+            number: spec.number,
+            track_type: spec.track_type,
+            start_lba,
+            sector_count,
+            pregap,
+            file_pregap,
+            bytes,
+        });
+    }
+
+    Ok(psx_iso::Disc::from_tracks(tracks))
+}
+
+/// Parse a CUE sheet to find the path of its first data track's BIN.
+/// Used to collapse CUE + BIN pairs in the UI and to inherit region
+/// metadata from the bootable track during library scans.
+pub fn primary_bin_from_cue(cue_path: &Path) -> Option<PathBuf> {
+    let tracks = parse_cue_tracks(cue_path).ok()?;
+    tracks
+        .into_iter()
+        .find(|track| track.track_type == psx_iso::TrackType::Data)
+        .map(|track| track.path)
 }
 
 /// FNV-1a-64 over any number of input slices, rendered as a
@@ -660,8 +812,7 @@ fn synth_sector(user_data: &[u8]) -> Vec<u8> {
     use psx_iso::{SECTOR_BYTES, SECTOR_USER_DATA_BYTES, SECTOR_USER_DATA_OFFSET};
     let mut out = vec![0u8; SECTOR_BYTES];
     let n = user_data.len().min(SECTOR_USER_DATA_BYTES);
-    out[SECTOR_USER_DATA_OFFSET..SECTOR_USER_DATA_OFFSET + n]
-        .copy_from_slice(&user_data[..n]);
+    out[SECTOR_USER_DATA_OFFSET..SECTOR_USER_DATA_OFFSET + n].copy_from_slice(&user_data[..n]);
     out
 }
 
@@ -669,6 +820,30 @@ fn synth_sector(user_data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn write_test_disc(path: &Path, title: &str, region_msg: &[u8]) {
+        let mut bin = vec![0u8; psx_iso::SECTOR_BYTES * 20];
+
+        let mut license = [0u8; psx_iso::SECTOR_USER_DATA_BYTES];
+        license[..region_msg.len()].copy_from_slice(region_msg);
+        let sec4 = synth_sector(&license);
+        let off4 = 4 * psx_iso::SECTOR_BYTES;
+        bin[off4..off4 + psx_iso::SECTOR_BYTES].copy_from_slice(&sec4);
+
+        let mut pvd = [0u8; psx_iso::SECTOR_USER_DATA_BYTES];
+        pvd[0] = 1;
+        pvd[1..6].copy_from_slice(b"CD001");
+        pvd[6] = 1;
+        pvd[8..19].copy_from_slice(b"PLAYSTATION");
+        let title_bytes = title.as_bytes();
+        pvd[40..40 + title_bytes.len().min(32)]
+            .copy_from_slice(&title_bytes[..title_bytes.len().min(32)]);
+        let sec16 = synth_sector(&pvd);
+        let off16 = 16 * psx_iso::SECTOR_BYTES;
+        bin[off16..off16 + psx_iso::SECTOR_BYTES].copy_from_slice(&sec16);
+
+        std::fs::write(path, &bin).unwrap();
+    }
 
     #[test]
     fn round_trip_empty_library() {
@@ -816,13 +991,11 @@ mod tests {
              got entries: {:?}",
             lib.entries.iter().map(|e| &e.path).collect::<Vec<_>>(),
         );
-        assert!(
-            lib.entries[0]
-                .path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map_or(false, |n| n == "hello-tri.exe"),
-        );
+        assert!(lib.entries[0]
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map_or(false, |n| n == "hello-tri.exe"),);
     }
 
     #[test]
@@ -836,32 +1009,19 @@ mod tests {
 
     #[test]
     fn parse_bin_extracts_region_and_title_from_synthetic_disc() {
-        // Build a fake BIN: 20 sectors, with LBA 4 holding the US
-        // license text and LBA 16 holding a PVD with title
-        // "TEST_TITLE".
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.bin");
-        let mut bin = vec![0u8; psx_iso::SECTOR_BYTES * 20];
-
-        let mut license = [0u8; psx_iso::SECTOR_USER_DATA_BYTES];
-        let msg = b"    Licensed  by   Sony Computer Entertainment America";
-        license[..msg.len()].copy_from_slice(msg);
-        let sec4 = synth_sector(&license);
-        let off4 = 4 * psx_iso::SECTOR_BYTES;
-        bin[off4..off4 + psx_iso::SECTOR_BYTES].copy_from_slice(&sec4);
-
-        let mut pvd = [0u8; psx_iso::SECTOR_USER_DATA_BYTES];
-        pvd[0] = 1;
-        pvd[1..6].copy_from_slice(b"CD001");
-        pvd[6] = 1;
-        pvd[8..19].copy_from_slice(b"PLAYSTATION");
-        pvd[40..52].copy_from_slice(b"TEST_TITLE  ");
-        let sec16 = synth_sector(&pvd);
-        let off16 = 16 * psx_iso::SECTOR_BYTES;
-        bin[off16..off16 + psx_iso::SECTOR_BYTES].copy_from_slice(&sec16);
-
-        std::fs::write(&path, &bin).unwrap();
-        let e = parse_entry(&path, GameKind::DiscBin, bin.len() as u64, 0);
+        write_test_disc(
+            &path,
+            "TEST_TITLE",
+            b"    Licensed  by   Sony Computer Entertainment America",
+        );
+        let e = parse_entry(
+            &path,
+            GameKind::DiscBin,
+            (psx_iso::SECTOR_BYTES * 20) as u64,
+            0,
+        );
         assert_eq!(e.title, "TEST_TITLE");
         assert_eq!(e.region, Region::NtscU);
         assert_eq!(e.kind, GameKind::DiscBin);
@@ -899,7 +1059,11 @@ mod tests {
     fn primary_bin_from_cue_handles_lowercase_keyword() {
         let tmp = TempDir::new().unwrap();
         let cue_path = tmp.path().join("g.cue");
-        std::fs::write(&cue_path, "file \"g.bin\" BINARY\n").unwrap();
+        std::fs::write(
+            &cue_path,
+            "file \"g.bin\" BINARY\n  track 01 mode2/2352\n    index 01 00:00:00\n",
+        )
+        .unwrap();
         assert_eq!(
             primary_bin_from_cue(&cue_path).unwrap(),
             tmp.path().join("g.bin")
@@ -912,6 +1076,73 @@ mod tests {
         let cue_path = tmp.path().join("bad.cue");
         std::fs::write(&cue_path, "REM some comment with no FILE\n").unwrap();
         assert!(primary_bin_from_cue(&cue_path).is_none());
+    }
+
+    #[test]
+    fn parse_entry_disc_cue_uses_data_track_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let cue_path = tmp.path().join("Crash Test.cue");
+        let track1_path = tmp.path().join("track1.bin");
+        write_test_disc(
+            &track1_path,
+            "CRASH_TEST_DISC",
+            b"    Licensed  by   Sony Computer Entertainment Europe",
+        );
+        std::fs::write(
+            &cue_path,
+            concat!(
+                "FILE \"track1.bin\" BINARY\n",
+                "  TRACK 01 MODE2/2352\n",
+                "    INDEX 01 00:00:00\n",
+            ),
+        )
+        .unwrap();
+
+        let entry = parse_entry(&cue_path, GameKind::DiscCue, 1234, 5678);
+        assert_eq!(entry.kind, GameKind::DiscCue);
+        assert_eq!(entry.title, "Crash Test");
+        assert_eq!(entry.region, Region::Pal);
+        assert_eq!(entry.path, cue_path);
+        assert_eq!(entry.size, 1234);
+        assert_eq!(entry.mtime, 5678);
+        assert_eq!(entry.diagnostic, None);
+    }
+
+    #[test]
+    fn load_disc_from_cue_positions_later_track_after_pregap() {
+        let tmp = TempDir::new().unwrap();
+        let cue_path = tmp.path().join("disc.cue");
+        let track1_path = tmp.path().join("track1.bin");
+        let track2_path = tmp.path().join("track2.bin");
+        let mut track1 = vec![0u8; psx_iso::SECTOR_BYTES * 10];
+        track1[12] = 0x00;
+        track1[13] = 0x02;
+        track1[14] = 0x00;
+        std::fs::write(&track1_path, track1).unwrap();
+        let mut track2 = vec![0u8; psx_iso::SECTOR_BYTES * 4];
+        track2[0] = 0xAB;
+        std::fs::write(&track2_path, track2).unwrap();
+        std::fs::write(
+            &cue_path,
+            concat!(
+                "FILE \"track1.bin\" BINARY\n",
+                "  TRACK 01 MODE2/2352\n",
+                "    INDEX 01 00:00:00\n",
+                "FILE \"track2.bin\" BINARY\n",
+                "  TRACK 02 AUDIO\n",
+                "    PREGAP 00:00:02\n",
+                "    INDEX 01 00:00:00\n",
+            ),
+        )
+        .unwrap();
+
+        let disc = load_disc_from_cue(&cue_path).unwrap();
+        let pos = disc.track_position_for_lba(10).unwrap();
+        assert_eq!(pos.track_number, 2);
+        assert_eq!(pos.index_number, 0);
+        assert_eq!(pos.relative_msf, (0, 0, 1));
+        assert!(disc.read_sector_raw(10).is_none());
+        assert_eq!(disc.read_sector_raw(12).unwrap()[0], 0xAB);
     }
 
     #[test]

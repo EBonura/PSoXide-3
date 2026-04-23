@@ -141,10 +141,10 @@ Validation is organized around named-game canaries rather than "support all game
 
 ## Prior art
 
-PSoXide is the third attempt; the first two taught the architectural lessons:
+PSoXide is the third attempt; the first two taught the architectural lessons and are kept as private archives:
 
-- **[psoxide](../PSoXide)**: mature CPU, full SDK, working frontend. Stalled on the exponential-tail work of commercial-game parity. Its Menu menu, HUD bar, and gamepad module live on here.
-- **[PSoXide-2](../PSoXide-2)**: rewrite attempt that got to boot + flat triangles but never reached full stack. Its Redux-oracle harness and debug-panel layout are the direct ancestors of the current tooling.
+- **[PSoXide-v1](../psoxide-v1)**: unified platform monorepo (SDK + emulator + editor + integration). Mature CPU, full SDK, working frontend. Stalled on the exponential-tail work of commercial-game parity. Its Menu menu, HUD bar, and gamepad module live on here.
+- **[PSoXide-v2](../psoxide-v2)**: first focused-emulator attempt — got to boot + flat triangles but never reached full stack. Its Redux-oracle harness and debug-panel layout are the direct ancestors of the current tooling.
 
 ## License
 

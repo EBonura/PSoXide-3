@@ -114,7 +114,7 @@ oracle-smoke:
 	cd emu && cargo test -p parity-oracle --test smoke -- --ignored --nocapture
 
 parity:
-	cd emu && cargo test -p emulator-core --release --test parity -- --ignored --nocapture
+	cd emu && cargo test -p emulator-core --release --features trace-cop2 --test parity -- --ignored --nocapture
 
 # Milestone-C regression suite — every SDK example side-loaded into
 # the emulator, multi-signal state pinned. Depends on `examples` so
