@@ -136,8 +136,10 @@ const RESPONSE_FIFO_DEPTH: usize = 16;
 /// - `AddIrqQueue(m_cmd, 0x800)` — universal first-response delay
 ///   (L1284). Every command's ack fires 2048 cycles after issue.
 /// - `AddIrqQueue(CdlID + 0x100, 20480)` — GetID second response,
-///   ~4.4 µs, observed across boot roms (L900). `CdlInit` uses the
-///   separate lid/rescan path instead of a second CDROM IRQ.
+///   ~4.4 µs, observed across boot roms (L900). `CdlInit` (`0x1C`)
+///   uses the separate lid/rescan path instead of a second CDROM IRQ.
+/// - `AddIrqQueue(CdlReset + 0x100, 4100000)` — Reset (`0x0A`)
+///   completion. MGS polls this INT2 before it starts issuing reads.
 /// - `cdReadTime = psxClockSpeed / 75` — one PSX CD-frame period
 ///   (L135). Redux schedules the first ReadN/ReadS sector at
 ///   `cdReadTime` in double-speed mode, then chains steady-state
@@ -147,6 +149,7 @@ const RESPONSE_FIFO_DEPTH: usize = 16;
 ///   seeked, quick ack; otherwise a full seek-time equivalent.
 const FIRST_RESPONSE_CYCLES: u64 = 0x800; // 2048
 const GETID_SECOND_RESPONSE_CYCLES: u64 = 20_480;
+const RESET_SECOND_RESPONSE_CYCLES: u64 = 4_100_000;
 const SEEK_SECOND_RESPONSE_CYCLES: u64 = CD_READ_TIME * 4; // ≈ 1,806,336
 const PAUSE_COMPLETE_CYCLES_STANDBY: u64 = 7_000;
 const PAUSE_COMPLETE_CYCLES_ACTIVE: u64 = 1_000_000;
@@ -800,8 +803,9 @@ impl CdRom {
             0x08 => self.cmd_stop(),
             // Pause: halt reads but keep motor on.
             0x09 => self.cmd_pause(),
-            // Init: reset drive + spin motor + clear mode.
-            0x0A => self.cmd_init(),
+            // Reset: abort in-flight drive activity, spin the motor,
+            // and complete after Redux's long reset delay.
+            0x0A => self.cmd_reset(),
             // Mute / Demute.
             0x0B => self.cmd_mute(true),
             0x0C => self.cmd_mute(false),
@@ -840,8 +844,8 @@ impl CdRom {
             // for INT2 (Complete), stranding MGS / Crash at the
             // Sony splash.
             0x1E => self.cmd_read_toc(),
-            // Reset — abort in-flight drive activity.
-            0x1C => self.cmd_reset(),
+            // Init — lid/rescan state machine; no CPU-visible INT2.
+            0x1C => self.cmd_init(),
             _ => self.cmd_getstat(),
         }
     }
@@ -1185,22 +1189,28 @@ impl CdRom {
         self.pending.clear();
         self.responses.clear();
         self.reading = false;
-        self.seek_done = false;
+        self.seek_done = true;
         self.setloc_pending = false;
         self.location_changed = false;
-        self.drive_status &= !drive_status_bit::PLAYING;
+        self.drive_status &= !(drive_status_bit::PLAYING
+            | drive_status_bit::READING
+            | drive_status_bit::SEEKING
+            | drive_status_bit::ERROR
+            | drive_status_bit::SEEK_ERROR);
         self.clear_data_fifo();
         self.reset_xa_stream();
         self.last_sector_header = [0; 4];
         self.last_sector_subheader = [0; 4];
         self.last_sector_header_valid = false;
-        self.motor_on = false;
-        self.drive_state = DriveState::Stopped;
+        self.mode = 0x20;
+        self.motor_on = true;
+        self.drive_state = DriveState::Standby;
         self.lid_deadline = None;
         self.lid_bootstrap_pending = false;
-        self.drive_status = 0;
+        self.drive_status |= drive_status_bit::MOTOR_ON;
         self.muted = false;
         self.schedule_first_response(vec![self.stat_byte()]);
+        self.schedule_second_response(vec![self.stat_byte()], RESET_SECOND_RESPONSE_CYCLES);
     }
 
     fn cmd_seek(&mut self) {
@@ -2876,7 +2886,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_cancels_read_and_clears_fifo() {
+    fn reset_cancels_read_and_completes_with_motor_on() {
         let mut cd = CdRom::new();
         cd.motor_on = true;
         cd.reading = true;
@@ -2889,17 +2899,26 @@ mod tests {
         });
 
         cd.cmd_reset();
-        cd.tick(10_000_000);
+        assert!(cd.tick(FIRST_RESPONSE_CYCLES + 1));
+        assert_eq!(cd.irq_flag, IrqType::Acknowledge as u8);
+        cd.write8(BASE, 1);
+        cd.write8(BASE + 3, 0x1F);
+        assert_eq!(cd.irq_flag, 0);
+        assert!(cd.tick(FIRST_RESPONSE_CYCLES + RESET_SECOND_RESPONSE_CYCLES + 2));
+        assert_eq!(cd.irq_flag, IrqType::Complete as u8);
 
-        assert!(!cd.motor_on);
+        assert!(cd.motor_on);
         assert!(!cd.reading);
         assert!(cd.data_fifo.is_empty());
         assert_eq!(
             cd.pending.len(),
             0,
-            "reset should leave only its own ack already delivered"
+            "reset ACK and completion should both be delivered"
         );
-        assert_eq!(cd.read8(BASE + 1), 0x00);
+        assert_eq!(
+            cd.read8(BASE + 1) & drive_status_bit::MOTOR_ON,
+            drive_status_bit::MOTOR_ON
+        );
     }
 
     #[test]

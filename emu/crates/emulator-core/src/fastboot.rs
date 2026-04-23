@@ -7,7 +7,7 @@
 
 use psx_iso::{load_boot_exe_from_disc, BootError, Disc};
 
-use crate::{Bus, Cpu, ExecutionError};
+use crate::{gpu::GP1_ADDR, Bus, Cpu, ExecutionError};
 
 /// Number of BIOS instructions to run before warm disc fast boot.
 ///
@@ -64,7 +64,17 @@ pub fn fast_boot_disc_with_hle(
     }
     bus.load_exe_payload(boot.exe.load_addr, &boot.exe.payload);
     bus.clear_exe_bss(boot.exe.bss_addr, boot.exe.bss_size);
-    cpu.seed_from_exe_with_args(boot.exe.initial_pc, boot.exe.initial_gp, stack_pointer, 1, 0);
+    // OpenBIOS enables display immediately before Exec. Some retail
+    // games rely on inheriting that shell state instead of issuing
+    // GP1(03h) themselves during early startup.
+    bus.write32(GP1_ADDR, 0x0300_0000);
+    cpu.seed_from_exe_with_args(
+        boot.exe.initial_pc,
+        boot.exe.initial_gp,
+        stack_pointer,
+        1,
+        0,
+    );
     if enable_hle_bios {
         bus.enable_hle_bios();
     }

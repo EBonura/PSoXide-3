@@ -9,8 +9,7 @@
 mod disc_support;
 
 use emulator_core::{
-    fast_boot_disc_with_hle, warm_bios_for_disc_fast_boot, Bus, Cpu,
-    DISC_FAST_BOOT_WARMUP_STEPS,
+    fast_boot_disc_with_hle, warm_bios_for_disc_fast_boot, Bus, Cpu, DISC_FAST_BOOT_WARMUP_STEPS,
 };
 use std::path::Path;
 

@@ -270,7 +270,11 @@ fn boot_signal(result: &BootResult) -> &'static str {
         "fastboot"
     } else if result.display_hash != SONY_LOGO_HASH {
         "passed-logo"
-    } else if result.cdrom_cmds.iter().any(|(op, _)| matches!(*op, 0x06 | 0x1b)) {
+    } else if result
+        .cdrom_cmds
+        .iter()
+        .any(|(op, _)| matches!(*op, 0x06 | 0x1b))
+    {
         "reading"
     } else {
         "sony-logo"

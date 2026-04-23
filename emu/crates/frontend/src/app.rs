@@ -288,7 +288,13 @@ impl AppState {
                     ));
                 }
                 let disc = Disc::from_bin(bytes);
-                maybe_fast_boot_disc(&mut bus, &mut cpu, &disc, entry, self.settings.emulator.fast_boot_disc);
+                maybe_fast_boot_disc(
+                    &mut bus,
+                    &mut cpu,
+                    &disc,
+                    entry,
+                    self.settings.emulator.fast_boot_disc,
+                );
                 bus.cdrom.insert_disc(Some(disc));
                 bus.attach_digital_pad_port1();
                 // Load + attach the per-game memory card on port 1.
@@ -303,7 +309,13 @@ impl AppState {
             }
             GameKind::DiscCue => {
                 let disc = psoxide_settings::library::load_disc_from_cue(&entry.path)?;
-                maybe_fast_boot_disc(&mut bus, &mut cpu, &disc, entry, self.settings.emulator.fast_boot_disc);
+                maybe_fast_boot_disc(
+                    &mut bus,
+                    &mut cpu,
+                    &disc,
+                    entry,
+                    self.settings.emulator.fast_boot_disc,
+                );
                 bus.cdrom.insert_disc(Some(disc));
                 bus.attach_digital_pad_port1();
                 self.paths

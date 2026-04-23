@@ -32,7 +32,8 @@ fn main() {
         .expect("Set PSOXIDE_DISC to the path of a CUE or BIN disc image");
 
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
-    let disc = disc_support::load_disc_path(std::path::Path::new(&disc_path)).expect("disc readable");
+    let disc =
+        disc_support::load_disc_path(std::path::Path::new(&disc_path)).expect("disc readable");
     eprintln!(
         "[boot_disc] bios={}  disc={}",
         bios_path.display(),
