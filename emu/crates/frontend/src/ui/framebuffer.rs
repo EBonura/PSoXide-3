@@ -50,8 +50,8 @@ pub fn draw(
     };
 
     let mode_label = match scale_mode {
-        ScaleMode::Fit => "fit",
-        ScaleMode::Integer => "native",
+        ScaleMode::Window => "window",
+        ScaleMode::Native => "1x",
     };
     let title = format!(
         "Framebuffer ({}×{} at {},{}){}{}  [{}]",
@@ -77,8 +77,8 @@ pub fn draw(
         );
         let tex_size = egui::vec2(area.width as f32, area.height as f32);
         match scale_mode {
-            ScaleMode::Fit => paint_image_fit(ui, vram_tex, tex_size, uv),
-            ScaleMode::Integer => paint_image_integer(ui, vram_tex, tex_size, uv),
+            ScaleMode::Window => paint_image_window(ui, vram_tex, tex_size, uv),
+            ScaleMode::Native => paint_image_native(ui, vram_tex, tex_size, uv),
         }
     });
 }
@@ -88,7 +88,7 @@ pub fn draw(
 /// (256/320/368/384/512/640). A 512×240 game frame is NOT supposed
 /// to display with square pixels; real hardware squashes it
 /// horizontally to hit the 4:3 CRT window. Emulating this squash in
-/// Fit mode is what stops Crash Bandicoot (which runs 512×240)
+/// Window mode is what stops Crash Bandicoot (which runs 512×240)
 /// from looking comically wide-screen.
 const CRT_ASPECT: f32 = 4.0 / 3.0;
 
@@ -98,10 +98,15 @@ const CRT_ASPECT: f32 = 4.0 / 3.0;
 /// picked — 256, 320, 512, and 640 all fill the same horizontal
 /// span, with differently-shaped pixels.
 ///
-/// Integer mode (see `paint_image_integer`) keeps 1:1 pixels for
-/// pixel-art fans; this "Fit" mode is for users who want the game
-/// to look like it did on a TV.
-fn paint_image_fit(ui: &mut egui::Ui, tex: egui::TextureId, tex_size: egui::Vec2, uv: egui::Rect) {
+/// Native mode (see `paint_image_native`) keeps exact 1× pixels for
+/// inspection; this "Window" mode is for users who want the game to
+/// fill the host window.
+fn paint_image_window(
+    ui: &mut egui::Ui,
+    tex: egui::TextureId,
+    tex_size: egui::Vec2,
+    uv: egui::Rect,
+) {
     let avail = ui.available_rect_before_wrap();
     if avail.width() <= 0.0 || avail.height() <= 0.0 || tex_size.x <= 0.0 || tex_size.y <= 0.0 {
         return;
@@ -119,12 +124,9 @@ fn paint_image_fit(ui: &mut egui::Ui, tex: egui::TextureId, tex_size: egui::Vec2
         .paint_at(ui, rect);
 }
 
-/// Integer-scale (nearest-neighbour multiple) fit. Always shows
-/// the texture at an exact 1× / 2× / 3× / … factor — letterboxes
-/// with the background when the window isn't a clean multiple.
-/// Pixel-perfect, which is what the user means by "PS1 original
-/// resolution" — no interpolation stretch blur.
-fn paint_image_integer(
+/// Native 1× presentation. Always shows the display rectangle at its
+/// original framebuffer size, centered in the available space.
+fn paint_image_native(
     ui: &mut egui::Ui,
     tex: egui::TextureId,
     tex_size: egui::Vec2,
@@ -134,10 +136,10 @@ fn paint_image_integer(
     if avail.width() <= 0.0 || avail.height() <= 0.0 || tex_size.x <= 0.0 || tex_size.y <= 0.0 {
         return;
     }
-    let max_scale_x = (avail.width() / tex_size.x).floor().max(1.0);
-    let max_scale_y = (avail.height() / tex_size.y).floor().max(1.0);
-    let scale = max_scale_x.min(max_scale_y);
-    let size = tex_size * scale;
+    let size = egui::vec2(
+        tex_size.x.min(avail.width()),
+        tex_size.y.min(avail.height()),
+    );
     let rect = egui::Rect::from_center_size(avail.center(), size);
     ui.allocate_rect(avail, egui::Sense::hover());
     egui::Image::new((tex, size)).uv(uv).paint_at(ui, rect);

@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 # for its normal (Redux-only) consumers.
 emulator-core = { path = "../emulator-core" }
 psx-iso       = { workspace = true }
+psoxide-settings = { workspace = true }
 
 [[test]]
 name = "smoke"

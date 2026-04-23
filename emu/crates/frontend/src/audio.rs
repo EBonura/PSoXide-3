@@ -17,7 +17,10 @@
 //! We keep the cpal host + stream + config alive inside [`AudioOut`].
 //! Dropping the struct stops the stream.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc, Mutex,
+};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -34,6 +37,7 @@ const TARGET_SAMPLE_RATE: u32 = 44_100;
 /// `VecDeque<(i16, i16)>` stores interleaved stereo; the callback
 /// pops `(l, r)` pairs and interleaves them into cpal's f32 output.
 pub type SampleQueue = Arc<Mutex<std::collections::VecDeque<(i16, i16)>>>;
+type VolumeControl = Arc<AtomicU32>;
 
 /// Live audio output. Owns the cpal stream (which runs on an OS
 /// audio thread) and exposes the producer handle to the shell's
@@ -51,6 +55,9 @@ pub struct AudioOut {
     /// callback linearly resamples the SPU stream to avoid the
     /// zippery crackle nearest-neighbour introduces at 48 kHz.
     host_sample_rate: u32,
+    /// Host-output gain. Stored atomically so the UI can adjust it
+    /// without locking the CPAL callback.
+    volume: VolumeControl,
 }
 
 impl AudioOut {
@@ -87,6 +94,7 @@ impl AudioOut {
         let queue: SampleQueue = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
             16_384,
         )));
+        let volume: VolumeControl = Arc::new(AtomicU32::new(1.0f32.to_bits()));
 
         // Ratio between PSX 44.1 kHz and the host's actual rate.
         // E.g. host @ 48 kHz, PSX @ 44.1 kHz → ratio = 44100/48000 ≈ 0.919,
@@ -94,6 +102,7 @@ impl AudioOut {
         let pull_rate = TARGET_SAMPLE_RATE as f32 / host_sample_rate as f32;
 
         let queue_cb = Arc::clone(&queue);
+        let volume_cb = Arc::clone(&volume);
         let err_fn = |e| eprintln!("[audio] stream error: {e}");
 
         let stream = match sample_format {
@@ -105,10 +114,11 @@ impl AudioOut {
                         move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                             let mut q = queue_cb.lock().unwrap();
                             for frame in out.chunks_mut(2) {
+                                let gain = f32::from_bits(volume_cb.load(Ordering::Relaxed));
                                 let (l, r) = resampler.next(&mut q, pull_rate);
-                                frame[0] = (l as f32) / 32768.0;
+                                frame[0] = apply_gain_f32(l, gain);
                                 if frame.len() > 1 {
-                                    frame[1] = (r as f32) / 32768.0;
+                                    frame[1] = apply_gain_f32(r, gain);
                                 }
                             }
                         }
@@ -119,6 +129,7 @@ impl AudioOut {
                 .ok()?,
             cpal::SampleFormat::I16 => {
                 let queue_cb = Arc::clone(&queue);
+                let volume_cb = Arc::clone(&volume);
                 device
                     .build_output_stream(
                         &stream_config,
@@ -127,10 +138,11 @@ impl AudioOut {
                             move |out: &mut [i16], _info: &cpal::OutputCallbackInfo| {
                                 let mut q = queue_cb.lock().unwrap();
                                 for frame in out.chunks_mut(2) {
+                                    let gain = f32::from_bits(volume_cb.load(Ordering::Relaxed));
                                     let (l, r) = resampler.next(&mut q, pull_rate);
-                                    frame[0] = l;
+                                    frame[0] = apply_gain_i16(l, gain);
                                     if frame.len() > 1 {
-                                        frame[1] = r;
+                                        frame[1] = apply_gain_i16(r, gain);
                                     }
                                 }
                             }
@@ -150,6 +162,7 @@ impl AudioOut {
             queue,
             _stream: stream,
             host_sample_rate,
+            volume,
         })
     }
 
@@ -174,6 +187,12 @@ impl AudioOut {
     /// HUD so users can confirm audio is actually running.
     pub fn host_sample_rate(&self) -> u32 {
         self.host_sample_rate
+    }
+
+    /// Set host-output gain. `1.0` is unity, `0.0` is silence.
+    pub fn set_volume(&self, volume: f32) {
+        self.volume
+            .store(volume.clamp(0.0, 1.5).to_bits(), Ordering::Relaxed);
     }
 
     /// Current queue depth in stereo samples. Diagnostic — very
@@ -234,4 +253,14 @@ fn lerp_sample(a: (i16, i16), b: (i16, i16), t: f32) -> (i16, i16) {
 fn lerp_i16(a: i16, b: i16, t: f32) -> i16 {
     let value = a as f32 + (b as f32 - a as f32) * t;
     value.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+fn apply_gain_f32(sample: i16, gain: f32) -> f32 {
+    ((sample as f32) / 32768.0 * gain).clamp(-1.0, 1.0)
+}
+
+fn apply_gain_i16(sample: i16, gain: f32) -> i16 {
+    ((sample as f32) * gain)
+        .round()
+        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }

@@ -11,7 +11,7 @@
 //!
 //! Usage:
 //! ```bash
-//! cargo run -p emulator-core --example probe_pixel_trace --release -- <steps> <x> <y>
+//! cargo run -p emulator-core --example probe_pixel_trace --release -- <steps> <x> <y> [disc]
 //! # e.g.:
 //! cargo run -p emulator-core --example probe_pixel_trace --release -- 900000000 210 26
 //! ```
@@ -19,45 +19,48 @@
 //! The coordinates are in DISPLAY space (not VRAM) — they're shifted
 //! into VRAM via the current `display_area()` before lookup.
 
-use emulator_core::{Bus, Cpu};
-use psx_iso::Disc;
+#[path = "support/disc.rs"]
+mod disc_support;
+
+use emulator_core::{spu::SAMPLE_CYCLES, Bus, Cpu};
 use std::env;
+use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let steps: u64 = args
         .get(1)
         .and_then(|s| s.parse().ok())
-        .expect("usage: probe_pixel_trace <steps> <x> <y>");
+        .expect("usage: probe_pixel_trace <steps> <x> <y> [disc]");
     let x: u16 = args
         .get(2)
         .and_then(|s| s.parse().ok())
-        .expect("usage: probe_pixel_trace <steps> <x> <y>");
+        .expect("usage: probe_pixel_trace <steps> <x> <y> [disc]");
     let y: u16 = args
         .get(3)
         .and_then(|s| s.parse().ok())
-        .expect("usage: probe_pixel_trace <steps> <x> <y>");
+        .expect("usage: probe_pixel_trace <steps> <x> <y> [disc]");
+    let disc_path = args.get(4).map(PathBuf::from);
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
-    let disc = std::fs::read(
-        "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin",
-    )
-    .expect("disc");
     let mut bus = Bus::new(bios).expect("bus");
-    bus.cdrom.insert_disc(Some(Disc::from_bin(disc)));
+    if let Some(path) = disc_path {
+        let disc = disc_support::load_disc_path(&path).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
+    } else {
+        let fallback =
+            "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
+        let disc = disc_support::load_disc_path(std::path::Path::new(fallback)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
+    }
     bus.gpu.enable_pixel_tracer();
     let mut cpu = Cpu::new();
 
-    let mut cycles_at_last_pump = 0u64;
+    let mut audio_cycle_accum = 0u64;
     eprintln!("[pixel_trace] running {steps} CPU steps with tracer armed...");
     for _ in 0..steps {
-        if cpu.step(&mut bus).is_err() {
+        if step_user_step(&mut cpu, &mut bus, &mut audio_cycle_accum).is_err() {
             break;
-        }
-        if bus.cycles() - cycles_at_last_pump > 560_000 {
-            cycles_at_last_pump = bus.cycles();
-            bus.run_spu_samples(735);
-            let _ = bus.spu.drain_audio();
         }
     }
 
@@ -175,7 +178,7 @@ fn main() {
         let lookback_start = idx;
         for back in (0..=lookback_start).rev() {
             let e = &bus.gpu.cmd_log[back as usize];
-            let mut emit = |label: &str| println!("  {label:<22} = 0x{:08x}", e.fifo[0]);
+            let emit = |label: &str| println!("  {label:<22} = 0x{:08x}", e.fifo[0]);
             match e.opcode {
                 0xE1 if !seen_e1 => {
                     emit("E1 draw_mode");
@@ -230,6 +233,39 @@ fn main() {
             }
         }
     }
+}
+
+fn step_user_step(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    audio_cycle_accum: &mut u64,
+) -> Result<(), emulator_core::ExecutionError> {
+    let was_in_isr = cpu.in_isr();
+    step_one_and_pump_audio(cpu, bus, audio_cycle_accum)?;
+    if !was_in_isr && cpu.in_irq_handler() {
+        while cpu.in_irq_handler() {
+            step_one_and_pump_audio(cpu, bus, audio_cycle_accum)?;
+        }
+    }
+    Ok(())
+}
+
+fn step_one_and_pump_audio(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    audio_cycle_accum: &mut u64,
+) -> Result<(), emulator_core::ExecutionError> {
+    let cycles_before = bus.cycles();
+    cpu.step(bus)?;
+    *audio_cycle_accum =
+        audio_cycle_accum.saturating_add(bus.cycles().saturating_sub(cycles_before));
+    let sample_count = (*audio_cycle_accum / SAMPLE_CYCLES) as usize;
+    *audio_cycle_accum %= SAMPLE_CYCLES;
+    if sample_count > 0 {
+        bus.run_spu_samples(sample_count);
+        let _ = bus.spu.drain_audio();
+    }
+    Ok(())
 }
 
 fn triangle_vertices(op: u8, fifo: &[u32]) -> ((i32, i32), (i32, i32), (i32, i32)) {

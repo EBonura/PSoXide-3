@@ -1115,8 +1115,9 @@ impl Gpu {
         self.rasterize_triangle(v0, v1, v2, color, mode);
     }
 
-    /// GP0 0x28..=0x2B — monochrome 4-vertex quad, split into two
-    /// triangles `(v0, v1, v2)` + `(v1, v2, v3)`.
+    /// GP0 0x28..=0x2B — monochrome 4-vertex quad. Redux draws the
+    /// lower/right half first, then the upper/left half, so pixels on
+    /// the shared diagonal are owned by `(v0, v1, v2)`.
     fn draw_monochrome_quad(&mut self) {
         let cmd = self.gp0_fifo[0];
         let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
@@ -1125,8 +1126,8 @@ impl Gpu {
         let v1 = self.decode_vertex(self.gp0_fifo[2]);
         let v2 = self.decode_vertex(self.gp0_fifo[3]);
         let v3 = self.decode_vertex(self.gp0_fifo[4]);
+        self.rasterize_triangle(v1, v3, v2, color, mode);
         self.rasterize_triangle(v0, v1, v2, color, mode);
-        self.rasterize_triangle(v1, v2, v3, color, mode);
     }
 
     /// GP0 0x30..=0x33 — Gouraud triangle. Per-vertex RGB24 colours,
@@ -1145,8 +1146,8 @@ impl Gpu {
     }
 
     /// GP0 0x38..=0x3B — Gouraud quad. 4 × (colour+vertex) =
-    /// 8 words, split into two shaded triangles sharing the middle
-    /// edge (v1–v2).
+    /// 8 words, split in Redux order so the first half wins the
+    /// shared diagonal.
     fn draw_shaded_quad(&mut self) {
         let cmd = self.gp0_fifo[0];
         let c0 = cmd & 0x00FF_FFFF;
@@ -1158,8 +1159,8 @@ impl Gpu {
         let v2 = self.decode_vertex(self.gp0_fifo[5]);
         let c3 = self.gp0_fifo[6] & 0x00FF_FFFF;
         let v3 = self.decode_vertex(self.gp0_fifo[7]);
+        self.rasterize_shaded_triangle(v1, v3, v2, c1, c3, c2, mode);
         self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2, mode);
-        self.rasterize_shaded_triangle(v1, v2, v3, c1, c2, c3, mode);
     }
 
     /// GP0 0x60..=0x63 — monochrome variable-size rectangle.
@@ -1492,8 +1493,7 @@ impl Gpu {
         );
     }
 
-    /// GP0 0x2C..=0x2F — textured quad. 9 words; split into two
-    /// textured triangles sharing v1–v2.
+    /// GP0 0x2C..=0x2F — textured quad. 9 words; split in Redux order.
     fn draw_textured_quad(&mut self) {
         let cmd = self.gp0_fifo[0];
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
@@ -1520,8 +1520,13 @@ impl Gpu {
         } else {
             split_tint(cmd & 0x00FF_FFFF)
         };
+        if self.rasterize_axis_aligned_textured_quad(
+            v0, v1, v2, v3, t0, t1, t2, t3, clut_word, semi, tint,
+        ) {
+            return;
+        }
+        self.rasterize_textured_triangle(v1, v3, v2, t1, t3, t2, clut_word, semi, tint);
         self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word, semi, tint);
-        self.rasterize_textured_triangle(v1, v2, v3, t1, t2, t3, clut_word, semi, tint);
     }
 
     /// GP0 0x34..=0x37 — textured + Gouraud-shaded triangle.
@@ -1567,7 +1572,7 @@ impl Gpu {
     }
 
     /// GP0 0x3C..=0x3F — textured + Gouraud-shaded quad. 12 words;
-    /// split into two textured-shaded triangles sharing edge v1–v2.
+    /// split in Redux order.
     /// Words: `[cmd+c0, v0, uv0+clut, c1, v1, uv1+texpage, c2, v2, uv2,
     ///          c3, v3, uv3]`.
     fn draw_textured_shaded_quad(&mut self) {
@@ -1596,11 +1601,107 @@ impl Gpu {
         // not bit 0 of the full cmd word.
         let raw = (cmd >> 24) & 1 != 0;
         self.rasterize_textured_shaded_triangle(
-            v0, v1, v2, t0, t1, t2, c0, c1, c2, clut_word, semi, raw,
+            v1, v3, v2, t1, t3, t2, c1, c3, c2, clut_word, semi, raw,
         );
         self.rasterize_textured_shaded_triangle(
-            v1, v2, v3, t1, t2, t3, c1, c2, c3, clut_word, semi, raw,
+            v0, v1, v2, t0, t1, t2, c0, c1, c2, clut_word, semi, raw,
         );
+    }
+
+    /// Fast path for the common 2D-sprite case: a flat textured quad
+    /// whose vertex order is top-left, top-right, bottom-left,
+    /// bottom-right. Redux renders flat textured quads with a true
+    /// four-edge scanline walker, not by splitting the primitive into
+    /// two triangles; using the same row-wide UV interpolation removes
+    /// diagonal sampling seams in BIOS text and loading-screen sprites.
+    #[allow(clippy::too_many_arguments)]
+    fn rasterize_axis_aligned_textured_quad(
+        &mut self,
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        v3: (i32, i32),
+        t0: (u16, u16),
+        t1: (u16, u16),
+        t2: (u16, u16),
+        t3: (u16, u16),
+        clut_word: u16,
+        semi_trans: bool,
+        tint: (u32, u32, u32),
+    ) -> bool {
+        if self.wireframe_enabled {
+            return false;
+        }
+        if v0.1 != v1.1 || v2.1 != v3.1 || v0.0 != v2.0 || v1.0 != v3.0 {
+            return false;
+        }
+        if triangle_exceeds_hw_extent(v1, v3, v2) || triangle_exceeds_hw_extent(v0, v1, v2) {
+            return true;
+        }
+        let left = v0.0;
+        let right = v1.0;
+        let top = v0.1;
+        let bottom = v2.1;
+        let width = right - left;
+        let height = bottom - top;
+        if width <= 0 || height <= 0 {
+            return true;
+        }
+
+        let draw_left = self.draw_area_left as i32;
+        let draw_right = self.draw_area_right as i32;
+        let draw_top = self.draw_area_top as i32;
+        let draw_bottom = self.draw_area_bottom as i32;
+        let y_start = top.max(draw_top);
+        let y_end = (bottom - 1).min(draw_bottom);
+        let x_start = left.max(draw_left);
+        let x_end = (right - 1).min(draw_right);
+        if y_start > y_end || x_start > x_end {
+            return true;
+        }
+
+        let clut_x = (clut_word & 0x3F) * 16;
+        let clut_y = (clut_word >> 6) & 0x1FF;
+        let tpage_mode = self.tex_blend_mode;
+        let left_u0 = (t0.0 as i64) << 16;
+        let left_v0 = (t0.1 as i64) << 16;
+        let right_u0 = (t1.0 as i64) << 16;
+        let right_v0 = (t1.1 as i64) << 16;
+        let delta_left_u = (((t2.0 as i64) << 16) - left_u0) / height as i64;
+        let delta_left_v = (((t2.1 as i64) << 16) - left_v0) / height as i64;
+        let delta_right_u = (((t3.0 as i64) << 16) - right_u0) / height as i64;
+        let delta_right_v = (((t3.1 as i64) << 16) - right_v0) / height as i64;
+
+        for py in y_start..=y_end {
+            let row = (py - top) as i64;
+            let mut pos_u = left_u0 + row * delta_left_u;
+            let mut pos_v = left_v0 + row * delta_left_v;
+            let right_u = right_u0 + row * delta_right_u;
+            let right_v = right_v0 + row * delta_right_v;
+            let delta_u = (right_u - pos_u) / width as i64;
+            let delta_v = (right_v - pos_v) / width as i64;
+            if x_start > left {
+                let skip = (x_start - left) as i64;
+                pos_u += skip * delta_u;
+                pos_v += skip * delta_v;
+            }
+            for px in x_start..=x_end {
+                let u = (pos_u >> 16) as u16;
+                let v = (pos_v >> 16) as u16;
+                if let Some(texel) = self.sample_texture(u, v, clut_x, clut_y) {
+                    let shaded = modulate_tint(texel, tint.0, tint.1, tint.2);
+                    let mode = if semi_trans && (texel & 0x8000) != 0 {
+                        tpage_mode
+                    } else {
+                        BlendMode::Opaque
+                    };
+                    self.plot_pixel(px as u16, py as u16, shaded, mode);
+                }
+                pos_u += delta_u;
+                pos_v += delta_v;
+            }
+        }
+        true
     }
 
     /// Rasterize a triangle with per-vertex tint colours AND per-vertex

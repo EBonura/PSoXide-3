@@ -59,19 +59,17 @@ impl Default for PanelVisibility {
 /// window. Toggled from the debug toolbar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleMode {
-    /// Stretch to fit the available area while preserving aspect
-    /// ratio. Fractional scale factors — smooth but may visibly
-    /// interpolate on integer-pixel art.
-    Fit,
-    /// Integer-multiple scale (1×, 2×, 3×, …) fitting inside the
-    /// available area. Pixel-perfect — the PSX's native res shows
-    /// with no interpolation or stretch. Letterboxes as needed.
-    Integer,
+    /// Fill the available area at CRT aspect. This is the normal
+    /// “use the whole window” presentation; scaling is fractional.
+    Window,
+    /// Show exactly one host pixel per PSX framebuffer pixel.
+    /// Useful when inspecting the original output resolution.
+    Native,
 }
 
 impl Default for ScaleMode {
     fn default() -> Self {
-        Self::Fit
+        Self::Window
     }
 }
 
@@ -79,9 +77,8 @@ impl Default for ScaleMode {
 /// single-threaded, UI reads state in-place per frame.
 pub struct AppState {
     pub panels: PanelVisibility,
-    /// How the framebuffer scales — `Fit` (stretch with aspect
-    /// preserved) vs `Integer` (1×/2×/3× pixel-perfect, letterbox
-    /// as needed). Toggled via the debug toolbar.
+    /// How the framebuffer scales — full-window presentation vs
+    /// exact 1× native pixels. Toggled via the debug toolbar.
     pub scale_mode: ScaleMode,
     pub cpu: Cpu,
     /// Optional because we let the frontend run without a BIOS for UI
@@ -134,6 +131,11 @@ pub struct AppState {
     /// "Scan complete: 54 games", etc. Displayed beneath the
     /// library panel; cleared after a few frames.
     pub status_message: Option<(String, f32)>,
+    /// Host-audio gain controlled from the toolbar. `1.0` is unity.
+    pub audio_volume: f32,
+    /// Toolbar mute latch. Kept separate from `audio_volume` so
+    /// unmuting restores the prior level.
+    pub audio_muted: bool,
 }
 
 impl Default for AppState {
@@ -210,6 +212,8 @@ impl AppState {
             paths,
             current_game: None,
             status_message: None,
+            audio_volume: 1.0,
+            audio_muted: false,
         };
         // Startup auto-rescan: always run when the SDK-examples dir
         // exists so stale `library.ron` entries (e.g. cargo
@@ -620,6 +624,15 @@ impl AppState {
     /// Menu without allocating a whole notification subsystem.
     pub fn status_message_set(&mut self, msg: impl Into<String>) {
         self.status_message = Some((msg.into(), STATUS_MESSAGE_TTL_SECS));
+    }
+
+    /// Current output gain after the mute latch is applied.
+    pub fn effective_audio_volume(&self) -> f32 {
+        if self.audio_muted {
+            0.0
+        } else {
+            self.audio_volume.clamp(0.0, 1.5)
+        }
     }
 }
 

@@ -311,6 +311,15 @@ impl ApplicationHandler for Shell {
                 // frame's edges into `MenuInput` and keep the merged
                 // mask handy for the run branch further down.
                 let pad_frame = self.input.poll();
+                if !pad_frame.notices.is_empty() {
+                    let msg = pad_frame
+                        .notices
+                        .iter()
+                        .map(|notice| notice.message())
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    self.state.status_message_set(msg);
+                }
                 if pad_frame.toggle_menu {
                     // Select+Start is the gamepad equivalent of
                     // Escape — route it into the same `toggle_open`
@@ -413,6 +422,7 @@ impl ApplicationHandler for Shell {
                         // clock even on 120 Hz / 144 Hz hosts or slow
                         // frames, matching the SPU's 768-cycles/sample
                         // timing model.
+                        let effective_audio_volume = self.state.effective_audio_volume();
                         if let Some(bus) = self.state.bus.as_mut() {
                             let cycles_after = bus.cycles();
                             self.audio_cycle_accum = self
@@ -424,6 +434,7 @@ impl ApplicationHandler for Shell {
                                 bus.run_spu_samples(sample_count);
                             }
                             if let Some(audio) = self.audio.as_ref() {
+                                audio.set_volume(effective_audio_volume);
                                 let samples = bus.spu.drain_audio();
                                 if !samples.is_empty() {
                                     audio.push_samples(&samples);

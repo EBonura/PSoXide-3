@@ -51,6 +51,7 @@ pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::Te
     });
 
     state.menu.draw(ctx, dt);
+    draw_status_toast(ctx, state);
 }
 
 pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> MenuOutcome {
@@ -161,4 +162,31 @@ fn fill_vram_test_pattern(vram: &mut emulator_core::Vram) {
             vram.set_pixel(x as u16, y as u16, color);
         }
     }
+}
+
+fn draw_status_toast(ctx: &egui::Context, state: &AppState) {
+    let Some((msg, ttl)) = state.status_message.as_ref() else {
+        return;
+    };
+    let alpha = (*ttl / 0.35).clamp(0.0, 1.0);
+    let bg = egui::Color32::from_rgba_premultiplied(16, 18, 22, (230.0 * alpha) as u8);
+    let stroke = egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgba_premultiplied(0, 191, 230, (180.0 * alpha) as u8),
+    );
+    let text = egui::Color32::from_rgba_premultiplied(235, 238, 242, (255.0 * alpha) as u8);
+
+    egui::Area::new("status-toast".into())
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-18.0, 48.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(bg)
+                .stroke(stroke)
+                .corner_radius(egui::CornerRadius::same(4))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(msg).color(text).size(13.0));
+                });
+        });
 }

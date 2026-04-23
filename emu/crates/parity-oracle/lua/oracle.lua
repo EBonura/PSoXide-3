@@ -123,6 +123,8 @@ end
 -- Pointers resolved once in `run()` and closed over by helpers. These
 -- addresses are stable for the life of the emulator.
 local ram_ptr, rom_ptr, regs, regs_ext
+local pad_prev_vblank = nil
+local pad_vblank_count = 0
 
 -- COP2 (GTE) accessors resolved at startup. `regs.CP2D` and `regs.CP2C`
 -- are unions in `psxregisters.h` with a `r[32]` array view; the FFI
@@ -495,11 +497,12 @@ local function run()
             else
                 local hw_ptr = get_hw_ptr()
                 local istat_ptr = ffi.cast("uint32_t*", hw_ptr + 0x1070)
-                local prev_vblank = bit.band(istat_ptr[0], 0x1)
-                local vblank_count = 0
+                if pad_prev_vblank == nil then
+                    pad_prev_vblank = bit.band(istat_ptr[0], 0x1)
+                end
                 local current_mask = nil
                 local function sync_pad_mask()
-                    local next_mask = effective_pad_mask(base_mask, pulses, vblank_count)
+                    local next_mask = effective_pad_mask(base_mask, pulses, pad_vblank_count)
                     if current_mask ~= next_mask then
                         local ok, err = apply_pad_mask(port, next_mask)
                         if not ok then
@@ -518,10 +521,10 @@ local function run()
                         PCSX.stepIn()
                         PCSX.runExecute()
                         local cur_vblank = bit.band(istat_ptr[0], 0x1)
-                        if cur_vblank ~= 0 and prev_vblank == 0 then
-                            vblank_count = vblank_count + 1
+                        if cur_vblank ~= 0 and pad_prev_vblank == 0 then
+                            pad_vblank_count = pad_vblank_count + 1
                         end
-                        prev_vblank = cur_vblank
+                        pad_prev_vblank = cur_vblank
                         ok, err = sync_pad_mask()
                         if not ok then
                             send("err run_checkpoint_pad: " .. tostring(err))

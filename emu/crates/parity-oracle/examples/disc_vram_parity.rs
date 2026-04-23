@@ -15,10 +15,12 @@
 //! ```
 //!
 //! Flags:
-//!   `--disc PATH`    : BIN/CUE (BIN only for now) to mount on both.
+//!   `--disc PATH`    : BIN/CUE to mount on both.
 //!   `--steps N`      : total Redux-style user steps to run (default 100 M).
 //!   `--chunk N`      : user steps per checkpoint (default 1 M).
 //!   `--bios PATH`    : override the default SCPH1001.BIN path.
+//!   `--pad-mask M`   : hold a port-1 button mask for the whole run.
+//!   `--pad-pulses S` : comma-separated `<mask>@<vblank>+<frames>` pulses.
 //!
 //! Exit code 0 iff every checkpoint matched or any transient mismatch
 //! converged again before the final checkpoint. Non-zero when the run
@@ -26,6 +28,7 @@
 //! hashes printed.
 
 use std::env;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -42,6 +45,29 @@ struct Args {
     bios: PathBuf,
     steps: u64,
     chunk: u64,
+    pad_port: u32,
+    pad_mask: u16,
+    pad_pulses: Vec<PadPulse>,
+}
+
+impl Args {
+    fn pad_enabled(&self) -> bool {
+        self.pad_mask != 0 || !self.pad_pulses.is_empty()
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PadPulse {
+    mask: u16,
+    start_vblank: u64,
+    frames: u64,
+}
+
+#[derive(Debug)]
+struct PadRuntime {
+    base_mask: u16,
+    pulses: Vec<PadPulse>,
+    current_mask: Option<u16>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +98,14 @@ fn main() {
         "[disc-parity] steps : {}  (chunk {})",
         args.steps, args.chunk,
     );
+    if args.pad_enabled() {
+        eprintln!(
+            "[disc-parity] pad   : port={} held=0x{:04x} pulses={}",
+            args.pad_port,
+            args.pad_mask,
+            format_pad_pulses(&args.pad_pulses),
+        );
+    }
 
     // --- Redux setup ----------------------------------------------------
     let lua = OracleConfig::default_lua_dir().join("oracle.lua");
@@ -85,10 +119,21 @@ fn main() {
     // --- Our emulator setup ---------------------------------------------
     eprintln!("[disc-parity] launching our emulator...");
     let bios = std::fs::read(&args.bios).expect("BIOS readable");
-    let disc_bytes = std::fs::read(&args.disc).expect("disc readable");
+    let disc = load_disc_path(&args.disc).expect("disc readable");
     let mut bus = Bus::new(bios).expect("bus");
-    bus.cdrom.insert_disc(Some(Disc::from_bin(disc_bytes)));
+    bus.cdrom.insert_disc(Some(disc));
+    if args.pad_enabled() {
+        bus.attach_digital_pad_port1();
+    }
     let mut cpu = Cpu::new();
+    let mut pad = args.pad_enabled().then(|| PadRuntime {
+        base_mask: args.pad_mask,
+        pulses: args.pad_pulses.clone(),
+        current_mask: None,
+    });
+    if let Some(pad) = pad.as_mut() {
+        pad.sync(&mut bus);
+    }
 
     // --- Run + compare in chunks ---------------------------------------
     let mut cursor: u64 = 0;
@@ -100,9 +145,29 @@ fn main() {
         let chunk = args.chunk.min(args.steps - cursor);
         chunk_count += 1;
 
-        // Redux: silent run — no trace records emitted.
+        // Redux: silent run — no trace records emitted unless input
+        // scheduling is enabled, in which case `run_checkpoint_pad`
+        // is the protocol surface that keeps controller state synced.
         let run_timeout = Duration::from_secs((chunk / 500_000).max(30));
-        if let Err(e) = redux.run(chunk, run_timeout) {
+        let redux_run = if args.pad_enabled() {
+            let pulses = args
+                .pad_pulses
+                .iter()
+                .map(|pulse| (pulse.mask, pulse.start_vblank, pulse.frames))
+                .collect::<Vec<_>>();
+            redux.run_checkpoint_pad(
+                chunk,
+                chunk,
+                args.pad_port,
+                args.pad_mask,
+                &pulses,
+                run_timeout,
+                |_step, _tick, _pc| Ok(()),
+            )
+        } else {
+            redux.run(chunk, run_timeout)
+        };
+        if let Err(e) = redux_run {
             eprintln!("[disc-parity] Redux run failed at step {cursor} (+{chunk}): {e}",);
             std::process::exit(1);
         }
@@ -110,7 +175,8 @@ fn main() {
         // Us: mirror Redux's user-side stepping. Redux's `stepIn`
         // breakpoint is in user code, so an IRQ entered by a user
         // instruction runs through to RFE inside the same outer step.
-        if let Some((sub_step, err)) = step_ours_user_steps(&mut cpu, &mut bus, chunk) {
+        if let Some((sub_step, err)) = step_ours_user_steps(&mut cpu, &mut bus, chunk, pad.as_mut())
+        {
             let total = cursor + sub_step;
             eprintln!("[disc-parity] our emulator stopped at user step {total}: {err:?}");
             cleanup(redux);
@@ -238,8 +304,12 @@ fn step_ours_user_steps(
     cpu: &mut Cpu,
     bus: &mut Bus,
     steps: u64,
+    mut pad: Option<&mut PadRuntime>,
 ) -> Option<(u64, emulator_core::ExecutionError)> {
     for i in 0..steps {
+        if let Some(pad) = pad.as_deref_mut() {
+            pad.sync(bus);
+        }
         let was_in_isr = cpu.in_isr();
         if let Err(e) = cpu.step(bus) {
             return Some((i, e));
@@ -251,8 +321,36 @@ fn step_ours_user_steps(
                 }
             }
         }
+        if let Some(pad) = pad.as_deref_mut() {
+            pad.sync(bus);
+        }
     }
     None
+}
+
+impl PadRuntime {
+    fn sync(&mut self, bus: &mut Bus) {
+        let vblank = bus.irq().raise_counts()[0];
+        let next_mask = effective_pad_mask(self.base_mask, &self.pulses, vblank);
+        if self.current_mask.is_some_and(|mask| mask == next_mask) {
+            return;
+        }
+        bus.set_port1_buttons(emulator_core::ButtonState::from_bits(next_mask));
+        self.current_mask = Some(next_mask);
+    }
+}
+
+fn load_disc_path(path: &Path) -> Result<Disc, String> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cue"))
+    {
+        psoxide_settings::library::load_disc_from_cue(path)
+    } else {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Disc::from_bin(bytes))
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -260,6 +358,20 @@ fn parse_args() -> Result<Args, String> {
     let mut bios: Option<PathBuf> = None;
     let mut steps: u64 = 100_000_000;
     let mut chunk: u64 = 1_000_000;
+    let mut pad_port: u32 = 1;
+    let mut pad_mask: u16 = match env::var("PSOXIDE_PAD1") {
+        Ok(mask) => {
+            parse_u16_mask(&mask).ok_or_else(|| "PSOXIDE_PAD1 must be a u16 mask".to_string())?
+        }
+        Err(_) => 0,
+    };
+    let mut pad_pulses: Vec<PadPulse> = match env::var("PSOXIDE_PAD1_PULSES") {
+        Ok(spec) if !spec.trim().is_empty() => parse_pad_pulses(&spec).ok_or_else(|| {
+            "PSOXIDE_PAD1_PULSES must be comma-separated <mask>@<vblank>+<frames> entries"
+                .to_string()
+        })?,
+        _ => Vec::new(),
+    };
     let mut it = env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -287,9 +399,38 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--chunk: {e}"))?;
             }
+            "--pad-port" => {
+                pad_port = it
+                    .next()
+                    .ok_or_else(|| "--pad-port takes a number".to_string())?
+                    .parse()
+                    .map_err(|e| format!("--pad-port: {e}"))?;
+            }
+            "--pad-mask" => {
+                let mask = it
+                    .next()
+                    .ok_or_else(|| "--pad-mask takes a u16 mask".to_string())?;
+                pad_mask =
+                    parse_u16_mask(&mask).ok_or_else(|| format!("--pad-mask: bad mask {mask}"))?;
+            }
+            "--pad-pulses" => {
+                let spec = it
+                    .next()
+                    .ok_or_else(|| "--pad-pulses takes a pulse spec".to_string())?;
+                pad_pulses = parse_pad_pulses(&spec).ok_or_else(|| {
+                    "--pad-pulses must be comma-separated <mask>@<vblank>+<frames> entries"
+                        .to_string()
+                })?;
+            }
             "--help" | "-h" => return Err("help".to_string()),
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+    if chunk == 0 {
+        return Err("--chunk must be greater than zero".to_string());
+    }
+    if pad_port != 1 && (pad_mask != 0 || !pad_pulses.is_empty()) {
+        return Err("--pad-port currently only supports port 1 in psoxide".to_string());
     }
     Ok(Args {
         disc: disc.ok_or_else(|| "missing --disc".to_string())?,
@@ -300,16 +441,89 @@ fn parse_args() -> Result<Args, String> {
         }),
         steps,
         chunk,
+        pad_port,
+        pad_mask,
+        pad_pulses,
     })
+}
+
+fn parse_u16_mask(text: &str) -> Option<u16> {
+    let s = text.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u16>().ok()
+    }
+}
+
+fn parse_pad_pulses(text: &str) -> Option<Vec<PadPulse>> {
+    let mut pulses = Vec::new();
+    for entry in text.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        pulses.push(parse_pad_pulse(entry)?);
+    }
+    Some(pulses)
+}
+
+fn parse_pad_pulse(text: &str) -> Option<PadPulse> {
+    let (mask_text, rest) = text.split_once('@')?;
+    let mask = parse_u16_mask(mask_text)?;
+    let (start_text, frames_text) = match rest.split_once('+') {
+        Some((start, frames)) => (start.trim(), frames.trim()),
+        None => (rest.trim(), "1"),
+    };
+    let start_vblank = start_text.parse().ok()?;
+    let frames = frames_text.parse().ok()?;
+    if frames == 0 {
+        return None;
+    }
+    Some(PadPulse {
+        mask,
+        start_vblank,
+        frames,
+    })
+}
+
+fn format_pad_pulses(pulses: &[PadPulse]) -> String {
+    if pulses.is_empty() {
+        return "(none)".to_string();
+    }
+    pulses
+        .iter()
+        .map(|pulse| {
+            format!(
+                "0x{:04x}@{}+{}",
+                pulse.mask, pulse.start_vblank, pulse.frames
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn effective_pad_mask(base_mask: u16, pulses: &[PadPulse], current_vblank: u64) -> u16 {
+    let mut mask = base_mask;
+    for pulse in pulses {
+        let end_vblank = pulse.start_vblank.saturating_add(pulse.frames);
+        if current_vblank >= pulse.start_vblank && current_vblank < end_vblank {
+            mask |= pulse.mask;
+        }
+    }
+    mask
 }
 
 fn print_usage() {
     eprintln!(
         "usage: disc_vram_parity --disc <path> [--bios <path>] \
-         [--steps N] [--chunk N]\n\
+         [--steps N] [--chunk N] [--pad-mask M] [--pad-pulses SPEC]\n\
          \n\
          Boots the same disc + BIOS on Redux and our emulator, then\n\
          compares VRAM display-area hashes every --chunk user steps.\n\
-         Stops + reports at the first divergence.",
+         Stops + reports at the first divergence.\n\
+         \n\
+         Pad pulses use <mask>@<vblank>+<frames>, e.g.\n\
+         --pad-pulses '0x0008@1200+4,0x4000@1250+1'.",
     );
 }

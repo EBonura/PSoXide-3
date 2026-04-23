@@ -65,12 +65,48 @@ pub fn draw(ctx: &Context, state: &mut AppState) {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     draw_buttons(ui, state);
                     ui.add_space(12.0);
+                    draw_audio_controls(ui, state);
+                    ui.add_space(12.0);
                     draw_boot_toggle(ui, state);
                     ui.add_space(12.0);
                     draw_debug_toggles(ui, state);
                 });
             });
         });
+}
+
+/// Compact volume control: mute button plus gain slider.
+fn draw_audio_controls(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+        let effective = state.effective_audio_volume();
+        let icon = if effective <= 0.0 {
+            icons::VOLUME_X
+        } else if effective < 0.6 {
+            icons::VOLUME_1
+        } else {
+            icons::VOLUME_2
+        };
+        let btn = toggle_button(icon, !state.audio_muted && state.audio_volume > 0.0);
+        if ui.add(btn).on_hover_text("Mute / unmute audio").clicked() {
+            state.audio_muted = !state.audio_muted;
+            state.status_message_set(if state.audio_muted {
+                "Audio muted"
+            } else {
+                "Audio unmuted"
+            });
+        }
+        let before = state.audio_volume;
+        let slider = egui::Slider::new(&mut state.audio_volume, 0.0..=1.5)
+            .show_value(false)
+            .clamping(egui::SliderClamping::Always);
+        let response = ui.add_sized([86.0, 18.0], slider).on_hover_text("Volume");
+        if response.changed() {
+            state.audio_volume = state.audio_volume.clamp(0.0, 1.5);
+            if state.audio_volume > 0.0 && before <= 0.0 {
+                state.audio_muted = false;
+            }
+        }
+    });
 }
 
 /// Disc boot-mode toggle. Active means warm fast boot is used on the
@@ -129,19 +165,23 @@ fn draw_debug_toggles(ui: &mut egui::Ui, state: &mut AppState) {
             bus.gpu.wireframe_enabled = !bus.gpu.wireframe_enabled;
         }
     }
-    // Resolution / scale-mode switch: Fit (stretches) ↔ Integer
-    // (pixel-perfect, letterboxed). MONITOR icon, tints green when
-    // Integer mode is active.
-    let integer_active = state.scale_mode == ScaleMode::Integer;
-    let scale_btn = toggle_button(icons::MONITOR, integer_active);
+    // Resolution / scale-mode switch: full-window presentation ↔
+    // exact native 1× pixels. Active means native inspection mode.
+    let native_active = state.scale_mode == ScaleMode::Native;
+    let scale_icon = if native_active {
+        icons::MINIMIZE
+    } else {
+        icons::MAXIMIZE
+    };
+    let scale_btn = toggle_button(scale_icon, native_active);
     if ui
         .add(scale_btn)
-        .on_hover_text("Toggle native (pixel-perfect integer scale) vs. fit-to-window")
+        .on_hover_text("Toggle full-window scale vs. native 1x pixels")
         .clicked()
     {
         state.scale_mode = match state.scale_mode {
-            ScaleMode::Fit => ScaleMode::Integer,
-            ScaleMode::Integer => ScaleMode::Fit,
+            ScaleMode::Window => ScaleMode::Native,
+            ScaleMode::Native => ScaleMode::Window,
         };
     }
 }
