@@ -6,7 +6,10 @@ use emulator_core::{Bus, Cpu};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let stop_before: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(90_146_543);
+    let stop_before: u64 = args
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90_146_543);
     let window: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5_000);
     let addr: u32 = args
         .get(2)
@@ -34,8 +37,11 @@ fn main() {
         }
     }
     let initial = bus.peek_instruction(addr).unwrap_or(0);
-    println!("=== at step {stop_before}: pc=0x{:08x}, cycles={}, RAM[0x{addr:08x}]=0x{initial:08x} ===",
-        cpu.pc(), bus.cycles());
+    println!(
+        "=== at step {stop_before}: pc=0x{:08x}, cycles={}, RAM[0x{addr:08x}]=0x{initial:08x} ===",
+        cpu.pc(),
+        bus.cycles()
+    );
     println!();
     println!("stepping next {window} instructions (NO folding), watching RAM[0x{addr:08x}]...");
     let mut prev = initial;

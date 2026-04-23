@@ -6,8 +6,8 @@
 //! and our cycle at end of step 31139235 also equals 72764422,
 //! the IRQ should raise at that step.
 
-use emulator_core::{Bus, Cpu};
 use emulator_core::scheduler::EventSlot;
+use emulator_core::{Bus, Cpu};
 use psx_iso::Disc;
 
 fn main() {
@@ -28,10 +28,14 @@ fn main() {
     let mut steps = 0u64;
     while steps < target {
         let was_in_isr = cpu.in_isr();
-        if cpu.step(&mut bus).is_err() { break; }
+        if cpu.step(&mut bus).is_err() {
+            break;
+        }
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                if cpu.step(&mut bus).is_err() { break; }
+                if cpu.step(&mut bus).is_err() {
+                    break;
+                }
             }
         }
         steps += 1;
@@ -40,7 +44,9 @@ fn main() {
     let vb_target = bus.scheduler.target(EventSlot::VBlank);
     println!(
         "Pre-step {}: our cycles={}, VBlank target={:?}",
-        target, bus.cycles(), vb_target,
+        target,
+        bus.cycles(),
+        vb_target,
     );
 
     // Step one at a time and log cycle + VBlank-pending changes.

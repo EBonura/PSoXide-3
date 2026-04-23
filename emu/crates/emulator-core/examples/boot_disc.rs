@@ -3,7 +3,7 @@
 //! disc-check passes) and onwards.
 //!
 //! ```bash
-//! PSOXIDE_DISC="/path/to/Crash.bin" \
+//! PSOXIDE_DISC="/path/to/Crash.cue" \
 //! PSOXIDE_VRAM_DUMP=/tmp/crash.ppm \
 //! cargo run -p emulator-core --example boot_disc --release -- 500000000
 //! ```
@@ -13,8 +13,10 @@
 //! "licensed-disc + seek to SYSTEM.CNF" branch instead of the
 //! "please insert disc" branch.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::{Bus, Cpu};
-use psx_iso::Disc;
 use std::path::PathBuf;
 
 fn main() {
@@ -26,22 +28,19 @@ fn main() {
     let bios_path = std::env::var("PSOXIDE_BIOS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN"));
-    let disc_path = std::env::var("PSOXIDE_DISC").expect(
-        "Set PSOXIDE_DISC to the path of a BIN disc image (no CUE parsing yet)",
-    );
+    let disc_path = std::env::var("PSOXIDE_DISC")
+        .expect("Set PSOXIDE_DISC to the path of a CUE or BIN disc image");
 
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
-    let disc_bytes = std::fs::read(&disc_path).expect("disc BIN readable");
+    let disc = disc_support::load_disc_path(std::path::Path::new(&disc_path)).expect("disc readable");
     eprintln!(
-        "[boot_disc] bios={}  disc={} ({} MiB, {} sectors)",
+        "[boot_disc] bios={}  disc={}",
         bios_path.display(),
         disc_path,
-        disc_bytes.len() / (1024 * 1024),
-        disc_bytes.len() / 2352,
     );
 
     let mut bus = Bus::new(bios).expect("bus");
-    bus.cdrom.insert_disc(Some(Disc::from_bin(disc_bytes)));
+    bus.cdrom.insert_disc(Some(disc));
     let mut cpu = Cpu::new();
 
     let mut stopped_at: Option<(u64, emulator_core::ExecutionError)> = None;
@@ -77,9 +76,9 @@ fn main() {
     }
     let exc = cpu.exception_counts();
     let exc_names: [&str; 32] = [
-        "Int", "Mod", "TLBL", "TLBS", "AdEL", "AdES", "IBE", "DBE", "Syscall", "Break",
-        "RI", "CpU", "Ov", "Tr", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-",
-        "-", "-", "-", "-", "-", "-", "-",
+        "Int", "Mod", "TLBL", "TLBS", "AdEL", "AdES", "IBE", "DBE", "Syscall", "Break", "RI",
+        "CpU", "Ov", "Tr", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-",
+        "-", "-", "-", "-",
     ];
     print!("exceptions       =");
     let mut any = false;
@@ -96,8 +95,17 @@ fn main() {
 
     let irq = bus.irq();
     let raise_names = [
-        "VBlank", "Gpu", "Cdrom", "Dma", "Timer0", "Timer1", "Timer2",
-        "Controller", "Sio", "Spu", "Lightpen",
+        "VBlank",
+        "Gpu",
+        "Cdrom",
+        "Dma",
+        "Timer0",
+        "Timer1",
+        "Timer2",
+        "Controller",
+        "Sio",
+        "Spu",
+        "Lightpen",
     ];
     print!("irq raises       =");
     for (i, &n) in irq.raise_counts().iter().enumerate() {

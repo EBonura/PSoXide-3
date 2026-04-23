@@ -83,5 +83,8 @@ fn main() {
     println!("MAIN_VOL_R     = 0x{main_r:04x}");
     let kon_lo = bus.spu.read16(0x1F80_1D88);
     let kon_hi = bus.spu.read16(0x1F80_1D8A);
-    println!("KON            = 0x{:08x}", ((kon_hi as u32) << 16) | kon_lo as u32);
+    println!(
+        "KON            = 0x{:08x}",
+        ((kon_hi as u32) << 16) | kon_lo as u32
+    );
 }

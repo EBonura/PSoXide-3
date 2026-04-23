@@ -17,8 +17,7 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
 
     let dir = cache::default_dir();
-    let trace = cache::load_prefix(&dir, &bios, 50_000_000)
-        .expect("No cached trace long enough");
+    let trace = cache::load_prefix(&dir, &bios, 50_000_000).expect("No cached trace long enough");
 
     let target_step: usize = std::env::var("PSOXIDE_ISR_AT")
         .ok()
@@ -65,9 +64,7 @@ fn main() {
     let was_in_isr = cpu.in_isr();
     let pc_before = cpu.pc();
     let cycles_before = bus.cycles();
-    eprintln!(
-        "Starting: pc=0x{pc_before:08x}  cycles={cycles_before}  in_isr={was_in_isr}",
-    );
+    eprintln!("Starting: pc=0x{pc_before:08x}  cycles={cycles_before}  in_isr={was_in_isr}",);
 
     // Dump bus state before stepping — which IRQs are pending?
     let istat = bus.irq().stat();
@@ -89,8 +86,17 @@ fn main() {
     // rate.
     let raise_counts = bus.irq().raise_counts();
     let names = [
-        "VBlank", "Gpu", "Cdrom", "Dma", "Timer0", "Timer1", "Timer2",
-        "Controller", "Sio", "Spu", "Lightpen",
+        "VBlank",
+        "Gpu",
+        "Cdrom",
+        "Dma",
+        "Timer0",
+        "Timer1",
+        "Timer2",
+        "Controller",
+        "Sio",
+        "Spu",
+        "Lightpen",
     ];
     eprintln!("  IRQ raise histogram to this point:");
     for (i, &n) in raise_counts.iter().enumerate() {
@@ -111,7 +117,11 @@ fn main() {
     let rec = cpu.step(&mut bus).expect("step");
     eprintln!(
         "  [main] pc=0x{:08x}  tick={}  (delta={})  in_isr={}  in_irq={}",
-        rec.pc, rec.tick, rec.tick - cycles_before, cpu.in_isr(), cpu.in_irq_handler(),
+        rec.pc,
+        rec.tick,
+        rec.tick - cycles_before,
+        cpu.in_isr(),
+        cpu.in_irq_handler(),
     );
 
     if !was_in_isr && cpu.in_irq_handler() {
@@ -130,7 +140,10 @@ fn main() {
                 break;
             }
         }
-        eprintln!("=== ISR done in {isr_step} instructions, final tick={} ===", bus.cycles());
+        eprintln!(
+            "=== ISR done in {isr_step} instructions, final tick={} ===",
+            bus.cycles()
+        );
     } else {
         eprintln!("(No ISR was folded in at this step.)");
     }
@@ -138,8 +151,7 @@ fn main() {
     eprintln!();
     eprintln!(
         "Redux says step {target_step} should end at tick {} with pc={:08x}.",
-        trace[target_step].tick,
-        trace[target_step].pc,
+        trace[target_step].tick, trace[target_step].pc,
     );
     eprintln!(
         "We end at tick {} with pc=0x{:08x}. Delta tick: {:+}.",
@@ -167,8 +179,17 @@ fn main() {
         if !was_in_isr && cpu.in_irq_handler() {
             // Bit name lookup.
             let names = [
-                "VBlank", "Gpu", "Cdrom", "Dma", "Timer0", "Timer1", "Timer2",
-                "Controller", "Sio", "Spu", "Lightpen",
+                "VBlank",
+                "Gpu",
+                "Cdrom",
+                "Dma",
+                "Timer0",
+                "Timer1",
+                "Timer2",
+                "Controller",
+                "Sio",
+                "Spu",
+                "Lightpen",
             ];
             let pending = pre_istat & pre_imask;
             let mut which = vec![];

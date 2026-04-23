@@ -29,23 +29,23 @@ fn main() {
     // === Identity rotation ===
     // PSX-SPX layout: ctc2(0)=(RT00,RT01), (1)=(RT02,RT10),
     // (2)=(RT11,RT12), (3)=(RT20,RT21), (4)=RT22.
-    g.write_control(0, pack_i16(0x1000, 0));      // RT00=1.0, RT01=0
-    g.write_control(1, pack_i16(0, 0));           // RT02=0, RT10=0
-    g.write_control(2, pack_i16(0x1000, 0));      // RT11=1.0, RT12=0
-    g.write_control(3, pack_i16(0, 0));           // RT20=0, RT21=0
-    g.write_control(4, 0x1000);                   // RT22=1.0
+    g.write_control(0, pack_i16(0x1000, 0)); // RT00=1.0, RT01=0
+    g.write_control(1, pack_i16(0, 0)); // RT02=0, RT10=0
+    g.write_control(2, pack_i16(0x1000, 0)); // RT11=1.0, RT12=0
+    g.write_control(3, pack_i16(0, 0)); // RT20=0, RT21=0
+    g.write_control(4, 0x1000); // RT22=1.0
 
     // === Translation ===
-    g.write_control(5, 0);            // TRX
-    g.write_control(6, 0);            // TRY
-    g.write_control(7, 0x1000);       // TRZ = 1.0 in 1.3.12
+    g.write_control(5, 0); // TRX
+    g.write_control(6, 0); // TRY
+    g.write_control(7, 0x1000); // TRZ = 1.0 in 1.3.12
 
     // === Screen setup ===
-    g.write_control(24, (160 << 16) as u32);    // OFX
-    g.write_control(25, (120 << 16) as u32);    // OFY
-    g.write_control(26, 200);                   // H (projection plane)
-    g.write_control(27, 0);                     // DQA
-    g.write_control(28, 0);                     // DQB
+    g.write_control(24, (160 << 16) as u32); // OFX
+    g.write_control(25, (120 << 16) as u32); // OFY
+    g.write_control(26, 200); // H (projection plane)
+    g.write_control(27, 0); // DQA
+    g.write_control(28, 0); // DQB
 
     // === Load V0 = (0, 0, 0x1000) ===
     // data reg 0 = (VX0, VY0) packed, data reg 1 = VZ0.
@@ -59,9 +59,23 @@ fn main() {
     eprintln!("  2: 0x{:08x}", g.read_control(2));
     eprintln!("  3: 0x{:08x}", g.read_control(3));
     eprintln!("  4: 0x{:08x}", g.read_control(4));
-    eprintln!("TR: ({:#x}, {:#x}, {:#x})", g.read_control(5), g.read_control(6), g.read_control(7));
-    eprintln!("OFX={:#x} OFY={:#x} H={}", g.read_control(24), g.read_control(25), g.read_control(26));
-    eprintln!("V0 (data 0, 1): 0x{:08x} 0x{:08x}", g.read_data(0), g.read_data(1));
+    eprintln!(
+        "TR: ({:#x}, {:#x}, {:#x})",
+        g.read_control(5),
+        g.read_control(6),
+        g.read_control(7)
+    );
+    eprintln!(
+        "OFX={:#x} OFY={:#x} H={}",
+        g.read_control(24),
+        g.read_control(25),
+        g.read_control(26)
+    );
+    eprintln!(
+        "V0 (data 0, 1): 0x{:08x} 0x{:08x}",
+        g.read_data(0),
+        g.read_data(1)
+    );
 
     // === Execute RTPS sf=1 ===
     // Opcode encoding: 0x4A000000 | 1<<19 (sf=1) | 0x01 (RTPS).
@@ -84,9 +98,24 @@ fn main() {
     let ir2 = g.read_data(10);
     let ir3 = g.read_data(11);
     let flag = g.read_control(31);
-    eprintln!("SXY0: 0x{:08x}  (x={}, y={})", sxy0, sxy0 as i16, (sxy0 >> 16) as i16);
-    eprintln!("SXY1: 0x{:08x}  (x={}, y={})", sxy1, sxy1 as i16, (sxy1 >> 16) as i16);
-    eprintln!("SXY2: 0x{:08x}  (x={}, y={})", sxy2, sxy2 as i16, (sxy2 >> 16) as i16);
+    eprintln!(
+        "SXY0: 0x{:08x}  (x={}, y={})",
+        sxy0,
+        sxy0 as i16,
+        (sxy0 >> 16) as i16
+    );
+    eprintln!(
+        "SXY1: 0x{:08x}  (x={}, y={})",
+        sxy1,
+        sxy1 as i16,
+        (sxy1 >> 16) as i16
+    );
+    eprintln!(
+        "SXY2: 0x{:08x}  (x={}, y={})",
+        sxy2,
+        sxy2 as i16,
+        (sxy2 >> 16) as i16
+    );
     eprintln!("SZ3:  0x{:08x} ({})", sz3, sz3);
     eprintln!("MAC1: 0x{:08x} ({})", mac1, mac1 as i32);
     eprintln!("MAC2: 0x{:08x} ({})", mac2, mac2 as i32);
@@ -100,7 +129,10 @@ fn main() {
     let expected = (160_i16, 120_i16);
     eprintln!();
     if (sx, sy) == expected {
-        eprintln!("✓ PASS: SXY2 = ({sx}, {sy}) matches expected {:?}", expected);
+        eprintln!(
+            "✓ PASS: SXY2 = ({sx}, {sy}) matches expected {:?}",
+            expected
+        );
     } else {
         eprintln!(
             "✗ FAIL: SXY2 = ({sx}, {sy}) does NOT match expected {:?}. \
@@ -128,7 +160,8 @@ fn main() {
         (sxy2b >> 16) as i16,
     );
     eprintln!("Expected ≈ (210, 145)");
-    eprintln!("MAC1={} MAC2={} SZ3={}",
+    eprintln!(
+        "MAC1={} MAC2={} SZ3={}",
         g.read_data(25) as i32,
         g.read_data(26) as i32,
         g.read_data(19),

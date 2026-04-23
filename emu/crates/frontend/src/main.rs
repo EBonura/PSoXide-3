@@ -32,7 +32,7 @@ use winit::window::{Window, WindowId};
 use crate::app::AppState;
 use crate::cli::Cli;
 use crate::gfx::Graphics;
-use crate::ui::{MenuOutcome, menu::MenuInput};
+use crate::ui::{menu::MenuInput, MenuOutcome};
 
 use emulator_core::{button, spu::SAMPLE_CYCLES};
 

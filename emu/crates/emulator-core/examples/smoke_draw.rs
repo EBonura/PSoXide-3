@@ -197,9 +197,9 @@ fn main() {
     println!("EPC              = 0x{:08x}", cpu.cop0()[14]);
     let exc_counts = cpu.exception_counts();
     let exc_names: [&str; 32] = [
-        "Int", "Mod", "TLBL", "TLBS", "AdEL", "AdES", "IBE", "DBE", "Syscall",
-        "Break", "RI", "CpU", "Ov", "Tr", "-", "-", "-", "-", "-", "-", "-", "-",
-        "-", "-", "-", "-", "-", "-", "-", "-", "-", "-",
+        "Int", "Mod", "TLBL", "TLBS", "AdEL", "AdES", "IBE", "DBE", "Syscall", "Break", "RI",
+        "CpU", "Ov", "Tr", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-",
+        "-", "-", "-", "-",
     ];
     let mut any = false;
     for (i, &n) in exc_counts.iter().enumerate() {
@@ -216,18 +216,24 @@ fn main() {
     } else {
         println!("exceptions       = (none)");
     }
-    println!(
-        "irq_line_high    = {} steps",
-        cpu.irq_line_high_steps()
-    );
+    println!("irq_line_high    = {} steps", cpu.irq_line_high_steps());
     println!(
         "should_take_irq  = {} steps",
         cpu.should_take_interrupt_steps()
     );
     let irq = bus.irq();
     let raise_names = [
-        "VBlank", "Gpu", "Cdrom", "Dma", "Timer0", "Timer1", "Timer2",
-        "Controller", "Sio", "Spu", "Lightpen",
+        "VBlank",
+        "Gpu",
+        "Cdrom",
+        "Dma",
+        "Timer0",
+        "Timer1",
+        "Timer2",
+        "Controller",
+        "Sio",
+        "Spu",
+        "Lightpen",
     ];
     let raised = irq.raise_counts();
     print!("irq raises       =");
@@ -267,10 +273,9 @@ fn main() {
     // Disassemble ±4 instructions around the current PC so we can tell
     // at a glance whether we're in a wait loop and what it's waiting on.
     let gpr_names = [
-        "$0 ", "$at", "$v0", "$v1", "$a0", "$a1", "$a2", "$a3",
-        "$t0", "$t1", "$t2", "$t3", "$t4", "$t5", "$t6", "$t7",
-        "$s0", "$s1", "$s2", "$s3", "$s4", "$s5", "$s6", "$s7",
-        "$t8", "$t9", "$k0", "$k1", "$gp", "$sp", "$fp", "$ra",
+        "$0 ", "$at", "$v0", "$v1", "$a0", "$a1", "$a2", "$a3", "$t0", "$t1", "$t2", "$t3", "$t4",
+        "$t5", "$t6", "$t7", "$s0", "$s1", "$s2", "$s3", "$s4", "$s5", "$s6", "$s7", "$t8", "$t9",
+        "$k0", "$k1", "$gp", "$sp", "$fp", "$ra",
     ];
     println!("\n=== GPRs ===");
     for row in 0..4 {

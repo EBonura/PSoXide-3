@@ -80,9 +80,7 @@ fn log_cop2(pc: u32, instr: u32, cpu: &Cpu) {
         // COP2 function-op (RTPS, RTPT, NCLIP, …). Bits 5..0 = op id.
         let op = instr & 0x3F;
         let sf = (instr >> 19) & 1;
-        eprintln!(
-            "pc=0x{pc:08x} instr=0x{instr:08x}  COP2 COFUN op=0x{op:02x} sf={sf}",
-        );
+        eprintln!("pc=0x{pc:08x} instr=0x{instr:08x}  COP2 COFUN op=0x{op:02x} sf={sf}",);
     } else {
         let cop_op = (instr >> 21) & 0x1F;
         let rt = ((instr >> 16) & 0x1F) as u8;

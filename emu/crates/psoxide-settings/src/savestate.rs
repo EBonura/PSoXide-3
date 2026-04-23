@@ -191,8 +191,8 @@ where
                 path: std::path::PathBuf::new(),
             });
         }
-        let state: SaveStateV1<T> = postcard::from_bytes(bytes)
-            .map_err(|e| SaveStateError::Decode(e.to_string()))?;
+        let state: SaveStateV1<T> =
+            postcard::from_bytes(bytes).map_err(|e| SaveStateError::Decode(e.to_string()))?;
         if state.header.format_version > SAVESTATE_FORMAT_VERSION {
             return Err(SaveStateError::UnsupportedVersion {
                 found: state.header.format_version,
@@ -283,8 +283,8 @@ pub fn peek_header(path: &Path) -> Result<SaveStateHeader, SaveStateError> {
             path: path.to_path_buf(),
         });
     }
-    let (ho, _tail): (HeaderOnly, &[u8]) = postcard::take_from_bytes(&bytes)
-        .map_err(|e| SaveStateError::Decode(e.to_string()))?;
+    let (ho, _tail): (HeaderOnly, &[u8]) =
+        postcard::take_from_bytes(&bytes).map_err(|e| SaveStateError::Decode(e.to_string()))?;
     Ok(ho.header)
 }
 
@@ -360,7 +360,14 @@ mod tests {
     fn future_version_is_rejected() {
         // Build a state, corrupt its version to SAVESTATE_FORMAT_VERSION+1,
         // assert we don't load it.
-        let mut state = SaveStateV1::new(FakePayload { cpu_pc: 0, ram_hash: 0 }, "g", 0);
+        let mut state = SaveStateV1::new(
+            FakePayload {
+                cpu_pc: 0,
+                ram_hash: 0,
+            },
+            "g",
+            0,
+        );
         state.header.format_version = SAVESTATE_FORMAT_VERSION + 1;
         let bytes = state.to_bytes().unwrap();
         let err = SaveStateV1::<FakePayload>::from_bytes(&bytes).unwrap_err();
@@ -404,6 +411,9 @@ mod tests {
         state.write_to(&path).unwrap();
         assert!(path.exists());
         let tmp_name = path.with_extension("psx.tmp");
-        assert!(!tmp_name.exists(), "tmp file should be removed after rename");
+        assert!(
+            !tmp_name.exists(),
+            "tmp file should be removed after rename"
+        );
     }
 }

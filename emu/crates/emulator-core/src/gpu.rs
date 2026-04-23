@@ -451,10 +451,7 @@ impl Gpu {
     /// Idempotent: re-enabling resets the tracer to empty.
     pub fn enable_pixel_tracer(&mut self) {
         const SENTINEL_NO_OWNER: u32 = u32::MAX;
-        self.pixel_owner = Some(vec![
-            SENTINEL_NO_OWNER;
-            VRAM_WIDTH * VRAM_HEIGHT
-        ]);
+        self.pixel_owner = Some(vec![SENTINEL_NO_OWNER; VRAM_WIDTH * VRAM_HEIGHT]);
         self.cmd_log.clear();
         self.current_cmd_index = 0;
     }
@@ -466,7 +463,9 @@ impl Gpu {
     /// single command in isolation.
     pub fn pixel_owner_at(&self, x: u16, y: u16) -> Option<&GpuCmdLogEntry> {
         let pixel_owner = self.pixel_owner.as_ref()?;
-        let idx = pixel_owner.get(y as usize * VRAM_WIDTH + x as usize).copied()?;
+        let idx = pixel_owner
+            .get(y as usize * VRAM_WIDTH + x as usize)
+            .copied()?;
         if idx == u32::MAX {
             return None;
         }
@@ -522,12 +521,7 @@ impl Gpu {
                     let g = (((pixel >> 5) & 0x1F) as u8) << 3;
                     let b = (((pixel >> 10) & 0x1F) as u8) << 3;
                     // Replicate high 3 bits into low 3 for fuller range.
-                    out.extend_from_slice(&[
-                        r | (r >> 5),
-                        g | (g >> 5),
-                        b | (b >> 5),
-                        0xFF,
-                    ]);
+                    out.extend_from_slice(&[r | (r >> 5), g | (g >> 5), b | (b >> 5), 0xFF]);
                 }
             }
         }
@@ -549,7 +543,10 @@ impl Gpu {
     pub fn read32(&mut self, phys: u32) -> Option<u32> {
         match phys {
             GP0_ADDR => Some(self.read_gpuread()),
-            GP1_ADDR => Some(self.status.read(self.vram_download.is_some(), self.busy_credit > 0)),
+            GP1_ADDR => Some(
+                self.status
+                    .read(self.vram_download.is_some(), self.busy_credit > 0),
+            ),
             _ => None,
         }
     }
@@ -989,8 +986,7 @@ impl Gpu {
     /// in `gp0_fifo`. Dispatches on the opcode in word 0.
     fn execute_gp0_packet(&mut self) {
         let op = (self.gp0_fifo[0] >> 24) & 0xFF;
-        self.gp0_opcode_hist[op as usize] =
-            self.gp0_opcode_hist[op as usize].saturating_add(1);
+        self.gp0_opcode_hist[op as usize] = self.gp0_opcode_hist[op as usize].saturating_add(1);
         // If the pixel tracer is armed, stamp this packet into the
         // command log *before* dispatching — `plot_pixel` uses
         // `current_cmd_index` to tag every write, so it must point
@@ -1214,11 +1210,7 @@ impl Gpu {
         } else {
             split_tint(cmd & 0x00FF_FFFF)
         };
-        self.paint_textured_rect(
-            x, y, w, h, u0, v0, clut_word,
-            prim_is_semi_trans(cmd),
-            tint,
-        );
+        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word, prim_is_semi_trans(cmd), tint);
     }
 
     /// Fixed-size textured rect (1×1, 8×8, 16×16).
@@ -1241,11 +1233,7 @@ impl Gpu {
         } else {
             split_tint(cmd & 0x00FF_FFFF)
         };
-        self.paint_textured_rect(
-            x, y, w, h, u0, v0, clut_word,
-            prim_is_semi_trans(cmd),
-            tint,
-        );
+        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word, prim_is_semi_trans(cmd), tint);
     }
 
     /// Plot a textured rectangle. Each destination pixel samples a
@@ -1666,12 +1654,8 @@ impl Gpu {
             (t1.0 as i32, t1.1 as i32),
             (t2.0 as i32, t2.1 as i32),
         ];
-        let Some(mut setup) = setup_sections(
-            [v0.0, v1.0, v2.0],
-            [v0.1, v1.1, v2.1],
-            v_rgb,
-            v_uv,
-        ) else {
+        let Some(mut setup) = setup_sections([v0.0, v1.0, v2.0], [v0.1, v1.1, v2.1], v_rgb, v_uv)
+        else {
             return;
         };
 
@@ -1871,12 +1855,9 @@ impl Gpu {
             (t1.0 as i32, t1.1 as i32),
             (t2.0 as i32, t2.1 as i32),
         ];
-        let Some(mut setup) = setup_sections(
-            [v0.0, v1.0, v2.0],
-            [v0.1, v1.1, v2.1],
-            [(0, 0, 0); 3],
-            v_uv,
-        ) else {
+        let Some(mut setup) =
+            setup_sections([v0.0, v1.0, v2.0], [v0.1, v1.1, v2.1], [(0, 0, 0); 3], v_uv)
+        else {
             return;
         };
 
@@ -1977,12 +1958,9 @@ impl Gpu {
             (r(c1), g(c1), b(c1)),
             (r(c2), g(c2), b(c2)),
         ];
-        let Some(mut setup) = setup_sections(
-            [v0.0, v1.0, v2.0],
-            [v0.1, v1.1, v2.1],
-            v_rgb,
-            [(0, 0); 3],
-        ) else {
+        let Some(mut setup) =
+            setup_sections([v0.0, v1.0, v2.0], [v0.1, v1.1, v2.1], v_rgb, [(0, 0); 3])
+        else {
             return;
         };
 
@@ -2478,7 +2456,6 @@ fn gp0_packet_size(op: u8) -> usize {
     }
 }
 
-
 // ======================================================================
 // Scanline-delta triangle rasterizer
 // ======================================================================
@@ -2570,12 +2547,18 @@ struct SlTriSetup {
     right_section_height: i32,
 
     // --- Gouraud colour at left edge, current scanline (Q16.16). ---
-    left_r: i64, left_g: i64, left_b: i64,
-    delta_left_r: i64, delta_left_g: i64, delta_left_b: i64,
+    left_r: i64,
+    left_g: i64,
+    left_b: i64,
+    delta_left_r: i64,
+    delta_left_g: i64,
+    delta_left_b: i64,
 
     // --- UV at left edge, current scanline (Q16.16). ---
-    left_u: i64, left_v: i64,
-    delta_left_u: i64, delta_left_v: i64,
+    left_u: i64,
+    left_v: i64,
+    delta_left_u: i64,
+    delta_left_v: i64,
 
     // --- Per-column (per-X) deltas, computed once at setup time. ---
     //
@@ -2743,9 +2726,15 @@ fn setup_sections(
         };
     }
     // Sort by y ascending: bubble sort is fine for n=3.
-    if verts[0].y > verts[1].y { verts.swap(0, 1); }
-    if verts[0].y > verts[2].y { verts.swap(0, 2); }
-    if verts[1].y > verts[2].y { verts.swap(1, 2); }
+    if verts[0].y > verts[1].y {
+        verts.swap(0, 1);
+    }
+    if verts[0].y > verts[2].y {
+        verts.swap(0, 2);
+    }
+    if verts[1].y > verts[2].y {
+        verts.swap(1, 2);
+    }
 
     let v1 = &verts[0]; // top
     let v2 = &verts[1]; // middle
@@ -2773,15 +2762,27 @@ fn setup_sections(
         right_array: [0; 3],
         left_section: 0,
         right_section: 0,
-        left_x: 0, right_x: 0,
-        delta_left_x: 0, delta_right_x: 0,
-        left_section_height: 0, right_section_height: 0,
-        left_r: 0, left_g: 0, left_b: 0,
-        delta_left_r: 0, delta_left_g: 0, delta_left_b: 0,
-        left_u: 0, left_v: 0,
-        delta_left_u: 0, delta_left_v: 0,
-        delta_col_r: 0, delta_col_g: 0, delta_col_b: 0,
-        delta_col_u: 0, delta_col_v: 0,
+        left_x: 0,
+        right_x: 0,
+        delta_left_x: 0,
+        delta_right_x: 0,
+        left_section_height: 0,
+        right_section_height: 0,
+        left_r: 0,
+        left_g: 0,
+        left_b: 0,
+        delta_left_r: 0,
+        delta_left_g: 0,
+        delta_left_b: 0,
+        left_u: 0,
+        left_v: 0,
+        delta_left_u: 0,
+        delta_left_v: 0,
+        delta_col_r: 0,
+        delta_col_g: 0,
+        delta_col_b: 0,
+        delta_col_u: 0,
+        delta_col_v: 0,
         y_min: v1.y,
         y_max: v3.y - 1, // top-left rule: bottom row excluded
     };
@@ -2899,9 +2900,15 @@ fn dither_rgb(r: i32, g: i32, b: i32, x: i32, y: i32) -> u16 {
     // without it pure-white pixels would get stuck rounding up past
     // 0x1F and wrapping (or in Redux's case, indexing past the
     // precomputed LUT).
-    if rc < 0x1F && (r & 7) > coeff { rc += 1; }
-    if gc < 0x1F && (g & 7) > coeff { gc += 1; }
-    if bc < 0x1F && (b & 7) > coeff { bc += 1; }
+    if rc < 0x1F && (r & 7) > coeff {
+        rc += 1;
+    }
+    if gc < 0x1F && (g & 7) > coeff {
+        gc += 1;
+    }
+    if bc < 0x1F && (b & 7) > coeff {
+        bc += 1;
+    }
     (bc << 10) as u16 | ((gc << 5) as u16) | rc as u16
 }
 
@@ -3040,11 +3047,7 @@ fn modulate_tint_dithered(
 /// 128)` directly — one code path through [`modulate_tint`].
 #[inline]
 fn split_tint(tint24: u32) -> (u32, u32, u32) {
-    (
-        tint24 & 0xFF,
-        (tint24 >> 8) & 0xFF,
-        (tint24 >> 16) & 0xFF,
-    )
+    (tint24 & 0xFF, (tint24 >> 8) & 0xFF, (tint24 >> 16) & 0xFF)
 }
 
 /// Identity tint — pass-through for raw-texture primitives. Each
@@ -3078,12 +3081,12 @@ fn blend_pixel(bg: u16, fg: u16, mode: BlendMode) -> u16 {
         BlendMode::Opaque => unreachable!(),
         // Half-back + half-front — per-channel right-shift before
         // summing, matching Redux's `& 0x7bde >> 1` pattern.
-        BlendMode::Average => ((br >> 1) + (fr >> 1), (bgg >> 1) + (fgg >> 1), (bb >> 1) + (fb >> 1)),
-        BlendMode::Add => (
-            (br + fr).min(31),
-            (bgg + fgg).min(31),
-            (bb + fb).min(31),
+        BlendMode::Average => (
+            (br >> 1) + (fr >> 1),
+            (bgg >> 1) + (fgg >> 1),
+            (bb >> 1) + (fb >> 1),
         ),
+        BlendMode::Add => ((br + fr).min(31), (bgg + fgg).min(31), (bb + fb).min(31)),
         BlendMode::Sub => ((br - fr).max(0), (bgg - fgg).max(0), (bb - fb).max(0)),
         // Full-back + quarter-front — `fg / 4` via integer division
         // is the same as Redux's `(fg & 0x1c) >> 2` for 5-bit
@@ -3129,9 +3132,7 @@ impl GpuStatus {
         //          showed Redux is the authority and starts at 0.
         // Ready bits 26/28 are filled in by `read`; VRAM-ready (27) is
         // gated on an active VRAM→CPU transfer.
-        Self {
-            raw: 0x1480_2000,
-        }
+        Self { raw: 0x1480_2000 }
     }
 
     /// Compose the observable GPUSTAT word. `vram_send_ready` is the
@@ -3243,7 +3244,11 @@ mod tests {
         gpu.write32(GP0_ADDR, 0); // xy
         gpu.write32(GP0_ADDR, 0x0001_0001); // 1x1 size
         let stat = gpu.read32(GP1_ADDR).unwrap();
-        assert_eq!(stat & 0x0800_0000, 0x0800_0000, "bit 27 set during transfer");
+        assert_eq!(
+            stat & 0x0800_0000,
+            0x0800_0000,
+            "bit 27 set during transfer"
+        );
     }
 
     #[test]
@@ -3429,10 +3434,7 @@ mod tests {
             prim_blend_mode(0x2000_0000, BlendMode::Add),
             BlendMode::Opaque
         );
-        assert_eq!(
-            prim_blend_mode(0x2200_0000, BlendMode::Add),
-            BlendMode::Add
-        );
+        assert_eq!(prim_blend_mode(0x2200_0000, BlendMode::Add), BlendMode::Add);
     }
 
     #[test]
@@ -3640,8 +3642,7 @@ mod tests {
         //   5,5,5       | (1,0)  |   0   |     1          1          1   (5 > 0? yes)
         //   5,5,5       | (2,0)  |   6   |     0          0          0   (5 > 6? no)
 
-        let check = |r: i32, g: i32, b: i32, x: i32, y: i32,
-                     er: u16, eg: u16, eb: u16| {
+        let check = |r: i32, g: i32, b: i32, x: i32, y: i32, er: u16, eg: u16, eb: u16| {
             let v = dither_rgb(r, g, b, x, y);
             assert_eq!(v & 0x1F, er, "R mismatch for ({r},{g},{b})@({x},{y})");
             assert_eq!((v >> 5) & 0x1F, eg, "G mismatch");
@@ -3731,7 +3732,7 @@ mod tests {
         // Draw area: full VRAM.
         gpu.write32(GP0_ADDR, 0xE3_00_00_00); // top-left 0,0
         gpu.write32(GP0_ADDR, 0xE4_00_03_FF); // bot-right 1023,0 (one row)
-        // Mono line: white, from (0,0) to (9,0).
+                                              // Mono line: white, from (0,0) to (9,0).
         gpu.write32(GP0_ADDR, 0x40_FF_FF_FF); // cmd + white
         gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
         gpu.write32(GP0_ADDR, 0x0000_0009); // v1 = (9, 0)
@@ -3836,7 +3837,8 @@ mod tests {
         // All others set to non-zero so we can be sure the transparency
         // comes from CLUT[5]=0 and not from a wrong index.
         for e in 0..16u16 {
-            gpu.vram.set_pixel(0x200 + e, 0, if e == 5 { 0x0000 } else { 0x7FFF });
+            gpu.vram
+                .set_pixel(0x200 + e, 0, if e == 5 { 0x0000 } else { 0x7FFF });
         }
         assert_eq!(
             gpu.sample_texture(0, 0, 0x200, 0),
@@ -3880,11 +3882,7 @@ mod tests {
         // Exactly 1023 / 511 deltas are *kept* — only strictly greater
         // is dropped. This matches the hardware spec that the punch
         // list quotes ("|Δx| > 1023 or |Δy| > 511").
-        assert!(!triangle_exceeds_hw_extent(
-            (0, 0),
-            (1023, 0),
-            (0, 511),
-        ));
+        assert!(!triangle_exceeds_hw_extent((0, 0), (1023, 0), (0, 511),));
     }
 
     #[test]
@@ -3925,7 +3923,7 @@ mod tests {
         gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
         gpu.write32(GP0_ADDR, 0x0000_05DC); // v1 = (1500, 0) — 1500 > 1023
         gpu.write32(GP0_ADDR, 0x0064_0064); // v2 = (100, 100)
-        // No pixel anywhere along the would-be triangle should be set.
+                                            // No pixel anywhere along the would-be triangle should be set.
         for x in [0u16, 50, 100, 500, 1000, 1500] {
             assert_eq!(
                 gpu.vram.get_pixel(x, 0),
@@ -3947,7 +3945,7 @@ mod tests {
         gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
         gpu.write32(GP0_ADDR, 0x0000_0010); // v1 = (16, 0)
         gpu.write32(GP0_ADDR, 0x0010_0000); // v2 = (0, 16)
-        // v3 = (16, 600) — |v3.y - v1.y| = 600 > 511, second triangle drops.
+                                            // v3 = (16, 600) — |v3.y - v1.y| = 600 > 511, second triangle drops.
         gpu.write32(GP0_ADDR, 0x0258_0010);
         // Sane half wrote pixels.
         assert_ne!(gpu.vram.get_pixel(1, 1), 0, "first half should rasterise");

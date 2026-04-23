@@ -27,6 +27,24 @@
 local ffi = require "ffi"
 local bit = require "bit"
 
+ffi.cdef [[
+typedef struct {
+    psxGPRRegs GPR;
+    psxCP0Regs CP0;
+    psxCP2Data CP2D;
+    psxCP2Ctrl CP2C;
+    uint32_t pc;
+    uint32_t code;
+    uint64_t cycle;
+    uint64_t previousCycles;
+    uint32_t interrupt;
+    uint8_t spuInterrupt;
+    uint8_t _spu_pad[3];
+    uint64_t intTargets[32];
+    uint64_t lowestTarget;
+} psxRegistersExt;
+]]
+
 local function send(line)
     io.write("#PSX3:" .. line .. "\n")
     io.flush()
@@ -104,7 +122,7 @@ end
 
 -- Pointers resolved once in `run()` and closed over by helpers. These
 -- addresses are stable for the life of the emulator.
-local ram_ptr, rom_ptr, regs
+local ram_ptr, rom_ptr, regs, regs_ext
 
 -- COP2 (GTE) accessors resolved at startup. `regs.CP2D` and `regs.CP2C`
 -- are unions in `psxregisters.h` with a `r[32]` array view; the FFI
@@ -229,6 +247,7 @@ local function run()
     ram_ptr = PCSX.getMemPtr()
     rom_ptr = PCSX.getRomPtr()
     regs = PCSX.getRegisters()
+    regs_ext = ffi.cast("psxRegistersExt*", PCSX.getRegisters())
 
     -- COP2 register access via the unioned `r[32]` view. Both
     -- `psxCP2Data` and `psxCP2Ctrl` carry the same shape — one or
@@ -392,51 +411,29 @@ local function run()
             if n == 0 then
                 send("err log_cdrom_irqs: bad args")
             else
-                local hw_ptr
-                for _, name in ipairs({
-                    "getHardwareRegisters", "getHardwareRegistersPtr",
-                    "getHWPtr", "getHardwarePtr", "getHwRegPtr",
-                    "getIOPtr", "getIoPtr",
-                }) do
-                    local fn = PCSX[name]
-                    if type(fn) == "function" then
-                        local ok, p = pcall(fn)
-                        if ok and p then hw_ptr = p; break end
+                local hw_ptr = get_hw_ptr()
+                local istat_ptr = ffi.cast("uint32_t*", hw_ptr + 0x1070)
+                local cdirq_ptr = ffi.cast("uint8_t*", hw_ptr + 0x1803)
+                local prev = bit.band(istat_ptr[0], 0x4)
+                local emitted = 0
+                for i = 1, n do
+                    PCSX.stepIn()
+                    PCSX.runExecute()
+                    local cur = bit.band(istat_ptr[0], 0x4)
+                    if cur ~= 0 and prev == 0 then
+                        local tick = tonumber(PCSX.getCPUCycles())
+                        local ty = bit.band(cdirq_ptr[0], 0x7)
+                        send_nowait(string.format(
+                            "cdrom_irq step=%d tick=%d type=%d", i, tick, ty))
+                        emitted = emitted + 1
+                        if emitted % 32 == 0 then io.flush() end
+                        if emitted >= m_max then break end
                     end
+                    prev = cur
                 end
-                if not hw_ptr then
-                    send("err log_cdrom_irqs: no hw-regs accessor")
-                else
-                    -- I_STAT is at phys 0x1F801070, offset 0x70
-                    -- inside the 8 K io[] mirror.
-                    local istat_ptr = ffi.cast("uint32_t*", hw_ptr + 0x70)
-                    -- CDROM IRQ flag at phys 0x1F801803 idx=1; bits
-                    -- 0-2 carry the IRQ type (1=DataReady, 2=Complete,
-                    -- 3=Acknowledge, 4=DataEnd, 5=Error). Redux keeps
-                    -- the live value at offset 0x803 of the same
-                    -- mirror, so we can read it with no index dance.
-                    local cdirq_ptr = ffi.cast("uint8_t*", hw_ptr + 0x803)
-                    local prev = bit.band(istat_ptr[0], 0x4)
-                    local emitted = 0
-                    for i = 1, n do
-                        PCSX.stepIn()
-                        PCSX.runExecute()
-                        local cur = bit.band(istat_ptr[0], 0x4)
-                        if cur ~= 0 and prev == 0 then
-                            local tick = tonumber(PCSX.getCPUCycles())
-                            local ty = bit.band(cdirq_ptr[0], 0x7)
-                            send_nowait(string.format(
-                                "cdrom_irq step=%d tick=%d type=%d", i, tick, ty))
-                            emitted = emitted + 1
-                            if emitted % 32 == 0 then io.flush() end
-                            if emitted >= m_max then break end
-                        end
-                        prev = cur
-                    end
-                    io.flush()
-                    send(string.format(
-                        "log_cdrom_irqs ok emitted=%d", emitted))
-                end
+                io.flush()
+                send(string.format(
+                    "log_cdrom_irqs ok emitted=%d", emitted))
             end
 
         elseif cmd == "run_checkpoint" then
@@ -573,25 +570,9 @@ local function run()
                     -- into io[] on every change, so reading from there is
                     -- equivalent to what software sees.
                     if phys >= 0x1F801000 and phys < 0x1F803000 then
-                        local candidates = {
-                            "getHardwareRegisters", "getHardwareRegistersPtr",
-                            "getHWPtr", "getHardwarePtr", "getHwRegPtr",
-                            "getIOPtr", "getIoPtr", "getRegisters",
-                        }
-                        for _, name in ipairs(candidates) do
-                            local fn = PCSX[name]
-                            if type(fn) == "function" then
-                                local hw = fn()
-                                if hw then
-                                    local off = phys - 0x1F801000
-                                    return tonumber(ffi.cast("uint32_t*", hw + off)[0])
-                                end
-                            end
-                        end
-                        -- Last resort: list keys for debugging.
-                        local keys = {}
-                        for k, _ in pairs(PCSX) do keys[#keys+1] = k end
-                        error("no hw-regs accessor; PCSX keys: " .. table.concat(keys, ","))
+                        local hw = get_hw_ptr()
+                        local hw_off = phys - 0x1F800000
+                        return tonumber(ffi.cast("uint32_t*", hw + hw_off)[0])
                     end
                     return 0xDEADBEEF
                 end)
@@ -615,13 +596,38 @@ local function run()
                 local cause = r and r[13]
                 local sr = r and r[12]
                 local epc = r and r[14]
+                local ok_interrupt, interrupt = pcall(function() return regs_ext[0].interrupt end)
+                local ok_lowest, lowest = pcall(function() return regs_ext[0].lowestTarget end)
+                local queue = "nil"
+                if ok_interrupt and interrupt then
+                    local mask = tonumber(interrupt) or 0
+                    local parts = {}
+                    for bit_idx = 0, 14 do
+                        if bit.band(mask, bit.lshift(1, bit_idx)) ~= 0 then
+                            local ok_target, target = pcall(function()
+                                return regs_ext[0].intTargets[bit_idx]
+                            end)
+                            if ok_target and target then
+                                parts[#parts + 1] = string.format("%d@%d", bit_idx, tonumber(target))
+                            else
+                                parts[#parts + 1] = tostring(bit_idx)
+                            end
+                        end
+                    end
+                    if #parts > 0 then
+                        queue = table.concat(parts, ",")
+                    end
+                end
                 send(string.format(
-                    "regs pc=%d cause=%s sr=%s epc=%s cycles=%d",
+                    "regs pc=%d cause=%s sr=%s epc=%s cycles=%d interrupt=%s lowest=%s queue=%s",
                     pc,
                     cause and tostring(tonumber(cause)) or "nil",
                     sr and tostring(tonumber(sr)) or "nil",
                     epc and tostring(tonumber(epc)) or "nil",
-                    cycles
+                    cycles,
+                    (ok_interrupt and interrupt) and tostring(tonumber(interrupt)) or "nil",
+                    (ok_lowest and lowest) and tostring(tonumber(lowest)) or "nil",
+                    queue
                 ))
             end)
             if not ok then

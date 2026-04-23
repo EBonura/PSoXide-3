@@ -823,11 +823,13 @@ impl DigitalPad {
     }
 
     fn record_command(&mut self, cmd: u8) {
-        self.cmd_histogram[cmd as usize] =
-            self.cmd_histogram[cmd as usize].saturating_add(1);
+        self.cmd_histogram[cmd as usize] = self.cmd_histogram[cmd as usize].saturating_add(1);
         self.recent_cmds[self.recent_cmd_head] = cmd;
         self.recent_cmd_head = (self.recent_cmd_head + 1) % self.recent_cmds.len();
-        self.recent_cmd_len = self.recent_cmd_len.saturating_add(1).min(self.recent_cmds.len());
+        self.recent_cmd_len = self
+            .recent_cmd_len
+            .saturating_add(1)
+            .min(self.recent_cmds.len());
     }
 
     fn record_trace_byte(&mut self, tx: u8, rx: u8) {

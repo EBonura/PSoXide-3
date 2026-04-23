@@ -42,8 +42,12 @@ fn main() {
     // Re-derive what a "lazy" read would return.
     let since_reset = bus.cycles() - t1.last_reset_cycle;
     let lazy_counter = since_reset / hsync_period;
-    println!("lazy counter      = (cycles - last_reset) / rate = ({} - {}) / {} = {}",
-        bus.cycles(), t1.last_reset_cycle, hsync_period, lazy_counter,
+    println!(
+        "lazy counter      = (cycles - last_reset) / rate = ({} - {}) / {} = {}",
+        bus.cycles(),
+        t1.last_reset_cycle,
+        hsync_period,
+        lazy_counter,
     );
     println!("(mod 0xFFFF)      = {}", lazy_counter & 0xFFFF);
 }

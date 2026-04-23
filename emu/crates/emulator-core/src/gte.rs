@@ -57,7 +57,11 @@ impl Cmd {
     }
 
     fn shift(&self) -> u32 {
-        if self.sf { 12 } else { 0 }
+        if self.sf {
+            12
+        } else {
+            0
+        }
     }
 }
 
@@ -674,10 +678,8 @@ impl Gte {
 
     /// `AVSZ4` — average of all four Z values. Same shape as AVSZ3.
     fn op_avsz4(&mut self) {
-        let sum = (self.sz[0] as i64)
-            + (self.sz[1] as i64)
-            + (self.sz[2] as i64)
-            + (self.sz[3] as i64);
+        let sum =
+            (self.sz[0] as i64) + (self.sz[1] as i64) + (self.sz[2] as i64) + (self.sz[3] as i64);
         let mac0 = (self.zsf4 as i64) * sum;
         self.mac0 = self.check_mac0(mac0);
         self.otz = self.saturate_otz(mac0 >> 12);
@@ -709,8 +711,8 @@ impl Gte {
             let temp = self.check_mac((i + 1) as u8, diff) >> sf;
             let ir = self.saturate_value_for_ir(temp as i32, false);
             let _ = self.saturate_ir_flag_only((i + 1) as u8, temp as i32, false);
-            let combined = self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (ir as i64))
-                >> sf;
+            let combined =
+                self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (ir as i64)) >> sf;
             self.mac[i] = combined as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, combined as i32, cmd.lm);
         }
@@ -736,8 +738,8 @@ impl Gte {
             let temp = self.check_mac((i + 1) as u8, diff) >> sf;
             let _ = self.saturate_ir_flag_only((i + 1) as u8, temp as i32, false);
             let ir = self.saturate_value_for_ir(temp as i32, false);
-            let combined = self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (ir as i64))
-                >> sf;
+            let combined =
+                self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (ir as i64)) >> sf;
             self.mac[i] = combined as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, combined as i32, cmd.lm);
         }
@@ -978,8 +980,7 @@ impl Gte {
     fn op_gpf(&mut self, cmd: Cmd) {
         let sf = cmd.shift();
         for i in 0..3 {
-            let mac =
-                self.check_mac((i + 1) as u8, (self.ir0 as i64) * (self.ir[i] as i64)) >> sf;
+            let mac = self.check_mac((i + 1) as u8, (self.ir0 as i64) * (self.ir[i] as i64)) >> sf;
             self.mac[i] = mac as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, mac as i32, cmd.lm);
         }
@@ -994,9 +995,10 @@ impl Gte {
             // pre-existing MAC value is treated as a fixed-point with
             // the same scaling as the new product).
             let base = (self.mac[i] as i64) << sf;
-            let mac =
-                self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (self.ir[i] as i64))
-                    >> sf;
+            let mac = self.check_mac(
+                (i + 1) as u8,
+                base + (self.ir0 as i64) * (self.ir[i] as i64),
+            ) >> sf;
             self.mac[i] = mac as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, mac as i32, cmd.lm);
         }
@@ -1232,8 +1234,16 @@ impl Gte {
                 let r = (self.rgbc[0] as i16) << 4;
                 [
                     [-r, r, self.ir0],
-                    [self.rotation[0][2], self.rotation[0][2], self.rotation[0][2]],
-                    [self.rotation[1][1], self.rotation[1][1], self.rotation[1][1]],
+                    [
+                        self.rotation[0][2],
+                        self.rotation[0][2],
+                        self.rotation[0][2],
+                    ],
+                    [
+                        self.rotation[1][1],
+                        self.rotation[1][1],
+                        self.rotation[1][1],
+                    ],
                 ]
             }
         }
@@ -1293,7 +1303,11 @@ fn pack_irgb(ir: &[i16; 3]) -> u32 {
 /// leading ones. The returned count is in 1..=32.
 fn leading_count_signed(value: u32) -> u32 {
     let test = if (value as i32) < 0 { !value } else { value };
-    if test == 0 { 32 } else { test.leading_zeros() }
+    if test == 0 {
+        32
+    } else {
+        test.leading_zeros()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1415,7 +1429,7 @@ mod tests {
         g.write_control(4, 0x1000);
         // V0 = (0, 0, 0)
         g.execute(0x0180_0001); // RTPS sf=1
-        // Flag should record divide overflow (sz3=0, h=0 still triggers).
+                                // Flag should record divide overflow (sz3=0, h=0 still triggers).
         assert!(g.read_control(31) & flag::DIV_OVERFLOW != 0);
     }
 
@@ -1437,12 +1451,12 @@ mod tests {
         g.write_data(17, 0x0100); // SZ1
         g.write_data(18, 0x0200); // SZ2
         g.write_data(19, 0x0300); // SZ3
-        // ZSF3 = 0x555 — close enough to 0x1000/3 to land OTZ near the
-        // simple arithmetic mean.
+                                  // ZSF3 = 0x555 — close enough to 0x1000/3 to land OTZ near the
+                                  // simple arithmetic mean.
         g.write_control(29, 0x0555);
         g.execute(0x2D); // AVSZ3
-        // MAC0 = 0x555 * (0x100 + 0x200 + 0x300) = 0x555 * 0x600 = 0x1FFE00.
-        // OTZ = 0x1FFE00 >> 12 = 0x1FF.
+                         // MAC0 = 0x555 * (0x100 + 0x200 + 0x300) = 0x555 * 0x600 = 0x1FFE00.
+                         // OTZ = 0x1FFE00 >> 12 = 0x1FF.
         assert_eq!(g.read_data(24) as i32, 0x1FFE00);
         assert_eq!(g.read_data(7), 0x1FF);
     }
@@ -1845,7 +1859,10 @@ mod tests {
         assert_eq!(g.read_data(25) as i32, 1, "MAC1 from clean stage 2");
         assert_eq!(g.read_data(9), 1, "IR1 from clean stage 2");
         // Stage 1 IR saturation: (FC<<12 + 0x1000*1) >> 12 ≈ 2^28 → IR_SAT.
-        assert!(g.read_control(31) & flag::IR1_SAT != 0, "IR1_SAT from stage 1");
+        assert!(
+            g.read_control(31) & flag::IR1_SAT != 0,
+            "IR1_SAT from stage 1"
+        );
     }
 
     #[test]

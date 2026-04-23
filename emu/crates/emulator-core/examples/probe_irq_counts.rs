@@ -36,11 +36,19 @@ fn main() {
 
     let counts = bus.irq().raise_counts();
     let names = [
-        "VBlank", "GPU", "CDROM", "DMA", "Timer0", "Timer1", "Timer2",
-        "Controller", "SIO", "SPU", "Lightpen",
+        "VBlank",
+        "GPU",
+        "CDROM",
+        "DMA",
+        "Timer0",
+        "Timer1",
+        "Timer2",
+        "Controller",
+        "SIO",
+        "SPU",
+        "Lightpen",
     ];
-    println!("=== IRQ raises at step {n} (cycles={}) ===",
-        bus.cycles());
+    println!("=== IRQ raises at step {n} (cycles={}) ===", bus.cycles());
     println!("{:<12} {:>14}", "source", "raises");
     println!("{}", "-".repeat(30));
     for (name, count) in names.iter().zip(counts.iter()) {
@@ -50,6 +58,8 @@ fn main() {
     println!("{}", "-".repeat(30));
     println!("{:<12} {:>14}", "total", total);
     println!();
-    println!("cycles/step ratio: {:.2} (normal: ~2.3)",
-        bus.cycles() as f64 / n as f64);
+    println!(
+        "cycles/step ratio: {:.2} (normal: ~2.3)",
+        bus.cycles() as f64 / n as f64
+    );
 }

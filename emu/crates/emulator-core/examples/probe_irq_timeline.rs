@@ -12,9 +12,15 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    let disc_path = std::env::args().nth(3);
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
+    if let Some(ref p) = disc_path {
+        let disc_bytes = std::fs::read(p).expect("disc readable");
+        bus.cdrom
+            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+    }
     let mut cpu = Cpu::new();
 
     for _ in 0..(from_step - 1) {
@@ -45,7 +51,11 @@ fn main() {
                 cpu.step(&mut bus).expect("isr step");
                 isr_count += 1;
             }
-            isr_info = format!(" ISR={}steps/{}cyc", isr_count, bus.cycles() - isr_start_cyc);
+            isr_info = format!(
+                " ISR={}steps/{}cyc",
+                isr_count,
+                bus.cycles() - isr_start_cyc
+            );
         }
 
         let istat = bus.irq().stat();
@@ -53,10 +63,14 @@ fn main() {
 
         let istat_delta = if istat != last_istat {
             format!(" ISTAT:{last_istat:#010x}->{istat:#010x}")
-        } else { "".into() };
+        } else {
+            "".into()
+        };
         let cflag_delta = if cflag != last_cflag {
             format!(" CDROM_FLAG:{last_cflag:#x}->{cflag:#x}")
-        } else { "".into() };
+        } else {
+            "".into()
+        };
 
         println!(
             "step={step_n:>10}  cyc={pre_cyc}->{}  pc=0x{pre_pc:08x}{isr_info}{istat_delta}{cflag_delta}",

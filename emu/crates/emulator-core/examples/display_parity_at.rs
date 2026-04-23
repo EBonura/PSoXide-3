@@ -57,8 +57,8 @@ fn main() {
     let _ = redux.terminate();
 
     let redux_bytes = std::fs::read(&redux_path).expect("read redux bytes");
-    let redux_meta = std::fs::read_to_string(format!("{}.txt", redux_path.display()))
-        .unwrap_or_default();
+    let redux_meta =
+        std::fs::read_to_string(format!("{}.txt", redux_path.display())).unwrap_or_default();
     let (r_w, r_h) = parse_wh(&redux_meta);
     eprintln!(
         "[redux] display {r_w}×{r_h}, {} bytes, hash=0x{:016x}",
@@ -100,7 +100,11 @@ fn main() {
     println!();
     println!("=== Display parity @ step {n} ===");
     println!("dimensions: redux={r_w}×{r_h}  ours={ours_w}×{ours_h}");
-    println!("byte count: redux={}  ours={}", redux_bytes.len(), ours_bytes.len());
+    println!(
+        "byte count: redux={}  ours={}",
+        redux_bytes.len(),
+        ours_bytes.len()
+    );
     if r_w == ours_w && r_h == ours_h {
         byte_compare(&redux_bytes, &ours_bytes, r_w);
     } else {
@@ -129,8 +133,10 @@ fn main() {
         }
         let total_bytes = (w * h * 2) as usize;
         println!("overlap: {w}×{h} = {total_bytes} bytes");
-        println!("differing bytes: {diffs} / {total_bytes} ({:.2}%)",
-            100.0 * diffs as f64 / total_bytes.max(1) as f64);
+        println!(
+            "differing bytes: {diffs} / {total_bytes} ({:.2}%)",
+            100.0 * diffs as f64 / total_bytes.max(1) as f64
+        );
         if let Some((y, x)) = first_diff {
             println!("first diff at (x={x}, y={y})");
         }
@@ -174,8 +180,10 @@ fn byte_compare(a: &[u8], b: &[u8], width: u32) {
         }
     }
     let total = a.len().min(b.len());
-    println!("differing bytes: {diffs} / {total} ({:.2}%)",
-        100.0 * diffs as f64 / total.max(1) as f64);
+    println!(
+        "differing bytes: {diffs} / {total} ({:.2}%)",
+        100.0 * diffs as f64 / total.max(1) as f64
+    );
     if let Some(off) = first_diff {
         let px = off / 2;
         let y = px as u32 / width;

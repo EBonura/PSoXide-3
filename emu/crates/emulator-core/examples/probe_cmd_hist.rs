@@ -37,15 +37,38 @@ fn main() {
     println!("=== CDROM command histogram @ step {n} ===");
     let hist = bus.cdrom.command_histogram();
     let names: [(u8, &str); 32] = [
-        (0x01, "GetStat"), (0x02, "SetLoc"), (0x03, "Play"), (0x04, "Forward"),
-        (0x05, "Backward"), (0x06, "ReadN"), (0x07, "MotorOn"), (0x08, "Stop"),
-        (0x09, "Pause"), (0x0A, "Init"), (0x0B, "Mute"), (0x0C, "Demute"),
-        (0x0D, "SetFilter"), (0x0E, "SetMode"), (0x0F, "GetParam"),
-        (0x10, "GetLocL"), (0x11, "GetLocP"), (0x12, "SetSession"),
-        (0x13, "GetTN"), (0x14, "GetTD"), (0x15, "SeekL"), (0x16, "SeekP"),
-        (0x19, "Test"), (0x1A, "GetID"), (0x1B, "ReadS"), (0x1C, "Reset"),
-        (0x1D, "GetQ"), (0x1E, "ReadTOC"), (0x1F, "VideoCD"),
-        (0x00, ""), (0x17, ""), (0x18, ""),
+        (0x01, "GetStat"),
+        (0x02, "SetLoc"),
+        (0x03, "Play"),
+        (0x04, "Forward"),
+        (0x05, "Backward"),
+        (0x06, "ReadN"),
+        (0x07, "MotorOn"),
+        (0x08, "Stop"),
+        (0x09, "Pause"),
+        (0x0A, "Init"),
+        (0x0B, "Mute"),
+        (0x0C, "Demute"),
+        (0x0D, "SetFilter"),
+        (0x0E, "SetMode"),
+        (0x0F, "GetParam"),
+        (0x10, "GetLocL"),
+        (0x11, "GetLocP"),
+        (0x12, "SetSession"),
+        (0x13, "GetTN"),
+        (0x14, "GetTD"),
+        (0x15, "SeekL"),
+        (0x16, "SeekP"),
+        (0x19, "Test"),
+        (0x1A, "GetID"),
+        (0x1B, "ReadS"),
+        (0x1C, "Reset"),
+        (0x1D, "GetQ"),
+        (0x1E, "ReadTOC"),
+        (0x1F, "VideoCD"),
+        (0x00, ""),
+        (0x17, ""),
+        (0x18, ""),
     ];
     let mut total: u64 = 0;
     for (cmd, name) in names.iter() {
@@ -58,10 +81,20 @@ fn main() {
     println!("  {:>25}", "---");
     println!("  total:                {total:>8}");
     println!();
-    println!("sector_events_scheduled = {}", bus.cdrom.sector_events_scheduled);
+    println!(
+        "sector_events_scheduled = {}",
+        bus.cdrom.sector_events_scheduled
+    );
     println!("data_fifo_pops          = {}", bus.cdrom.data_fifo_pops());
     let counts = bus.cdrom.irq_type_counts;
-    let types = ["None", "DataReady", "Complete", "Acknowledge", "DataEnd", "Error"];
+    let types = [
+        "None",
+        "DataReady",
+        "Complete",
+        "Acknowledge",
+        "DataEnd",
+        "Error",
+    ];
     println!();
     println!("=== CDROM IrqType raises ===");
     for (name, count) in types.iter().zip(counts.iter()) {

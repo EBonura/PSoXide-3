@@ -87,9 +87,7 @@ fn main() {
         // Redux: silent run — no trace records emitted.
         let run_timeout = Duration::from_secs((chunk / 500_000).max(30));
         if let Err(e) = redux.run(chunk, run_timeout) {
-            eprintln!(
-                "[disc-parity] Redux run failed at step {cursor} (+{chunk}): {e}",
-            );
+            eprintln!("[disc-parity] Redux run failed at step {cursor} (+{chunk}): {e}",);
             std::process::exit(1);
         }
 
@@ -100,9 +98,7 @@ fn main() {
         for _ in 0..chunk {
             if let Err(e) = cpu.step(&mut bus) {
                 let total = cursor + cpu.tick().saturating_sub(cursor);
-                eprintln!(
-                    "[disc-parity] our emulator stopped at step ≈{total}: {e:?}"
-                );
+                eprintln!("[disc-parity] our emulator stopped at step ≈{total}: {e:?}");
                 cleanup(redux);
                 std::process::exit(1);
             }
@@ -140,9 +136,7 @@ fn main() {
                 // jitter. Not a rendering bug — both sides will
                 // converge once they've both finished the
                 // mode-change sequence.
-                eprintln!(
-                    "      (dim mismatch — IRQ-timing jitter; continuing)"
-                );
+                eprintln!("      (dim mismatch — IRQ-timing jitter; continuing)");
                 continue;
             }
             // Mismatched content with matching dimensions is usually

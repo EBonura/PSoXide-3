@@ -55,8 +55,14 @@ fn main() {
                  was 0x{last:08x} ({:02x} {:02x} {:02x} {:02x})",
                 bus.cycles(),
                 cpu.in_irq_handler(),
-                b[0], b[1], b[2], b[3],
-                o[0], o[1], o[2], o[3],
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                o[0],
+                o[1],
+                o[2],
+                o[3],
             );
             last = w;
             if hits >= 200 {

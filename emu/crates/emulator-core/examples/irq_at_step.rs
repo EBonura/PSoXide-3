@@ -12,7 +12,16 @@ use emulator_core::{Bus, Cpu};
 use std::path::PathBuf;
 
 const SOURCE_NAMES: [&str; 11] = [
-    "VBlank", "Gpu", "Cdrom", "Dma", "Timer0", "Timer1", "Timer2", "Controller", "Sio", "Spu",
+    "VBlank",
+    "Gpu",
+    "Cdrom",
+    "Dma",
+    "Timer0",
+    "Timer1",
+    "Timer2",
+    "Controller",
+    "Sio",
+    "Spu",
     "Lightpen",
 ];
 
@@ -48,14 +57,23 @@ fn main() {
     println!("=== State at step {target} ===");
     println!("cycles      : {}", bus.cycles());
     println!("PC          : 0x{:08x}", cpu.pc());
-    println!("SR          : 0x{:08x}  (IEc={}, IM=0x{:02x}, BEV={})",
-        sr, sr & 1, (sr >> 8) & 0xFF, (sr >> 22) & 1);
-    println!("CAUSE       : 0x{:08x}  (ExcCode={} {}, IP=0x{:02x}, BD={})",
+    println!(
+        "SR          : 0x{:08x}  (IEc={}, IM=0x{:02x}, BEV={})",
+        sr,
+        sr & 1,
+        (sr >> 8) & 0xFF,
+        (sr >> 22) & 1
+    );
+    println!(
+        "CAUSE       : 0x{:08x}  (ExcCode={} {}, IP=0x{:02x}, BD={})",
         cause,
         (cause >> 2) & 0x1F,
-        EXC_NAMES.get(((cause >> 2) & 0x1F) as usize).unwrap_or(&"?"),
+        EXC_NAMES
+            .get(((cause >> 2) & 0x1F) as usize)
+            .unwrap_or(&"?"),
         (cause >> 8) & 0xFF,
-        (cause >> 31) & 1);
+        (cause >> 31) & 1
+    );
     println!("EPC         : 0x{:08x}", epc);
     println!();
     println!("I_STAT      : 0x{:08x}", irq.stat());
@@ -81,14 +99,22 @@ fn main() {
     println!("Exception counts (taken):");
     for (i, count) in cpu.exception_counts().iter().enumerate() {
         if *count > 0 {
-            println!("  [{:>2}] {:<6} {}", i, EXC_NAMES.get(i).unwrap_or(&"?"), count);
+            println!(
+                "  [{:>2}] {:<6} {}",
+                i,
+                EXC_NAMES.get(i).unwrap_or(&"?"),
+                count
+            );
         }
     }
     println!();
 
     println!("Diagnostics:");
     println!("  irq_line_high_steps      = {}", cpu.irq_line_high_steps());
-    println!("  should_take_interrupt_steps = {}", cpu.should_take_interrupt_steps());
+    println!(
+        "  should_take_interrupt_steps = {}",
+        cpu.should_take_interrupt_steps()
+    );
     println!("  pending_true_calls       = {}", irq.pending_true_calls());
     println!("  mask_write_count         = {}", irq.mask_write_count());
     println!("  stat_write_count         = {}", irq.stat_write_count());

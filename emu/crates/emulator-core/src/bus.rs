@@ -277,6 +277,11 @@ impl Bus {
         self.sio0.attach_port1(device);
     }
 
+    /// Immutable access to SIO0 for diagnostics.
+    pub fn sio0(&self) -> &Sio0 {
+        &self.sio0
+    }
+
     /// Plug a memory card into port 1 with the given backing
     /// contents (128 KiB buffer, typically loaded from a
     /// `.mcd` file). Pass an empty `Vec` to start with a fresh
@@ -289,8 +294,8 @@ impl Bus {
             vec![0u8; crate::pad::MEMCARD_SIZE]
         };
         // Preserve any existing pad.
-        let pad = std::mem::replace(self.sio0.port1_mut(), crate::pad::PortDevice::empty())
-            .into_pad();
+        let pad =
+            std::mem::replace(self.sio0.port1_mut(), crate::pad::PortDevice::empty()).into_pad();
         let mut device =
             crate::pad::PortDevice::empty().with_memcard(crate::pad::MemoryCard::from_bytes(bytes));
         if let Some(p) = pad {
@@ -393,8 +398,8 @@ impl Bus {
         } else {
             vec![0u8; crate::pad::MEMCARD_SIZE]
         };
-        let pad = std::mem::replace(self.sio0.port2_mut(), crate::pad::PortDevice::empty())
-            .into_pad();
+        let pad =
+            std::mem::replace(self.sio0.port2_mut(), crate::pad::PortDevice::empty()).into_pad();
         let mut device =
             crate::pad::PortDevice::empty().with_memcard(crate::pad::MemoryCard::from_bytes(bytes));
         if let Some(p) = pad {
@@ -536,6 +541,22 @@ impl Bus {
         use crate::scheduler::EventSlot;
         let now = self.cycles;
         let mut dma_edge = false;
+
+        // Redux updates root counters with `cycle >= nextCounter`
+        // before walking the strict interrupt-slot queue. VBlank is
+        // our root-counter-style event, so handle it inclusively here
+        // instead of via `take_due`'s generic `target < now` rule.
+        while let Some(target) = self
+            .scheduler
+            .take_slot_due_inclusive(EventSlot::VBlank, now)
+        {
+            self.irq.raise(IrqSource::VBlank);
+            self.gpu.toggle_vblank_field();
+            self.timers.notify_vblank();
+            self.scheduler
+                .schedule(EventSlot::VBlank, target, self.vblank_period);
+        }
+
         while let Some((slot, target)) = self.scheduler.take_due(now) {
             match slot {
                 EventSlot::MdecInDma => {
@@ -642,9 +663,9 @@ impl Bus {
     /// bank's accumulator matches Redux's lazy-read timer model.
     fn advance_cycles(&mut self, n: u32) {
         self.cycles = self.cycles.wrapping_add(n as u64);
-        let fired =
-            self.timers
-                .tick(n as u64, self.hsync_cycles, self.gpu.dot_clock_divisor());
+        let fired = self
+            .timers
+            .tick(n as u64, self.hsync_cycles, self.gpu.dot_clock_divisor());
         if fired & 1 != 0 {
             self.irq.raise(IrqSource::Timer0);
         }
@@ -812,10 +833,20 @@ impl Bus {
             }
             3 => {
                 if let Some(cdrom_words) = self.run_dma_cdrom() {
-                    let target = self.cycles + cdrom_words as u64;
-                    self.log_dma_schedule("CdrDma", cdrom_words as u64, target);
-                    self.scheduler
-                        .schedule(EventSlot::CdrDma, self.cycles, cdrom_words as u64);
+                    let delay = match self.dma.channels[3].channel_control {
+                        0x1140_0100 => (cdrom_words / 4) as u64,
+                        _ => cdrom_words as u64,
+                    };
+                    if delay == 0 {
+                        if self.complete_dma_channel(3) {
+                            self.irq.raise(IrqSource::Dma);
+                        }
+                    } else {
+                        let target = self.cycles + delay;
+                        self.log_dma_schedule("CdrDma", delay, target);
+                        self.scheduler
+                            .schedule(EventSlot::CdrDma, self.cycles, delay);
+                    }
                 }
             }
             4 => {
@@ -1041,6 +1072,14 @@ impl Bus {
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
         }
+        // Redux rejects DMA3 kicks until the CDROM request register
+        // has armed the current sector buffer. Without this gate we
+        // would "complete" zero-filled transfers and raise a DMA IRQ
+        // even though the drive was not ready, which is exactly the
+        // kind of silent loader corruption retail games trip over.
+        if !self.cdrom.data_transfer_armed() {
+            return Some(0);
+        }
         let sync_mode = (ch.channel_control >> 9) & 0x3;
         // PSX BIOS + most games use sync mode 1 (block request) for
         // CDROM reads, but some firmware paths use sync mode 0
@@ -1061,7 +1100,7 @@ impl Bus {
         // RAM, and the BIOS's PVD parse fell back to reading
         // LBA 0 on empty input.
         let bcr = ch.block_control;
-        let total_words = match sync_mode {
+        let requested_words = match sync_mode {
             0 => bcr & 0xFFFF,
             1 => {
                 let block_size = bcr & 0xFFFF;
@@ -1074,7 +1113,16 @@ impl Bus {
                 return Some(0);
             }
         };
-
+        // Redux falls back to the active sector size when BCR asks
+        // for zero words (for example Ape Escape programs `0001/0000`
+        // and expects a full 2048-byte transfer). Our FIFO already
+        // holds the exact transfer payload, so derive the word count
+        // from its live length.
+        let total_words = if requested_words == 0 {
+            self.cdrom.data_fifo_words()
+        } else {
+            requested_words
+        };
         let mut addr = ch.base & 0x001F_FFFC;
         let step: u32 = if (ch.channel_control >> 1) & 1 != 0 {
             0xFFFF_FFFCu32
@@ -1790,6 +1838,7 @@ fn zeroed_box<const N: usize>() -> Box<[u8; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::EventSlot;
     use crate::IrqSource;
 
     fn synthetic_bios() -> Vec<u8> {
@@ -1880,6 +1929,17 @@ mod tests {
     }
 
     #[test]
+    fn vblank_scheduler_fires_on_exact_threshold() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        bus.tick(FIRST_VBLANK_CYCLE as u32);
+        assert_eq!(bus.irq.stat() & 1, 1);
+        assert_eq!(
+            bus.next_vblank_cycle(),
+            FIRST_VBLANK_CYCLE + VBLANK_PERIOD_CYCLES
+        );
+    }
+
+    #[test]
     fn vblank_scheduler_catches_up_after_long_tick() {
         // Tick far past the first VBlank in one go — the scheduler
         // must fire every VBlank that would have elapsed, not just one.
@@ -1899,5 +1959,53 @@ mod tests {
     fn vblank_source_index_is_0() {
         // Sanity: IrqSource::VBlank is bit 0, matching Redux's setIrq(0x01).
         assert_eq!(IrqSource::VBlank as u32, 0);
+    }
+
+    #[test]
+    fn cdrom_dma_requires_transfer_request_latch() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        bus.cdrom.debug_seed_data_fifo(&[1, 2, 3, 4], true, false);
+        bus.dma.dpcr = 1 << (3 * 4 + 3);
+        bus.dma.channels[3].base = 0;
+        bus.dma.channels[3].block_control = 1;
+        bus.dma.channels[3].channel_control = 0x1100_0000;
+
+        bus.run_dma_channel(3);
+        assert_eq!(read_ram_u32(&bus.ram[..], 0), 0);
+        assert_eq!(bus.dma.channels[3].channel_control & (1 << 24), 0);
+        assert_eq!(bus.scheduler.target(EventSlot::CdrDma), None);
+    }
+
+    #[test]
+    fn cdrom_dma_zero_bcr_falls_back_to_buffered_sector_size() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        bus.cdrom
+            .debug_seed_data_fifo(&[1, 2, 3, 4, 5, 6, 7, 8], true, true);
+        bus.dma.dpcr = 1 << (3 * 4 + 3);
+        bus.dma.channels[3].base = 0;
+        bus.dma.channels[3].block_control = 0;
+        bus.dma.channels[3].channel_control = 0x1100_0000;
+
+        assert_eq!(bus.run_dma_cdrom(), Some(2));
+        assert_eq!(read_ram_u32(&bus.ram[..], 0), 0x0403_0201);
+        assert_eq!(read_ram_u32(&bus.ram[..], 4), 0x0807_0605);
+        assert_eq!(bus.cdrom.data_fifo_len(), 0);
+        assert!(!bus.cdrom.data_transfer_armed());
+    }
+
+    #[test]
+    fn cdrom_burst_dma_uses_redux_quarter_rate_completion_delay() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        bus.cycles = 100;
+        bus.cdrom
+            .debug_seed_data_fifo(&[1, 2, 3, 4, 5, 6, 7, 8], true, true);
+        bus.dma.dpcr = 1 << (3 * 4 + 3);
+        bus.dma.channels[3].base = 0;
+        bus.dma.channels[3].block_control = 2;
+        bus.dma.channels[3].channel_control = 0x1140_0100;
+
+        bus.run_dma_channel(3);
+
+        assert_eq!(bus.scheduler.target(EventSlot::CdrDma), Some(101));
     }
 }

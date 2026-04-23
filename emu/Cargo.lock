@@ -838,6 +838,7 @@ name = "emulator-core"
 version = "0.1.0"
 dependencies = [
  "parity-oracle",
+ "psoxide-settings",
  "psx-hw",
  "psx-iso",
  "psx-trace",

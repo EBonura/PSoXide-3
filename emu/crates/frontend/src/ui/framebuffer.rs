@@ -29,24 +29,37 @@ pub fn draw(
 ) {
     // Pull the GPU's configured display area when a Bus is live;
     // otherwise fall back to the canonical 320×240 @ (0, 0) layout.
-    let area = bus.map(|b| b.gpu.display_area()).unwrap_or(DisplayArea {
+    let reported = bus.map(|b| b.gpu.display_area()).unwrap_or(DisplayArea {
         x: 0,
         y: 0,
         width: DEFAULT_FB_WIDTH as u16,
         height: DEFAULT_FB_HEIGHT as u16,
         bpp24: false,
     });
+    let using_fallback = reported.width == 0 || reported.height == 0;
+    let area = if using_fallback {
+        DisplayArea {
+            x: reported.x,
+            y: reported.y,
+            width: DEFAULT_FB_WIDTH as u16,
+            height: DEFAULT_FB_HEIGHT as u16,
+            bpp24: reported.bpp24,
+        }
+    } else {
+        reported
+    };
 
     let mode_label = match scale_mode {
         ScaleMode::Fit => "fit",
         ScaleMode::Integer => "native",
     };
     let title = format!(
-        "Framebuffer ({}×{} at {},{}){}  [{}]",
+        "Framebuffer ({}×{} at {},{}){}{}  [{}]",
         area.width,
         area.height,
         area.x,
         area.y,
+        if using_fallback { " · fallback" } else { "" },
         if area.bpp24 { " · 24bpp" } else { "" },
         mode_label,
     );
@@ -88,12 +101,7 @@ const CRT_ASPECT: f32 = 4.0 / 3.0;
 /// Integer mode (see `paint_image_integer`) keeps 1:1 pixels for
 /// pixel-art fans; this "Fit" mode is for users who want the game
 /// to look like it did on a TV.
-fn paint_image_fit(
-    ui: &mut egui::Ui,
-    tex: egui::TextureId,
-    tex_size: egui::Vec2,
-    uv: egui::Rect,
-) {
+fn paint_image_fit(ui: &mut egui::Ui, tex: egui::TextureId, tex_size: egui::Vec2, uv: egui::Rect) {
     let avail = ui.available_rect_before_wrap();
     if avail.width() <= 0.0 || avail.height() <= 0.0 || tex_size.x <= 0.0 || tex_size.y <= 0.0 {
         return;
@@ -106,7 +114,9 @@ fn paint_image_fit(
     let w = h * CRT_ASPECT;
     let rect = egui::Rect::from_center_size(avail.center(), egui::vec2(w, h));
     ui.allocate_rect(avail, egui::Sense::hover());
-    egui::Image::new((tex, rect.size())).uv(uv).paint_at(ui, rect);
+    egui::Image::new((tex, rect.size()))
+        .uv(uv)
+        .paint_at(ui, rect);
 }
 
 /// Integer-scale (nearest-neighbour multiple) fit. Always shows

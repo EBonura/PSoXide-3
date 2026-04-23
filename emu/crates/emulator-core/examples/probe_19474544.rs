@@ -70,7 +70,11 @@ fn main() {
             gprs[r + 3],
         );
     }
-    println!("IRQ:  stat=0x{:08x}  mask=0x{:08x}", bus.irq().stat(), bus.irq().mask());
+    println!(
+        "IRQ:  stat=0x{:08x}  mask=0x{:08x}",
+        bus.irq().stat(),
+        bus.irq().mask()
+    );
     println!("Raise counts {:?}", bus.irq().raise_counts());
     println!(
         "Scheduler pending=0b{:b}  lowest_target={}",

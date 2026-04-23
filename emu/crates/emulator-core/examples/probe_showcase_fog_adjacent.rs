@@ -27,8 +27,7 @@ fn main() {
     // Wrap expected around frame 41 (ring_spacing / scroll_speed = 40 steps).
     // Dump 20 consecutive frames spanning two potential wrap points.
     let sample_targets: &[u64] = &[
-        35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-        75, 76, 77, 78, 79, 80, 81, 82, 83, 84,
+        35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84,
     ];
     let mut cycles_at_last_pump = 0u64;
     for &target in sample_targets {

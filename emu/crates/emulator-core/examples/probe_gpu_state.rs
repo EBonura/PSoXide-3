@@ -36,6 +36,8 @@ fn main() {
     let da = bus.gpu.display_area();
     println!("=== GPU state at step {n} (cycles={}) ===", bus.cycles());
     println!("display_hash : 0x{h:016x}  ({w}×{hh}, {len} bytes)");
-    println!("display_area(): x={} y={} width={} height={} 24bpp={}",
-        da.x, da.y, da.width, da.height, da.bpp24);
+    println!(
+        "display_area(): x={} y={} width={} height={} 24bpp={}",
+        da.x, da.y, da.width, da.height, da.bpp24
+    );
 }

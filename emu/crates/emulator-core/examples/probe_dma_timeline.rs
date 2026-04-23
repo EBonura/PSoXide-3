@@ -28,7 +28,9 @@ fn main() {
 
     // Run to 19_480_000 — past the first cycle divergence at 19474544.
     for _ in 0..19_480_000u64 {
-        if cpu.step(&mut bus).is_err() { break; }
+        if cpu.step(&mut bus).is_err() {
+            break;
+        }
     }
 
     let log = bus.drain_dma_log();
@@ -46,7 +48,10 @@ fn main() {
     }
 
     println!("=== Our DMA schedules ===");
-    println!("{:<9} {:>12} {:>8} {:>12}", "kind", "cycle_now", "delta", "target");
+    println!(
+        "{:<9} {:>12} {:>8} {:>12}",
+        "kind", "cycle_now", "delta", "target"
+    );
     for (kind, cycle, delta, target) in &log {
         println!("{kind:<9} {cycle:>12} {delta:>8} {target:>12}");
     }
@@ -54,7 +59,10 @@ fn main() {
     println!();
     println!("=== Redux trace folds (step N with tick delta > 200) ===");
     println!("(each is a step where Redux's cycle jumped — likely an ISR fold)");
-    println!("{:<12} {:>12} {:>12} {:>8}", "step", "prev_tick", "new_tick", "delta");
+    println!(
+        "{:<12} {:>12} {:>12} {:>8}",
+        "step", "prev_tick", "new_tick", "delta"
+    );
     for (step, prev, new, delta) in redux_folds.iter().take(15) {
         println!("{step:<12} {prev:>12} {new:>12} {delta:>8}");
     }
@@ -71,7 +79,7 @@ fn main() {
             // the target. Match if the Redux pre-fold tick is within 10
             // cycles of our target.
             (*new_tick as i64 - *target as i64).abs() < 2500
-                // post-ISR tick is within ~2500 of our target
+            // post-ISR tick is within ~2500 of our target
         }) {
             println!(
                 "our_target={target:>12}  redux step={step:<10}  redux_tick={new_tick:>12}  delta={}",
@@ -80,5 +88,8 @@ fn main() {
             matched += 1;
         }
     }
-    println!("Matched {matched} of {} schedule events to Redux ISR folds.", log.len());
+    println!(
+        "Matched {matched} of {} schedule events to Redux ISR folds.",
+        log.len()
+    );
 }

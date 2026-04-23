@@ -40,8 +40,10 @@ fn main() {
         log.len(),
     );
     println!();
-    println!("{:>6}  {:<9}  {:>10}  {:>10}  {:>12}",
-        "#", "kind", "cycle_now", "delta", "target");
+    println!(
+        "{:>6}  {:<9}  {:>10}  {:>10}  {:>12}",
+        "#", "kind", "cycle_now", "delta", "target"
+    );
     for (i, (kind, cycle, delta, target)) in log.iter().enumerate() {
         println!(
             "{:>6}  {kind:<9}  {cycle:>10}  {delta:>10}  {target:>12}",

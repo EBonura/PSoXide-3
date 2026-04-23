@@ -144,9 +144,9 @@ fn redux_trace_cached(n: usize) -> Vec<InstructionRecord> {
 /// Software-visible names for the 32 COP2 (GTE) data registers,
 /// in `MFC2` index order. Used only for divergence diagnostics.
 const COP2_DATA_NAMES: [&str; 32] = [
-    "VXY0", "VZ0", "VXY1", "VZ1", "VXY2", "VZ2", "RGBC", "OTZ", "IR0", "IR1", "IR2", "IR3",
-    "SXY0", "SXY1", "SXY2", "SXYP", "SZ0", "SZ1", "SZ2", "SZ3", "RGB0", "RGB1", "RGB2", "RES1",
-    "MAC0", "MAC1", "MAC2", "MAC3", "IRGB", "ORGB", "LZCS", "LZCR",
+    "VXY0", "VZ0", "VXY1", "VZ1", "VXY2", "VZ2", "RGBC", "OTZ", "IR0", "IR1", "IR2", "IR3", "SXY0",
+    "SXY1", "SXY2", "SXYP", "SZ0", "SZ1", "SZ2", "SZ3", "RGB0", "RGB1", "RGB2", "RES1", "MAC0",
+    "MAC1", "MAC2", "MAC3", "IRGB", "ORGB", "LZCS", "LZCR",
 ];
 
 /// Software-visible names for the 32 COP2 (GTE) control registers,

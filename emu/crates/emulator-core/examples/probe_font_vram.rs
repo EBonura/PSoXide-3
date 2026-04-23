@@ -28,7 +28,9 @@ fn main() {
 
     let mut cycles_at_last_pump = 0u64;
     for _ in 0..steps {
-        if cpu.step(&mut bus).is_err() { break; }
+        if cpu.step(&mut bus).is_err() {
+            break;
+        }
         if bus.cycles() - cycles_at_last_pump > 560_000 {
             cycles_at_last_pump = bus.cycles();
             bus.run_spu_samples(735);
@@ -52,7 +54,9 @@ fn main() {
         }
         if i < 32 {
             print!(" {p:04x}");
-            if (i + 1) % 8 == 0 { println!(); }
+            if (i + 1) % 8 == 0 {
+                println!();
+            }
         }
     }
     println!();
@@ -67,7 +71,7 @@ fn main() {
     println!();
     println!("=== Font texture at VRAM (256..384, 256..512) — 8bpp sample ===");
     let mut tex_non_zero = 0;
-    let tex_total: u32 = 128 * 256;  // words
+    let tex_total: u32 = 128 * 256; // words
     for y in 0..256u16 {
         for x in 0..128u16 {
             let p = vram.get_pixel(256 + x, 256 + y);
@@ -84,7 +88,8 @@ fn main() {
     println!();
     println!("=== Glyph around UV(192,112) → VRAM (352, 368) ===");
     for dy in 0..16 {
-        for dx in 0..8 {  // 16 texels = 8 VRAM words
+        for dx in 0..8 {
+            // 16 texels = 8 VRAM words
             let p = vram.get_pixel(352 + dx, 368 + dy);
             print!(" {p:04x}");
         }

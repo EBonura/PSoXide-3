@@ -41,8 +41,9 @@ fn main() {
                     let delta = new - old;
                     for _ in 0..delta {
                         println!(
-                            "step={step:>10}  cyc={:>12}  cmd=0x{i:02x}",
+                            "step={step:>10}  cyc={:>12}  sched_cyc={:>12}  cmd=0x{i:02x}",
                             bus.cycles(),
+                            bus.cdrom.scheduling_cycle(),
                         );
                     }
                 }

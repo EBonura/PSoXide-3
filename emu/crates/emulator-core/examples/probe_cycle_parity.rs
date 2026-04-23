@@ -65,7 +65,8 @@ fn main() {
             .filter_map(|s| s.trim().parse().ok())
             .collect();
         println!("(override) running crash at {steps:?}");
-        let disc = "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
+        let disc =
+            "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
         let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
         let mut bus = Bus::new(bios).expect("bus");
         let disc_bytes = std::fs::read(disc).expect("disc");
@@ -75,7 +76,9 @@ fn main() {
         let mut cursor = 0u64;
         for target in steps {
             while cursor < target {
-                if cpu.step(&mut bus).is_err() { break; }
+                if cpu.step(&mut bus).is_err() {
+                    break;
+                }
                 cursor += 1;
                 if bus.cycles() - cycles_at_last_pump > 560_000 {
                     cycles_at_last_pump = bus.cycles();
@@ -83,7 +86,8 @@ fn main() {
                     let _ = bus.spu.drain_audio();
                 }
             }
-            println!("crash step={target:>12}  our_cycles={:>14}  cpi={:.4}",
+            println!(
+                "crash step={target:>12}  our_cycles={:>14}  cpi={:.4}",
                 bus.cycles(),
                 bus.cycles() as f64 / target as f64,
             );
@@ -92,8 +96,10 @@ fn main() {
     }
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
-    println!("{:<8} {:>12} {:>14} {:>14} {:>10} {:>10}",
-        "scenario", "steps", "our_cycles", "redux_tick", "delta", "pct_off");
+    println!(
+        "{:<8} {:>12} {:>14} {:>14} {:>10} {:>10}",
+        "scenario", "steps", "our_cycles", "redux_tick", "delta", "pct_off"
+    );
     println!("{}", "-".repeat(76));
     for (name, disc_path, checkpoints) in scenarios {
         let mut bus = Bus::new(bios.clone()).expect("bus");

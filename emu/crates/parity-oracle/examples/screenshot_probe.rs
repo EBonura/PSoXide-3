@@ -13,9 +13,7 @@ fn main() {
     let config = OracleConfig::new(bios_path, lua).expect("Redux binary resolves");
 
     let mut redux = ReduxProcess::launch(&config).expect("Redux launches");
-    redux
-        .handshake(Duration::from_secs(10))
-        .expect("handshake");
+    redux.handshake(Duration::from_secs(10)).expect("handshake");
 
     // Step a few million instructions so the GPU has actually
     // drawn something and `takeScreenShot` returns a non-empty

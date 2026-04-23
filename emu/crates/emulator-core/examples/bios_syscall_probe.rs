@@ -65,8 +65,7 @@ fn main() {
         };
         if let Some(t) = table {
             let t1 = cpu.gprs()[9] as u8;
-            hist[t as usize][t1 as usize] =
-                hist[t as usize][t1 as usize].saturating_add(1);
+            hist[t as usize][t1 as usize] = hist[t as usize][t1 as usize].saturating_add(1);
             if recent.len() >= 64 {
                 recent.pop_front();
             }
@@ -156,8 +155,14 @@ fn main() {
         println!("{}-functions ({total} calls):", labels[t]);
         for (op, c) in pairs.iter().take(20) {
             let name = function_name(t as u8, *op);
-            println!("  {:>3}%  {:>9}× {}(0x{:02X}) {}",
-                100 * c / total.max(1), c, labels[t], op, name);
+            println!(
+                "  {:>3}%  {:>9}× {}(0x{:02X}) {}",
+                100 * c / total.max(1),
+                c,
+                labels[t],
+                op,
+                name
+            );
         }
         println!();
     }

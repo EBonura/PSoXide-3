@@ -209,6 +209,30 @@ impl Scheduler {
         }
     }
 
+    /// Remove and return `slot` when its target is `<= now`.
+    ///
+    /// Most Redux scheduled interrupts are strict (`target < cycle`),
+    /// which is what [`Scheduler::take_due`] models. Root counters are
+    /// different: `branchTest` calls `Counters::update()` when
+    /// `cycle >= m_psxNextCounter`. VBlank is currently represented as
+    /// a scheduler slot in PSoXide, so the bus uses this helper to keep
+    /// counter/VBlank timing inclusive without weakening DMA/CDROM
+    /// interrupt timing.
+    pub fn take_slot_due_inclusive(&mut self, slot: EventSlot, now: u64) -> Option<u64> {
+        let mask = 1 << slot.bit();
+        if self.active & mask == 0 {
+            return None;
+        }
+        let target = self.targets[slot as usize];
+        if target > now {
+            return None;
+        }
+        self.active &= !mask;
+        self.recompute_lowest();
+        self.total_fired = self.total_fired.saturating_add(1);
+        Some(target)
+    }
+
     /// Remove and return the earliest-deadline slot whose target is
     /// `< now`, along with that original target cycle. `None` if
     /// nothing's due. Callers invoke this in a loop to drain every

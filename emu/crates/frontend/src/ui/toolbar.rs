@@ -158,9 +158,7 @@ fn draw_metrics(ui: &mut egui::Ui, state: &AppState) {
         (STATUS_PAUSED, "PAUSED")
     };
     ui.add(Label::new(
-        RichText::new("●")
-            .color(dot_color)
-            .size(METRIC_TEXT_SIZE),
+        RichText::new("●").color(dot_color).size(METRIC_TEXT_SIZE),
     ));
     ui.add(Label::new(
         RichText::new(status_label)

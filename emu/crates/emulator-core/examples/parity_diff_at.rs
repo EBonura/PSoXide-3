@@ -74,7 +74,12 @@ fn main() {
             println!("      pc:    ours=0x{:08x}  theirs=0x{:08x}", u.pc, t.pc);
         }
         if !match_tick {
-            println!("      tick:  ours={:>10}  theirs={:>10}  delta={}", u.tick, t.tick, u.tick as i64 - t.tick as i64);
+            println!(
+                "      tick:  ours={:>10}  theirs={:>10}  delta={}",
+                u.tick,
+                t.tick,
+                u.tick as i64 - t.tick as i64
+            );
         }
         if !match_gprs {
             for r in 0..32 {

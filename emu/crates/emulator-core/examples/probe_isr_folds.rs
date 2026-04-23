@@ -91,9 +91,7 @@ fn main() {
         "[redux] ff done in {:.1}s, tracing {window} steps...",
         t0.elapsed().as_secs_f64()
     );
-    let trace = redux
-        .step(window, TRACE_STEP_TIMEOUT)
-        .expect("step trace");
+    let trace = redux.step(window, TRACE_STEP_TIMEOUT).expect("step trace");
     redux.send_command("quit").ok();
     let _ = redux.wait_for_response(Duration::from_secs(2));
     let _ = redux.terminate();
@@ -128,7 +126,14 @@ fn main() {
     }
     println!();
     println!("=== Our CDROM IRQ log ===");
-    let names = ["None", "DataReady", "Complete", "Acknowledge", "DataEnd", "Error"];
+    let names = [
+        "None",
+        "DataReady",
+        "Complete",
+        "Acknowledge",
+        "DataEnd",
+        "Error",
+    ];
     for (i, &(cyc, ty)) in our_log.iter().enumerate() {
         let name = names.get(ty as usize).copied().unwrap_or("?");
         println!("  #{i:>3}  cyc={cyc:>12}  {name}");

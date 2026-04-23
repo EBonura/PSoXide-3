@@ -158,8 +158,7 @@ impl Dma {
                         c.channel_control = value;
                         if (value >> 24) & 1 != 0 {
                             self.start_trigger_counts[ch] += 1;
-                            self.chcr_write_count[ch] =
-                                self.chcr_write_count[ch].saturating_add(1);
+                            self.chcr_write_count[ch] = self.chcr_write_count[ch].saturating_add(1);
                         }
                     }
                     _ => {}
@@ -344,8 +343,8 @@ mod tests {
         // round-trip; W1C bits (15, 24..30) ignore writes-of-zero.
         let mut dma = Dma::new();
         dma.write32(0x1F80_10F4, 0x00FF_0000); // enables 16..23
-        // Read-back includes the computed master flag in bit 31 — clear
-        // here because no per-channel flag is set.
+                                               // Read-back includes the computed master flag in bit 31 — clear
+                                               // here because no per-channel flag is set.
         assert_eq!(dma.read32(0x1F80_10F4), 0x00FF_0000);
     }
 

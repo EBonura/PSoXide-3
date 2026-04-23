@@ -17,8 +17,7 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
 
     let dir = cache::default_dir();
-    let trace = cache::load_prefix(&dir, &bios, 50_000_000)
-        .expect("No cached trace long enough");
+    let trace = cache::load_prefix(&dir, &bios, 50_000_000).expect("No cached trace long enough");
     eprintln!("Loaded {} records", trace.len());
 
     // Print the steps around 19_472_416 where we saw the jump.
@@ -47,7 +46,11 @@ fn main() {
         }
         prev_tick = r.tick;
     }
-    println!("Found {} per-step deltas > 20 cycles out of {}", jumps.len(), trace.len());
+    println!(
+        "Found {} per-step deltas > 20 cycles out of {}",
+        jumps.len(),
+        trace.len()
+    );
     for &(i, prev, curr) in jumps.iter().take(20) {
         println!("  step {i}: {prev} -> {curr} (+{})", curr - prev);
     }

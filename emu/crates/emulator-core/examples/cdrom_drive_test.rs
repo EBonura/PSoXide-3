@@ -69,7 +69,7 @@ fn main() {
     // Enable all CDROM IRQ types so nothing gets masked.
     bus.write8(0x1F801800, 1); // idx=1
     bus.write8(0x1F801802, 0x1F); // IRQ mask = 0x1F (all INT types)
-    // Ack any pending.
+                                  // Ack any pending.
     bus.write8(0x1F801803, 0x1F);
 
     // 0x0a = Init: spin motor, reset mode.
@@ -78,9 +78,9 @@ fn main() {
 
     // 0x02 SetLoc (02, 16, 00) — LBA 16 in BCD.
     issue(&mut bus, 0x02, &[0x00, 0x02, 0x16]); // FAKE: we're writing BCD minute, second, frame
-    //                                              ^
-    // PSX convention: params are (minute, second, frame) in BCD.
-    // For LBA 16 → 00:02:16 BCD.
+                                                //                                              ^
+                                                // PSX convention: params are (minute, second, frame) in BCD.
+                                                // For LBA 16 → 00:02:16 BCD.
     tick_and_ack(&mut bus, 200_000);
 
     // 0x15 SeekL
@@ -101,7 +101,10 @@ fn main() {
     issue(&mut bus, 0x09, &[]);
     tick_and_ack(&mut bus, 700_000);
 
-    println!("data_fifo_len after ReadN+tick: {}", bus.cdrom.data_fifo_len());
+    println!(
+        "data_fifo_len after ReadN+tick: {}",
+        bus.cdrom.data_fifo_len()
+    );
     // Drain the FIFO via MMIO reads.
     let mut drained = Vec::with_capacity(2048);
     for _ in 0..2048 {
@@ -115,7 +118,13 @@ fn main() {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         let ascii: String = chunk
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         println!("  {}  {}", hex.join(" "), ascii);
     }

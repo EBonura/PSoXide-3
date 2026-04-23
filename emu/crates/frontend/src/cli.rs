@@ -24,7 +24,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use emulator_core::{Bus, Cpu};
+use emulator_core::{spu::SAMPLE_CYCLES, Bus, Cpu};
 use psoxide_settings::{
     library::{GameKind, LibraryEntry},
     ConfigPaths, Library, Settings,
@@ -315,11 +315,21 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
     // Step the CPU. Report early on opcode errors — they're usually
     // "we hit an unimplemented instruction" and worth surfacing.
     let mut stopped_at: Option<u64> = None;
+    let mut audio_cycle_accum = 0u64;
     for i in 0..args.steps {
+        let cycles_before = bus.cycles();
         if let Err(e) = cpu.step(&mut bus) {
             eprintln!("[cli] step {i} failed: {e:?}");
             stopped_at = Some(i);
             break;
+        }
+        audio_cycle_accum =
+            audio_cycle_accum.saturating_add(bus.cycles().saturating_sub(cycles_before));
+        let sample_count = (audio_cycle_accum / SAMPLE_CYCLES) as usize;
+        audio_cycle_accum %= SAMPLE_CYCLES;
+        if sample_count > 0 {
+            bus.run_spu_samples(sample_count);
+            let _ = bus.spu.drain_audio();
         }
     }
 

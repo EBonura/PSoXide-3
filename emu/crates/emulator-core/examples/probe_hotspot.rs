@@ -38,8 +38,11 @@ fn main() {
             }
         }
     }
-    println!("warmup done @ step {warmup}, pc=0x{:08x}, cycles={}",
-        cpu.pc(), bus.cycles());
+    println!(
+        "warmup done @ step {warmup}, pc=0x{:08x}, cycles={}",
+        cpu.pc(),
+        bus.cycles()
+    );
 
     // Sample last 1M.
     let mut counts: HashMap<u32, u64> = HashMap::new();
@@ -68,5 +71,8 @@ fn main() {
     println!();
     println!("unique PCs: {}", sorted.len());
     let top5_sum: u64 = sorted.iter().take(5).map(|(_, c)| c).sum();
-    println!("top-5 concentration: {:.1}%", 100.0 * top5_sum as f64 / 1_000_000.0);
+    println!(
+        "top-5 concentration: {:.1}%",
+        100.0 * top5_sum as f64 / 1_000_000.0
+    );
 }

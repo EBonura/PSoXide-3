@@ -296,7 +296,10 @@ fn print_capture(state: &SdkExampleState, example: &str, vblanks: u64) {
     eprintln!("        vblanks: {vblanks},");
     eprintln!("        vram_hash: 0x{:016x},", state.vram_hash);
     eprintln!("        display_hash: 0x{:016x},", state.display_hash);
-    eprintln!("        display_size: ({}, {}),", state.display_size.0, state.display_size.1);
+    eprintln!(
+        "        display_size: ({}, {}),",
+        state.display_size.0, state.display_size.1
+    );
     eprintln!("        vblank_raises: {},", state.vblank_raises);
     eprintln!("        spu_samples: {},", state.spu_samples);
     eprintln!("        final_pc: 0x{:08x},", state.final_pc);

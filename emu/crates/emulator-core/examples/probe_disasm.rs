@@ -17,10 +17,7 @@ fn main() {
         .get(1)
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .expect("need start PC hex");
-    let count: u32 = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
+    let count: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(16);
     let disc_path = args.get(3).cloned();
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
@@ -64,7 +61,13 @@ fn decode_mips(instr: u32) -> String {
     let target = instr & 0x03FF_FFFF;
     match op {
         0x00 => match func {
-            0x00 => if instr == 0 { "nop".into() } else { format!("sll $r{rd},$r{rt},{shamt}") },
+            0x00 => {
+                if instr == 0 {
+                    "nop".into()
+                } else {
+                    format!("sll $r{rd},$r{rt},{shamt}")
+                }
+            }
             0x02 => format!("srl $r{rd},$r{rt},{shamt}"),
             0x03 => format!("sra $r{rd},$r{rt},{shamt}"),
             0x08 => format!("jr $r{rs}"),

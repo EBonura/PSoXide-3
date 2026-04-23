@@ -123,6 +123,10 @@ fn main() {
         "[redux] done in {:.1}s, tick = {redux_tick}",
         t0.elapsed().as_secs_f64()
     );
+    redux.send_command("regs").expect("regs cmd");
+    let redux_regs = redux
+        .wait_for_response(Duration::from_secs(5))
+        .unwrap_or_else(|_| "regs <timeout>".to_string());
     let redux_peeks = peek_addrs
         .iter()
         .map(|&addr| {
@@ -150,6 +154,7 @@ fn main() {
     println!("redux tick : {redux_tick:>14}");
     println!("delta      : {delta:>+14}");
     println!("pct_off    : {pct:>+14.3}%");
+    println!("redux regs : {redux_regs}");
     if !peek_addrs.is_empty() {
         println!();
         println!("peek32:");

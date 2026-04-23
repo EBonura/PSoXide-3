@@ -502,7 +502,10 @@ mod tests {
         }
         w.finish().unwrap();
 
-        assert_eq!(fs::read(&save_path).unwrap(), fs::read(&stream_path).unwrap());
+        assert_eq!(
+            fs::read(&save_path).unwrap(),
+            fs::read(&stream_path).unwrap()
+        );
         assert_eq!(load(&stream_path).unwrap(), records);
     }
 

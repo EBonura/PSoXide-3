@@ -387,8 +387,7 @@ impl Cpu {
             bus.drain_scheduler_events_post_op();
         }
         if in_delay_slot && self.should_take_interrupt(bus) {
-            self.should_take_interrupt_steps =
-                self.should_take_interrupt_steps.saturating_add(1);
+            self.should_take_interrupt_steps = self.should_take_interrupt_steps.saturating_add(1);
             // Redux passes `bd=0` to `exception(0x400, 0)`: the IRQ
             // is taken cleanly between instructions, not in a delay
             // slot of its own.
@@ -1653,8 +1652,8 @@ mod tests {
         assert_eq!(record.pc, 0xBFC0_0000);
         assert_eq!(record.instr, 0x3C08_0013);
         assert_eq!(record.gprs[8], 0x0013_0000); // $t0
-        // tick = bus.cycles() = BIAS=2 for the single retired lui.
-        // (Lui is not a load/store so no +1 extra.)
+                                                 // tick = bus.cycles() = BIAS=2 for the single retired lui.
+                                                 // (Lui is not a load/store so no +1 extra.)
         assert_eq!(record.tick, 2);
         assert_eq!(cpu.pc(), 0xBFC0_0004);
     }
@@ -1924,7 +1923,8 @@ mod tests {
             let result = (reg & mask) | (mem << shift);
             assert_eq!(
                 result, expected[aw as usize],
-                "LWL addr&3={aw}: got 0x{result:08x}, want 0x{:08x}", expected[aw as usize]
+                "LWL addr&3={aw}: got 0x{result:08x}, want 0x{:08x}",
+                expected[aw as usize]
             );
         }
     }
@@ -1947,7 +1947,8 @@ mod tests {
             let result = (reg & mask) | (mem >> shift);
             assert_eq!(
                 result, expected[aw as usize],
-                "LWR addr&3={aw}: got 0x{result:08x}, want 0x{:08x}", expected[aw as usize]
+                "LWR addr&3={aw}: got 0x{result:08x}, want 0x{:08x}",
+                expected[aw as usize]
             );
         }
     }
@@ -1970,7 +1971,8 @@ mod tests {
             let result = (mem & mask) | (reg >> (24 - shift));
             assert_eq!(
                 result, expected[aw as usize],
-                "SWL addr&3={aw}: got 0x{result:08x}, want 0x{:08x}", expected[aw as usize]
+                "SWL addr&3={aw}: got 0x{result:08x}, want 0x{:08x}",
+                expected[aw as usize]
             );
         }
     }
@@ -1993,7 +1995,8 @@ mod tests {
             let result = (mem & mask) | (reg << shift);
             assert_eq!(
                 result, expected[aw as usize],
-                "SWR addr&3={aw}: got 0x{result:08x}, want 0x{:08x}", expected[aw as usize]
+                "SWR addr&3={aw}: got 0x{result:08x}, want 0x{:08x}",
+                expected[aw as usize]
             );
         }
     }

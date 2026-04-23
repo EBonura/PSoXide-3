@@ -487,10 +487,7 @@ mod tests {
     #[test]
     fn gp1_display_mode_encodes_all_fields() {
         // hres=1 (320), vres=0 (240), NTSC, 15bit, no interlace.
-        assert_eq!(
-            gp1::display_mode(1, 0, false, false, false),
-            0x0800_0001
-        );
+        assert_eq!(gp1::display_mode(1, 0, false, false, false), 0x0800_0001);
         // 640x480 PAL, 24bit, interlaced.
         let m = gp1::display_mode(3, 1, true, true, true);
         assert_eq!(m & 0xFF, 0x3F, "low byte = 00111111");

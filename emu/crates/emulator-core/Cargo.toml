@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 parity-oracle = { workspace = true }
+psoxide-settings = { workspace = true }
 
 [features]
 default = []

@@ -192,7 +192,11 @@ impl MenuState {
         }
 
         // Try to preserve the user's category if it still exists.
-        if let Some(idx) = self.categories.iter().position(|c| c.name == current_cat_name) {
+        if let Some(idx) = self
+            .categories
+            .iter()
+            .position(|c| c.name == current_cat_name)
+        {
             self.category_index = idx;
         } else {
             self.category_index = 0;
@@ -207,13 +211,13 @@ impl MenuState {
     /// Rebuild categories with a fresh "Run"/"Pause" label. Called
     /// when `AppState.running` flips.
     pub fn sync_run_label(&mut self, running: bool) {
-        if let Some(system) = self
-            .categories
-            .iter_mut()
-            .find(|c| c.name == "System")
-        {
+        if let Some(system) = self.categories.iter_mut().find(|c| c.name == "System") {
             if let Some(item) = system.items.first_mut() {
-                item.label = if running { "Pause".into() } else { "Run".into() };
+                item.label = if running {
+                    "Pause".into()
+                } else {
+                    "Run".into()
+                };
             }
         }
     }
@@ -678,7 +682,10 @@ mod tests {
             MenuAction::LaunchGame("g1".to_string())
         );
         // Refresh row is appended after the actual entries.
-        assert_eq!(s.categories[0].items.last().unwrap().action, MenuAction::RescanLibrary);
+        assert_eq!(
+            s.categories[0].items.last().unwrap().action,
+            MenuAction::RescanLibrary
+        );
         assert_eq!(s.categories[1].items[0].label, "hello-tri");
     }
 
@@ -713,14 +720,20 @@ mod tests {
             ],
             &[],
         );
-        let right = MenuInput { right: true, ..Default::default() };
+        let right = MenuInput {
+            right: true,
+            ..Default::default()
+        };
         s.update(&right); // → Examples
         s.update(&right); // → System
         s.update(&right); // → Debug
         s.update(&right); // → Quit
         s.update(&right); // past end — should clamp
         assert_eq!(s.current_category(), Some("Quit"));
-        let left = MenuInput { left: true, ..Default::default() };
+        let left = MenuInput {
+            left: true,
+            ..Default::default()
+        };
         for _ in 0..10 {
             s.update(&left);
         }

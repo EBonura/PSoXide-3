@@ -92,7 +92,12 @@ fn main() {
     );
     println!("{}", "-".repeat(60));
     let irq_names = [
-        "NONE", "DataReady", "Complete", "Acknowledge", "DataEnd", "Error",
+        "NONE",
+        "DataReady",
+        "Complete",
+        "Acknowledge",
+        "DataEnd",
+        "Error",
     ];
     let pairs = our_log.len().min(redux_log.len());
     let mut first_diff: Option<usize> = None;
@@ -100,10 +105,7 @@ fn main() {
         let (ot, oty) = our_log[i];
         let (_rs, rt, rty) = redux_log[i];
         let delta = ot as i64 - rt as i64;
-        let oname = irq_names
-            .get(oty as usize)
-            .copied()
-            .unwrap_or("?");
+        let oname = irq_names.get(oty as usize).copied().unwrap_or("?");
         let marker = if delta != 0 && first_diff.is_none() {
             first_diff = Some(i);
             " <<<"
@@ -111,13 +113,14 @@ fn main() {
             ""
         };
         let flags = if oty != rty {
-            format!(" (type diff: redux={})", irq_names.get(rty as usize).copied().unwrap_or("?"))
+            format!(
+                " (type diff: redux={})",
+                irq_names.get(rty as usize).copied().unwrap_or("?")
+            )
         } else {
             String::new()
         };
-        println!(
-            "{i:>4}  {oname:<9}  {ot:>13}  {rt:>13}  {delta:>+10}{marker}{flags}"
-        );
+        println!("{i:>4}  {oname:<9}  {ot:>13}  {rt:>13}  {delta:>+10}{marker}{flags}");
     }
     if our_log.len() != redux_log.len() {
         println!();

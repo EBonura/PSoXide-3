@@ -69,7 +69,13 @@ pub struct Hle {
 /// `args` is the four argument registers `$a0..$a3` (`$r4..$r7`),
 /// `t1_func_num` is `$r9` (the function selector set by the caller's
 /// delay-slot load), and `ra` is `$r31`.
-pub fn dispatch(cpu_pc: u32, bus: &mut Bus, args: [u32; 4], t1_func_num: u32, ra: u32) -> Option<Hle> {
+pub fn dispatch(
+    cpu_pc: u32,
+    bus: &mut Bus,
+    args: [u32; 4],
+    t1_func_num: u32,
+    ra: u32,
+) -> Option<Hle> {
     let phys = to_physical(cpu_pc);
     let table = Table::from_phys(phys)?;
     let func = (t1_func_num & 0xFF) as u8;

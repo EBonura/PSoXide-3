@@ -26,7 +26,10 @@ fn main() {
         }
     }
 
-    println!("=== CDROM state at step {target} (cyc={}) ===", bus.cycles());
+    println!(
+        "=== CDROM state at step {target} (cyc={}) ===",
+        bus.cycles()
+    );
     println!("commands dispatched: {}", bus.cdrom.commands_dispatched());
     println!("last command byte:   0x{:02x}", bus.cdrom.last_command());
     println!("irq_flag:            0x{:x}", bus.cdrom.irq_flag());
@@ -46,15 +49,27 @@ fn main() {
     println!("scheduler (pending events):");
     use emulator_core::scheduler::EventSlot;
     for slot in [
-        EventSlot::Sio, EventSlot::Sio1, EventSlot::Cdr, EventSlot::CdRead,
-        EventSlot::GpuDma, EventSlot::MdecOutDma, EventSlot::SpuDma,
-        EventSlot::MdecInDma, EventSlot::GpuOtcDma, EventSlot::CdrDma,
-        EventSlot::CdrPlay, EventSlot::CdrDbuf, EventSlot::CdrLid,
-        EventSlot::SpuAsync, EventSlot::VBlank,
+        EventSlot::Sio,
+        EventSlot::Sio1,
+        EventSlot::Cdr,
+        EventSlot::CdRead,
+        EventSlot::GpuDma,
+        EventSlot::MdecOutDma,
+        EventSlot::SpuDma,
+        EventSlot::MdecInDma,
+        EventSlot::GpuOtcDma,
+        EventSlot::CdrDma,
+        EventSlot::CdrPlay,
+        EventSlot::CdrDbuf,
+        EventSlot::CdrLid,
+        EventSlot::SpuAsync,
+        EventSlot::VBlank,
     ] {
         if let Some(target) = bus.scheduler.target(slot) {
-            println!("  {slot:?}: target = {target}  (in {} cycles)",
-                (target as i64) - (bus.cycles() as i64));
+            println!(
+                "  {slot:?}: target = {target}  (in {} cycles)",
+                (target as i64) - (bus.cycles() as i64)
+            );
         }
     }
 }

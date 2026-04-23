@@ -65,4 +65,3 @@ fn main() {
     println!("display_byte_len={disp_len}");
     println!("display_fnv1a_64=0x{disp_hash:016x}");
 }
-

@@ -44,18 +44,22 @@ fn main() {
         }
         println!("=== step {cp} (cpu_cyc={}) ===", bus.cycles());
         println!("SPUCNT        = 0x{:04x}", bus.spu.spucnt());
-        println!("MAIN_VOL_L/R  = 0x{:04x} / 0x{:04x}",
-            bus.spu.read16(0x1F80_1D80), bus.spu.read16(0x1F80_1D82));
-        println!("CD_VOL_L/R    = 0x{:04x} / 0x{:04x}",
-            bus.spu.read16(0x1F80_1DB0), bus.spu.read16(0x1F80_1DB2));
+        println!(
+            "MAIN_VOL_L/R  = 0x{:04x} / 0x{:04x}",
+            bus.spu.read16(0x1F80_1D80),
+            bus.spu.read16(0x1F80_1D82)
+        );
+        println!(
+            "CD_VOL_L/R    = 0x{:04x} / 0x{:04x}",
+            bus.spu.read16(0x1F80_1DB0),
+            bus.spu.read16(0x1F80_1DB2)
+        );
         // Per-voice snapshot. Each voice occupies 16 bytes starting
         // at 0x1F80_1C00. Offsets: +0 vol_l, +2 vol_r, +4 pitch, +6
         // start_addr, +8 adsr_low, +10 adsr_high, +12 current_envelope,
         // +14 repeat_addr.
         println!();
-        println!(
-            " v  vol_l  vol_r  pitch  start adsr_l adsr_h  env  repeat"
-        );
+        println!(" v  vol_l  vol_r  pitch  start adsr_l adsr_h  env  repeat");
         for v in 0..24 {
             let base = 0x1F80_1C00 + v * 16;
             let vol_l = bus.spu.read16(base);

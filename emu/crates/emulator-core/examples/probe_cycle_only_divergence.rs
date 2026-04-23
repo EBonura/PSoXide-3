@@ -18,8 +18,7 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
 
     let dir = cache::default_dir();
-    let trace = cache::load_prefix(&dir, &bios, 50_000_000)
-        .expect("No cached trace long enough");
+    let trace = cache::load_prefix(&dir, &bios, 50_000_000).expect("No cached trace long enough");
     eprintln!("Loaded {} records", trace.len());
 
     let mut bus = Bus::new(bios).expect("bus");
@@ -55,7 +54,10 @@ fn main() {
             cumulative_cycle_delta = delta;
             if cycle_only_count <= 5 {
                 println!();
-                println!("=== CYCLE-ONLY divergence #{} at step {i} ===", cycle_only_count);
+                println!(
+                    "=== CYCLE-ONLY divergence #{} at step {i} ===",
+                    cycle_only_count
+                );
                 println!(
                     "  tick:  ours={:>12}  redux={:>12}  delta={:+}",
                     our_rec.tick, expected.tick, delta,
@@ -96,8 +98,14 @@ fn main() {
                 expected.tick,
                 our_rec.tick as i64 - expected.tick as i64,
             );
-            println!("  pc:    ours=0x{:08x}  redux=0x{:08x}", our_rec.pc, expected.pc);
-            println!("  By this point cumulative cycle drift was {:+} cycles", cumulative_cycle_delta);
+            println!(
+                "  pc:    ours=0x{:08x}  redux=0x{:08x}",
+                our_rec.pc, expected.pc
+            );
+            println!(
+                "  By this point cumulative cycle drift was {:+} cycles",
+                cumulative_cycle_delta
+            );
             println!("  {cycle_only_count} cycle-only divergences happened before this.");
             break;
         }
@@ -105,7 +113,10 @@ fn main() {
 
     if first_full_divergence.is_none() {
         println!();
-        println!("Walked all {} records without full divergence.", trace.len());
+        println!(
+            "Walked all {} records without full divergence.",
+            trace.len()
+        );
     }
     println!();
     println!(

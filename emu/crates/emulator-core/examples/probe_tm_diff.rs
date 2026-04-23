@@ -129,9 +129,7 @@ fn main() {
         let px1 = (max_cx + 1) * w / hw;
         let py0 = min_cy * h / hh;
         let py1 = (max_cy + 1) * h / hh;
-        println!(
-            "hottest cluster (≥50% peak) spans display pixels x={px0}..{px1}  y={py0}..{py1}"
-        );
+        println!("hottest cluster (≥50% peak) spans display pixels x={px0}..{px1}  y={py0}..{py1}");
     }
 
     // --- Dump a small RGB swatch of mismatches at the hottest cell
@@ -179,7 +177,11 @@ fn bgr15_to_rgb24(buf: &[u8], x: usize, y: usize, w: usize) -> (u8, u8, u8) {
     let r5 = (pix & 0x1F) as u8;
     let g5 = ((pix >> 5) & 0x1F) as u8;
     let b5 = ((pix >> 10) & 0x1F) as u8;
-    ((r5 << 3) | (r5 >> 2), (g5 << 3) | (g5 >> 2), (b5 << 3) | (b5 >> 2))
+    (
+        (r5 << 3) | (r5 >> 2),
+        (g5 << 3) | (g5 >> 2),
+        (b5 << 3) | (b5 >> 2),
+    )
 }
 
 fn write_ppm(path: &PathBuf, w: usize, h: usize, pixel: impl Fn(usize, usize) -> (u8, u8, u8)) {

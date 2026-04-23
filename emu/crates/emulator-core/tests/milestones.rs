@@ -51,7 +51,8 @@ use psx_iso::Disc;
 use std::path::PathBuf;
 
 const DEFAULT_BIOS: &str = "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN";
-const CRASH_DISC: &str = "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
+const CRASH_DISC: &str =
+    "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
 const TEKKEN_DISC: &str =
     "/Users/ebonura/Downloads/ps1 games/Tekken 3 (USA)/Tekken 3 (USA) (Track 1).bin";
 

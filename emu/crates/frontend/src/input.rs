@@ -204,9 +204,7 @@ impl InputRouter {
                     } else {
                         "SDL_GameControllerDB"
                     };
-                    eprintln!(
-                        "[input] connected: id={id:?} name={name:?} mapping={mapping}",
-                    );
+                    eprintln!("[input] connected: id={id:?} name={name:?} mapping={mapping}",);
                     self.pads.insert(id, TrackedPad { name });
                 }
                 EventType::Disconnected => {

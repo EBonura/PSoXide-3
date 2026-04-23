@@ -20,7 +20,9 @@ fn main() {
     let mut cpu = Cpu::new();
 
     for _ in 0..600_000_000u64 {
-        if cpu.step(&mut bus).is_err() { break; }
+        if cpu.step(&mut bus).is_err() {
+            break;
+        }
     }
 
     let target: u32 = std::env::var("PSOXIDE_TARGET_IDX")
@@ -39,15 +41,35 @@ fn main() {
     for back in (0..=target as i64).rev() {
         let e = &bus.gpu.cmd_log[back as usize];
         match e.opcode {
-            0xE1 if !seen_e1 => { println!("  E1 draw_mode    = 0x{:08x}", e.fifo[0]); seen_e1 = true; }
-            0xE2 if !seen_e2 => { println!("  E2 tex_window   = 0x{:08x}", e.fifo[0]); seen_e2 = true; }
-            0xE3 if !seen_e3 => { println!("  E3 draw_area_tl = 0x{:08x}", e.fifo[0]); seen_e3 = true; }
-            0xE4 if !seen_e4 => { println!("  E4 draw_area_br = 0x{:08x}", e.fifo[0]); seen_e4 = true; }
-            0xE5 if !seen_e5 => { println!("  E5 draw_offset  = 0x{:08x}", e.fifo[0]); seen_e5 = true; }
-            0xE6 if !seen_e6 => { println!("  E6 mask_bits    = 0x{:08x}", e.fifo[0]); seen_e6 = true; }
+            0xE1 if !seen_e1 => {
+                println!("  E1 draw_mode    = 0x{:08x}", e.fifo[0]);
+                seen_e1 = true;
+            }
+            0xE2 if !seen_e2 => {
+                println!("  E2 tex_window   = 0x{:08x}", e.fifo[0]);
+                seen_e2 = true;
+            }
+            0xE3 if !seen_e3 => {
+                println!("  E3 draw_area_tl = 0x{:08x}", e.fifo[0]);
+                seen_e3 = true;
+            }
+            0xE4 if !seen_e4 => {
+                println!("  E4 draw_area_br = 0x{:08x}", e.fifo[0]);
+                seen_e4 = true;
+            }
+            0xE5 if !seen_e5 => {
+                println!("  E5 draw_offset  = 0x{:08x}", e.fifo[0]);
+                seen_e5 = true;
+            }
+            0xE6 if !seen_e6 => {
+                println!("  E6 mask_bits    = 0x{:08x}", e.fifo[0]);
+                seen_e6 = true;
+            }
             _ => {}
         }
-        if seen_e1 && seen_e2 && seen_e3 && seen_e4 && seen_e5 && seen_e6 { break; }
+        if seen_e1 && seen_e2 && seen_e3 && seen_e4 && seen_e5 && seen_e6 {
+            break;
+        }
     }
 
     // Decode E1 draw_mode.
