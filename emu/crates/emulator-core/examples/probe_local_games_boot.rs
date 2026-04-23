@@ -8,15 +8,18 @@
 //!
 //! ```bash
 //! cargo run --release -p emulator-core --example probe_local_games_boot -- 300000000
+//! cargo run --release -p emulator-core --example probe_local_games_boot -- --fastboot 50000000
 //! ```
 
 #[path = "support/disc.rs"]
 mod disc_support;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 
-use emulator_core::{Bus, Cpu};
+use emulator_core::{
+    fast_boot_disc_with_hle, warm_bios_for_disc_fast_boot, Bus, Cpu, DISC_FAST_BOOT_WARMUP_STEPS,
+};
 
 const DEFAULT_BIOS: &str = "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN";
 const DEFAULT_GAMES_DIR: &str = "/Users/ebonura/Downloads/ps1 games";
@@ -42,17 +45,31 @@ struct BootResult {
     cdrom_irq_flag: u8,
     cdrom_irq_mask: u8,
     cdrom_next_event: String,
+    fast_boot: Option<String>,
     error: Option<String>,
     recent_pcs: VecDeque<u32>,
 }
 
 fn main() {
-    let steps = std::env::args()
-        .nth(1)
+    let mut fastboot = false;
+    let mut positional = Vec::new();
+    for arg in std::env::args().skip(1) {
+        if arg == "--fastboot" {
+            fastboot = true;
+        } else {
+            positional.push(arg);
+        }
+    }
+    if let Ok(value) = std::env::var("PSOXIDE_FASTBOOT") {
+        fastboot |= value != "0" && !value.eq_ignore_ascii_case("false");
+    }
+
+    let steps = positional
+        .first()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_STEPS);
-    let games_root = std::env::args()
-        .nth(2)
+    let games_root = positional
+        .get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_GAMES_DIR));
     let bios_path = std::env::var("PSOXIDE_BIOS")
@@ -63,9 +80,10 @@ fn main() {
     let cues = disc_support::discover_cue_files(&games_root).expect("discover CUE files");
     let total_games = cues.len();
     println!(
-        "boot sweep: {} games, {} steps each, bios={}",
+        "boot sweep: {} games, {} steps each, mode={}, bios={}",
         total_games,
         steps,
+        if fastboot { "fastboot" } else { "bios" },
         bios_path.display()
     );
     println!(
@@ -74,18 +92,16 @@ fn main() {
     );
     println!("{}", "-".repeat(128));
 
-    let mut passed_logo = 0usize;
+    let mut signal_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut errored = 0usize;
     for cue in cues {
         let name = game_name(&cue);
-        let result = run_one(&bios, &cue, steps);
+        let result = run_one(&bios, &cue, steps, fastboot);
         if result.error.is_some() {
             errored += 1;
         }
         let signal = boot_signal(&result);
-        if signal == "passed-logo" {
-            passed_logo += 1;
-        }
+        *signal_counts.entry(signal).or_default() += 1;
         println!(
             "{:<42} {:>10}  0x{:08x}  0x{:016x} {:>10} {:>8} {:>8}  {}",
             truncate(&name, 42),
@@ -98,7 +114,7 @@ fn main() {
             summarize_pcs(&result.recent_pcs),
         );
         println!(
-            "  cycles={} tick={} display={}x{} vram_nz={} cd_irq(flag=0x{:02x},mask=0x{:02x}) fifo={} pending={} next={}{}",
+            "  cycles={} tick={} display={}x{} vram_nz={} cd_irq(flag=0x{:02x},mask=0x{:02x}) fifo={} pending={} next={}{}{}",
             result.cycles,
             result.cpu_tick,
             result.display_size.0,
@@ -110,6 +126,11 @@ fn main() {
             result.pending_cdrom_events,
             result.cdrom_next_event,
             result
+                .fast_boot
+                .as_ref()
+                .map(|info| format!(" fastboot={info}"))
+                .unwrap_or_default(),
+            result
                 .error
                 .as_ref()
                 .map(|e| format!(" error={e}"))
@@ -118,12 +139,10 @@ fn main() {
     }
 
     println!("{}", "-".repeat(128));
-    println!(
-        "summary: {passed_logo} passed-logo signal, {errored} errored, {total_games} total"
-    );
+    println!("summary: signals={signal_counts:?}, {errored} errored, {total_games} total");
 }
 
-fn run_one(bios: &[u8], cue: &Path, steps: u64) -> BootResult {
+fn run_one(bios: &[u8], cue: &Path, steps: u64, fastboot: bool) -> BootResult {
     let mut bus = match Bus::new(bios.to_vec()) {
         Ok(bus) => bus,
         Err(e) => {
@@ -133,17 +152,44 @@ fn run_one(bios: &[u8], cue: &Path, steps: u64) -> BootResult {
             };
         }
     };
-    match disc_support::load_disc_path(cue) {
-        Ok(disc) => bus.cdrom.insert_disc(Some(disc)),
+    let disc = match disc_support::load_disc_path(cue) {
+        Ok(disc) => disc,
         Err(e) => {
             return BootResult {
                 error: Some(format!("disc load: {e}")),
                 ..BootResult::default()
             };
         }
-    }
+    };
 
     let mut cpu = Cpu::new();
+    let fast_boot = if fastboot {
+        if let Err(e) =
+            warm_bios_for_disc_fast_boot(&mut bus, &mut cpu, DISC_FAST_BOOT_WARMUP_STEPS)
+        {
+            return BootResult {
+                error: Some(format!("BIOS warmup: {e:?}")),
+                ..BootResult::default()
+            };
+        }
+        match fast_boot_disc_with_hle(&mut bus, &mut cpu, &disc, false) {
+            Ok(info) => Some(format!(
+                "{}@0x{:08x}/{}B/warm{}",
+                info.boot_path, info.initial_pc, info.payload_len, DISC_FAST_BOOT_WARMUP_STEPS
+            )),
+            Err(e) => {
+                return BootResult {
+                    error: Some(format!("fast boot: {e:?}")),
+                    ..BootResult::default()
+                };
+            }
+        }
+    } else {
+        None
+    };
+    bus.cdrom.insert_disc(Some(disc));
+    bus.attach_digital_pad_port1();
+
     let mut cycles_at_last_pump = 0u64;
     let mut recent_pcs = VecDeque::with_capacity(12);
     let mut error = None;
@@ -194,6 +240,7 @@ fn run_one(bios: &[u8], cue: &Path, steps: u64) -> BootResult {
         cdrom_irq_flag: bus.cdrom.irq_flag(),
         cdrom_irq_mask: bus.cdrom.irq_mask_value(),
         cdrom_next_event,
+        fast_boot,
         error,
         recent_pcs,
     }
@@ -209,6 +256,18 @@ fn push_recent_pc(recent_pcs: &mut VecDeque<u32>, pc: u32) {
 fn boot_signal(result: &BootResult) -> &'static str {
     if result.error.is_some() {
         "error"
+    } else if is_bios_license_loop(result) {
+        "bios-loop"
+    } else if result.fast_boot.is_some()
+        && result.display_size.0 > 0
+        && result.display_size.1 > 0
+        && result.vram_nonzero_words > 0
+    {
+        "rendered"
+    } else if result.fast_boot.is_some() && !(0xBFC0_0000..=0xBFC7_FFFF).contains(&result.pc) {
+        "game-code"
+    } else if result.fast_boot.is_some() {
+        "fastboot"
     } else if result.display_hash != SONY_LOGO_HASH {
         "passed-logo"
     } else if result.cdrom_cmds.iter().any(|(op, _)| matches!(*op, 0x06 | 0x1b)) {
@@ -216,6 +275,15 @@ fn boot_signal(result: &BootResult) -> &'static str {
     } else {
         "sony-logo"
     }
+}
+
+fn is_bios_license_loop(result: &BootResult) -> bool {
+    let init_count = result
+        .cdrom_cmds
+        .iter()
+        .find_map(|(op, count)| (*op == 0x0A).then_some(*count))
+        .unwrap_or(0);
+    (0xBFC0_4A00..=0xBFC0_4AFF).contains(&result.pc) && init_count >= 8
 }
 
 fn summarize_cmds(cmds: &[(u8, u32)]) -> String {

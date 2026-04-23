@@ -11,6 +11,9 @@
 //! Runs silently on both sides; ours takes ~2 s for 100 M steps,
 //! Redux ~3 min.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -40,9 +43,8 @@ fn main() {
     let mut bus = Bus::new(bios).expect("bus");
     bus.cdrom.enable_irq_log(max_log as usize);
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc");
-        bus.cdrom
-            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(&PathBuf::from(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
     for _ in 0..n {

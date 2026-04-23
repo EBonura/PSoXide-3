@@ -6,7 +6,9 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 
-use emulator_core::{Bus, Cpu};
+use emulator_core::{
+    fast_boot_disc_with_hle, warm_bios_for_disc_fast_boot, Bus, Cpu, DISC_FAST_BOOT_WARMUP_STEPS,
+};
 use psoxide_settings::library::{GameKind, Region};
 use psoxide_settings::{ConfigPaths, Library, LibraryEntry, Settings};
 use psx_iso::{Disc, Exe, SECTOR_BYTES};
@@ -177,6 +179,7 @@ impl AppState {
         let bus = load_bus(&settings).map(|mut bus| {
             if let Some(exe) = load_exe() {
                 bus.load_exe_payload(exe.load_addr, &exe.payload);
+                bus.clear_exe_bss(exe.bss_addr, exe.bss_size);
                 cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
                 bus.enable_hle_bios();
                 bus.attach_digital_pad_port1();
@@ -259,6 +262,7 @@ impl AppState {
                     .map_err(|e| format!("{}: {e}", entry.path.display()))?;
                 let exe = Exe::parse(&bytes).map_err(|e| format!("parse EXE: {e:?}"))?;
                 bus.load_exe_payload(exe.load_addr, &exe.payload);
+                bus.clear_exe_bss(exe.bss_addr, exe.bss_size);
                 cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
                 // HLE BIOS is effectively mandatory for side-loaded
                 // EXEs: the kernel's syscall tables (A0 / B0 / C0)
@@ -283,7 +287,9 @@ impl AppState {
                         entry.path.display()
                     ));
                 }
-                bus.cdrom.insert_disc(Some(Disc::from_bin(bytes)));
+                let disc = Disc::from_bin(bytes);
+                maybe_fast_boot_disc(&mut bus, &mut cpu, &disc, entry, self.settings.emulator.fast_boot_disc);
+                bus.cdrom.insert_disc(Some(disc));
                 bus.attach_digital_pad_port1();
                 // Load + attach the per-game memory card on port 1.
                 // File lives under `<config>/games/<id>/memcard-1.mcd`;
@@ -297,6 +303,7 @@ impl AppState {
             }
             GameKind::DiscCue => {
                 let disc = psoxide_settings::library::load_disc_from_cue(&entry.path)?;
+                maybe_fast_boot_disc(&mut bus, &mut cpu, &disc, entry, self.settings.emulator.fast_boot_disc);
                 bus.cdrom.insert_disc(Some(disc));
                 bus.attach_digital_pad_port1();
                 self.paths
@@ -683,6 +690,39 @@ pub fn step_one_frame(state: &mut AppState) {
                 break;
             }
         }
+    }
+}
+
+fn maybe_fast_boot_disc(
+    bus: &mut Bus,
+    cpu: &mut Cpu,
+    disc: &Disc,
+    entry: &LibraryEntry,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    if let Err(e) = warm_bios_for_disc_fast_boot(bus, cpu, DISC_FAST_BOOT_WARMUP_STEPS) {
+        eprintln!(
+            "[frontend] BIOS warmup failed for {} ({e:?}); falling back to BIOS boot",
+            entry.path.display()
+        );
+        return;
+    }
+    match fast_boot_disc_with_hle(bus, cpu, disc, false) {
+        Ok(info) => eprintln!(
+            "[frontend] warm-fast-booted {} via {} entry=0x{:08x} load=0x{:08x} payload={}B",
+            entry.path.display(),
+            info.boot_path,
+            info.initial_pc,
+            info.load_addr,
+            info.payload_len
+        ),
+        Err(e) => eprintln!(
+            "[frontend] fast boot unavailable for {} ({e:?}); falling back to BIOS boot",
+            entry.path.display()
+        ),
     }
 }
 

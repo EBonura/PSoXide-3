@@ -199,6 +199,26 @@ impl Cpu {
         }
     }
 
+    /// Seed CPU state from a PSX-EXE header plus BIOS `Exec` arguments.
+    ///
+    /// Retail disc boot enters through `Exec(header, argc, argv)`,
+    /// which moves `argc` into `$a0` and `argv` into `$a1` before
+    /// jumping to the EXE entry point. Fast-boot paths that warm the
+    /// real BIOS first must set these explicitly so stale BIOS register
+    /// values do not leak into game code.
+    pub fn seed_from_exe_with_args(
+        &mut self,
+        initial_pc: u32,
+        initial_gp: u32,
+        initial_sp: Option<u32>,
+        argc: u32,
+        argv: u32,
+    ) {
+        self.seed_from_exe(initial_pc, initial_gp, initial_sp);
+        self.set_gpr(4, argc);
+        self.set_gpr(5, argv);
+    }
+
     /// Current program counter.
     #[inline]
     pub fn pc(&self) -> u32 {

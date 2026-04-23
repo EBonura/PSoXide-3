@@ -6,8 +6,11 @@
 //! cargo run --release -p emulator-core --example probe_openevent_returns -- 20000000 "/path/to/game.bin"
 //! ```
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::{Bus, Cpu};
-use psx_iso::Disc;
+use std::path::Path;
 
 #[derive(Copy, Clone)]
 struct PendingCall {
@@ -29,8 +32,8 @@ fn main() {
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
     if let Some(ref path) = disc_path {
-        let disc = std::fs::read(path).expect("disc");
-        bus.cdrom.insert_disc(Some(Disc::from_bin(disc)));
+        let disc = disc_support::load_disc_path(Path::new(path)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
 

@@ -9,11 +9,13 @@
 //! cargo run -p parity-oracle --example display_parity_at --release -- 100000000
 //! ```
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::{Bus, Cpu};
 use parity_oracle::{OracleConfig, ReduxProcess};
-use psx_iso::Disc;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -70,8 +72,8 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("bios");
     let mut bus = Bus::new(bios).expect("bus");
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc");
-        bus.cdrom.insert_disc(Some(Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(&PathBuf::from(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
     eprintln!("[ours]  running {n} steps in our emulator...");

@@ -3,7 +3,11 @@
 //! a tight polling loop and we need the register values, not just the
 //! PC.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::{Bus, Cpu};
+use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -16,10 +20,9 @@ fn main() {
         .expect("usage: probe_spin_state <steps> <disc.bin>");
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
-    let disc_bytes = std::fs::read(disc_path).expect("disc readable");
     let mut bus = Bus::new(bios).expect("bus");
-    bus.cdrom
-        .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+    let disc = disc_support::load_disc_path(Path::new(disc_path)).expect("disc readable");
+    bus.cdrom.insert_disc(Some(disc));
     let mut cpu = Cpu::new();
 
     for _ in 0..n {

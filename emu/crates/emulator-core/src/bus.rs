@@ -786,6 +786,39 @@ impl Bus {
         self.ram[base as usize..base as usize + payload.len()].copy_from_slice(payload);
     }
 
+    /// Zero the optional BSS range declared by a PSX-EXE header.
+    ///
+    /// The BIOS clears this area before jumping to the executable;
+    /// side-load and fast-boot paths need to do the same because they
+    /// bypass the BIOS loader.
+    pub fn clear_exe_bss(&mut self, bss_addr: u32, bss_size: u32) {
+        if bss_size == 0 {
+            return;
+        }
+        let base = bss_addr & 0x001F_FFFF; // KSEG/KUSEG -> physical RAM
+        let size = bss_size as usize;
+        assert!(
+            (base as usize) + size <= self.ram.len(),
+            "EXE BSS overflows RAM: bss_addr={bss_addr:#010x} len={size}",
+        );
+        self.ram[base as usize..base as usize + size].fill(0);
+    }
+
+    /// Zero an address range in main RAM after KSEG/KUSEG address
+    /// normalization. The end address is exclusive.
+    pub fn clear_ram_range(&mut self, start_addr: u32, end_addr: u32) {
+        let start = (start_addr & 0x001F_FFFF) as usize;
+        let end = (end_addr & 0x001F_FFFF) as usize;
+        if end <= start {
+            return;
+        }
+        assert!(
+            end <= self.ram.len(),
+            "RAM clear range overflows: start={start_addr:#010x} end={end_addr:#010x}",
+        );
+        self.ram[start..end].fill(0);
+    }
+
     /// Run DMA on a single channel after its CHCR was just written
     /// with the start bit set. Mirrors Redux's per-channel
     /// `dmaExec<N>` dispatch in `psxhw.cc` — each CHCR write goes

@@ -190,6 +190,32 @@ struct PendingEvent {
     followup: Option<PendingFollowup>,
 }
 
+/// One command-port write captured for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdRomCommandLogEntry {
+    /// Bus cycle when the command byte was written.
+    pub cycle: u64,
+    /// Command byte written to `0x1F801801`.
+    pub command: u8,
+    /// Parameter FIFO contents drained by this command.
+    pub params: [u8; PARAM_FIFO_DEPTH],
+    /// Number of valid bytes in [`CdRomCommandLogEntry::params`].
+    pub param_len: u8,
+}
+
+/// One IRQ response packet delivered by the controller, captured for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdRomResponseLogEntry {
+    /// Bus cycle when the response IRQ packet was latched.
+    pub cycle: u64,
+    /// IRQ type associated with this packet.
+    pub irq: IrqType,
+    /// Response FIFO contents published by this packet.
+    pub bytes: [u8; RESPONSE_FIFO_DEPTH],
+    /// Number of valid bytes in [`CdRomResponseLogEntry::bytes`].
+    pub len: u8,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DriveState {
     Stopped,
@@ -260,6 +286,15 @@ pub struct CdRom {
     /// — used by the `cdrom_probe` example to log exactly which
     /// command was just issued at each `commands_dispatched` bump.
     last_command: u8,
+    /// Bounded command log. Disabled by default; probes opt in with
+    /// [`CdRom::enable_command_log`] when command parameters matter.
+    command_log: Vec<CdRomCommandLogEntry>,
+    /// Max length of [`CdRom::command_log`].
+    command_log_cap: usize,
+    /// Bounded response-packet log for diagnostics.
+    response_log: Vec<CdRomResponseLogEntry>,
+    /// Max length of [`CdRom::response_log`].
+    response_log_cap: usize,
     /// Total bytes popped from the data FIFO via MMIO reads.
     /// Diagnostic. If this grows in lockstep with DataReady events
     /// the BIOS is actually consuming the sectors we delivered; if
@@ -423,6 +458,10 @@ impl CdRom {
             commands_dispatched: 0,
             command_hist: [0; 32],
             last_command: 0,
+            command_log: Vec::new(),
+            command_log_cap: 0,
+            response_log: Vec::new(),
+            response_log_cap: 0,
             data_fifo_pops: 0,
             scheduling_cycle: 0,
             irq_type_counts: [0; 6],
@@ -729,6 +768,17 @@ impl CdRom {
         // Drain parameters into a local vec — handlers need them and
         // pop-order matches push-order.
         let params: Vec<u8> = self.params.drain(..).collect();
+        if self.command_log.len() < self.command_log_cap {
+            let mut logged_params = [0u8; PARAM_FIFO_DEPTH];
+            let n = params.len().min(PARAM_FIFO_DEPTH);
+            logged_params[..n].copy_from_slice(&params[..n]);
+            self.command_log.push(CdRomCommandLogEntry {
+                cycle: now,
+                command,
+                params: logged_params,
+                param_len: n as u8,
+            });
+        }
 
         match command {
             // Sync / NOP — acts as GetStat.
@@ -1037,6 +1087,7 @@ impl CdRom {
 
     fn cmd_pause(&mut self) {
         let was_motor_on = self.motor_on;
+        let ack_stat = self.stat_byte();
         // Pause halts the sector-read chain but leaves the motor on.
         // Missing this flip meant DataReady events kept chaining
         // `load_next_sector + schedule_sector_event` indefinitely
@@ -1048,7 +1099,7 @@ impl CdRom {
         self.location_changed = false;
         self.drive_status &= !drive_status_bit::PLAYING;
         self.reset_xa_stream();
-        self.schedule_first_response(vec![self.stat_byte()]);
+        self.schedule_first_response(vec![ack_stat]);
         let stat = self.stat_byte();
         // Redux uses a short ~7000-cycle follow-up when the drive is
         // already spun up ("standby"), and a much longer completion
@@ -1527,25 +1578,18 @@ impl CdRom {
 
     fn cmd_getid(&mut self) {
         if self.disc_present {
-            // Licensed PS1 disc response: 8 bytes.
-            //   [0]: stat (0x02 = motor on)
-            //   [1]: flags (0x00 = licensed)
-            //   [2]: disc type (0x20 = mode-2 data)
-            //   [3]: reserved 0
-            //   [4..=7]: region code
-            //
-            // Region comes from the disc's license sector (LBA 4
-            // user-data), which carries the same "Sony Computer
-            // Entertainment Amer/Euro/Inc." strings the BIOS checks.
-            // Falling back to SCEA keeps homebrew / synthetic discs on
-            // the permissive US path instead of spuriously rejecting.
+            // Match PCSX-Redux's BIOS-visible response exactly:
+            // stat, licensed flags clear, two reserved zeros, then a
+            // benign four-byte controller ID. The BIOS has already
+            // verified the region/license string by reading the early
+            // data sectors; returning SCEA/SCEE here made every local
+            // disc reach the license screen and then fall back to the
+            // shell's repeated Init loop instead of continuing into the
+            // filesystem boot path.
             let stat = self.stat_byte();
-            let region = self.disc.as_ref().map(disc_region_code).unwrap_or(*b"SCEA");
             self.schedule_first_response(vec![stat]);
             self.schedule_second_response(
-                vec![
-                    0x02, 0x00, 0x20, 0x00, region[0], region[1], region[2], region[3],
-                ],
+                vec![stat, 0x00, 0x00, 0x00, b'P', b'C', b'S', b'X'],
                 GETID_SECOND_RESPONSE_CYCLES,
             );
         } else {
@@ -1658,6 +1702,17 @@ impl CdRom {
                     self.responses.push_back(b);
                 }
             }
+            if self.response_log.len() < self.response_log_cap {
+                let mut bytes = [0u8; RESPONSE_FIFO_DEPTH];
+                let n = ev.bytes.len().min(RESPONSE_FIFO_DEPTH);
+                bytes[..n].copy_from_slice(&ev.bytes[..n]);
+                self.response_log.push(CdRomResponseLogEntry {
+                    cycle: cycles_now,
+                    irq: ev.irq,
+                    bytes,
+                    len: n as u8,
+                });
+            }
             self.command_busy = false;
             // Raise IRQ. The flag-gate above already guaranteed
             // irq_flag was 0 on entry.
@@ -1701,6 +1756,28 @@ impl CdRom {
     /// Per-command histogram (indexed by command byte) — same purpose.
     pub fn command_histogram(&self) -> &[u32; 32] {
         &self.command_hist
+    }
+
+    /// Enable bounded command logging for diagnostics.
+    pub fn enable_command_log(&mut self, cap: usize) {
+        self.command_log_cap = cap;
+        self.command_log.clear();
+    }
+
+    /// Captured command-port writes, up to the configured cap.
+    pub fn command_log(&self) -> &[CdRomCommandLogEntry] {
+        &self.command_log
+    }
+
+    /// Enable bounded response-packet logging for diagnostics.
+    pub fn enable_response_log(&mut self, cap: usize) {
+        self.response_log_cap = cap;
+        self.response_log.clear();
+    }
+
+    /// Captured response IRQ packets, up to the configured cap.
+    pub fn response_log(&self) -> &[CdRomResponseLogEntry] {
+        &self.response_log
     }
 
     /// Current raw IRQ-flag (for diagnostics).
@@ -1837,6 +1914,7 @@ impl Default for CdRom {
 // can use them.
 use psx_iso::{bin_to_bcd, lba_to_msf};
 
+#[cfg(test)]
 fn disc_region_code(disc: &Disc) -> [u8; 4] {
     let Some(user) = disc.read_sector_user(4) else {
         return *b"SCEA";
@@ -2456,6 +2534,12 @@ mod tests {
 
         let ack_deadline = 1_000 + FIRST_RESPONSE_CYCLES;
         assert!(cd.tick(ack_deadline + 1));
+        assert_eq!(
+            cd.read8(BASE + 1),
+            drive_status_bit::MOTOR_ON | drive_status_bit::READING,
+            "Pause ACK should report the pre-pause read state"
+        );
+        cd.irq_flag = 0;
         let pause_complete = cd
             .pending
             .iter()
