@@ -35,6 +35,7 @@ use crate::gfx::Graphics;
 use crate::ui::{menu::MenuInput, MenuOutcome};
 
 use emulator_core::{button, spu::SAMPLE_CYCLES};
+use psoxide_settings::settings::{InputBinding, PortBindings};
 
 /// Default window size when not running fullscreen. Chosen big
 /// enough to show the Menu + a framebuffer comfortably on a
@@ -153,33 +154,56 @@ impl Shell {
     }
 }
 
-/// Map a winit logical key to a PSX digital-pad bitmask. Returns
-/// `None` for keys that aren't bound.
-///
-/// Bindings: arrows = D-pad, Z = Cross, X = Circle, A = Square,
-/// S = Triangle, Enter = Start, Shift = Select, Q/W = L1/R1,
-/// E/R = L2/R2. Lowercase vs. uppercase doesn't matter — winit
-/// gives us the logical key post-modifier, we compare on the
-/// character directly.
-fn key_to_pad_button(key: &Key) -> Option<u16> {
+/// Map a winit logical key to a PSX digital-pad bitmask using the
+/// persisted port-1 bindings. Returns `None` for keys that aren't
+/// bound.
+fn key_to_pad_button(key: &Key, bindings: &PortBindings) -> Option<u16> {
+    [
+        (button::UP, &bindings.up),
+        (button::DOWN, &bindings.down),
+        (button::LEFT, &bindings.left),
+        (button::RIGHT, &bindings.right),
+        (button::CROSS, &bindings.cross),
+        (button::CIRCLE, &bindings.circle),
+        (button::SQUARE, &bindings.square),
+        (button::TRIANGLE, &bindings.triangle),
+        (button::L1, &bindings.l1),
+        (button::R1, &bindings.r1),
+        (button::L2, &bindings.l2),
+        (button::R2, &bindings.r2),
+        (button::START, &bindings.start),
+        (button::SELECT, &bindings.select),
+    ]
+    .into_iter()
+    .find_map(|(mask, binding)| binding_matches_key(binding, key).then_some(mask))
+}
+
+fn binding_matches_key(binding: &InputBinding, key: &Key) -> bool {
+    match (binding, key) {
+        (InputBinding::Unbound, _) => false,
+        (InputBinding::Character(expected), Key::Character(actual)) => actual
+            .chars()
+            .next()
+            .is_some_and(|c| c.eq_ignore_ascii_case(expected)),
+        (InputBinding::Named(expected), Key::Named(actual)) => {
+            named_key_label(actual).is_some_and(|name| expected.eq_ignore_ascii_case(name))
+        }
+        _ => false,
+    }
+}
+
+fn named_key_label(key: &NamedKey) -> Option<&'static str> {
     match key {
-        Key::Named(NamedKey::ArrowUp) => Some(button::UP),
-        Key::Named(NamedKey::ArrowDown) => Some(button::DOWN),
-        Key::Named(NamedKey::ArrowLeft) => Some(button::LEFT),
-        Key::Named(NamedKey::ArrowRight) => Some(button::RIGHT),
-        Key::Named(NamedKey::Enter) => Some(button::START),
-        Key::Named(NamedKey::Shift) => Some(button::SELECT),
-        Key::Character(s) => match s.as_str() {
-            "z" | "Z" => Some(button::CROSS),
-            "x" | "X" => Some(button::CIRCLE),
-            "a" | "A" => Some(button::SQUARE),
-            "s" | "S" => Some(button::TRIANGLE),
-            "q" | "Q" => Some(button::L1),
-            "w" | "W" => Some(button::R1),
-            "e" | "E" => Some(button::L2),
-            "r" | "R" => Some(button::R2),
-            _ => None,
-        },
+        NamedKey::ArrowUp => Some("ArrowUp"),
+        NamedKey::ArrowDown => Some("ArrowDown"),
+        NamedKey::ArrowLeft => Some("ArrowLeft"),
+        NamedKey::ArrowRight => Some("ArrowRight"),
+        NamedKey::Enter => Some("Enter"),
+        NamedKey::Backspace => Some("Backspace"),
+        NamedKey::Shift => Some("Shift"),
+        NamedKey::Space => Some("Space"),
+        NamedKey::Tab => Some("Tab"),
+        NamedKey::Escape => Some("Escape"),
         _ => None,
     }
 }
@@ -254,7 +278,9 @@ impl ApplicationHandler for Shell {
                 // events are ignored — the key is already down, and the
                 // BIOS polls every frame anyway.
                 if !repeat {
-                    if let Some(mask) = key_to_pad_button(&logical_key) {
+                    if let Some(mask) =
+                        key_to_pad_button(&logical_key, &self.state.settings.input.port1)
+                    {
                         match state {
                             ElementState::Pressed => self.pad1_mask |= mask,
                             ElementState::Released => self.pad1_mask &= !mask,
@@ -457,4 +483,46 @@ fn merge_key(mut input: MenuInput, key: &Key) -> MenuInput {
         _ => {}
     }
     input
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_mapping_uses_default_settings() {
+        let bindings = PortBindings::default();
+
+        assert_eq!(
+            key_to_pad_button(&Key::Character("x".into()), &bindings),
+            Some(button::CROSS)
+        );
+        assert_eq!(
+            key_to_pad_button(&Key::Character("c".into()), &bindings),
+            Some(button::CIRCLE)
+        );
+        assert_eq!(
+            key_to_pad_button(&Key::Character("z".into()), &bindings),
+            Some(button::SQUARE)
+        );
+        assert_eq!(
+            key_to_pad_button(&Key::Named(NamedKey::Backspace), &bindings),
+            Some(button::SELECT)
+        );
+    }
+
+    #[test]
+    fn keyboard_mapping_honors_rebound_button() {
+        let mut bindings = PortBindings::default();
+        bindings.cross = InputBinding::Character('j');
+
+        assert_eq!(
+            key_to_pad_button(&Key::Character("j".into()), &bindings),
+            Some(button::CROSS)
+        );
+        assert_eq!(
+            key_to_pad_button(&Key::Character("x".into()), &bindings),
+            None
+        );
+    }
 }

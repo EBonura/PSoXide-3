@@ -84,6 +84,10 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
             }
             MenuOutcome::None
         }
+        ToggleFastBoot => {
+            state.toggle_fast_boot_disc();
+            MenuOutcome::None
+        }
         FillVramTestPattern => {
             if let Some(bus) = state.bus.as_mut() {
                 fill_vram_test_pattern(&mut bus.gpu.vram);

@@ -233,6 +233,8 @@ impl AppState {
         // possibly-rescanned) library so the user sees entries
         // immediately instead of a "No games found" placeholder.
         out.refresh_menu_library();
+        out.menu
+            .sync_fast_boot_label(out.settings.emulator.fast_boot_disc);
         out
     }
 }
@@ -255,6 +257,7 @@ impl AppState {
             std::fs::read(&bios_path).map_err(|e| format!("BIOS {}: {e}", bios_path.display()))?;
         let mut bus = Bus::new(bios).map_err(|e| format!("BIOS rejected: {e}"))?;
         let mut cpu = Cpu::new();
+        let mut boot_mode = "EXE";
 
         match entry.kind {
             GameKind::Exe => {
@@ -288,7 +291,7 @@ impl AppState {
                     ));
                 }
                 let disc = Disc::from_bin(bytes);
-                maybe_fast_boot_disc(
+                boot_mode = maybe_fast_boot_disc(
                     &mut bus,
                     &mut cpu,
                     &disc,
@@ -309,7 +312,7 @@ impl AppState {
             }
             GameKind::DiscCue => {
                 let disc = psoxide_settings::library::load_disc_from_cue(&entry.path)?;
-                maybe_fast_boot_disc(
+                boot_mode = maybe_fast_boot_disc(
                     &mut bus,
                     &mut cpu,
                     &disc,
@@ -347,7 +350,7 @@ impl AppState {
         self.current_game = Some(entry.clone());
         self.menu.sync_run_label(true);
         self.status_message = Some((
-            format!("Launched: {}", entry.title),
+            format!("Launched: {} ({boot_mode})", entry.title),
             STATUS_MESSAGE_TTL_SECS,
         ));
         Ok(())
@@ -550,6 +553,29 @@ impl AppState {
             .map_err(|e| format!("save settings.ron: {e}"))
     }
 
+    /// Flip the disc fast-boot preference, keep the Menu label in
+    /// sync, and persist immediately so the next launch uses the
+    /// requested path even if the app exits abruptly.
+    pub fn toggle_fast_boot_disc(&mut self) {
+        let enabled = !self.settings.emulator.fast_boot_disc;
+        self.settings.emulator.fast_boot_disc = enabled;
+        self.menu.sync_fast_boot_label(enabled);
+
+        let msg = if enabled {
+            "Fast boot enabled: PS logo skipped on disc launch"
+        } else {
+            "Fast boot disabled: BIOS logo shown on disc launch"
+        };
+
+        match self.save_settings() {
+            Ok(()) => self.status_message_set(msg),
+            Err(e) => {
+                eprintln!("[frontend] {e}");
+                self.status_message_set(format!("{msg} (settings save failed)"));
+            }
+        }
+    }
+
     /// Flush any dirty memory-card state on port 1 back to its
     /// `<config>/games/<id>/memcard-1.mcd` file. A no-op when no
     /// card is attached or when no writes have landed since load.
@@ -711,30 +737,36 @@ fn maybe_fast_boot_disc(
     disc: &Disc,
     entry: &LibraryEntry,
     enabled: bool,
-) {
+) -> &'static str {
     if !enabled {
-        return;
+        return "BIOS boot";
     }
     if let Err(e) = warm_bios_for_disc_fast_boot(bus, cpu, DISC_FAST_BOOT_WARMUP_STEPS) {
         eprintln!(
             "[frontend] BIOS warmup failed for {} ({e:?}); falling back to BIOS boot",
             entry.path.display()
         );
-        return;
+        return "BIOS boot";
     }
     match fast_boot_disc_with_hle(bus, cpu, disc, false) {
-        Ok(info) => eprintln!(
-            "[frontend] warm-fast-booted {} via {} entry=0x{:08x} load=0x{:08x} payload={}B",
-            entry.path.display(),
-            info.boot_path,
-            info.initial_pc,
-            info.load_addr,
-            info.payload_len
-        ),
-        Err(e) => eprintln!(
-            "[frontend] fast boot unavailable for {} ({e:?}); falling back to BIOS boot",
-            entry.path.display()
-        ),
+        Ok(info) => {
+            eprintln!(
+                "[frontend] warm-fast-booted {} via {} entry=0x{:08x} load=0x{:08x} payload={}B",
+                entry.path.display(),
+                info.boot_path,
+                info.initial_pc,
+                info.load_addr,
+                info.payload_len
+            );
+            "fast boot"
+        }
+        Err(e) => {
+            eprintln!(
+                "[frontend] fast boot unavailable for {} ({e:?}); falling back to BIOS boot",
+                entry.path.display()
+            );
+            "BIOS boot"
+        }
     }
 }
 

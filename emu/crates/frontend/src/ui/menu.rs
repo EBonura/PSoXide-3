@@ -39,6 +39,9 @@ pub enum MenuAction {
     StepOne,
     /// Reseat the CPU at its reset vector.
     Reset,
+    /// Toggle warm SYSTEM.CNF disc fast boot. When disabled, discs
+    /// boot through the full BIOS logo path.
+    ToggleFastBoot,
     /// Paint a test pattern into VRAM (dev aid until the GPU renders).
     FillVramTestPattern,
     /// Launch a game by its stable library ID. The app layer
@@ -222,6 +225,20 @@ impl MenuState {
         }
     }
 
+    /// Update the System category's disc fast-boot value after the
+    /// persisted setting changes.
+    pub fn sync_fast_boot_label(&mut self, enabled: bool) {
+        if let Some(system) = self.categories.iter_mut().find(|c| c.name == "System") {
+            if let Some(item) = system
+                .items
+                .iter_mut()
+                .find(|item| item.action == MenuAction::ToggleFastBoot)
+            {
+                item.value = Some(if enabled { "On" } else { "Off" }.into());
+            }
+        }
+    }
+
     /// Feed one frame of input. Returns `Some(action)` when a confirm
     /// selects an item.
     pub fn update(&mut self, input: &MenuInput) -> Option<MenuAction> {
@@ -275,6 +292,7 @@ impl MenuState {
     /// tests use it to assert the menu is populated correctly
     /// without driving input events.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn selected_action(&self) -> Option<&MenuAction> {
         self.categories
             .get(self.category_index)
@@ -605,6 +623,11 @@ fn build_system_category(running: bool) -> Category {
                 action: MenuAction::Reset,
                 value: None,
             },
+            MenuItem {
+                label: "Fast boot discs".into(),
+                action: MenuAction::ToggleFastBoot,
+                value: Some("On".into()),
+            },
         ],
     }
 }
@@ -706,6 +729,33 @@ mod tests {
         assert_eq!(s.categories[2].items[0].label, "Pause");
         s.sync_run_label(false);
         assert_eq!(s.categories[2].items[0].label, "Run");
+    }
+
+    #[test]
+    fn sync_fast_boot_label_flips_system_value() {
+        let mut s = MenuState::new();
+        let fast_boot = s.categories[2]
+            .items
+            .iter()
+            .find(|item| item.action == MenuAction::ToggleFastBoot)
+            .unwrap();
+        assert_eq!(fast_boot.value.as_deref(), Some("On"));
+
+        s.sync_fast_boot_label(false);
+        let fast_boot = s.categories[2]
+            .items
+            .iter()
+            .find(|item| item.action == MenuAction::ToggleFastBoot)
+            .unwrap();
+        assert_eq!(fast_boot.value.as_deref(), Some("Off"));
+
+        s.sync_fast_boot_label(true);
+        let fast_boot = s.categories[2]
+            .items
+            .iter()
+            .find(|item| item.action == MenuAction::ToggleFastBoot)
+            .unwrap();
+        assert_eq!(fast_boot.value.as_deref(), Some("On"));
     }
 
     #[test]

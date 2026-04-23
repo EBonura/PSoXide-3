@@ -65,10 +65,27 @@ pub fn draw(ctx: &Context, state: &mut AppState) {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     draw_buttons(ui, state);
                     ui.add_space(12.0);
+                    draw_boot_toggle(ui, state);
+                    ui.add_space(12.0);
                     draw_debug_toggles(ui, state);
                 });
             });
         });
+}
+
+/// Disc boot-mode toggle. Active means warm fast boot is used on the
+/// next disc launch; inactive means the full BIOS logo path.
+fn draw_boot_toggle(ui: &mut egui::Ui, state: &mut AppState) {
+    let enabled = state.settings.emulator.fast_boot_disc;
+    let tooltip = if enabled {
+        "Disc fast boot enabled - skips BIOS logo"
+    } else {
+        "Disc fast boot disabled - full BIOS logo boot"
+    };
+    let btn = toggle_button(icons::DISC, enabled);
+    if ui.add(btn).on_hover_text(tooltip).clicked() {
+        state.toggle_fast_boot_disc();
+    }
 }
 
 /// Debug-panel toggle cluster. Each button reflects the current on/off
