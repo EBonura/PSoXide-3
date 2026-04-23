@@ -1,4 +1,5 @@
-//! Capture Redux's and our display-area pixels at step N, compare
+//! Capture Redux's and our display-area pixels at Redux-style user
+//! step N, compare
 //! byte-for-byte, and report exactly what matches and where. Used
 //! to establish Redux-anchored display parity for milestone
 //! goldens (Sony logo, shell, PlayStation splash, game title) so
@@ -77,9 +78,7 @@ fn main() {
     }
     let mut cpu = Cpu::new();
     eprintln!("[ours]  running {n} steps in our emulator...");
-    for _ in 0..n {
-        cpu.step(&mut bus).expect("step");
-    }
+    step_ours_user_steps(&mut cpu, &mut bus, n);
     let (_ours_hash, ours_w, ours_h, ours_len) = bus.gpu.display_hash();
     // Also dump raw bytes for direct comparison.
     let da = bus.gpu.display_area();
@@ -146,6 +145,18 @@ fn main() {
     println!();
     println!("Redux raw bytes: {}", redux_path.display());
     println!("Ours raw bytes:  {}", ours_path.display());
+}
+
+fn step_ours_user_steps(cpu: &mut Cpu, bus: &mut Bus, steps: u64) {
+    for _ in 0..steps {
+        let was_in_isr = cpu.in_isr();
+        cpu.step(bus).expect("step");
+        if !was_in_isr && cpu.in_irq_handler() {
+            while cpu.in_irq_handler() {
+                cpu.step(bus).expect("isr step");
+            }
+        }
+    }
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {

@@ -70,7 +70,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// capturing.
 #[derive(Clone, Copy, Debug)]
 struct Checkpoint {
-    /// Instruction count from cold boot.
+    /// Redux-style user-step count from cold boot.
     steps: u64,
     /// Human-readable label; shows up in the report + PPM filenames.
     name: &'static str,
@@ -382,9 +382,12 @@ fn run_parity_suite(suite: &str, disc_path: Option<&str>, checkpoints: &[Checkpo
     }
 }
 
-/// Step our CPU forward `delta` instructions, pumping SPU every
-/// ~560k cycles to mirror the frontend's per-frame cadence. Returns
-/// the sub-step the CPU errored at, or `None` on clean finish.
+/// Step our CPU forward `delta` Redux-style user steps, pumping SPU
+/// every ~560k cycles to mirror the frontend's per-frame cadence.
+/// Redux's `stepIn` breakpoint sits in user code, so an IRQ entered
+/// by a user instruction is folded into that same outer step; mirror
+/// that here or visual checkpoints compare different timelines.
+/// Returns the sub-step the CPU errored at, or `None` on clean finish.
 fn step_ours(
     cpu: &mut Cpu,
     bus: &mut Bus,
@@ -392,16 +395,33 @@ fn step_ours(
     cycles_at_last_pump: &mut u64,
 ) -> Option<u64> {
     for i in 0..delta {
-        if cpu.step(bus).is_err() {
+        let was_in_isr = cpu.in_isr();
+        if step_once_and_pump(cpu, bus, cycles_at_last_pump).is_err() {
             return Some(i);
         }
-        if bus.cycles() - *cycles_at_last_pump > 560_000 {
-            *cycles_at_last_pump = bus.cycles();
-            bus.run_spu_samples(735);
-            let _ = bus.spu.drain_audio();
+        if !was_in_isr && cpu.in_irq_handler() {
+            while cpu.in_irq_handler() {
+                if step_once_and_pump(cpu, bus, cycles_at_last_pump).is_err() {
+                    return Some(i);
+                }
+            }
         }
     }
     None
+}
+
+fn step_once_and_pump(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    cycles_at_last_pump: &mut u64,
+) -> Result<(), emulator_core::ExecutionError> {
+    cpu.step(bus)?;
+    if bus.cycles() - *cycles_at_last_pump > 560_000 {
+        *cycles_at_last_pump = bus.cycles();
+        bus.run_spu_samples(735);
+        let _ = bus.spu.drain_audio();
+    }
+    Ok(())
 }
 
 /// Compare two equally-sized framebuffers. Returns

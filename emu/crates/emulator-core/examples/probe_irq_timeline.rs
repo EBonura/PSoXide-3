@@ -3,6 +3,20 @@
 
 use emulator_core::{Bus, Cpu};
 
+const IRQ_NAMES: [&str; 11] = [
+    "VBlank",
+    "Gpu",
+    "Cdrom",
+    "Dma",
+    "Timer0",
+    "Timer1",
+    "Timer2",
+    "Controller",
+    "Sio",
+    "Spu",
+    "Lightpen",
+];
+
 fn main() {
     let from_step: u64 = std::env::args()
         .nth(1)
@@ -40,21 +54,27 @@ fn main() {
         let step_n = from_step + i;
         let pre_cyc = bus.cycles();
         let pre_pc = cpu.pc();
+        let pre_istat = bus.irq().stat();
+        let pre_imask = bus.irq().mask();
 
         let was_in_isr = cpu.in_isr();
         cpu.step(&mut bus).expect("step");
         let mut isr_info = String::new();
         if !was_in_isr && cpu.in_irq_handler() {
             let isr_start_cyc = bus.cycles();
+            let irq_istat = bus.irq().stat();
+            let irq_imask = bus.irq().mask();
             let mut isr_count = 0;
             while cpu.in_irq_handler() {
                 cpu.step(&mut bus).expect("isr step");
                 isr_count += 1;
             }
+            let sources = pending_sources(irq_istat & irq_imask);
             isr_info = format!(
-                " ISR={}steps/{}cyc",
+                " ISR={}steps/{}cyc src=[{}] pre_istat=0x{pre_istat:03x} pre_imask=0x{pre_imask:03x} irq_istat=0x{irq_istat:03x} irq_imask=0x{irq_imask:03x}",
                 isr_count,
-                bus.cycles() - isr_start_cyc
+                bus.cycles() - isr_start_cyc,
+                sources.join(","),
             );
         }
 
@@ -79,4 +99,14 @@ fn main() {
         last_istat = istat;
         last_cflag = cflag;
     }
+}
+
+fn pending_sources(bits: u32) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for (idx, name) in IRQ_NAMES.iter().enumerate() {
+        if bits & (1 << idx) != 0 {
+            out.push(*name);
+        }
+    }
+    out
 }

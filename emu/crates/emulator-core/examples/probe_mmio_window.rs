@@ -1,3 +1,6 @@
+//! Print a small execution window plus the tail of selected MMIO
+//! accesses around a user-step checkpoint.
+
 use emulator_core::{Bus, Cpu};
 
 #[cfg(feature = "trace-mmio")]
@@ -75,5 +78,7 @@ fn main() {
 
 #[cfg(feature = "trace-mmio")]
 fn is_interest(addr: u32) -> bool {
-    (0x1f80_1800..=0x1f80_1803).contains(&addr) || (0x1f80_1070..=0x1f80_1074).contains(&addr)
+    (0x1f80_1100..=0x1f80_112f).contains(&addr)
+        || (0x1f80_1800..=0x1f80_1803).contains(&addr)
+        || (0x1f80_1070..=0x1f80_1074).contains(&addr)
 }

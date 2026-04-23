@@ -16,12 +16,14 @@
 //!
 //! Flags:
 //!   `--disc PATH`    : BIN/CUE (BIN only for now) to mount on both.
-//!   `--steps N`      : total instructions to run (default 100 M).
-//!   `--chunk N`      : instructions per checkpoint (default 1 M).
+//!   `--steps N`      : total Redux-style user steps to run (default 100 M).
+//!   `--chunk N`      : user steps per checkpoint (default 1 M).
 //!   `--bios PATH`    : override the default SCPH1001.BIN path.
 //!
-//! Exit code 0 iff every checkpoint matched. Non-zero on first
-//! divergence, with the step count and both hashes printed.
+//! Exit code 0 iff every checkpoint matched or any transient mismatch
+//! converged again before the final checkpoint. Non-zero when the run
+//! ends with an unresolved mismatch, with the step count and both
+//! hashes printed.
 
 use std::env;
 use std::path::PathBuf;
@@ -40,6 +42,18 @@ struct Args {
     bios: PathBuf,
     steps: u64,
     chunk: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMismatch {
+    step: u64,
+    kind: &'static str,
+    our_hash: u64,
+    redux_hash: u64,
+    our_w: u32,
+    our_h: u32,
+    redux_w: u32,
+    redux_h: u32,
 }
 
 fn main() {
@@ -79,6 +93,8 @@ fn main() {
     // --- Run + compare in chunks ---------------------------------------
     let mut cursor: u64 = 0;
     let mut chunk_count = 0u64;
+    let mut mismatch_count = 0u64;
+    let mut pending_mismatch: Option<PendingMismatch> = None;
     let started = Instant::now();
     while cursor < args.steps {
         let chunk = args.chunk.min(args.steps - cursor);
@@ -91,17 +107,14 @@ fn main() {
             std::process::exit(1);
         }
 
-        // Us: step one instruction at a time. We don't collapse IRQs
-        // here — Redux's `run` also doesn't collapse (it's natural
-        // execution). Both sides retire the same number of
-        // instructions per chunk.
-        for _ in 0..chunk {
-            if let Err(e) = cpu.step(&mut bus) {
-                let total = cursor + cpu.tick().saturating_sub(cursor);
-                eprintln!("[disc-parity] our emulator stopped at step ≈{total}: {e:?}");
-                cleanup(redux);
-                std::process::exit(1);
-            }
+        // Us: mirror Redux's user-side stepping. Redux's `stepIn`
+        // breakpoint is in user code, so an IRQ entered by a user
+        // instruction runs through to RFE inside the same outer step.
+        if let Some((sub_step, err)) = step_ours_user_steps(&mut cpu, &mut bus, chunk) {
+            let total = cursor + sub_step;
+            eprintln!("[disc-parity] our emulator stopped at user step {total}: {err:?}");
+            cleanup(redux);
+            std::process::exit(1);
         }
         cursor += chunk;
 
@@ -128,33 +141,86 @@ fn main() {
             rate / 1000.0,
         );
 
-        if our_hash != their.hash {
-            let dims_differ = our_w != their.width || our_h != their.height;
-            if dims_differ {
-                // GP1 0x07/0x08 write hit slightly different
-                // instruction windows because of IRQ timing
-                // jitter. Not a rendering bug — both sides will
-                // converge once they've both finished the
-                // mode-change sequence.
-                eprintln!("      (dim mismatch — IRQ-timing jitter; continuing)");
-                continue;
+        let dims_match = our_w == their.width && our_h == their.height;
+        let hash_match = our_hash == their.hash;
+        if dims_match && hash_match {
+            if let Some(prev) = pending_mismatch.take() {
+                eprintln!(
+                    "      (previous {} mismatch at step {} resolved at step {cursor})",
+                    prev.kind, prev.step,
+                );
             }
+            continue;
+        }
+
+        mismatch_count += 1;
+        if !dims_match {
+            // GP1 0x07/0x08 writes can hit slightly different
+            // instruction windows because of IRQ timing jitter. Keep
+            // running so a later checkpoint can prove convergence, but
+            // fail the probe if this is still unresolved at the end.
+            eprintln!(
+                "      (dim mismatch: ours={}x{} redux={}x{} — will retry next chunk)",
+                our_w, our_h, their.width, their.height,
+            );
+            pending_mismatch = Some(PendingMismatch {
+                step: cursor,
+                kind: "dimension",
+                our_hash,
+                redux_hash: their.hash,
+                our_w,
+                our_h,
+                redux_w: their.width,
+                redux_h: their.height,
+            });
+            continue;
+        }
+
+        if !hash_match {
             // Mismatched content with matching dimensions is usually
             // frame-completion jitter: Redux finished drawing frame
             // N at cycle X; we finish drawing it at cycle X+epsilon,
             // so at this exact check we see different VRAM. Log it
-            // once and keep going — if we catch up within the next
-            // few chunks, it was timing. If we never catch up, the
-            // last logged mismatch IS the real bug.
+            // and keep going. If we catch up within the next few
+            // chunks, it was timing; if we never catch up, the last
+            // logged mismatch is a real parity failure.
             eprintln!(
                 "      (content mismatch: ours=0x{our_hash:016x} \
                  redux=0x{:016x} — will retry next chunk)",
                 their.hash,
             );
+            pending_mismatch = Some(PendingMismatch {
+                step: cursor,
+                kind: "content",
+                our_hash,
+                redux_hash: their.hash,
+                our_w,
+                our_h,
+                redux_w: their.width,
+                redux_h: their.height,
+            });
         }
     }
 
     eprintln!();
+    if let Some(mismatch) = pending_mismatch {
+        eprintln!(
+            "[disc-parity] unresolved {} mismatch at final checkpoint step {}",
+            mismatch.kind, mismatch.step,
+        );
+        eprintln!(
+            "              ours=0x{:016x} ({}x{})  redux=0x{:016x} ({}x{})",
+            mismatch.our_hash,
+            mismatch.our_w,
+            mismatch.our_h,
+            mismatch.redux_hash,
+            mismatch.redux_w,
+            mismatch.redux_h,
+        );
+        eprintln!("[disc-parity] mismatching checkpoints observed: {mismatch_count}");
+        cleanup(redux);
+        std::process::exit(1);
+    }
     eprintln!(
         "[disc-parity] OK through {cursor} steps ({} chunks)",
         chunk_count,
@@ -166,6 +232,27 @@ fn cleanup(mut redux: ReduxProcess) {
     redux.send_command("quit").ok();
     let _ = redux.wait_for_response(Duration::from_secs(5));
     let _ = redux.terminate();
+}
+
+fn step_ours_user_steps(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    steps: u64,
+) -> Option<(u64, emulator_core::ExecutionError)> {
+    for i in 0..steps {
+        let was_in_isr = cpu.in_isr();
+        if let Err(e) = cpu.step(bus) {
+            return Some((i, e));
+        }
+        if !was_in_isr && cpu.in_irq_handler() {
+            while cpu.in_irq_handler() {
+                if let Err(e) = cpu.step(bus) {
+                    return Some((i, e));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -222,7 +309,7 @@ fn print_usage() {
          [--steps N] [--chunk N]\n\
          \n\
          Boots the same disc + BIOS on Redux and our emulator, then\n\
-         compares VRAM display-area hashes every --chunk instructions.\n\
+         compares VRAM display-area hashes every --chunk user steps.\n\
          Stops + reports at the first divergence.",
     );
 }
