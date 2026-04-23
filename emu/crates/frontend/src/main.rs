@@ -32,15 +32,22 @@ use winit::window::{Window, WindowId};
 use crate::app::AppState;
 use crate::cli::Cli;
 use crate::gfx::Graphics;
-use crate::ui::{menu::MenuInput, MenuOutcome};
+use crate::ui::{MenuOutcome, menu::MenuInput};
 
-use emulator_core::button;
+use emulator_core::{button, spu::SAMPLE_CYCLES};
 
 /// Default window size when not running fullscreen. Chosen big
 /// enough to show the Menu + a framebuffer comfortably on a
 /// standard laptop display.
 const INITIAL_WIDTH: u32 = 1600;
 const INITIAL_HEIGHT: u32 = 1000;
+/// Frontend run cadence target. The toolbar, "advance one frame"
+/// control, and sample pump all assume an NTSC-ish 60 Hz shell.
+const TARGET_FRAME_DT: f32 = 1.0 / 60.0;
+/// Don't try to catch up an arbitrarily long stall in one redraw;
+/// cap the burst so a debugger stop or window drag doesn't spend
+/// seconds chewing through delayed emu frames.
+const MAX_CATCHUP_FRAMES: u32 = 4;
 
 fn main() {
     // Argument parsing first — if a subcommand is present, we
@@ -94,6 +101,18 @@ struct Shell {
     /// a failed gilrs init just produces empty frames so the
     /// keyboard path keeps working.
     input: input::InputRouter,
+    /// Wall-clock debt waiting to be converted into emulated
+    /// "frames". Without this, the current `ControlFlow::Poll`
+    /// shell runs the guest as fast as redraws can arrive, which
+    /// massively overfills the audio queue and produces crackle
+    /// from dropped samples.
+    emu_frame_accum: f32,
+    /// Residual emulated CPU cycles that haven't yet been converted
+    /// into SPU sample ticks. Redux clocks the SPU at 44.1 kHz from
+    /// the PSX master clock (768 cycles/sample); tying audio to host
+    /// redraws instead produces under/over-runs on anything that
+    /// isn't an exact 60 Hz render loop.
+    audio_cycle_accum: u64,
 }
 
 impl Default for Shell {
@@ -106,16 +125,16 @@ impl Shell {
     fn new(config_dir: Option<std::path::PathBuf>, fullscreen: bool) -> Self {
         let audio = audio::AudioOut::open();
         if let Some(a) = audio.as_ref() {
-            eprintln!(
-                "[audio] opened host stream @ {} Hz",
-                a.host_sample_rate()
-            );
+            eprintln!("[audio] opened host stream @ {} Hz", a.host_sample_rate());
         } else {
             eprintln!("[audio] no host output device available — running silent");
         }
         let input = input::InputRouter::new();
         if input.is_connected() {
-            eprintln!("[input] already-connected pads: {}", input.connected_names());
+            eprintln!(
+                "[input] already-connected pads: {}",
+                input.connected_names()
+            );
         } else {
             eprintln!("[input] no pads connected at startup — watching for hot-plug");
         }
@@ -128,6 +147,8 @@ impl Shell {
             fullscreen,
             audio,
             input,
+            emu_frame_accum: 0.0,
+            audio_cycle_accum: 0,
         }
     }
 }
@@ -328,12 +349,14 @@ impl ApplicationHandler for Shell {
                     }
                 }
 
-                // Run loop: retire `run_steps_per_frame` instructions this
-                // frame if we're in run mode. Any execution error auto-
-                // pauses and surfaces via the register panel. History
-                // captures only the tail via `push_history`'s ring-buffer
-                // semantics, so a 100k-instruction frame doesn't allocate.
+                // Run loop: retire one NTSC frame's worth of PSX cycles
+                // if we're in run mode. Any execution error auto-pauses
+                // and surfaces via the register panel. History captures
+                // only the tail via `push_history`'s ring-buffer semantics.
                 if self.state.running {
+                    self.emu_frame_accum = (self.emu_frame_accum + dt).min(0.25);
+                    let frames_to_run =
+                        ((self.emu_frame_accum / TARGET_FRAME_DT) as u32).min(MAX_CATCHUP_FRAMES);
                     // Merge the current keyboard-derived pad mask with
                     // gamepad input before stepping, so the game/homebrew
                     // sees fresh input this frame. `pad_frame.pad1_mask`
@@ -353,28 +376,48 @@ impl ApplicationHandler for Shell {
                         let map = |v: f32| ((v.clamp(-1.0, 1.0) * 127.0) + 128.0) as u8;
                         bus.set_port1_sticks(map(rx), map(-ry), map(lx), map(-ly));
                     }
-                    app::step_one_frame(&mut self.state);
+                    for _ in 0..frames_to_run {
+                        let cycles_before =
+                            self.state.bus.as_ref().map(|bus| bus.cycles()).unwrap_or(0);
+                        app::step_one_frame(&mut self.state);
 
-                    // Pump the SPU forward by one NTSC frame's worth of
-                    // samples (44_100 / 60 = 735) and flush the newly-
-                    // produced audio into the cpal ring. SPU ticks
-                    // deliberately don't run inside `Cpu::step` — see
-                    // `Bus::run_spu_samples` for the rationale.
-                    if let Some(bus) = self.state.bus.as_mut() {
-                        bus.run_spu_samples(735);
-                        if let Some(audio) = self.audio.as_ref() {
-                            let samples = bus.spu.drain_audio();
-                            if !samples.is_empty() {
-                                audio.push_samples(&samples);
+                        // Pump the SPU by however much emulated time the
+                        // CPU just advanced, not by "one host redraw".
+                        // This keeps audio pacing tied to the PSX master
+                        // clock even on 120 Hz / 144 Hz hosts or slow
+                        // frames, matching the SPU's 768-cycles/sample
+                        // timing model.
+                        if let Some(bus) = self.state.bus.as_mut() {
+                            let cycles_after = bus.cycles();
+                            self.audio_cycle_accum = self
+                                .audio_cycle_accum
+                                .saturating_add(cycles_after.saturating_sub(cycles_before));
+                            let sample_count = (self.audio_cycle_accum / SAMPLE_CYCLES) as usize;
+                            self.audio_cycle_accum %= SAMPLE_CYCLES;
+                            if sample_count > 0 {
+                                bus.run_spu_samples(sample_count);
                             }
-                            // Surface the cpal ring depth in the HUD.
-                            self.state.hud.set_audio_queue_len(audio.queue_len());
-                        } else {
-                            // No output device — drain and discard so the
-                            // SPU's internal queue doesn't grow unbounded.
-                            let _ = bus.spu.drain_audio();
+                            if let Some(audio) = self.audio.as_ref() {
+                                let samples = bus.spu.drain_audio();
+                                if !samples.is_empty() {
+                                    audio.push_samples(&samples);
+                                }
+                                // Surface the cpal ring depth in the HUD.
+                                self.state.hud.set_audio_queue_len(audio.queue_len());
+                            } else {
+                                // No output device — drain and discard so the
+                                // SPU's internal queue doesn't grow unbounded.
+                                let _ = bus.spu.drain_audio();
+                            }
                         }
                     }
+                    self.emu_frame_accum -= (frames_to_run as f32) * TARGET_FRAME_DT;
+                } else {
+                    self.emu_frame_accum = 0.0;
+                    // Throw away any fractional carry when emulation is
+                    // paused or no game is running so a later launch or
+                    // resume doesn't inherit cycles from an older run.
+                    self.audio_cycle_accum = 0;
                 }
 
                 let state = &mut self.state;

@@ -110,6 +110,8 @@ pub const TRANSFER_ADDR: u32 = 0x1F80_1DA6;
 pub const TRANSFER_FIFO: u32 = 0x1F80_1DA8;
 /// SPU control register.
 pub const SPUCNT: u32 = 0x1F80_1DAA;
+/// SPUCNT bit 14: 0 = muted, 1 = unmuted.
+const SPUCNT_UNMUTE: u16 = 1 << 14;
 /// Data transfer control (typically 0x0004 — 4-bit transfer step).
 pub const TRANSFER_CTRL: u32 = 0x1F80_1DAC;
 /// SPU status register.
@@ -185,13 +187,7 @@ const OUTPUT_BUFFER_CAP: usize = 44100 * 2; // 2 seconds of stereo samples
 /// Filters 0..4 are the canonical set used by the real hardware; filters 5..15
 /// use the same coefficients (SPU-SPX notes that only the lower 3 bits of the
 /// predictor field matter, so 0..7 clamp to 0..4 — we clamp explicitly).
-const ADPCM_FILTER_TABLE: [(i32, i32); 5] = [
-    (0, 0),
-    (60, 0),
-    (115, -52),
-    (98, -55),
-    (122, -60),
-];
+const ADPCM_FILTER_TABLE: [(i32, i32); 5] = [(0, 0), (60, 0), (115, -52), (98, -55), (122, -60)];
 
 // ===============================================================
 //  ADSR envelope rate tables — port of Redux's `EnvelopeTables`.
@@ -249,14 +245,14 @@ enum AdsrPhase {
 /// hot path (envelope tick per sample) is pure arithmetic.
 #[derive(Copy, Clone, Debug, Default)]
 struct AdsrConfig {
-    attack_rate: i32,     // 0..=127 (with mode bit folded in)
-    attack_exp: bool,     // linear vs exponential slope
-    decay_rate: i32,      // 0..=15
-    sustain_level: i32,   // 0..=15 (target = (N+1) * 0x800)
-    sustain_rate: i32,    // 0..=127 (with mode bits folded in)
+    attack_rate: i32,   // 0..=127 (with mode bit folded in)
+    attack_exp: bool,   // linear vs exponential slope
+    decay_rate: i32,    // 0..=15
+    sustain_level: i32, // 0..=15 (target = (N+1) * 0x800)
+    sustain_rate: i32,  // 0..=127 (with mode bits folded in)
     sustain_exp: bool,
     sustain_increase: bool, // 1 = rising, 0 = falling
-    release_rate: i32,    // 0..=31
+    release_rate: i32,      // 0..=31
     release_exp: bool,
 }
 
@@ -406,15 +402,30 @@ struct Voice {
     /// Index into `sample_buf`; when it reaches 28 we decode the next
     /// block before taking the next sample.
     sample_index: usize,
-    /// Fractional position within the current sample — advances by
-    /// `raw_pitch` each output sample and wraps at `0x1000`. Used for
-    /// linear interpolation between `sample_buf[sample_index]` and
-    /// `sample_buf[sample_index + 1]`.
-    sample_frac: u32,
+    /// Redux-style fixed-point sample cursor (`spos`). Each output
+    /// sample consumes decoded input samples while this stays above
+    /// `0x10000`, then adds the pitch step (`raw_pitch << 4`) for the
+    /// next call. Starting at `0x30000` primes the Gaussian window
+    /// with three decoded samples before the first audible output.
+    sample_pos: u32,
+    /// Rolling 4-sample interpolation ring. Redux stores decoded
+    /// samples into `SB[29..32]` and runs the Gaussian window over the
+    /// ring so block boundaries still see the previous block's tail.
+    /// Without this history, the interpolator falls back to zeros at
+    /// every 28-sample ADPCM edge and the output gets audibly gritty.
+    interp_ring: [i16; 4],
+    /// Next insertion slot in `interp_ring`. Also the logical
+    /// "oldest sample" index when reading the Gaussian window.
+    interp_pos: usize,
     /// Previous two decoded samples — ADPCM filter history. Preserved
     /// across block boundaries; reset on KON.
     s_1: i32,
     s_2: i32,
+    /// Set when a decoded block had the stop flag without a valid
+    /// loop. The current 28-sample block must still play out fully;
+    /// Redux only turns the voice off when the decoder reaches the
+    /// *next* block boundary.
+    stop_after_block: bool,
     /// Most recent interpolated sample output by this voice (post-ADSR,
     /// pre-volume). Kept for reads of the ADSR_CURRENT register and
     /// pitch modulation consumers.
@@ -439,9 +450,12 @@ impl Default for Voice {
             current_addr: 0,
             sample_buf: [0; ADPCM_SAMPLES_PER_BLOCK],
             sample_index: ADPCM_SAMPLES_PER_BLOCK, // forces decode on first tick
-            sample_frac: 0,
+            sample_pos: 0x30000,
+            interp_ring: [0; 4],
+            interp_pos: 0,
             s_1: 0,
             s_2: 0,
+            stop_after_block: false,
             last_sample: 0,
         }
     }
@@ -456,9 +470,12 @@ impl Voice {
         self.envelope_sub = 0;
         self.current_addr = self.start_addr;
         self.sample_index = ADPCM_SAMPLES_PER_BLOCK;
-        self.sample_frac = 0;
+        self.sample_pos = 0x30000;
+        self.interp_ring = [0; 4];
+        self.interp_pos = 0;
         self.s_1 = 0;
         self.s_2 = 0;
+        self.stop_after_block = false;
         self.loop_addr_locked = false;
         self.last_sample = 0;
     }
@@ -470,6 +487,20 @@ impl Voice {
         if self.phase != AdsrPhase::Off {
             self.phase = AdsrPhase::Release;
         }
+    }
+
+    fn push_interpolation_sample(&mut self, sample: i16) {
+        self.interp_ring[self.interp_pos] = sample;
+        self.interp_pos = (self.interp_pos + 1) & 3;
+    }
+
+    fn interpolation_window(&self) -> [i16; 4] {
+        [
+            self.interp_ring[self.interp_pos],
+            self.interp_ring[(self.interp_pos + 1) & 3],
+            self.interp_ring[(self.interp_pos + 2) & 3],
+            self.interp_ring[(self.interp_pos + 3) & 3],
+        ]
     }
 
     /// Advance the ADSR envelope by one sample. Returns the current
@@ -774,10 +805,9 @@ impl Spu {
         // Hardware "form" table — bit pattern injected into the
         // LFSR low bit when it shifts.
         const NOISE_WAVE_ADD: [u8; 64] = [
-            1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0,
-            1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0,
-            0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1,
-            0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1,
+            1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0,
+            1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1,
+            1, 0, 1, 0, 0, 1,
         ];
         // Hardware "fraction" table — sub-sample increment per
         // step value (low 2 bits of clock); index 4 is the
@@ -1303,7 +1333,7 @@ impl Spu {
     /// Advance one voice by one output sample. Returns `(l, r)`
     /// pre-main-volume, post-voice-volume contribution in i16 scale.
     fn tick_voice(&mut self, v: usize) -> (i16, i16) {
-        // Fetch raw sample using linear interpolation.
+        // Fetch raw sample using the SPU's Gaussian interpolation path.
         let sample_i16 = self.fetch_voice_sample(v);
 
         // Advance ADSR envelope.
@@ -1322,20 +1352,19 @@ impl Spu {
         (saturate_i16(l), saturate_i16(r))
     }
 
-    /// Fetch the current voice's interpolated sample, advancing
-    /// `sample_frac` + `sample_index` as needed. Decodes new ADPCM
-    /// blocks on demand when `sample_index` reaches the block end.
+    /// Fetch the current voice's interpolated sample. This mirrors
+    /// Redux's `spos` + `StoreInterpolationVal` flow: consume decoded
+    /// samples into a rolling 4-sample ring while `sample_pos >=
+    /// 0x10000`, then run the Gaussian window over that ring using the
+    /// remaining fractional position.
     fn fetch_voice_sample(&mut self, v: usize) -> i16 {
-        // Noise-mode voices emit the current noise-generator sample.
-        // The per-voice pitch register is ignored in noise mode
-        // (the noise clock comes from SPUCNT bits 8-13 instead).
-        if self.noise_on & (1 << v) != 0 {
-            return self.noise_val;
-        }
         // Voices in Off contribute nothing.
         if self.voices[v].phase == AdsrPhase::Off {
             return 0;
         }
+        let noise_mode = self.noise_on & (1 << v) != 0;
+        let feeds_fmod = v + 1 < NUM_VOICES && (self.pmon & (1 << (v + 1))) != 0;
+        let mute_voice_sample = (self.spucnt & SPUCNT_UNMUTE) == 0 && !feeds_fmod;
 
         // Determine effective pitch. PMOn: voice N takes its pitch
         // from voice N-1's most recent post-ADSR sample. Formula is
@@ -1353,47 +1382,50 @@ impl Spu {
             let np = ((0x8000 + prev) * pitch as i32) / 0x8000;
             pitch = (np.clamp(1, 0x3FFF)) as u32;
         }
-
-        // Decode next block if we consumed the previous one.
-        if self.voices[v].sample_index >= ADPCM_SAMPLES_PER_BLOCK {
-            self.decode_next_block(v);
+        if pitch == 0 {
+            pitch = 1;
         }
 
-        // 4-point Gaussian interpolation across the decoded sample
-        // buffer. The coefficients come from a table logged from a
-        // real PS1 SPU (see `GAUSS_TABLE`). The window is the 4
-        // samples centred on `sample_index`, with the two previous
-        // samples (`prev2`, `prev1`) and the next one clamping at
-        // the block edges — inaudible because loop-blocks continue
-        // decoding before the window runs off.
-        let voice = &self.voices[v];
-        let idx = voice.sample_index;
-        let sb = &voice.sample_buf;
-        let prev2 = if idx >= 2 { sb[idx - 2] } else { 0 };
-        let prev1 = if idx >= 1 { sb[idx - 1] } else { 0 };
-        let curr = sb[idx];
-        let next = if idx + 1 < ADPCM_SAMPLES_PER_BLOCK {
-            sb[idx + 1]
-        } else {
-            curr
-        };
-        let out = gauss_interpolate([prev2, prev1, curr, next], voice.sample_frac);
-
-        // Advance sample position.
-        let voice = &mut self.voices[v];
-        voice.sample_frac += pitch;
-        while voice.sample_frac >= 0x1000 {
-            voice.sample_frac -= 0x1000;
-            voice.sample_index += 1;
-            if voice.sample_index >= ADPCM_SAMPLES_PER_BLOCK {
-                // Leave it; next call to fetch_voice_sample will
-                // decode the next block. (Don't decode in the inner
-                // loop — one block is always enough for one sample
-                // period because pitch <= 0x3FFF = ~3.99 samples per
-                // tick, less than the 28 samples in a block.)
-                break;
+        // Consume decoded samples into the interpolation ring until
+        // the fixed-point cursor is back inside the current source
+        // sample. This preserves the previous block's tail across
+        // ADPCM boundaries instead of substituting zeros.
+        while self.voices[v].sample_pos >= 0x10000 {
+            if self.voices[v].sample_index >= ADPCM_SAMPLES_PER_BLOCK {
+                if self.voices[v].stop_after_block {
+                    let voice = &mut self.voices[v];
+                    voice.phase = AdsrPhase::Off;
+                    voice.envelope = 0;
+                    voice.stop_after_block = false;
+                    voice.last_sample = 0;
+                    return 0;
+                }
+                self.decode_next_block(v);
             }
+            let voice = &mut self.voices[v];
+            let sample = if mute_voice_sample {
+                0
+            } else {
+                // Redux applies SPUCNT's mute bit before storing into
+                // the interpolation history, and clamps the raw decoded
+                // value to -32767..32767 on that same path.
+                voice.sample_buf[voice.sample_index].clamp(-32767, 32767)
+            };
+            voice.sample_index += 1;
+            voice.push_interpolation_sample(sample);
+            voice.sample_pos -= 0x10000;
         }
+
+        let out = if noise_mode {
+            // Redux still advances the sample cursor / decode state for
+            // noise voices, but substitutes the final audible sample
+            // with the shared noise generator output.
+            self.noise_val
+        } else {
+            let window = self.voices[v].interpolation_window();
+            gauss_interpolate(window, self.voices[v].sample_pos)
+        };
+        self.voices[v].sample_pos = self.voices[v].sample_pos.saturating_add(pitch << 4);
         out
     }
 
@@ -1434,10 +1466,16 @@ impl Spu {
             } else {
                 (byte >> 4) & 0x0F
             };
-            // Sign-extend 4 bits to i32, shift to high word, arithmetic
-            // shift right by `(12 - shift)`.
+            // Match Redux's SPU decode path exactly:
+            //   s = sign_extend_4bit(nibble) << 12
+            //   raw = s >> shift_factor
+            //
+            // The previous code effectively inverted the shift and
+            // collapsed large-amplitude samples into near-silence for
+            // low shift factors, which mangled ordinary SPU voice audio
+            // including BIOS beeps.
             let signed = ((nibble << 28) >> 28) << 12;
-            let raw = signed >> (12 - shift as i32).max(0);
+            let raw = signed >> shift;
             let fa = raw + ((voice.s_1 * f1) >> 6) + ((voice.s_2 * f2) >> 6);
             let fa_clamped = fa.clamp(-0x8000, 0x7FFF);
             voice.sample_buf[i] = fa_clamped as i16;
@@ -1467,14 +1505,19 @@ impl Spu {
             if flags & 0x2 != 0 {
                 // Repeat — jump to loop_addr.
                 voice.current_addr = voice.loop_addr;
+                voice.stop_after_block = false;
             } else {
-                // One-shot done — stop the voice. Envelope drops to 0.
-                voice.phase = AdsrPhase::Off;
-                voice.envelope = 0;
+                // One-shot done — keep this decoded block audible and
+                // stop only when playback reaches the next block
+                // boundary. Redux marks the next source pointer as a
+                // sentinel and turns the voice off on the following
+                // decode attempt.
+                voice.stop_after_block = true;
                 voice.current_addr = next_addr;
             }
         } else {
             voice.current_addr = next_addr;
+            voice.stop_after_block = false;
         }
     }
 }
@@ -1486,99 +1529,104 @@ impl Spu {
 /// 1024-entry Gaussian interpolation coefficient table, logged from
 /// a real PS1 SPU and also matching SPC700 curves. Pulled verbatim
 /// from PCSX-Redux's `src/spu/gauss.h`. Indexed by
-/// `(sample_frac >> 2) & ~3` + {0,1,2,3} — four coefficients per
+/// `(sample_pos >> 6) & ~3` + {0,1,2,3} — four coefficients per
 /// fractional position. Values are 11-bit; product with an i16
 /// sample fits in i32 and needs an `& !2047` mask to match the
 /// hardware's 11-bit accumulator granularity.
 const GAUSS_TABLE: [i32; 1024] = [
-    0x172, 0x519, 0x176, 0x000, 0x16E, 0x519, 0x17A, 0x000, 0x16A, 0x518, 0x17D, 0x000, 0x166, 0x518, 0x181, 0x000,
-    0x162, 0x518, 0x185, 0x000, 0x15F, 0x518, 0x189, 0x000, 0x15B, 0x518, 0x18D, 0x000, 0x157, 0x517, 0x191, 0x000,
-    0x153, 0x517, 0x195, 0x000, 0x150, 0x517, 0x19A, 0x000, 0x14C, 0x516, 0x19E, 0x000, 0x148, 0x516, 0x1A2, 0x000,
-    0x145, 0x515, 0x1A6, 0x000, 0x141, 0x514, 0x1AA, 0x000, 0x13E, 0x514, 0x1AE, 0x000, 0x13A, 0x513, 0x1B2, 0x000,
-    0x137, 0x512, 0x1B7, 0x001, 0x133, 0x511, 0x1BB, 0x001, 0x130, 0x511, 0x1BF, 0x001, 0x12C, 0x510, 0x1C3, 0x001,
-    0x129, 0x50F, 0x1C8, 0x001, 0x125, 0x50E, 0x1CC, 0x001, 0x122, 0x50D, 0x1D0, 0x001, 0x11E, 0x50C, 0x1D5, 0x001,
-    0x11B, 0x50B, 0x1D9, 0x001, 0x118, 0x50A, 0x1DD, 0x001, 0x114, 0x508, 0x1E2, 0x001, 0x111, 0x507, 0x1E6, 0x002,
-    0x10E, 0x506, 0x1EB, 0x002, 0x10B, 0x504, 0x1EF, 0x002, 0x107, 0x503, 0x1F3, 0x002, 0x104, 0x502, 0x1F8, 0x002,
-    0x101, 0x500, 0x1FC, 0x002, 0x0FE, 0x4FF, 0x201, 0x002, 0x0FB, 0x4FD, 0x205, 0x003, 0x0F8, 0x4FB, 0x20A, 0x003,
-    0x0F5, 0x4FA, 0x20F, 0x003, 0x0F2, 0x4F8, 0x213, 0x003, 0x0EF, 0x4F6, 0x218, 0x003, 0x0EC, 0x4F5, 0x21C, 0x004,
-    0x0E9, 0x4F3, 0x221, 0x004, 0x0E6, 0x4F1, 0x226, 0x004, 0x0E3, 0x4EF, 0x22A, 0x004, 0x0E0, 0x4ED, 0x22F, 0x004,
-    0x0DD, 0x4EB, 0x233, 0x005, 0x0DA, 0x4E9, 0x238, 0x005, 0x0D7, 0x4E7, 0x23D, 0x005, 0x0D4, 0x4E5, 0x241, 0x005,
-    0x0D2, 0x4E3, 0x246, 0x006, 0x0CF, 0x4E0, 0x24B, 0x006, 0x0CC, 0x4DE, 0x250, 0x006, 0x0C9, 0x4DC, 0x254, 0x006,
-    0x0C7, 0x4D9, 0x259, 0x007, 0x0C4, 0x4D7, 0x25E, 0x007, 0x0C1, 0x4D5, 0x263, 0x007, 0x0BF, 0x4D2, 0x267, 0x008,
-    0x0BC, 0x4D0, 0x26C, 0x008, 0x0BA, 0x4CD, 0x271, 0x008, 0x0B7, 0x4CB, 0x276, 0x009, 0x0B4, 0x4C8, 0x27B, 0x009,
-    0x0B2, 0x4C5, 0x280, 0x009, 0x0AF, 0x4C3, 0x284, 0x00A, 0x0AD, 0x4C0, 0x289, 0x00A, 0x0AB, 0x4BD, 0x28E, 0x00A,
-    0x0A8, 0x4BA, 0x293, 0x00B, 0x0A6, 0x4B7, 0x298, 0x00B, 0x0A3, 0x4B5, 0x29D, 0x00B, 0x0A1, 0x4B2, 0x2A2, 0x00C,
-    0x09F, 0x4AF, 0x2A6, 0x00C, 0x09C, 0x4AC, 0x2AB, 0x00D, 0x09A, 0x4A9, 0x2B0, 0x00D, 0x098, 0x4A6, 0x2B5, 0x00E,
-    0x096, 0x4A2, 0x2BA, 0x00E, 0x093, 0x49F, 0x2BF, 0x00F, 0x091, 0x49C, 0x2C4, 0x00F, 0x08F, 0x499, 0x2C9, 0x00F,
-    0x08D, 0x496, 0x2CE, 0x010, 0x08B, 0x492, 0x2D3, 0x010, 0x089, 0x48F, 0x2D8, 0x011, 0x086, 0x48C, 0x2DC, 0x011,
-    0x084, 0x488, 0x2E1, 0x012, 0x082, 0x485, 0x2E6, 0x013, 0x080, 0x481, 0x2EB, 0x013, 0x07E, 0x47E, 0x2F0, 0x014,
-    0x07C, 0x47A, 0x2F5, 0x014, 0x07A, 0x477, 0x2FA, 0x015, 0x078, 0x473, 0x2FF, 0x015, 0x076, 0x470, 0x304, 0x016,
-    0x075, 0x46C, 0x309, 0x017, 0x073, 0x468, 0x30E, 0x017, 0x071, 0x465, 0x313, 0x018, 0x06F, 0x461, 0x318, 0x018,
-    0x06D, 0x45D, 0x31D, 0x019, 0x06B, 0x459, 0x322, 0x01A, 0x06A, 0x455, 0x326, 0x01B, 0x068, 0x452, 0x32B, 0x01B,
-    0x066, 0x44E, 0x330, 0x01C, 0x064, 0x44A, 0x335, 0x01D, 0x063, 0x446, 0x33A, 0x01D, 0x061, 0x442, 0x33F, 0x01E,
-    0x05F, 0x43E, 0x344, 0x01F, 0x05E, 0x43A, 0x349, 0x020, 0x05C, 0x436, 0x34E, 0x020, 0x05A, 0x432, 0x353, 0x021,
-    0x059, 0x42E, 0x357, 0x022, 0x057, 0x42A, 0x35C, 0x023, 0x056, 0x425, 0x361, 0x024, 0x054, 0x421, 0x366, 0x024,
-    0x053, 0x41D, 0x36B, 0x025, 0x051, 0x419, 0x370, 0x026, 0x050, 0x415, 0x374, 0x027, 0x04E, 0x410, 0x379, 0x028,
-    0x04D, 0x40C, 0x37E, 0x029, 0x04C, 0x408, 0x383, 0x02A, 0x04A, 0x403, 0x388, 0x02B, 0x049, 0x3FF, 0x38C, 0x02C,
-    0x047, 0x3FB, 0x391, 0x02D, 0x046, 0x3F6, 0x396, 0x02E, 0x045, 0x3F2, 0x39B, 0x02F, 0x043, 0x3ED, 0x39F, 0x030,
-    0x042, 0x3E9, 0x3A4, 0x031, 0x041, 0x3E5, 0x3A9, 0x032, 0x040, 0x3E0, 0x3AD, 0x033, 0x03E, 0x3DC, 0x3B2, 0x034,
-    0x03D, 0x3D7, 0x3B7, 0x035, 0x03C, 0x3D2, 0x3BB, 0x036, 0x03B, 0x3CE, 0x3C0, 0x037, 0x03A, 0x3C9, 0x3C5, 0x038,
-    0x038, 0x3C5, 0x3C9, 0x03A, 0x037, 0x3C0, 0x3CE, 0x03B, 0x036, 0x3BB, 0x3D2, 0x03C, 0x035, 0x3B7, 0x3D7, 0x03D,
-    0x034, 0x3B2, 0x3DC, 0x03E, 0x033, 0x3AD, 0x3E0, 0x040, 0x032, 0x3A9, 0x3E5, 0x041, 0x031, 0x3A4, 0x3E9, 0x042,
-    0x030, 0x39F, 0x3ED, 0x043, 0x02F, 0x39B, 0x3F2, 0x045, 0x02E, 0x396, 0x3F6, 0x046, 0x02D, 0x391, 0x3FB, 0x047,
-    0x02C, 0x38C, 0x3FF, 0x049, 0x02B, 0x388, 0x403, 0x04A, 0x02A, 0x383, 0x408, 0x04C, 0x029, 0x37E, 0x40C, 0x04D,
-    0x028, 0x379, 0x410, 0x04E, 0x027, 0x374, 0x415, 0x050, 0x026, 0x370, 0x419, 0x051, 0x025, 0x36B, 0x41D, 0x053,
-    0x024, 0x366, 0x421, 0x054, 0x024, 0x361, 0x425, 0x056, 0x023, 0x35C, 0x42A, 0x057, 0x022, 0x357, 0x42E, 0x059,
-    0x021, 0x353, 0x432, 0x05A, 0x020, 0x34E, 0x436, 0x05C, 0x020, 0x349, 0x43A, 0x05E, 0x01F, 0x344, 0x43E, 0x05F,
-    0x01E, 0x33F, 0x442, 0x061, 0x01D, 0x33A, 0x446, 0x063, 0x01D, 0x335, 0x44A, 0x064, 0x01C, 0x330, 0x44E, 0x066,
-    0x01B, 0x32B, 0x452, 0x068, 0x01B, 0x326, 0x455, 0x06A, 0x01A, 0x322, 0x459, 0x06B, 0x019, 0x31D, 0x45D, 0x06D,
-    0x018, 0x318, 0x461, 0x06F, 0x018, 0x313, 0x465, 0x071, 0x017, 0x30E, 0x468, 0x073, 0x017, 0x309, 0x46C, 0x075,
-    0x016, 0x304, 0x470, 0x076, 0x015, 0x2FF, 0x473, 0x078, 0x015, 0x2FA, 0x477, 0x07A, 0x014, 0x2F5, 0x47A, 0x07C,
-    0x014, 0x2F0, 0x47E, 0x07E, 0x013, 0x2EB, 0x481, 0x080, 0x013, 0x2E6, 0x485, 0x082, 0x012, 0x2E1, 0x488, 0x084,
-    0x011, 0x2DC, 0x48C, 0x086, 0x011, 0x2D8, 0x48F, 0x089, 0x010, 0x2D3, 0x492, 0x08B, 0x010, 0x2CE, 0x496, 0x08D,
-    0x00F, 0x2C9, 0x499, 0x08F, 0x00F, 0x2C4, 0x49C, 0x091, 0x00F, 0x2BF, 0x49F, 0x093, 0x00E, 0x2BA, 0x4A2, 0x096,
-    0x00E, 0x2B5, 0x4A6, 0x098, 0x00D, 0x2B0, 0x4A9, 0x09A, 0x00D, 0x2AB, 0x4AC, 0x09C, 0x00C, 0x2A6, 0x4AF, 0x09F,
-    0x00C, 0x2A2, 0x4B2, 0x0A1, 0x00B, 0x29D, 0x4B5, 0x0A3, 0x00B, 0x298, 0x4B7, 0x0A6, 0x00B, 0x293, 0x4BA, 0x0A8,
-    0x00A, 0x28E, 0x4BD, 0x0AB, 0x00A, 0x289, 0x4C0, 0x0AD, 0x00A, 0x284, 0x4C3, 0x0AF, 0x009, 0x280, 0x4C5, 0x0B2,
-    0x009, 0x27B, 0x4C8, 0x0B4, 0x009, 0x276, 0x4CB, 0x0B7, 0x008, 0x271, 0x4CD, 0x0BA, 0x008, 0x26C, 0x4D0, 0x0BC,
-    0x008, 0x267, 0x4D2, 0x0BF, 0x007, 0x263, 0x4D5, 0x0C1, 0x007, 0x25E, 0x4D7, 0x0C4, 0x007, 0x259, 0x4D9, 0x0C7,
-    0x006, 0x254, 0x4DC, 0x0C9, 0x006, 0x250, 0x4DE, 0x0CC, 0x006, 0x24B, 0x4E0, 0x0CF, 0x006, 0x246, 0x4E3, 0x0D2,
-    0x005, 0x241, 0x4E5, 0x0D4, 0x005, 0x23D, 0x4E7, 0x0D7, 0x005, 0x238, 0x4E9, 0x0DA, 0x005, 0x233, 0x4EB, 0x0DD,
-    0x004, 0x22F, 0x4ED, 0x0E0, 0x004, 0x22A, 0x4EF, 0x0E3, 0x004, 0x226, 0x4F1, 0x0E6, 0x004, 0x221, 0x4F3, 0x0E9,
-    0x004, 0x21C, 0x4F5, 0x0EC, 0x003, 0x218, 0x4F6, 0x0EF, 0x003, 0x213, 0x4F8, 0x0F2, 0x003, 0x20F, 0x4FA, 0x0F5,
-    0x003, 0x20A, 0x4FB, 0x0F8, 0x003, 0x205, 0x4FD, 0x0FB, 0x002, 0x201, 0x4FF, 0x0FE, 0x002, 0x1FC, 0x500, 0x101,
-    0x002, 0x1F8, 0x502, 0x104, 0x002, 0x1F3, 0x503, 0x107, 0x002, 0x1EF, 0x504, 0x10B, 0x002, 0x1EB, 0x506, 0x10E,
-    0x002, 0x1E6, 0x507, 0x111, 0x001, 0x1E2, 0x508, 0x114, 0x001, 0x1DD, 0x50A, 0x118, 0x001, 0x1D9, 0x50B, 0x11B,
-    0x001, 0x1D5, 0x50C, 0x11E, 0x001, 0x1D0, 0x50D, 0x122, 0x001, 0x1CC, 0x50E, 0x125, 0x001, 0x1C8, 0x50F, 0x129,
-    0x001, 0x1C3, 0x510, 0x12C, 0x001, 0x1BF, 0x511, 0x130, 0x001, 0x1BB, 0x511, 0x133, 0x001, 0x1B7, 0x512, 0x137,
-    0x000, 0x1B2, 0x513, 0x13A, 0x000, 0x1AE, 0x514, 0x13E, 0x000, 0x1AA, 0x514, 0x141, 0x000, 0x1A6, 0x515, 0x145,
-    0x000, 0x1A2, 0x516, 0x148, 0x000, 0x19E, 0x516, 0x14C, 0x000, 0x19A, 0x517, 0x150, 0x000, 0x195, 0x517, 0x153,
-    0x000, 0x191, 0x517, 0x157, 0x000, 0x18D, 0x518, 0x15B, 0x000, 0x189, 0x518, 0x15F, 0x000, 0x185, 0x518, 0x162,
-    0x000, 0x181, 0x518, 0x166, 0x000, 0x17D, 0x518, 0x16A, 0x000, 0x17A, 0x519, 0x16E, 0x000, 0x176, 0x519, 0x172,
+    0x172, 0x519, 0x176, 0x000, 0x16E, 0x519, 0x17A, 0x000, 0x16A, 0x518, 0x17D, 0x000, 0x166,
+    0x518, 0x181, 0x000, 0x162, 0x518, 0x185, 0x000, 0x15F, 0x518, 0x189, 0x000, 0x15B, 0x518,
+    0x18D, 0x000, 0x157, 0x517, 0x191, 0x000, 0x153, 0x517, 0x195, 0x000, 0x150, 0x517, 0x19A,
+    0x000, 0x14C, 0x516, 0x19E, 0x000, 0x148, 0x516, 0x1A2, 0x000, 0x145, 0x515, 0x1A6, 0x000,
+    0x141, 0x514, 0x1AA, 0x000, 0x13E, 0x514, 0x1AE, 0x000, 0x13A, 0x513, 0x1B2, 0x000, 0x137,
+    0x512, 0x1B7, 0x001, 0x133, 0x511, 0x1BB, 0x001, 0x130, 0x511, 0x1BF, 0x001, 0x12C, 0x510,
+    0x1C3, 0x001, 0x129, 0x50F, 0x1C8, 0x001, 0x125, 0x50E, 0x1CC, 0x001, 0x122, 0x50D, 0x1D0,
+    0x001, 0x11E, 0x50C, 0x1D5, 0x001, 0x11B, 0x50B, 0x1D9, 0x001, 0x118, 0x50A, 0x1DD, 0x001,
+    0x114, 0x508, 0x1E2, 0x001, 0x111, 0x507, 0x1E6, 0x002, 0x10E, 0x506, 0x1EB, 0x002, 0x10B,
+    0x504, 0x1EF, 0x002, 0x107, 0x503, 0x1F3, 0x002, 0x104, 0x502, 0x1F8, 0x002, 0x101, 0x500,
+    0x1FC, 0x002, 0x0FE, 0x4FF, 0x201, 0x002, 0x0FB, 0x4FD, 0x205, 0x003, 0x0F8, 0x4FB, 0x20A,
+    0x003, 0x0F5, 0x4FA, 0x20F, 0x003, 0x0F2, 0x4F8, 0x213, 0x003, 0x0EF, 0x4F6, 0x218, 0x003,
+    0x0EC, 0x4F5, 0x21C, 0x004, 0x0E9, 0x4F3, 0x221, 0x004, 0x0E6, 0x4F1, 0x226, 0x004, 0x0E3,
+    0x4EF, 0x22A, 0x004, 0x0E0, 0x4ED, 0x22F, 0x004, 0x0DD, 0x4EB, 0x233, 0x005, 0x0DA, 0x4E9,
+    0x238, 0x005, 0x0D7, 0x4E7, 0x23D, 0x005, 0x0D4, 0x4E5, 0x241, 0x005, 0x0D2, 0x4E3, 0x246,
+    0x006, 0x0CF, 0x4E0, 0x24B, 0x006, 0x0CC, 0x4DE, 0x250, 0x006, 0x0C9, 0x4DC, 0x254, 0x006,
+    0x0C7, 0x4D9, 0x259, 0x007, 0x0C4, 0x4D7, 0x25E, 0x007, 0x0C1, 0x4D5, 0x263, 0x007, 0x0BF,
+    0x4D2, 0x267, 0x008, 0x0BC, 0x4D0, 0x26C, 0x008, 0x0BA, 0x4CD, 0x271, 0x008, 0x0B7, 0x4CB,
+    0x276, 0x009, 0x0B4, 0x4C8, 0x27B, 0x009, 0x0B2, 0x4C5, 0x280, 0x009, 0x0AF, 0x4C3, 0x284,
+    0x00A, 0x0AD, 0x4C0, 0x289, 0x00A, 0x0AB, 0x4BD, 0x28E, 0x00A, 0x0A8, 0x4BA, 0x293, 0x00B,
+    0x0A6, 0x4B7, 0x298, 0x00B, 0x0A3, 0x4B5, 0x29D, 0x00B, 0x0A1, 0x4B2, 0x2A2, 0x00C, 0x09F,
+    0x4AF, 0x2A6, 0x00C, 0x09C, 0x4AC, 0x2AB, 0x00D, 0x09A, 0x4A9, 0x2B0, 0x00D, 0x098, 0x4A6,
+    0x2B5, 0x00E, 0x096, 0x4A2, 0x2BA, 0x00E, 0x093, 0x49F, 0x2BF, 0x00F, 0x091, 0x49C, 0x2C4,
+    0x00F, 0x08F, 0x499, 0x2C9, 0x00F, 0x08D, 0x496, 0x2CE, 0x010, 0x08B, 0x492, 0x2D3, 0x010,
+    0x089, 0x48F, 0x2D8, 0x011, 0x086, 0x48C, 0x2DC, 0x011, 0x084, 0x488, 0x2E1, 0x012, 0x082,
+    0x485, 0x2E6, 0x013, 0x080, 0x481, 0x2EB, 0x013, 0x07E, 0x47E, 0x2F0, 0x014, 0x07C, 0x47A,
+    0x2F5, 0x014, 0x07A, 0x477, 0x2FA, 0x015, 0x078, 0x473, 0x2FF, 0x015, 0x076, 0x470, 0x304,
+    0x016, 0x075, 0x46C, 0x309, 0x017, 0x073, 0x468, 0x30E, 0x017, 0x071, 0x465, 0x313, 0x018,
+    0x06F, 0x461, 0x318, 0x018, 0x06D, 0x45D, 0x31D, 0x019, 0x06B, 0x459, 0x322, 0x01A, 0x06A,
+    0x455, 0x326, 0x01B, 0x068, 0x452, 0x32B, 0x01B, 0x066, 0x44E, 0x330, 0x01C, 0x064, 0x44A,
+    0x335, 0x01D, 0x063, 0x446, 0x33A, 0x01D, 0x061, 0x442, 0x33F, 0x01E, 0x05F, 0x43E, 0x344,
+    0x01F, 0x05E, 0x43A, 0x349, 0x020, 0x05C, 0x436, 0x34E, 0x020, 0x05A, 0x432, 0x353, 0x021,
+    0x059, 0x42E, 0x357, 0x022, 0x057, 0x42A, 0x35C, 0x023, 0x056, 0x425, 0x361, 0x024, 0x054,
+    0x421, 0x366, 0x024, 0x053, 0x41D, 0x36B, 0x025, 0x051, 0x419, 0x370, 0x026, 0x050, 0x415,
+    0x374, 0x027, 0x04E, 0x410, 0x379, 0x028, 0x04D, 0x40C, 0x37E, 0x029, 0x04C, 0x408, 0x383,
+    0x02A, 0x04A, 0x403, 0x388, 0x02B, 0x049, 0x3FF, 0x38C, 0x02C, 0x047, 0x3FB, 0x391, 0x02D,
+    0x046, 0x3F6, 0x396, 0x02E, 0x045, 0x3F2, 0x39B, 0x02F, 0x043, 0x3ED, 0x39F, 0x030, 0x042,
+    0x3E9, 0x3A4, 0x031, 0x041, 0x3E5, 0x3A9, 0x032, 0x040, 0x3E0, 0x3AD, 0x033, 0x03E, 0x3DC,
+    0x3B2, 0x034, 0x03D, 0x3D7, 0x3B7, 0x035, 0x03C, 0x3D2, 0x3BB, 0x036, 0x03B, 0x3CE, 0x3C0,
+    0x037, 0x03A, 0x3C9, 0x3C5, 0x038, 0x038, 0x3C5, 0x3C9, 0x03A, 0x037, 0x3C0, 0x3CE, 0x03B,
+    0x036, 0x3BB, 0x3D2, 0x03C, 0x035, 0x3B7, 0x3D7, 0x03D, 0x034, 0x3B2, 0x3DC, 0x03E, 0x033,
+    0x3AD, 0x3E0, 0x040, 0x032, 0x3A9, 0x3E5, 0x041, 0x031, 0x3A4, 0x3E9, 0x042, 0x030, 0x39F,
+    0x3ED, 0x043, 0x02F, 0x39B, 0x3F2, 0x045, 0x02E, 0x396, 0x3F6, 0x046, 0x02D, 0x391, 0x3FB,
+    0x047, 0x02C, 0x38C, 0x3FF, 0x049, 0x02B, 0x388, 0x403, 0x04A, 0x02A, 0x383, 0x408, 0x04C,
+    0x029, 0x37E, 0x40C, 0x04D, 0x028, 0x379, 0x410, 0x04E, 0x027, 0x374, 0x415, 0x050, 0x026,
+    0x370, 0x419, 0x051, 0x025, 0x36B, 0x41D, 0x053, 0x024, 0x366, 0x421, 0x054, 0x024, 0x361,
+    0x425, 0x056, 0x023, 0x35C, 0x42A, 0x057, 0x022, 0x357, 0x42E, 0x059, 0x021, 0x353, 0x432,
+    0x05A, 0x020, 0x34E, 0x436, 0x05C, 0x020, 0x349, 0x43A, 0x05E, 0x01F, 0x344, 0x43E, 0x05F,
+    0x01E, 0x33F, 0x442, 0x061, 0x01D, 0x33A, 0x446, 0x063, 0x01D, 0x335, 0x44A, 0x064, 0x01C,
+    0x330, 0x44E, 0x066, 0x01B, 0x32B, 0x452, 0x068, 0x01B, 0x326, 0x455, 0x06A, 0x01A, 0x322,
+    0x459, 0x06B, 0x019, 0x31D, 0x45D, 0x06D, 0x018, 0x318, 0x461, 0x06F, 0x018, 0x313, 0x465,
+    0x071, 0x017, 0x30E, 0x468, 0x073, 0x017, 0x309, 0x46C, 0x075, 0x016, 0x304, 0x470, 0x076,
+    0x015, 0x2FF, 0x473, 0x078, 0x015, 0x2FA, 0x477, 0x07A, 0x014, 0x2F5, 0x47A, 0x07C, 0x014,
+    0x2F0, 0x47E, 0x07E, 0x013, 0x2EB, 0x481, 0x080, 0x013, 0x2E6, 0x485, 0x082, 0x012, 0x2E1,
+    0x488, 0x084, 0x011, 0x2DC, 0x48C, 0x086, 0x011, 0x2D8, 0x48F, 0x089, 0x010, 0x2D3, 0x492,
+    0x08B, 0x010, 0x2CE, 0x496, 0x08D, 0x00F, 0x2C9, 0x499, 0x08F, 0x00F, 0x2C4, 0x49C, 0x091,
+    0x00F, 0x2BF, 0x49F, 0x093, 0x00E, 0x2BA, 0x4A2, 0x096, 0x00E, 0x2B5, 0x4A6, 0x098, 0x00D,
+    0x2B0, 0x4A9, 0x09A, 0x00D, 0x2AB, 0x4AC, 0x09C, 0x00C, 0x2A6, 0x4AF, 0x09F, 0x00C, 0x2A2,
+    0x4B2, 0x0A1, 0x00B, 0x29D, 0x4B5, 0x0A3, 0x00B, 0x298, 0x4B7, 0x0A6, 0x00B, 0x293, 0x4BA,
+    0x0A8, 0x00A, 0x28E, 0x4BD, 0x0AB, 0x00A, 0x289, 0x4C0, 0x0AD, 0x00A, 0x284, 0x4C3, 0x0AF,
+    0x009, 0x280, 0x4C5, 0x0B2, 0x009, 0x27B, 0x4C8, 0x0B4, 0x009, 0x276, 0x4CB, 0x0B7, 0x008,
+    0x271, 0x4CD, 0x0BA, 0x008, 0x26C, 0x4D0, 0x0BC, 0x008, 0x267, 0x4D2, 0x0BF, 0x007, 0x263,
+    0x4D5, 0x0C1, 0x007, 0x25E, 0x4D7, 0x0C4, 0x007, 0x259, 0x4D9, 0x0C7, 0x006, 0x254, 0x4DC,
+    0x0C9, 0x006, 0x250, 0x4DE, 0x0CC, 0x006, 0x24B, 0x4E0, 0x0CF, 0x006, 0x246, 0x4E3, 0x0D2,
+    0x005, 0x241, 0x4E5, 0x0D4, 0x005, 0x23D, 0x4E7, 0x0D7, 0x005, 0x238, 0x4E9, 0x0DA, 0x005,
+    0x233, 0x4EB, 0x0DD, 0x004, 0x22F, 0x4ED, 0x0E0, 0x004, 0x22A, 0x4EF, 0x0E3, 0x004, 0x226,
+    0x4F1, 0x0E6, 0x004, 0x221, 0x4F3, 0x0E9, 0x004, 0x21C, 0x4F5, 0x0EC, 0x003, 0x218, 0x4F6,
+    0x0EF, 0x003, 0x213, 0x4F8, 0x0F2, 0x003, 0x20F, 0x4FA, 0x0F5, 0x003, 0x20A, 0x4FB, 0x0F8,
+    0x003, 0x205, 0x4FD, 0x0FB, 0x002, 0x201, 0x4FF, 0x0FE, 0x002, 0x1FC, 0x500, 0x101, 0x002,
+    0x1F8, 0x502, 0x104, 0x002, 0x1F3, 0x503, 0x107, 0x002, 0x1EF, 0x504, 0x10B, 0x002, 0x1EB,
+    0x506, 0x10E, 0x002, 0x1E6, 0x507, 0x111, 0x001, 0x1E2, 0x508, 0x114, 0x001, 0x1DD, 0x50A,
+    0x118, 0x001, 0x1D9, 0x50B, 0x11B, 0x001, 0x1D5, 0x50C, 0x11E, 0x001, 0x1D0, 0x50D, 0x122,
+    0x001, 0x1CC, 0x50E, 0x125, 0x001, 0x1C8, 0x50F, 0x129, 0x001, 0x1C3, 0x510, 0x12C, 0x001,
+    0x1BF, 0x511, 0x130, 0x001, 0x1BB, 0x511, 0x133, 0x001, 0x1B7, 0x512, 0x137, 0x000, 0x1B2,
+    0x513, 0x13A, 0x000, 0x1AE, 0x514, 0x13E, 0x000, 0x1AA, 0x514, 0x141, 0x000, 0x1A6, 0x515,
+    0x145, 0x000, 0x1A2, 0x516, 0x148, 0x000, 0x19E, 0x516, 0x14C, 0x000, 0x19A, 0x517, 0x150,
+    0x000, 0x195, 0x517, 0x153, 0x000, 0x191, 0x517, 0x157, 0x000, 0x18D, 0x518, 0x15B, 0x000,
+    0x189, 0x518, 0x15F, 0x000, 0x185, 0x518, 0x162, 0x000, 0x181, 0x518, 0x166, 0x000, 0x17D,
+    0x518, 0x16A, 0x000, 0x17A, 0x519, 0x16E, 0x000, 0x176, 0x519, 0x172,
 ];
 
 /// Sample four points through the Gaussian coefficient table at the
-/// current fractional position. `samples` is `[prev2, prev1, curr,
-/// next]` (oldest to newest); `frac` is the 12-bit fractional
-/// position (0..=0xFFF — `sample_frac` at the call site).
+/// current fractional position. `samples` is the Redux-style rolling
+/// ring window `[oldest, ..., newest]`; `frac` is the 16.16 fixed
+/// point cursor remainder (nominally `0..0xFFFF`).
 ///
 /// Returns the interpolated sample. Masking with `!2047` before
 /// summing matches the 11-bit hardware accumulator precision.
 fn gauss_interpolate(samples: [i16; 4], frac: u32) -> i16 {
     // Redux: `vl = (spos >> 6) & ~3`, where `spos` is a 16.16
-    // fixed-point position (0..=0xFFFF). Our `frac` is 12-bit
-    // (0..=0xFFF nominally), so the equivalent shift is
-    // `<< 4 >> 6 = >> 2` to reach the `vl` scale, then `& ~3`
-    // for alignment.
-    //
-    // Clamp `vl` to 1020 because the advance loop in
-    // `fetch_voice_sample` can break out of its inner step with
-    // `sample_frac` still >= 0x1000 (when the block boundary is
-    // hit mid-advance at high pitch). The next call then decodes
-    // a new block but inherits that leftover fraction — valid
-    // hardware-wise (the "extra" fraction is consumed on the
-    // next sample) but potentially indexes past 1023 here.
-    let vl_raw = ((frac >> 2) & !3) as usize;
+    // fixed-point cursor kept below `0x10000` before interpolation.
+    // Clamp defensively in case a caller hands us a larger value.
+    let vl_raw = ((frac >> 6) & !3) as usize;
     let vl = vl_raw.min(1020);
     let a = (GAUSS_TABLE[vl] * samples[0] as i32) & !2047;
     let b = (GAUSS_TABLE[vl + 1] * samples[1] as i32) & !2047;
@@ -1618,20 +1666,14 @@ impl XaDecoderState {
 /// XA ADPCM filter coefficients `k0, k1` in Q10 form. Four filter
 /// IDs match the real-hardware decode table. Pattern matches
 /// Redux's `decode_xa.cc::s_K0/s_K1` at `(1<<SHC = 1024)`.
-const XA_FILTER: [(i32, i32); 4] = [
-    (0, 0),
-    (960, 0),
-    (1840, -832),
-    (1568, -880),
-];
+const XA_FILTER: [(i32, i32); 4] = [(0, 0), (960, 0), (1840, -832), (1568, -880)];
 
 /// Decode 28 ADPCM samples (one "sound unit") from an XA block.
 /// - `filter_range` — packed byte: high nibble = filter ID (0..=3,
-///   values >3 are reserved), low nibble = range (output shift, clamp
-///   >=12 to 9 per hardware).
-/// - `data` — 14 × 16-bit words giving 28 × 4-bit nibbles, or
-///   28 × 4-bit nibbles for 8-bit mode. We model the 4-bit case
-///   (used by Level B/C XA — the common one).
+///   values >3 are reserved), low nibble = range (output shift).
+/// - `data` — seven 16-bit packed words, laid out exactly like
+///   Redux's `decode_xa.cc` before it calls `ADPCM_DecodeBlock16`.
+///   Each word carries four 4-bit samples.
 /// - `state` — in/out filter history; mutates across calls within a
 ///   sound group.
 ///
@@ -1645,32 +1687,45 @@ pub fn xa_decode_block(
     stride: usize,
 ) {
     let filter_id = ((filter_range >> 4) & 0x0F).min(3) as usize;
-    let range = (filter_range & 0x0F).min(12) as u32;
+    let range = (filter_range & 0x0F) as u32;
     let (k0, k1) = XA_FILTER[filter_id];
     let mut y0 = state.y0;
     let mut y1 = state.y1;
 
-    // 14 words × 4 samples each = 56, but we only output 28 per
-    // block. XA groups the 14 words so that each nibble column
-    // produces one sample — walking i32 nibbles from low to high.
-    // Redux's inner loop does this as 7 quads; we mirror exactly.
-    for i in 0..(data.len().min(7)) {
-        let word = data[i * 2] as u32 | ((data[i * 2 + 1] as u32) << 16);
-        for n in 0..4 {
-            let nibble = ((word >> (n * 4)) & 0xF) as i32;
-            // Sign-extend 4 bits, shift up to high word, arithmetic
-            // shift down by `(range)` to apply the per-block scale.
-            let signed = ((nibble << 28) >> 28) << 12;
-            let mut sample = signed >> range;
-            // Apply IIR filter with prev samples.
-            sample += (y0 * k0 + y1 * k1) >> 10;
-            let clamped = sample.clamp(-0x8000, 0x7FFF);
+    // Match Redux's `ADPCM_DecodeBlock16` exactly: unpack one packed
+    // 16-bit word into x0..x3 (high nibble first), run the IIR filter,
+    // clamp in Q4, then emit 16-bit PCM.
+    for (i, &word) in data.iter().take(7).enumerate() {
+        let expand = |shift: u32| -> i32 {
+            let nib = ((((word as u32) << shift) & 0xF000) as u16) as i16 as i32;
+            (nib >> range) << 4
+        };
+
+        let mut x3 = expand(0);
+        let mut x2 = expand(4);
+        let mut x1 = expand(8);
+        let mut x0 = expand(12);
+
+        x0 += (y0 * k0 + y1 * k1) >> 10;
+        y1 = y0;
+        y0 = x0;
+        x1 += (y0 * k0 + y1 * k1) >> 10;
+        y1 = y0;
+        y0 = x1;
+        x2 += (y0 * k0 + y1 * k1) >> 10;
+        y1 = y0;
+        y0 = x2;
+        x3 += (y0 * k0 + y1 * k1) >> 10;
+        y1 = y0;
+        y0 = x3;
+
+        let decoded = [x0, x1, x2, x3];
+        for (n, &sample) in decoded.iter().enumerate() {
+            let clamped = sample.clamp(-32768 << 4, 32767 << 4);
             let idx = (i * 4 + n) * stride;
             if idx < out.len() {
-                out[idx] = clamped as i16;
+                out[idx] = (clamped >> 4) as i16;
             }
-            y1 = y0;
-            y0 = clamped;
         }
     }
     state.y0 = y0;
@@ -1948,6 +2003,23 @@ mod tests {
     }
 
     #[test]
+    fn adpcm_decode_uses_redux_shift_direction() {
+        let mut s = Spu::new();
+        let mut block = [0u8; 16];
+        // Predictor 0, shift 0. The first packed byte contains two
+        // signed 4-bit samples: +1 then +2.
+        block[0] = 0x00;
+        block[2] = 0x21;
+        write_adpcm_block(&mut s, 0x20, &block);
+        s.voices[0].current_addr = 0x20;
+
+        s.decode_next_block(0);
+
+        assert_eq!(s.voices[0].sample_buf[0], 0x1000);
+        assert_eq!(s.voices[0].sample_buf[1], 0x2000);
+    }
+
+    #[test]
     fn adpcm_flag_1_2_loops_back_to_loop_addr() {
         let mut s = Spu::new();
         s.voices[0].loop_addr = 0x100;
@@ -1968,8 +2040,26 @@ mod tests {
         block[1] = 0x1; // flag 1 only
         write_adpcm_block(&mut s, 0x40, &block);
         s.decode_next_block(0);
-        assert_eq!(s.voices[0].phase, AdsrPhase::Off);
+        assert_eq!(s.voices[0].phase, AdsrPhase::Attack);
+        assert!(s.voices[0].stop_after_block);
         assert_ne!(s.endx_latched & 1, 0);
+    }
+
+    #[test]
+    fn adpcm_stop_flag_turns_voice_off_after_final_block_is_consumed() {
+        let mut s = Spu::new();
+        s.voices[0].phase = AdsrPhase::Attack;
+        s.voices[0].envelope = 0x7FFF;
+        s.voices[0].sample_pos = 0x10000;
+        s.voices[0].sample_index = ADPCM_SAMPLES_PER_BLOCK;
+        s.voices[0].stop_after_block = true;
+
+        let out = s.fetch_voice_sample(0);
+
+        assert_eq!(out, 0);
+        assert_eq!(s.voices[0].phase, AdsrPhase::Off);
+        assert_eq!(s.voices[0].envelope, 0);
+        assert!(!s.voices[0].stop_after_block);
     }
 
     #[test]
@@ -2007,7 +2097,11 @@ mod tests {
         s.voices[0].phase = AdsrPhase::Attack;
         // After a single step, envelope should have risen from 0.
         s.voices[0].step_envelope();
-        assert!(s.voices[0].envelope > 0, "env after 1 step: {}", s.voices[0].envelope);
+        assert!(
+            s.voices[0].envelope > 0,
+            "env after 1 step: {}",
+            s.voices[0].envelope
+        );
     }
 
     #[test]
@@ -2077,12 +2171,13 @@ mod tests {
         let mut s = Spu::new();
         s.main_vol_l.write(0x3FFF);
         s.main_vol_r.write(0x3FFF);
+        s.write16(SPUCNT, SPUCNT_UNMUTE);
         // Seed SPU RAM with a repeating ADPCM block so each voice
         // has something to decode.
         let mut block = [0u8; 16];
         block[0] = 0x0C; // shift=0x0C, filter=0
         block[1] = 0x02; // flag 2 = repeat
-        // Loop this one block for the first 0x1000 bytes of RAM.
+                         // Loop this one block for the first 0x1000 bytes of RAM.
         for base in (0..0x1000).step_by(16) {
             for i in 0..16 {
                 let idx = (base + i) / 2;
@@ -2176,7 +2271,11 @@ mod tests {
         for _ in 0..10 {
             env.tick();
         }
-        assert!(env.current > 0, "sweep-increase must raise current: {}", env.current);
+        assert!(
+            env.current > 0,
+            "sweep-increase must raise current: {}",
+            env.current
+        );
     }
 
     #[test]
@@ -2188,7 +2287,11 @@ mod tests {
         for _ in 0..10 {
             env.tick();
         }
-        assert!(env.current < 0x3FFF, "sweep-decrease must lower: {}", env.current);
+        assert!(
+            env.current < 0x3FFF,
+            "sweep-decrease must lower: {}",
+            env.current
+        );
     }
 
     #[test]
@@ -2214,15 +2317,25 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_interp_handles_frac_past_0x1000() {
-        // Regression: at high pitch with a block-boundary break,
-        // `sample_frac` can leak above 0x1000 by a handful of
-        // units. Make sure the clamp inside `gauss_interpolate`
-        // keeps us in-bounds instead of panicking.
-        for frac in [0x1000, 0x1004, 0x100F, 0x10FF, 0x1FFF] {
+    fn gaussian_interp_handles_frac_past_0x10000() {
+        // Defensive clamp: the caller keeps the remainder below one
+        // source sample, but out-of-range values still shouldn't
+        // index past the end of the coefficient table.
+        for frac in [0x10000, 0x10004, 0x1FFFF, 0xFFFF_FFFF] {
             let _ = gauss_interpolate([0, 0, 0, 0], frac);
             let _ = gauss_interpolate([0x1234, 0x5678, -0x100, 0x7FFF], frac);
         }
+    }
+
+    #[test]
+    fn interpolation_ring_preserves_previous_block_tail() {
+        let mut voice = Voice::default();
+        voice.push_interpolation_sample(10);
+        voice.push_interpolation_sample(20);
+        voice.push_interpolation_sample(30);
+        voice.push_interpolation_sample(40);
+        voice.push_interpolation_sample(50);
+        assert_eq!(voice.interpolation_window(), [20, 30, 40, 50]);
     }
 
     #[test]
@@ -2244,7 +2357,10 @@ mod tests {
         }
         let mut out = [0i16; 28];
         xa_decode_block(&mut state, 0x01, &data, &mut out, 1);
-        assert!(out.iter().any(|&s| s != 0), "some samples should be nonzero");
+        assert!(
+            out.iter().any(|&s| s != 0),
+            "some samples should be nonzero"
+        );
     }
 
     // -- Volume register decoding --
@@ -2318,6 +2434,7 @@ mod tests {
         let mut s = Spu::new();
         s.main_vol_l.write(0x3FFF);
         s.main_vol_r.write(0x3FFF);
+        s.write16(SPUCNT, SPUCNT_UNMUTE);
 
         // Mark voice 1 as pitch-modulated by voice 0.
         s.write16(PMON_LO, 0x0002);
@@ -2343,11 +2460,34 @@ mod tests {
         // would produce one full-scale sample's worth of output.
         // Bound it: total must be < 2× single-voice level.
         let voice_only = (0x4000_i32 * 0x3FFF) >> 14;
-        assert!((l as i32) < voice_only * 3 / 2, "voice 0 leaked into L: l={l}");
-        assert!((r as i32) < voice_only * 3 / 2, "voice 0 leaked into R: r={r}");
+        assert!(
+            (l as i32) < voice_only * 3 / 2,
+            "voice 0 leaked into L: l={l}"
+        );
+        assert!(
+            (r as i32) < voice_only * 3 / 2,
+            "voice 0 leaked into R: r={r}"
+        );
         // And greater than zero — voice 1 still played.
         assert!(l > 0);
         assert!(r > 0);
+    }
+
+    #[test]
+    fn spucnt_mute_zeroes_voice_sample_history() {
+        let mut s = Spu::new();
+        s.main_vol_l.write(0x3FFF);
+        s.main_vol_r.write(0x3FFF);
+        s.voices[0].phase = AdsrPhase::Sustain;
+        s.voices[0].envelope = 0x7FFF;
+        s.voices[0].sample_buf = [0x4000; ADPCM_SAMPLES_PER_BLOCK];
+        s.voices[0].sample_index = 0;
+
+        s.tick_sample(SAMPLE_CYCLES);
+        let (l, r) = s.drain_audio()[0];
+
+        assert_eq!((l, r), (0, 0));
+        assert_eq!(s.voices[0].interpolation_window(), [0, 0, 0, 0]);
     }
 
     #[test]
@@ -2367,20 +2507,31 @@ mod tests {
         s.tick_sample(SAMPLE_CYCLES);
         // last_sample for voice 0 should be approximately envelope *
         // sample (saturated), not zero.
-        assert!(s.voices[0].last_sample != 0, "modulator's last_sample was zeroed");
+        assert!(
+            s.voices[0].last_sample != 0,
+            "modulator's last_sample was zeroed"
+        );
     }
 
     #[test]
     fn noise_value_substitutes_for_voice_sample() {
         // Voice 5 is in noise mode; fetch_voice_sample returns
-        // noise_val unchanged regardless of ADPCM state.
+        // noise_val unchanged when the voice is active.
         let mut s = Spu::new();
         s.noise_on = 1 << 5;
         s.noise_val = 0x1234;
-        // Must NOT touch ADPCM state — voice phase stays Off but
-        // we still get noise out (matches Redux: `iGetNoiseVal` is
-        // called regardless of ADSR state).
+        s.voices[5].phase = AdsrPhase::Attack;
         let out = s.fetch_voice_sample(5);
         assert_eq!(out, 0x1234);
+    }
+
+    #[test]
+    fn off_noise_voice_stays_silent() {
+        let mut s = Spu::new();
+        s.noise_on = 1 << 5;
+        s.noise_val = 0x1234;
+        s.voices[5].phase = AdsrPhase::Off;
+        let out = s.fetch_voice_sample(5);
+        assert_eq!(out, 0);
     }
 }

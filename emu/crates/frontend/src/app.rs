@@ -90,12 +90,12 @@ pub struct AppState {
     pub menu: MenuState,
     pub hud: HudState,
     pub memory_view: MemoryView,
-    /// When true, the shell drives `cpu.step` at `run_steps_per_frame`
-    /// instructions per redraw. Toggled via the Menu's Run/Pause item.
+    /// When true, the shell advances emulation on each redraw. Toggled
+    /// via the Menu's Run/Pause item.
     pub running: bool,
-    /// How many CPU instructions the run loop retires per frame when
-    /// `running` is true. Tuned to stay real-time-ish on a modern host
-    /// without overshooting VBlank granularity once timers land.
+    /// Safety cap for one frontend frame. The run loop targets PSX
+    /// master-clock cycles, not this many instructions, but the cap
+    /// prevents a broken guest from spinning forever in one redraw.
     pub run_steps_per_frame: u32,
     /// Rolling window of the last [`EXEC_HISTORY_CAP`] retired
     /// instructions, newest at the back. Driven by both single-step
@@ -198,7 +198,7 @@ impl AppState {
             hud: HudState::default(),
             memory_view: MemoryView::default(),
             running: false,
-            run_steps_per_frame: 100_000,
+            run_steps_per_frame: 1_000_000,
             exec_history: VecDeque::with_capacity(EXEC_HISTORY_CAP),
             breakpoints: BTreeSet::new(),
             gpr_snapshot: None,
@@ -639,21 +639,29 @@ pub fn push_history(history: &mut VecDeque<InstructionRecord>, record: Instructi
     history.push_back(record);
 }
 
-/// Retire up to `run_steps_per_frame` instructions. Any execution
-/// error auto-pauses, reopens the Menu, and surfaces the stopped
-/// state via the register panel. Hitting a breakpoint does the
-/// same. Split out here (rather than living in the shell loop) so
-/// both the shell's per-frame run path and the toolbar's "advance
-/// one frame" button can invoke the same logic.
+/// Retire enough instructions to cover one NTSC frame's worth of PSX
+/// master-clock cycles. Any execution error auto-pauses, reopens the
+/// Menu, and surfaces the stopped state via the register panel. Hitting
+/// a breakpoint does the same. Split out here (rather than living in
+/// the shell loop) so both the shell's per-frame run path and the
+/// toolbar's "advance one frame" button can invoke the same logic.
 pub fn step_one_frame(state: &mut AppState) {
-    let steps = state.run_steps_per_frame;
+    const PSX_MASTER_CLOCK_HZ: u64 = 33_868_800;
+    const NTSC_FRAMES_PER_SECOND: u64 = 60;
+    const CYCLES_PER_FRAME: u64 = PSX_MASTER_CLOCK_HZ / NTSC_FRAMES_PER_SECOND;
+
+    let max_steps = state.run_steps_per_frame.max(1);
     let Some(bus) = state.bus.as_mut() else {
         state.running = false;
         state.menu.sync_run_label(false);
         return;
     };
 
-    for _ in 0..steps {
+    let target_cycles = bus.cycles().saturating_add(CYCLES_PER_FRAME);
+    for _ in 0..max_steps {
+        if bus.cycles() >= target_cycles {
+            break;
+        }
         // Breakpoint check happens BEFORE stepping so the paused PC
         // is the BP address itself — the instruction at that PC has
         // not yet executed.

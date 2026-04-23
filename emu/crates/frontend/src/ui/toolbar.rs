@@ -207,10 +207,9 @@ fn metric(ui: &mut egui::Ui, label: &str, value: String) {
 fn draw_buttons(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(4.0);
 
-    // Advance one frame — run `run_steps_per_frame` instructions
-    // unconditionally. Pauses first so clicking while running
-    // doesn't advance two frames (one from the click, one from the
-    // shell's run loop).
+    // Advance one emulated frame. Pauses first so clicking while
+    // running doesn't advance two frames (one from the click, one
+    // from the shell's run loop).
     let step_btn = Button::new(icons::text(icons::SKIP_FORWARD, ICON_SIZE)).min_size(BUTTON_SIZE);
     if ui
         .add(step_btn)

@@ -84,8 +84,9 @@ impl AudioOut {
         let sample_format = config.sample_format();
         let stream_config: cpal::StreamConfig = config.into();
 
-        let queue: SampleQueue =
-            Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(16_384)));
+        let queue: SampleQueue = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+            16_384,
+        )));
 
         // Ratio between PSX 44.1 kHz and the host's actual rate —
         // used to pull samples from the queue at the right pace.
@@ -96,6 +97,12 @@ impl AudioOut {
         let queue_cb = Arc::clone(&queue);
         let err_fn = |e| eprintln!("[audio] stream error: {e}");
         let mut accum: f32 = 0.0;
+        // Resampler state must persist across callbacks. Resetting the
+        // held sample at the start of every callback injects tiny
+        // discontinuities whenever the first host frame doesn't cross
+        // the next `pull_rate` boundary, which is exactly the sort of
+        // periodic crackle users hear on 48 kHz hosts.
+        let mut last_sample = (0i16, 0i16);
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device
@@ -103,16 +110,13 @@ impl AudioOut {
                     &stream_config,
                     move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                         let mut q = queue_cb.lock().unwrap();
-                        let mut last_sample = (0i16, 0i16);
                         for frame in out.chunks_mut(2) {
                             // Consume one PSX sample for every
                             // `1/pull_rate` host samples — nearest-
                             // neighbour resample. Good enough.
                             accum += pull_rate;
                             while accum >= 1.0 {
-                                if let Some(s) = q.pop_front() {
-                                    last_sample = s;
-                                }
+                                last_sample = q.pop_front().unwrap_or((0, 0));
                                 accum -= 1.0;
                             }
                             frame[0] = (last_sample.0 as f32) / 32768.0;
@@ -130,13 +134,10 @@ impl AudioOut {
                     &stream_config,
                     move |out: &mut [i16], _info: &cpal::OutputCallbackInfo| {
                         let mut q = queue_cb.lock().unwrap();
-                        let mut last_sample = (0i16, 0i16);
                         for frame in out.chunks_mut(2) {
                             accum += pull_rate;
                             while accum >= 1.0 {
-                                if let Some(s) = q.pop_front() {
-                                    last_sample = s;
-                                }
+                                last_sample = q.pop_front().unwrap_or((0, 0));
                                 accum -= 1.0;
                             }
                             frame[0] = last_sample.0;

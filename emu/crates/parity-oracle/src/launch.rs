@@ -15,6 +15,7 @@
 //! Callers never see Redux's own chatter; they see typed protocol
 //! responses through [`ReduxProcess::wait_for_response`].
 
+use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -103,11 +104,12 @@ impl ReduxProcess {
         let run_dir = tempfile::Builder::new()
             .prefix("psoxide3-redux-")
             .tempdir()?;
+        let binary = stage_redux_binary(&config.binary, run_dir.path())?;
 
         let bios = config.bios.to_string_lossy().into_owned();
         let lua = config.lua_script.to_string_lossy().into_owned();
 
-        let mut cmd = Command::new(&config.binary);
+        let mut cmd = Command::new(&binary);
         cmd.args([
             "-no-ui",
             "-no-gui-log",
@@ -392,6 +394,58 @@ impl ReduxProcess {
         Ok(tick)
     }
 
+    /// `run_checkpoint`, but with a VBlank-timed pad schedule applied
+    /// on Redux's side. `base_mask` is the always-held mask and
+    /// `pulses` is a list of `(mask, start_vblank, frames)` tuples
+    /// combined with it while the given VBlank window is active.
+    pub fn run_checkpoint_pad<F>(
+        &mut self,
+        n: u64,
+        interval: u64,
+        port: u32,
+        base_mask: u16,
+        pulses: &[(u16, u64, u64)],
+        timeout: Duration,
+        mut on_checkpoint: F,
+    ) -> Result<u64, OracleError>
+    where
+        F: FnMut(u64, u64, u32) -> Result<(), OracleError>,
+    {
+        if interval == 0 || n == 0 || port == 0 {
+            return Err(OracleError::Protocol {
+                expected: "n > 0, interval > 0, port > 0".to_string(),
+                got: format!("n={n} interval={interval} port={port}"),
+            });
+        }
+        let pulse_spec = if pulses.is_empty() {
+            "-".to_string()
+        } else {
+            pulses
+                .iter()
+                .map(|(mask, start_vblank, frames)| format!("{mask}@{start_vblank}+{frames}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        self.send_command(&format!(
+            "run_checkpoint_pad {n} {interval} {port} {base_mask} {pulse_spec}"
+        ))?;
+        let expected_checkpoints = n / interval;
+        for _ in 0..expected_checkpoints {
+            let line = self.wait_for_response(timeout)?;
+            let (step, tick, pc) = parse_checkpoint(&line)?;
+            on_checkpoint(step, tick, pc)?;
+        }
+        let final_line = self.wait_for_response(timeout)?;
+        let rest = final_line
+            .strip_prefix("run_checkpoint_pad ok ")
+            .ok_or_else(|| OracleError::Protocol {
+                expected: "run_checkpoint_pad ok ...".to_string(),
+                got: final_line.clone(),
+            })?;
+        let (_step, tick, _pc) = parse_kv_triple(rest, &final_line)?;
+        Ok(tick)
+    }
+
     /// Silently advance Redux by `n` instructions without emitting
     /// per-step records. The caller typically follows this with a
     /// `vram_hash` / `regs` / `peek32` query to capture only the
@@ -414,6 +468,50 @@ impl ReduxProcess {
                 expected: "run ok tick=<cycles>".to_string(),
                 got: line,
             })
+        }
+    }
+
+    /// Run `n` user-side steps silently while draining Redux's mixed
+    /// audio output to `path` as raw little-endian stereo s16 PCM.
+    ///
+    /// `chunk_steps` controls how often the Lua side drains the SPU's
+    /// internal audio stream. Smaller values reduce the risk of stream
+    /// overflow during audio-heavy scenes; larger values reduce
+    /// protocol overhead.
+    pub fn run_audio_capture(
+        &mut self,
+        n: u64,
+        chunk_steps: u64,
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<(u64, u64), OracleError> {
+        self.send_command(&format!(
+            "run_audio_capture {n} {chunk_steps} {}",
+            path.display()
+        ))?;
+        let line = self.wait_for_response(timeout)?;
+        let Some(rest) = line.strip_prefix("run_audio_capture ok ") else {
+            return Err(OracleError::Protocol {
+                expected: "run_audio_capture ok tick=<cycles> frames=<n>".to_string(),
+                got: line,
+            });
+        };
+
+        let mut tick = None;
+        let mut frames = None;
+        for part in rest.split_whitespace() {
+            if let Some(v) = part.strip_prefix("tick=") {
+                tick = v.parse::<u64>().ok();
+            } else if let Some(v) = part.strip_prefix("frames=") {
+                frames = v.parse::<u64>().ok();
+            }
+        }
+        match (tick, frames) {
+            (Some(tick), Some(frames)) => Ok((tick, frames)),
+            _ => Err(OracleError::Protocol {
+                expected: "tick=<cycles> frames=<n>".to_string(),
+                got: line,
+            }),
         }
     }
 
@@ -491,6 +589,26 @@ impl ReduxProcess {
         Ok(out)
     }
 
+    /// Read one 32-bit MMIO / RAM / BIOS word through Redux's view
+    /// of the system. Mirrors the oracle's `peek32` command.
+    pub fn peek32(&mut self, addr: u32, timeout: Duration) -> Result<u32, OracleError> {
+        self.send_command(&format!("peek32 {addr}"))?;
+        let line = self.wait_for_response(timeout)?;
+        let Some(rest) = line.strip_prefix("peek32 ") else {
+            return Err(OracleError::Protocol {
+                expected: "peek32 <value>".to_string(),
+                got: line,
+            });
+        };
+        rest.trim()
+            .parse::<i64>()
+            .map(|v| v as u32)
+            .map_err(|e| OracleError::Protocol {
+                expected: "peek32 integer".to_string(),
+                got: format!("{rest} ({e})"),
+            })
+    }
+
     /// Convenience: consume Lua's initial `ready` announcement and
     /// round-trip a `handshake` command.
     ///
@@ -566,10 +684,12 @@ impl Drop for ReduxProcess {
 
 /// Parse `chk step=X tick=Y pc=Z` checkpoint lines.
 fn parse_checkpoint(line: &str) -> Result<(u64, u64, u32), OracleError> {
-    let rest = line.strip_prefix("chk ").ok_or_else(|| OracleError::Protocol {
-        expected: "chk step=... tick=... pc=...".to_string(),
-        got: line.to_string(),
-    })?;
+    let rest = line
+        .strip_prefix("chk ")
+        .ok_or_else(|| OracleError::Protocol {
+            expected: "chk step=... tick=... pc=...".to_string(),
+            got: line.to_string(),
+        })?;
     parse_kv_triple(rest, line)
 }
 
@@ -606,6 +726,30 @@ fn ensure_file(path: &std::path::Path) -> Result<(), OracleError> {
             source: io::Error::new(io::ErrorKind::NotFound, "file does not exist"),
         })
     }
+}
+
+fn stage_redux_binary(
+    source: &std::path::Path,
+    run_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, OracleError> {
+    let staged = run_dir.join("pcsx-redux-oracle");
+    fs::copy(source, &staged)?;
+
+    // On macOS, launching `/path/to/pcsx-redux/pcsx-redux` can make
+    // the kernel/code-signing stack treat the whole checkout as a
+    // malformed bundle because the executable name matches the parent
+    // directory. The process then sits forever in "launched-suspended"
+    // state before Lua or even `main` runs. Running a copied executable
+    // with a neutral filename avoids that bundle heuristic.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(source)?.permissions();
+        perms.set_mode(perms.mode() | 0o700);
+        fs::set_permissions(&staged, perms)?;
+    }
+
+    Ok(staged)
 }
 
 /// Stdout drain: classifies each line by the protocol prefix.

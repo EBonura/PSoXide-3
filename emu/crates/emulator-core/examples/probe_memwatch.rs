@@ -9,7 +9,10 @@ use emulator_core::{Bus, Cpu};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let n: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(500_000_000);
+    let n: u64 = args
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500_000_000);
     let addr: u32 = args
         .get(1)
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
@@ -35,10 +38,13 @@ fn main() {
         }
     }
 
-    println!("=== RAM @ 0x{addr:08x} after step {n} (cycles={}) ===", bus.cycles());
+    println!(
+        "=== RAM @ 0x{addr:08x} after step {n} (cycles={}) ===",
+        bus.cycles()
+    );
     for i in 0..count {
         let a = addr + i * 4;
-        let w = bus.peek_instruction(a).unwrap_or(0xFFFFFFFF);
+        let w = bus.peek_instruction(a).unwrap_or_else(|| bus.read32(a));
         println!("  0x{a:08x}: 0x{w:08x}");
     }
 }

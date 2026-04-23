@@ -7,6 +7,12 @@
 //! / `0x46` / `0x47` / `0x4C` / `0x4D`), or never getting a sane pad
 //! response at all.
 //!
+//! Supports two input modes:
+//! - `PSOXIDE_PAD1=0x0008` keeps a mask held for the whole run.
+//! - `PSOXIDE_PAD1_PULSES='0x0008@1200+4,0x4000@1250+1'` presses one
+//!   or more masks for a fixed number of VBlanks starting at the given
+//!   VBlank count. Format per entry: `<mask>@<start_vblank>+<frames>`.
+//!
 //! Best used with MMIO tracing enabled:
 //!
 //! ```bash
@@ -20,11 +26,25 @@ use psx_iso::Disc;
 use std::path::PathBuf;
 
 #[cfg(feature = "trace-mmio")]
-use std::collections::BTreeMap;
+use emulator_core::mmio_trace::MmioEntry;
 #[cfg(feature = "trace-mmio")]
 use emulator_core::{MmioKind, Sio0};
 #[cfg(feature = "trace-mmio")]
-use emulator_core::mmio_trace::MmioEntry;
+use std::collections::BTreeMap;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PadPulse {
+    mask: u16,
+    start_vblank: u64,
+    frames: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PadMaskChange {
+    vblank: u64,
+    cycles: u64,
+    mask: u16,
+}
 
 fn main() {
     let steps: u64 = std::env::args()
@@ -42,6 +62,18 @@ fn main() {
         .ok()
         .and_then(|s| parse_u16_mask(&s))
         .unwrap_or(0);
+    let pad_pulses = std::env::var("PSOXIDE_PAD1_PULSES")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            parse_pad_pulses(&s).unwrap_or_else(|| {
+                panic!(
+                    "PSOXIDE_PAD1_PULSES must be comma-separated \
+                     <mask>@<start_vblank>+<frames> entries"
+                )
+            })
+        })
+        .unwrap_or_default();
 
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
     let disc = std::fs::read(&disc_path).expect("disc readable");
@@ -49,16 +81,29 @@ fn main() {
     let mut bus = Bus::new(bios).expect("bus");
     bus.cdrom.insert_disc(Some(Disc::from_bin(disc)));
     bus.attach_digital_pad_port1();
-    if held_buttons != 0 {
-        bus.set_port1_buttons(emulator_core::ButtonState::from_bits(held_buttons));
-    }
 
     let mut cpu = Cpu::new();
     let mut cycles_at_last_pump = 0u64;
+    let mut current_pad_mask = None;
+    let mut pad_mask_changes = Vec::new();
+    sync_pad_mask(
+        &mut bus,
+        held_buttons,
+        &pad_pulses,
+        &mut current_pad_mask,
+        &mut pad_mask_changes,
+    );
     for _ in 0..steps {
         if cpu.step(&mut bus).is_err() {
             break;
         }
+        sync_pad_mask(
+            &mut bus,
+            held_buttons,
+            &pad_pulses,
+            &mut current_pad_mask,
+            &mut pad_mask_changes,
+        );
         if bus.cycles() - cycles_at_last_pump > 560_000 {
             cycles_at_last_pump = bus.cycles();
             bus.run_spu_samples(735);
@@ -70,19 +115,19 @@ fn main() {
     println!("disc: {disc_path}");
     println!("steps:      {steps}");
     println!("pad mask:   0x{held_buttons:04x}");
+    println!("pad pulses: {}", format_pad_pulses(&pad_pulses));
     println!("cpu.tick:   {}", cpu.tick());
     println!("bus.cycles: {}", bus.cycles());
     println!("final pc:   0x{:08x}", cpu.pc());
     println!("vblank:     {}", bus.irq().raise_counts()[0]);
     println!("display:    {w}x{h}  hash=0x{display_hash:016x}");
+    dump_pad_mask_changes(&pad_mask_changes);
     dump_pad_histogram(&bus);
 
     #[cfg(feature = "trace-mmio")]
     dump_trace(&bus);
     #[cfg(not(feature = "trace-mmio"))]
-    println!(
-        "\nMMIO tracing is disabled. Re-run with --features emulator-core/trace-mmio."
-    );
+    println!("\nMMIO tracing is disabled. Re-run with --features emulator-core/trace-mmio.");
 }
 
 fn parse_u16_mask(text: &str) -> Option<u16> {
@@ -91,6 +136,102 @@ fn parse_u16_mask(text: &str) -> Option<u16> {
         u16::from_str_radix(hex, 16).ok()
     } else {
         s.parse::<u16>().ok()
+    }
+}
+
+fn parse_pad_pulses(text: &str) -> Option<Vec<PadPulse>> {
+    let mut pulses = Vec::new();
+    for entry in text.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        pulses.push(parse_pad_pulse(entry)?);
+    }
+    Some(pulses)
+}
+
+fn parse_pad_pulse(text: &str) -> Option<PadPulse> {
+    let (mask_text, rest) = text.split_once('@')?;
+    let mask = parse_u16_mask(mask_text)?;
+    let (start_text, frames_text) = match rest.split_once('+') {
+        Some((start, frames)) => (start.trim(), frames.trim()),
+        None => (rest.trim(), "1"),
+    };
+    let start_vblank = start_text.parse().ok()?;
+    let frames = frames_text.parse().ok()?;
+    if frames == 0 {
+        return None;
+    }
+    Some(PadPulse {
+        mask,
+        start_vblank,
+        frames,
+    })
+}
+
+fn format_pad_pulses(pulses: &[PadPulse]) -> String {
+    if pulses.is_empty() {
+        return "(none)".into();
+    }
+    pulses
+        .iter()
+        .map(|pulse| {
+            format!(
+                "0x{:04x}@{}+{}",
+                pulse.mask, pulse.start_vblank, pulse.frames
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn effective_pad_mask(base_mask: u16, pulses: &[PadPulse], current_vblank: u64) -> u16 {
+    let mut mask = base_mask;
+    for pulse in pulses {
+        let end_vblank = pulse.start_vblank.saturating_add(pulse.frames);
+        if current_vblank >= pulse.start_vblank && current_vblank < end_vblank {
+            mask |= pulse.mask;
+        }
+    }
+    mask
+}
+
+fn sync_pad_mask(
+    bus: &mut Bus,
+    base_mask: u16,
+    pulses: &[PadPulse],
+    current_mask: &mut Option<u16>,
+    changes: &mut Vec<PadMaskChange>,
+) {
+    let vblank = bus.irq().raise_counts()[0];
+    let next_mask = effective_pad_mask(base_mask, pulses, vblank);
+    if current_mask.is_some_and(|mask| mask == next_mask) {
+        return;
+    }
+
+    bus.set_port1_buttons(emulator_core::ButtonState::from_bits(next_mask));
+    if current_mask.is_some() || next_mask != 0 {
+        changes.push(PadMaskChange {
+            vblank,
+            cycles: bus.cycles(),
+            mask: next_mask,
+        });
+    }
+    *current_mask = Some(next_mask);
+}
+
+fn dump_pad_mask_changes(changes: &[PadMaskChange]) {
+    println!("\n=== Pad-1 mask changes ===");
+    if changes.is_empty() {
+        println!("  (none)");
+        return;
+    }
+    for change in changes {
+        println!(
+            "  vblank={}  cycles={}  mask=0x{:04x}",
+            change.vblank, change.cycles, change.mask
+        );
     }
 }
 
@@ -174,7 +315,11 @@ fn dump_pad_histogram(bus: &Bus) {
                 .join(" ");
             println!(
                 "  {}  tx=[{tx}]  rx=[{rx}]",
-                if poll.complete { "complete" } else { "partial " }
+                if poll.complete {
+                    "complete"
+                } else {
+                    "partial "
+                }
             );
         }
     }

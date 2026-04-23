@@ -37,6 +37,71 @@ local function send_nowait(line)
     io.write("#PSX3:" .. line .. "\n")
 end
 
+local function get_hw_ptr()
+    return PCSX.getScratchPtr()
+end
+
+local function get_pad_slot(port)
+    local sio0 = PCSX.SIO0
+    if not sio0 or not sio0.slots then
+        return nil
+    end
+    local slot = sio0.slots[port]
+    if not slot or not slot.pads then
+        return nil
+    end
+    return slot.pads[1]
+end
+
+local function apply_pad_mask(port, mask)
+    local pad = get_pad_slot(port)
+    if not pad then
+        return false, "pad slot unavailable"
+    end
+    for button = 0, 15 do
+        if bit.band(mask, bit.lshift(1, button)) ~= 0 then
+            pad.setOverride(button)
+        else
+            pad.clearOverride(button)
+        end
+    end
+    return true
+end
+
+local function parse_pad_pulses(spec)
+    if spec == nil or spec == "" or spec == "-" then
+        return {}
+    end
+    local pulses = {}
+    for entry in string.gmatch(spec, "[^,]+") do
+        local mask_s, start_s, frames_s = entry:match("^(%d+)@(%d+)%+(%d+)$")
+        if not mask_s then
+            return nil, "bad pulse spec"
+        end
+        local frames = tonumber(frames_s)
+        if not frames or frames <= 0 then
+            return nil, "bad pulse frames"
+        end
+        pulses[#pulses + 1] = {
+            mask = tonumber(mask_s),
+            start_vblank = tonumber(start_s),
+            frames = frames,
+        }
+    end
+    return pulses
+end
+
+local function effective_pad_mask(base_mask, pulses, current_vblank)
+    local mask = base_mask
+    for _, pulse in ipairs(pulses) do
+        local end_vblank = pulse.start_vblank + pulse.frames
+        if current_vblank >= pulse.start_vblank and current_vblank < end_vblank then
+            mask = bit.bor(mask, pulse.mask)
+        end
+    end
+    return mask
+end
+
 -- Pointers resolved once in `run()` and closed over by helpers. These
 -- addresses are stable for the life of the emulator.
 local ram_ptr, rom_ptr, regs
@@ -220,6 +285,95 @@ local function run()
             local tick = tonumber(PCSX.getCPUCycles())
             send(string.format("run ok tick=%d", tick))
 
+        elseif cmd == "run_audio_capture" then
+            -- `run_audio_capture N CHUNK_STEPS PATH` — run N user-side
+            -- steps silently and append mixed audio into PATH as raw
+            -- little-endian s16 stereo PCM.
+            --
+            -- Important: Redux's SPU mixing thread is host-driven and
+            -- can run ahead of emulated CPU time when the oracle is in
+            -- quiet stepped mode. So we do NOT drain "everything that's
+            -- buffered". Instead we drain only the number of frames
+            -- implied by the retired CPU cycles (`33868800 / 44100 =
+            -- 768 cycles/sample`) and let the queue back-pressure the
+            -- producer if it tries to outrun emulated time.
+            local n_str, chunk_str, path =
+                line:match("^run_audio_capture%s+(%d+)%s+(%d+)%s+(.+)$")
+            local n = tonumber(n_str) or 0
+            local chunk = tonumber(chunk_str) or 0
+            if n == 0 or chunk == 0 or not path then
+                send("err run_audio_capture: bad args")
+            else
+                local ok, result = pcall(function()
+                    local batch_frames = 2048
+                    local pcm = ffi.new("int16_t[?]", batch_frames * 2)
+                    local file = io.open(path, "wb")
+                    if not file then
+                        error("cannot open " .. path)
+                    end
+
+                    -- Drop audio that Redux's host-driven SPU thread
+                    -- prebuffered before the capture window. Without
+                    -- this, BIOS comparisons measure MiniAudio queue
+                    -- latency rather than emulated SPU time.
+                    local flushed = 0
+                    while flushed < 32768 do
+                        local frames = tonumber(PCSX.drainAudioFrames(pcm, batch_frames)) or 0
+                        if frames <= 0 then
+                            break
+                        end
+                        flushed = flushed + frames
+                    end
+
+                    local total_frames = 0
+                    local cycle_remainder = 0
+                    local prev_tick = tonumber(PCSX.getCPUCycles()) or 0
+                    local remaining = n
+                    while remaining > 0 do
+                        local take = math.min(remaining, chunk)
+                        for i = 1, take do
+                            PCSX.stepIn()
+                            PCSX.runExecute()
+                        end
+                        remaining = remaining - take
+
+                        local tick = tonumber(PCSX.getCPUCycles()) or 0
+                        local tick_delta = tick - prev_tick
+                        prev_tick = tick
+                        cycle_remainder = cycle_remainder + tick_delta
+
+                        local wanted = math.floor(cycle_remainder / 768)
+                        cycle_remainder = cycle_remainder % 768
+
+                        while wanted > 0 do
+                            local request = math.min(batch_frames, wanted)
+                            local frames = tonumber(PCSX.drainAudioFrames(pcm, request)) or 0
+                            if frames <= 0 then
+                                break
+                            end
+                            file:write(ffi.string(ffi.cast("char*", pcm), frames * 4))
+                            total_frames = total_frames + frames
+                            wanted = wanted - frames
+                        end
+                    end
+
+                    file:close()
+
+                    local meta = io.open(path .. ".txt", "w")
+                    if meta then
+                        meta:write(string.format("rate=44100 channels=2 format=s16le frames=%d\n", total_frames))
+                        meta:close()
+                    end
+                    local tick = tonumber(PCSX.getCPUCycles()) or 0
+                    return string.format("tick=%d frames=%d", tick, total_frames)
+                end)
+                if ok then
+                    send("run_audio_capture ok " .. result)
+                else
+                    send("err run_audio_capture: " .. tostring(result))
+                end
+            end
+
         elseif cmd == "log_cdrom_irqs" then
             -- `log_cdrom_irqs N M` — run N user-side steps
             -- silently, emitting one `cdrom_irq tick=... type=...`
@@ -323,6 +477,74 @@ local function run()
                 local tick = tonumber(PCSX.getCPUCycles())
                 local pc = tonumber(regs.pc)
                 send(string.format("run_checkpoint ok step=%d tick=%d pc=%d", n, tick, pc))
+            end
+
+        elseif cmd == "run_checkpoint_pad" then
+            -- `run_checkpoint_pad N M PORT BASE_MASK PULSES` — same as
+            -- `run_checkpoint`, but also applies a VBlank-timed button
+            -- schedule to the given controller port. `PULSES` is either
+            -- `-` or a comma-separated list of
+            -- `<mask>@<start_vblank>+<frames>` entries, using decimal
+            -- integers only so the shell and protocol stay boring.
+            local n_str, m_str, port_str, base_mask_str, pulse_spec =
+                line:match("^run_checkpoint_pad%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%S+)$")
+            local n = tonumber(n_str) or 0
+            local m = tonumber(m_str) or 1
+            local port = tonumber(port_str) or 0
+            local base_mask = tonumber(base_mask_str) or 0
+            local pulses, pulse_err = parse_pad_pulses(pulse_spec)
+            if n == 0 or port == 0 or not pulses then
+                send("err run_checkpoint_pad: " .. tostring(pulse_err or "bad args"))
+            else
+                local hw_ptr = get_hw_ptr()
+                local istat_ptr = ffi.cast("uint32_t*", hw_ptr + 0x1070)
+                local prev_vblank = bit.band(istat_ptr[0], 0x1)
+                local vblank_count = 0
+                local current_mask = nil
+                local function sync_pad_mask()
+                    local next_mask = effective_pad_mask(base_mask, pulses, vblank_count)
+                    if current_mask ~= next_mask then
+                        local ok, err = apply_pad_mask(port, next_mask)
+                        if not ok then
+                            return false, err
+                        end
+                        current_mask = next_mask
+                    end
+                    return true
+                end
+                local ok, err = sync_pad_mask()
+                if not ok then
+                    send("err run_checkpoint_pad: " .. tostring(err))
+                else
+                    local emissions = 0
+                    for i = 1, n do
+                        PCSX.stepIn()
+                        PCSX.runExecute()
+                        local cur_vblank = bit.band(istat_ptr[0], 0x1)
+                        if cur_vblank ~= 0 and prev_vblank == 0 then
+                            vblank_count = vblank_count + 1
+                        end
+                        prev_vblank = cur_vblank
+                        ok, err = sync_pad_mask()
+                        if not ok then
+                            send("err run_checkpoint_pad: " .. tostring(err))
+                            break
+                        end
+                        if i % m == 0 then
+                            local tick = tonumber(PCSX.getCPUCycles())
+                            local pc = tonumber(regs.pc)
+                            send_nowait(string.format("chk step=%d tick=%d pc=%d", i, tick, pc))
+                            emissions = emissions + 1
+                            if emissions % 256 == 0 then io.flush() end
+                        end
+                    end
+                    io.flush()
+                    if ok then
+                        local tick = tonumber(PCSX.getCPUCycles())
+                        local pc = tonumber(regs.pc)
+                        send(string.format("run_checkpoint_pad ok step=%d tick=%d pc=%d", n, tick, pc))
+                    end
+                end
             end
 
         elseif cmd == "peek32" then
