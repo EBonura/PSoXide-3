@@ -139,10 +139,9 @@ const RESPONSE_FIFO_DEPTH: usize = 16;
 ///   response, ~4.4 µs, observed across boot roms (L900, and the
 ///   shellopen path L938 scheduleCDLidIRQ(20480)).
 /// - `cdReadTime = psxClockSpeed / 75` — one PSX CD-frame period
-///   (L135). At double-speed (mode bit 7) a sector is ready every
-///   `cdReadTime` cycles; at single-speed, `cdReadTime * 2`. We
-///   don't track the mode bit yet — the BIOS's disc probe uses
-///   double-speed, so pick that as the default.
+///   (L135). Redux schedules the first ReadN/ReadS sector at
+///   `cdReadTime` in double-speed mode, then chains steady-state
+///   sectors at `cdReadTime / 2` (single-speed uses 2x those delays).
 /// - `scheduleCDPlayIRQ(SEEK_DONE ? 0x800 : cdReadTime * 4)` —
 ///   SeekL / SeekP second response (L875). If the target is already
 ///   seeked, quick ack; otherwise a full seek-time equivalent.
@@ -153,9 +152,17 @@ const SEEK_SECOND_RESPONSE_CYCLES: u64 = CD_READ_TIME * 4; // ≈ 1,806,336
 /// PSX system clock / CD frames per second. `33_868_800 / 75`.
 /// Redux's `cdReadTime`.
 const CD_READ_TIME: u64 = 451_584;
-// Sector-read cycles are now derived per-instance from the current
-// mode byte via [`CdRom::sector_read_cycles`]: double-speed =
-// `CD_READ_TIME`, single-speed = `CD_READ_TIME * 2`.
+// Sector-read cycles are derived per-instance from the current mode
+// byte. The first sector after ReadN/ReadS is slower than the
+// steady-state stream; see `initial_sector_read_cycles` and
+// `sector_read_cycles`.
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct XaCoding {
+    stereo: bool,
+    freq: u32,
+    nbits: u8,
+}
 
 /// A deferred response: when `bus.cycles` passes `deadline` (an
 /// absolute bus-cycle count), the event's bytes land in the response
@@ -244,10 +251,10 @@ pub struct CdRom {
     /// runs). Probes set this via [`CdRom::enable_irq_log`].
     cdrom_irq_log_cap: usize,
     /// Count of `schedule_sector_event_at` calls. Diagnostic only —
-    /// the BIOS should see one DataReady per sector read at
-    /// ~451 K cycles apart, so this should match the sector count
-    /// the game requested. A blown-out number means we're chaining
-    /// extra events somewhere.
+    /// the BIOS should see one DataReady per sector read at the
+    /// current CD speed's cadence, so this should match the sector
+    /// count the game requested. A blown-out number means we're
+    /// chaining extra events somewhere.
     pub sector_events_scheduled: u64,
     /// Loaded disc image, if any. When `Some`, `disc_present` is also
     /// true and GetID / ReadN follow the disc-present paths; when
@@ -295,6 +302,11 @@ pub struct CdRom {
     /// first one in a stream, `0` = continuing stream, `-1` =
     /// decode disabled until the next `Read*`.
     xa_first_sector: i8,
+    /// Parsed XA coding for the active stream. Redux parses this on
+    /// the first sector, resets decoder history if it changes, then
+    /// reuses it for successive sectors instead of trusting every
+    /// sector's coding byte.
+    xa_coding: Option<XaCoding>,
     /// Live CD-XA volume matrix, applied before samples reach the SPU.
     attenuator_left_to_left: u8,
     attenuator_left_to_right: u8,
@@ -374,6 +386,7 @@ impl CdRom {
             xa_filter_file: 1,
             xa_filter_channel: 1,
             xa_first_sector: 0,
+            xa_coding: None,
             attenuator_left_to_left: 0x80,
             attenuator_left_to_right: 0x00,
             attenuator_right_to_left: 0x00,
@@ -411,6 +424,7 @@ impl CdRom {
 
     fn reset_xa_stream(&mut self) {
         self.xa_first_sector = 0;
+        self.xa_coding = None;
         self.xa_left.reset();
         self.xa_right.reset();
         self.cd_audio.clear();
@@ -782,16 +796,26 @@ impl CdRom {
         ]);
     }
 
-    /// Cycles between DataReady events for the current speed. Double-
-    /// speed (mode bit 7 set) reads at 150 sectors/sec → `CD_READ_TIME`
-    /// cycles per sector. Single-speed reads at half that rate →
-    /// `CD_READ_TIME * 2` cycles per sector. Matches Redux's pacing in
-    /// `core/cdriso.cc`.
-    fn sector_read_cycles(&self) -> u64 {
+    /// Delay from a ReadN/ReadS command to the first DataReady event.
+    /// Redux uses one full CD frame at double-speed here, then switches
+    /// to half-frame cadence for the chained stream.
+    fn initial_sector_read_cycles(&self) -> u64 {
         if self.mode & 0x80 != 0 {
             CD_READ_TIME
         } else {
             CD_READ_TIME * 2
+        }
+    }
+
+    /// Cycles between chained DataReady events once a sector stream is
+    /// active. Redux's `readInterrupt()` schedules steady double-speed
+    /// reads at `cdReadTime / 2`, not `cdReadTime`; the old value fed
+    /// XA audio at half rate, which made long music streams underrun.
+    fn sector_read_cycles(&self) -> u64 {
+        if self.mode & 0x80 != 0 {
+            CD_READ_TIME / 2
+        } else {
+            CD_READ_TIME
         }
     }
 
@@ -947,13 +971,13 @@ impl CdRom {
     /// not the original `cmd_read` cycle.
     fn schedule_sector_event(&mut self) {
         let base = self.scheduling_cycle;
-        self.schedule_sector_event_at(base);
+        self.schedule_sector_event_at(base, self.initial_sector_read_cycles());
     }
 
-    fn schedule_sector_event_at(&mut self, base_cycle: u64) {
+    fn schedule_sector_event_at(&mut self, base_cycle: u64, delay: u64) {
         let stat = self.stat_byte();
         self.pending.push_back(PendingEvent {
-            deadline: base_cycle.saturating_add(self.sector_read_cycles()),
+            deadline: base_cycle.saturating_add(delay),
             irq: IrqType::DataReady,
             bytes: vec![stat],
         });
@@ -966,7 +990,11 @@ impl CdRom {
     /// bit 6 (XA ADPCM enable) is set, we ALSO decode the audio
     /// half into `cd_audio` for the SPU's CD input. Called from
     /// `tick` once per sector event.
-    fn load_next_sector(&mut self) {
+    ///
+    /// Returns whether this sector should raise the CPU-visible
+    /// DataReady IRQ. Redux suppresses DataReady for XA audio sectors
+    /// while STRSND is enabled, but still schedules the next sector.
+    fn load_next_sector(&mut self) -> bool {
         let lba = self.read_lba;
         self.read_lba = self.read_lba.wrapping_add(1);
         if let Some(disc) = self.disc.as_ref() {
@@ -974,6 +1002,8 @@ impl CdRom {
                 self.last_sector_header.copy_from_slice(&raw[12..16]);
                 self.last_sector_subheader.copy_from_slice(&raw[16..20]);
                 self.last_sector_header_valid = true;
+                let submode = raw[18];
+                let suppress_data_ready = self.mode & 0x40 != 0 && submode & 0x04 != 0;
 
                 // If XA mode is on, only decode sectors that match the
                 // Redux gate: unmuted, audio submode set, matching
@@ -984,7 +1014,6 @@ impl CdRom {
                 if !self.muted && self.mode & 0x40 != 0 && self.xa_first_sector != -1 {
                     let file = raw[16];
                     let channel = raw[17];
-                    let submode = raw[18];
 
                     if self.xa_first_sector == 1 && self.mode & 0x08 == 0 {
                         self.xa_filter_file = file;
@@ -996,9 +1025,24 @@ impl CdRom {
                         && channel == self.xa_filter_channel
                         && channel != 0xFF
                     {
-                        if let Some(mut samples) =
-                            decode_xa_audio_sector(raw, &mut self.xa_left, &mut self.xa_right)
-                        {
+                        if self.xa_first_sector == 1 || self.xa_coding.is_none() {
+                            let Some(coding) = parse_xa_coding(raw[19]) else {
+                                self.xa_first_sector = -1;
+                                return !suppress_data_ready;
+                            };
+                            if self.xa_coding != Some(coding) {
+                                self.xa_left.reset();
+                                self.xa_right.reset();
+                                self.xa_coding = Some(coding);
+                            }
+                        }
+                        let coding = self.xa_coding.expect("XA coding seeded above");
+                        if let Some(mut samples) = decode_xa_audio_sector(
+                            raw,
+                            coding,
+                            &mut self.xa_left,
+                            &mut self.xa_right,
+                        ) {
                             self.attenuate_xa_samples(&mut samples);
                             let cap = 44_100; // ~1 s at SPU rate
                             let overflow =
@@ -1009,7 +1053,7 @@ impl CdRom {
                             self.cd_audio.extend(samples.iter().copied());
                             self.xa_first_sector = 0;
                             self.data_fifo.clear();
-                            return;
+                            return false;
                         }
                         self.xa_first_sector = -1;
                     }
@@ -1031,13 +1075,14 @@ impl CdRom {
                 } else {
                     self.data_fifo.extend(raw[24..24 + 2048].iter().copied());
                 }
-                return;
+                return !suppress_data_ready;
             }
 
             // Raw-sector miss means we ran off the end of the image.
         }
         // Past end of disc — stop the read and leave the FIFO empty.
         self.reading = false;
+        true
     }
 
     /// CdlGetlocL (0x10) — return the current logical position
@@ -1326,21 +1371,25 @@ impl CdRom {
                 continue;
             }
 
-            for b in ev.bytes.iter().copied() {
-                if self.responses.len() < RESPONSE_FIFO_DEPTH {
-                    self.responses.push_back(b);
-                }
-            }
             // DataReady events drive the sector-stream — load the
             // next sector's payload into the data FIFO as the event
             // fires, and chain the subsequent DataReady (anchored on
-            // `cycles_now` so the next sector fires
-            // `sector_read_cycles` after the PREVIOUS one, not from
-            // the ancient `cmd_read` issue time).
+            // `cycles_now` so the next sector fires at the steady
+            // stream cadence after the PREVIOUS one, not from the
+            // ancient `cmd_read` issue time).
+            let mut should_raise_irq = true;
             if ev.irq == IrqType::DataReady {
-                self.load_next_sector();
+                should_raise_irq = self.load_next_sector();
                 if self.reading {
-                    self.schedule_sector_event_at(cycles_now);
+                    self.schedule_sector_event_at(cycles_now, self.sector_read_cycles());
+                }
+            }
+            if !should_raise_irq {
+                continue;
+            }
+            for b in ev.bytes.iter().copied() {
+                if self.responses.len() < RESPONSE_FIFO_DEPTH {
+                    self.responses.push_back(b);
                 }
             }
             // Raise IRQ. The flag-gate above already guaranteed
@@ -1509,21 +1558,12 @@ fn disc_region_code(disc: &Disc) -> [u8; 4] {
 /// Subheader byte 3 (coding info): bits 0-1 mono/stereo, bits 2-3
 /// sample rate, bits 4-5 bits/sample.
 ///
-/// For the common case (4-bit stereo, 37800 Hz) we decode the 18
-/// sound groups of 128 bytes each, each producing 112 stereo
-/// samples. Other forms return `None`.
+/// Decodes the Redux-supported XA layouts: 4-bit/8-bit, mono/stereo,
+/// at 37.8 kHz or 18.9 kHz. Unsupported coding nibbles return `None`.
 ///
-/// Samples are decoded in Redux's 4-bit stereo order, then resampled
-/// from the XA source rate up to the SPU's 44.1 kHz rate on output.
-fn decode_xa_audio_sector(
-    raw: &[u8],
-    left: &mut crate::spu::XaDecoderState,
-    right: &mut crate::spu::XaDecoderState,
-) -> Option<Vec<(i16, i16)>> {
-    if raw.len() < 2352 {
-        return None;
-    }
-    let coding = raw[19];
+/// Samples are decoded in Redux's sound-unit order, then resampled from
+/// the XA source rate up to the SPU's 44.1 kHz rate on output.
+fn parse_xa_coding(coding: u8) -> Option<XaCoding> {
     let stereo = match coding & 0x03 {
         1 => true,
         0 => false,
@@ -1539,58 +1579,102 @@ fn decode_xa_audio_sector(
         1 => 8u8,
         _ => return None,
     };
+    Some(XaCoding {
+        stereo,
+        freq,
+        nbits,
+    })
+}
 
-    // Crash's XA/FMVs are the common 4-bit stereo path. Return None
-    // for the rarer modes until we model them accurately.
-    if !stereo || nbits != 4 {
+fn decode_xa_audio_sector(
+    raw: &[u8],
+    coding: XaCoding,
+    left: &mut crate::spu::XaDecoderState,
+    right: &mut crate::spu::XaDecoderState,
+) -> Option<Vec<(i16, i16)>> {
+    if raw.len() < 2352 {
         return None;
     }
+    let stereo = coding.stereo;
+    let freq = coding.freq;
+    let nbits = coding.nbits;
 
     // XA payload starts at offset 24 (after 12+4+8 bytes of header).
-    // 18 sound groups × 128 bytes.
+    // 18 sound groups × 128 bytes. 4-bit stereo yields 2016 source
+    // frames, while 4-bit mono yields 4032. 8-bit modes carry fewer
+    // sound units per group; keep the same Redux unpacking path rather
+    // than rejecting the stream and prematurely killing playback.
     let payload = &raw[24..24 + 18 * 128];
-    let mut decoded = vec![(0i16, 0i16); 18 * 28 * 4];
+    let units_per_group = if nbits == 4 { 4 } else { 2 };
+    let mut decoded: Vec<(i16, i16)> =
+        Vec::with_capacity(18 * units_per_group * 28 * if stereo { 1 } else { 2 });
     let head_table = [0usize, 2, 8, 10];
     for group_idx in 0..18 {
         let group = &payload[group_idx * 128..group_idx * 128 + 128];
         let headers = &group[0..16];
         let data = &group[16..128];
 
-        for unit in 0..4 {
-            let mut left_words = [0u16; 7];
-            let mut right_words = [0u16; 7];
-            for k in 0..7 {
-                let base = k * 16 + unit;
-                let b0 = data[base] as u16;
-                let b1 = data[base + 4] as u16;
-                let b2 = data[base + 8] as u16;
-                let b3 = data[base + 12] as u16;
-                left_words[k] =
-                    (b0 & 0x0F) | ((b1 & 0x0F) << 4) | ((b2 & 0x0F) << 8) | ((b3 & 0x0F) << 12);
-                right_words[k] =
-                    (b0 >> 4) | ((b1 >> 4) << 4) | ((b2 >> 4) << 8) | ((b3 >> 4) << 12);
-            }
+        for unit in 0..units_per_group {
+            let decode_words = if nbits == 4 {
+                let mut low_words = [0u16; 7];
+                let mut high_words = [0u16; 7];
+                for k in 0..7 {
+                    let base = k * 16 + unit;
+                    let b0 = data[base] as u16;
+                    let b1 = data[base + 4] as u16;
+                    let b2 = data[base + 8] as u16;
+                    let b3 = data[base + 12] as u16;
+                    low_words[k] =
+                        (b0 & 0x0F) | ((b1 & 0x0F) << 4) | ((b2 & 0x0F) << 8) | ((b3 & 0x0F) << 12);
+                    high_words[k] =
+                        (b0 >> 4) | ((b1 >> 4) << 4) | ((b2 >> 4) << 8) | ((b3 >> 4) << 12);
+                }
+                (low_words, high_words)
+            } else {
+                let mut words = [0u16; 7];
+                for k in 0..7 {
+                    let base = k * 8 + unit;
+                    words[k] = data[base] as u16 | ((data[base + 4] as u16) << 8);
+                }
+                (words, words)
+            };
 
-            let mut left_samples = [0i16; 28];
-            let mut right_samples = [0i16; 28];
+            let mut first_samples = [0i16; 28];
             crate::spu::xa_decode_block(
                 left,
                 headers[head_table[unit]],
-                &left_words,
-                &mut left_samples,
-                1,
-            );
-            crate::spu::xa_decode_block(
-                right,
-                headers[head_table[unit] + 1],
-                &right_words,
-                &mut right_samples,
+                &decode_words.0,
+                &mut first_samples,
                 1,
             );
 
-            let base = group_idx * 112 + unit * 28;
-            for i in 0..28 {
-                decoded[base + i] = (left_samples[i], right_samples[i]);
+            if stereo {
+                let mut second_samples = [0i16; 28];
+                crate::spu::xa_decode_block(
+                    right,
+                    headers[head_table[unit] + 1],
+                    &decode_words.1,
+                    &mut second_samples,
+                    1,
+                );
+                for i in 0..28 {
+                    decoded.push((first_samples[i], second_samples[i]));
+                }
+            } else {
+                for &sample in &first_samples {
+                    decoded.push((sample, sample));
+                }
+                let mut second_samples = [0i16; 28];
+                crate::spu::xa_decode_block(
+                    left,
+                    headers[head_table[unit] + 1],
+                    &decode_words.1,
+                    &mut second_samples,
+                    1,
+                );
+                for &sample in &second_samples {
+                    decoded.push((sample, sample));
+                }
             }
         }
     }
@@ -1789,19 +1873,93 @@ mod tests {
     }
 
     #[test]
-    fn sector_read_cycles_tracks_mode_bit_7() {
+    fn sector_read_cycles_match_redux_initial_and_stream_cadence() {
         let mut cd = CdRom::new();
         // Default mode = 0x80 → double-speed.
-        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME);
+        assert_eq!(cd.initial_sector_read_cycles(), CD_READ_TIME);
+        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME / 2);
         // Flipping bit 7 off via SetMode gives single-speed (2×).
         cd.cmd_setmode(&[0x00]);
-        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME * 2);
+        assert_eq!(cd.initial_sector_read_cycles(), CD_READ_TIME * 2);
+        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME);
         // Setting other bits without bit 7 stays single-speed.
         cd.cmd_setmode(&[0x60]);
-        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME * 2);
+        assert_eq!(cd.initial_sector_read_cycles(), CD_READ_TIME * 2);
+        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME);
         // Back to double-speed when bit 7 returns.
         cd.cmd_setmode(&[0x80]);
-        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME);
+        assert_eq!(cd.initial_sector_read_cycles(), CD_READ_TIME);
+        assert_eq!(cd.sector_read_cycles(), CD_READ_TIME / 2);
+    }
+
+    #[test]
+    fn read_command_uses_initial_delay_then_steady_stream_delay() {
+        let mut cd = CdRom::new();
+        cd.insert_disc(Some(Disc::from_bin(vec![0u8; psx_iso::SECTOR_BYTES * 4])));
+        cd.scheduling_cycle = 1_000;
+
+        cd.cmd_read();
+        assert_eq!(cd.pending.len(), 2); // command ACK + first DataReady
+        let first_data_ready = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::DataReady)
+            .expect("first DataReady scheduled");
+        assert_eq!(first_data_ready.deadline, 1_000 + CD_READ_TIME);
+
+        assert!(cd.tick(1_000 + FIRST_RESPONSE_CYCLES));
+        cd.irq_flag = 0;
+        cd.responses.clear();
+
+        assert!(cd.tick(1_000 + CD_READ_TIME));
+        let next_data_ready = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::DataReady)
+            .expect("steady DataReady scheduled");
+        assert_eq!(
+            next_data_ready.deadline,
+            1_000 + CD_READ_TIME + CD_READ_TIME / 2
+        );
+    }
+
+    #[test]
+    fn xa_audio_sector_suppresses_dataready_irq_but_keeps_streaming() {
+        let mut cd = CdRom::new();
+        let xa_sector = raw_sector([0x00, 0x02, 0x00, 0x02], [0x07, 0x02, 0x24, 0x01], 0);
+        let data_sector = raw_sector([0x00, 0x02, 0x01, 0x02], [0x07, 0x02, 0x00, 0x00], 0x5A);
+        let mut disc = xa_sector;
+        disc.extend(data_sector);
+        cd.insert_disc(Some(Disc::from_bin(disc)));
+        cd.mode = 0xC0; // double-speed + STRSND/XA enable
+        cd.setloc_msf = (0x00, 0x02, 0x00); // LBA 0
+        cd.scheduling_cycle = 1_000;
+
+        cd.cmd_read();
+        assert!(cd.tick(1_000 + FIRST_RESPONSE_CYCLES));
+        cd.irq_flag = 0;
+        cd.responses.clear();
+
+        assert!(
+            !cd.tick(1_000 + CD_READ_TIME),
+            "Redux suppresses DataReady IRQs for STRSND XA audio sectors"
+        );
+        assert_eq!(cd.irq_flag, 0);
+        assert!(cd.responses.is_empty());
+        assert!(
+            cd.cd_audio_queue_len() > 0,
+            "XA sector should still feed decoded samples to the SPU"
+        );
+        assert_eq!(cd.irq_type_counts[IrqType::DataReady as usize], 0);
+        let next_data_ready = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::DataReady)
+            .expect("suppressed audio sector should still chain the read stream");
+        assert_eq!(
+            next_data_ready.deadline,
+            1_000 + CD_READ_TIME + CD_READ_TIME / 2
+        );
     }
 
     #[test]
@@ -1969,8 +2127,47 @@ mod tests {
 
         let mut left = crate::spu::XaDecoderState::new();
         let mut right = crate::spu::XaDecoderState::new();
-        let samples = decode_xa_audio_sector(&raw, &mut left, &mut right)
+        let coding = parse_xa_coding(raw[19]).expect("valid XA coding");
+        let samples = decode_xa_audio_sector(&raw, coding, &mut left, &mut right)
             .expect("common 4-bit stereo XA should decode");
+
+        assert_eq!(samples.len(), 2352);
+        assert!(samples.iter().all(|&(l, r)| l == 0 && r == 0));
+    }
+
+    #[test]
+    fn xa_decode_silent_mono_sector_has_full_frame_count() {
+        let mut raw = vec![0u8; psx_iso::SECTOR_BYTES];
+        raw[15] = 2;
+        raw[18] = 0x24;
+        raw[19] = 0x00; // 4-bit mono, 37.8 kHz
+
+        let mut left = crate::spu::XaDecoderState::new();
+        let mut right = crate::spu::XaDecoderState::new();
+        let coding = parse_xa_coding(raw[19]).expect("valid XA coding");
+        let samples = decode_xa_audio_sector(&raw, coding, &mut left, &mut right)
+            .expect("4-bit mono XA should decode");
+
+        assert_eq!(samples.len(), 4704);
+        assert!(samples.iter().all(|&(l, r)| l == 0 && r == 0));
+    }
+
+    #[test]
+    fn xa_decode_uses_stream_coding_not_each_sector_byte() {
+        let mut raw = vec![0u8; psx_iso::SECTOR_BYTES];
+        raw[15] = 2;
+        raw[18] = 0x24;
+        raw[19] = 0x0c; // invalid if reparsed; Redux ignores this mid-stream.
+
+        let mut left = crate::spu::XaDecoderState::new();
+        let mut right = crate::spu::XaDecoderState::new();
+        let coding = XaCoding {
+            stereo: true,
+            freq: 37_800,
+            nbits: 4,
+        };
+        let samples = decode_xa_audio_sector(&raw, coding, &mut left, &mut right)
+            .expect("stream coding should drive decode after the first sector");
 
         assert_eq!(samples.len(), 2352);
         assert!(samples.iter().all(|&(l, r)| l == 0 && r == 0));

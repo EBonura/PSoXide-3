@@ -47,9 +47,9 @@ pub struct AudioOut {
     _stream: cpal::Stream,
     /// Sample rate actually negotiated with the host. Differs from
     /// [`TARGET_SAMPLE_RATE`] when the OS device doesn't accept
-    /// 44.1 kHz (e.g. macOS CoreAudio often wants 48 kHz). We
-    /// upsample by nearest-neighbour in the callback — good enough
-    /// for uncompressed 16-bit PSX audio.
+    /// 44.1 kHz (e.g. macOS CoreAudio often wants 48 kHz). The
+    /// callback linearly resamples the SPU stream to avoid the
+    /// zippery crackle nearest-neighbour introduces at 48 kHz.
     host_sample_rate: u32,
 }
 
@@ -88,40 +88,28 @@ impl AudioOut {
             16_384,
         )));
 
-        // Ratio between PSX 44.1 kHz and the host's actual rate —
-        // used to pull samples from the queue at the right pace.
+        // Ratio between PSX 44.1 kHz and the host's actual rate.
         // E.g. host @ 48 kHz, PSX @ 44.1 kHz → ratio = 44100/48000 ≈ 0.919,
-        // so every 1000 host samples consume ~919 PSX samples.
+        // so every 1000 host samples advance ~919 source samples.
         let pull_rate = TARGET_SAMPLE_RATE as f32 / host_sample_rate as f32;
 
         let queue_cb = Arc::clone(&queue);
         let err_fn = |e| eprintln!("[audio] stream error: {e}");
-        let mut accum: f32 = 0.0;
-        // Resampler state must persist across callbacks. Resetting the
-        // held sample at the start of every callback injects tiny
-        // discontinuities whenever the first host frame doesn't cross
-        // the next `pull_rate` boundary, which is exactly the sort of
-        // periodic crackle users hear on 48 kHz hosts.
-        let mut last_sample = (0i16, 0i16);
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device
                 .build_output_stream(
                     &stream_config,
-                    move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                        let mut q = queue_cb.lock().unwrap();
-                        for frame in out.chunks_mut(2) {
-                            // Consume one PSX sample for every
-                            // `1/pull_rate` host samples — nearest-
-                            // neighbour resample. Good enough.
-                            accum += pull_rate;
-                            while accum >= 1.0 {
-                                last_sample = q.pop_front().unwrap_or((0, 0));
-                                accum -= 1.0;
-                            }
-                            frame[0] = (last_sample.0 as f32) / 32768.0;
-                            if frame.len() > 1 {
-                                frame[1] = (last_sample.1 as f32) / 32768.0;
+                    {
+                        let mut resampler = LinearResampler::new();
+                        move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                            let mut q = queue_cb.lock().unwrap();
+                            for frame in out.chunks_mut(2) {
+                                let (l, r) = resampler.next(&mut q, pull_rate);
+                                frame[0] = (l as f32) / 32768.0;
+                                if frame.len() > 1 {
+                                    frame[1] = (r as f32) / 32768.0;
+                                }
                             }
                         }
                     },
@@ -129,27 +117,29 @@ impl AudioOut {
                     None,
                 )
                 .ok()?,
-            cpal::SampleFormat::I16 => device
-                .build_output_stream(
-                    &stream_config,
-                    move |out: &mut [i16], _info: &cpal::OutputCallbackInfo| {
-                        let mut q = queue_cb.lock().unwrap();
-                        for frame in out.chunks_mut(2) {
-                            accum += pull_rate;
-                            while accum >= 1.0 {
-                                last_sample = q.pop_front().unwrap_or((0, 0));
-                                accum -= 1.0;
+            cpal::SampleFormat::I16 => {
+                let queue_cb = Arc::clone(&queue);
+                device
+                    .build_output_stream(
+                        &stream_config,
+                        {
+                            let mut resampler = LinearResampler::new();
+                            move |out: &mut [i16], _info: &cpal::OutputCallbackInfo| {
+                                let mut q = queue_cb.lock().unwrap();
+                                for frame in out.chunks_mut(2) {
+                                    let (l, r) = resampler.next(&mut q, pull_rate);
+                                    frame[0] = l;
+                                    if frame.len() > 1 {
+                                        frame[1] = r;
+                                    }
+                                }
                             }
-                            frame[0] = last_sample.0;
-                            if frame.len() > 1 {
-                                frame[1] = last_sample.1;
-                            }
-                        }
-                    },
-                    err_fn,
-                    None,
-                )
-                .ok()?,
+                        },
+                        err_fn,
+                        None,
+                    )
+                    .ok()?
+            }
             // Other formats (U16, etc.) — not common on modern
             // hosts; gracefully fail and let the shell run silent.
             _ => return None,
@@ -192,4 +182,56 @@ impl AudioOut {
     pub fn queue_len(&self) -> usize {
         self.queue.lock().map(|q| q.len()).unwrap_or(0)
     }
+}
+
+/// Tiny stateful sample-rate converter used by the CPAL callback.
+/// It keeps its interpolation phase across callbacks; resetting this
+/// state per callback is audible as periodic ticks on hosts whose
+/// native rate is 48 kHz.
+struct LinearResampler {
+    phase: f32,
+    prev: (i16, i16),
+    next: (i16, i16),
+    primed: bool,
+}
+
+impl LinearResampler {
+    fn new() -> Self {
+        Self {
+            phase: 0.0,
+            prev: (0, 0),
+            next: (0, 0),
+            primed: false,
+        }
+    }
+
+    fn next(
+        &mut self,
+        queue: &mut std::collections::VecDeque<(i16, i16)>,
+        pull_rate: f32,
+    ) -> (i16, i16) {
+        if !self.primed {
+            self.prev = queue.pop_front().unwrap_or((0, 0));
+            self.next = queue.pop_front().unwrap_or(self.prev);
+            self.primed = true;
+        }
+
+        let out = lerp_sample(self.prev, self.next, self.phase);
+        self.phase += pull_rate;
+        while self.phase >= 1.0 {
+            self.prev = self.next;
+            self.next = queue.pop_front().unwrap_or((0, 0));
+            self.phase -= 1.0;
+        }
+        out
+    }
+}
+
+fn lerp_sample(a: (i16, i16), b: (i16, i16), t: f32) -> (i16, i16) {
+    (lerp_i16(a.0, b.0, t), lerp_i16(a.1, b.1, t))
+}
+
+fn lerp_i16(a: i16, b: i16, t: f32) -> i16 {
+    let value = a as f32 + (b as f32 - a as f32) * t;
+    value.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }

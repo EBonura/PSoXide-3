@@ -306,6 +306,10 @@ fn build_report(
         (Some(o), Some(r)) => diff_stats(&ours_samples[o..], &redux_samples[r..]),
         _ => DiffStats::default(),
     };
+    let fine = match (ours_first, redux_first) {
+        (Some(o), Some(r)) => best_fine_alignment(&ours_samples[o..], &redux_samples[r..], 8),
+        _ => LaggedDiffStats::default(),
+    };
 
     let mut out = String::new();
     use std::fmt::Write as _;
@@ -365,9 +369,26 @@ fn build_report(
         aligned.max_abs_delta,
         fmt_opt(aligned.first_diff_frame)
     );
+    let _ = writeln!(
+        out,
+        "best fine alignment (+/-8 frames): ours_skip={} redux_skip={} compared={} mean_abs={:.2} rms={:.2} max_abs_delta={}",
+        fine.ours_skip,
+        fine.redux_skip,
+        fine.stats.compared_frames,
+        fine.stats.mean_abs,
+        fine.stats.rms,
+        fine.stats.max_abs_delta
+    );
     let _ = writeln!(out, "ours wav:  {}", ours_wav.display());
     let _ = writeln!(out, "redux wav: {}", redux_wav.display());
     out
+}
+
+#[derive(Default)]
+struct LaggedDiffStats {
+    ours_skip: usize,
+    redux_skip: usize,
+    stats: DiffStats,
 }
 
 #[derive(Default)]
@@ -409,6 +430,37 @@ fn diff_stats(a: &[(i16, i16)], b: &[(i16, i16)]) -> DiffStats {
         max_abs_delta: max_abs,
         first_diff_frame: first_diff,
     }
+}
+
+fn best_fine_alignment(a: &[(i16, i16)], b: &[(i16, i16)], max_skip: usize) -> LaggedDiffStats {
+    let mut best = LaggedDiffStats {
+        ours_skip: 0,
+        redux_skip: 0,
+        stats: diff_stats(a, b),
+    };
+    for skip in 1..=max_skip {
+        if skip < a.len() {
+            let candidate = LaggedDiffStats {
+                ours_skip: skip,
+                redux_skip: 0,
+                stats: diff_stats(&a[skip..], b),
+            };
+            if candidate.stats.mean_abs < best.stats.mean_abs {
+                best = candidate;
+            }
+        }
+        if skip < b.len() {
+            let candidate = LaggedDiffStats {
+                ours_skip: 0,
+                redux_skip: skip,
+                stats: diff_stats(a, &b[skip..]),
+            };
+            if candidate.stats.mean_abs < best.stats.mean_abs {
+                best = candidate;
+            }
+        }
+    }
+    best
 }
 
 fn first_nonzero_frame(samples: &[(i16, i16)]) -> Option<usize> {
