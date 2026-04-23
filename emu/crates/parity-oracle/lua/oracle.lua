@@ -224,6 +224,42 @@ local function format_cop2_data(ptr)
     return table.concat(parts, ",")
 end
 
+local fnv_prime = ffi.new("uint64_t", 0x100000001B3ULL)
+
+local function fnv_update_byte(h, byte)
+    h = bit.bxor(h, ffi.new("uint64_t", byte))
+    return h * fnv_prime
+end
+
+local function fnv_update_u32(h, value)
+    local u = tonumber(ffi.cast("uint32_t", value)) or 0
+    h = fnv_update_byte(h, u % 256)
+    h = fnv_update_byte(h, math.floor(u / 256) % 256)
+    h = fnv_update_byte(h, math.floor(u / 65536) % 256)
+    h = fnv_update_byte(h, math.floor(u / 16777216) % 256)
+    return h
+end
+
+local function format_u64_hex(value)
+    local hi = ffi.cast("uint32_t", bit.rshift(value, 32))
+    local lo = ffi.cast("uint32_t", bit.band(value, 0xFFFFFFFFULL))
+    return string.format("%08x%08x", tonumber(hi), tonumber(lo))
+end
+
+local function cpu_state_hash_hex()
+    local h = ffi.new("uint64_t", 0xCBF29CE484222325ULL)
+    for i = 0, 31 do
+        h = fnv_update_u32(h, regs.GPR.r[i])
+    end
+    for i = 0, 31 do
+        h = fnv_update_u32(h, cop2_data_view(cop2d_ptr, i))
+    end
+    for i = 0, 31 do
+        h = fnv_update_u32(h, cop2c_ptr[i])
+    end
+    return format_u64_hex(h)
+end
+
 local function encode_record(tick, pc, instr, gpr_ptr)
     return string.format(
         '{"tick":%d,"pc":%d,"instr":%d,"gprs":[%s],"cop2_data":[%s],"cop2_ctl":[%s]}',
@@ -467,7 +503,9 @@ local function run()
                     if i % m == 0 then
                         local tick = tonumber(PCSX.getCPUCycles())
                         local pc = tonumber(regs.pc)
-                        send_nowait(string.format("chk step=%d tick=%d pc=%d", i, tick, pc))
+                        send_nowait(string.format(
+                            "chk step=%d tick=%d pc=%d state=%s",
+                            i, tick, pc, cpu_state_hash_hex()))
                         emissions = emissions + 1
                         if emissions % 256 == 0 then io.flush() end
                     end
@@ -475,7 +513,41 @@ local function run()
                 io.flush()
                 local tick = tonumber(PCSX.getCPUCycles())
                 local pc = tonumber(regs.pc)
-                send(string.format("run_checkpoint ok step=%d tick=%d pc=%d", n, tick, pc))
+                send(string.format(
+                    "run_checkpoint ok step=%d tick=%d pc=%d state=%s",
+                    n, tick, pc, cpu_state_hash_hex()))
+            end
+
+        elseif cmd == "run_state_checkpoint" then
+            -- `run_state_checkpoint N M` — same sampling cadence as
+            -- `run_checkpoint`, but the state hash is part of the
+            -- contract and Rust rejects output that omits it.
+            local n_str, m_str = line:match("^run_state_checkpoint%s+(%d+)%s+(%d+)$")
+            local n = tonumber(n_str) or 0
+            local m = tonumber(m_str) or 1
+            if n == 0 then
+                send("err run_state_checkpoint: bad args")
+            else
+                local emissions = 0
+                for i = 1, n do
+                    PCSX.stepIn()
+                    PCSX.runExecute()
+                    if i % m == 0 then
+                        local tick = tonumber(PCSX.getCPUCycles())
+                        local pc = tonumber(regs.pc)
+                        send_nowait(string.format(
+                            "chk step=%d tick=%d pc=%d state=%s",
+                            i, tick, pc, cpu_state_hash_hex()))
+                        emissions = emissions + 1
+                        if emissions % 256 == 0 then io.flush() end
+                    end
+                end
+                io.flush()
+                local tick = tonumber(PCSX.getCPUCycles())
+                local pc = tonumber(regs.pc)
+                send(string.format(
+                    "run_state_checkpoint ok step=%d tick=%d pc=%d state=%s",
+                    n, tick, pc, cpu_state_hash_hex()))
             end
 
         elseif cmd == "run_checkpoint_pad" then
@@ -771,22 +843,19 @@ local function run()
                 local bpp = tonumber(shot.bpp) or 0
                 local len = #shot.data
                 local h = ffi.new("uint64_t", 0xCBF29CE484222325ULL)
-                local prime = ffi.new("uint64_t", 0x100000001B3ULL)
                 for i = 0, len - 1 do
                     local byte = tonumber(shot.data[i]) or 0
                     h = bit.bxor(h, ffi.new("uint64_t", byte))
-                    h = h * prime
+                    h = h * fnv_prime
                 end
                 -- Format as two 32-bit halves. `tonumber(u64)` goes
                 -- through Lua's `double`, which only has a 53-bit
                 -- mantissa — so `%016x` on the result silently
                 -- zeroes the bottom ~11 bits of the hash. Splitting
                 -- into high and low u32s keeps every bit precise.
-                local hi = ffi.cast("uint32_t", bit.rshift(h, 32))
-                local lo = ffi.cast("uint32_t", bit.band(h, 0xFFFFFFFFULL))
                 return string.format(
-                    "%08x%08x w=%d h=%d bpp=%d len=%d",
-                    tonumber(hi), tonumber(lo),
+                    "%s w=%d h=%d bpp=%d len=%d",
+                    format_u64_hex(h),
                     w, h_dim, bpp, len
                 )
             end)

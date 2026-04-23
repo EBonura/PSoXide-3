@@ -91,6 +91,24 @@ pub struct DisplayHash {
     pub byte_len: usize,
 }
 
+/// Coarse CPU state checkpoint emitted by Redux during a silent run.
+///
+/// `state_hash` is an FNV-1a-64 digest of the software-visible GPR and
+/// COP2 register files at the checkpoint. It is intentionally small so
+/// long local-library sweeps can verify instruction-state lockstep
+/// without shipping a full JSON trace over the pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateCheckpoint {
+    /// Redux-style user-side step count from the start of the run.
+    pub step: u64,
+    /// Redux CPU cycle counter at this checkpoint.
+    pub tick: u64,
+    /// Program counter after the checkpoint step retires.
+    pub pc: u32,
+    /// FNV-1a-64 over GPR + software-visible COP2 state.
+    pub state_hash: u64,
+}
+
 impl ReduxProcess {
     /// Spawn Redux with the configured flags and start draining its
     /// output streams.
@@ -394,6 +412,47 @@ impl ReduxProcess {
         Ok(tick)
     }
 
+    /// Coarse-grained lockstep probe: run `n` user-side steps silently,
+    /// invoking `on_checkpoint` every `interval` steps with PC, cycle
+    /// count, and a compact digest of CPU-visible state.
+    ///
+    /// This is the preferred first pass for whole-library parity work:
+    /// if every checkpoint matches, the run is very likely instruction-
+    /// state aligned; if one diverges, the caller can rerun the prior
+    /// window with full [`InstructionRecord`] tracing.
+    pub fn run_state_checkpoint<F>(
+        &mut self,
+        n: u64,
+        interval: u64,
+        timeout: Duration,
+        mut on_checkpoint: F,
+    ) -> Result<StateCheckpoint, OracleError>
+    where
+        F: FnMut(StateCheckpoint) -> Result<(), OracleError>,
+    {
+        if interval == 0 || n == 0 {
+            return Err(OracleError::Protocol {
+                expected: "n > 0, interval > 0".to_string(),
+                got: format!("n={n} interval={interval}"),
+            });
+        }
+        self.send_command(&format!("run_state_checkpoint {n} {interval}"))?;
+        let expected_checkpoints = n / interval;
+        for _ in 0..expected_checkpoints {
+            let line = self.wait_for_response(timeout)?;
+            let checkpoint = parse_state_checkpoint(&line)?;
+            on_checkpoint(checkpoint)?;
+        }
+        let final_line = self.wait_for_response(timeout)?;
+        let rest = final_line
+            .strip_prefix("run_state_checkpoint ok ")
+            .ok_or_else(|| OracleError::Protocol {
+                expected: "run_state_checkpoint ok ...".to_string(),
+                got: final_line.clone(),
+            })?;
+        parse_state_kv(rest, &final_line)
+    }
+
     /// `run_checkpoint`, but with a VBlank-timed pad schedule applied
     /// on Redux's side. `base_mask` is the always-held mask and
     /// `pulses` is a list of `(mask, start_vblank, frames)` tuples
@@ -691,6 +750,48 @@ fn parse_checkpoint(line: &str) -> Result<(u64, u64, u32), OracleError> {
             got: line.to_string(),
         })?;
     parse_kv_triple(rest, line)
+}
+
+/// Parse `chk step=X tick=Y pc=Z state=H` checkpoint lines.
+fn parse_state_checkpoint(line: &str) -> Result<StateCheckpoint, OracleError> {
+    let rest = line
+        .strip_prefix("chk ")
+        .ok_or_else(|| OracleError::Protocol {
+            expected: "chk step=... tick=... pc=... state=...".to_string(),
+            got: line.to_string(),
+        })?;
+    parse_state_kv(rest, line)
+}
+
+/// Parse `step=X tick=Y pc=Z state=H` fragments.
+fn parse_state_kv(rest: &str, full_line: &str) -> Result<StateCheckpoint, OracleError> {
+    let mut step = None;
+    let mut tick = None;
+    let mut pc = None;
+    let mut state_hash = None;
+    for part in rest.split_whitespace() {
+        if let Some(v) = part.strip_prefix("step=") {
+            step = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("tick=") {
+            tick = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("pc=") {
+            pc = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("state=") {
+            state_hash = u64::from_str_radix(v, 16).ok();
+        }
+    }
+    match (step, tick, pc, state_hash) {
+        (Some(step), Some(tick), Some(pc), Some(state_hash)) => Ok(StateCheckpoint {
+            step,
+            tick,
+            pc,
+            state_hash,
+        }),
+        _ => Err(OracleError::Protocol {
+            expected: "step=... tick=... pc=... state=<16-hex>".to_string(),
+            got: full_line.to_string(),
+        }),
+    }
 }
 
 /// Parse `step=X tick=Y pc=Z` fragments (shared between `chk ...`

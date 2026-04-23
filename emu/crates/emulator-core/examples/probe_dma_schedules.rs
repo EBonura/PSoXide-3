@@ -11,6 +11,9 @@
 //! cargo run -p emulator-core --example probe_dma_schedules --release
 //! ```
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::{Bus, Cpu};
 use std::path::PathBuf;
 
@@ -25,6 +28,10 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
 
     let mut bus = Bus::new(bios).expect("bus");
+    if let Ok(path) = std::env::var("PSOXIDE_DISC") {
+        let disc = disc_support::load_disc_path(&PathBuf::from(path)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
+    }
     bus.set_dma_log_enabled(true);
     let mut cpu = Cpu::new();
 

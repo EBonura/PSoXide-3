@@ -866,15 +866,15 @@ impl Bus {
             }
             3 => {
                 if let Some(cdrom_words) = self.run_dma_cdrom() {
-                    let delay = match self.dma.channels[3].channel_control {
-                        0x1140_0100 => (cdrom_words / 4) as u64,
-                        _ => cdrom_words as u64,
-                    };
-                    if delay == 0 {
+                    if cdrom_words == 0 {
                         if self.complete_dma_channel(3) {
                             self.irq.raise(IrqSource::Dma);
                         }
                     } else {
+                        let delay = match self.dma.channels[3].channel_control {
+                            0x1140_0100 => (cdrom_words / 4).max(1) as u64,
+                            _ => cdrom_words as u64,
+                        };
                         let target = self.cycles + delay;
                         self.log_dma_schedule("CdrDma", delay, target);
                         self.scheduler
@@ -1261,13 +1261,13 @@ impl Bus {
 
     fn dma_gpu_linked_list(&mut self) -> u32 {
         let mut addr = self.dma.channels[2].base & 0x001F_FFFC;
-        // Start at 1 to account for the initial pointer load —
-        // matches Redux's `gpuDmaChainSize` in `core/gpu.cc:445`:
-        // `size = 1;` before the loop. Without it we underbill the
-        // DMA-completion cycle count by 1 per chain, which looks
-        // harmless until you multiply by hundreds of chains per
-        // frame and end up several thousand cycles early.
-        let mut total_words: u32 = 1;
+        // Completion delay is the traversed command-list word count.
+        // Redux's helper seeds its local counter at 1, but the
+        // scheduled interrupt reaches `branchTest` one cycle earlier
+        // than our strict-slot scheduler when we include that seed.
+        // Billing only the headers + payload words keeps the BIOS DMA
+        // IRQ fold aligned for disc boots such as MGS.
+        let mut total_words: u32 = 0;
         // Bound the walk so a malformed list can't spin forever.
         for _ in 0..0x100_0000 {
             let header = read_ram_u32(&self.ram[..], addr);
@@ -1624,7 +1624,9 @@ impl Bus {
             return;
         }
         if Dma::contains(phys) {
-            self.dma.write32(phys, value);
+            if self.dma.write32(phys, value) {
+                self.irq.raise(IrqSource::Dma);
+            }
             // Only a CHCR write with bit 24 set starts a transfer —
             // matches Redux's `dmaExec<N>` dispatcher in `psxhw.cc`,
             // which runs from the per-channel `case 0x1f80_1088/98/
