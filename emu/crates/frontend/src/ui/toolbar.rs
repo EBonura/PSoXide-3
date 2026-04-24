@@ -38,15 +38,11 @@ const BAR_HEIGHT: f32 = 34.0;
 const TOOLBAR_MARGIN_X: f32 = 8.0;
 /// Gap between the metrics lane and the controls lane.
 const TOOLBAR_CLUSTER_GAP: f32 = 8.0;
-/// Full control lane: transport, volume slider, BIOS toggle, debug toggles.
-const CONTROLS_WIDTH_WIDE: f32 = 468.0;
-/// Medium lane: transport, mute button, BIOS toggle, debug toggles.
-const CONTROLS_WIDTH_MEDIUM: f32 = 386.0;
-/// Narrow lane: transport, mute button, BIOS toggle.
-const CONTROLS_WIDTH_NARROW: f32 = 206.0;
+/// Right-side lane: transport, volume slider, BIOS toggle, debug toggles.
+const CONTROLS_WIDTH: f32 = 560.0;
 /// Keep enough room for the status dot + RUNNING/PAUSED label.
 const METRICS_MIN_WIDTH: f32 = 116.0;
-/// Slider width used in the wide toolbar density.
+/// Slider width used in the toolbar.
 const AUDIO_SLIDER_WIDTH: f32 = 72.0;
 
 /// Text size for the left-hand metrics cluster. Slightly smaller than
@@ -62,33 +58,6 @@ const STATUS_PAUSED: Color32 = Color32::from_rgb(153, 153, 166);
 const METRIC_TEXT: Color32 = Color32::from_rgb(204, 204, 217);
 const METRIC_LABEL: Color32 = Color32::from_rgb(102, 102, 115);
 
-#[derive(Clone, Copy)]
-struct ToolbarDensity {
-    controls_width: f32,
-    show_audio_slider: bool,
-    show_debug_toggles: bool,
-}
-
-impl ToolbarDensity {
-    fn for_width(width: f32) -> Self {
-        let (desired_controls_width, show_audio_slider, show_debug_toggles) = if width >= 920.0 {
-            (CONTROLS_WIDTH_WIDE, true, true)
-        } else if width >= 700.0 {
-            (CONTROLS_WIDTH_MEDIUM, false, true)
-        } else {
-            (CONTROLS_WIDTH_NARROW, false, false)
-        };
-
-        let max_controls_width = (width - METRICS_MIN_WIDTH - TOOLBAR_CLUSTER_GAP).max(0.0);
-
-        Self {
-            controls_width: desired_controls_width.min(max_controls_width),
-            show_audio_slider,
-            show_debug_toggles,
-        }
-    }
-}
-
 /// Paint the top toolbar. Called once per frame before the central
 /// panel so the framebuffer clips underneath it.
 pub fn draw(ctx: &Context, state: &mut AppState) {
@@ -96,7 +65,6 @@ pub fn draw(ctx: &Context, state: &mut AppState) {
         .resizable(false)
         .exact_height(BAR_HEIGHT)
         .show(ctx, |ui| {
-            let ui_scale = ctx.pixels_per_point().max(1.0);
             let panel_rect = ui.max_rect();
             let row_left = panel_rect.left() + TOOLBAR_MARGIN_X;
             let row_right = (panel_rect.right() - TOOLBAR_MARGIN_X).max(row_left);
@@ -105,11 +73,10 @@ pub fn draw(ctx: &Context, state: &mut AppState) {
                 egui::pos2(row_right, panel_rect.bottom()),
             );
 
-            let density = ToolbarDensity::for_width(row_rect.width() / ui_scale);
-            let controls_width = density.controls_width * ui_scale;
-            let cluster_gap = TOOLBAR_CLUSTER_GAP * ui_scale;
+            let controls_width = CONTROLS_WIDTH
+                .min((row_rect.width() - METRICS_MIN_WIDTH - TOOLBAR_CLUSTER_GAP).max(0.0));
             let controls_left = (row_rect.right() - controls_width).max(row_rect.left());
-            let metrics_right = (controls_left - cluster_gap).max(row_rect.left());
+            let metrics_right = (controls_left - TOOLBAR_CLUSTER_GAP).max(row_rect.left());
 
             let metrics_rect = Rect::from_min_max(
                 egui::pos2(row_rect.left(), row_rect.top()),
@@ -128,34 +95,32 @@ pub fn draw(ctx: &Context, state: &mut AppState) {
                     ui.set_clip_rect(metrics_rect);
                     ui.set_width(metrics_rect.width());
                     ui.set_height(metrics_rect.height());
-                    draw_metrics(ui, state, metrics_rect.width() / ui_scale);
+                    draw_metrics(ui, state, metrics_rect.width());
                 },
             );
 
             ui.scope_builder(
                 egui::UiBuilder::new()
                     .max_rect(controls_rect)
-                    .layout(Layout::left_to_right(Align::Center)),
+                    .layout(Layout::right_to_left(Align::Center)),
                 |ui| {
                     ui.set_clip_rect(controls_rect);
                     ui.set_width(controls_rect.width());
                     ui.set_height(controls_rect.height());
-                    draw_toolbar_controls(ui, state, density);
+                    draw_toolbar_controls(ui, state);
                 },
             );
         });
 }
 
-fn draw_toolbar_controls(ui: &mut egui::Ui, state: &mut AppState, density: ToolbarDensity) {
-    if density.show_debug_toggles {
-        draw_debug_toggles(ui, state);
-        ui.add_space(TOOLBAR_CLUSTER_GAP);
-    }
+fn draw_toolbar_controls(ui: &mut egui::Ui, state: &mut AppState) {
+    draw_buttons(ui, state);
+    ui.add_space(TOOLBAR_CLUSTER_GAP);
+    draw_audio_controls(ui, state);
+    ui.add_space(TOOLBAR_CLUSTER_GAP);
     draw_boot_toggle(ui, state);
     ui.add_space(TOOLBAR_CLUSTER_GAP);
-    draw_audio_controls(ui, state, density.show_audio_slider);
-    ui.add_space(TOOLBAR_CLUSTER_GAP);
-    draw_buttons(ui, state);
+    draw_debug_toggles(ui, state);
 }
 
 fn toolbar_label(text: impl Into<String>, color: Color32) -> Label {
@@ -199,8 +164,8 @@ fn maybe_metric(
     }
 }
 
-/// Compact volume control: mute button plus optional gain slider.
-fn draw_audio_controls(ui: &mut egui::Ui, state: &mut AppState, show_slider: bool) {
+/// Volume control: mute button plus gain slider.
+fn draw_audio_controls(ui: &mut egui::Ui, state: &mut AppState) {
     let effective = state.effective_audio_volume();
     let icon = if effective <= 0.0 {
         icons::VOLUME_X
@@ -217,10 +182,6 @@ fn draw_audio_controls(ui: &mut egui::Ui, state: &mut AppState, show_slider: boo
         } else {
             "Audio unmuted"
         });
-    }
-
-    if !show_slider {
-        return;
     }
 
     let before = state.audio_volume;

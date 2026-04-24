@@ -42,6 +42,11 @@ use psoxide_settings::settings::{InputBinding, PortBindings};
 /// standard laptop display.
 const INITIAL_WIDTH: u32 = 1600;
 const INITIAL_HEIGHT: u32 = 1000;
+/// Keep the toolbar usable: full debug controls + boot toggle +
+/// volume slider + transport buttons need roughly 700 logical px on
+/// Retina displays, and the initial window is already larger.
+const MIN_WIDTH: u32 = 1400;
+const MIN_HEIGHT: u32 = 700;
 /// Frontend run cadence target. The toolbar, "advance one frame"
 /// control, and sample pump all assume an NTSC-ish 60 Hz shell.
 const TARGET_FRAME_DT: f32 = 1.0 / 60.0;
@@ -220,7 +225,8 @@ impl ApplicationHandler for Shell {
         // panels + a terminal remains bearable.
         let mut attrs = Window::default_attributes()
             .with_title("PSoXide")
-            .with_inner_size(winit::dpi::PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT));
+            .with_inner_size(winit::dpi::PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
+            .with_min_inner_size(winit::dpi::PhysicalSize::new(MIN_WIDTH, MIN_HEIGHT));
         if self.fullscreen {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
