@@ -49,22 +49,7 @@ pub fn draw(
         reported
     };
 
-    let mode_label = match scale_mode {
-        ScaleMode::Window => "window",
-        ScaleMode::Native => "1x",
-    };
-    let title = format!(
-        "Framebuffer ({}×{} at {},{}){}{}  [{}]",
-        area.width,
-        area.height,
-        area.x,
-        area.y,
-        if using_fallback { " · fallback" } else { "" },
-        if area.bpp24 { " · 24bpp" } else { "" },
-        mode_label,
-    );
-
-    theme::viz_frame(ui, &title, |ui| {
+    theme::viz_frame(ui, "", |ui| {
         let uv = egui::Rect::from_min_size(
             egui::pos2(
                 area.x as f32 / VRAM_WIDTH as f32,
