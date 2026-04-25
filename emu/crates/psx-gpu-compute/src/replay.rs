@@ -30,7 +30,7 @@ use crate::primitive::{
     TexQuadBilinear, TexRect, TexTri, Tpage,
 };
 use crate::rasterizer::Rasterizer;
-use crate::vram::VramGpu;
+use crate::vram::{self, VramGpu};
 
 /// GP0 state we have to track in lockstep with the CPU rasterizer
 /// so triangle / rect dispatches see the right tpage, drawing area,
@@ -240,6 +240,33 @@ impl ComputeBackend {
     /// the egui texture without the CPU round-trip.
     pub fn download_vram(&self) -> Vec<u16> {
         self.vram.download_full().unwrap_or_default()
+    }
+
+    /// Lift a sub-rectangle of CPU VRAM into GPU VRAM. The bisector
+    /// uses this to apply CPU-to-VRAM uploads and FillRects whose
+    /// pixel data isn't in the cmd_log proper — it streams via
+    /// `ingest_vram_upload_word` on the bus side. Production replay
+    /// (frontend / replay_disc) doesn't need this because it
+    /// `sync_vram_from_cpu`s the full VRAM at frame boundaries.
+    pub fn upload_rect_from_cpu(&self, cpu_words: &[u16], x: u32, y: u32, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        // Honour VRAM wrap (hardware wraps both axes mod 1024 / 512).
+        // We slice CPU words row-by-row so partial-row wraps work.
+        let mut buf = Vec::with_capacity((w * h) as usize);
+        for row in 0..h {
+            let py = (y + row) & (vram::VRAM_HEIGHT as u32 - 1);
+            for col in 0..w {
+                let px = (x + col) & (vram::VRAM_WIDTH as u32 - 1);
+                buf.push(cpu_words[(py * vram::VRAM_WIDTH as u32 + px) as usize]);
+            }
+        }
+        let _ = self.vram.upload_rect(x & (vram::VRAM_WIDTH as u32 - 1),
+                                       y & (vram::VRAM_HEIGHT as u32 - 1),
+                                       w.min(vram::VRAM_WIDTH as u32),
+                                       h.min(vram::VRAM_HEIGHT as u32),
+                                       &buf);
     }
 
     /// Replay one GP0 packet captured by `enable_pixel_tracer` on

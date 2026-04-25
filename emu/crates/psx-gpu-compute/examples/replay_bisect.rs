@@ -216,6 +216,22 @@ fn main() {
     let mut first_diverge: Option<u32> = None;
     for entry in &log {
         backend.replay_packet(entry);
+        // Bulk-write packets (FillRect / VRAM-VRAM / CPU-VRAM upload)
+        // either rely on `sync_vram_from_cpu` at frame boundaries
+        // (the production path) or stream via the bus side
+        // (`ingest_vram_upload_word`) that doesn't reach `replay_packet`.
+        // For per-packet bisection we need the GPU's VRAM to actually
+        // reflect each bulk write before the next primitive replay,
+        // otherwise every later sample of an uploaded texel
+        // diverges and the bisector keeps re-flagging false
+        // positives. Lift the rect from CPU final VRAM — the result
+        // is correct for any pixel whose final value came from the
+        // bulk write OR from a later opaque overdraw, and only
+        // approximates pixels touched by post-upload semi-trans
+        // primitives (acceptable for bug-hunting).
+        if let Some((x, y, w, h)) = bulk_writer_footprint(entry) {
+            backend.upload_rect_from_cpu(&cpu_words, x as u32, y as u32, w as u32, h as u32);
+        }
         // Find any pixel that BOTH this packet owns (per augmented
         // owner) AND disagrees between CPU and GPU. That packet is
         // the offender.
@@ -264,8 +280,33 @@ fn main() {
     if first_diverge.is_some() {
         std::process::exit(1);
     } else {
+        // Bisector couldn't attribute. Dump the unattributed
+        // divergence so we still get a clue about what's wrong.
+        let final_gpu = backend.download_vram();
+        let mut diff_count = 0usize;
+        let mut samples: Vec<(usize, u16, u16, u32)> = Vec::new();
+        for (i, (&c, &g)) in cpu_words.iter().zip(final_gpu.iter()).enumerate() {
+            if c != g {
+                diff_count += 1;
+                if samples.len() < 16 {
+                    samples.push((i, c, g, owner_aug[i]));
+                }
+            }
+        }
         eprintln!("=== No per-packet divergence found ===");
-        eprintln!("(any final-VRAM divergence is from packets whose owner-tag was overwritten by a later packet — try a smaller window)");
+        eprintln!("(but {} pixels still differ at end of window)", diff_count);
+        for (i, c, g, own) in &samples {
+            let x = i % 1024;
+            let y = i / 1024;
+            let own_str = if *own == u32::MAX {
+                "MAX (warmup-era)".to_string()
+            } else {
+                format!("#{} (in window)", own)
+            };
+            eprintln!(
+                "  vram({x:>4},{y:>3}) cpu=0x{c:04x} gpu=0x{g:04x} owner={own_str}",
+            );
+        }
     }
 }
 
