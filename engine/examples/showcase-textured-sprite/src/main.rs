@@ -2,10 +2,10 @@
 //!
 //! A compact interactive material room.
 //!
-//! The room is cheap flat geometry with visible neutral walls and a
-//! single upright pane in the centre. Controller input swaps the
-//! texture sample and blend mode while the HUD names what is currently
-//! being shown.
+//! The room uses the two cooked sample textures directly: brick walls
+//! and a cobblestone floor. A single upright pane in the centre shows
+//! one material at a time; controller input swaps the texture sample
+//! and blend mode while the HUD names what is currently being shown.
 
 #![no_std]
 #![no_main]
@@ -54,10 +54,8 @@ const FLOOR_X: i32 = 310;
 const FLOOR_FRONT_Z: i32 = 245;
 const WALL_Z: i32 = -46;
 const WALL_TOP: i32 = 154;
-const BACKING_SIZE: i32 = 150;
 const PANEL_SIZE: i32 = 112;
 const PANEL_BOTTOM: i32 = 20;
-const BACKING_Z: i32 = -10;
 const PANEL_Z: i32 = 0;
 
 const SAMPLE_BRICK: u8 = 0;
@@ -114,7 +112,6 @@ impl Scene for Showcase {
     fn render(&mut self, ctx: &mut Ctx) {
         let camera = camera_for(ctx.frame);
         draw_room(camera);
-        draw_material_backing(camera);
         draw_material_pane(self, camera);
         if let Some(font) = self.font.as_ref() {
             self.draw_hud(font);
@@ -261,231 +258,96 @@ fn draw_room(camera: Camera) {
     draw_wall(camera);
     draw_side_walls(camera);
     draw_floor(camera);
-    draw_floor_panels(camera);
 }
 
 fn draw_floor(camera: Camera) {
-    draw_world_flat(
+    let material = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x78, 0x78, 0x80));
+    draw_floor_tile(camera, -FLOOR_X, -104, WALL_Z, 96, material);
+    draw_floor_tile(camera, -104, 104, WALL_Z, 96, material);
+    draw_floor_tile(camera, 104, FLOOR_X, WALL_Z, 96, material);
+    draw_floor_tile(camera, -FLOOR_X, -104, 96, FLOOR_FRONT_Z, material);
+    draw_floor_tile(camera, -104, 104, 96, FLOOR_FRONT_Z, material);
+    draw_floor_tile(camera, 104, FLOOR_X, 96, FLOOR_FRONT_Z, material);
+}
+
+fn draw_floor_tile(camera: Camera, x0: i32, x1: i32, z0: i32, z1: i32, material: TextureMaterial) {
+    draw_world_textured(
         camera,
-        Vec3 {
-            x: -FLOOR_X,
-            y: 0,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: FLOOR_X,
-            y: 0,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: -FLOOR_X,
-            y: 0,
-            z: FLOOR_FRONT_Z,
-        },
-        Vec3 {
-            x: FLOOR_X,
-            y: 0,
-            z: FLOOR_FRONT_Z,
-        },
-        (46, 48, 54),
+        Vec3 { x: x0, y: 0, z: z0 },
+        Vec3 { x: x1, y: 0, z: z0 },
+        Vec3 { x: x0, y: 0, z: z1 },
+        Vec3 { x: x1, y: 0, z: z1 },
+        FLOOR_U,
+        material,
     );
 }
 
 fn draw_wall(camera: Camera) {
-    draw_world_flat(
-        camera,
-        Vec3 {
-            x: -FLOOR_X,
-            y: WALL_TOP,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: FLOOR_X,
-            y: WALL_TOP,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: -FLOOR_X,
-            y: PANEL_BOTTOM - 8,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: FLOOR_X,
-            y: PANEL_BOTTOM - 8,
-            z: WALL_Z,
-        },
-        (50, 48, 56),
-    );
-    draw_world_flat(
-        camera,
-        Vec3 {
-            x: -FLOOR_X,
-            y: PANEL_BOTTOM - 8,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: FLOOR_X,
-            y: PANEL_BOTTOM - 8,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: -FLOOR_X,
-            y: 0,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: FLOOR_X,
-            y: 0,
-            z: WALL_Z,
-        },
-        (62, 58, 64),
-    );
+    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x70, 0x68, 0x60));
+    draw_wall_tile(camera, -FLOOR_X, -104, 0, WALL_TOP, WALL_Z, material);
+    draw_wall_tile(camera, -104, 104, 0, WALL_TOP, WALL_Z, material);
+    draw_wall_tile(camera, 104, FLOOR_X, 0, WALL_TOP, WALL_Z, material);
 }
 
 fn draw_side_walls(camera: Camera) {
-    draw_world_flat(
+    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x58, 0x58, 0x60));
+    draw_side_wall_tile(
         camera,
-        Vec3 {
-            x: -FLOOR_X,
-            y: WALL_TOP,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: -FLOOR_X,
-            y: WALL_TOP - 20,
-            z: FLOOR_FRONT_Z,
-        },
-        Vec3 {
-            x: -FLOOR_X,
-            y: 0,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: -FLOOR_X,
-            y: 0,
-            z: FLOOR_FRONT_Z,
-        },
-        (40, 42, 50),
+        -FLOOR_X,
+        WALL_Z,
+        FLOOR_FRONT_Z,
+        0,
+        WALL_TOP - 18,
+        material,
     );
-    draw_world_flat(
+    draw_side_wall_tile(
         camera,
-        Vec3 {
-            x: FLOOR_X,
-            y: WALL_TOP,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: FLOOR_X,
-            y: WALL_TOP - 20,
-            z: FLOOR_FRONT_Z,
-        },
-        Vec3 {
-            x: FLOOR_X,
-            y: 0,
-            z: WALL_Z,
-        },
-        Vec3 {
-            x: FLOOR_X,
-            y: 0,
-            z: FLOOR_FRONT_Z,
-        },
-        (36, 38, 46),
+        FLOOR_X,
+        WALL_Z,
+        FLOOR_FRONT_Z,
+        0,
+        WALL_TOP - 18,
+        material,
     );
 }
 
-fn draw_floor_panels(camera: Camera) {
-    draw_floor_panel(camera, -FLOOR_X, -96, WALL_Z, 78, (54, 56, 62));
-    draw_floor_panel(camera, -96, 96, WALL_Z, 78, (66, 64, 68));
-    draw_floor_panel(camera, 96, FLOOR_X, WALL_Z, 78, (50, 52, 58));
-    draw_floor_panel(camera, -FLOOR_X, -96, 78, FLOOR_FRONT_Z, (42, 46, 52));
-    draw_floor_panel(camera, -96, 96, 78, FLOOR_FRONT_Z, (58, 58, 64));
-    draw_floor_panel(camera, 96, FLOOR_X, 78, FLOOR_FRONT_Z, (44, 48, 54));
-}
-
-fn draw_floor_panel(camera: Camera, x0: i32, x1: i32, z0: i32, z1: i32, color: (u8, u8, u8)) {
-    draw_world_flat(
+fn draw_wall_tile(
+    camera: Camera,
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+    z: i32,
+    material: TextureMaterial,
+) {
+    draw_world_textured(
         camera,
-        Vec3 { x: x0, y: 1, z: z0 },
-        Vec3 { x: x1, y: 1, z: z0 },
-        Vec3 { x: x0, y: 1, z: z1 },
-        Vec3 { x: x1, y: 1, z: z1 },
-        color,
+        Vec3 { x: x0, y: y1, z },
+        Vec3 { x: x1, y: y1, z },
+        Vec3 { x: x0, y: y0, z },
+        Vec3 { x: x1, y: y0, z },
+        BRICK_U,
+        material,
     );
 }
 
-fn draw_material_backing(camera: Camera) {
-    draw_backing(camera);
-    draw_backing_crossbar(camera);
-}
-
-fn draw_backing(camera: Camera) {
-    let half = BACKING_SIZE / 2;
-    let mid_x = 0;
-    let mid_y = PANEL_BOTTOM + PANEL_SIZE / 2;
-    let x0 = -half;
-    let x1 = half;
-    let y0 = PANEL_BOTTOM - ((BACKING_SIZE - PANEL_SIZE) / 2);
-    let y1 = y0 + BACKING_SIZE;
-    draw_backing_rect(camera, x0, mid_x, mid_y, y1, (128, 122, 112));
-    draw_backing_rect(camera, mid_x, x1, mid_y, y1, (70, 72, 78));
-    draw_backing_rect(camera, x0, mid_x, y0, mid_y, (62, 64, 70));
-    draw_backing_rect(camera, mid_x, x1, y0, mid_y, (154, 148, 136));
-}
-
-fn draw_backing_rect(camera: Camera, x0: i32, x1: i32, y0: i32, y1: i32, color: (u8, u8, u8)) {
-    draw_world_flat(
+fn draw_side_wall_tile(
+    camera: Camera,
+    x: i32,
+    z0: i32,
+    z1: i32,
+    y0: i32,
+    y1: i32,
+    material: TextureMaterial,
+) {
+    draw_world_textured(
         camera,
-        Vec3 {
-            x: x0,
-            y: y1,
-            z: BACKING_Z,
-        },
-        Vec3 {
-            x: x1,
-            y: y1,
-            z: BACKING_Z,
-        },
-        Vec3 {
-            x: x0,
-            y: y0,
-            z: BACKING_Z,
-        },
-        Vec3 {
-            x: x1,
-            y: y0,
-            z: BACKING_Z,
-        },
-        color,
-    );
-}
-
-fn draw_backing_crossbar(camera: Camera) {
-    let half = BACKING_SIZE / 2;
-    let y0 = PANEL_BOTTOM + PANEL_SIZE / 2 - 4;
-    let y1 = y0 + 8;
-    draw_world_flat(
-        camera,
-        Vec3 {
-            x: -half,
-            y: y1,
-            z: BACKING_Z - 1,
-        },
-        Vec3 {
-            x: half,
-            y: y1,
-            z: BACKING_Z - 1,
-        },
-        Vec3 {
-            x: -half,
-            y: y0,
-            z: BACKING_Z - 1,
-        },
-        Vec3 {
-            x: half,
-            y: y0,
-            z: BACKING_Z - 1,
-        },
-        (176, 170, 158),
+        Vec3 { x, y: y1, z: z0 },
+        Vec3 { x, y: y1, z: z1 },
+        Vec3 { x, y: y0, z: z0 },
+        Vec3 { x, y: y0, z: z1 },
+        BRICK_U,
+        material,
     );
 }
 
@@ -537,12 +399,6 @@ fn draw_world_textured(
 ) {
     if let Some(verts) = project_quad(camera, [a, b, c, d]) {
         gpu::draw_quad_textured_material(verts, texture_uvs(base_u), material);
-    }
-}
-
-fn draw_world_flat(camera: Camera, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: (u8, u8, u8)) {
-    if let Some(verts) = project_quad(camera, [a, b, c, d]) {
-        gpu::draw_quad_flat(verts, color.0, color.1, color.2);
     }
 }
 
