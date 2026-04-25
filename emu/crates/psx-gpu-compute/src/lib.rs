@@ -11,6 +11,7 @@
 
 pub mod primitive;
 pub mod rasterizer;
+pub mod scanline;
 pub mod vram;
 
 pub use primitive::{

@@ -14,6 +14,7 @@ use crate::primitive::{
     BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri, TexRect,
     TexTri, Tpage,
 };
+use crate::scanline::{self, RowState, ScanlineConsts};
 use crate::vram::VramGpu;
 
 const WORKGROUP_SIZE_X: u32 = 8;
@@ -61,6 +62,17 @@ pub struct Rasterizer {
     // `tex_tri_bg_layout` (4 bindings: VRAM + prim + draw area + tpage).
     shaded_tex_tri_pipeline: wgpu::ComputePipeline,
     shaded_tex_tri_uniform: wgpu::Buffer,
+
+    // Phase B.x: textured triangle with bit-exact scanline-delta UV
+    // interpolation. Custom 6-binding shape because it adds a
+    // per-row storage buffer + per-primitive scanline-consts uniform.
+    tex_tri_scanline_pipeline: wgpu::ComputePipeline,
+    tex_tri_scanline_bg_layout: wgpu::BindGroupLayout,
+    tex_tri_scanline_consts: wgpu::Buffer,
+    /// Resizable per-row storage buffer. Reallocated when a primitive
+    /// needs more rows than the current capacity (cheap — wgpu
+    /// doesn't actually free until `submit` completes anyway).
+    tex_tri_scanline_rows: std::cell::RefCell<wgpu::Buffer>,
 }
 
 impl Rasterizer {
@@ -404,6 +416,112 @@ impl Rasterizer {
             mapped_at_creation: false,
         });
 
+        // ---------- Tex-tri scanline pipeline (B.x) ----------
+        // 6 bindings: VRAM, prim, draw area, tpage, per-row state
+        // (storage), scanline consts (uniform).
+        let tex_tri_scanline_bg_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("psx-rasterizer-tex-tri-scanline-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let tex_tri_scanline_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("psx-rasterizer-tex-tri-scanline-pl"),
+            bind_group_layouts: &[&tex_tri_scanline_bg_layout],
+            push_constant_ranges: &[],
+        });
+        let tex_tri_scanline_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("psx-rasterizer-tex-tri-scanline-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/tex_tri_scanline.wgsl").into(),
+                ),
+            });
+        let tex_tri_scanline_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("psx-rasterizer-tex-tri-scanline"),
+                layout: Some(&tex_tri_scanline_pl),
+                module: &tex_tri_scanline_shader,
+                entry_point: Some("rasterize"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let tex_tri_scanline_consts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-tex-tri-scanline-consts"),
+            size: std::mem::size_of::<ScanlineConsts>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Pre-allocate room for a 512-row triangle (the max). Avoids
+        // reallocating in the hot path. 512 × 64 = 32 KiB.
+        let initial_rows_capacity_bytes = 512u64 * std::mem::size_of::<RowState>() as u64;
+        let tex_tri_scanline_rows = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-tex-tri-scanline-rows"),
+            size: initial_rows_capacity_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             device,
             queue,
@@ -426,7 +544,140 @@ impl Rasterizer {
             shaded_tri_uniform,
             shaded_tex_tri_pipeline,
             shaded_tex_tri_uniform,
+            tex_tri_scanline_pipeline,
+            tex_tri_scanline_bg_layout,
+            tex_tri_scanline_consts,
+            tex_tri_scanline_rows: std::cell::RefCell::new(tex_tri_scanline_rows),
         }
+    }
+
+    /// Bit-exact textured-triangle dispatch via scanline-delta math.
+    /// The host runs the same `setup_sections` + `next_row` loop the
+    /// CPU rasterizer does, ships per-row state to the GPU, and the
+    /// shader walks per-pixel using i64-emulated Q16.16 arithmetic.
+    /// Results match the CPU rasterizer byte-for-byte.
+    ///
+    /// Returns `false` if the triangle degenerates (zero height /
+    /// longest) — same drop conditions as the CPU.
+    pub fn dispatch_tex_tri_scanline(
+        &self,
+        vram: &VramGpu,
+        tri: &TexTri,
+        tpage: &Tpage,
+        area: &DrawArea,
+    ) -> bool {
+        if tri.exceeds_hw_extent() {
+            return false;
+        }
+        let v = [
+            (tri.v0[0], tri.v0[1]),
+            (tri.v1[0], tri.v1[1]),
+            (tri.v2[0], tri.v2[1]),
+        ];
+        let uv = [
+            (
+                (tri.uv0 & 0xFF) as i32,
+                ((tri.uv0 >> 8) & 0xFF) as i32,
+            ),
+            (
+                (tri.uv1 & 0xFF) as i32,
+                ((tri.uv1 >> 8) & 0xFF) as i32,
+            ),
+            (
+                (tri.uv2 & 0xFF) as i32,
+                ((tri.uv2 >> 8) & 0xFF) as i32,
+            ),
+        ];
+        let setup = match scanline::build_setup(v, uv, [(0, 0, 0); 3]) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Re-allocate per-row buffer if too small.
+        let rows_size_bytes =
+            (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
+        {
+            let mut rows_buf = self.tex_tri_scanline_rows.borrow_mut();
+            if rows_buf.size() < rows_size_bytes {
+                *rows_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("psx-rasterizer-tex-tri-scanline-rows-grown"),
+                    size: rows_size_bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+        }
+
+        // Upload uniforms + per-row data.
+        self.queue
+            .write_buffer(&self.tex_tri_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+        self.queue.write_buffer(
+            &self.tex_tri_scanline_consts,
+            0,
+            bytemuck::bytes_of(&setup.consts),
+        );
+        let rows_buf = self.tex_tri_scanline_rows.borrow();
+        self.queue
+            .write_buffer(&rows_buf, 0, bytemuck::cast_slice(&setup.rows));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-tex-tri-scanline-bg"),
+            layout: &self.tex_tri_scanline_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.tex_tri_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.draw_area_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.tpage_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: rows_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.tex_tri_scanline_consts.as_entire_binding(),
+                },
+            ],
+        });
+
+        let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
+        let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
+        if bbox_w <= 0 || bbox_h <= 0 {
+            return false;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-tex-tri-scanline-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-tex-tri-scanline-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.tex_tri_scanline_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        true
     }
 
     /// Dispatch one textured Gouraud-shaded triangle. Composes
@@ -1866,6 +2117,156 @@ mod tests {
         let touched = inside_pixels.iter().filter(|&&i| gpu_words[i] != prefill).count();
         assert!(untouched > 0, "expected some transparent-skip pixels");
         assert!(touched > 0, "expected some opaque-write pixels");
+    }
+
+    // -------------------------------------------------------
+    //  Phase B.x — scanline-delta textured triangle: BIT-EXACT
+    // -------------------------------------------------------
+
+    #[test]
+    fn tex_tri_scanline_15bpp_axis_aligned_is_bit_exact() {
+        // Same setup as the B.2 axis-aligned test, but using the
+        // scanline-delta dispatcher. Strict `assert_eq!` is the
+        // whole point of this phase.
+        let v = [(20i32, 20i32), (60, 20), (20, 60)];
+        let uv = [(0u8, 0u8), (32, 0), (0, 32)];
+        let tpage_x = 128u32;
+        let tpage_word = make_tpage_word(tpage_x, 0, 2, 0);
+
+        let mut vram = vec![0u16; 1024 * 512];
+        for vy in 0..64u16 {
+            for ux in 0..64u16 {
+                let val = ((vy as u16) << 5) | ux | 0x0001;
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu_push_tex_tri(&mut cpu, 0x25, (0, 0, 0), v, uv, 0, tpage_word);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = TexTri::new(
+            v[0], v[1], v[2],
+            uv[0], uv[1], uv[2],
+            0, 0,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 2);
+        let dispatched = r.dispatch_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
+        assert!(dispatched, "valid triangle should dispatch");
+        let gpu_words = vg.download_full().unwrap();
+
+        assert_eq!(cpu_words, gpu_words, "tex tri scanline strict parity");
+    }
+
+    #[test]
+    fn tex_tri_scanline_skewed_is_bit_exact() {
+        // The skewed triangle case. Without scanline-delta this had
+        // ±2/5-bit channel error from barycentric rounding. Now
+        // strict equality.
+        let v = [(50i32, 20i32), (130, 70), (30, 90)];
+        let uv = [(0u8, 0u8), (60, 0), (0, 50)];
+        let tpage_x = 128u32;
+        let tpage_word = make_tpage_word(tpage_x, 0, 2, 0);
+
+        let mut vram = vec![0u16; 1024 * 512];
+        for vy in 0..128u16 {
+            for ux in 0..128u16 {
+                let val = ((vy as u16) << 5) | (ux as u16) | 0x0001;
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu_push_tex_tri(&mut cpu, 0x25, (0, 0, 0), v, uv, 0, tpage_word);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = TexTri::new(
+            v[0], v[1], v[2],
+            uv[0], uv[1], uv[2],
+            0, 0,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 2);
+        r.dispatch_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        assert_eq!(cpu_words, gpu_words, "tex tri scanline skewed strict parity");
+    }
+
+    #[test]
+    fn tex_tri_scanline_4bpp_with_clut_is_bit_exact() {
+        // 4bpp + CLUT — exercises the texture-window-free CLUT
+        // sampling path with bit-exact UV.
+        let v = [(20i32, 20i32), (60, 20), (20, 60)];
+        let uv = [(0u8, 0u8), (32, 0), (0, 32)];
+        let tpage_x = 0u32;
+        let tpage_word = make_tpage_word(tpage_x, 0, 0, 0);
+        let clut_x = 0u32;
+        let clut_y = 256u32;
+        let clut_word = make_clut_word(clut_x, clut_y);
+
+        let mut vram = vec![0u16; 1024 * 512];
+        for i in 0..16u16 {
+            let val = (i.max(1) << 1) | (i.max(1) << 6) | 0x4000;
+            vram[clut_y as usize * 1024 + (clut_x as usize + i as usize)] = val;
+        }
+        for vy in 0..16u16 {
+            for word_x in 0..4u16 {
+                let mut word = 0u16;
+                for n in 0..4u16 {
+                    let nibble = ((word_x * 4 + n) + vy) & 0xF;
+                    word |= nibble << (n * 4);
+                }
+                vram[vy as usize * 1024 + (tpage_x as usize + word_x as usize)] = word;
+            }
+        }
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu_push_tex_tri(&mut cpu, 0x25, (0, 0, 0), v, uv, clut_word, tpage_word);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = TexTri::new(
+            v[0], v[1], v[2],
+            uv[0], uv[1], uv[2],
+            clut_x, clut_y,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 0);
+        r.dispatch_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        assert_eq!(cpu_words, gpu_words, "tex tri scanline 4bpp+CLUT strict parity");
     }
 
     // -------------------------------------------------------
