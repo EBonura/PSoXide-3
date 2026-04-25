@@ -18,7 +18,7 @@
 //! `left_x_q16`, `left_u_q16`, `left_v_q16`, `left_r/g/b_q16` plus
 //! `right_x_q16` and the per-column deltas (uniform across the
 //! primitive). The GPU's per-pixel job then becomes:
-//! ```
+//! ```text
 //! col = px - (left_x_q16 >> 16);
 //! u_q16 = left_u_q16 + col * delta_col_u_q16;
 //! u = u_q16 >> 16;

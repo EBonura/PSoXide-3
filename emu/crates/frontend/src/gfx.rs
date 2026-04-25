@@ -198,6 +198,66 @@ impl Graphics {
         );
     }
 
+    /// Phase C — same as `prepare_display`, but the source pixels
+    /// come from a custom `Vec<u16>` (typically the compute
+    /// backend's VRAM downloaded via `VramGpu::download_full`)
+    /// instead of the CPU rasterizer's VRAM. The display rect /
+    /// 24-bit-mode flag is still pulled from `gpu` (it's the same
+    /// state the framebuffer panel reads); we just substitute the
+    /// VRAM cells.
+    pub fn prepare_display_from_words(&self, words: Vec<u16>, gpu: Option<&Gpu>) {
+        let Some(gpu) = gpu else {
+            return;
+        };
+        if words.len() != VRAM_WIDTH * VRAM_HEIGHT {
+            return;
+        }
+        let da = gpu.display_area();
+        if da.width == 0 || da.height == 0 {
+            return;
+        }
+        // 16bpp BGR15 readback, bit-replicated to RGB888 — same
+        // expansion `Vram::to_rgba8` does on the CPU side.
+        let eff_w = da.width.min(VRAM_WIDTH as u16 - da.x) as usize;
+        let eff_h = da.height.min(VRAM_HEIGHT as u16 - da.y) as usize;
+        let mut packed = vec![0u8; VRAM_WIDTH * VRAM_HEIGHT * 4];
+        let dst_stride = VRAM_WIDTH * 4;
+        for row in 0..eff_h {
+            let src_row = (da.y as usize + row) * VRAM_WIDTH + da.x as usize;
+            let dst_off = row * dst_stride;
+            for col in 0..eff_w {
+                let pix = words[src_row + col];
+                let r5 = (pix & 0x1F) as u8;
+                let g5 = ((pix >> 5) & 0x1F) as u8;
+                let b5 = ((pix >> 10) & 0x1F) as u8;
+                let i = dst_off + col * 4;
+                packed[i] = (r5 << 3) | (r5 >> 2);
+                packed[i + 1] = (g5 << 3) | (g5 >> 2);
+                packed[i + 2] = (b5 << 3) | (b5 >> 2);
+                packed[i + 3] = 0xFF;
+            }
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.display_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &packed,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(VRAM_WIDTH as u32 * 4),
+                rows_per_image: Some(VRAM_HEIGHT as u32),
+            },
+            wgpu::Extent3d {
+                width: VRAM_WIDTH as u32,
+                height: VRAM_HEIGHT as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;

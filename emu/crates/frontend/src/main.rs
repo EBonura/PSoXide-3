@@ -12,6 +12,7 @@
 mod app;
 mod audio;
 mod cli;
+mod compute_backend;
 mod disasm;
 mod gfx;
 mod icons;
@@ -74,11 +75,12 @@ fn main() {
     // real settings. Ditto `--fullscreen`.
     let config_dir = cli.config_dir;
     let fullscreen = cli.fullscreen;
+    let gpu_compute = cli.gpu_compute;
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = Shell::new(config_dir, fullscreen);
+    let mut app = Shell::new(config_dir, fullscreen, gpu_compute);
     event_loop.run_app(&mut app).expect("event loop");
 }
 
@@ -119,16 +121,30 @@ struct Shell {
     /// redraws instead produces under/over-runs on anything that
     /// isn't an exact 60 Hz render loop.
     audio_cycle_accum: u64,
+    /// Phase C — when `Some`, the experimental compute-shader
+    /// rasterizer is shadowing the CPU rasterizer: each frame the
+    /// CPU's `cmd_log` is drained and replayed onto the GPU compute
+    /// path, and the display reads from the GPU's VRAM.
+    compute_backend: Option<compute_backend::ComputeBackend>,
+    /// Whether to display the GPU compute output instead of the CPU
+    /// VRAM. Toggled at runtime by F12. Independent of whether the
+    /// compute backend is active — when off, GPU still runs (so it
+    /// stays in sync) but the user sees CPU output.
+    display_gpu_compute: bool,
 }
 
 impl Default for Shell {
     fn default() -> Self {
-        Self::new(None, false)
+        Self::new(None, false, false)
     }
 }
 
 impl Shell {
-    fn new(config_dir: Option<std::path::PathBuf>, fullscreen: bool) -> Self {
+    fn new(
+        config_dir: Option<std::path::PathBuf>,
+        fullscreen: bool,
+        gpu_compute: bool,
+    ) -> Self {
         let audio = audio::AudioOut::open();
         if let Some(a) = audio.as_ref() {
             eprintln!("[audio] opened host stream @ {} Hz", a.host_sample_rate());
@@ -144,6 +160,19 @@ impl Shell {
         } else {
             eprintln!("[input] no pads connected at startup — watching for hot-plug");
         }
+        // The compute backend gets its own headless wgpu device.
+        // We *could* share the main `Graphics` device for zero-copy
+        // VRAM-to-display, but that needs `Arc<Device>` plumbing
+        // throughout `Graphics` — bigger refactor for a marginal
+        // perf win in an opt-in shadow path. Per-frame VRAM bounces
+        // through CPU memory, which costs ~1 MiB read + 1 MiB write
+        // and is invisible next to the rasterizer cost.
+        let compute_backend = if gpu_compute {
+            eprintln!("[gpu-compute] enabling shadow compute rasterizer");
+            Some(compute_backend::ComputeBackend::new_headless())
+        } else {
+            None
+        };
         Self {
             graphics: None,
             state: AppState::with_config_dir(config_dir),
@@ -155,6 +184,8 @@ impl Shell {
             input,
             emu_frame_accum: 0.0,
             audio_cycle_accum: 0,
+            compute_backend,
+            display_gpu_compute: gpu_compute,
         }
     }
 }
@@ -300,6 +331,19 @@ impl ApplicationHandler for Shell {
                 // navigation; releases don't.
                 if state == ElementState::Pressed {
                     self.pending_input = merge_key(self.pending_input, &logical_key);
+                }
+                // F12 — toggle the display source between the CPU
+                // rasterizer's VRAM and the compute backend's. Only
+                // meaningful when the compute backend is active
+                // (i.e. `--gpu-compute` was passed). No-op otherwise.
+                if state == ElementState::Pressed && !repeat {
+                    if matches!(&logical_key, Key::Named(NamedKey::F12)) {
+                        self.display_gpu_compute = !self.display_gpu_compute;
+                        eprintln!(
+                            "[gpu-compute] display source: {}",
+                            if self.display_gpu_compute { "GPU compute" } else { "CPU rasterizer" }
+                        );
+                    }
                 }
                 gfx.window.request_redraw();
             }
@@ -464,8 +508,50 @@ impl ApplicationHandler for Shell {
                 }
 
                 let state = &mut self.state;
+
+                // Phase C: drain the CPU rasterizer's `cmd_log` and
+                // replay each GP0 packet onto the compute backend.
+                // This runs for every frame the bus advanced (or
+                // not, when paused — in which case `cmd_log` will
+                // be empty and the loop is a no-op).
+                if let (Some(backend), Some(bus)) =
+                    (self.compute_backend.as_mut(), state.bus.as_mut())
+                {
+                    // Enable the pixel tracer once. It's idempotent:
+                    // a second call resets the cmd_log + owner buffer.
+                    // We only want it on if we're actually replaying.
+                    if bus.gpu.pixel_owner.is_none() {
+                        bus.gpu.enable_pixel_tracer();
+                    }
+                    // Sync VRAM so any uploads / FMV writes / VRAM-to-
+                    // VRAM copies are reflected on the compute side
+                    // before we replay this frame's draw commands.
+                    backend.sync_vram_from_cpu(bus.gpu.vram.words());
+                    // Drain & replay.
+                    let log = std::mem::take(&mut bus.gpu.cmd_log);
+                    for entry in &log {
+                        backend.replay_packet(entry);
+                    }
+                    // pixel_owner needs resetting too — we don't use
+                    // its data here, but its `current_cmd_index`
+                    // would otherwise drift past u32::MAX over time.
+                    if let Some(owner) = bus.gpu.pixel_owner.as_mut() {
+                        owner.fill(u32::MAX);
+                    }
+                }
+
                 gfx.prepare_vram(state.bus.as_ref().map(|b| &b.gpu.vram));
-                gfx.prepare_display(state.bus.as_ref().map(|b| &b.gpu));
+                // Display source: GPU VRAM if the user toggled it on,
+                // else the CPU's. The compute output should look
+                // identical to the CPU's; flipping makes that visible.
+                if self.display_gpu_compute && self.compute_backend.is_some() {
+                    gfx.prepare_display_from_words(
+                        self.compute_backend.as_ref().unwrap().download_vram(),
+                        state.bus.as_ref().map(|b| &b.gpu),
+                    );
+                } else {
+                    gfx.prepare_display(state.bus.as_ref().map(|b| &b.gpu));
+                }
                 let vram_tex = gfx.vram_texture_id();
                 let display_tex = gfx.display_texture_id();
                 gfx.render(|ctx| app::build_ui(ctx, state, vram_tex, display_tex, dt));
