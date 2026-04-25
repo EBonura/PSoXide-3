@@ -1,11 +1,11 @@
 //! `showcase-textured-sprite` - 3D textured material showcase.
 //!
-//! A compact 3D material booth.
+//! A compact interactive material room.
 //!
-//! The floor and back wall are cheap flat geometry; only the small
-//! upright samples are textured. Transparent samples sit over strong
-//! backing colours so the PS1 blend modes are easy to read without
-//! turning the demo into a fill-rate test.
+//! The room is cheap flat geometry with a small textured floor inset.
+//! A single upright pane in the centre shows one material at a time;
+//! controller input swaps the texture sample and blend mode while the
+//! HUD names what is currently being shown.
 
 #![no_std]
 #![no_main]
@@ -13,7 +13,8 @@
 extern crate psx_rt;
 
 use psx_asset::Texture;
-use psx_engine::{App, Config, Ctx, Scene};
+use psx_engine::{button, App, Config, Ctx, Scene};
+use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{
     self as gpu,
     material::{BlendMode, TextureMaterial},
@@ -27,6 +28,8 @@ static FLOOR_BLOB: &[u8] = include_bytes!("../../showcase-fog/assets/floor.psxt"
 const SHARED_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
 const BRICK_CLUT: Clut = Clut::new(0, 480);
 const FLOOR_CLUT: Clut = Clut::new(0, 481);
+const FONT_TPAGE: Tpage = Tpage::new(320, 0, TexDepth::Bit4);
+const FONT_CLUT: Clut = Clut::new(320, 256);
 
 const TEX_W: u16 = 64;
 const TEX_H: u16 = 64;
@@ -47,15 +50,22 @@ const CAMERA_Y: i32 = 170;
 const ORBIT_RADIUS: i32 = 540;
 const CAMERA_PITCH_Q12: u16 = 4096 - 128;
 
-const FLOOR_X: i32 = 230;
-const FLOOR_FRONT_Z: i32 = 145;
-const WALL_Z: i32 = -18;
-const WALL_TOP: i32 = 130;
-const BACKING_SIZE: i32 = 74;
-const PANEL_SIZE: i32 = 54;
-const PANEL_BOTTOM: i32 = 34;
-const BACKING_Z: i32 = -6;
+const FLOOR_X: i32 = 320;
+const FLOOR_FRONT_Z: i32 = 250;
+const WALL_Z: i32 = -42;
+const WALL_TOP: i32 = 150;
+const RUG_X: i32 = 210;
+const RUG_FRONT_Z: i32 = 170;
+const BACKING_SIZE: i32 = 142;
+const PANEL_SIZE: i32 = 112;
+const PANEL_BOTTOM: i32 = 20;
+const BACKING_Z: i32 = -10;
 const PANEL_Z: i32 = 0;
+
+const SAMPLE_BRICK: u8 = 0;
+const SAMPLE_FLOOR: u8 = 1;
+const SAMPLE_COUNT: u8 = 2;
+const BLEND_COUNT: u8 = 5;
 
 #[derive(Copy, Clone)]
 struct Vec3 {
@@ -76,25 +86,41 @@ struct Camera {
 }
 
 struct Showcase {
-    brick_opaque: TextureMaterial,
-    glass_average: TextureMaterial,
-    glow_add: TextureMaterial,
-    shadow_subtract: TextureMaterial,
-    highlight_quarter: TextureMaterial,
+    font: Option<FontAtlas>,
+    sample_idx: u8,
+    blend_idx: u8,
 }
 
 impl Scene for Showcase {
     fn init(&mut self, _ctx: &mut Ctx) {
         upload_sample_textures();
+        self.font = Some(FontAtlas::upload(&BASIC, FONT_TPAGE, FONT_CLUT));
     }
 
-    fn update(&mut self, _ctx: &mut Ctx) {}
+    fn update(&mut self, ctx: &mut Ctx) {
+        if ctx.just_pressed(button::RIGHT) || ctx.just_pressed(button::CROSS) {
+            self.blend_idx = (self.blend_idx + 1) % BLEND_COUNT;
+        }
+        if ctx.just_pressed(button::LEFT) || ctx.just_pressed(button::SQUARE) {
+            self.blend_idx = (self.blend_idx + BLEND_COUNT - 1) % BLEND_COUNT;
+        }
+        if ctx.just_pressed(button::UP)
+            || ctx.just_pressed(button::DOWN)
+            || ctx.just_pressed(button::TRIANGLE)
+            || ctx.just_pressed(button::CIRCLE)
+        {
+            self.sample_idx = (self.sample_idx + 1) % SAMPLE_COUNT;
+        }
+    }
 
     fn render(&mut self, ctx: &mut Ctx) {
         let camera = camera_for(ctx.frame);
-        draw_floor(camera);
-        draw_panel_backs(camera);
-        draw_material_panels(self, camera);
+        draw_room(camera);
+        draw_material_backing(camera);
+        draw_material_pane(self, camera);
+        if let Some(font) = self.font.as_ref() {
+            self.draw_hud(font);
+        }
     }
 }
 
@@ -111,32 +137,67 @@ fn main() -> ! {
 impl Showcase {
     const fn new() -> Self {
         Self {
-            brick_opaque: TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, IDENTITY_TINT),
-            glass_average: TextureMaterial::blended(
-                FLOOR_CLUT_WORD,
+            font: None,
+            sample_idx: SAMPLE_FLOOR,
+            blend_idx: 1,
+        }
+    }
+
+    fn sample_name(&self) -> &'static str {
+        if self.sample_idx == SAMPLE_BRICK {
+            "BRICK"
+        } else {
+            "FLOOR"
+        }
+    }
+
+    fn blend_name(&self) -> &'static str {
+        match self.blend_idx {
+            0 => "OPAQUE",
+            1 => "AVERAGE",
+            2 => "ADDITIVE",
+            3 => "SUBTRACT",
+            _ => "ADD QUARTER",
+        }
+    }
+
+    fn material(&self) -> TextureMaterial {
+        let clut = if self.sample_idx == SAMPLE_BRICK {
+            BRICK_CLUT_WORD
+        } else {
+            FLOOR_CLUT_WORD
+        };
+        match self.blend_idx {
+            0 => TextureMaterial::opaque(clut, TPAGE_WORD, IDENTITY_TINT),
+            1 => TextureMaterial::blended(clut, TPAGE_WORD, (0x88, 0x98, 0xb0), BlendMode::Average),
+            2 => TextureMaterial::blended(clut, TPAGE_WORD, (0x58, 0x70, 0xa0), BlendMode::Add),
+            3 => {
+                TextureMaterial::blended(clut, TPAGE_WORD, (0x78, 0x78, 0x78), BlendMode::Subtract)
+            }
+            _ => TextureMaterial::blended(
+                clut,
                 TPAGE_WORD,
-                (0x68, 0x78, 0x98),
-                BlendMode::Average,
-            ),
-            glow_add: TextureMaterial::blended(
-                FLOOR_CLUT_WORD,
-                TPAGE_WORD,
-                (0x50, 0x64, 0x98),
-                BlendMode::Add,
-            ),
-            shadow_subtract: TextureMaterial::blended(
-                BRICK_CLUT_WORD,
-                TPAGE_WORD,
-                (0x78, 0x78, 0x78),
-                BlendMode::Subtract,
-            ),
-            highlight_quarter: TextureMaterial::blended(
-                BRICK_CLUT_WORD,
-                TPAGE_WORD,
-                (0xc0, 0xc0, 0x98),
+                (0xb8, 0xb8, 0x98),
                 BlendMode::AddQuarter,
             ),
         }
+    }
+
+    fn base_u(&self) -> u8 {
+        if self.sample_idx == SAMPLE_BRICK {
+            BRICK_U
+        } else {
+            FLOOR_U
+        }
+    }
+
+    fn draw_hud(&self, font: &FontAtlas) {
+        font.draw_text(8, 8, "MATERIAL VIEWER", (220, 220, 245));
+        font.draw_text(8, 24, "TEXTURE", (130, 150, 190));
+        font.draw_text(72, 24, self.sample_name(), (235, 235, 210));
+        font.draw_text(8, 38, "BLEND", (130, 150, 190));
+        font.draw_text(56, 38, self.blend_name(), (235, 235, 210));
+        font.draw_text(8, 224, "UP/DN TEXTURE  L/R BLEND", (140, 155, 190));
     }
 }
 
@@ -198,6 +259,12 @@ fn camera_for(frame: u32) -> Camera {
     }
 }
 
+fn draw_room(camera: Camera) {
+    draw_floor(camera);
+    draw_floor_inset(camera);
+    draw_wall(camera);
+}
+
 fn draw_floor(camera: Camera) {
     draw_world_flat(
         camera,
@@ -246,6 +313,35 @@ fn draw_floor(camera: Camera) {
             z: FLOOR_FRONT_Z,
         },
         (54, 56, 64),
+    );
+}
+
+fn draw_floor_inset(camera: Camera) {
+    let material = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x70, 0x70, 0x78));
+    draw_world_textured(
+        camera,
+        Vec3 {
+            x: -RUG_X,
+            y: 1,
+            z: WALL_Z + 10,
+        },
+        Vec3 {
+            x: RUG_X,
+            y: 1,
+            z: WALL_Z + 10,
+        },
+        Vec3 {
+            x: -RUG_X,
+            y: 1,
+            z: RUG_FRONT_Z,
+        },
+        Vec3 {
+            x: RUG_X,
+            y: 1,
+            z: RUG_FRONT_Z,
+        },
+        FLOOR_U,
+        material,
     );
 }
 
@@ -300,20 +396,16 @@ fn draw_wall(camera: Camera) {
     );
 }
 
-fn draw_panel_backs(camera: Camera) {
-    draw_wall(camera);
-    draw_backing(camera, -128, (248, 248, 232), (20, 24, 36));
-    draw_backing(camera, -64, (230, 28, 34), (24, 210, 222));
-    draw_backing(camera, 0, (24, 76, 230), (24, 220, 76));
-    draw_backing(camera, 64, (248, 220, 40), (220, 28, 214));
-    draw_backing(camera, 128, (248, 248, 248), (44, 72, 232));
+fn draw_material_backing(camera: Camera) {
+    draw_backing(camera, (24, 76, 230), (248, 220, 40));
+    draw_backing_crossbar(camera);
 }
 
-fn draw_backing(camera: Camera, center_x: i32, left: (u8, u8, u8), right: (u8, u8, u8)) {
+fn draw_backing(camera: Camera, left: (u8, u8, u8), right: (u8, u8, u8)) {
     let half = BACKING_SIZE / 2;
-    let mid = center_x;
-    let x0 = center_x - half;
-    let x1 = center_x + half;
+    let mid = 0;
+    let x0 = -half;
+    let x1 = half;
     let y0 = PANEL_BOTTOM - ((BACKING_SIZE - PANEL_SIZE) / 2);
     let y1 = y0 + BACKING_SIZE;
     draw_world_flat(
@@ -366,18 +458,44 @@ fn draw_backing(camera: Camera, center_x: i32, left: (u8, u8, u8), right: (u8, u
     );
 }
 
-fn draw_material_panels(scene: &Showcase, camera: Camera) {
-    draw_vertical_square(camera, -128, BRICK_U, scene.brick_opaque);
-    draw_vertical_square(camera, -64, FLOOR_U, scene.glass_average);
-    draw_vertical_square(camera, 0, FLOOR_U, scene.glow_add);
-    draw_vertical_square(camera, 64, BRICK_U, scene.shadow_subtract);
-    draw_vertical_square(camera, 128, BRICK_U, scene.highlight_quarter);
+fn draw_backing_crossbar(camera: Camera) {
+    let half = BACKING_SIZE / 2;
+    let y0 = PANEL_BOTTOM + PANEL_SIZE / 2 - 4;
+    let y1 = y0 + 8;
+    draw_world_flat(
+        camera,
+        Vec3 {
+            x: -half,
+            y: y1,
+            z: BACKING_Z - 1,
+        },
+        Vec3 {
+            x: half,
+            y: y1,
+            z: BACKING_Z - 1,
+        },
+        Vec3 {
+            x: -half,
+            y: y0,
+            z: BACKING_Z - 1,
+        },
+        Vec3 {
+            x: half,
+            y: y0,
+            z: BACKING_Z - 1,
+        },
+        (232, 232, 232),
+    );
 }
 
-fn draw_vertical_square(camera: Camera, center_x: i32, base_u: u8, material: TextureMaterial) {
+fn draw_material_pane(scene: &Showcase, camera: Camera) {
+    draw_vertical_square(camera, scene.base_u(), scene.material());
+}
+
+fn draw_vertical_square(camera: Camera, base_u: u8, material: TextureMaterial) {
     let half = PANEL_SIZE / 2;
-    let x0 = center_x - half;
-    let x1 = center_x + half;
+    let x0 = -half;
+    let x1 = half;
     let y0 = PANEL_BOTTOM;
     let y1 = PANEL_BOTTOM + PANEL_SIZE;
     draw_world_textured(
