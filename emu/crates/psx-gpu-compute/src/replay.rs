@@ -228,22 +228,17 @@ impl ComputeBackend {
     /// Replace the GPU-side VRAM with the CPU rasterizer's current
     /// VRAM. Called at frame start so the compute path sees the
     /// same texture / framebuffer state the CPU is about to render
-    /// against. Flushes any pending dispatches first — VRAM uploads
-    /// happen on the queue-write side, but writes are ordered with
-    /// submitted command buffers, so we want all prior draws to
-    /// land before this overwrites their output.
+    /// against.
     pub fn sync_vram_from_cpu(&self, cpu_words: &[u16]) {
-        self.rasterizer.flush();
+        // `upload_full` validates length matches 1024×512.
         let _ = self.vram.upload_full(cpu_words);
     }
 
     /// Read back the GPU VRAM for display. Slow per-frame
     /// (1 MiB GPU→CPU bounce) — acceptable for an opt-in shadow
     /// renderer. A future optimisation would render directly into
-    /// the egui texture without the CPU round-trip. Flushes pending
-    /// dispatches so the readback sees their output.
+    /// the egui texture without the CPU round-trip.
     pub fn download_vram(&self) -> Vec<u16> {
-        self.rasterizer.flush();
         self.vram.download_full().unwrap_or_default()
     }
 
@@ -257,7 +252,6 @@ impl ComputeBackend {
         if w == 0 || h == 0 {
             return;
         }
-        self.rasterizer.flush();
         // Honour VRAM wrap (hardware wraps both axes mod 1024 / 512).
         // We slice CPU words row-by-row so partial-row wraps work.
         let mut buf = Vec::with_capacity((w * h) as usize);

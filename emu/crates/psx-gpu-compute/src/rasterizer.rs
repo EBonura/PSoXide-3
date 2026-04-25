@@ -22,35 +22,9 @@ const WORKGROUP_SIZE_Y: u32 = 8;
 
 /// Holds every wgpu pipeline object the rasterizer needs. Built once
 /// per `VramGpu` and reused for the lifetime of the device.
-///
-/// Dispatches are *batched*: each `dispatch_*` records into a
-/// `pending` `CommandEncoder` and creates fresh per-dispatch
-/// uniform / storage buffers (so writes from concurrent dispatches
-/// don't clobber each other before submission). The single
-/// `queue.submit` happens in [`Rasterizer::flush`], called by
-/// `ComputeBackend` at frame boundaries (or by tests right before
-/// reading VRAM back). On Apple Silicon this turns ~40us of per-
-/// dispatch driver overhead into a single submit per batch.
-///
-/// To bound peak memory + avoid wgpu/Metal stalling on extreme
-/// batches, an internal counter auto-flushes after
-/// `MAX_DISPATCHES_PER_BATCH` records. The threshold is large
-/// enough to amortise the submit cost across a typical PS1 frame
-/// (~500 packets) while keeping the buffer pool / encoder backlog
-/// bounded for traces that batch many frames at once.
-const MAX_DISPATCHES_PER_BATCH: u32 = 1024;
-
 pub struct Rasterizer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    /// Open command encoder accumulating dispatches since the last
-    /// `flush`. Lazily created on first dispatch; taken (and
-    /// submitted) by `flush`.
-    pending: std::cell::RefCell<Option<wgpu::CommandEncoder>>,
-    /// How many dispatches have been recorded into `pending`.
-    /// Cleared on flush; auto-flush triggers when it reaches
-    /// `MAX_DISPATCHES_PER_BATCH`.
-    pending_count: std::cell::Cell<u32>,
 
     // Mono-triangle pipeline.
     mono_tri_pipeline: wgpu::ComputePipeline,
@@ -808,81 +782,7 @@ impl Rasterizer {
             shaded_tri_scanline_pipeline,
             shaded_tri_scanline_consts,
             shaded_tri_scanline_rows: std::cell::RefCell::new(shaded_tri_scanline_rows),
-            pending: std::cell::RefCell::new(None),
-            pending_count: std::cell::Cell::new(0),
         }
-    }
-
-    // -------- Batched dispatch helpers --------
-    //
-    // Each `dispatch_*` writes its data into a *fresh* uniform /
-    // storage buffer and records its compute pass into a single
-    // pending encoder. Submission is deferred until `flush` so we
-    // pay one driver round-trip per frame instead of per primitive.
-    //
-    // Why fresh buffers: `queue.write_buffer` is lazy — multiple
-    // writes to the same buffer between submits coalesce, with the
-    // last write winning for *every* dispatch in the batch. Allocating
-    // a small uniform per dispatch costs less than the `queue.submit`
-    // it replaces (~40us on Metal).
-
-    /// Allocate a uniform buffer initialized with `data`. Returns the
-    /// buffer; the bind group will keep an Arc-reference to it, so it
-    /// stays alive until the dispatch executes.
-    fn make_uniform<T: bytemuck::Pod>(&self, label: &'static str, data: &T) -> wgpu::Buffer {
-        use wgpu::util::DeviceExt;
-        self.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::bytes_of(data),
-                usage: wgpu::BufferUsages::UNIFORM,
-            })
-    }
-
-    /// Allocate a storage buffer initialized with `data`. Used by the
-    /// scanline-delta paths for per-row state.
-    fn make_storage<T: bytemuck::Pod>(&self, label: &'static str, data: &[T]) -> wgpu::Buffer {
-        use wgpu::util::DeviceExt;
-        self.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(data),
-                usage: wgpu::BufferUsages::STORAGE,
-            })
-    }
-
-    /// Record a compute pass into the pending encoder, lazily
-    /// creating the encoder on first call. Auto-flushes after
-    /// `MAX_DISPATCHES_PER_BATCH` records so a single batch never
-    /// holds more than ~thousands of buffers / bind groups (Metal
-    /// stalls past that point).
-    fn record<F: FnOnce(&mut wgpu::CommandEncoder)>(&self, _label: &'static str, f: F) {
-        {
-            let mut slot = self.pending.borrow_mut();
-            let encoder = slot.get_or_insert_with(|| {
-                self.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("psx-rasterizer-batch-encoder"),
-                    })
-            });
-            f(encoder);
-        }
-        let n = self.pending_count.get() + 1;
-        self.pending_count.set(n);
-        if n >= MAX_DISPATCHES_PER_BATCH {
-            self.flush();
-        }
-    }
-
-    /// Submit any pending dispatches. Tests call this right before
-    /// reading VRAM back; `ComputeBackend` calls it at frame
-    /// boundaries (download / sync / upload).
-    pub fn flush(&self) {
-        let enc = self.pending.borrow_mut().take();
-        if let Some(enc) = enc {
-            self.queue.submit([enc.finish()]);
-        }
-        self.pending_count.set(0);
     }
 
     /// Bit-exact monochrome triangle dispatch via scanline-delta
@@ -975,23 +875,49 @@ impl Rasterizer {
         tri: &P,
         _prim_size_bytes: u64,
         pipeline: &wgpu::ComputePipeline,
-        _consts_buf_unused: &wgpu::Buffer,
-        _rows_cell_unused: &std::cell::RefCell<wgpu::Buffer>,
+        consts_buf: &wgpu::Buffer,
+        rows_cell: &std::cell::RefCell<wgpu::Buffer>,
         setup: &scanline::ScanlineSetup,
         area: &DrawArea,
         bbox_w: i32,
         bbox_h: i32,
-        _label: &'static str,
+        label: &'static str,
     ) -> bool {
         if bbox_w <= 0 || bbox_h <= 0 {
             return false;
         }
-        // Fresh per-dispatch buffers — multiple scanline draws in the
-        // same batch must not share rows / consts / prim slots.
-        let prim_buf = self.make_uniform("scanline-prim", tri);
-        let area_buf = self.make_uniform("scanline-area", area);
-        let consts_buf = self.make_uniform("scanline-consts", &setup.consts);
-        let rows_buf = self.make_storage("scanline-rows", &setup.rows);
+        // Both mono and shaded scanline paths reuse `mono_tri_uniform`
+        // (mono) / `shaded_tri_uniform` (shaded) — but to keep this
+        // helper generic, we'll write through the existing per-prim
+        // uniform we already manage. Looking up which one to use:
+        let prim_uniform = match label {
+            "mono" => &self.mono_tri_uniform,
+            "shaded" => &self.shaded_tri_uniform,
+            _ => unreachable!("unknown scanline-dispatch label: {label}"),
+        };
+
+        let rows_size_bytes =
+            (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
+        {
+            let mut rows_buf = rows_cell.borrow_mut();
+            if rows_buf.size() < rows_size_bytes {
+                *rows_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("psx-rasterizer-scanline-rows-grown"),
+                    size: rows_size_bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+        }
+        self.queue.write_buffer(prim_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(consts_buf, 0, bytemuck::bytes_of(&setup.consts));
+        let rows_buf = rows_cell.borrow();
+        self.queue
+            .write_buffer(&rows_buf, 0, bytemuck::cast_slice(&setup.rows));
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-scanline-bg"),
             layout: &self.mono_shaded_scanline_bg_layout,
@@ -1002,11 +928,11 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: prim_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -1018,17 +944,24 @@ impl Rasterizer {
                 },
             ],
         });
-        let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
-        self.record("scanline", |encoder| {
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-scanline-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-scanline-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
         true
     }
 
@@ -1071,16 +1004,39 @@ impl Rasterizer {
             Some(s) => s,
             None => return false,
         };
-        let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
-        let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
-        if bbox_w <= 0 || bbox_h <= 0 {
-            return false;
+
+        let rows_size_bytes =
+            (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
+        {
+            let mut rows_buf = self.shaded_tex_tri_scanline_rows.borrow_mut();
+            if rows_buf.size() < rows_size_bytes {
+                *rows_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("psx-rasterizer-shaded-tex-tri-scanline-rows-grown"),
+                    size: rows_size_bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
         }
-        let prim_buf = self.make_uniform("shaded-tex-tri-scanline-prim", tri);
-        let area_buf = self.make_uniform("shaded-tex-tri-scanline-area", area);
-        let tpage_buf = self.make_uniform("shaded-tex-tri-scanline-tpage", tpage);
-        let consts_buf = self.make_uniform("shaded-tex-tri-scanline-consts", &setup.consts);
-        let rows_buf = self.make_storage("shaded-tex-tri-scanline-rows", &setup.rows);
+
+        self.queue.write_buffer(
+            &self.shaded_tex_tri_uniform,
+            0,
+            bytemuck::bytes_of(tri),
+        );
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+        self.queue.write_buffer(
+            &self.shaded_tex_tri_scanline_consts,
+            0,
+            bytemuck::bytes_of(&setup.consts),
+        );
+        let rows_buf = self.shaded_tex_tri_scanline_rows.borrow();
+        self.queue
+            .write_buffer(&rows_buf, 0, bytemuck::cast_slice(&setup.rows));
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-shaded-tex-tri-scanline-bg"),
             layout: &self.tex_tri_scanline_bg_layout,
@@ -1091,15 +1047,15 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.shaded_tex_tri_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: tpage_buf.as_entire_binding(),
+                    resource: self.tpage_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -1107,21 +1063,33 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: consts_buf.as_entire_binding(),
+                    resource: self.shaded_tex_tri_scanline_consts.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
-        self.record("shaded-tex-tri-scanline", |encoder| {
+
+        let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
+        let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
+        if bbox_w <= 0 || bbox_h <= 0 {
+            return false;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri-scanline-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-shaded-tex-tri-scanline-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.shaded_tex_tri_scanline_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
         true
     }
 
@@ -1166,16 +1134,38 @@ impl Rasterizer {
             Some(s) => s,
             None => return false,
         };
-        let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
-        let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
-        if bbox_w <= 0 || bbox_h <= 0 {
-            return false;
+
+        // Re-allocate per-row buffer if too small.
+        let rows_size_bytes =
+            (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
+        {
+            let mut rows_buf = self.tex_tri_scanline_rows.borrow_mut();
+            if rows_buf.size() < rows_size_bytes {
+                *rows_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("psx-rasterizer-tex-tri-scanline-rows-grown"),
+                    size: rows_size_bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
         }
-        let prim_buf = self.make_uniform("tex-tri-scanline-prim", tri);
-        let area_buf = self.make_uniform("tex-tri-scanline-area", area);
-        let tpage_buf = self.make_uniform("tex-tri-scanline-tpage", tpage);
-        let consts_buf = self.make_uniform("tex-tri-scanline-consts", &setup.consts);
-        let rows_buf = self.make_storage("tex-tri-scanline-rows", &setup.rows);
+
+        // Upload uniforms + per-row data.
+        self.queue
+            .write_buffer(&self.tex_tri_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+        self.queue.write_buffer(
+            &self.tex_tri_scanline_consts,
+            0,
+            bytemuck::bytes_of(&setup.consts),
+        );
+        let rows_buf = self.tex_tri_scanline_rows.borrow();
+        self.queue
+            .write_buffer(&rows_buf, 0, bytemuck::cast_slice(&setup.rows));
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-tex-tri-scanline-bg"),
             layout: &self.tex_tri_scanline_bg_layout,
@@ -1186,15 +1176,15 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.tex_tri_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: tpage_buf.as_entire_binding(),
+                    resource: self.tpage_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -1202,21 +1192,33 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: consts_buf.as_entire_binding(),
+                    resource: self.tex_tri_scanline_consts.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
-        self.record("tex-tri-scanline", |encoder| {
+
+        let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
+        let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
+        if bbox_w <= 0 || bbox_h <= 0 {
+            return false;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-tex-tri-scanline-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-tex-tri-scanline-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.tex_tri_scanline_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
         true
     }
 
@@ -1238,9 +1240,12 @@ impl Rasterizer {
         if bbox_w <= 0 || bbox_h <= 0 {
             return;
         }
-        let prim_buf = self.make_uniform("shaded-tex-tri-prim", tri);
-        let area_buf = self.make_uniform("shaded-tex-tri-area", area);
-        let tpage_buf = self.make_uniform("shaded-tex-tri-tpage", tpage);
+        self.queue
+            .write_buffer(&self.shaded_tex_tri_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-shaded-tex-tri-bg"),
             layout: &self.tex_tri_bg_layout,
@@ -1251,29 +1256,35 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.shaded_tex_tri_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: tpage_buf.as_entire_binding(),
+                    resource: self.tpage_uniform.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
-        self.record("shaded-tex-tri", |encoder| {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-shaded-tex-tri-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.shaded_tex_tri_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one Gouraud-shaded triangle. Same coverage rules as
@@ -1288,8 +1299,10 @@ impl Rasterizer {
         if bbox_w <= 0 || bbox_h <= 0 {
             return;
         }
-        let prim_buf = self.make_uniform("shaded-tri-prim", tri);
-        let area_buf = self.make_uniform("shaded-tri-area", area);
+        self.queue
+            .write_buffer(&self.shaded_tri_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-shaded-tri-bg"),
             layout: &self.mono_tri_bg_layout,
@@ -1300,25 +1313,31 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.shaded_tri_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
-        self.record("shaded-tri", |encoder| {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-shaded-tri-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-shaded-tri-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.shaded_tri_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one quick-fill primitive into VRAM. Bypasses all
@@ -1345,9 +1364,12 @@ impl Rasterizer {
         if w <= 0 || h <= 0 {
             return false;
         }
-        let prim_buf = self.make_uniform("tex-quad-bilinear-prim", quad);
-        let area_buf = self.make_uniform("tex-quad-bilinear-area", area);
-        let tpage_buf = self.make_uniform("tex-quad-bilinear-tpage", tpage);
+        self.queue
+            .write_buffer(&self.tex_quad_bilinear_uniform, 0, bytemuck::bytes_of(quad));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-tex-quad-bilinear-bg"),
             layout: &self.tex_tri_bg_layout,
@@ -1358,29 +1380,35 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.tex_quad_bilinear_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: tpage_buf.as_entire_binding(),
+                    resource: self.tpage_uniform.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = (w as u32).div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = (h as u32).div_ceil(WORKGROUP_SIZE_Y);
-        self.record("tex-quad-bilinear", |encoder| {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-tex-quad-bilinear-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-tex-quad-bilinear-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.tex_quad_bilinear_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (h as u32).div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
         true
     }
 
@@ -1388,7 +1416,8 @@ impl Rasterizer {
         if fill.wh[0] == 0 || fill.wh[1] == 0 {
             return;
         }
-        let prim_buf = self.make_uniform("fill-prim", fill);
+        self.queue
+            .write_buffer(&self.fill_uniform, 0, bytemuck::bytes_of(fill));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-fill-bg"),
             layout: &self.fill_bg_layout,
@@ -1399,21 +1428,27 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.fill_uniform.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = fill.wh[0].div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = fill.wh[1].div_ceil(WORKGROUP_SIZE_Y);
-        self.record("fill", |encoder| {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-fill-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-fill-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.fill_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = fill.wh[0].div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = fill.wh[1].div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// VRAM-to-VRAM copy (`GP0 0x80`). Mirrors the CPU rasterizer's
@@ -1444,29 +1479,32 @@ impl Rasterizer {
         }
 
         let row_bytes = (w as u64) * 4;
-        // Fresh temp buffer per dispatch — multiple vram-copies in
-        // the same batch must not share a 1-row staging buffer.
         let temp = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("psx-rasterizer-vram-copy-temp"),
             size: row_bytes,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.record("vram-copy", |encoder| {
-            for row in 0..h {
-                let s_off = ((sy + row) as u64 * super::vram::VRAM_WIDTH as u64
-                    + sx as u64)
-                    * 4;
-                let d_off = ((dy + row) as u64 * super::vram::VRAM_WIDTH as u64
-                    + dx as u64)
-                    * 4;
-                // Step 1: src row → temp.
-                encoder.copy_buffer_to_buffer(vram.buffer(), s_off, &temp, 0, row_bytes);
-                // Step 2: temp → dst row. Same encoder ⇒ runs strictly
-                // after step 1, which gives the CPU's row-buffer semantics.
-                encoder.copy_buffer_to_buffer(&temp, 0, vram.buffer(), d_off, row_bytes);
-            }
-        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-vram-copy-encoder"),
+            });
+        for row in 0..h {
+            let s_off = ((sy + row) as u64 * super::vram::VRAM_WIDTH as u64
+                + sx as u64)
+                * 4;
+            let d_off = ((dy + row) as u64 * super::vram::VRAM_WIDTH as u64
+                + dx as u64)
+                * 4;
+            // Step 1: src row → temp.
+            encoder.copy_buffer_to_buffer(vram.buffer(), s_off, &temp, 0, row_bytes);
+            // Step 2: temp → dst row. Same encoder ⇒ runs strictly
+            // after step 1, which gives the CPU's row-buffer semantics.
+            encoder.copy_buffer_to_buffer(&temp, 0, vram.buffer(), d_off, row_bytes);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one monochrome rectangle. `xy` is the top-left
@@ -1476,8 +1514,11 @@ impl Rasterizer {
         if rect.wh[0] == 0 || rect.wh[1] == 0 {
             return;
         }
-        let prim_buf = self.make_uniform("mono-rect-prim", rect);
-        let area_buf = self.make_uniform("mono-rect-area", area);
+        self.queue
+            .write_buffer(&self.mono_rect_uniform, 0, bytemuck::bytes_of(rect));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-mono-rect-bg"),
             layout: &self.mono_tri_bg_layout,
@@ -1488,25 +1529,32 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.mono_rect_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = rect.wh[0].div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = rect.wh[1].div_ceil(WORKGROUP_SIZE_Y);
-        self.record("mono-rect", |encoder| {
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-mono-rect-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-mono-rect-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.mono_rect_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = rect.wh[0].div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = rect.wh[1].div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one textured rectangle. Linear UV stepping (no
@@ -1521,9 +1569,13 @@ impl Rasterizer {
         if rect.wh[0] == 0 || rect.wh[1] == 0 {
             return;
         }
-        let prim_buf = self.make_uniform("tex-rect-prim", rect);
-        let area_buf = self.make_uniform("tex-rect-area", area);
-        let tpage_buf = self.make_uniform("tex-rect-tpage", tpage);
+        self.queue
+            .write_buffer(&self.tex_rect_uniform, 0, bytemuck::bytes_of(rect));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-tex-rect-bg"),
             layout: &self.tex_tri_bg_layout,
@@ -1534,29 +1586,36 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.tex_rect_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: tpage_buf.as_entire_binding(),
+                    resource: self.tpage_uniform.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = rect.wh[0].div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = rect.wh[1].div_ceil(WORKGROUP_SIZE_Y);
-        self.record("tex-rect", |encoder| {
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-tex-rect-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-tex-rect-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.tex_rect_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = rect.wh[0].div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = rect.wh[1].div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one textured triangle into VRAM. `tpage` selects the
@@ -1577,9 +1636,14 @@ impl Rasterizer {
         if bbox_w <= 0 || bbox_h <= 0 {
             return;
         }
-        let prim_buf = self.make_uniform("tex-tri-prim", tri);
-        let area_buf = self.make_uniform("tex-tri-area", area);
-        let tpage_buf = self.make_uniform("tex-tri-tpage", tpage);
+
+        self.queue
+            .write_buffer(&self.tex_tri_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-tex-tri-bg"),
             layout: &self.tex_tri_bg_layout,
@@ -1590,46 +1654,59 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.tex_tri_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: tpage_buf.as_entire_binding(),
+                    resource: self.tpage_uniform.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
-        self.record("tex-tri", |encoder| {
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-tex-tri-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-tex-tri-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.tex_tri_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
-    /// Dispatch one monochrome triangle into VRAM. Records into the
-    /// pending batch encoder; the caller must `flush()` (or call
-    /// `ComputeBackend::download_vram` which flushes) before reading
-    /// the result.
+    /// Dispatch one monochrome triangle into VRAM. Returns immediately
+    /// after queuing the submit; callers must `download_*` from VRAM
+    /// (which inserts a wait) to read back results.
     pub fn dispatch_mono_tri(&self, vram: &VramGpu, tri: &MonoTri, area: &DrawArea) {
+        // Hardware-extent rule mirrors the CPU rasterizer.
         if tri.exceeds_hw_extent() {
             return;
         }
+        // Empty bounding box → nothing to do.
         let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
         let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
         if bbox_w <= 0 || bbox_h <= 0 {
             return;
         }
-        let prim_buf = self.make_uniform("mono-tri-prim", tri);
-        let area_buf = self.make_uniform("mono-tri-area", area);
+
+        // Update uniforms.
+        self.queue
+            .write_buffer(&self.mono_tri_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-rasterizer-mono-tri-bg"),
             layout: &self.mono_tri_bg_layout,
@@ -1640,25 +1717,33 @@ impl Rasterizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: self.mono_tri_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: area_buf.as_entire_binding(),
+                    resource: self.draw_area_uniform.as_entire_binding(),
                 },
             ],
         });
-        let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
-        let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
-        self.record("mono-tri", |encoder| {
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-mono-tri-encoder"),
+            });
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("psx-rasterizer-mono-tri-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.mono_tri_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            // One workgroup per `WG×WG` pixel tile of the bbox.
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
-        });
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 }
 
@@ -1796,7 +1881,6 @@ mod tests {
         let tri = MonoTri::opaque(v0, v1, v2, color);
         let area = DrawArea::full_vram();
         r.dispatch_mono_tri(&vg, &tri, &area);
-        r.flush();
         let gpu_vram = vg.download_full().expect("download");
 
         let diffs = diff_count(&cpu_vram, &gpu_vram);
@@ -1826,7 +1910,6 @@ mod tests {
         let tri = MonoTri::opaque(v0, v1, v2, color);
         let area = DrawArea::full_vram();
         r.dispatch_mono_tri(&vg, &tri, &area);
-        r.flush();
         let gpu_vram = vg.download_full().expect("download");
 
         let diffs = diff_count(&cpu_vram, &gpu_vram);
@@ -1857,7 +1940,6 @@ mod tests {
         let tri = MonoTri::opaque(v0, v1, v2, color);
         let area = DrawArea::full_vram();
         r.dispatch_mono_tri(&vg, &tri, &area);
-        r.flush();
         let gpu_vram = vg.download_full().expect("download");
 
         // Both should be all-zero VRAM (degenerate primitive
@@ -1887,7 +1969,6 @@ mod tests {
         let tri = MonoTri::new(v0, v1, v2, color, flags, blend_mode);
         let area = DrawArea::full_vram();
         r.dispatch_mono_tri(&vg, &tri, &area);
-        r.flush();
         vg.download_full().expect("download")
     }
 
@@ -2097,7 +2178,6 @@ mod tests {
             BlendMode::Average,
         );
         r.dispatch_mono_tri(&vg, &tri, &DrawArea::full_vram());
-        r.flush();
         let gpu = vg.download_full().unwrap();
 
         let diffs = diff_inside_bbox(&cpu, &gpu, (10, 10), (60, 60));
@@ -2181,7 +2261,6 @@ mod tests {
             bottom: 40,
         };
         r.dispatch_mono_tri(&vg, &tri, &area);
-        r.flush();
         let gpu_vram = vg.download_full().expect("download");
 
         // Strict assertions on the clip boundary. Pixels outside
@@ -2305,7 +2384,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, tpage_y, 2);
         r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         // Functional parity: the GPU samples the SAME texture cells
@@ -2415,7 +2493,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, tpage_y, 0);
         r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         // See `tex_tri_15bpp_axis_aligned_matches_cpu` for parity
@@ -2490,7 +2567,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, tpage_y, 1);
         r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (20, 20), (60, 60));
@@ -2541,7 +2617,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, 0, 2);
         r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (20, 20), (60, 60));
@@ -2626,7 +2701,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, 0, 2);
         r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         // Inside the triangle, both backends should agree on coverage
@@ -2700,7 +2774,6 @@ mod tests {
         let tp = Tpage::new(tpage_x, 0, 2);
         let dispatched = r.dispatch_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
         assert!(dispatched, "valid triangle should dispatch");
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(cpu_words, gpu_words, "tex tri scanline strict parity");
@@ -2746,7 +2819,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, 0, 2);
         r.dispatch_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(cpu_words, gpu_words, "tex tri scanline skewed strict parity");
@@ -2802,7 +2874,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, 0, 0);
         r.dispatch_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(cpu_words, gpu_words, "tex tri scanline 4bpp+CLUT strict parity");
@@ -2868,7 +2939,6 @@ mod tests {
         let tp = Tpage::new(tpage_x, 0, 2);
         let dispatched = r.dispatch_shaded_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
         assert!(dispatched);
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(
@@ -2958,7 +3028,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, tpage_y, 2);
         r.dispatch_tex_quad_bilinear(&vg, &quad, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         let mut diffs: Vec<(usize, usize, u16, u16)> = Vec::new();
@@ -2998,7 +3067,6 @@ mod tests {
         let tri = MonoTri::opaque(v0, v1, v2, color);
         let dispatched = r.dispatch_mono_tri_scanline(&vg, &tri, &DrawArea::full_vram());
         assert!(dispatched);
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "mono tri scanline skewed strict parity");
     }
@@ -3024,7 +3092,6 @@ mod tests {
         );
         let dispatched = r.dispatch_shaded_tri_scanline(&vg, &tri, &DrawArea::full_vram());
         assert!(dispatched);
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "shaded tri scanline skewed strict parity");
     }
@@ -3090,7 +3157,6 @@ mod tests {
             &MonoRect::opaque(xy, wh, color),
             &DrawArea::full_vram(),
         );
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "mono rect strict parity");
     }
@@ -3124,7 +3190,6 @@ mod tests {
                 bottom: 40,
             },
         );
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "mono rect clip strict parity");
     }
@@ -3150,7 +3215,6 @@ mod tests {
             ),
             &DrawArea::full_vram(),
         );
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "mono rect semi-trans Average parity");
     }
@@ -3176,7 +3240,6 @@ mod tests {
             ),
             &DrawArea::full_vram(),
         );
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "mono rect mask-check parity");
         // Sanity: nothing should have been written.
@@ -3194,7 +3257,6 @@ mod tests {
             &MonoRect::opaque((10, 10), (0, 5), 0x4321),
             &DrawArea::full_vram(),
         );
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert!(cpu.iter().all(|&w| w == 0), "CPU drops zero-width rect");
         assert!(gpu.iter().all(|&w| w == 0), "GPU drops zero-width rect");
@@ -3279,7 +3341,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, 0, 2);
         r.dispatch_tex_rect(&vg, &rect, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(cpu_words, gpu_words, "tex rect strict parity");
@@ -3326,7 +3387,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, 0, 2);
         r.dispatch_tex_rect(&vg, &rect, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(cpu_words, gpu_words, "tex rect X-flip strict parity");
@@ -3371,7 +3431,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, 0, 2);
         r.dispatch_tex_rect(&vg, &rect, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(cpu_words, gpu_words, "tex rect modulated strict parity");
@@ -3432,7 +3491,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, 0, 0);
         r.dispatch_tex_rect(&vg, &rect, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(cpu_words, gpu_words, "tex rect 4bpp+CLUT strict parity");
@@ -3484,7 +3542,6 @@ mod tests {
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
         r.dispatch_fill(&vg, &Fill::new(xy, wh, color));
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "fill basic parity");
     }
@@ -3509,7 +3566,6 @@ mod tests {
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
         r.dispatch_fill(&vg, &Fill::new(xy, wh, color));
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "fill ignores draw area");
         // Sanity: a pixel OUTSIDE the draw area but INSIDE the fill
@@ -3548,7 +3604,6 @@ mod tests {
         gpu_prefill_full(&vg, prefill);
         let r = Rasterizer::new(&vg);
         r.dispatch_fill(&vg, &Fill::new(xy, wh, color));
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "fill bypasses mask-check");
         // Sanity: pixel inside fill rect must NOT be the prefill.
@@ -3562,7 +3617,6 @@ mod tests {
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
         r.dispatch_fill(&vg, &Fill::new((32, 32), (0, 32), 0xCAFE));
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert!(cpu.iter().all(|&w| w == 0));
         assert!(gpu.iter().all(|&w| w == 0));
@@ -3602,7 +3656,6 @@ mod tests {
         vg.upload_full(&seed).unwrap();
         let r = Rasterizer::new(&vg);
         r.dispatch_vram_copy(&vg, (200, 0), (400, 100), (32, 32));
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu, "vram copy non-overlapping strict parity");
     }
@@ -3627,7 +3680,6 @@ mod tests {
         vg.upload_full(&seed).unwrap();
         let r = Rasterizer::new(&vg);
         r.dispatch_vram_copy(&vg, (50, 50), (54, 54), (16, 16));
-        r.flush();
         let gpu = vg.download_full().unwrap();
         // Strict parity: our host-bounce reads the entire src rect
         // before any writes — equivalent to the CPU's row-buffer
@@ -3695,7 +3747,6 @@ mod tests {
             BlendMode::Average,
         );
         r.dispatch_shaded_tri(&vg, &tri, &DrawArea::full_vram());
-        r.flush();
         let gpu = vg.download_full().unwrap();
 
         let diffs = diff_inside_bbox(&cpu, &gpu, (20, 20), (60, 60));
@@ -3819,7 +3870,6 @@ mod tests {
         );
         let tp = Tpage::new(tpage_x, 0, 2);
         r.dispatch_shaded_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
-        r.flush();
         let gpu_words = vg.download_full().unwrap();
 
         let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (20, 20), (60, 60));
@@ -3863,7 +3913,6 @@ mod tests {
             BlendMode::Average,
         );
         r.dispatch_shaded_tri(&vg, &tri, &DrawArea::full_vram());
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert!(cpu.iter().all(|&w| w == 0));
         assert!(gpu.iter().all(|&w| w == 0));
@@ -3876,7 +3925,6 @@ mod tests {
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
         r.dispatch_vram_copy(&vg, (0, 0), (100, 100), (0, 32));
-        r.flush();
         let gpu = vg.download_full().unwrap();
         assert_eq!(cpu, gpu);
     }
