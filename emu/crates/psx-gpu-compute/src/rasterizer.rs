@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::primitive::{DrawArea, MonoTri};
+use crate::primitive::{BlendMode, DrawArea, MonoTri, PrimFlags};
 use crate::vram::VramGpu;
 
 const WORKGROUP_SIZE_X: u32 = 8;
@@ -217,30 +217,74 @@ mod tests {
     use super::*;
     use emulator_core::Gpu;
 
+    /// Run the CPU rasterizer for a monochrome triangle, optionally
+    /// with semi-trans / mask flags pre-configured. Returns the full
+    /// row-major VRAM snapshot for byte-by-byte comparison.
+    ///
+    /// Configuration knobs:
+    ///   - `cmd_byte` 0x20 = opaque, 0x22 = semi-trans (cmd-bit-1 = 1).
+    ///   - `tpage_blend_bits` (0..3) → bits 5-6 of GP0 0xE1 → tpage
+    ///     blend mode (Average / Add / Sub / AddQuarter).
+    ///   - `mask_e6` writes GP0 0xE6 with the given low-2-bit value
+    ///     (bit 0 = mask_set_on_draw, bit 1 = mask_check_before_draw).
+    ///   - `prefill` paints the entire VRAM with one color before
+    ///     submitting the primitive — needed for semi-trans tests
+    ///     where the back buffer must not be zero, and for mask-check
+    ///     tests where the existing pixel needs bit 15 set.
+    fn cpu_rasterize_mono_tri_full(
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        color: u16,
+        cmd_byte: u8,
+        tpage_blend_bits: u8,
+        mask_e6: u8,
+        prefill: u16,
+    ) -> Vec<u16> {
+        let mut gpu = Gpu::new();
+        // Pre-fill VRAM by writing every word directly. Cheaper than
+        // streaming a 1 MiB block through GP0.
+        if prefill != 0 {
+            for y in 0..512u16 {
+                for x in 0..1024u16 {
+                    gpu.vram.set_pixel(x, y, prefill);
+                }
+            }
+        }
+        gpu.gp0_push(0xE3000000); // E3 — top-left at (0, 0)
+        gpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        // Tpage: only bits 5-6 (semi-trans mode) matter for mono prims.
+        let e1 = 0xE100_0000_u32 | ((tpage_blend_bits as u32) & 0x3) << 5;
+        gpu.gp0_push(e1);
+        // Mask config (E6).
+        gpu.gp0_push(0xE600_0000_u32 | (mask_e6 as u32) & 0x3);
+        // Triangle command word.
+        let cmd = ((cmd_byte as u32) << 24) | bgr15_to_rgb24(color);
+        gpu.gp0_push(cmd);
+        gpu.gp0_push(pack_xy(v0));
+        gpu.gp0_push(pack_xy(v1));
+        gpu.gp0_push(pack_xy(v2));
+        gpu.vram.words().to_vec()
+    }
+
     fn cpu_rasterize_mono_tri(
         v0: (i32, i32),
         v1: (i32, i32),
         v2: (i32, i32),
         color: u16,
     ) -> Vec<u16> {
-        // The CPU rasterizer doesn't expose `rasterize_triangle`
-        // directly. Drive it through the GP0 packet API: GP0 0x20
-        // is "monochrome flat triangle", 4-word packet.
-        let mut gpu = Gpu::new();
-        // Set draw area to full VRAM so nothing gets clipped.
-        gpu.gp0_push(0xE3000000); // E3 — top-left at (0, 0)
-        // E4 — bottom-right at (1023, 511): X bits 9:0, Y bits 18:10.
-        gpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
-        // Pack RGB into the cmd word: cmd byte 0x20 in bits 24..31,
-        // R/G/B in 0..23.
-        let cmd = 0x20000000_u32 | bgr15_to_rgb24(color);
-        gpu.gp0_push(cmd);
-        gpu.gp0_push(pack_xy(v0));
-        gpu.gp0_push(pack_xy(v1));
-        gpu.gp0_push(pack_xy(v2));
-        // Read VRAM back as a row-major u16 vec.
-        let vram = gpu.vram.words().to_vec();
-        vram
+        cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x20, 0, 0, 0)
+    }
+
+    /// Pre-fill GPU VRAM with a single 16-bit value via the GPU-side
+    /// upload path. Mirrors what `prefill` does on the CPU side so
+    /// both backends start from byte-identical state.
+    fn gpu_prefill(vg: &VramGpu, value: u16) {
+        if value == 0 {
+            return;
+        }
+        let buf = vec![value; (super::super::VRAM_WIDTH * super::super::VRAM_HEIGHT) as usize];
+        vg.upload_full(&buf).expect("upload prefill");
     }
 
     fn pack_xy(p: (i32, i32)) -> u32 {
@@ -278,7 +322,7 @@ mod tests {
 
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
-        let tri = MonoTri::new(v0, v1, v2, color);
+        let tri = MonoTri::opaque(v0, v1, v2, color);
         let area = DrawArea::full_vram();
         r.dispatch_mono_tri(&vg, &tri, &area);
         let gpu_vram = vg.download_full().expect("download");
@@ -307,7 +351,7 @@ mod tests {
 
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
-        let tri = MonoTri::new(v0, v1, v2, color);
+        let tri = MonoTri::opaque(v0, v1, v2, color);
         let area = DrawArea::full_vram();
         r.dispatch_mono_tri(&vg, &tri, &area);
         let gpu_vram = vg.download_full().expect("download");
@@ -337,7 +381,7 @@ mod tests {
 
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
-        let tri = MonoTri::new(v0, v1, v2, color);
+        let tri = MonoTri::opaque(v0, v1, v2, color);
         let area = DrawArea::full_vram();
         r.dispatch_mono_tri(&vg, &tri, &area);
         let gpu_vram = vg.download_full().expect("download");
@@ -346,6 +390,287 @@ mod tests {
         // dropped before any plotting).
         assert!(cpu_vram.iter().all(|&w| w == 0), "CPU should drop");
         assert!(gpu_vram.iter().all(|&w| w == 0), "GPU should drop");
+    }
+
+    // -------------------------------------------------------
+    //  Phase B.4 — semi-trans + mask-bit parity vs CPU
+    // -------------------------------------------------------
+
+    /// Run the GPU rasterizer for one mono-tri with the given flags
+    /// onto a pre-filled VRAM, return the post-dispatch full VRAM.
+    fn gpu_rasterize_mono_tri_full(
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        color: u16,
+        flags: PrimFlags,
+        blend_mode: BlendMode,
+        prefill: u16,
+    ) -> Vec<u16> {
+        let vg = VramGpu::new_headless();
+        gpu_prefill(&vg, prefill);
+        let r = Rasterizer::new(&vg);
+        let tri = MonoTri::new(v0, v1, v2, color, flags, blend_mode);
+        let area = DrawArea::full_vram();
+        r.dispatch_mono_tri(&vg, &tri, &area);
+        vg.download_full().expect("download")
+    }
+
+    /// Run a strict bbox-only diff: count mismatches inside the
+    /// triangle's bbox and a 2-pixel halo. Skewed triangles will
+    /// always disagree on a few edge pixels (different fill rule);
+    /// allowing a small tolerance lets us pin the inside-of-triangle
+    /// blend math precisely.
+    fn diff_inside_bbox(
+        a: &[u16],
+        b: &[u16],
+        bbox_min: (i32, i32),
+        bbox_max: (i32, i32),
+    ) -> usize {
+        let mut diffs = 0;
+        let x0 = (bbox_min.0 - 2).max(0) as usize;
+        let y0 = (bbox_min.1 - 2).max(0) as usize;
+        let x1 = ((bbox_max.0 + 2).min(1023)) as usize;
+        let y1 = ((bbox_max.1 + 2).min(511)) as usize;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let i = y * 1024 + x;
+                if a[i] != b[i] {
+                    diffs += 1;
+                }
+            }
+        }
+        diffs
+    }
+
+    #[test]
+    fn semi_trans_average_matches_cpu_byte_for_byte() {
+        // The trickiest blend mode — Redux's `(b>>1) + (f>>1)` quirk
+        // produces different LSBs from the naive `(b+f)/2`. If the
+        // shader gets this wrong, every output pixel of an axis-
+        // aligned triangle (no edge-rule diffs) will be off-by-one
+        // on at least one channel. Strict parity expected.
+        let v0 = (10, 10);
+        let v1 = (50, 10);
+        let v2 = (10, 50);
+        let color = 0x1234; // arbitrary BGR15 (low and high LSBs set so the quirk shows)
+        let prefill = 0x5678;
+        let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 0, 0, prefill);
+        let gpu = gpu_rasterize_mono_tri_full(
+            v0, v1, v2, color,
+            PrimFlags::SEMI_TRANS,
+            BlendMode::Average,
+            prefill,
+        );
+        let diffs = diff_inside_bbox(&cpu, &gpu, (10, 10), (50, 50));
+        // Axis-aligned right-triangle → no edge-rule disagreement.
+        // Inside pixels must blend identically.
+        assert!(diffs == 0, "Average blend mismatch: {diffs} pixels differ");
+    }
+
+    #[test]
+    fn semi_trans_add_matches_cpu_byte_for_byte() {
+        let v0 = (5, 5);
+        let v1 = (45, 5);
+        let v2 = (5, 45);
+        // Pick a color whose channels saturate against the prefill.
+        let color = 0x4210;        // (r=0x10, g=0x10, b=0x10)
+        let prefill = 0x4210;       // same — sum must clamp to 31 per channel
+        let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 1, 0, prefill);
+        let gpu = gpu_rasterize_mono_tri_full(
+            v0, v1, v2, color,
+            PrimFlags::SEMI_TRANS,
+            BlendMode::Add,
+            prefill,
+        );
+        let diffs = diff_inside_bbox(&cpu, &gpu, (5, 5), (45, 45));
+        assert!(diffs == 0, "Add blend mismatch: {diffs} pixels differ");
+    }
+
+    #[test]
+    fn semi_trans_sub_matches_cpu_byte_for_byte() {
+        let v0 = (5, 5);
+        let v1 = (45, 5);
+        let v2 = (5, 45);
+        let color = 0x2108;         // (r=8, g=8, b=8)
+        let prefill = 0x4210;       // (r=16, g=16, b=16) → result (r=8,g=8,b=8)
+        let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 2, 0, prefill);
+        let gpu = gpu_rasterize_mono_tri_full(
+            v0, v1, v2, color,
+            PrimFlags::SEMI_TRANS,
+            BlendMode::Sub,
+            prefill,
+        );
+        let diffs = diff_inside_bbox(&cpu, &gpu, (5, 5), (45, 45));
+        assert!(diffs == 0, "Sub blend mismatch: {diffs} pixels differ");
+    }
+
+    #[test]
+    fn semi_trans_addquarter_matches_cpu_byte_for_byte() {
+        let v0 = (5, 5);
+        let v1 = (45, 5);
+        let v2 = (5, 45);
+        let color = 0x4210;
+        let prefill = 0x2108;
+        let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 3, 0, prefill);
+        let gpu = gpu_rasterize_mono_tri_full(
+            v0, v1, v2, color,
+            PrimFlags::SEMI_TRANS,
+            BlendMode::AddQuarter,
+            prefill,
+        );
+        let diffs = diff_inside_bbox(&cpu, &gpu, (5, 5), (45, 45));
+        assert!(
+            diffs == 0,
+            "AddQuarter blend mismatch: {diffs} pixels differ"
+        );
+    }
+
+    #[test]
+    fn mask_set_writes_bit_15_in_every_plotted_pixel() {
+        // Opaque triangle with mask_set_on_draw → every plotted
+        // pixel should have bit 15 = 1, others left as prefill.
+        let v0 = (10, 10);
+        let v1 = (50, 10);
+        let v2 = (10, 50);
+        let color = 0x0123; // bit 15 clear in source color
+        let prefill = 0x4567;
+        // CPU path: cmd 0x20 (opaque), tpage doesn't matter for
+        // opaque mono, mask_e6 = 0b01 = mask_set_on_draw.
+        let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x20, 0, 0b01, prefill);
+        let gpu = gpu_rasterize_mono_tri_full(
+            v0, v1, v2, color,
+            PrimFlags::MASK_SET,
+            BlendMode::Average,
+            prefill,
+        );
+        let diffs = diff_inside_bbox(&cpu, &gpu, (10, 10), (50, 50));
+        assert!(diffs == 0, "MASK_SET parity: {diffs} differ");
+        // Sanity: spot-check a point firmly inside the triangle has
+        // bit 15 set on both backends.
+        let inside_idx = 20 * 1024 + 20;
+        assert!(cpu[inside_idx] & 0x8000 != 0, "CPU inside pixel: bit 15 set");
+        assert!(gpu[inside_idx] & 0x8000 != 0, "GPU inside pixel: bit 15 set");
+    }
+
+    #[test]
+    fn mask_check_skips_when_back_buffer_has_bit_15() {
+        // Pre-fill with bit-15-set pixels; opaque triangle with
+        // mask_check should leave them all alone.
+        let v0 = (10, 10);
+        let v1 = (50, 10);
+        let v2 = (10, 50);
+        let color = 0x0123;
+        let prefill = 0x8888; // bit 15 set
+        let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x20, 0, 0b10, prefill);
+        let gpu = gpu_rasterize_mono_tri_full(
+            v0, v1, v2, color,
+            PrimFlags::MASK_CHECK,
+            BlendMode::Average,
+            prefill,
+        );
+        // Strict equality on every pixel — nothing should have changed.
+        let diffs = diff_inside_bbox(&cpu, &gpu, (10, 10), (50, 50));
+        assert!(diffs == 0, "MASK_CHECK parity: {diffs} differ");
+        let inside_idx = 20 * 1024 + 20;
+        assert_eq!(cpu[inside_idx], prefill, "CPU inside untouched");
+        assert_eq!(gpu[inside_idx], prefill, "GPU inside untouched");
+    }
+
+    #[test]
+    fn mask_check_only_skips_protected_pixels_not_others() {
+        // Half the back buffer has bit 15, half doesn't. The triangle
+        // should write only to the unprotected half.
+        let v0 = (10, 10);
+        let v1 = (60, 10);
+        let v2 = (10, 60);
+        let color = 0x0123;
+        // CPU prefill: alternate rows have bit 15 set.
+        let mut gpu_buffer =
+            vec![0u16; (super::super::VRAM_WIDTH * super::super::VRAM_HEIGHT) as usize];
+        for y in 0..512u16 {
+            let v = if y & 1 == 0 { 0x4567 } else { 0xC567 };
+            for x in 0..1024u16 {
+                gpu_buffer[y as usize * 1024 + x as usize] = v;
+            }
+        }
+        // Build an identical CPU state.
+        let mut cpu_gpu = Gpu::new();
+        for (i, &w) in gpu_buffer.iter().enumerate() {
+            let x = (i % 1024) as u16;
+            let y = (i / 1024) as u16;
+            cpu_gpu.vram.set_pixel(x, y, w);
+        }
+        cpu_gpu.gp0_push(0xE3000000);
+        cpu_gpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu_gpu.gp0_push(0xE100_0000); // tpage
+        cpu_gpu.gp0_push(0xE600_0002); // E6 — mask_check_before_draw
+        let cmd = 0x20_000000_u32 | bgr15_to_rgb24(color);
+        cpu_gpu.gp0_push(cmd);
+        cpu_gpu.gp0_push(pack_xy(v0));
+        cpu_gpu.gp0_push(pack_xy(v1));
+        cpu_gpu.gp0_push(pack_xy(v2));
+        let cpu = cpu_gpu.vram.words().to_vec();
+
+        // Identical GPU state.
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&gpu_buffer).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = MonoTri::new(
+            v0, v1, v2, color,
+            PrimFlags::MASK_CHECK,
+            BlendMode::Average,
+        );
+        r.dispatch_mono_tri(&vg, &tri, &DrawArea::full_vram());
+        let gpu = vg.download_full().unwrap();
+
+        let diffs = diff_inside_bbox(&cpu, &gpu, (10, 10), (60, 60));
+        assert!(diffs == 0, "selective mask-check parity: {diffs} differ");
+        // Sanity check: ODD rows (prefill 0xC567, bit-15 set) must be
+        // unchanged; EVEN rows (prefill 0x4567, bit-15 clear) must
+        // have been overwritten with the new color.
+        for y in [11u16, 13, 15] {
+            let i = y as usize * 1024 + 20;
+            assert_eq!(cpu[i], 0xC567, "CPU row {y} (protected) unchanged");
+            assert_eq!(gpu[i], 0xC567, "GPU row {y} (protected) unchanged");
+        }
+        for y in [12u16, 14, 16] {
+            let i = y as usize * 1024 + 20;
+            // The new pixel may have bit 15 set/cleared depending on
+            // mask-set; it shouldn't have it here. The colour part
+            // must be `color`.
+            assert_eq!(cpu[i] & 0x7FFF, color & 0x7FFF, "CPU row {y} (open) overwritten");
+            assert_eq!(gpu[i] & 0x7FFF, color & 0x7FFF, "GPU row {y} (open) overwritten");
+        }
+    }
+
+    #[test]
+    fn semi_trans_plus_mask_set_combine_correctly() {
+        // The full RMW chain: blend with back buffer THEN OR bit 15.
+        // If the shader gets ordering wrong (e.g. OR-then-blend), the
+        // blended result will have bit 15 propagating into the colour
+        // math.
+        let v0 = (10, 10);
+        let v1 = (50, 10);
+        let v2 = (10, 50);
+        let color = 0x1234;
+        let prefill = 0x5678;
+        let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 0, 0b01, prefill);
+        let gpu = gpu_rasterize_mono_tri_full(
+            v0, v1, v2, color,
+            PrimFlags::SEMI_TRANS | PrimFlags::MASK_SET,
+            BlendMode::Average,
+            prefill,
+        );
+        let diffs = diff_inside_bbox(&cpu, &gpu, (10, 10), (50, 50));
+        assert!(
+            diffs == 0,
+            "semi-trans + mask-set parity: {diffs} differ"
+        );
+        let inside_idx = 20 * 1024 + 20;
+        // Both must have bit 15 set after MASK_SET.
+        assert!(cpu[inside_idx] & 0x8000 != 0);
+        assert!(gpu[inside_idx] & 0x8000 != 0);
     }
 
     #[test]
@@ -372,7 +697,7 @@ mod tests {
         // GPU path with matching draw area.
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
-        let tri = MonoTri::new(v0, v1, v2, color);
+        let tri = MonoTri::opaque(v0, v1, v2, color);
         let area = DrawArea {
             left: 20,
             top: 20,

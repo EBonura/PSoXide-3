@@ -12,6 +12,7 @@ path = "src/lib.rs"
 wgpu      = { workspace = true }
 pollster  = { workspace = true }
 bytemuck  = { version = "1.16", features = ["derive"] }
+bitflags  = "2.6"
 thiserror = { workspace = true }
 
 [dev-dependencies]
