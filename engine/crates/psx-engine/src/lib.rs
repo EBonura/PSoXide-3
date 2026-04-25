@@ -51,6 +51,7 @@ pub mod angle;
 pub mod app;
 pub mod frames;
 pub mod render;
+pub mod render3d;
 pub mod scene;
 pub mod sfx;
 pub mod transform;
@@ -59,6 +60,9 @@ pub use angle::Angle;
 pub use app::{App, Config};
 pub use frames::{Frames, Ticks};
 pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
+pub use render3d::{
+    DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand, MeshRenderStats,
+};
 pub use scene::{Ctx, Scene};
 pub use transform::{ActorTransform, Vec3World};
 

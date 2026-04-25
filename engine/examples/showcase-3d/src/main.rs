@@ -33,14 +33,14 @@ extern crate psx_rt;
 
 use psx_asset::Mesh;
 use psx_engine::{
-    ActorTransform, App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena, Scene,
-    Vec3World,
+    ActorTransform, App, Config, Ctx, DepthBand, DepthPolicy, DepthRange, GouraudMeshOptions,
+    GouraudRenderPass, GouraudTriCommand, OtFrame, PrimitiveArena, Scene, Vec3World,
 };
 use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_fx::{LcgRng, ParticlePool, ShakeState};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat, TriGouraud};
-use psx_gte::lighting::{Light, LightRig};
+use psx_gte::lighting::{Light, LightRig, ProjectedLit};
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene;
 use psx_vram::{Clut, TexDepth, Tpage};
@@ -57,7 +57,7 @@ static TEAPOT_BLOB: &[u8] = include_bytes!("../assets/teapot.psxm");
 
 const SCREEN_W: i16 = 320;
 const SCREEN_H: i16 = 240;
-const OT_DEPTH: usize = 16;
+const OT_DEPTH: usize = 128;
 const BG_SLOT: usize = OT_DEPTH - 1;
 const STAR_SLOT: usize = OT_DEPTH - 2;
 const WORLD_BAND: DepthBand = DepthBand::new(3, OT_DEPTH - 3);
@@ -188,6 +188,7 @@ static mut GOURAUD_TRIS: [TriGouraud; 320] = [const {
 
 /// Rects for stars + sparks.
 static mut SCENE_RECTS: [RectFlat; 128] = [const { RectFlat::new(0, 0, 0, 0, 0, 0, 0) }; 128];
+static mut GOURAUD_COMMANDS: [GouraudTriCommand; 320] = [GouraudTriCommand::EMPTY; 320];
 
 static mut BG_QUAD: QuadGouraud = QuadGouraud {
     tag: 0,
@@ -205,15 +206,21 @@ static mut BG_QUAD: QuadGouraud = QuadGouraud {
 /// Topology shares verts 4-6× per face, so doing the GTE work
 /// once per vertex rather than per triangle face is a big win.
 ///
-/// Tuple layout: (sx, sy, sz, r, g, b). The three colour channels
+/// Projected screen-space + lit vertices. The three colour channels
 /// are the GTE's NCCS output for this vertex + the current
 /// object-local light rig — they drive the Gouraud interpolator
 /// on each triangle.
-type VertProj = (i16, i16, u16, u8, u8, u8);
-const EMPTY_VERT: VertProj = (0, 0, 0, 0, 0, 0);
+const EMPTY_VERT: ProjectedLit = ProjectedLit {
+    sx: 0,
+    sy: 0,
+    sz: 0,
+    r: 0,
+    g: 0,
+    b: 0,
+};
 
-static mut SUZANNE_PROJ: [VertProj; 128] = [EMPTY_VERT; 128];
-static mut TEAPOT_PROJ: [VertProj; 128] = [EMPTY_VERT; 128];
+static mut SUZANNE_PROJ: [ProjectedLit; 128] = [EMPTY_VERT; 128];
+static mut TEAPOT_PROJ: [ProjectedLit; 128] = [EMPTY_VERT; 128];
 
 // ----------------------------------------------------------------------
 // Scene impl
@@ -374,8 +381,13 @@ impl Showcase3D {
             Mat3I16::rotate_y((frame.wrapping_mul(LIGHT_ORBIT_PER_FRAME as u32) & 0xFFFF) as u16);
         let scene_lights = BASE_LIGHTS.rotated(&light_orbit);
         let view = camera_view(frame);
+        let mesh_options = GouraudMeshOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE)
+            .with_depth_policy(DepthPolicy::Average)
+            .with_screen_offset((shake_dx, shake_dy));
+        let mut world_pass =
+            unsafe { GouraudRenderPass::new(&mut ot, &mut gouraud, &mut GOURAUD_COMMANDS) };
 
-        // --- SUZANNE (slot 5) — two-axis tumble, lit by scene rig ---
+        // --- SUZANNE — two-axis tumble, lit by scene rig ---
         let suz_rot = Mat3I16::rotate_y((frame.wrapping_mul(3) & 0xFFFF) as u16)
             .mul(&Mat3I16::rotate_x((frame.wrapping_mul(2) & 0xFFFF) as u16));
         let suz_view_rot = view.mul(&suz_rot);
@@ -389,41 +401,13 @@ impl Showcase3D {
             .load_gte();
         // Rotate camera-space lights into Suzanne's local frame + upload.
         scene_lights.for_object(&suz_view_rot).load();
-        let suz_proj = unsafe { &mut SUZANNE_PROJ };
-        for i in 0..suzanne.vert_count() {
-            let v = suzanne.vertex(i as u8);
-            let n = suzanne.vertex_normal(i as u8).unwrap_or(Vec3I16::ZERO);
-            // Per-face palette still lives in the blob; we use it as
-            // the material RGBC so the lit output carries the face's
-            // tint. We average this per-vertex: assign vert colour
-            // from the first face that references it (good enough —
-            // the gouraud interpolator blurs any mismatch anyway).
-            let material = vertex_material(&suzanne, i as u8);
-            let p = psx_gte::lighting::project_lit(v, n, material);
-            suz_proj[i as usize] = (p.sx + shake_dx, p.sy + shake_dy, p.sz, p.r, p.g, p.b);
-        }
-        for face_idx in 0..suzanne.face_count() {
-            let (ia, ib, ic) = suzanne.face(face_idx);
-            let (v0, v1, v2) = (
-                suz_proj[ia as usize],
-                suz_proj[ib as usize],
-                suz_proj[ic as usize],
-            );
-            if back_facing(v0, v1, v2) {
-                continue;
-            }
-            let Some(tri) = gouraud.push(TriGouraud::new(
-                [(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)],
-                [(v0.3, v0.4, v0.5), (v1.3, v1.4, v1.5), (v2.3, v2.4, v2.5)],
-            )) else {
-                break;
-            };
-            let slot = WORLD_BAND.slot::<OT_DEPTH>(WORLD_DEPTH_RANGE, face_depth(v0, v1, v2));
-            ot.add_packet_slot(slot, tri);
-            self.tri_count += 1;
-        }
+        let suz_stats =
+            world_pass.submit_lit_mesh(&suzanne, unsafe { &mut SUZANNE_PROJ }, mesh_options);
+        self.tri_count = self
+            .tri_count
+            .saturating_add(suz_stats.submitted_triangles);
 
-        // --- TEAPOT (slot 4) — opposite tumble, lit by same rig ---
+        // --- TEAPOT — opposite tumble, lit by same rig ---
         let tea_rot = Mat3I16::rotate_y((frame.wrapping_mul(4) & 0xFFFF).wrapping_neg() as u16)
             .mul(&Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16));
         let tea_view_rot = view.mul(&tea_rot);
@@ -432,34 +416,13 @@ impl Showcase3D {
             .with_rotation(tea_view_rot)
             .load_gte();
         scene_lights.for_object(&tea_view_rot).load();
-        let tea_proj = unsafe { &mut TEAPOT_PROJ };
-        for i in 0..teapot.vert_count() {
-            let v = teapot.vertex(i as u8);
-            let n = teapot.vertex_normal(i as u8).unwrap_or(Vec3I16::ZERO);
-            let material = vertex_material(&teapot, i as u8);
-            let p = psx_gte::lighting::project_lit(v, n, material);
-            tea_proj[i as usize] = (p.sx + shake_dx, p.sy + shake_dy, p.sz, p.r, p.g, p.b);
-        }
-        for face_idx in 0..teapot.face_count() {
-            let (ia, ib, ic) = teapot.face(face_idx);
-            let (v0, v1, v2) = (
-                tea_proj[ia as usize],
-                tea_proj[ib as usize],
-                tea_proj[ic as usize],
-            );
-            if back_facing(v0, v1, v2) {
-                continue;
-            }
-            let Some(tri) = gouraud.push(TriGouraud::new(
-                [(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)],
-                [(v0.3, v0.4, v0.5), (v1.3, v1.4, v1.5), (v2.3, v2.4, v2.5)],
-            )) else {
-                break;
-            };
-            let slot = WORLD_BAND.slot::<OT_DEPTH>(WORLD_DEPTH_RANGE, face_depth(v0, v1, v2));
-            ot.add_packet_slot(slot, tri);
-            self.tri_count += 1;
-        }
+        let tea_stats =
+            world_pass.submit_lit_mesh(&teapot, unsafe { &mut TEAPOT_PROJ }, mesh_options);
+        self.tri_count = self
+            .tri_count
+            .saturating_add(tea_stats.submitted_triangles);
+
+        world_pass.flush();
 
         // Foreground effects — sparks in front of the meshes.
         let _ = render_particles(
@@ -551,24 +514,9 @@ fn camera_space_position(view: &Mat3I16, offset: Vec3World) -> Vec3World {
 
 fn transform_axis(m: &Mat3I16, row: usize, v: Vec3World) -> i32 {
     let row = m.row(row);
-    let sum = (row[0] as i64) * (v.x as i64)
-        + (row[1] as i64) * (v.y as i64)
-        + (row[2] as i64) * (v.z as i64);
+    let sum =
+        (row[0] as i32) * v.x + (row[1] as i32) * v.y + (row[2] as i32) * v.z;
     (sum >> 12) as i32
-}
-
-/// 2D cross-product test — triangles wound clockwise on screen
-/// are back-facing and get culled.
-fn back_facing(v0: VertProj, v1: VertProj, v2: VertProj) -> bool {
-    let ax = (v1.0 as i32) - (v0.0 as i32);
-    let ay = (v1.1 as i32) - (v0.1 as i32);
-    let bx = (v2.0 as i32) - (v0.0 as i32);
-    let by = (v2.1 as i32) - (v0.1 as i32);
-    (ax * by - ay * bx) <= 0
-}
-
-fn face_depth(v0: VertProj, v1: VertProj, v2: VertProj) -> i32 {
-    ((v0.2 as i32) + (v1.2 as i32) + (v2.2 as i32)) / 3
 }
 
 fn render_particles<const N: usize, const OT_N: usize>(
@@ -605,29 +553,6 @@ fn render_particles<const N: usize, const OT_N: usize>(
         written += 1;
     }
     written
-}
-
-/// Sample a per-vertex material colour for a lit-mesh vertex.
-///
-/// The cooked mesh stores per-*face* colours, not per-vertex.
-/// For a Gouraud-lit render we need a per-vertex material — we
-/// walk the triangle list and take the colour from the first
-/// face that references this vertex. Vertices shared between
-/// differently-coloured faces get the first-seen face's tint;
-/// the gouraud interpolator then blurs the result so it reads
-/// as a smooth palette.
-///
-/// Shared between Suzanne and the teapot — the pre-engine
-/// version was called `suzanne_vertex_material` but did the same
-/// thing for both meshes; renamed here to the role-based name.
-fn vertex_material(mesh: &Mesh, vert: u8) -> (u8, u8, u8) {
-    for f in 0..mesh.face_count() {
-        let (a, b, c) = mesh.face(f);
-        if a == vert || b == vert || c == vert {
-            return mesh.face_color(f).unwrap_or((128, 128, 128));
-        }
-    }
-    (128, 128, 128)
 }
 
 // ----------------------------------------------------------------------

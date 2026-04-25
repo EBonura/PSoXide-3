@@ -404,7 +404,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_0ae0,
+            final_pc: 0x8001_0acc,
             redux_display_hash: None,
         }),
         "showcase-textured-sprite" => Some(SdkGolden {
@@ -571,14 +571,15 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-lights" => Some(SdkGolden {
             example: "showcase-lights",
             vblanks: 60,
-            vram_hash: 0xe8e0_4b58_fa66_d538,
-            display_hash: 0x4fb6_ca27_0f7f_b8c0,
+            vram_hash: 0x393c_1b7b_a3ff_b8bd,
+            display_hash: 0xcbb2_2705_0c4f_7575,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            // Engine OT pass now uses `PrimitiveArena` and a shared
-            // depth band for per-face cube sorting.
-            final_pc: 0x8001_186c,
+            // Engine `GouraudRenderPass` now owns culling, depth
+            // policy, command sorting, and OT insertion for the
+            // CPU-lit cube layer.
+            final_pc: 0x8001_147c,
             redux_display_hash: None,
         }),
 
@@ -592,14 +593,19 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-3d" => Some(SdkGolden {
             example: "showcase-3d",
             vblanks: 60,
-            vram_hash: 0x0d33_3808_2273_ef32,
-            display_hash: 0xc9eb_398e_44ff_274a,
+            vram_hash: 0xbf7e_537c_28b4_ca87,
+            display_hash: 0x9eb4_a149_9747_33f9,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
             // Suzanne and teapot now share an engine depth band using
             // per-face projected SZ instead of fixed object slots.
-            final_pc: 0x8001_50b8,
+            // The engine `GouraudRenderPass` sorts all opaque mesh
+            // triangles before OT insertion, so same-slot order is
+            // deterministic across both meshes instead of source-order.
+            // The showcase uses 128 OT slots to make depth-bucket
+            // artifacts easier to inspect under real GTE load.
+            final_pc: 0x8001_3b7c,
             redux_display_hash: None,
         }),
         // PS1-commercial textured-Gouraud pipeline: per-vertex RTPS
@@ -624,7 +630,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             spu_samples: 44100,
             // Pixels unchanged; render loop now uses `OtFrame`,
             // `PrimitiveArena`, and `DepthBand` for the GTE OTZ map.
-            final_pc: 0x8001_1780,
+            final_pc: 0x8001_130c,
             redux_display_hash: None,
         }),
         "showcase-particles" => Some(SdkGolden {

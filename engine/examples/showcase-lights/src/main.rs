@@ -41,12 +41,13 @@ extern crate psx_rt;
 
 use psx_asset::Mesh;
 use psx_engine::{
-    ActorTransform, App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena, Scene,
-    Vec3World,
+    ActorTransform, App, Config, Ctx, DepthBand, DepthRange, GouraudMeshOptions, GouraudRenderPass,
+    GouraudTriCommand, OtFrame, PrimitiveArena, Scene, Vec3World,
 };
 use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat, TriGouraud};
+use psx_gte::lighting::ProjectedLit;
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene;
 use psx_math::sincos;
@@ -95,7 +96,9 @@ const LIGHT_RADIUS_SQ: i32 = 0x1800_0000;
 /// "reference distance" the dot product divides by to turn its
 /// N · D magnitude (which carries distance) into a rough
 /// direction-only scalar.
-const RADIUS_LINEAR: i64 = 0x4E00;
+const RADIUS_LINEAR: i32 = 0x4E00;
+const LIGHT_ATT_DENOM_Q12: i32 = LIGHT_RADIUS_SQ >> 12;
+const LIGHT_DELTA_LIMIT: i32 = 0x4F00;
 
 /// Per-channel ambient term, added before clamping. Dim blueish
 /// so shadowed faces read as "in the dark room" rather than
@@ -194,7 +197,7 @@ struct Lighting {
 
 static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
 
-/// Gouraud cube tris: 6 cubes × 12 tris = 72. 96 slots leaves
+/// Gouraud cube tris: 4 cubes × 12 tris = 48. 96 slots leaves
 /// headroom for a denser layout later.
 static mut GOURAUD_TRIS: [TriGouraud; 96] = [const {
     TriGouraud {
@@ -212,6 +215,7 @@ static mut GOURAUD_TRIS: [TriGouraud; 96] = [const {
 /// square at each light's projected screen pos so the viewer can
 /// see where the lights are).
 static mut LIGHT_MARKERS: [RectFlat; 16] = [const { RectFlat::new(0, 0, 0, 0, 0, 0, 0) }; 16];
+static mut GOURAUD_COMMANDS: [GouraudTriCommand; 96] = [GouraudTriCommand::EMPTY; 96];
 
 static mut BG_QUAD: QuadGouraud = QuadGouraud {
     tag: 0,
@@ -225,10 +229,16 @@ static mut BG_QUAD: QuadGouraud = QuadGouraud {
     v3: 0,
 };
 
-/// Per-cube projected vertex cache: (sx, sy, sz, r, g, b).
-type VertProj = (i16, i16, u16, u8, u8, u8);
-const EMPTY_VERT: VertProj = (0, 0, 0, 0, 0, 0);
-static mut CUBE_PROJ: [VertProj; 32] = [EMPTY_VERT; 32];
+/// Per-cube projected vertex cache.
+const EMPTY_VERT: ProjectedLit = ProjectedLit {
+    sx: 0,
+    sy: 0,
+    sz: 0,
+    r: 0,
+    g: 0,
+    b: 0,
+};
+static mut CUBE_PROJ: [ProjectedLit; 32] = [EMPTY_VERT; 32];
 
 // ----------------------------------------------------------------------
 // Per-vertex CPU lighting
@@ -263,26 +273,30 @@ fn light_vertex(
         let dy = (light.pos.y as i32) - (world_pos.y as i32);
         let dz = (light.pos.z as i32) - (world_pos.z as i32);
 
-        // Distance squared, in i64 to avoid overflow (each
-        // component can be up to ~0x3000, squared ≈ 0x900_0000,
-        // sum up to ~0x1B00_0000 — fits i32 but tight. i64 keeps
-        // headroom for wider scenes.)
-        let dist_sq =
-            (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64) + (dz as i64) * (dz as i64);
+        if dx < -LIGHT_DELTA_LIMIT
+            || dx > LIGHT_DELTA_LIMIT
+            || dy < -LIGHT_DELTA_LIMIT
+            || dy > LIGHT_DELTA_LIMIT
+            || dz < -LIGHT_DELTA_LIMIT
+            || dz > LIGHT_DELTA_LIMIT
+        {
+            continue;
+        }
 
-        if dist_sq > LIGHT_RADIUS_SQ as i64 {
+        let dist_sq = dx * dx + dy * dy + dz * dz;
+
+        if dist_sq > LIGHT_RADIUS_SQ {
             continue;
         }
 
         // Quadratic attenuation: 1 at dist=0, 0 at dist²=RADIUS_SQ.
         // att in [0, 0x1000]
-        let att_q12 = (((LIGHT_RADIUS_SQ as i64 - dist_sq) << 12) / LIGHT_RADIUS_SQ as i64) as i32;
+        let att_q12 = ((LIGHT_RADIUS_SQ - dist_sq) / LIGHT_ATT_DENOM_Q12).clamp(0, 0x1000);
 
         // Un-normalised N · D. Components of N are Q3.12, D's are
         // raw world units. Result is in Q3.12 × world-units.
-        let dot_unnorm = (world_normal.x as i64) * (dx as i64)
-            + (world_normal.y as i64) * (dy as i64)
-            + (world_normal.z as i64) * (dz as i64);
+        let dot_unnorm =
+            (world_normal.x as i32) * dx + (world_normal.y as i32) * dy + (world_normal.z as i32) * dz;
 
         // Facing-away? Skip.
         if dot_unnorm <= 0 {
@@ -298,11 +312,11 @@ fn light_vertex(
         // Dividing the Q3.12 dot (which carries distance in its
         // magnitude) by `RADIUS_LINEAR` rescales it into a rough
         // Q3.12 direction-intensity in `[0, ~0x1000]`.
-        let intensity_q12 = (dot_unnorm / RADIUS_LINEAR) as i32;
+        let intensity_q12 = dot_unnorm / RADIUS_LINEAR;
 
         // Modulate by quadratic attenuation and normal magnitude.
         // `lit_scalar` is in Q3.12, roughly [0, 0x1000].
-        let lit_scalar = ((intensity_q12 as i64 * att_q12 as i64) >> 12) as i32;
+        let lit_scalar = (intensity_q12 * att_q12) >> 12;
         // Clamp before accumulating — single lights shouldn't
         // saturate the channel on their own.
         let lit_scalar = lit_scalar.clamp(0, 0x1000);
@@ -385,7 +399,11 @@ impl Lighting {
         };
         ot.add_packet(BG_SLOT, bg);
 
-        // World band — all 6 cube instances, CPU-lit + GTE-projected.
+        let mesh_options = GouraudMeshOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE);
+        let mut world_pass =
+            unsafe { GouraudRenderPass::new(&mut ot, &mut gouraud, &mut GOURAUD_COMMANDS) };
+
+        // World band — all cube instances, CPU-lit + GTE-projected.
         for instance in &CUBE_LAYOUT {
             // Per-instance: compose Y-spin rotation × identity (no
             // other rotation). `frame * spin` gives the current angle.
@@ -437,31 +455,22 @@ impl Lighting {
 
                 // Project via GTE (actor transform already loaded).
                 let p = scene::project_vertex(vl);
-                cube_proj[vi as usize] = (p.sx, p.sy, p.sz, r, g, b);
+                cube_proj[vi as usize] = ProjectedLit {
+                    sx: p.sx,
+                    sy: p.sy,
+                    sz: p.sz,
+                    r,
+                    g,
+                    b,
+                };
             }
 
-            // Emit triangles with per-vertex lit colours.
-            for face_idx in 0..cube.face_count() {
-                let (ia, ib, ic) = cube.face(face_idx);
-                let (v0, v1, v2) = (
-                    cube_proj[ia as usize],
-                    cube_proj[ib as usize],
-                    cube_proj[ic as usize],
-                );
-                if back_facing(v0, v1, v2) {
-                    continue;
-                }
-                let Some(tri) = gouraud.push(TriGouraud::new(
-                    [(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)],
-                    [(v0.3, v0.4, v0.5), (v1.3, v1.4, v1.5), (v2.3, v2.4, v2.5)],
-                )) else {
-                    break;
-                };
-                let slot = WORLD_BAND.slot::<OT_DEPTH>(WORLD_DEPTH_RANGE, face_depth(v0, v1, v2));
-                ot.add_packet_slot(slot, tri);
-                self.tri_count += 1;
-            }
+            let cube_stats = world_pass.submit_projected_mesh(&cube, cube_proj, mesh_options);
+            self.tri_count = self
+                .tri_count
+                .saturating_add(cube_stats.submitted_triangles);
         }
+        world_pass.flush();
 
         // Foreground — visible light position markers (small bright
         // squares at each light's projected screen position, colour
@@ -544,18 +553,6 @@ fn mat_row_dot(m: &Mat3I16, r: usize, v: Vec3I16) -> i32 {
         + (m.m[r][1] as i32) * (v.y as i32)
         + (m.m[r][2] as i32) * (v.z as i32);
     sum >> 12
-}
-
-fn back_facing(v0: VertProj, v1: VertProj, v2: VertProj) -> bool {
-    let ax = (v1.0 as i32) - (v0.0 as i32);
-    let ay = (v1.1 as i32) - (v0.1 as i32);
-    let bx = (v2.0 as i32) - (v0.0 as i32);
-    let by = (v2.1 as i32) - (v0.1 as i32);
-    (ax * by - ay * bx) <= 0
-}
-
-fn face_depth(v0: VertProj, v1: VertProj, v2: VertProj) -> i32 {
-    ((v0.2 as i32) + (v1.2 as i32) + (v2.2 as i32)) / 3
 }
 
 // ----------------------------------------------------------------------

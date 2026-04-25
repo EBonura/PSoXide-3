@@ -78,13 +78,8 @@ impl Mat3I16 {
         let mut out = [[0i16; 3]; 3];
         for i in 0..3 {
             for j in 0..3 {
-                let mut sum: i64 = 0;
-                for k in 0..3 {
-                    sum += (self.m[i][k] as i64) * (other.m[k][j] as i64);
-                }
-                // Drop the shared 12-bit fractional part.
-                let shifted = sum >> 12;
-                out[i][j] = shifted.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+                let column = [other.m[0][j], other.m[1][j], other.m[2][j]];
+                out[i][j] = clamp_i32_to_i16(dot_q12_i16(self.m[i], column));
             }
         }
         Self { m: out }
@@ -97,10 +92,7 @@ impl Mat3I16 {
     pub fn transform(&self, v: Vec3I16) -> [i32; 3] {
         let mut out = [0i32; 3];
         for i in 0..3 {
-            let sum = (self.m[i][0] as i64) * (v.x as i64)
-                + (self.m[i][1] as i64) * (v.y as i64)
-                + (self.m[i][2] as i64) * (v.z as i64);
-            out[i] = (sum >> 12) as i32;
+            out[i] = dot_q12_i16(self.m[i], [v.x, v.y, v.z]);
         }
         out
     }
@@ -116,11 +108,7 @@ impl Mat3I16 {
         let c = cos_1_3_12(angle);
         let s = sin_1_3_12(angle);
         Self {
-            m: [
-                [0x1000, 0, 0],
-                [0, c, -s],
-                [0, s, c],
-            ],
+            m: [[0x1000, 0, 0], [0, c, -s], [0, s, c]],
         }
     }
 
@@ -135,11 +123,7 @@ impl Mat3I16 {
         let c = cos_1_3_12(angle);
         let s = sin_1_3_12(angle);
         Self {
-            m: [
-                [c, 0, s],
-                [0, 0x1000, 0],
-                [-s, 0, c],
-            ],
+            m: [[c, 0, s], [0, 0x1000, 0], [-s, 0, c]],
         }
     }
 
@@ -154,13 +138,25 @@ impl Mat3I16 {
         let c = cos_1_3_12(angle);
         let s = sin_1_3_12(angle);
         Self {
-            m: [
-                [c, -s, 0],
-                [s, c, 0],
-                [0, 0, 0x1000],
-            ],
+            m: [[c, -s, 0], [s, c, 0], [0, 0, 0x1000]],
         }
     }
+}
+
+#[inline]
+fn dot_q12_i16(a: [i16; 3], b: [i16; 3]) -> i32 {
+    let mut sum = 0i32;
+    let mut i = 0;
+    while i < 3 {
+        sum = sum.saturating_add((a[i] as i32) * (b[i] as i32));
+        i += 1;
+    }
+    sum >> 12
+}
+
+#[inline]
+fn clamp_i32_to_i16(value: i32) -> i16 {
+    value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 #[cfg(test)]

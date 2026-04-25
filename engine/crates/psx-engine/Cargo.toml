@@ -7,6 +7,7 @@ repository.workspace = true
 description = "PSoXide engine layer. Scene/App framework + canonical unit types (Angle, Frames) sitting on top of the SDK. Host-independent; MIPS-target only."
 
 [dependencies]
+psx-asset = { workspace = true }
 psx-gpu  = { workspace = true }
 psx-gte  = { workspace = true }
 psx-math = { workspace = true }

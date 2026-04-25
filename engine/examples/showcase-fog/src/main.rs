@@ -416,7 +416,8 @@ impl Scene for Corridor {
 }
 
 fn update_ring_z(frame: u32) {
-    let phase = (((frame as u64) * (SCROLL_SPEED as u64)) % (RING_SPACING as u64)) as i32;
+    let spacing = RING_SPACING as u32;
+    let phase = (((frame % spacing) * (SCROLL_SPEED as u32)) % spacing) as i32;
     let rings = unsafe { &mut RING_Z };
     let mut i = 0;
     while i < NUM_RINGS {

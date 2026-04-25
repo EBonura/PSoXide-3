@@ -165,10 +165,10 @@ impl DepthBand {
             return DepthSlot::new(back);
         }
 
-        let span = (range.far - range.near) as i64;
-        let offset = (depth - range.near) as i64;
-        let band_slots = (back - front) as i64;
-        DepthSlot::new(front + ((offset * band_slots) / span) as usize)
+        let span = range.far - range.near;
+        let offset = depth - range.near;
+        let band_slots = (back - front) as i32;
+        DepthSlot::new(front + ((offset.saturating_mul(band_slots)) / span) as usize)
     }
 }
 
@@ -280,13 +280,31 @@ impl<'a, T> PrimitiveArena<'a, T> {
     /// Write `prim` and return a mutable reference suitable for OT
     /// insertion. Returns `None` if the arena is full.
     pub fn push(&mut self, prim: T) -> Option<&mut T> {
+        let idx = self.push_index(prim)?;
+        Some(&mut self.storage[idx])
+    }
+
+    /// Write `prim` and return its arena index.
+    ///
+    /// This is useful for render passes that need to build packets
+    /// first, sort draw commands, and only then borrow the packets
+    /// for ordering-table insertion.
+    pub fn push_index(&mut self, prim: T) -> Option<usize> {
         if self.len >= self.storage.len() {
             return None;
         }
         let idx = self.len;
         self.len += 1;
         self.storage[idx] = prim;
-        Some(&mut self.storage[idx])
+        Some(idx)
+    }
+
+    /// Borrow a primitive previously written by [`push_index`](Self::push_index).
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len {
+            return None;
+        }
+        Some(&mut self.storage[index])
     }
 }
 
@@ -351,5 +369,17 @@ mod tests {
         arena.reset();
         assert!(arena.is_empty());
         assert_eq!(arena.remaining(), 2);
+    }
+
+    #[test]
+    fn primitive_arena_can_reborrow_by_index() {
+        let mut storage = [0u16; 2];
+        let mut arena = PrimitiveArena::new(&mut storage);
+
+        let idx = arena.push_index(7).expect("slot 0");
+        *arena.get_mut(idx).expect("reborrow") = 12;
+
+        assert_eq!(*arena.get_mut(idx).expect("slot still live"), 12);
+        assert!(arena.get_mut(1).is_none());
     }
 }
