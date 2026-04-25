@@ -1,158 +1,343 @@
-//! `showcase-textured-sprite` — polished textured-sprite demo.
+//! `showcase-textured-sprite` - 3D textured material showcase.
 //!
-//! A 32×32 texture with four visually-distinct regions (quadrant
-//! colors + diagonal accents) uploaded into a 15bpp tpage, then two
-//! sprites bounce around the screen on different periods:
-//! a full 32×32 rendering of the texture, plus a 16×16 detail
-//! crop that shows UV-offset sampling of the same page.
-//!
-//! Compared to `hello-tex` this exercises:
-//! - a larger, visually rich texture built via [`psx_vram::Color555`]
-//! - two simultaneous sprites with different UVs into the same page
-//! - a non-uniform bouncing motion that gives the pixel-pinned
-//!   milestone test a non-trivial frame to hash
-//!
-//! Ported to `psx-engine` in Phase 3e: the init (gpu::init,
-//! framebuffer, draw-area, texture upload, tpage/apply_as_draw_mode)
-//! lives in `Scene::init`; render submits per-frame GP0 writes for
-//! the two sprites. `ctx.frame` drives the bounce cadence.
+//! A flat textured plane with upright square material samples at the
+//! centre. The camera slowly orbits the scene and keeps looking at the
+//! middle, with the translucent cards placed over high-contrast backing
+//! colours so the blend modes read clearly.
 
 #![no_std]
 #![no_main]
 
 extern crate psx_rt;
 
+use psx_asset::Texture;
 use psx_engine::{App, Config, Ctx, Scene};
-use psx_hw::gpu::{pack_color, pack_texcoord, pack_vertex, pack_xy};
-use psx_io::gpu::{wait_cmd_ready, write_gp0};
-use psx_vram::{Color555, TexDepth, Tpage, VramRect, upload_15bpp};
+use psx_gpu::{
+    self as gpu,
+    material::{BlendMode, TextureMaterial},
+};
+use psx_math::{cos_q12, sin_q12};
+use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
-/// Texture page — picked at the standard off-display X=768 to
-/// stay clear of a potential 640-wide framebuffer.
-const TEX_TPAGE: Tpage = Tpage::new(768, 0, TexDepth::Bit15);
-/// 32×32 demo texture.
-const TEX_W: u16 = 32;
-const TEX_H: u16 = 32;
-const TEX_RECT: VramRect = VramRect::new(TEX_TPAGE.x(), TEX_TPAGE.y(), TEX_W, TEX_H);
+static BRICK_BLOB: &[u8] = include_bytes!("../../showcase-fog/assets/brick-wall.psxt");
+static FLOOR_BLOB: &[u8] = include_bytes!("../../showcase-fog/assets/floor.psxt");
 
-// ----------------------------------------------------------------------
-// Scene state
-// ----------------------------------------------------------------------
+const SHARED_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
+const BRICK_CLUT: Clut = Clut::new(0, 480);
+const FLOOR_CLUT: Clut = Clut::new(0, 481);
 
-/// Scene state. `tpage_word` is baked once in `init` because
-/// [`Tpage::uv_tpage_word`] can be const-folded at that point and
-/// held cheap for the render loop.
+const TEX_W: u16 = 64;
+const TEX_H: u16 = 64;
+const BRICK_U: u8 = 0;
+const FLOOR_U: u8 = 64;
+
+const TPAGE_WORD: u16 = SHARED_TPAGE.uv_tpage_word(0);
+const BRICK_CLUT_WORD: u16 = BRICK_CLUT.uv_clut_word();
+const FLOOR_CLUT_WORD: u16 = FLOOR_CLUT.uv_clut_word();
+const IDENTITY_TINT: (u8, u8, u8) = (0x80, 0x80, 0x80);
+
+const SCREEN_CX: i32 = 160;
+const SCREEN_CY: i32 = 118;
+const FOCAL: i32 = 220;
+const NEAR_Z: i32 = 48;
+
+const CAMERA_Y: i32 = 170;
+const ORBIT_RADIUS: i32 = 540;
+const CAMERA_PITCH_Q12: u16 = 4096 - 128;
+
+const PLANE_HALF: i32 = 300;
+const PANEL_SIZE: i32 = 88;
+const PANEL_BOTTOM: i32 = 18;
+
+#[derive(Copy, Clone)]
+struct Vec3 {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+#[derive(Copy, Clone)]
+struct Camera {
+    x: i32,
+    y: i32,
+    z: i32,
+    sin_yaw: i32,
+    cos_yaw: i32,
+    sin_pitch: i32,
+    cos_pitch: i32,
+}
+
 struct Showcase {
-    tpage_word: u16,
+    floor_opaque: TextureMaterial,
+    brick_opaque: TextureMaterial,
+    glass_average: TextureMaterial,
+    glow_add: TextureMaterial,
+    shadow_subtract: TextureMaterial,
+    highlight_quarter: TextureMaterial,
 }
 
 impl Scene for Showcase {
     fn init(&mut self, _ctx: &mut Ctx) {
-        // Upload the demo texture, then activate its tpage as the
-        // draw mode (the GP0 0xE1 write that sets tex-page + semi-
-        // transparency for subsequent primitives).
-        upload_demo_texture();
-        TEX_TPAGE.apply_as_draw_mode();
-        self.tpage_word = TEX_TPAGE.uv_tpage_word(0);
+        upload_sample_textures();
     }
 
-    fn update(&mut self, _ctx: &mut Ctx) {
-        // Pure animation demo; no state mutates outside the
-        // frame counter that `App` owns.
-    }
+    fn update(&mut self, _ctx: &mut Ctx) {}
 
     fn render(&mut self, ctx: &mut Ctx) {
-        // The bounce cadence reads a `u16` so it matches the
-        // pre-engine golden exactly — wrapping at 65536 gives the
-        // same phase arithmetic.
-        let frame = ctx.frame as u16;
-
-        // Full 32×32 sprite bouncing left/right + down/up.
-        let x_full = 24 + bounce(frame, 200);
-        let y_full = 48 + bounce(frame.wrapping_mul(2), 120);
-        draw_sprite(x_full, y_full, TEX_W, TEX_H, (0, 0), self.tpage_word);
-
-        // 16×16 detail crop starting at UV (8, 8) — the centre of
-        // the texture. Independent bounce periods so the two sprites
-        // trace different paths.
-        let x_detail = 220 - bounce(frame.wrapping_mul(3), 120);
-        let y_detail = 132 + bounce(frame.wrapping_mul(5), 56);
-        draw_sprite(x_detail, y_detail, 16, 16, (8, 8), self.tpage_word);
+        let camera = camera_for(ctx.frame);
+        draw_floor(self, camera);
+        draw_panel_backs(camera);
+        draw_material_panels(self, camera);
     }
 }
 
-// ----------------------------------------------------------------------
-// Entry point
-// ----------------------------------------------------------------------
-
 #[no_mangle]
 fn main() -> ! {
-    let mut scene = Showcase { tpage_word: 0 };
-    // Deep navy clear — matches the pre-engine (8, 14, 40) backdrop.
+    let mut scene = Showcase::new();
     let config = Config {
-        clear_color: (8, 14, 40),
+        clear_color: (5, 7, 12),
         ..Config::default()
     };
     App::run(config, &mut scene);
 }
 
-// ----------------------------------------------------------------------
-// Texture + sprite helpers — unchanged from the pre-engine showcase.
-// ----------------------------------------------------------------------
-
-/// Build the 32×32 showcase texture:
-/// - background quadrants (orange / cyan / deep-blue)
-/// - diagonal white accents
-/// - checker detail at the 4-pixel grid
-fn upload_demo_texture() {
-    const SIZE: usize = (TEX_W as usize) * (TEX_H as usize);
-    let mut pixels = [Color555::BLACK; SIZE];
-    // Palette chosen for visual distinctness and within the 5-bit
-    // channel range that rgb5 takes directly.
-    let orange = Color555::rgb5(31, 17, 4);
-    let cyan = Color555::rgb5(0, 27, 30);
-    let deep_blue = Color555::rgb5(2, 4, 15);
-    let white = Color555::rgb5(31, 31, 31);
-
-    for y in 0..TEX_H {
-        for x in 0..TEX_W {
-            let checker = ((x / 4) + (y / 4)) % 2 == 0;
-            let on_main_diag = (x as i16 - y as i16).abs() < 3;
-            let on_anti_diag = (x as i16 + y as i16 - (TEX_W as i16 - 1)).abs() < 3;
-            let color = if on_main_diag || on_anti_diag {
-                white
-            } else if checker {
-                orange
-            } else if y < TEX_H / 2 {
-                cyan
-            } else {
-                deep_blue
-            };
-            pixels[y as usize * TEX_W as usize + x as usize] = color;
+impl Showcase {
+    const fn new() -> Self {
+        Self {
+            floor_opaque: TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, IDENTITY_TINT),
+            brick_opaque: TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, IDENTITY_TINT),
+            glass_average: TextureMaterial::blended(
+                FLOOR_CLUT_WORD,
+                TPAGE_WORD,
+                (0x68, 0x78, 0x98),
+                BlendMode::Average,
+            ),
+            glow_add: TextureMaterial::blended(
+                FLOOR_CLUT_WORD,
+                TPAGE_WORD,
+                (0x50, 0x64, 0x98),
+                BlendMode::Add,
+            ),
+            shadow_subtract: TextureMaterial::blended(
+                BRICK_CLUT_WORD,
+                TPAGE_WORD,
+                (0x78, 0x78, 0x78),
+                BlendMode::Subtract,
+            ),
+            highlight_quarter: TextureMaterial::blended(
+                BRICK_CLUT_WORD,
+                TPAGE_WORD,
+                (0xc0, 0xc0, 0x98),
+                BlendMode::AddQuarter,
+            ),
         }
     }
-
-    upload_15bpp(TEX_RECT, &pixels);
 }
 
-/// Issue GP0 0x64 (variable-size textured rectangle).
-fn draw_sprite(x: i16, y: i16, w: u16, h: u16, uv: (u8, u8), tpage: u16) {
-    wait_cmd_ready();
-    write_gp0(0x6400_0000 | pack_color(0x80, 0x80, 0x80));
-    write_gp0(pack_vertex(x, y));
-    write_gp0(pack_texcoord(uv.0, uv.1, tpage));
-    write_gp0(pack_xy(w, h));
+fn upload_sample_textures() {
+    let brick = Texture::from_bytes(BRICK_BLOB).expect("brick-wall.psxt");
+    let floor = Texture::from_bytes(FLOOR_BLOB).expect("floor.psxt");
+
+    let brick_pix_rect = VramRect::new(
+        SHARED_TPAGE.x(),
+        SHARED_TPAGE.y(),
+        brick.halfwords_per_row(),
+        brick.height(),
+    );
+    upload_bytes(brick_pix_rect, brick.pixel_bytes());
+    let brick_clut_rect = VramRect::new(BRICK_CLUT.x(), BRICK_CLUT.y(), brick.clut_entries(), 1);
+    upload_blend_clut(brick_clut_rect, brick.clut_bytes());
+
+    let floor_pix_rect = VramRect::new(
+        SHARED_TPAGE.x() + brick.halfwords_per_row(),
+        SHARED_TPAGE.y(),
+        floor.halfwords_per_row(),
+        floor.height(),
+    );
+    upload_bytes(floor_pix_rect, floor.pixel_bytes());
+    let floor_clut_rect = VramRect::new(FLOOR_CLUT.x(), FLOOR_CLUT.y(), floor.clut_entries(), 1);
+    upload_blend_clut(floor_clut_rect, floor.clut_bytes());
 }
 
-/// Triangle wave: input ∈ u16 phase, output ∈ 0..span pixels,
-/// period = 2·span. Simpler than a sine but enough motion for
-/// a visual-debug demo.
-fn bounce(frame: u16, span: i16) -> i16 {
-    let cycle = (span as u16).saturating_mul(2);
-    let phase = if cycle == 0 { 0 } else { frame % cycle };
-    if phase < span as u16 {
-        phase as i16
-    } else {
-        (cycle - phase) as i16
+fn upload_blend_clut(rect: VramRect, bytes: &[u8]) {
+    let mut marked = [0u8; 512];
+    assert!(bytes.len() <= marked.len());
+    assert!(bytes.len() % 2 == 0);
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let raw = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        let marked_color = if raw == 0 { 0 } else { raw | 0x8000 };
+        let pair = marked_color.to_le_bytes();
+        marked[i] = pair[0];
+        marked[i + 1] = pair[1];
+        i += 2;
     }
+
+    upload_bytes(rect, &marked[..bytes.len()]);
+}
+
+fn camera_for(frame: u32) -> Camera {
+    let yaw = 220u16.wrapping_add((frame as u16) / 2);
+    let sx = sin_q12(yaw);
+    let cz = cos_q12(yaw);
+    Camera {
+        x: (sx * ORBIT_RADIUS) >> 12,
+        y: CAMERA_Y,
+        z: (cz * ORBIT_RADIUS) >> 12,
+        sin_yaw: sx,
+        cos_yaw: cz,
+        sin_pitch: sin_q12(CAMERA_PITCH_Q12),
+        cos_pitch: cos_q12(CAMERA_PITCH_Q12),
+    }
+}
+
+fn draw_floor(scene: &Showcase, camera: Camera) {
+    draw_floor_tile(scene, camera, -PLANE_HALF, 0, -PLANE_HALF, 0);
+    draw_floor_tile(scene, camera, 0, PLANE_HALF, -PLANE_HALF, 0);
+    draw_floor_tile(scene, camera, -PLANE_HALF, 0, 0, PLANE_HALF);
+    draw_floor_tile(scene, camera, 0, PLANE_HALF, 0, PLANE_HALF);
+}
+
+fn draw_floor_tile(scene: &Showcase, camera: Camera, x0: i32, x1: i32, z0: i32, z1: i32) {
+    draw_world_textured(
+        camera,
+        Vec3 { x: x0, y: 0, z: z0 },
+        Vec3 { x: x1, y: 0, z: z0 },
+        Vec3 { x: x0, y: 0, z: z1 },
+        Vec3 { x: x1, y: 0, z: z1 },
+        FLOOR_U,
+        scene.floor_opaque,
+    );
+}
+
+fn draw_panel_backs(camera: Camera) {
+    draw_backing(camera, -176, (248, 248, 232), (20, 24, 36));
+    draw_backing(camera, -88, (230, 28, 34), (24, 210, 222));
+    draw_backing(camera, 0, (24, 76, 230), (24, 220, 76));
+    draw_backing(camera, 88, (248, 220, 40), (220, 28, 214));
+    draw_backing(camera, 176, (248, 248, 248), (44, 72, 232));
+}
+
+fn draw_backing(camera: Camera, center_x: i32, left: (u8, u8, u8), right: (u8, u8, u8)) {
+    let half = PANEL_SIZE / 2;
+    let mid = center_x;
+    let x0 = center_x - half;
+    let x1 = center_x + half;
+    let y0 = PANEL_BOTTOM;
+    let y1 = PANEL_BOTTOM + PANEL_SIZE;
+    draw_world_flat(
+        camera,
+        Vec3 { x: x0, y: y1, z: 0 },
+        Vec3 {
+            x: mid,
+            y: y1,
+            z: 0,
+        },
+        Vec3 { x: x0, y: y0, z: 0 },
+        Vec3 {
+            x: mid,
+            y: y0,
+            z: 0,
+        },
+        left,
+    );
+    draw_world_flat(
+        camera,
+        Vec3 {
+            x: mid,
+            y: y1,
+            z: 0,
+        },
+        Vec3 { x: x1, y: y1, z: 0 },
+        Vec3 {
+            x: mid,
+            y: y0,
+            z: 0,
+        },
+        Vec3 { x: x1, y: y0, z: 0 },
+        right,
+    );
+}
+
+fn draw_material_panels(scene: &Showcase, camera: Camera) {
+    draw_vertical_square(camera, -176, BRICK_U, scene.brick_opaque);
+    draw_vertical_square(camera, -88, FLOOR_U, scene.glass_average);
+    draw_vertical_square(camera, 0, FLOOR_U, scene.glow_add);
+    draw_vertical_square(camera, 88, BRICK_U, scene.shadow_subtract);
+    draw_vertical_square(camera, 176, BRICK_U, scene.highlight_quarter);
+}
+
+fn draw_vertical_square(camera: Camera, center_x: i32, base_u: u8, material: TextureMaterial) {
+    let half = PANEL_SIZE / 2;
+    let x0 = center_x - half;
+    let x1 = center_x + half;
+    let y0 = PANEL_BOTTOM;
+    let y1 = PANEL_BOTTOM + PANEL_SIZE;
+    draw_world_textured(
+        camera,
+        Vec3 { x: x0, y: y1, z: 0 },
+        Vec3 { x: x1, y: y1, z: 0 },
+        Vec3 { x: x0, y: y0, z: 0 },
+        Vec3 { x: x1, y: y0, z: 0 },
+        base_u,
+        material,
+    );
+}
+
+fn draw_world_textured(
+    camera: Camera,
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+    d: Vec3,
+    base_u: u8,
+    material: TextureMaterial,
+) {
+    if let Some(verts) = project_quad(camera, [a, b, c, d]) {
+        gpu::draw_quad_textured_material(verts, texture_uvs(base_u), material);
+    }
+}
+
+fn draw_world_flat(camera: Camera, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: (u8, u8, u8)) {
+    if let Some(verts) = project_quad(camera, [a, b, c, d]) {
+        gpu::draw_quad_flat(verts, color.0, color.1, color.2);
+    }
+}
+
+fn project_quad(camera: Camera, verts: [Vec3; 4]) -> Option<[(i16, i16); 4]> {
+    Some([
+        project_vertex(camera, verts[0])?,
+        project_vertex(camera, verts[1])?,
+        project_vertex(camera, verts[2])?,
+        project_vertex(camera, verts[3])?,
+    ])
+}
+
+fn project_vertex(camera: Camera, v: Vec3) -> Option<(i16, i16)> {
+    let dx = v.x - camera.x;
+    let dy = v.y - camera.y;
+    let dz = v.z - camera.z;
+
+    let x1 = ((dx * camera.cos_yaw) - (dz * camera.sin_yaw)) >> 12;
+    let z1 = ((-dx * camera.sin_yaw) - (dz * camera.cos_yaw)) >> 12;
+    let y2 = ((dy * camera.cos_pitch) - (z1 * camera.sin_pitch)) >> 12;
+    let z2 = ((dy * camera.sin_pitch) + (z1 * camera.cos_pitch)) >> 12;
+
+    if z2 <= NEAR_Z {
+        return None;
+    }
+
+    let sx = SCREEN_CX + (x1 * FOCAL) / z2;
+    let sy = SCREEN_CY - (y2 * FOCAL) / z2;
+    Some((sx as i16, sy as i16))
+}
+
+fn texture_uvs(base_u: u8) -> [(u8, u8); 4] {
+    [
+        (base_u, 0),
+        (base_u + (TEX_W as u8 - 1), 0),
+        (base_u, TEX_H as u8 - 1),
+        (base_u + (TEX_W as u8 - 1), TEX_H as u8 - 1),
+    ]
 }
