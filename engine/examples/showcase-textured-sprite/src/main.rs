@@ -2,10 +2,10 @@
 //!
 //! A compact interactive material room.
 //!
-//! The room uses the two cooked sample textures directly: brick walls
-//! and a cobblestone floor. A single upright pane in the centre shows
-//! one material at a time; controller input swaps the texture sample
-//! and blend mode while the HUD names what is currently being shown.
+//! The room uses the two cooked sample textures directly: dark brick
+//! walls and a cobblestone floor. A single upright pane in the centre
+//! shows one material at a time over a muted contrast target, so blend
+//! modes are readable without hiding the room.
 
 #![no_std]
 #![no_main]
@@ -53,8 +53,10 @@ const CAMERA_PITCH_Q12: u16 = 4096 - 128;
 const FLOOR_X: i32 = 310;
 const FLOOR_FRONT_Z: i32 = 245;
 const WALL_Z: i32 = -46;
-const WALL_TOP: i32 = 154;
-const PANEL_SIZE: i32 = 112;
+const WALL_TOP: i32 = 166;
+const TARGET_SIZE: i32 = 164;
+const TARGET_Z: i32 = -12;
+const PANEL_SIZE: i32 = 124;
 const PANEL_BOTTOM: i32 = 20;
 const PANEL_Z: i32 = 0;
 
@@ -112,6 +114,7 @@ impl Scene for Showcase {
     fn render(&mut self, ctx: &mut Ctx) {
         let camera = camera_for(ctx.frame);
         draw_room(camera);
+        draw_material_target(camera);
         draw_material_pane(self, camera);
         if let Some(font) = self.font.as_ref() {
             self.draw_hud(font);
@@ -133,16 +136,16 @@ impl Showcase {
     const fn new() -> Self {
         Self {
             font: None,
-            sample_idx: SAMPLE_FLOOR,
+            sample_idx: SAMPLE_BRICK,
             blend_idx: 1,
         }
     }
 
     fn sample_name(&self) -> &'static str {
-        if self.sample_idx == SAMPLE_BRICK {
-            "BRICK"
-        } else {
-            "FLOOR"
+        match self.sample_idx {
+            SAMPLE_BRICK => "BRICK",
+            SAMPLE_FLOOR => "FLOOR",
+            _ => "FLOOR",
         }
     }
 
@@ -157,10 +160,10 @@ impl Showcase {
     }
 
     fn material(&self) -> TextureMaterial {
-        let clut = if self.sample_idx == SAMPLE_BRICK {
-            BRICK_CLUT_WORD
-        } else {
-            FLOOR_CLUT_WORD
+        let clut = match self.sample_idx {
+            SAMPLE_BRICK => BRICK_CLUT_WORD,
+            SAMPLE_FLOOR => FLOOR_CLUT_WORD,
+            _ => FLOOR_CLUT_WORD,
         };
         match self.blend_idx {
             0 => TextureMaterial::opaque(clut, TPAGE_WORD, IDENTITY_TINT),
@@ -179,10 +182,10 @@ impl Showcase {
     }
 
     fn base_u(&self) -> u8 {
-        if self.sample_idx == SAMPLE_BRICK {
-            BRICK_U
-        } else {
-            FLOOR_U
+        match self.sample_idx {
+            SAMPLE_BRICK => BRICK_U,
+            SAMPLE_FLOOR => FLOOR_U,
+            _ => FLOOR_U,
         }
     }
 
@@ -261,13 +264,16 @@ fn draw_room(camera: Camera) {
 }
 
 fn draw_floor(camera: Camera) {
-    let material = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x78, 0x78, 0x80));
-    draw_floor_tile(camera, -FLOOR_X, -104, WALL_Z, 96, material);
-    draw_floor_tile(camera, -104, 104, WALL_Z, 96, material);
-    draw_floor_tile(camera, 104, FLOOR_X, WALL_Z, 96, material);
-    draw_floor_tile(camera, -FLOOR_X, -104, 96, FLOOR_FRONT_Z, material);
-    draw_floor_tile(camera, -104, 104, 96, FLOOR_FRONT_Z, material);
-    draw_floor_tile(camera, 104, FLOOR_X, 96, FLOOR_FRONT_Z, material);
+    let edge = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x42, 0x4a, 0x50));
+    let centre = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x88, 0x88, 0x90));
+    let front_edge = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x34, 0x3a, 0x3e));
+    let front_centre = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x72, 0x72, 0x78));
+    draw_floor_tile(camera, -FLOOR_X, -104, WALL_Z, 96, edge);
+    draw_floor_tile(camera, -104, 104, WALL_Z, 96, centre);
+    draw_floor_tile(camera, 104, FLOOR_X, WALL_Z, 96, edge);
+    draw_floor_tile(camera, -FLOOR_X, -104, 96, FLOOR_FRONT_Z, front_edge);
+    draw_floor_tile(camera, -104, 104, 96, FLOOR_FRONT_Z, front_centre);
+    draw_floor_tile(camera, 104, FLOOR_X, 96, FLOOR_FRONT_Z, front_edge);
 }
 
 fn draw_floor_tile(camera: Camera, x0: i32, x1: i32, z0: i32, z1: i32, material: TextureMaterial) {
@@ -283,14 +289,15 @@ fn draw_floor_tile(camera: Camera, x0: i32, x1: i32, z0: i32, z1: i32, material:
 }
 
 fn draw_wall(camera: Camera) {
-    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x70, 0x68, 0x60));
-    draw_wall_tile(camera, -FLOOR_X, -104, 0, WALL_TOP, WALL_Z, material);
-    draw_wall_tile(camera, -104, 104, 0, WALL_TOP, WALL_Z, material);
-    draw_wall_tile(camera, 104, FLOOR_X, 0, WALL_TOP, WALL_Z, material);
+    let edge = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x32, 0x32, 0x38));
+    let centre = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x68, 0x5c, 0x50));
+    draw_wall_tile(camera, -FLOOR_X, -104, 0, WALL_TOP, WALL_Z, edge);
+    draw_wall_tile(camera, -104, 104, 0, WALL_TOP, WALL_Z, centre);
+    draw_wall_tile(camera, 104, FLOOR_X, 0, WALL_TOP, WALL_Z, edge);
 }
 
 fn draw_side_walls(camera: Camera) {
-    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x58, 0x58, 0x60));
+    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x28, 0x2c, 0x34));
     draw_side_wall_tile(
         camera,
         -FLOOR_X,
@@ -308,6 +315,48 @@ fn draw_side_walls(camera: Camera) {
         0,
         WALL_TOP - 18,
         material,
+    );
+}
+
+fn draw_material_target(camera: Camera) {
+    let half = TARGET_SIZE / 2;
+    let mid_x = 0;
+    let mid_y = PANEL_BOTTOM + PANEL_SIZE / 2;
+    let x0 = -half;
+    let x1 = half;
+    let y0 = PANEL_BOTTOM - ((TARGET_SIZE - PANEL_SIZE) / 2);
+    let y1 = y0 + TARGET_SIZE;
+    draw_target_rect(camera, x0, mid_x, mid_y, y1, (48, 54, 66));
+    draw_target_rect(camera, mid_x, x1, mid_y, y1, (154, 142, 112));
+    draw_target_rect(camera, x0, mid_x, y0, mid_y, (34, 38, 46));
+    draw_target_rect(camera, mid_x, x1, y0, mid_y, (112, 118, 116));
+    draw_target_rect(camera, x0, x1, mid_y - 4, mid_y + 4, (184, 178, 156));
+}
+
+fn draw_target_rect(camera: Camera, x0: i32, x1: i32, y0: i32, y1: i32, color: (u8, u8, u8)) {
+    draw_world_flat(
+        camera,
+        Vec3 {
+            x: x0,
+            y: y1,
+            z: TARGET_Z,
+        },
+        Vec3 {
+            x: x1,
+            y: y1,
+            z: TARGET_Z,
+        },
+        Vec3 {
+            x: x0,
+            y: y0,
+            z: TARGET_Z,
+        },
+        Vec3 {
+            x: x1,
+            y: y0,
+            z: TARGET_Z,
+        },
+        color,
     );
 }
 
@@ -399,6 +448,12 @@ fn draw_world_textured(
 ) {
     if let Some(verts) = project_quad(camera, [a, b, c, d]) {
         gpu::draw_quad_textured_material(verts, texture_uvs(base_u), material);
+    }
+}
+
+fn draw_world_flat(camera: Camera, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: (u8, u8, u8)) {
+    if let Some(verts) = project_quad(camera, [a, b, c, d]) {
+        gpu::draw_quad_flat(verts, color.0, color.1, color.2);
     }
 }
 
