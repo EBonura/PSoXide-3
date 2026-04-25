@@ -594,41 +594,27 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             final_pc: 0x8001_3170,
             redux_display_hash: None,
         }),
-        // Full PS1-commercial textured-Gouraud pipeline: RTPT +
-        // NCLIP + AVSZ3 + NCDT feeds per-vertex lit+fogged colours
-        // into textured-Gouraud triangles (GP0 0x34). Brick walls
-        // + cobblestone floor sampled from two cooked PSXT
-        // textures in a shared tpage, tiled per ring, modulated by
-        // NCDT's fog gradient. The Silent-Hill-era look, rendered
-        // through hardware ops only.
-        // PS1-commercial textured-Gouraud pipeline: RTPT + NCLIP +
-        // AVSZ3 + NCDT feeds per-vertex depth-cue-blended colours
-        // into textured-Gouraud triangles (GP0 0x34). Brick walls
-        // + cobblestone floor sampled from two cooked PSXT
-        // textures in a shared tpage, modulated by NCDT's fog
-        // gradient. Pure ambient lighting (no directional or
-        // orbit) — the fog is the only visual variable. Static
-        // corridor — no camera scroll, so no ring-wrap discontinuity.
-        // Per-vertex fog via 3× RTPS + 3× NCDS + NCLIP + AVSZ3.
-        // Each vertex gets its own IR0 (depth-cue weight) so the
-        // texture-Gouraud tint interpolates smoothly across each
-        // wall. Two rings (no intermediate segments) → walls are
-        // single continuous quads from near to far, no seams at
-        // tile boundaries.
-        // Refreshed in Phase 3e after port to `psx-engine`. The HUD
-        // reads `ctx.frame` directly, so the displayed hex frame #
-        // is off-by-one from the pre-engine demo (which incremented
-        // at start-of-update rather than end-of-loop). Geometry is
-        // identical — the hash drift is confined to the HUD row.
+        // PS1-commercial textured-Gouraud pipeline: per-vertex RTPS
+        // + NCDS feeds depth-cue-blended colours into textured-Gouraud
+        // triangles (GP0 0x34), followed by NCLIP + AVSZ3 for cull
+        // and OT placement. Brick walls + cobblestone floor are
+        // sampled from two cooked PSXT textures in a shared tpage.
+        // Scrolling 16-ring corridor: each ring gap maps the full
+        // 64x64 tile once, avoiding hardware UV repeat while reducing
+        // the long-poly affine stretch of the old single-quad version.
+        // Refreshed after restoring segmented geometry and slow
+        // forward motion.
+        // The display hash now covers 120 textured-Gouraud tris
+        // instead of the temporary 8-tri single-quad corridor.
         "showcase-fog" => Some(SdkGolden {
             example: "showcase-fog",
             vblanks: 60,
-            vram_hash: 0xb370_c6da_8371_68e5,
-            display_hash: 0x2b4d_221d_5825_016b,
+            vram_hash: 0x6f2c_e3f9_b389_3e6d,
+            display_hash: 0x1e65_dee2_c74a_167f,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_1988,
+            final_pc: 0x8001_1418,
             redux_display_hash: None,
         }),
         // First engine-domain example. Exercises `App::run`'s
@@ -783,10 +769,9 @@ fn milestone_c_showcase_text() {
 #[test]
 #[ignore = "SDK milestone: showcase-fog roundtrip"]
 fn milestone_c_showcase_fog() {
-    // 60 VBlanks captures the corridor after ~1 s of forward
-    // dolly — multiple ring-wraps in, light rig orbited a visible
-    // amount, fog gradient fully lit across all rings. Covers
-    // RTPT + NCLIP + AVSZ3 + NCDT end-to-end.
+    // 60 VBlanks captures the segmented corridor after ~1 s of slow
+    // forward motion. Covers per-vertex RTPS + NCDS, then NCLIP +
+    // AVSZ3, feeding textured-Gouraud tris end-to-end.
     run_sdk_milestone("showcase-fog", 60);
 }
 
