@@ -247,6 +247,15 @@ pub fn side_load_and_hash(exe_path: &Path, vblanks: u64) -> Option<SdkExampleSta
 /// specific subsystem that regressed.
 fn assert_sdk_golden(state: &SdkExampleState, golden: &SdkGolden) {
     let name = golden.example;
+    if state.display_size != golden.display_size
+        || state.vblank_raises != golden.vblank_raises
+        || state.display_hash != golden.display_hash
+        || state.vram_hash != golden.vram_hash
+        || state.spu_samples != golden.spu_samples
+        || state.final_pc != golden.final_pc
+    {
+        print_capture(state, golden.example, golden.vblanks);
+    }
     assert_eq!(
         state.display_size, golden.display_size,
         "{name}: display dimensions changed — GP1 display-mode regression",
@@ -410,21 +419,29 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-textured-sprite" => Some(SdkGolden {
             example: "showcase-textured-sprite",
             vblanks: 3,
-            vram_hash: 0x6f85_7a78_ea7a_f98b,
-            display_hash: 0x6b53_d7bb_40f7_f07a,
+            vram_hash: 0x4258_6aa5_5493_4f74,
+            display_hash: 0xc949_202f_e476_f5ce,
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
             // Interactive material viewer: a compact room with a
-            // single upright material pane. D-pad swaps the texture
-            // sample and blend mode while the HUD names the active
-            // material. The room uses short textured side returns and
-            // repeated floor tiles so the faster orbit stays readable
-            // without artificial backing cards.
-            // Migrated from immediate GP0 textured draws to OT-backed
-            // `QuadTextured` packets so the transparent material pane
-            // sorts against the textured room like real scene geometry.
-            final_pc: 0x8001_27a0,
+            // single upright material pane. Face buttons swap the
+            // texture sample and blend mode while the HUD names the
+            // active material. World geometry is now authored as quads but
+            // submitted through `WorldRenderPass` as independently
+            // culled/sorted textured triangles: 3x3 floor, four
+            // backface-culled walls, and a double-sided material card.
+            // Floor/card surfaces use near-plane clipping; walls use
+            // the stricter all-corners-projected path to avoid giant
+            // behind-camera slabs during the orbit.
+            // The camera no longer auto-orbits: D-pad rotates/dollies
+            // the view while face buttons keep material selection.
+            // Pitch is derived from the dolly radius so the view keeps
+            // looking at the centre of the material card.
+            // The world textured path now splits projected triangles
+            // that would exceed the PS1 hardware extent limits, so the
+            // floor stays stable at close and pulled-back camera ranges.
+            final_pc: 0x8001_2768,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:

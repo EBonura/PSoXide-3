@@ -61,7 +61,9 @@ pub use app::{App, Config};
 pub use frames::{Frames, Ticks};
 pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
 pub use render3d::{
-    DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand, MeshRenderStats,
+    CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand,
+    MeshRenderStats, ProjectedVertex, TexturedViewVertex, ViewVertex, WorldProjection,
+    WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,
 };
 pub use scene::{Ctx, Scene};
 pub use transform::{ActorTransform, Vec3World};

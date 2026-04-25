@@ -200,9 +200,28 @@ impl<'a, const DEPTH: usize> OtFrame<'a, DEPTH> {
         self.ot.add(slot, prim, words);
     }
 
+    /// Insert a raw primitive packet pointer at a raw OT slot.
+    ///
+    /// # Safety
+    /// `packet_ptr` must point at the first word of a live GPU packet
+    /// that remains writable until the ordering-table DMA has consumed
+    /// it. `words` is the number of data words following the tag word.
+    pub unsafe fn add_raw(&mut self, slot: usize, packet_ptr: *mut u32, words: u8) {
+        debug_assert!(words <= 15);
+        unsafe { self.ot.insert(slot, packet_ptr, words) };
+    }
+
     /// Insert a primitive at a typed OT slot.
     pub fn add_slot<T>(&mut self, slot: DepthSlot, prim: &mut T, words: u8) {
         self.add(slot.index(), prim, words);
+    }
+
+    /// Insert a raw primitive packet pointer at a typed OT slot.
+    ///
+    /// # Safety
+    /// Same requirements as [`add_raw`](Self::add_raw).
+    pub unsafe fn add_raw_slot(&mut self, slot: DepthSlot, packet_ptr: *mut u32, words: u8) {
+        unsafe { self.add_raw(slot.index(), packet_ptr, words) };
     }
 
     /// Insert a known SDK GPU packet at a raw OT slot.

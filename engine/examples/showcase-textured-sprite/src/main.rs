@@ -13,12 +13,16 @@
 extern crate psx_rt;
 
 use psx_asset::Texture;
-use psx_engine::{button, App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena, Scene};
+use psx_engine::{
+    button, App, Config, Ctx, CullMode, DepthBand, DepthRange, OtFrame, PrimitiveArena,
+    ProjectedVertex, Scene, TexturedViewVertex, ViewVertex, WorldProjection, WorldRenderPass,
+    WorldSurfaceOptions, WorldTriCommand,
+};
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{
     material::{BlendMode, TextureMaterial},
     ot::OrderingTable,
-    prim::QuadTextured,
+    prim::TriTextured,
 };
 use psx_math::{cos_q12, sin_q12};
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
@@ -44,49 +48,52 @@ const IDENTITY_TINT: (u8, u8, u8) = (0x80, 0x80, 0x80);
 
 const SCREEN_CX: i32 = 160;
 const SCREEN_CY: i32 = 118;
-const FOCAL: i32 = 220;
+const FOCAL: i32 = 320;
 const NEAR_Z: i32 = 48;
+const PROJECTION: WorldProjection =
+    WorldProjection::new(SCREEN_CX as i16, SCREEN_CY as i16, FOCAL, NEAR_Z);
 
 const CAMERA_Y: i32 = 170;
-const ORBIT_RADIUS: i32 = 540;
-const CAMERA_PITCH_Q12: u16 = 4096 - 128;
+const CAMERA_START_RADIUS: i32 = 260;
+const CAMERA_RADIUS_MIN: i32 = 150;
+const CAMERA_RADIUS_MAX: i32 = 900;
+const CAMERA_RADIUS_STEP: i32 = 12;
 const CAMERA_START_YAW: u16 = 220;
-const CAMERA_ORBIT_PER_FRAME: u16 = 1;
+const CAMERA_YAW_STEP: u16 = 12;
 
-const FLOOR_X: i32 = 310;
-const FLOOR_FRONT_Z: i32 = 245;
-const SIDE_FRONT_Z: i32 = 150;
-const WALL_Z: i32 = -46;
-const WALL_TOP: i32 = 166;
-const PANEL_SIZE: i32 = 124;
-const PANEL_BOTTOM: i32 = 20;
+const ROOM_HALF: i32 = 300;
+const WALL_TOP: i32 = 176;
+const PANEL_SIZE: i32 = 120;
+const PANEL_BOTTOM: i32 = 28;
 const PANEL_Z: i32 = 0;
+const CAMERA_TARGET_X: i32 = 0;
+const CAMERA_TARGET_Y: i32 = PANEL_BOTTOM + PANEL_SIZE / 2;
+const CAMERA_TARGET_Z: i32 = PANEL_Z;
 
 const SAMPLE_BRICK: u8 = 0;
 const SAMPLE_FLOOR: u8 = 1;
 const SAMPLE_COUNT: u8 = 2;
 const BLEND_COUNT: u8 = 5;
-const FLOOR_X_EDGES: [i32; 6] = [-FLOOR_X, -186, -62, 62, 186, FLOOR_X];
-const FLOOR_Z_EDGES: [i32; 5] = [WALL_Z, 28, 100, 172, FLOOR_FRONT_Z];
-const WALL_X_EDGES: [i32; 6] = [-FLOOR_X, -186, -62, 62, 186, FLOOR_X];
-const WALL_Y_EDGES: [i32; 3] = [0, 83, WALL_TOP];
-const SIDE_Z_EDGES: [i32; 4] = [WALL_Z, 18, 84, SIDE_FRONT_Z];
-const SIDE_Y_EDGES: [i32; 3] = [0, 74, WALL_TOP - 18];
-const OT_DEPTH: usize = 16;
+const ROOM_EDGES: [i32; 4] = [-ROOM_HALF, -100, 100, ROOM_HALF];
+const WALL_Y_EDGES: [i32; 3] = [0, WALL_TOP / 2, WALL_TOP];
+const OT_DEPTH: usize = 64;
 const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 1);
-const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, ORBIT_RADIUS + FLOOR_FRONT_Z);
-const MAX_QUADS: usize = 64;
+const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, CAMERA_RADIUS_MAX + ROOM_HALF + 80);
+const MAX_TEXTURED_TRIS: usize = 192;
 
-const QUAD_ZERO: QuadTextured = QuadTextured::new(
-    [(0, 0), (0, 0), (0, 0), (0, 0)],
-    [(0, 0), (0, 0), (0, 0), (0, 0)],
+const TRI_ZERO: TriTextured = TriTextured::new(
+    [(0, 0), (0, 0), (0, 0)],
+    [(0, 0), (0, 0), (0, 0)],
     0,
     0,
     (0, 0, 0),
 );
 
 static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
-static mut QUADS: [QuadTextured; MAX_QUADS] = [const { QUAD_ZERO }; MAX_QUADS];
+static mut TEXTURED_TRIS: [TriTextured; MAX_TEXTURED_TRIS] =
+    [const { TRI_ZERO }; MAX_TEXTURED_TRIS];
+static mut WORLD_COMMANDS: [WorldTriCommand; MAX_TEXTURED_TRIS] =
+    [WorldTriCommand::EMPTY; MAX_TEXTURED_TRIS];
 
 #[derive(Copy, Clone)]
 struct Vec3 {
@@ -106,16 +113,12 @@ struct Camera {
     cos_pitch: i32,
 }
 
-#[derive(Copy, Clone)]
-struct ProjectedQuad {
-    verts: [(i16, i16); 4],
-    depth: i32,
-}
-
 struct Showcase {
     font: Option<FontAtlas>,
     sample_idx: u8,
     blend_idx: u8,
+    camera_yaw: u16,
+    camera_radius: i32,
 }
 
 impl Scene for Showcase {
@@ -125,27 +128,38 @@ impl Scene for Showcase {
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
-        if ctx.just_pressed(button::RIGHT) || ctx.just_pressed(button::CROSS) {
+        if ctx.is_held(button::RIGHT) {
+            self.camera_yaw = self.camera_yaw.wrapping_add(CAMERA_YAW_STEP);
+        }
+        if ctx.is_held(button::LEFT) {
+            self.camera_yaw = self.camera_yaw.wrapping_sub(CAMERA_YAW_STEP);
+        }
+        if ctx.is_held(button::UP) {
+            self.camera_radius = (self.camera_radius - CAMERA_RADIUS_STEP).max(CAMERA_RADIUS_MIN);
+        }
+        if ctx.is_held(button::DOWN) {
+            self.camera_radius = (self.camera_radius + CAMERA_RADIUS_STEP).min(CAMERA_RADIUS_MAX);
+        }
+
+        if ctx.just_pressed(button::CROSS) {
             self.blend_idx = (self.blend_idx + 1) % BLEND_COUNT;
         }
-        if ctx.just_pressed(button::LEFT) || ctx.just_pressed(button::SQUARE) {
+        if ctx.just_pressed(button::SQUARE) {
             self.blend_idx = (self.blend_idx + BLEND_COUNT - 1) % BLEND_COUNT;
         }
-        if ctx.just_pressed(button::UP)
-            || ctx.just_pressed(button::DOWN)
-            || ctx.just_pressed(button::TRIANGLE)
-            || ctx.just_pressed(button::CIRCLE)
-        {
+        if ctx.just_pressed(button::TRIANGLE) || ctx.just_pressed(button::CIRCLE) {
             self.sample_idx = (self.sample_idx + 1) % SAMPLE_COUNT;
         }
     }
 
-    fn render(&mut self, ctx: &mut Ctx) {
-        let camera = camera_for(ctx.frame);
+    fn render(&mut self, _ctx: &mut Ctx) {
+        let camera = camera_for(self.camera_yaw, self.camera_radius);
         let mut ot = unsafe { OtFrame::begin(&mut OT) };
-        let mut quads = unsafe { PrimitiveArena::new(&mut QUADS) };
-        draw_room(camera, &mut ot, &mut quads);
-        draw_material_pane(self, camera, &mut ot, &mut quads);
+        let mut triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_TRIS) };
+        let mut world = unsafe { WorldRenderPass::new(&mut ot, &mut WORLD_COMMANDS) };
+        draw_room(camera, &mut world, &mut triangles);
+        draw_material_pane(self, camera, &mut world, &mut triangles);
+        world.flush();
         ot.submit();
         if let Some(font) = self.font.as_ref() {
             self.draw_hud(font);
@@ -169,6 +183,8 @@ impl Showcase {
             font: None,
             sample_idx: SAMPLE_FLOOR,
             blend_idx: 1,
+            camera_yaw: CAMERA_START_YAW,
+            camera_radius: CAMERA_START_RADIUS,
         }
     }
 
@@ -226,7 +242,7 @@ impl Showcase {
         font.draw_text(72, 24, self.sample_name(), (235, 235, 210));
         font.draw_text(8, 38, "BLEND", (130, 150, 190));
         font.draw_text(56, 38, self.blend_name(), (235, 235, 210));
-        font.draw_text(8, 224, "UP/DN TEXTURE  L/R BLEND", (140, 155, 190));
+        font.draw_text(8, 224, "D-PAD CAMERA  FACE MATERIAL", (140, 155, 190));
     }
 }
 
@@ -273,50 +289,96 @@ fn upload_blend_clut(rect: VramRect, bytes: &[u8]) {
     upload_bytes(rect, &marked[..bytes.len()]);
 }
 
-fn camera_for(frame: u32) -> Camera {
-    let yaw = CAMERA_START_YAW.wrapping_add((frame as u16).wrapping_mul(CAMERA_ORBIT_PER_FRAME));
+fn camera_for(yaw: u16, radius: i32) -> Camera {
     let sx = sin_q12(yaw);
     let cz = cos_q12(yaw);
+    let target_dy = CAMERA_TARGET_Y - CAMERA_Y;
+    let pitch_len =
+        isqrt_i32(radius.saturating_mul(radius) + target_dy.saturating_mul(target_dy)).max(1);
     Camera {
-        x: (sx * ORBIT_RADIUS) >> 12,
+        x: CAMERA_TARGET_X + ((sx * radius) >> 12),
         y: CAMERA_Y,
-        z: (cz * ORBIT_RADIUS) >> 12,
+        z: CAMERA_TARGET_Z + ((cz * radius) >> 12),
         sin_yaw: sx,
         cos_yaw: cz,
-        sin_pitch: sin_q12(CAMERA_PITCH_Q12),
-        cos_pitch: cos_q12(CAMERA_PITCH_Q12),
+        sin_pitch: (target_dy * 4096) / pitch_len,
+        cos_pitch: (radius * 4096) / pitch_len,
     }
+}
+
+fn isqrt_i32(value: i32) -> i32 {
+    if value <= 0 {
+        return 0;
+    }
+
+    let mut bit = 1 << 30;
+    let mut n = value;
+    let mut root = 0;
+    while bit > n {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if n >= root + bit {
+            n -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    root
 }
 
 fn draw_room(
     camera: Camera,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
-    draw_floor(camera, ot, quads);
-    draw_wall(camera, ot, quads);
-    draw_side_walls(camera, ot, quads);
+    draw_floor(camera, world, triangles);
+    draw_walls(camera, world, triangles);
 }
 
 fn draw_floor(
     camera: Camera,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
     let material = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x62, 0x66, 0x6c));
+    let options =
+        WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE).with_cull_mode(CullMode::None);
     let mut zi = 0;
-    while zi + 1 < FLOOR_Z_EDGES.len() {
+    while zi + 1 < ROOM_EDGES.len() {
         let mut xi = 0;
-        while xi + 1 < FLOOR_X_EDGES.len() {
-            draw_floor_tile(
+        while xi + 1 < ROOM_EDGES.len() {
+            draw_world_textured(
                 camera,
-                FLOOR_X_EDGES[xi],
-                FLOOR_X_EDGES[xi + 1],
-                FLOOR_Z_EDGES[zi],
-                FLOOR_Z_EDGES[zi + 1],
+                [
+                    Vec3 {
+                        x: ROOM_EDGES[xi],
+                        y: 0,
+                        z: ROOM_EDGES[zi],
+                    },
+                    Vec3 {
+                        x: ROOM_EDGES[xi + 1],
+                        y: 0,
+                        z: ROOM_EDGES[zi],
+                    },
+                    Vec3 {
+                        x: ROOM_EDGES[xi],
+                        y: 0,
+                        z: ROOM_EDGES[zi + 1],
+                    },
+                    Vec3 {
+                        x: ROOM_EDGES[xi + 1],
+                        y: 0,
+                        z: ROOM_EDGES[zi + 1],
+                    },
+                ],
+                FLOOR_U,
                 material,
-                ot,
-                quads,
+                options,
+                world,
+                triangles,
             );
             xi += 1;
         }
@@ -324,233 +386,222 @@ fn draw_floor(
     }
 }
 
-fn draw_floor_tile(
+fn draw_walls(
     camera: Camera,
-    x0: i32,
-    x1: i32,
-    z0: i32,
-    z1: i32,
-    material: TextureMaterial,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
-    draw_world_textured(
-        camera,
-        Vec3 { x: x0, y: 0, z: z0 },
-        Vec3 { x: x1, y: 0, z: z0 },
-        Vec3 { x: x0, y: 0, z: z1 },
-        Vec3 { x: x1, y: 0, z: z1 },
-        FLOOR_U,
-        material,
-        ot,
-        quads,
+    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x4c, 0x44, 0x40));
+    let options =
+        WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE).with_cull_mode(CullMode::Back);
+    draw_z_wall(
+        camera, -ROOM_HALF, false, material, options, world, triangles,
+    );
+    draw_z_wall(camera, ROOM_HALF, true, material, options, world, triangles);
+    draw_x_wall(
+        camera, -ROOM_HALF, true, material, options, world, triangles,
+    );
+    draw_x_wall(
+        camera, ROOM_HALF, false, material, options, world, triangles,
     );
 }
 
-fn draw_wall(
+fn draw_z_wall(
     camera: Camera,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
+    z: i32,
+    reverse_x: bool,
+    material: TextureMaterial,
+    options: WorldSurfaceOptions,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
-    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x4c, 0x44, 0x40));
     let mut yi = 0;
     while yi + 1 < WALL_Y_EDGES.len() {
         let mut xi = 0;
-        while xi + 1 < WALL_X_EDGES.len() {
-            draw_wall_tile(
-                camera,
-                WALL_X_EDGES[xi],
-                WALL_X_EDGES[xi + 1],
-                WALL_Y_EDGES[yi],
-                WALL_Y_EDGES[yi + 1],
-                WALL_Z,
-                material,
-                ot,
-                quads,
-            );
+        while xi + 1 < ROOM_EDGES.len() {
+            let x0 = ROOM_EDGES[xi];
+            let x1 = ROOM_EDGES[xi + 1];
+            let y0 = WALL_Y_EDGES[yi];
+            let y1 = WALL_Y_EDGES[yi + 1];
+            let verts = if reverse_x {
+                [
+                    Vec3 { x: x1, y: y1, z },
+                    Vec3 { x: x0, y: y1, z },
+                    Vec3 { x: x1, y: y0, z },
+                    Vec3 { x: x0, y: y0, z },
+                ]
+            } else {
+                [
+                    Vec3 { x: x0, y: y1, z },
+                    Vec3 { x: x1, y: y1, z },
+                    Vec3 { x: x0, y: y0, z },
+                    Vec3 { x: x1, y: y0, z },
+                ]
+            };
+            draw_wall_textured(camera, verts, BRICK_U, material, options, world, triangles);
             xi += 1;
         }
         yi += 1;
     }
 }
 
-fn draw_side_walls(
-    camera: Camera,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
-) {
-    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x28, 0x2c, 0x34));
-    if camera.x >= 0 {
-        draw_side_wall(camera, -FLOOR_X, material, ot, quads);
-        draw_side_wall(camera, FLOOR_X, material, ot, quads);
-    } else {
-        draw_side_wall(camera, FLOOR_X, material, ot, quads);
-        draw_side_wall(camera, -FLOOR_X, material, ot, quads);
-    }
-}
-
-fn draw_side_wall(
+fn draw_x_wall(
     camera: Camera,
     x: i32,
+    reverse_z: bool,
     material: TextureMaterial,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
+    options: WorldSurfaceOptions,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
     let mut yi = 0;
-    while yi + 1 < SIDE_Y_EDGES.len() {
+    while yi + 1 < WALL_Y_EDGES.len() {
         let mut zi = 0;
-        while zi + 1 < SIDE_Z_EDGES.len() {
-            draw_side_wall_tile(
-                camera,
-                x,
-                SIDE_Z_EDGES[zi],
-                SIDE_Z_EDGES[zi + 1],
-                SIDE_Y_EDGES[yi],
-                SIDE_Y_EDGES[yi + 1],
-                material,
-                ot,
-                quads,
-            );
+        while zi + 1 < ROOM_EDGES.len() {
+            let z0 = ROOM_EDGES[zi];
+            let z1 = ROOM_EDGES[zi + 1];
+            let y0 = WALL_Y_EDGES[yi];
+            let y1 = WALL_Y_EDGES[yi + 1];
+            let verts = if reverse_z {
+                [
+                    Vec3 { x, y: y1, z: z1 },
+                    Vec3 { x, y: y1, z: z0 },
+                    Vec3 { x, y: y0, z: z1 },
+                    Vec3 { x, y: y0, z: z0 },
+                ]
+            } else {
+                [
+                    Vec3 { x, y: y1, z: z0 },
+                    Vec3 { x, y: y1, z: z1 },
+                    Vec3 { x, y: y0, z: z0 },
+                    Vec3 { x, y: y0, z: z1 },
+                ]
+            };
+            draw_wall_textured(camera, verts, BRICK_U, material, options, world, triangles);
             zi += 1;
         }
         yi += 1;
     }
 }
 
-fn draw_wall_tile(
-    camera: Camera,
-    x0: i32,
-    x1: i32,
-    y0: i32,
-    y1: i32,
-    z: i32,
-    material: TextureMaterial,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
-) {
-    draw_world_textured(
-        camera,
-        Vec3 { x: x0, y: y1, z },
-        Vec3 { x: x1, y: y1, z },
-        Vec3 { x: x0, y: y0, z },
-        Vec3 { x: x1, y: y0, z },
-        BRICK_U,
-        material,
-        ot,
-        quads,
-    );
-}
-
-fn draw_side_wall_tile(
-    camera: Camera,
-    x: i32,
-    z0: i32,
-    z1: i32,
-    y0: i32,
-    y1: i32,
-    material: TextureMaterial,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
-) {
-    draw_world_textured(
-        camera,
-        Vec3 { x, y: y1, z: z0 },
-        Vec3 { x, y: y1, z: z1 },
-        Vec3 { x, y: y0, z: z0 },
-        Vec3 { x, y: y0, z: z1 },
-        BRICK_U,
-        material,
-        ot,
-        quads,
-    );
-}
-
 fn draw_material_pane(
     scene: &Showcase,
     camera: Camera,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
-    draw_vertical_square(camera, scene.base_u(), scene.material(), ot, quads);
+    draw_vertical_square(camera, scene.base_u(), scene.material(), world, triangles);
 }
 
 fn draw_vertical_square(
     camera: Camera,
     base_u: u8,
     material: TextureMaterial,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
     let half = PANEL_SIZE / 2;
     let x0 = -half;
     let x1 = half;
     let y0 = PANEL_BOTTOM;
     let y1 = PANEL_BOTTOM + PANEL_SIZE;
+    let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE)
+        .with_cull_mode(CullMode::None)
+        .with_depth_bias(-8);
     draw_world_textured(
         camera,
-        Vec3 {
-            x: x0,
-            y: y1,
-            z: PANEL_Z,
-        },
-        Vec3 {
-            x: x1,
-            y: y1,
-            z: PANEL_Z,
-        },
-        Vec3 {
-            x: x0,
-            y: y0,
-            z: PANEL_Z,
-        },
-        Vec3 {
-            x: x1,
-            y: y0,
-            z: PANEL_Z,
-        },
+        [
+            Vec3 {
+                x: x0,
+                y: y1,
+                z: PANEL_Z,
+            },
+            Vec3 {
+                x: x1,
+                y: y1,
+                z: PANEL_Z,
+            },
+            Vec3 {
+                x: x0,
+                y: y0,
+                z: PANEL_Z,
+            },
+            Vec3 {
+                x: x1,
+                y: y0,
+                z: PANEL_Z,
+            },
+        ],
         base_u,
         material,
-        ot,
-        quads,
+        options,
+        world,
+        triangles,
     );
 }
 
 fn draw_world_textured(
     camera: Camera,
-    a: Vec3,
-    b: Vec3,
-    c: Vec3,
-    d: Vec3,
+    verts: [Vec3; 4],
     base_u: u8,
     material: TextureMaterial,
-    ot: &mut OtFrame<'_, OT_DEPTH>,
-    quads: &mut PrimitiveArena<'_, QuadTextured>,
+    options: WorldSurfaceOptions,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
-    if let Some(projected) = project_quad(camera, [a, b, c, d]) {
-        let Some(quad) = quads.push(QuadTextured::with_material(
-            projected.verts,
+    let uvs = texture_uvs(base_u);
+    let _ = world.submit_textured_view_quad(
+        triangles,
+        [
+            textured_view_vertex(camera, verts[0], uvs[0]),
+            textured_view_vertex(camera, verts[1], uvs[1]),
+            textured_view_vertex(camera, verts[2], uvs[2]),
+            textured_view_vertex(camera, verts[3], uvs[3]),
+        ],
+        PROJECTION,
+        material,
+        options,
+    );
+}
+
+fn draw_wall_textured(
+    camera: Camera,
+    verts: [Vec3; 4],
+    base_u: u8,
+    material: TextureMaterial,
+    options: WorldSurfaceOptions,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
+) {
+    if let Some(projected) = project_quad(camera, verts) {
+        let _ = world.submit_textured_quad(
+            triangles,
+            projected,
             texture_uvs(base_u),
             material,
-        )) else {
-            return;
-        };
-        let slot = WORLD_BAND.slot::<OT_DEPTH>(WORLD_DEPTH_RANGE, projected.depth);
-        ot.add_packet_slot(slot, quad);
+            options,
+        );
     }
 }
 
-fn project_quad(camera: Camera, verts: [Vec3; 4]) -> Option<ProjectedQuad> {
-    let a = project_vertex(camera, verts[0])?;
-    let b = project_vertex(camera, verts[1])?;
-    let c = project_vertex(camera, verts[2])?;
-    let d = project_vertex(camera, verts[3])?;
-    Some(ProjectedQuad {
-        verts: [(a.0, a.1), (b.0, b.1), (c.0, c.1), (d.0, d.1)],
-        depth: (a.2 + b.2 + c.2 + d.2) / 4,
-    })
+fn project_quad(camera: Camera, verts: [Vec3; 4]) -> Option<[ProjectedVertex; 4]> {
+    Some([
+        project_vertex(camera, verts[0])?,
+        project_vertex(camera, verts[1])?,
+        project_vertex(camera, verts[2])?,
+        project_vertex(camera, verts[3])?,
+    ])
 }
 
-fn project_vertex(camera: Camera, v: Vec3) -> Option<(i16, i16, i32)> {
+fn project_vertex(camera: Camera, v: Vec3) -> Option<ProjectedVertex> {
+    PROJECTION.project_view(view_vertex(camera, v))
+}
+
+fn textured_view_vertex(camera: Camera, v: Vec3, uv: (u8, u8)) -> TexturedViewVertex {
+    TexturedViewVertex::new(view_vertex(camera, v), uv.0 as i32, uv.1 as i32)
+}
+
+fn view_vertex(camera: Camera, v: Vec3) -> ViewVertex {
     let dx = v.x - camera.x;
     let dy = v.y - camera.y;
     let dz = v.z - camera.z;
@@ -560,13 +611,7 @@ fn project_vertex(camera: Camera, v: Vec3) -> Option<(i16, i16, i32)> {
     let y2 = ((dy * camera.cos_pitch) - (z1 * camera.sin_pitch)) >> 12;
     let z2 = ((dy * camera.sin_pitch) + (z1 * camera.cos_pitch)) >> 12;
 
-    if z2 <= NEAR_Z {
-        return None;
-    }
-
-    let sx = SCREEN_CX + (x1 * FOCAL) / z2;
-    let sy = SCREEN_CY - (y2 * FOCAL) / z2;
-    Some((sx as i16, sy as i16, z2))
+    ViewVertex::new(x1, y2, z2)
 }
 
 fn texture_uvs(base_u: u8) -> [(u8, u8); 4] {
