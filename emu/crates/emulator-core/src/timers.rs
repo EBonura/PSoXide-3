@@ -67,6 +67,15 @@ const MODE_REACHED_WRAP: u32 = 1 << 12;
 pub struct Timers {
     /// Per-counter state. Index 0 / 1 / 2 corresponds to Timer 0 / 1 / 2.
     pub timers: [Timer; 3],
+    /// Bus cycle at which the timers were last advanced. Used by
+    /// `advance_to` so the bus can drive timer state lazily —
+    /// once per branch-test scheduler drain and on demand from
+    /// MMIO read paths — instead of paying the per-instruction
+    /// 3-counter accumulator/divider cost. Mirrors PCSX-Redux's
+    /// `Counters::set` / `update` model where each counter holds
+    /// `cycleStart` and the live count is `(cycle - cycleStart) /
+    /// rate` evaluated lazily.
+    last_advance_cycle: u64,
 }
 
 impl Timers {
@@ -147,7 +156,42 @@ impl Timers {
                 fired |= 1 << i;
             }
         }
+        self.last_advance_cycle = self.last_advance_cycle.saturating_add(cycles);
         fired
+    }
+
+    /// Advance the timer bank to the absolute cycle `now`, using the
+    /// time elapsed since the last advance. Equivalent to calling
+    /// `tick(delta, ...)` where `delta = now - last_advance_cycle`.
+    /// Returns the same 3-bit "fired" bitmap.
+    ///
+    /// This is the lazy entry point: bus calls it once per
+    /// scheduler drain (instead of every `Bus::tick`), and read /
+    /// write paths that observe timer state call it first so the
+    /// values they see match the cycle they observe at.
+    pub fn advance_to(&mut self, now: u64, hsync_period: u64, dot_clock_divisor: u64) -> u8 {
+        let delta = now.saturating_sub(self.last_advance_cycle);
+        if delta == 0 {
+            return 0;
+        }
+        let mut fired: u8 = 0;
+        for i in 0..3 {
+            if self.advance_timer(i, delta, hsync_period, dot_clock_divisor) {
+                fired |= 1 << i;
+            }
+        }
+        self.last_advance_cycle = now;
+        fired
+    }
+
+    /// Sync the lazy clock to `now` without advancing any state.
+    /// Used by the bus when it discards skipped cycles (e.g.
+    /// post-warmup resets in tests) — calling this prevents
+    /// `advance_to` from later seeing a huge backlog and trying
+    /// to fast-forward through millions of cycles in one go.
+    #[allow(dead_code)]
+    pub fn sync_clock_to(&mut self, now: u64) {
+        self.last_advance_cycle = now;
     }
 
     /// Is this timer currently paused per its sync-mode bits?

@@ -260,6 +260,28 @@ impl Sio0 {
         self.ack_end_deadline
     }
 
+    /// Earliest pending state-machine deadline across the three
+    /// timers, or `None` if SIO0 is idle. The bus uses this to
+    /// (re)schedule [`EventSlot::Sio`] so the per-instruction
+    /// `Bus::tick` poll can be retired in favour of one event-driven
+    /// wake-up. Mirrors the role of `intCycle[PSXINT_SIO]` in
+    /// PCSX-Redux's `branchTest`.
+    pub fn next_deadline(&self) -> Option<u64> {
+        let mut next: Option<u64> = None;
+        let consider = |cur: &mut Option<u64>, candidate: Option<u64>| {
+            if let Some(c) = candidate {
+                *cur = Some(match cur {
+                    Some(prev) => (*prev).min(c),
+                    None => c,
+                });
+            }
+        };
+        consider(&mut next, self.transfer_deadline);
+        consider(&mut next, self.ack_deadline);
+        consider(&mut next, self.ack_end_deadline);
+        next
+    }
+
     /// RX slot contents, if a byte is waiting to be read.
     pub fn debug_rx(&self) -> Option<u8> {
         self.rx

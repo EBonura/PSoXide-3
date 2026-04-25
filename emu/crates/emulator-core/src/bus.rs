@@ -624,12 +624,33 @@ impl Bus {
         }
     }
 
-    /// Advance the SIO0 byte/ACK timers to the current bus cycle and
-    /// forward any newly latched controller IRQ to `I_STAT`.
+    /// Advance the SIO0 byte/ACK timers to the current bus cycle,
+    /// forward any newly latched controller IRQ to `I_STAT`, and
+    /// (re)schedule [`EventSlot::Sio`] for whatever deadline is
+    /// next pending. With the scheduler firing the wake-up, the
+    /// per-instruction poll is no longer needed — `Bus::tick`
+    /// dropped its `service_sio0` call. Read paths still call
+    /// this synchronously so a load that happens between the
+    /// branch tests sees a deadline that's already due.
     fn service_sio0(&mut self) {
         self.sio0.tick(self.cycles);
         if self.sio0.take_pending_irq() {
             self.irq.raise(IrqSource::Controller);
+        }
+        self.reschedule_sio0_event();
+    }
+
+    /// (Re)plant the [`EventSlot::Sio`] entry on the scheduler so
+    /// the next deadline (transfer / ack / ack-end) wakes us up
+    /// without us polling every instruction. Cancels any prior
+    /// pending Sio event when SIO0 has gone idle.
+    fn reschedule_sio0_event(&mut self) {
+        if let Some(deadline) = self.sio0.next_deadline() {
+            let delta = deadline.saturating_sub(self.cycles);
+            self.scheduler
+                .schedule(crate::scheduler::EventSlot::Sio, self.cycles, delta);
+        } else {
+            self.scheduler.cancel(crate::scheduler::EventSlot::Sio);
         }
     }
 
@@ -659,7 +680,11 @@ impl Bus {
     pub fn tick(&mut self, n: u32) {
         self.advance_cycles(n);
         self.drain_scheduler_events_without_cdr_dma();
-        self.service_sio0();
+        // SIO0 used to be polled here (every instruction).
+        // It's now woken up by `EventSlot::Sio` from the scheduler
+        // — see `drain_scheduler_events_inner`. Read paths still
+        // call `service_sio0` synchronously so MMIO loads observe
+        // any deadline that's already due.
     }
 
     /// Public entry point that the CPU calls between the opcode's
@@ -670,6 +695,14 @@ impl Bus {
     /// exception dispatch. Redux achieves the same effect via
     /// `branchTest` → `counters->update()`.
     pub fn drain_scheduler_events_post_op(&mut self) {
+        // Advance timer state to `now` once per branch boundary so
+        // any IRQ that would have fired between the last branchTest
+        // and this one lands in `I_STAT` in time for the same
+        // step's exception dispatch. Per-instruction `Bus::tick`
+        // doesn't touch timers anymore; this is the only path that
+        // matters for IRQ visibility. Mirrors Redux's
+        // `Counters::update` call at the top of `branchTest`.
+        self.service_timers();
         self.drain_scheduler_events();
         let cdrom_irq_pending =
             self.irq.stat() & self.irq.mask() & (1 << (IrqSource::Cdrom as u32)) != 0;
@@ -680,7 +713,12 @@ impl Bus {
         {
             self.irq.raise(IrqSource::Cdrom);
         }
-        self.service_sio0();
+        // SIO0 wake-up comes from the scheduler dispatch above
+        // (`EventSlot::Sio` in `drain_scheduler_events_inner`),
+        // not from a separate poll. The `take_due` walk is
+        // strict-greater-than, so events that were due as of
+        // `now` will fire next branch test; SIO0's parity
+        // tolerance is well within that window.
     }
 
     /// Walk every scheduler slot whose deadline has passed and
@@ -711,6 +749,14 @@ impl Bus {
         use crate::scheduler::EventSlot;
         let now = self.cycles;
         let mut dma_edge = false;
+        // NOTE: `service_timers()` is intentionally NOT called here.
+        // This function runs from the per-instruction `Bus::tick`
+        // path (via `drain_scheduler_events_without_cdr_dma`); the
+        // whole point of the lazy refactor is to avoid touching
+        // timer state on every instruction. The branch-boundary
+        // drain (`drain_scheduler_events_post_op`) advances timers
+        // before doing anything else, which is enough to keep
+        // timer IRQs firing at parity-relevant cycles.
 
         // Redux updates root counters with `cycle >= nextCounter`
         // before walking the strict interrupt-slot queue. VBlank is
@@ -725,6 +771,26 @@ impl Bus {
             self.timers.notify_vblank();
             self.scheduler
                 .schedule(EventSlot::VBlank, target, self.vblank_period);
+        }
+
+        // SIO0 also fires inclusively: the legacy polling path used
+        // `deadline <= now`, so we keep that semantic to avoid an
+        // off-by-one parity drift on controller IRQ timing. Each
+        // service may set a new deadline (transfer → ack → ack-end);
+        // `service_sio0` reschedules accordingly via
+        // `reschedule_sio0_event`, so the loop drains chained
+        // transitions in one pass.
+        while self
+            .scheduler
+            .take_slot_due_inclusive(EventSlot::Sio, now)
+            .is_some()
+        {
+            self.service_sio0();
+            // If `service_sio0` chained a follow-up deadline that's
+            // also already due (e.g. transfer → ack within one
+            // dispatch), `take_slot_due_inclusive` picks it up on
+            // the next iteration. Otherwise the loop exits and the
+            // future deadline waits for its scheduled wake-up.
         }
 
         let cdr_dma_mask = 1 << EventSlot::CdrDma.bit();
@@ -853,9 +919,31 @@ impl Bus {
     /// bank's accumulator matches Redux's lazy-read timer model.
     fn advance_cycles(&mut self, n: u32) {
         self.cycles = self.cycles.wrapping_add(n as u64);
+        // Timers used to be ticked here every instruction (~25M
+        // calls/sec, three accumulator-divides each). They're now
+        // advanced lazily — `service_timers()` runs once per
+        // scheduler drain and on demand from MMIO read / write
+        // paths. The lazy advance reads `self.cycles` so it
+        // observes the same effective time the per-tick path did.
+        // Decay the GPU's pseudo-busy credit as time passes. At
+        // 32 units per cycle a full-screen (~640×478) fill-rect
+        // credit of 153k takes ~4.8k cycles to drain — about the
+        // duration of a short VBlank window, matching real
+        // hardware's "a few scanlines to finish the batch".
+        self.gpu.decay_busy((n as u64) * 32);
+    }
+
+    /// Advance the timer bank to the current bus cycle and forward
+    /// any newly-latched timer IRQs to `I_STAT`. Cheap when nothing
+    /// changed (just a `last_advance` saturating-sub returning 0);
+    /// the work happens only in proportion to the cycles elapsed
+    /// since the last call. Read / write paths call this before
+    /// observing timer state; the scheduler drain calls it once
+    /// per branch-test boundary so IRQs fire on time.
+    fn service_timers(&mut self) {
         let fired = self
             .timers
-            .tick(n as u64, self.hsync_cycles, self.gpu.dot_clock_divisor());
+            .advance_to(self.cycles, self.hsync_cycles, self.gpu.dot_clock_divisor());
         if fired & 1 != 0 {
             self.irq.raise(IrqSource::Timer0);
         }
@@ -865,12 +953,6 @@ impl Bus {
         if fired & 4 != 0 {
             self.irq.raise(IrqSource::Timer2);
         }
-        // Decay the GPU's pseudo-busy credit as time passes. At
-        // 32 units per cycle a full-screen (~640×478) fill-rect
-        // credit of 153k takes ~4.8k cycles to drain — about the
-        // duration of a short VBlank window, matching real
-        // hardware's "a few scanlines to finish the batch".
-        self.gpu.decay_busy((n as u64) * 32);
     }
 
     /// Cumulative cycles since reset.
@@ -1667,6 +1749,7 @@ impl Bus {
         // counter reads zero from the io[] echo buffer and the loop
         // never sees the tick advance.
         if Timers::contains(phys) {
+            self.service_timers();
             return self.timers.read32(phys) as u16;
         }
         if Dma::contains(phys) {
@@ -1759,6 +1842,7 @@ impl Bus {
             return self.irq.mask();
         }
         if Timers::contains(phys) {
+            self.service_timers();
             return self.timers.read32(phys);
         }
         if Dma::contains(phys) {
@@ -1827,6 +1911,10 @@ impl Bus {
             return;
         }
         if Timers::contains(phys) {
+            // Advance pre-write so an in-flight tick fires its IRQ
+            // before the write resets / re-arms the counter, then
+            // perform the write.
+            self.service_timers();
             self.timers.write32(phys, value, self.cycles);
             return;
         }
@@ -2028,6 +2116,7 @@ impl Bus {
         }
         // Timer registers are 16-bit on hardware.
         if Timers::contains(phys) {
+            self.service_timers();
             self.timers.write32(phys, value as u32, self.cycles);
             return;
         }
