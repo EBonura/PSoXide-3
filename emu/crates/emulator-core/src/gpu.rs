@@ -1339,6 +1339,17 @@ impl Gpu {
     /// tiling set non-zero mask/offset to reuse a sub-rectangle of
     /// the tpage across multiple primitives.
     fn sample_texture(&self, u: u16, v: u16, clut_x: u16, clut_y: u16) -> Option<u16> {
+        // PSX-SPX: the GPU's U/V counters are 8 bits — texture pages
+        // wrap every 256 texels horizontally and vertically. Callers
+        // pass u16 because rasterizer interpolation works in a wider
+        // domain, so we mask down to 8 bits *before* the texture
+        // window. Without this, a sprite or polygon whose `U + dx`
+        // exceeds 255 reads VRAM PAST the tpage edge — typically the
+        // neighbouring tpage's data, garbage texels, or a different
+        // CLUT-driven byte. Visible as smeared / corrupted 2D sprites
+        // (Tekken 3 character portraits, BIOS dialog frames).
+        let u = u & 0xFF;
+        let v = v & 0xFF;
         // Apply the texture window — PSX-SPX:
         //   U' = (U AND NOT(mask_x * 8)) OR ((offset_x * 8) AND (mask_x * 8))
         // but both `mask_*` and `offset_*` are already pre-shifted (×8)
@@ -4003,6 +4014,44 @@ mod tests {
         assert_eq!(gpu.sample_texture(0, 0, 0, 0), None);
         gpu.vram.set_pixel(1, 0, 0x1234);
         assert_eq!(gpu.sample_texture(1, 0, 0, 0), Some(0x1234));
+    }
+
+    #[test]
+    fn sample_texture_uv_wrap_at_256_per_psx_spx() {
+        // Regression: the PS1's GPU walks U/V through an 8-bit counter,
+        // so a tpage wraps every 256 texels horizontally and vertically.
+        // The rasterizer adds a width-bounded `dx` to the base U/V and
+        // can pass values >= 256 here; without the explicit `& 0xFF`
+        // we read VRAM PAST the tpage edge and pull garbage from the
+        // neighbouring tpage. Visible as smeared 2D sprites in pre-fight
+        // loading screens (Tekken 3 character portraits) and corrupt
+        // BIOS dialog frames.
+        //
+        // Test: in 15bpp mode, place a recognisable colour at tpage
+        // origin (u,v)=(0,0) and a different colour at host VRAM
+        // (256,0) — outside the tpage. Sampling at u=256 must return
+        // the FIRST colour (wrap), not the second.
+        let mut gpu = Gpu::new();
+        gpu.tex_depth = 2; // 15bpp — one VRAM word per texel
+        gpu.tex_page_x = 0;
+        gpu.tex_page_y = 0;
+        gpu.vram.set_pixel(0, 0, 0x1111); // tpage origin
+        gpu.vram.set_pixel(256, 0, 0x2222); // outside the tpage
+        assert_eq!(
+            gpu.sample_texture(256, 0, 0, 0),
+            Some(0x1111),
+            "u=256 should wrap to u=0 within the tpage"
+        );
+        assert_eq!(
+            gpu.sample_texture(257, 0, 0, 0),
+            None,
+            "u=257 should wrap to u=1 → vram(1,0)=0 → transparent"
+        );
+        // V wrap: v=256 → v&0xFF=0 → vram(0,0)=0x1111. v=257 →
+        // v&0xFF=1 → vram(0,1) (a different row), confirms v wraps too.
+        gpu.vram.set_pixel(0, 1, 0x3333);
+        assert_eq!(gpu.sample_texture(0, 256, 0, 0), Some(0x1111), "v=256 wraps to v=0");
+        assert_eq!(gpu.sample_texture(0, 257, 0, 0), Some(0x3333), "v=257 wraps to v=1");
     }
 
     #[test]
