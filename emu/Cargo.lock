@@ -2414,6 +2414,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "psx-gpu-compute"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "emulator-core",
+ "pollster",
+ "thiserror 1.0.69",
+ "wgpu",
+]
+
+[[package]]
 name = "psx-hw"
 version = "0.1.0"
 dependencies = [

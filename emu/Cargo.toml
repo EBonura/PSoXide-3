@@ -5,6 +5,7 @@ members = [
     "crates/frontend",
     "crates/parity-oracle",
     "crates/psoxide-settings",
+    "crates/psx-gpu-compute",
 ]
 
 [workspace.package]
