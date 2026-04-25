@@ -137,8 +137,8 @@ impl Angle {
 
     /// Convert to the u16 that [`psx_math::sincos::sin_q12`] and
     /// [`psx_math::sincos::cos_q12`] consume. Drops the low 4 bits
-    /// to land on Q0.12 (4096-per-revolution). The low bits don't
-    /// survive the LUT anyway.
+    /// of the Q0.16 value to land on Q0.12
+    /// (4096-per-revolution).
     pub const fn sin_q12_arg(self) -> u16 {
         (self.0 >> 4) & 0xFFF
     }
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn sin_q12_arg_strips_low_nibble() {
+    fn sin_q12_arg_converts_to_q0_12() {
         // Q0.16 = 0x4000 → Q0.12 = 0x400 (quarter turn in 4096-per-rev).
         assert_eq!(Angle::QUARTER.sin_q12_arg(), 0x400);
         // Q0.16 = 0x8000 → Q0.12 = 0x800.

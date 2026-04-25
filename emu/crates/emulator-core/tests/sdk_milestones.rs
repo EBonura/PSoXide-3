@@ -366,23 +366,23 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-tex" => Some(SdkGolden {
             example: "hello-tex",
             vblanks: 2,
-            vram_hash: 0x1291_2e30_2641_3e9f,
+            vram_hash: 0x7d8c_c1a8_3fd6_ee47,
             display_hash: 0x6b0c_8a05_afca_2bae,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_1298,
+            final_pc: 0x8001_130c,
             redux_display_hash: None,
         }),
         "hello-ot" => Some(SdkGolden {
             example: "hello-ot",
             vblanks: 2,
-            vram_hash: 0xa8fc_3c26_d9a2_ee80,
-            display_hash: 0xdb22_e03e_82dc_86be,
+            vram_hash: 0x759a_f51d_8acc_34c1,
+            display_hash: 0xd1dd_e059_00c0_5be3,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_05a0,
+            final_pc: 0x8001_05e4,
             redux_display_hash: None,
         }),
         "hello-input" => Some(SdkGolden {
@@ -410,8 +410,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-textured-sprite" => Some(SdkGolden {
             example: "showcase-textured-sprite",
             vblanks: 3,
-            vram_hash: 0xb287_f9fe_3151_b02f,
-            display_hash: 0x9dc1_d0c3_9eca_9931,
+            vram_hash: 0x058d_8dd1_155f_7871,
+            display_hash: 0xb56f_aae2_9dc3_c4ea,
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
@@ -421,7 +421,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             // material. The room uses short textured side returns and
             // repeated floor tiles so the faster orbit stays readable
             // without artificial backing cards.
-            final_pc: 0x8001_2518,
+            final_pc: 0x8001_2490,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:
@@ -566,12 +566,12 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-lights" => Some(SdkGolden {
             example: "showcase-lights",
             vblanks: 60,
-            vram_hash: 0x4058_93e4_75f3_5230,
-            display_hash: 0xc6dc_b875_f7e6_0798,
+            vram_hash: 0xb06b_834b_a396_2f7d,
+            display_hash: 0xc3d9_1f9e_0ae3_ede5,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_10dc,
+            final_pc: 0x8001_115c,
             redux_display_hash: None,
         }),
 
@@ -622,12 +622,12 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-engine" => Some(SdkGolden {
             example: "hello-engine",
             vblanks: 4,
-            vram_hash: 0xf7c6_35c6_c967_2d25,
-            display_hash: 0xb2d4_083b_0bd1_1125,
+            vram_hash: 0xed9a_1715_859f_f925,
+            display_hash: 0xcf68_7a3c_953c_2d25,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0770,
+            final_pc: 0x8001_07d8,
             redux_display_hash: None,
         }),
         _ => None,

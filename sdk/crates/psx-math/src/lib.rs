@@ -11,7 +11,7 @@
 //! ## What's here today
 //!
 //! - [`sincos`] — Q0.12 angle type + 256-entry Q1.12 sine LUT +
-//!   `sin_q12` / `cos_q12` lookups. ~1.4° angular resolution.
+//!   interpolated `sin_q12` / `cos_q12` lookups.
 //!
 //! ## What's planned (same crate, future modules)
 //!
