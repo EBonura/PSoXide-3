@@ -73,6 +73,24 @@ pub struct Rasterizer {
     /// needs more rows than the current capacity (cheap — wgpu
     /// doesn't actually free until `submit` completes anyway).
     tex_tri_scanline_rows: std::cell::RefCell<wgpu::Buffer>,
+
+    // Phase B.x: shaded-textured triangle with bit-exact scanline-
+    // delta UV + RGB interpolation. Reuses tex_tri_scanline_bg_layout
+    // (same 6-binding shape).
+    shaded_tex_tri_scanline_pipeline: wgpu::ComputePipeline,
+    shaded_tex_tri_scanline_consts: wgpu::Buffer,
+    shaded_tex_tri_scanline_rows: std::cell::RefCell<wgpu::Buffer>,
+
+    // Phase B.x: mono + shaded triangle scanline pipelines. Same
+    // 5-binding shape (VRAM + prim + draw area + rows + consts —
+    // no tpage since neither samples a texture).
+    mono_shaded_scanline_bg_layout: wgpu::BindGroupLayout,
+    mono_tri_scanline_pipeline: wgpu::ComputePipeline,
+    mono_tri_scanline_consts: wgpu::Buffer,
+    mono_tri_scanline_rows: std::cell::RefCell<wgpu::Buffer>,
+    shaded_tri_scanline_pipeline: wgpu::ComputePipeline,
+    shaded_tri_scanline_consts: wgpu::Buffer,
+    shaded_tri_scanline_rows: std::cell::RefCell<wgpu::Buffer>,
 }
 
 impl Rasterizer {
@@ -522,6 +540,167 @@ impl Rasterizer {
             mapped_at_creation: false,
         });
 
+        // ---------- Shaded-tex-tri scanline pipeline (B.x) ----------
+        // Same 6-binding layout as tex_tri_scanline; just a different
+        // shader entry that walks RGB in addition to UV.
+        let shaded_tex_tri_scanline_pl = device.create_pipeline_layout(
+            &wgpu::PipelineLayoutDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri-scanline-pl"),
+                bind_group_layouts: &[&tex_tri_scanline_bg_layout],
+                push_constant_ranges: &[],
+            },
+        );
+        let shaded_tex_tri_scanline_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri-scanline-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/shaded_tex_tri_scanline.wgsl").into(),
+                ),
+            });
+        let shaded_tex_tri_scanline_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri-scanline"),
+                layout: Some(&shaded_tex_tri_scanline_pl),
+                module: &shaded_tex_tri_scanline_shader,
+                entry_point: Some("rasterize"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let shaded_tex_tri_scanline_consts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-shaded-tex-tri-scanline-consts"),
+            size: std::mem::size_of::<ScanlineConsts>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shaded_tex_tri_scanline_rows = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-shaded-tex-tri-scanline-rows"),
+            size: initial_rows_capacity_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // ---------- Mono / Shaded tri scanline pipelines (B.x) ----------
+        // 5-binding shape: VRAM + prim + draw area + rows + consts.
+        let mono_shaded_scanline_bg_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("psx-rasterizer-mono-shaded-scanline-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let mono_shaded_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("psx-rasterizer-mono-shaded-scanline-pl"),
+            bind_group_layouts: &[&mono_shaded_scanline_bg_layout],
+            push_constant_ranges: &[],
+        });
+
+        let mono_tri_scanline_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("psx-rasterizer-mono-tri-scanline-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/mono_tri_scanline.wgsl").into(),
+                ),
+            });
+        let mono_tri_scanline_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("psx-rasterizer-mono-tri-scanline"),
+                layout: Some(&mono_shaded_pl),
+                module: &mono_tri_scanline_shader,
+                entry_point: Some("rasterize"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let mono_tri_scanline_consts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-mono-tri-scanline-consts"),
+            size: std::mem::size_of::<ScanlineConsts>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mono_tri_scanline_rows = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-mono-tri-scanline-rows"),
+            size: initial_rows_capacity_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let shaded_tri_scanline_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("psx-rasterizer-shaded-tri-scanline-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/shaded_tri_scanline.wgsl").into(),
+                ),
+            });
+        let shaded_tri_scanline_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("psx-rasterizer-shaded-tri-scanline"),
+                layout: Some(&mono_shaded_pl),
+                module: &shaded_tri_scanline_shader,
+                entry_point: Some("rasterize"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let shaded_tri_scanline_consts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-shaded-tri-scanline-consts"),
+            size: std::mem::size_of::<ScanlineConsts>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shaded_tri_scanline_rows = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-shaded-tri-scanline-rows"),
+            size: initial_rows_capacity_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             device,
             queue,
@@ -548,7 +727,327 @@ impl Rasterizer {
             tex_tri_scanline_bg_layout,
             tex_tri_scanline_consts,
             tex_tri_scanline_rows: std::cell::RefCell::new(tex_tri_scanline_rows),
+            shaded_tex_tri_scanline_pipeline,
+            shaded_tex_tri_scanline_consts,
+            shaded_tex_tri_scanline_rows: std::cell::RefCell::new(
+                shaded_tex_tri_scanline_rows,
+            ),
+            mono_shaded_scanline_bg_layout,
+            mono_tri_scanline_pipeline,
+            mono_tri_scanline_consts,
+            mono_tri_scanline_rows: std::cell::RefCell::new(mono_tri_scanline_rows),
+            shaded_tri_scanline_pipeline,
+            shaded_tri_scanline_consts,
+            shaded_tri_scanline_rows: std::cell::RefCell::new(shaded_tri_scanline_rows),
         }
+    }
+
+    /// Bit-exact monochrome triangle dispatch via scanline-delta
+    /// coverage. Same drawing/RMW behaviour as `dispatch_mono_tri`
+    /// but uses the CPU rasterizer's per-row `(left_x, right_x)`
+    /// coverage rule instead of a per-pixel edge-function test, so
+    /// edge pixels match the CPU byte-for-byte.
+    pub fn dispatch_mono_tri_scanline(
+        &self,
+        vram: &VramGpu,
+        tri: &MonoTri,
+        area: &DrawArea,
+    ) -> bool {
+        if tri.exceeds_hw_extent() {
+            return false;
+        }
+        let v = [
+            (tri.v0[0], tri.v0[1]),
+            (tri.v1[0], tri.v1[1]),
+            (tri.v2[0], tri.v2[1]),
+        ];
+        let setup = match scanline::build_setup(v, [(0, 0); 3], [(0, 0, 0); 3]) {
+            Some(s) => s,
+            None => return false,
+        };
+        self.scanline_dispatch(
+            vram,
+            tri,
+            std::mem::size_of::<MonoTri>() as u64,
+            &self.mono_tri_scanline_pipeline,
+            &self.mono_tri_scanline_consts,
+            &self.mono_tri_scanline_rows,
+            &setup,
+            area,
+            tri.bbox_max[0] - tri.bbox_min[0] + 1,
+            tri.bbox_max[1] - tri.bbox_min[1] + 1,
+            "mono",
+        )
+    }
+
+    /// Bit-exact Gouraud-shaded triangle dispatch via scanline-delta.
+    pub fn dispatch_shaded_tri_scanline(
+        &self,
+        vram: &VramGpu,
+        tri: &ShadedTri,
+        area: &DrawArea,
+    ) -> bool {
+        if tri.exceeds_hw_extent() {
+            return false;
+        }
+        let v = [
+            (tri.v0[0], tri.v0[1]),
+            (tri.v1[0], tri.v1[1]),
+            (tri.v2[0], tri.v2[1]),
+        ];
+        let unpack_rgb = |c: u32| {
+            (
+                (c & 0xFF) as i32,
+                ((c >> 8) & 0xFF) as i32,
+                ((c >> 16) & 0xFF) as i32,
+            )
+        };
+        let rgb = [unpack_rgb(tri.c0), unpack_rgb(tri.c1), unpack_rgb(tri.c2)];
+        let setup = match scanline::build_setup(v, [(0, 0); 3], rgb) {
+            Some(s) => s,
+            None => return false,
+        };
+        self.scanline_dispatch(
+            vram,
+            tri,
+            std::mem::size_of::<ShadedTri>() as u64,
+            &self.shaded_tri_scanline_pipeline,
+            &self.shaded_tri_scanline_consts,
+            &self.shaded_tri_scanline_rows,
+            &setup,
+            area,
+            tri.bbox_max[0] - tri.bbox_min[0] + 1,
+            tri.bbox_max[1] - tri.bbox_min[1] + 1,
+            "shaded",
+        )
+    }
+
+    /// Shared dispatch helper for the 5-binding scanline pipelines
+    /// (mono + shaded). Writes the prim uniform from the host
+    /// struct, uploads per-row state, and dispatches over the bbox.
+    #[allow(clippy::too_many_arguments)]
+    fn scanline_dispatch<P: bytemuck::Pod>(
+        &self,
+        vram: &VramGpu,
+        tri: &P,
+        _prim_size_bytes: u64,
+        pipeline: &wgpu::ComputePipeline,
+        consts_buf: &wgpu::Buffer,
+        rows_cell: &std::cell::RefCell<wgpu::Buffer>,
+        setup: &scanline::ScanlineSetup,
+        area: &DrawArea,
+        bbox_w: i32,
+        bbox_h: i32,
+        label: &'static str,
+    ) -> bool {
+        if bbox_w <= 0 || bbox_h <= 0 {
+            return false;
+        }
+        // Both mono and shaded scanline paths reuse `mono_tri_uniform`
+        // (mono) / `shaded_tri_uniform` (shaded) — but to keep this
+        // helper generic, we'll write through the existing per-prim
+        // uniform we already manage. Looking up which one to use:
+        let prim_uniform = match label {
+            "mono" => &self.mono_tri_uniform,
+            "shaded" => &self.shaded_tri_uniform,
+            _ => unreachable!("unknown scanline-dispatch label: {label}"),
+        };
+
+        let rows_size_bytes =
+            (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
+        {
+            let mut rows_buf = rows_cell.borrow_mut();
+            if rows_buf.size() < rows_size_bytes {
+                *rows_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("psx-rasterizer-scanline-rows-grown"),
+                    size: rows_size_bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+        }
+        self.queue.write_buffer(prim_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(consts_buf, 0, bytemuck::bytes_of(&setup.consts));
+        let rows_buf = rows_cell.borrow();
+        self.queue
+            .write_buffer(&rows_buf, 0, bytemuck::cast_slice(&setup.rows));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-scanline-bg"),
+            layout: &self.mono_shaded_scanline_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: prim_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.draw_area_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: rows_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: consts_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-scanline-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-scanline-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        true
+    }
+
+    /// Bit-exact textured-Gouraud triangle dispatch (B.x). Composes
+    /// the scanline-delta UV walk from `dispatch_tex_tri_scanline`
+    /// with the per-vertex tint walk; the host runs the same
+    /// `setup_sections` + `next_row` loop the CPU does, with both
+    /// UV and RGB attributes populated, so the GPU output matches
+    /// the CPU rasterizer byte-for-byte.
+    pub fn dispatch_shaded_tex_tri_scanline(
+        &self,
+        vram: &VramGpu,
+        tri: &ShadedTexTri,
+        tpage: &Tpage,
+        area: &DrawArea,
+    ) -> bool {
+        if tri.exceeds_hw_extent() {
+            return false;
+        }
+        let v = [
+            (tri.v0[0], tri.v0[1]),
+            (tri.v1[0], tri.v1[1]),
+            (tri.v2[0], tri.v2[1]),
+        ];
+        let uv = [
+            ((tri.uv0 & 0xFF) as i32, ((tri.uv0 >> 8) & 0xFF) as i32),
+            ((tri.uv1 & 0xFF) as i32, ((tri.uv1 >> 8) & 0xFF) as i32),
+            ((tri.uv2 & 0xFF) as i32, ((tri.uv2 >> 8) & 0xFF) as i32),
+        ];
+        // Vertex tints are 24-bit RGB packed in the c0/c1/c2 fields.
+        let unpack_rgb = |c: u32| {
+            (
+                (c & 0xFF) as i32,
+                ((c >> 8) & 0xFF) as i32,
+                ((c >> 16) & 0xFF) as i32,
+            )
+        };
+        let rgb = [unpack_rgb(tri.c0), unpack_rgb(tri.c1), unpack_rgb(tri.c2)];
+        let setup = match scanline::build_setup(v, uv, rgb) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let rows_size_bytes =
+            (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
+        {
+            let mut rows_buf = self.shaded_tex_tri_scanline_rows.borrow_mut();
+            if rows_buf.size() < rows_size_bytes {
+                *rows_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("psx-rasterizer-shaded-tex-tri-scanline-rows-grown"),
+                    size: rows_size_bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+        }
+
+        self.queue.write_buffer(
+            &self.shaded_tex_tri_uniform,
+            0,
+            bytemuck::bytes_of(tri),
+        );
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+        self.queue.write_buffer(
+            &self.shaded_tex_tri_scanline_consts,
+            0,
+            bytemuck::bytes_of(&setup.consts),
+        );
+        let rows_buf = self.shaded_tex_tri_scanline_rows.borrow();
+        self.queue
+            .write_buffer(&rows_buf, 0, bytemuck::cast_slice(&setup.rows));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-shaded-tex-tri-scanline-bg"),
+            layout: &self.tex_tri_scanline_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.shaded_tex_tri_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.draw_area_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.tpage_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: rows_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.shaded_tex_tri_scanline_consts.as_entire_binding(),
+                },
+            ],
+        });
+
+        let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
+        let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
+        if bbox_w <= 0 || bbox_h <= 0 {
+            return false;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri-scanline-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri-scanline-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.shaded_tex_tri_scanline_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        true
     }
 
     /// Bit-exact textured-triangle dispatch via scanline-delta math.
@@ -2267,6 +2766,118 @@ mod tests {
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(cpu_words, gpu_words, "tex tri scanline 4bpp+CLUT strict parity");
+    }
+
+    #[test]
+    fn shaded_tex_tri_scanline_15bpp_is_bit_exact() {
+        // The same setup as the B.3.b textured-shaded test, but
+        // through the scanline-delta dispatcher. Strict equality
+        // expected — both UV and RGB walks now exactly match the
+        // CPU's cumulative arithmetic.
+        let v = [(20i32, 20i32), (60, 20), (20, 60)];
+        let uv = [(0u8, 0u8), (32, 0), (0, 32)];
+        let c = [
+            (0x80u8, 0x80u8, 0x80u8),
+            (0xC0, 0xC0, 0xC0),
+            (0xFFu8, 0xFFu8, 0xFFu8),
+        ];
+        let tpage_x = 128u32;
+        let tpage_word = make_tpage_word(tpage_x, 0, 2, 0);
+
+        let mut vram = vec![0u16; 1024 * 512];
+        for vy in 0..32u16 {
+            for ux in 0..32u16 {
+                let val = ((vy as u16) << 5) | (ux as u16) | 0x0001;
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        let pack_rgb = |t: (u8, u8, u8)| {
+            (t.0 as u32) | ((t.1 as u32) << 8) | ((t.2 as u32) << 16)
+        };
+        // 0x34 = textured-shaded triangle.
+        cpu.gp0_push((0x34u32 << 24) | pack_rgb(c[0]));
+        cpu.gp0_push(pack_xy(v[0]));
+        cpu.gp0_push(uv_pack(uv[0]));
+        cpu.gp0_push(pack_rgb(c[1]));
+        cpu.gp0_push(pack_xy(v[1]));
+        cpu.gp0_push((tpage_word << 16) | uv_pack(uv[1]));
+        cpu.gp0_push(pack_rgb(c[2]));
+        cpu.gp0_push(pack_xy(v[2]));
+        cpu.gp0_push(uv_pack(uv[2]));
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = ShadedTexTri::new(
+            v[0], v[1], v[2],
+            c[0], c[1], c[2],
+            uv[0], uv[1], uv[2],
+            0, 0,
+            PrimFlags::empty(),
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 2);
+        let dispatched = r.dispatch_shaded_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
+        assert!(dispatched);
+        let gpu_words = vg.download_full().unwrap();
+
+        assert_eq!(
+            cpu_words, gpu_words,
+            "shaded-tex-tri scanline strict parity"
+        );
+    }
+
+    #[test]
+    fn mono_tri_scanline_skewed_is_bit_exact() {
+        // The B.1 skewed triangle case had ≤0.5% edge-rule diffs
+        // under barycentric. With scanline-delta coverage, strict
+        // equality.
+        let v0 = (50i32, 20i32);
+        let v1 = (130, 70);
+        let v2 = (30, 90);
+        let color = 0x03E0u16;
+        let cpu = cpu_rasterize_mono_tri(v0, v1, v2, color);
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        let tri = MonoTri::opaque(v0, v1, v2, color);
+        let dispatched = r.dispatch_mono_tri_scanline(&vg, &tri, &DrawArea::full_vram());
+        assert!(dispatched);
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "mono tri scanline skewed strict parity");
+    }
+
+    #[test]
+    fn shaded_tri_scanline_skewed_is_bit_exact() {
+        // The B.3.a tri had ±2/5-bit channel error under barycentric.
+        // With scanline-delta RGB walk, strict equality.
+        let v = [(50i32, 20i32), (130, 70), (30, 90)];
+        let c = [
+            (0xFFu8, 0x00u8, 0x00u8),
+            (0x00, 0xFF, 0x00),
+            (0x00, 0x00, 0xFF),
+        ];
+        let cpu = cpu_rasterize_shaded_tri(v, c, 0x30, 0, 0, 0);
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        let tri = ShadedTri::new(
+            v[0], v[1], v[2],
+            c[0], c[1], c[2],
+            PrimFlags::empty(),
+            BlendMode::Average,
+        );
+        let dispatched = r.dispatch_shaded_tri_scanline(&vg, &tri, &DrawArea::full_vram());
+        assert!(dispatched);
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "shaded tri scanline skewed strict parity");
     }
 
     // -------------------------------------------------------
