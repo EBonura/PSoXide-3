@@ -1205,7 +1205,15 @@ impl Gte {
         let z = (sz3 as u16).leading_zeros();
         let n = h << z;
         let d = sz3 << z;
-        let table_index = ((d.wrapping_sub(0x7FC0)) >> 7) as usize & 0xFF;
+        // Table index is `(d - 0x7FC0) >> 7`, range 0..=256 (UNR_TABLE
+        // has 257 entries). A `& 0xFF` mask aliases index 256 →
+        // index 0, which corrupts the reciprocal whenever the
+        // normalised divisor lands in {0xFFFE, 0xFFFF}: table[256]=0x00
+        // gives u=0x101 (smallest seed) but table[0]=0xFF gives
+        // u=0x200 (largest), producing a divisor ~2000× too small and
+        // collapsing projected vertices toward the screen offset.
+        // Matches Redux's `gte_divide` and PSX-SPX exactly.
+        let table_index = (d.wrapping_sub(0x7FC0) >> 7) as usize;
         let u = (UNR_TABLE[table_index] as u32) + 0x101;
         let d = (0x2000080u32.wrapping_sub(d.wrapping_mul(u))) >> 8;
         let d = (0x80u32.wrapping_add(d.wrapping_mul(u))) >> 8;
@@ -1828,6 +1836,38 @@ mod tests {
         g.write_control(26, 2); // H = 2 → H >= 2*SZ3.
         g.execute(cmd_word(true, false, 0, 0, 0, 0x01));
         assert!(g.read_control(31) & flag::DIV_OVERFLOW != 0);
+    }
+
+    #[test]
+    fn rtps_unr_table_index_256_is_not_aliased() {
+        // Regression: when the normalised SZ3 lands in {0xFFFE, 0xFFFF}
+        // the UNR-table index is 256 — the upper bound of the
+        // 257-entry table. A defensive `& 0xFF` mask on the index
+        // aliased it to 0, swapping the smallest reciprocal multiplier
+        // (table[256]=0x00 → u=0x101) for the largest
+        // (table[0]=0xFF → u=0x200). The resulting divisor was about
+        // 2000× too small, which collapses the projected vertex
+        // toward (OFX>>16, OFY>>16) — visually "triangles exploding
+        // to the screen centre". Pin the boundary so the mask can't
+        // sneak back in.
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        // V0 = (0x100, 0, 0x7FFF). With identity rotation and sf=1,
+        // MAC3 = V.z = 0x7FFF, so SZ3 = 0x7FFF; leading_zeros
+        // normalises that to d = 0xFFFE which exercises table[256].
+        g.write_data(0, pack_xy_i16(0x100, 0));
+        g.write_data(1, 0x7FFF);
+        g.write_control(24, 0); // OFX
+        g.write_control(25, 0); // OFY
+        g.write_control(26, 0x4000); // H
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x01));
+        assert_eq!(g.read_data(19), 0x7FFF, "SZ3 fixture");
+        // Correct divisor is 0x8001 (≈(H<<16)/SZ3=0x8000.4, rounded
+        // up by Newton-Raphson). With the buggy mask divisor=0x4 and
+        // SX2 collapses to 0. Expected SX2 = (0x8001*0x100)>>16 = 0x80.
+        let sxy2 = g.read_data(14);
+        let sx2 = (sxy2 & 0xFFFF) as i16;
+        assert_eq!(sx2, 0x80, "SX2 should be 0x80, was {sx2:#x}");
     }
 
     #[test]
