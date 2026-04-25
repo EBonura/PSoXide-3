@@ -114,6 +114,12 @@ pub struct Bus {
     /// the VBlank scheduler. Flipped by [`Bus::set_pal_mode`];
     /// defaults to NTSC for existing parity tests.
     hsync_cycles: u64,
+    /// HSync cadence used by the VBlank scheduler. Redux changes
+    /// the active PAL/NTSC thresholds on GP1 display-mode writes,
+    /// but the base counter's target can retain its previous cadence;
+    /// keeping this separate from Timer 1's HBlank source preserves
+    /// that phase.
+    vblank_hsync_cycles: u64,
     /// VBlank period in cycles — one full frame at the current
     /// video region. 564_398 for NTSC, 677_343 for PAL.
     vblank_period: u64,
@@ -164,6 +170,60 @@ const VBLANK_PERIOD_CYCLES_PAL: u64 = HSYNC_CYCLES_PAL * HSYNC_TOTAL_PAL;
 const FIRST_VBLANK_CYCLE: u64 = FIRST_VBLANK_CYCLE_NTSC;
 #[allow(dead_code)]
 const VBLANK_PERIOD_CYCLES: u64 = VBLANK_PERIOD_CYCLES_NTSC;
+
+#[derive(Clone, Copy)]
+struct VideoTiming {
+    hsync: u64,
+    period: u64,
+    start_scanline: u64,
+    total_scanlines: u64,
+}
+
+fn current_video_params(hsync: u64, period: u64) -> Option<VideoTiming> {
+    if period == hsync.saturating_mul(HSYNC_TOTAL_NTSC) {
+        Some(VideoTiming {
+            hsync,
+            period,
+            start_scanline: VBLANK_START_SCANLINE_NTSC,
+            total_scanlines: HSYNC_TOTAL_NTSC,
+        })
+    } else if period == hsync.saturating_mul(HSYNC_TOTAL_PAL) {
+        Some(VideoTiming {
+            hsync,
+            period,
+            start_scanline: VBLANK_START_SCANLINE_PAL,
+            total_scanlines: HSYNC_TOTAL_PAL,
+        })
+    } else {
+        None
+    }
+}
+
+fn estimate_current_scanline(
+    now: u64,
+    next_vblank: u64,
+    period: u64,
+    hsync: u64,
+    start_scanline: u64,
+    total_scanlines: u64,
+) -> u64 {
+    let previous_vblank = previous_vblank_target(now, next_vblank, period);
+    let since_previous = now.saturating_sub(previous_vblank);
+    (start_scanline + since_previous / hsync.max(1)) % total_scanlines.max(1)
+}
+
+fn estimate_scanline_phase(now: u64, next_vblank: u64, period: u64, hsync: u64) -> u64 {
+    let previous_vblank = previous_vblank_target(now, next_vblank, period);
+    now.saturating_sub(previous_vblank) % hsync.max(1)
+}
+
+fn previous_vblank_target(now: u64, mut next_vblank: u64, period: u64) -> u64 {
+    let period = period.max(1);
+    while next_vblank > now {
+        next_vblank = next_vblank.saturating_sub(period);
+    }
+    next_vblank
+}
 
 impl Bus {
     /// Build a bus with the given BIOS image. RAM and scratchpad are
@@ -220,6 +280,7 @@ impl Bus {
             hle_bios_enabled: false,
             hle_bios_calls: [[0; 256]; 3],
             hsync_cycles: HSYNC_CYCLES_NTSC,
+            vblank_hsync_cycles: HSYNC_CYCLES_NTSC,
             vblank_period: VBLANK_PERIOD_CYCLES_NTSC,
             unmapped_read_seen: std::collections::BTreeSet::new(),
             unmapped_write_seen: std::collections::BTreeSet::new(),
@@ -231,24 +292,110 @@ impl Bus {
     /// Switch to PAL video timing: 50 Hz refresh, 314-scanline
     /// frames, 2157 HSync cycles. Resets the VBlank scheduler to
     /// the PAL first-VBlank cycle + period, and reconfigures the
-    /// HBlank tick rate for Timer 1. Call before stepping on a PAL
-    /// game; NTSC is the default.
+    /// HBlank tick rate for Timer 1. PAL retail games select this
+    /// through GP1 display-mode writes; NTSC is the reset default.
     ///
     /// Calling this after any stepping has already happened leaves
     /// cumulative `cycles` in place — the next VBlank will still
     /// fire at the correct *frame* boundary even if mid-frame.
     pub fn set_pal_mode(&mut self) {
-        self.hsync_cycles = HSYNC_CYCLES_PAL;
-        self.vblank_period = VBLANK_PERIOD_CYCLES_PAL;
+        self.set_video_region(true);
+    }
+
+    /// Switch to NTSC video timing: 60 Hz refresh, 263-scanline
+    /// frames, 2146 HSync cycles.
+    pub fn set_ntsc_mode(&mut self) {
+        self.set_video_region(false);
+    }
+
+    fn set_video_region(&mut self, pal: bool) {
+        let old = current_video_params(self.vblank_hsync_cycles, self.vblank_period);
+        let (hsync, first_vblank, canonical_period, start_scanline, total_scanlines) = if pal {
+            (
+                HSYNC_CYCLES_PAL,
+                FIRST_VBLANK_CYCLE_PAL,
+                VBLANK_PERIOD_CYCLES_PAL,
+                VBLANK_START_SCANLINE_PAL,
+                HSYNC_TOTAL_PAL,
+            )
+        } else {
+            (
+                HSYNC_CYCLES_NTSC,
+                FIRST_VBLANK_CYCLE_NTSC,
+                VBLANK_PERIOD_CYCLES_NTSC,
+                VBLANK_START_SCANLINE_NTSC,
+                HSYNC_TOTAL_NTSC,
+            )
+        };
+        if self.hsync_cycles == hsync {
+            return;
+        }
+        let vblank_hsync = if self.cycles == 0 {
+            hsync
+        } else {
+            old.map(|old| old.hsync).unwrap_or(hsync)
+        };
+        let period = if self.cycles == 0 {
+            canonical_period
+        } else {
+            vblank_hsync.saturating_mul(total_scanlines)
+        };
+        let delay = if self.cycles == 0 {
+            first_vblank
+        } else {
+            let current_scanline = old
+                .and_then(|old| {
+                    self.scheduler
+                        .target(crate::scheduler::EventSlot::VBlank)
+                        .map(|t| (old, t))
+                })
+                .map(|(old, next_vblank)| {
+                    estimate_current_scanline(
+                        self.cycles,
+                        next_vblank,
+                        old.period,
+                        old.hsync,
+                        old.start_scanline,
+                        old.total_scanlines,
+                    )
+                })
+                .unwrap_or(0);
+            let line_phase = old
+                .and_then(|old| {
+                    self.scheduler
+                        .target(crate::scheduler::EventSlot::VBlank)
+                        .map(|t| (old, t))
+                })
+                .map(|(old, next_vblank)| {
+                    estimate_scanline_phase(self.cycles, next_vblank, old.period, old.hsync)
+                })
+                .unwrap_or(0);
+            let remaining_lines = if current_scanline < start_scanline {
+                start_scanline - current_scanline
+            } else {
+                total_scanlines - current_scanline + start_scanline
+            };
+            // Redux's base counter target is not recalculated by the
+            // display-mode write, so the next VBlank remains aligned
+            // to the old hsync cadence while using the new region's
+            // VBlank-start scanline.
+            remaining_lines
+                .saturating_mul(vblank_hsync)
+                .saturating_sub(line_phase)
+                .saturating_add(4)
+                .max(1)
+        };
+        self.hsync_cycles = hsync;
+        self.vblank_hsync_cycles = vblank_hsync;
+        self.vblank_period = period;
         self.scheduler.cancel(crate::scheduler::EventSlot::VBlank);
-        // Schedule the next VBlank at the PAL first-VBlank offset
-        // from now, so cold-start and mid-run switches both land
-        // at a reasonable first VBlank.
-        self.scheduler.schedule(
-            crate::scheduler::EventSlot::VBlank,
-            self.cycles,
-            FIRST_VBLANK_CYCLE_PAL,
-        );
+        // Preserve current scanline phase across the region switch.
+        // Redux's auto-video path changes the active video setting
+        // from GP1 display-mode writes, but the counter phase keeps
+        // marching; restarting from scanline 0 makes PAL games miss
+        // the next VBlank by a large fraction of a frame.
+        self.scheduler
+            .schedule(crate::scheduler::EventSlot::VBlank, self.cycles, delay);
     }
 
     /// Current HSync period in cycles — NTSC = 2146, PAL = 2157.
@@ -273,7 +420,12 @@ impl Bus {
     /// games can poll for button state. Convenience: most single-player
     /// games use port 1 only.
     pub fn attach_digital_pad_port1(&mut self) {
-        let device = crate::pad::PortDevice::empty().with_pad(crate::pad::DigitalPad::new());
+        let old = std::mem::replace(self.sio0.port1_mut(), crate::pad::PortDevice::empty());
+        let memcard = old.into_memcard();
+        let mut device = crate::pad::PortDevice::empty().with_pad(crate::pad::DigitalPad::new());
+        if let Some(card) = memcard {
+            device = device.with_memcard(card);
+        }
         self.sio0.attach_port1(device);
     }
 
@@ -288,16 +440,15 @@ impl Bus {
     /// card. Keeps any pad already attached — real hardware
     /// multiplexes pad + memcard on the same port.
     pub fn attach_memcard_port1(&mut self, initial_bytes: Vec<u8>) {
-        let bytes = if initial_bytes.len() == crate::pad::MEMCARD_SIZE {
-            initial_bytes
+        let card = if initial_bytes.len() == crate::pad::MEMCARD_SIZE {
+            crate::pad::MemoryCard::from_bytes(initial_bytes)
         } else {
-            vec![0u8; crate::pad::MEMCARD_SIZE]
+            crate::pad::MemoryCard::new()
         };
         // Preserve any existing pad.
         let pad =
             std::mem::replace(self.sio0.port1_mut(), crate::pad::PortDevice::empty()).into_pad();
-        let mut device =
-            crate::pad::PortDevice::empty().with_memcard(crate::pad::MemoryCard::from_bytes(bytes));
+        let mut device = crate::pad::PortDevice::empty().with_memcard(card);
         if let Some(p) = pad {
             device = device.with_pad(p);
         }
@@ -386,22 +537,26 @@ impl Bus {
     /// SIO0 already multiplexes port 1 / port 2 internally via
     /// the CTRL.SLOT bit — games switch between them per poll.
     pub fn attach_digital_pad_port2(&mut self) {
-        let device = crate::pad::PortDevice::empty().with_pad(crate::pad::DigitalPad::new());
+        let old = std::mem::replace(self.sio0.port2_mut(), crate::pad::PortDevice::empty());
+        let memcard = old.into_memcard();
+        let mut device = crate::pad::PortDevice::empty().with_pad(crate::pad::DigitalPad::new());
+        if let Some(card) = memcard {
+            device = device.with_memcard(card);
+        }
         self.sio0.attach_port2(device);
     }
 
     /// Plug a memory card into port 2. Same semantics as
     /// [`Bus::attach_memcard_port1`].
     pub fn attach_memcard_port2(&mut self, initial_bytes: Vec<u8>) {
-        let bytes = if initial_bytes.len() == crate::pad::MEMCARD_SIZE {
-            initial_bytes
+        let card = if initial_bytes.len() == crate::pad::MEMCARD_SIZE {
+            crate::pad::MemoryCard::from_bytes(initial_bytes)
         } else {
-            vec![0u8; crate::pad::MEMCARD_SIZE]
+            crate::pad::MemoryCard::new()
         };
         let pad =
             std::mem::replace(self.sio0.port2_mut(), crate::pad::PortDevice::empty()).into_pad();
-        let mut device =
-            crate::pad::PortDevice::empty().with_memcard(crate::pad::MemoryCard::from_bytes(bytes));
+        let mut device = crate::pad::PortDevice::empty().with_memcard(card);
         if let Some(p) = pad {
             device = device.with_pad(p);
         }
@@ -503,7 +658,8 @@ impl Bus {
     /// byte than Redux and exit the loop early.
     pub fn tick(&mut self, n: u32) {
         self.advance_cycles(n);
-        self.drain_scheduler_events();
+        self.drain_scheduler_events_without_cdr_dma();
+        self.service_sio0();
     }
 
     /// Public entry point that the CPU calls between the opcode's
@@ -515,7 +671,13 @@ impl Bus {
     /// `branchTest` → `counters->update()`.
     pub fn drain_scheduler_events_post_op(&mut self) {
         self.drain_scheduler_events();
-        if self.cdrom.tick(self.cycles) && self.cdrom.should_wake_cpu() {
+        let cdrom_irq_pending =
+            self.irq.stat() & self.irq.mask() & (1 << (IrqSource::Cdrom as u32)) != 0;
+        if self
+            .cdrom
+            .tick_with_irq_pending(self.cycles, cdrom_irq_pending)
+            && self.cdrom.should_wake_cpu()
+        {
             self.irq.raise(IrqSource::Cdrom);
         }
         self.service_sio0();
@@ -537,7 +699,15 @@ impl Bus {
     /// them — the legacy timers still own those. Each migration
     /// replaces a legacy timer with `scheduler.schedule(...)` and
     /// adds a `match` arm here.
+    fn drain_scheduler_events_without_cdr_dma(&mut self) {
+        self.drain_scheduler_events_inner(false);
+    }
+
     fn drain_scheduler_events(&mut self) {
+        self.drain_scheduler_events_inner(true);
+    }
+
+    fn drain_scheduler_events_inner(&mut self, include_cdr_dma: bool) {
         use crate::scheduler::EventSlot;
         let now = self.cycles;
         let mut dma_edge = false;
@@ -557,7 +727,12 @@ impl Bus {
                 .schedule(EventSlot::VBlank, target, self.vblank_period);
         }
 
-        while let Some((slot, target)) = self.scheduler.take_due(now) {
+        let cdr_dma_mask = 1 << EventSlot::CdrDma.bit();
+        while let Some((slot, target)) = if include_cdr_dma {
+            self.scheduler.take_due(now)
+        } else {
+            self.scheduler.take_due_excluding(now, cdr_dma_mask)
+        } {
             match slot {
                 EventSlot::MdecInDma => {
                     if self.complete_dma_channel(0) {
@@ -565,6 +740,9 @@ impl Bus {
                     }
                 }
                 EventSlot::MdecOutDma => {
+                    if self.mdec.complete_dma_out() && self.complete_dma_channel(0) {
+                        dma_edge = true;
+                    }
                     if self.complete_dma_channel(1) {
                         dma_edge = true;
                     }
@@ -597,9 +775,8 @@ impl Bus {
                     // frame boundaries. Matches Redux's
                     // `SoftGPU::vblank` which XORs the same bit.
                     self.gpu.toggle_vblank_field();
-                    // Tell the timer bank — Timer 1 sync-mode-3
-                    // unlocks on this pulse, sync-mode-1 resets
-                    // its counter.
+                    // Tell the timer bank — Timer 1 sync-mode-1
+                    // resets its counter on this pulse.
                     self.timers.notify_vblank();
                     // Re-arm the next VBlank from the original
                     // target, not `now`. A 500K-cycle drain lag
@@ -627,6 +804,19 @@ impl Bus {
                 | EventSlot::CdrDbuf
                 | EventSlot::CdrLid => {}
             }
+        }
+        // CDROM DMA completion is observed by Redux at the exact
+        // target boundary in retail boot paths (MGS license-sector
+        // DMA lands here). Keep the generic scheduler strict for the
+        // other interrupt slots, but let CDR DMA finish on equality.
+        if include_cdr_dma
+            && self
+                .scheduler
+                .take_slot_due_inclusive(EventSlot::CdrDma, now)
+                .is_some()
+            && self.complete_dma_channel(3)
+        {
+            dma_edge = true;
         }
         if dma_edge {
             self.irq.raise(IrqSource::Dma);
@@ -842,19 +1032,21 @@ impl Bus {
         match ch {
             0 => {
                 if let Some(mdec_words) = self.run_dma_mdec_in() {
-                    let target = self.cycles + mdec_words as u64;
-                    self.log_dma_schedule("MdecIn", mdec_words as u64, target);
-                    self.scheduler
-                        .schedule(EventSlot::MdecInDma, self.cycles, mdec_words as u64);
+                    if self.mdec.decode_dma0_waits_for_output() {
+                        self.try_schedule_ready_mdec_out();
+                    } else {
+                        let target = self.cycles + mdec_words as u64;
+                        self.log_dma_schedule("MdecIn", mdec_words as u64, target);
+                        self.scheduler.schedule(
+                            EventSlot::MdecInDma,
+                            self.cycles,
+                            mdec_words as u64,
+                        );
+                    }
                 }
             }
             1 => {
-                if let Some(mdec_words) = self.run_dma_mdec_out() {
-                    let target = self.cycles + mdec_words as u64;
-                    self.log_dma_schedule("MdecOut", mdec_words as u64, target);
-                    self.scheduler
-                        .schedule(EventSlot::MdecOutDma, self.cycles, mdec_words as u64);
-                }
+                self.try_schedule_ready_mdec_out();
             }
             2 => {
                 if let Some(gpu_cycles) = self.run_dma_gpu() {
@@ -865,8 +1057,16 @@ impl Bus {
                 }
             }
             3 => {
+                let ch = self.dma.channels[3];
+                let fifo_len = self.cdrom.data_fifo_len();
+                let armed = self.cdrom.data_transfer_armed();
                 if let Some(cdrom_words) = self.run_dma_cdrom() {
+                    let label = format!(
+                        "CdrDma words={cdrom_words} fifo={fifo_len} armed={} madr=0x{:08x} bcr=0x{:08x} chcr=0x{:08x}",
+                        armed as u8, ch.base, ch.block_control, ch.channel_control
+                    );
                     if cdrom_words == 0 {
+                        self.log_dma_schedule(&label, 0, self.cycles);
                         if self.complete_dma_channel(3) {
                             self.irq.raise(IrqSource::Dma);
                         }
@@ -876,7 +1076,7 @@ impl Bus {
                             _ => cdrom_words as u64,
                         };
                         let target = self.cycles + delay;
-                        self.log_dma_schedule("CdrDma", delay, target);
+                        self.log_dma_schedule(&label, delay, target);
                         self.scheduler
                             .schedule(EventSlot::CdrDma, self.cycles, delay);
                     }
@@ -934,6 +1134,23 @@ impl Bus {
         }
     }
 
+    fn try_schedule_ready_mdec_out(&mut self) {
+        use crate::scheduler::EventSlot;
+
+        if self.scheduler.is_pending(EventSlot::MdecOutDma) || !self.mdec.can_dma_out() {
+            return;
+        }
+        if let Some(mdec_words) = self.run_dma_mdec_out() {
+            // Redux's MDEC model schedules output DMA by byte count
+            // multiplied by MDEC_BIAS=2.0, i.e. 8 cycles per 32-bit word.
+            let delay = mdec_words as u64 * 8;
+            let target = self.cycles + delay;
+            self.log_dma_schedule("MdecOut", delay, target);
+            self.scheduler
+                .schedule(EventSlot::MdecOutDma, self.cycles, delay);
+        }
+    }
+
     /// Execute DMA channel 0 → MDEC input. Ships command + RLE data
     /// from main RAM to the MDEC's input queue. Sync mode 1 (block)
     /// is the only mode PS1 software uses for this channel.
@@ -945,17 +1162,7 @@ impl Bus {
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
         }
-        let sync_mode = (ch.channel_control >> 9) & 0x3;
-        let bcr = ch.block_control;
-        let total_words: u32 = match sync_mode {
-            0 => bcr & 0xFFFF,
-            1 => {
-                let block_size = bcr & 0xFFFF;
-                let block_count = (bcr >> 16).max(1) & 0xFFFF;
-                block_size * block_count
-            }
-            _ => 0,
-        };
+        let total_words = mdec_dma_word_count(ch.block_control, ch.channel_control);
         let step: u32 = if (ch.channel_control >> 1) & 1 != 0 {
             0xFFFF_FFFCu32
         } else {
@@ -978,21 +1185,14 @@ impl Bus {
         if !self.dma.is_channel_enabled(1) {
             return None;
         }
+        if !self.mdec.can_dma_out() {
+            return None;
+        }
         let ch = &self.dma.channels[1];
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
         }
-        let sync_mode = (ch.channel_control >> 9) & 0x3;
-        let bcr = ch.block_control;
-        let total_words: u32 = match sync_mode {
-            0 => bcr & 0xFFFF,
-            1 => {
-                let block_size = bcr & 0xFFFF;
-                let block_count = (bcr >> 16).max(1) & 0xFFFF;
-                block_size * block_count
-            }
-            _ => 0,
-        };
+        let total_words = mdec_dma_word_count(ch.block_control, ch.channel_control);
         let step: u32 = if (ch.channel_control >> 1) & 1 != 0 {
             0xFFFF_FFFCu32
         } else {
@@ -1105,12 +1305,13 @@ impl Bus {
         if (ch.channel_control >> 24) & 1 == 0 {
             return None;
         }
-        // Redux rejects DMA3 kicks until the CDROM request register
-        // has armed the current sector buffer. Without this gate we
-        // would "complete" zero-filled transfers and raise a DMA IRQ
-        // even though the drive was not ready, which is exactly the
-        // kind of silent loader corruption retail games trip over.
-        if !self.cdrom.data_transfer_armed() {
+        // Redux rejects DMA3 kicks only until a sector is ready in
+        // the transfer buffer (`m_read == 0`). It does not require
+        // the request-register bit that gates MMIO data reads; the
+        // BIOS kicks DMA before that latch is armed in Tekken 3's
+        // CDROM handler and expects CHCR bit 24 to remain busy for
+        // the scheduled DMA window.
+        if self.cdrom.data_fifo_len() == 0 {
             return Some(0);
         }
         let sync_mode = (ch.channel_control >> 9) & 0x3;
@@ -1164,10 +1365,10 @@ impl Bus {
         };
 
         for _ in 0..total_words {
-            let b0 = self.cdrom.pop_data_byte() as u32;
-            let b1 = self.cdrom.pop_data_byte() as u32;
-            let b2 = self.cdrom.pop_data_byte() as u32;
-            let b3 = self.cdrom.pop_data_byte() as u32;
+            let b0 = self.cdrom.pop_dma_data_byte() as u32;
+            let b1 = self.cdrom.pop_dma_data_byte() as u32;
+            let b2 = self.cdrom.pop_dma_data_byte() as u32;
+            let b3 = self.cdrom.pop_dma_data_byte() as u32;
             let word = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
             let offset = (addr & 0x001F_FFFF) as usize;
             if offset + 4 <= self.ram.len() {
@@ -1389,6 +1590,9 @@ impl Bus {
         {
             return 0xFF;
         }
+        if Dma::contains(phys) {
+            return self.dma.read8(phys);
+        }
         if Sio0::contains(phys) {
             self.service_sio0();
             return self.sio0.read8(phys).unwrap_or(0);
@@ -1464,6 +1668,9 @@ impl Bus {
         // never sees the tick advance.
         if Timers::contains(phys) {
             return self.timers.read32(phys) as u16;
+        }
+        if Dma::contains(phys) {
+            return self.dma.read16(phys);
         }
         if Spu::contains(phys) {
             return self.spu.read16_at(phys, self.cycles);
@@ -1655,6 +1862,13 @@ impl Bus {
             return;
         }
         if self.gpu.write32(phys, value) {
+            if phys == crate::gpu::GP1_ADDR && (value >> 24) == 0x08 {
+                if value & (1 << 3) != 0 {
+                    self.set_pal_mode();
+                } else {
+                    self.set_ntsc_mode();
+                }
+            }
             return;
         }
         if Spu::contains(phys) {
@@ -1741,7 +1955,15 @@ impl Bus {
             // Thread `self.cycles` through so the CDROM scheduler
             // anchors response-IRQ deadlines on the exact cycle at
             // the cmd-port write, matching Redux's `AddIrqQueue`.
-            self.cdrom.write8_at(phys, value, self.cycles);
+            if self.cdrom.write8_at(phys, value, self.cycles) {
+                self.irq.raise(IrqSource::Cdrom);
+            }
+            return;
+        }
+        if Dma::contains(phys) {
+            if self.dma.write8(phys, value) {
+                self.irq.raise(IrqSource::Dma);
+            }
             return;
         }
         if Sio0::contains(phys) {
@@ -1809,6 +2031,12 @@ impl Bus {
             self.timers.write32(phys, value as u32, self.cycles);
             return;
         }
+        if Dma::contains(phys) {
+            if self.dma.write16(phys, value) {
+                self.irq.raise(IrqSource::Dma);
+            }
+            return;
+        }
         if Spu::contains(phys) {
             self.spu.write16_at(phys, value, self.cycles);
             return;
@@ -1861,6 +2089,18 @@ fn read_ram_u32(ram: &[u8], phys: u32) -> u32 {
     }
 }
 
+fn mdec_dma_word_count(block_control: u32, channel_control: u32) -> u32 {
+    match (channel_control >> 9) & 0x3 {
+        0 => block_control & 0xFFFF,
+        1 => {
+            let block_size = block_control & 0xFFFF;
+            let block_count = (block_control >> 16).max(1) & 0xFFFF;
+            block_size * block_count
+        }
+        _ => 0,
+    }
+}
+
 fn zeroed_box<const N: usize>() -> Box<[u8; N]> {
     // Allocates a zero-initialised slice and converts it. The try_into
     // cannot fail because the source slice has exactly N elements.
@@ -1910,6 +2150,56 @@ mod tests {
             .target(crate::scheduler::EventSlot::VBlank)
             .expect("VBlank must be rescheduled on PAL switch");
         assert_eq!(target, FIRST_VBLANK_CYCLE_PAL);
+    }
+
+    #[test]
+    fn gp1_display_mode_switches_video_region() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+
+        bus.write32(crate::gpu::GP1_ADDR, 0x0800_0008);
+        assert_eq!(bus.hsync_cycles(), HSYNC_CYCLES_PAL);
+        assert_eq!(bus.vblank_period(), VBLANK_PERIOD_CYCLES_PAL);
+        assert_eq!(
+            bus.scheduler
+                .target(crate::scheduler::EventSlot::VBlank)
+                .unwrap(),
+            FIRST_VBLANK_CYCLE_PAL,
+        );
+
+        bus.write32(crate::gpu::GP1_ADDR, 0x0800_0000);
+        assert_eq!(bus.hsync_cycles(), HSYNC_CYCLES_NTSC);
+        assert_eq!(bus.vblank_period(), VBLANK_PERIOD_CYCLES_NTSC);
+        assert_eq!(
+            bus.scheduler
+                .target(crate::scheduler::EventSlot::VBlank)
+                .unwrap(),
+            FIRST_VBLANK_CYCLE_NTSC,
+        );
+    }
+
+    #[test]
+    fn video_region_switch_preserves_scanline_phase() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        let phase = 500;
+        bus.cycles = FIRST_VBLANK_CYCLE_NTSC + 100 * HSYNC_CYCLES_NTSC + phase;
+        bus.scheduler.cancel(crate::scheduler::EventSlot::VBlank);
+        bus.scheduler.schedule(
+            crate::scheduler::EventSlot::VBlank,
+            0,
+            FIRST_VBLANK_CYCLE_NTSC + VBLANK_PERIOD_CYCLES_NTSC,
+        );
+
+        bus.write32(crate::gpu::GP1_ADDR, 0x0800_0008);
+
+        let current_scanline = (VBLANK_START_SCANLINE_NTSC + 100) % HSYNC_TOTAL_NTSC;
+        let remaining = VBLANK_START_SCANLINE_PAL - current_scanline;
+        let expected = bus.cycles + remaining * HSYNC_CYCLES_NTSC - phase + 4;
+        assert_eq!(
+            bus.scheduler
+                .target(crate::scheduler::EventSlot::VBlank)
+                .unwrap(),
+            expected,
+        );
     }
 
     #[test]
@@ -1997,9 +2287,9 @@ mod tests {
     }
 
     #[test]
-    fn cdrom_dma_requires_transfer_request_latch() {
+    fn cdrom_dma_requires_ready_sector() {
         let mut bus = Bus::new(synthetic_bios()).unwrap();
-        bus.cdrom.debug_seed_data_fifo(&[1, 2, 3, 4], true, false);
+        bus.cdrom.debug_seed_data_fifo(&[], false, false);
         bus.dma.dpcr = 1 << (3 * 4 + 3);
         bus.dma.channels[3].base = 0;
         bus.dma.channels[3].block_control = 1;
@@ -2009,6 +2299,40 @@ mod tests {
         assert_eq!(read_ram_u32(&bus.ram[..], 0), 0);
         assert_eq!(bus.dma.channels[3].channel_control & (1 << 24), 0);
         assert_eq!(bus.scheduler.target(EventSlot::CdrDma), None);
+    }
+
+    #[test]
+    fn cdrom_dma_drains_ready_sector_without_request_latch() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        bus.cdrom.debug_seed_data_fifo(&[1, 2, 3, 4], true, false);
+        bus.dma.dpcr = 1 << (3 * 4 + 3);
+        bus.dma.channels[3].base = 0;
+        bus.dma.channels[3].block_control = 1;
+        bus.dma.channels[3].channel_control = 0x1100_0000;
+
+        bus.run_dma_channel(3);
+
+        assert_eq!(read_ram_u32(&bus.ram[..], 0), 0x0403_0201);
+        assert_ne!(bus.dma.channels[3].channel_control & (1 << 24), 0);
+        assert_eq!(bus.scheduler.target(EventSlot::CdrDma), Some(1));
+
+        bus.tick(1);
+        assert_ne!(bus.dma.channels[3].channel_control & (1 << 24), 0);
+        bus.drain_scheduler_events_post_op();
+        assert_eq!(bus.dma.channels[3].channel_control & (1 << 24), 0);
+    }
+
+    #[test]
+    fn dma_does_not_lose_byte_writes_to_dicr() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+
+        bus.write8(0x1F80_10F6, 0x80);
+        assert_eq!(bus.read8(0x1F80_10F6) & 0x08, 0);
+        assert!(!bus.dma.notify_channel_done(3));
+
+        bus.write8(0x1F80_10F6, 0x88);
+        assert_ne!(bus.read8(0x1F80_10F6) & 0x08, 0);
+        assert!(bus.dma.notify_channel_done(3));
     }
 
     #[test]
@@ -2042,5 +2366,71 @@ mod tests {
         bus.run_dma_channel(3);
 
         assert_eq!(bus.scheduler.target(EventSlot::CdrDma), Some(101));
+    }
+
+    #[test]
+    fn mdec_decode_dma0_completes_with_final_dma1() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        seed_one_macroblock_decode(&mut bus);
+        enable_mdec_dma(&mut bus);
+
+        bus.dma.channels[0].base = 0x100;
+        bus.dma.channels[0].block_control = 6;
+        bus.dma.channels[0].channel_control = 0x0100_0201;
+        bus.run_dma_channel(0);
+
+        assert_eq!(bus.scheduler.target(EventSlot::MdecInDma), None);
+        assert_ne!(bus.dma.channels[0].channel_control & (1 << 24), 0);
+
+        bus.dma.channels[1].base = 0x200;
+        bus.dma.channels[1].block_control = 192;
+        bus.dma.channels[1].channel_control = 0x0100_0200;
+        bus.run_dma_channel(1);
+
+        assert_eq!(bus.scheduler.target(EventSlot::MdecOutDma), Some(192 * 8));
+        assert_ne!(bus.dma.channels[0].channel_control & (1 << 24), 0);
+        assert_ne!(bus.dma.channels[1].channel_control & (1 << 24), 0);
+
+        bus.tick(192 * 8 + 1);
+        assert_eq!(bus.dma.channels[0].channel_control & (1 << 24), 0);
+        assert_eq!(bus.dma.channels[1].channel_control & (1 << 24), 0);
+    }
+
+    #[test]
+    fn pending_mdec_dma1_fires_after_dma0_produces_output() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        seed_one_macroblock_decode(&mut bus);
+        enable_mdec_dma(&mut bus);
+
+        bus.dma.channels[1].base = 0x200;
+        bus.dma.channels[1].block_control = 192;
+        bus.dma.channels[1].channel_control = 0x0100_0200;
+        bus.run_dma_channel(1);
+
+        assert_eq!(bus.scheduler.target(EventSlot::MdecOutDma), None);
+        assert_ne!(bus.dma.channels[1].channel_control & (1 << 24), 0);
+
+        bus.dma.channels[0].base = 0x100;
+        bus.dma.channels[0].block_control = 6;
+        bus.dma.channels[0].channel_control = 0x0100_0201;
+        bus.run_dma_channel(0);
+
+        assert_eq!(bus.scheduler.target(EventSlot::MdecInDma), None);
+        assert_eq!(bus.scheduler.target(EventSlot::MdecOutDma), Some(192 * 8));
+        assert_ne!(read_ram_u32(&bus.ram[..], 0x200), 0);
+    }
+
+    fn enable_mdec_dma(bus: &mut Bus) {
+        bus.dma.dpcr = (1 << (0 * 4 + 3)) | (1 << (1 * 4 + 3));
+    }
+
+    fn seed_one_macroblock_decode(bus: &mut Bus) {
+        bus.mdec.write32(crate::mdec::MDEC_CMD_DATA, 0x4000_0020);
+        bus.mdec.dma_write_in(&[0x01_01_01_01; 32]);
+        bus.mdec.write32(crate::mdec::MDEC_CMD_DATA, 0x3000_0006);
+        for i in 0..6 {
+            let offset = 0x100 + i * 4;
+            bus.ram[offset..offset + 4].copy_from_slice(&0xFE00_0010u32.to_le_bytes());
+        }
     }
 }

@@ -25,7 +25,11 @@ fn main() {
     bus.cdrom.insert_disc(Some(disc));
     let mut cpu = Cpu::new();
 
-    for _ in 0..n {
+    let stop_cycles = std::env::var("PSOXIDE_STOP_CYCLES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let mut user_steps = 0u64;
+    while user_steps < n && stop_cycles.map_or(true, |target| bus.cycles() < target) {
         let was_in_isr = cpu.in_isr();
         cpu.step(&mut bus).expect("step");
         if !was_in_isr && cpu.in_irq_handler() {
@@ -33,10 +37,14 @@ fn main() {
                 cpu.step(&mut bus).expect("isr step");
             }
         }
+        user_steps += 1;
     }
 
     let pc = cpu.pc();
-    println!("steps={n} cycles={} pc=0x{pc:08x}", bus.cycles());
+    println!(
+        "steps={user_steps} requested_steps={n} cycles={} pc=0x{pc:08x}",
+        bus.cycles()
+    );
     println!(
         "sr=0x{:08x} cause=0x{:08x} epc=0x{:08x} istat=0x{:03x} imask=0x{:03x}",
         cpu.cop0()[12],
@@ -68,6 +76,22 @@ fn main() {
     println!();
     println!("=== caller disasm around $ra=0x{ra:08x} ===");
     dump_disasm(&bus, ra_lo, ra_hi, ra);
+
+    if let Ok(spec) = std::env::var("PSOXIDE_DUMP_DISASM") {
+        for (lo, hi) in parse_ranges(&spec) {
+            println!();
+            println!("=== requested disasm 0x{lo:08x}..=0x{hi:08x} ===");
+            dump_disasm(&bus, lo, hi, pc);
+        }
+    }
+
+    if let Ok(spec) = std::env::var("PSOXIDE_DUMP_MEM") {
+        for (base, hi) in parse_ranges(&spec) {
+            println!();
+            println!("=== requested memory 0x{base:08x}..=0x{hi:08x} ===");
+            dump_mem(&bus, base, hi);
+        }
+    }
 
     if std::env::var_os("PSOXIDE_ADVANCE_ONE").is_some() {
         println!();
@@ -197,5 +221,44 @@ fn dump_disasm(bus: &Bus, lo: u32, hi: u32, marker_addr: u32) {
             disasm(instr, addr)
         );
         addr = addr.wrapping_add(4);
+    }
+}
+
+fn parse_ranges(spec: &str) -> Vec<(u32, u32)> {
+    spec.split(',')
+        .filter_map(|part| {
+            let (start, len) = part.split_once(':')?;
+            let start = parse_u32(start)?;
+            let len = parse_u32(len)?;
+            let hi = start.wrapping_add(len.saturating_sub(4)) & !3;
+            Some((start & !3, hi))
+        })
+        .collect()
+}
+
+fn parse_u32(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}
+
+fn dump_mem(bus: &Bus, base: u32, hi: u32) {
+    let mut addr = base & !0xf;
+    while addr <= hi {
+        print!("0x{addr:08x}:");
+        for off in (0..16).step_by(4) {
+            let word_addr = addr.wrapping_add(off);
+            if word_addr >= base && word_addr <= hi {
+                let word = bus.peek_instruction(word_addr).unwrap_or(0xDEAD_BEEF);
+                print!(" {word:08x}");
+            } else {
+                print!("         ");
+            }
+        }
+        println!();
+        addr = addr.wrapping_add(16);
     }
 }

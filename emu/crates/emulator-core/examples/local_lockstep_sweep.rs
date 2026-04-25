@@ -178,7 +178,6 @@ fn parse_args() -> Config {
     }
     assert!(cfg.steps > 0, "--steps must be > 0");
     assert!(cfg.interval > 0, "--interval must be > 0");
-    assert!(cfg.exact_window > 0, "--exact-window must be > 0");
     if !cfg.report_dir.is_absolute() {
         cfg.report_dir = std::env::current_dir()
             .expect("current dir")
@@ -584,7 +583,7 @@ fn compare_visual(
         .map_err(|e| format!("Redux screenshot: {e}"))?;
     let redux_bytes = fs::read(&redux_bin).map_err(|e| format!("read Redux screenshot: {e}"))?;
     let meta = fs::read_to_string(format!("{}.txt", redux_bin.display())).unwrap_or_default();
-    let (rw, rh) = parse_wh(&meta);
+    let (rw, rh, _redux_bpp, _redux_len) = parse_screenshot_meta(&meta);
 
     let (_hash, ow, oh, len) = bus.gpu.display_hash();
     let our_bytes = read_display_bytes(bus, ow, oh);
@@ -592,13 +591,24 @@ fn compare_visual(
     let our_bin = game_dir.join(format!("{label}_ours.bin"));
     fs::write(&our_bin, &our_bytes).map_err(|e| format!("write ours screenshot: {e}"))?;
 
-    let (diff_bytes, first_diff, compared_bytes) =
-        compare_framebuffers(&our_bytes, ow, oh, &redux_bytes, rw, rh);
-    if ow == rw && oh == rh {
+    let our_stride = bytes_per_pixel(&our_bytes, ow, oh);
+    let redux_stride = bytes_per_pixel(&redux_bytes, rw, rh);
+    let (diff_bytes, first_diff, compared_bytes) = compare_framebuffers(
+        &our_bytes,
+        ow,
+        oh,
+        our_stride,
+        &redux_bytes,
+        rw,
+        rh,
+        redux_stride,
+    );
+    if ow == rw && oh == rh && our_stride == redux_stride {
         write_mask_ppm(
             &game_dir.join(format!("{label}_mask.ppm")),
             ow as usize,
             oh as usize,
+            our_stride,
             &our_bytes,
             &redux_bytes,
         )?;
@@ -617,65 +627,112 @@ fn compare_framebuffers(
     ours: &[u8],
     ow: u32,
     oh: u32,
+    ours_stride: usize,
     redux: &[u8],
     rw: u32,
     rh: u32,
+    redux_stride: usize,
 ) -> (usize, Option<(u32, u32)>, usize) {
     let w = ow.min(rw);
     let h = oh.min(rh);
+    let stride = ours_stride.min(redux_stride).max(1);
     let mut diffs = 0usize;
     let mut first = None;
     for y in 0..h {
-        let o_row = y as usize * ow as usize * 2;
-        let r_row = y as usize * rw as usize * 2;
-        for x in 0..(w as usize * 2) {
-            let o = ours.get(o_row + x).copied();
-            let r = redux.get(r_row + x).copied();
-            if o != r {
-                diffs += 1;
-                if first.is_none() {
-                    first = Some(((x / 2) as u32, y));
+        let o_row = y as usize * ow as usize * ours_stride;
+        let r_row = y as usize * rw as usize * redux_stride;
+        for x in 0..w as usize {
+            let o_px = o_row + x * ours_stride;
+            let r_px = r_row + x * redux_stride;
+            for b in 0..stride {
+                let o = ours.get(o_px + b).copied();
+                let r = redux.get(r_px + b).copied();
+                if o != r {
+                    diffs += 1;
+                    if first.is_none() {
+                        first = Some((x as u32, y));
+                    }
                 }
             }
         }
     }
-    if (ow, oh) != (rw, rh) {
-        let ours_len = (ow * oh * 2) as usize;
-        let redux_len = (rw * rh * 2) as usize;
-        diffs += ours_len.max(redux_len) - (w * h * 2) as usize;
+    let compared = w as usize * h as usize * stride;
+    let max_len = ours.len().max(redux.len());
+    if max_len > compared {
+        diffs += max_len - compared;
     }
-    (diffs, first, (w * h * 2) as usize)
+    (diffs, first, compared)
 }
 
 fn read_display_bytes(bus: &Bus, w: u32, h: u32) -> Vec<u8> {
     let da = bus.gpu.display_area();
-    let mut out = Vec::with_capacity((w * h * 2) as usize);
-    for dy in 0..h as u16 {
-        for dx in 0..w as u16 {
-            let pixel = bus.gpu.vram.get_pixel(da.x + dx, da.y + dy);
-            out.extend_from_slice(&pixel.to_le_bytes());
+    if da.bpp24 {
+        let mut out = Vec::with_capacity((w * h * 3) as usize);
+        for dy in 0..h as u16 {
+            for dx in 0..w as u16 {
+                let x = da.x.wrapping_add(dx);
+                out.push(display_24bpp_byte(bus, x, da.y.wrapping_add(dy), 0));
+                out.push(display_24bpp_byte(bus, x, da.y.wrapping_add(dy), 1));
+                out.push(display_24bpp_byte(bus, x, da.y.wrapping_add(dy), 2));
+            }
         }
+        out
+    } else {
+        let mut out = Vec::with_capacity((w * h * 2) as usize);
+        for dy in 0..h as u16 {
+            for dx in 0..w as u16 {
+                let pixel = bus.gpu.vram.get_pixel(da.x + dx, da.y + dy);
+                out.extend_from_slice(&pixel.to_le_bytes());
+            }
+        }
+        out
     }
-    out
 }
 
-fn parse_wh(meta: &str) -> (u32, u32) {
+fn display_24bpp_byte(bus: &Bus, x: u16, y: u16, channel_offset: u32) -> u8 {
+    let byte_x = x as u32 * 3 + channel_offset;
+    let word_x = (byte_x / 2) as u16;
+    let word = bus.gpu.vram.get_pixel(word_x, y);
+    if byte_x & 1 == 0 {
+        (word & 0x00ff) as u8
+    } else {
+        (word >> 8) as u8
+    }
+}
+
+fn parse_screenshot_meta(meta: &str) -> (u32, u32, u32, usize) {
     let mut w = 0u32;
     let mut h = 0u32;
+    let mut bpp = 0u32;
+    let mut len = 0usize;
     for tok in meta.split_whitespace() {
         if let Some(v) = tok.strip_prefix("w=") {
             w = v.parse().unwrap_or(0);
         } else if let Some(v) = tok.strip_prefix("h=") {
             h = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("bpp=") {
+            bpp = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("len=") {
+            len = v.parse().unwrap_or(0);
         }
     }
-    (w, h)
+    (w, h, bpp, len)
+}
+
+fn bytes_per_pixel(bytes: &[u8], w: u32, h: u32) -> usize {
+    let pixels = w as usize * h as usize;
+    if pixels == 0 {
+        1
+    } else {
+        (bytes.len() / pixels).max(1)
+    }
 }
 
 fn write_mask_ppm(
     path: &Path,
     w: usize,
     h: usize,
+    bytes_per_pixel: usize,
     ours: &[u8],
     redux: &[u8],
 ) -> Result<(), String> {
@@ -684,14 +741,20 @@ fn write_mask_ppm(
     let mut buf = Vec::with_capacity(w * h * 3);
     for y in 0..h {
         for x in 0..w {
-            let off = (y * w + x) * 2;
-            let a = u16::from_le_bytes([ours[off], ours[off + 1]]);
-            let b = u16::from_le_bytes([redux[off], redux[off + 1]]);
+            let off = (y * w + x) * bytes_per_pixel;
+            let a = &ours[off..off + bytes_per_pixel];
+            let b = &redux[off..off + bytes_per_pixel];
             if a != b {
                 buf.extend_from_slice(&[0xFF, 0, 0]);
-            } else {
-                let (r, g, bl) = bgr15_to_rgb(a);
+            } else if bytes_per_pixel == 2 {
+                let pixel = u16::from_le_bytes([a[0], a[1]]);
+                let (r, g, bl) = bgr15_to_rgb(pixel);
                 buf.extend_from_slice(&[r / 3, g / 3, bl / 3]);
+            } else if bytes_per_pixel == 3 {
+                buf.extend_from_slice(&[a[0] / 3, a[1] / 3, a[2] / 3]);
+            } else {
+                let v = a[0] / 3;
+                buf.extend_from_slice(&[v, v, v]);
             }
         }
     }

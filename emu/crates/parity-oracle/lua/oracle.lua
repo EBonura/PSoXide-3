@@ -327,6 +327,97 @@ local function run()
             end
             io.flush()
 
+        elseif cmd == "trace_one_step" then
+            -- Trace the raw interpreter instructions that Redux runs
+            -- during one user-side stepIn/runExecute pair. This is a
+            -- diagnostic for folded IRQ timing: `step` intentionally
+            -- hides the ISR body, but a temporary exec breakpoint can
+            -- observe it without pausing.
+            local cap = tonumber(line:match("^trace_one_step%s*(%d*)$")) or 1024
+            local entries = {}
+            local function capture(address, width, cause)
+                if #entries < cap then
+                    entries[#entries + 1] = {
+                        pc = tonumber(address),
+                        code = tonumber(regs.code),
+                        tick = tonumber(PCSX.getCPUCycles()),
+                    }
+                end
+                return true
+            end
+            local pc_before = tonumber(regs.pc)
+            local instr = read_instruction(pc_before)
+            local bp_ram = PCSX.addBreakpoint(0x00000000, "Exec", 0x00200000, "trace_one_step", capture)
+            local bp_ram_kseg0 = PCSX.addBreakpoint(0x80000000, "Exec", 0x00200000, "trace_one_step", capture)
+            local bp_ram_kseg1 = PCSX.addBreakpoint(0xa0000000, "Exec", 0x00200000, "trace_one_step", capture)
+            local bp_bios = PCSX.addBreakpoint(0x1fc00000, "Exec", 0x00080000, "trace_one_step", capture)
+            local bp_bios_kseg1 = PCSX.addBreakpoint(0xbfc00000, "Exec", 0x00080000, "trace_one_step", capture)
+            local bp_next = PCSX.addBreakpoint(bit.band(pc_before + 4, 0x1fffffff), "Exec", 4, "trace_one_step", capture)
+            PCSX.stepIn()
+            PCSX.runExecute()
+            bp_next:remove()
+            bp_bios_kseg1:remove()
+            bp_ram:remove()
+            bp_ram_kseg0:remove()
+            bp_ram_kseg1:remove()
+            bp_bios:remove()
+            send(string.format(
+                "trace_one_step begin pc=%d instr=%d count=%d tick=%d",
+                pc_before, instr, #entries, tonumber(PCSX.getCPUCycles())))
+            for i, entry in ipairs(entries) do
+                send_nowait(string.format(
+                    "raw i=%d pc=%d code=%d tick=%d",
+                    i, entry.pc, entry.code, entry.tick))
+                if i % 256 == 0 then io.flush() end
+            end
+            io.flush()
+            send("trace_one_step ok")
+
+        elseif cmd == "manual_trace_until" then
+            -- Manually step raw interpreter instructions until `STOP_PC`
+            -- is reached (or CAP is hit). This is slower than
+            -- stepIn/runExecute, but works in contexts where Redux's
+            -- Lua breakpoint callbacks do not fire inside runExecute.
+            local stop_str, cap_str = line:match("^manual_trace_until%s+(%S+)%s*(%d*)$")
+            local stop_pc = tonumber(stop_str)
+            local cap = tonumber(cap_str) or 10000
+            if stop_pc == nil then
+                send("err manual_trace_until: bad stop pc")
+            else
+                local pc_before = tonumber(regs.pc)
+                local instr_before = read_instruction(pc_before)
+                send(string.format(
+                    "manual_trace_until begin pc=%d instr=%d stop=%d tick=%d",
+                    pc_before, instr_before, stop_pc, tonumber(PCSX.getCPUCycles())))
+                local reached = false
+                for i = 1, cap do
+                    local pc = tonumber(regs.pc)
+                    local instr = read_instruction(pc)
+                    local tick = tonumber(PCSX.getCPUCycles())
+                    send_nowait(string.format(
+                        "raw i=%d pc=%d code=%d tick=%d",
+                        i, pc, instr, tick))
+                    PCSX.stepIn()
+                    PCSX.runExecute()
+                    if i % 256 == 0 then io.flush() end
+                    if tonumber(regs.pc) == stop_pc then
+                        reached = true
+                        send(string.format(
+                            "manual_trace_until reached i=%d tick=%d",
+                            i, tonumber(PCSX.getCPUCycles())))
+                        break
+                    end
+                end
+                io.flush()
+                if reached then
+                    send("manual_trace_until ok")
+                else
+                    send(string.format(
+                        "err manual_trace_until: cap hit pc=%d tick=%d",
+                        tonumber(regs.pc), tonumber(PCSX.getCPUCycles())))
+                end
+            end
+
         elseif cmd == "run" then
             -- Like `step N` but WITHOUT emitting per-instruction
             -- records. Used by milestone tests that only want final
@@ -452,15 +543,15 @@ local function run()
                 local hw_ptr = get_hw_ptr()
                 local istat_ptr = ffi.cast("uint32_t*", hw_ptr + 0x1070)
                 local cdirq_ptr = ffi.cast("uint8_t*", hw_ptr + 0x1803)
-                local prev = bit.band(istat_ptr[0], 0x4)
+                local prev = bit.band(tonumber(istat_ptr[0]) or 0, 0x4)
                 local emitted = 0
                 for i = 1, n do
                     PCSX.stepIn()
                     PCSX.runExecute()
-                    local cur = bit.band(istat_ptr[0], 0x4)
+                    local cur = bit.band(tonumber(istat_ptr[0]) or 0, 0x4)
                     if cur ~= 0 and prev == 0 then
                         local tick = tonumber(PCSX.getCPUCycles())
-                        local ty = bit.band(cdirq_ptr[0], 0x7)
+                        local ty = bit.band(tonumber(cdirq_ptr[0]) or 0, 0x7)
                         send_nowait(string.format(
                             "cdrom_irq step=%d tick=%d type=%d", i, tick, ty))
                         emitted = emitted + 1
@@ -507,7 +598,7 @@ local function run()
                             "chk step=%d tick=%d pc=%d state=%s",
                             i, tick, pc, cpu_state_hash_hex()))
                         emissions = emissions + 1
-                        if emissions % 256 == 0 then io.flush() end
+                        io.flush()
                     end
                 end
                 io.flush()
@@ -539,7 +630,7 @@ local function run()
                             "chk step=%d tick=%d pc=%d state=%s",
                             i, tick, pc, cpu_state_hash_hex()))
                         emissions = emissions + 1
-                        if emissions % 256 == 0 then io.flush() end
+                        io.flush()
                     end
                 end
                 io.flush()
@@ -607,7 +698,7 @@ local function run()
                             local pc = tonumber(regs.pc)
                             send_nowait(string.format("chk step=%d tick=%d pc=%d", i, tick, pc))
                             emissions = emissions + 1
-                            if emissions % 256 == 0 then io.flush() end
+                            io.flush()
                         end
                     end
                     io.flush()

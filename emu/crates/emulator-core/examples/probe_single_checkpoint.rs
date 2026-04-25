@@ -5,6 +5,9 @@
 //! cargo run --release -p emulator-core --example probe_single_checkpoint -- 100000000 "/path/to/game.bin"
 //! ```
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -54,9 +57,8 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc");
-        bus.cdrom
-            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(std::path::Path::new(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     if wants_pad {
         bus.attach_digital_pad_port1();

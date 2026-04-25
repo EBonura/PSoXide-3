@@ -68,6 +68,8 @@ fn main() {
     let max_raw_steps = up_to_step.saturating_mul(2);
     for raw_step in 1..=max_raw_steps {
         let pre_pc = cpu.pc();
+        let pre_ra = cpu.gpr(31);
+        let pre_args = [cpu.gpr(4), cpu.gpr(5), cpu.gpr(6), cpu.gpr(7)];
         cpu.step(&mut bus).expect("step");
         let w = bus.peek_instruction(target_word).unwrap_or(0);
         if w != last {
@@ -76,9 +78,14 @@ fn main() {
             let o = last.to_le_bytes();
             println!(
                 "raw_step={raw_step:>11}  cyc={:>12}  pc=0x{pre_pc:08x}  \
+                 ra=0x{pre_ra:08x}  a0=0x{:08x} a1=0x{:08x} a2=0x{:08x} a3=0x{:08x}  \
                  in_isr={}  word 0x{w:08x} ({:02x} {:02x} {:02x} {:02x}) \
                  was 0x{last:08x} ({:02x} {:02x} {:02x} {:02x})",
                 bus.cycles(),
+                pre_args[0],
+                pre_args[1],
+                pre_args[2],
+                pre_args[3],
                 cpu.in_irq_handler(),
                 b[0],
                 b[1],

@@ -159,20 +159,11 @@ pub struct Gpu {
     /// executing command. Bumped just before each packet dispatch.
     current_cmd_index: u32,
 
-    /// Cumulative "pseudo-busy" credit. Incremented by each
-    /// primitive rasterisation proportionally to its pixel count;
-    /// decremented by `set_idle_cycles` each time the frontend
-    /// advances the GPU clock. When > 0, GPUSTAT bit 26
-    /// (command-FIFO ready) and bit 28 (DMA-block ready) both
-    /// clear, so games polling for "GPU idle" before pushing the
-    /// next packet see a realistic 0→1 transition instead of an
-    /// always-ready register.
-    ///
-    /// Real hardware's busy flag is driven by the command-FIFO
-    /// fill level and by an internal rasteriser "work credit".
-    /// This approximation is enough for games that do the common
-    /// "wait for GPU" spin on bit 26 right after issuing a big
-    /// draw batch.
+    /// Cumulative diagnostic "pseudo-busy" credit for expensive
+    /// primitives. This deliberately does *not* affect GPUSTAT:
+    /// PCSX-Redux's soft GPU keeps command/DMA-ready bits set even
+    /// while software has just kicked a large copy/fill, and games
+    /// like WipEout 2097 poll those bits during boot.
     busy_credit: u64,
 
     // --- Display area (GP1 0x05 / 0x06 / 0x07 / 0x08) ---
@@ -225,6 +216,11 @@ pub struct Gpu {
     /// diagnostics see whether the BIOS is flipping buffers or just
     /// repeatedly re-writing the same location.
     display_start_history: std::collections::BTreeSet<(u16, u16)>,
+    /// Distinct raw GP1 0x08 display-mode values seen since reset.
+    display_mode_history: std::collections::BTreeSet<u32>,
+    /// Recent GP1 writes in chronological order. Diagnostic only; capped
+    /// so long FMV probes do not grow without bound.
+    gp1_write_history: Vec<u32>,
 }
 
 /// Public snapshot of the GPU's display configuration, read by the
@@ -236,7 +232,7 @@ pub struct DisplayArea {
     pub x: u16,
     /// VRAM Y of the top-left displayed pixel.
     pub y: u16,
-    /// Horizontal resolution in pixels (one of 256/320/384/512/640).
+    /// Horizontal resolution in pixels (one of 256/320/368/384/512/640).
     pub width: u16,
     /// Vertical resolution in pixels (240 or 480 interlaced).
     pub height: u16,
@@ -343,6 +339,8 @@ impl Gpu {
             gp0_opcode_hist: [0; 256],
             gp1_opcode_hist: [0; 256],
             display_start_history: std::collections::BTreeSet::new(),
+            display_mode_history: std::collections::BTreeSet::new(),
+            gp1_write_history: Vec::new(),
         }
     }
 
@@ -350,6 +348,16 @@ impl Gpu {
     /// for telling a re-write loop from a front/back-buffer flip.
     pub fn display_start_history(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
         self.display_start_history.iter().copied()
+    }
+
+    /// Distinct raw GP1 0x08 display-mode values seen since reset.
+    pub fn display_mode_history(&self) -> impl Iterator<Item = u32> + '_ {
+        self.display_mode_history.iter().copied()
+    }
+
+    /// Recent raw GP1 writes in chronological order. Diagnostic.
+    pub fn gp1_write_history(&self) -> &[u32] {
+        &self.gp1_write_history
     }
 
     /// Snapshot of the GP0 opcode histogram — per-byte count of
@@ -543,10 +551,7 @@ impl Gpu {
     pub fn read32(&mut self, phys: u32) -> Option<u32> {
         match phys {
             GP0_ADDR => Some(self.read_gpuread()),
-            GP1_ADDR => Some(
-                self.status
-                    .read(self.vram_download.is_some(), self.busy_credit > 0),
-            ),
+            GP1_ADDR => Some(self.status.read(self.vram_download.is_some())),
             _ => None,
         }
     }
@@ -611,6 +616,10 @@ impl Gpu {
             GP1_ADDR => {
                 let op = ((value >> 24) & 0xFF) as usize;
                 self.gp1_opcode_hist[op] = self.gp1_opcode_hist[op].saturating_add(1);
+                if self.gp1_write_history.len() == 512 {
+                    self.gp1_write_history.remove(0);
+                }
+                self.gp1_write_history.push(value);
                 self.apply_gp1_display(value);
                 self.status.gp1_write(value);
                 true
@@ -772,14 +781,24 @@ impl Gpu {
             // actual pixel count is derived together with V-range in
             // [`Gpu::effective_display_height`].
             0x08 => {
-                let hres = match value & 0x3 {
-                    0 => 256,
-                    1 => 320,
-                    2 => 512,
-                    3 => 640,
-                    _ => unreachable!(),
+                self.display_mode_history.insert(value);
+                let hres = if value & (1 << 6) != 0 {
+                    match value & 0x3 {
+                        0 => 368,
+                        1 => 384,
+                        2 => 512,
+                        3 => 640,
+                        _ => unreachable!(),
+                    }
+                } else {
+                    match value & 0x3 {
+                        0 => 256,
+                        1 => 320,
+                        2 => 512,
+                        3 => 640,
+                        _ => unreachable!(),
+                    }
                 };
-                let hres = if value & (1 << 6) != 0 { 384 } else { hres };
                 self.display_width = hres;
                 self.display_height_480 = value & (1 << 2) != 0;
                 self.display_24bpp = value & (1 << 4) != 0;
@@ -3238,21 +3257,17 @@ impl GpuStatus {
 
     /// Compose the observable GPUSTAT word. `vram_send_ready` is the
     /// live "is a VRAM→CPU transfer in progress and has pixels
-    /// waiting" flag owned by the GPU proper; `busy` is the
-    /// "pseudo-busy" flag from `Gpu::is_busy`.
-    fn read(&self, vram_send_ready: bool, busy: bool) -> u32 {
+    /// waiting" flag owned by the GPU proper.
+    fn read(&self, vram_send_ready: bool) -> u32 {
         let mut ret = self.raw;
 
         // Ready bits: 26 (cmd FIFO ready) + 28 (DMA block ready).
-        // Set when idle; cleared under `busy`. Bit 27 (VRAM→CPU
-        // ready) is only set while software is actually pulling
-        // pixels from a GPUREAD; Redux's default is 0 and the
-        // BIOS polls this bit to detect transfer completion.
-        if !busy {
-            ret |= 0x1400_0000;
-        } else {
-            ret &= !0x1400_0000;
-        }
+        // Redux's soft GPU keeps both set on every status read.
+        // Bit 27 (VRAM→CPU ready) is only set while software is
+        // actually pulling pixels from GPUREAD; Redux's default is
+        // 0 and BIOS/game code polls this bit to detect transfer
+        // completion.
+        ret |= 0x1400_0000;
         if vram_send_ready {
             ret |= 0x0800_0000;
         } else {
@@ -3329,6 +3344,7 @@ mod tests {
     #[test]
     fn read_status_has_always_ready_bits() {
         let mut gpu = Gpu::new();
+        gpu.charge_busy(10_000);
         let stat = gpu.read32(GP1_ADDR).unwrap();
         // Bits 26 (cmd ready) + 28 (DMA block ready) are always set.
         // Bit 27 (VRAM→CPU ready) is gated on an active transfer;
@@ -3375,6 +3391,17 @@ mod tests {
         gpu.write32(GP1_ADDR, 0x0300_0000);
         let stat_enabled = gpu.read32(GP1_ADDR).unwrap();
         assert_eq!(stat_enabled & (1 << 23), 0);
+    }
+
+    #[test]
+    fn gp1_extended_hres_zero_is_368_pixels() {
+        let mut gpu = Gpu::new();
+        gpu.write32(GP1_ADDR, 0x0703_c000); // v-range 0..240
+        gpu.write32(GP1_ADDR, 0x0800_0060); // hres2=1, hres1=0
+        assert_eq!(gpu.display_area().width, 368);
+
+        gpu.write32(GP1_ADDR, 0x0800_0061); // hres2=1, hres1=1
+        assert_eq!(gpu.display_area().width, 384);
     }
 
     #[test]

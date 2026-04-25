@@ -881,6 +881,12 @@ fn load_disc() -> Option<Disc> {
 
 /// Build all panels/overlays for one frame. Called from `gfx::Graphics::render`
 /// inside the egui context. `dt` drives Menu animations.
-pub fn build_ui(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::TextureId, dt: f32) {
-    ui::draw_layout(ctx, state, vram_tex, dt);
+pub fn build_ui(
+    ctx: &egui::Context,
+    state: &mut AppState,
+    vram_tex: egui::TextureId,
+    display_tex: egui::TextureId,
+    dt: f32,
+) {
+    ui::draw_layout(ctx, state, vram_tex, display_tex, dt);
 }

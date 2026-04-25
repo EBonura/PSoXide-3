@@ -1,6 +1,9 @@
 //! Print a small execution window plus the tail of selected MMIO
 //! accesses around a user-step checkpoint.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::{Bus, Cpu};
 
 #[cfg(feature = "trace-mmio")]
@@ -16,12 +19,13 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
     let disc_path = std::env::args().nth(3);
+    let quiet_steps = std::env::var_os("PSOXIDE_MMIO_QUIET_STEPS").is_some();
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
     if let Some(ref p) = disc_path {
-        let disc = std::fs::read(p).expect("disc");
-        bus.cdrom.insert_disc(Some(psx_iso::Disc::from_bin(disc)));
+        let disc = disc_support::load_disc_path(std::path::Path::new(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
 
@@ -40,11 +44,13 @@ fn main() {
         let pc = cpu.pc();
         let cyc = bus.cycles();
         cpu.step(&mut bus).expect("raw step");
-        println!(
-            "step={step_n:>10} cyc={cyc:>12}->{:>12} pc=0x{pc:08x} in_irq={}",
-            bus.cycles(),
-            cpu.in_irq_handler()
-        );
+        if !quiet_steps {
+            println!(
+                "step={step_n:>10} cyc={cyc:>12}->{:>12} pc=0x{pc:08x} in_irq={}",
+                bus.cycles(),
+                cpu.in_irq_handler()
+            );
+        }
     }
 
     #[cfg(feature = "trace-mmio")]
@@ -79,6 +85,9 @@ fn main() {
 #[cfg(feature = "trace-mmio")]
 fn is_interest(addr: u32) -> bool {
     (0x1f80_1100..=0x1f80_112f).contains(&addr)
+        || (0x1f80_1040..=0x1f80_104f).contains(&addr)
         || (0x1f80_1800..=0x1f80_1803).contains(&addr)
+        || (0x1f80_1810..=0x1f80_1814).contains(&addr)
+        || (0x1f80_1820..=0x1f80_1827).contains(&addr)
         || (0x1f80_1070..=0x1f80_1074).contains(&addr)
 }

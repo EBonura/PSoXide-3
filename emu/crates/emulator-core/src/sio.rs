@@ -63,6 +63,7 @@ const PAD_ACK_DELAY_TICKS: u64 = 450;
 /// Memory cards answer faster than pads.
 const MEMCARD_ACK_DELAY_TICKS: u64 = 170;
 /// `/ACK` is a pulse, not a sticky level.
+#[cfg(test)]
 const ACK_PULSE_TICKS: u64 = 100;
 
 /// SIO0 state. Register-level accuracy for the "nothing plugged in"
@@ -154,8 +155,10 @@ impl Sio0 {
             ack_deadline: None,
             ack_end_deadline: None,
             ack_delay_ticks: PAD_ACK_DELAY_TICKS,
-            port1: crate::pad::PortDevice::empty().with_pad(crate::pad::DigitalPad::new()),
-            port2: crate::pad::PortDevice::empty(),
+            port1: crate::pad::PortDevice::empty()
+                .with_pad(crate::pad::DigitalPad::new())
+                .with_memcard(crate::pad::MemoryCard::new()),
+            port2: crate::pad::PortDevice::empty().with_memcard(crate::pad::MemoryCard::new()),
             last_joyn: false,
         }
     }
@@ -323,6 +326,15 @@ impl Sio0 {
                     self.rx = Some(self.pending_rx);
                     self.transfer_busy = false;
                     if self.pending_ack {
+                        // PCSX-Redux schedules the SIO interrupt at
+                        // byte-completion time (`baud * 8`). Keep the
+                        // visible ACK/DSR pulse delayed below, but let
+                        // IRQ-driven BIOS handlers keep clocking the
+                        // transaction immediately when RX becomes ready.
+                        if self.ctrl & ctrl_bit::ACK_IRQ_ENABLE != 0 {
+                            self.irq_latched = true;
+                            self.pending_irq = true;
+                        }
                         self.awaiting_ack = true;
                         self.ack_deadline = Some(deadline.saturating_add(self.ack_delay_ticks));
                     }
@@ -339,12 +351,11 @@ impl Sio0 {
                 if deadline <= now {
                     self.ack_deadline = None;
                     self.awaiting_ack = false;
-                    self.ack_input = true;
-                    self.ack_end_deadline = Some(deadline.saturating_add(ACK_PULSE_TICKS));
-                    if self.ctrl & ctrl_bit::ACK_IRQ_ENABLE != 0 {
-                        self.irq_latched = true;
-                        self.pending_irq = true;
-                    }
+                    // Redux does not expose a visible ACK-input pulse
+                    // in STAT for these BIOS polls; the interrupt
+                    // above is the observable handshake.
+                    self.ack_input = false;
+                    self.ack_end_deadline = None;
                     continue;
                 }
             }
@@ -726,18 +737,25 @@ mod tests {
             0,
             "ACK must wait for the ACK phase"
         );
-        assert_eq!(stat & stat_bit::IRQ, 0, "IRQ bit must stay low until ACK");
-        assert!(
-            !sio.take_pending_irq(),
-            "bus IRQ should not fire before ACK"
+        assert_ne!(
+            stat & stat_bit::IRQ,
+            0,
+            "IRQ bit should latch when the response byte is ready"
         );
+        assert!(
+            sio.take_pending_irq(),
+            "bus IRQ should fire when the response byte is ready"
+        );
+        assert!(!sio.take_pending_irq(), "IRQ edge should be single-shot");
 
         sio.tick(DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_ne!(stat & stat_bit::ACK_INPUT, 0, "ACK input should be visible");
+        assert_eq!(
+            stat & stat_bit::ACK_INPUT,
+            0,
+            "ACK input should stay low under the Redux-style SIO model"
+        );
         assert_ne!(stat & stat_bit::IRQ, 0, "STAT IRQ bit should latch");
-        assert!(sio.take_pending_irq(), "bus should see one IRQ edge");
-        assert!(!sio.take_pending_irq(), "IRQ edge should be single-shot");
 
         sio.write16(Sio0::BASE + 0xA, ctrl_bit::JOYN_OUTPUT | ctrl_bit::ACK);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
@@ -756,10 +774,10 @@ mod tests {
         sio.tick(DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);
 
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_ne!(
+        assert_eq!(
             stat & stat_bit::ACK_INPUT,
             0,
-            "ACK input should still be visible"
+            "ACK input should stay low under the Redux-style SIO model"
         );
         assert_eq!(
             stat & stat_bit::IRQ,
@@ -938,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_input_is_a_pulse_not_a_sticky_level() {
+    fn ack_input_stays_low_after_ack_deadline() {
         use crate::pad::{DigitalPad, PortDevice};
 
         let mut sio = Sio0::new();
@@ -947,10 +965,10 @@ mod tests {
 
         sio.write8_at(Sio0::BASE, 0x01, 100);
         sio.tick(100 + DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);
-        assert_ne!(
+        assert_eq!(
             sio.read32(Sio0::BASE + 0x4).unwrap() & stat_bit::ACK_INPUT,
             0,
-            "ACK pulse should become visible"
+            "ACK input should not become visible"
         );
 
         sio.tick(100 + DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS + ACK_PULSE_TICKS);

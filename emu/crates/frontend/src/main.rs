@@ -465,8 +465,10 @@ impl ApplicationHandler for Shell {
 
                 let state = &mut self.state;
                 gfx.prepare_vram(state.bus.as_ref().map(|b| &b.gpu.vram));
+                gfx.prepare_display(state.bus.as_ref().map(|b| &b.gpu));
                 let vram_tex = gfx.vram_texture_id();
-                gfx.render(|ctx| app::build_ui(ctx, state, vram_tex, dt));
+                let display_tex = gfx.display_texture_id();
+                gfx.render(|ctx| app::build_ui(ctx, state, vram_tex, display_tex, dt));
             }
             _ => {
                 if !consumed {

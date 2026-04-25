@@ -11,7 +11,7 @@
 //! a compact binary encoding alongside this one — the struct shape
 //! stays canonical.
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 /// Format version. Bump whenever [`InstructionRecord`] gains or removes
 /// a field. Readers should reject records with an unexpected version.
@@ -38,10 +38,10 @@ pub struct InstructionRecord {
     /// always be zero; emitters must not rely on the bus to maintain it.
     pub gprs: [u32; 32],
     /// All 32 GTE data registers (`MFC2` view) after execution.
-    #[serde(default = "zero_regs")]
+    #[serde(default = "zero_regs", deserialize_with = "deserialize_reg_array")]
     pub cop2_data: [u32; 32],
     /// All 32 GTE control registers (`CFC2` view) after execution.
-    #[serde(default = "zero_regs")]
+    #[serde(default = "zero_regs", deserialize_with = "deserialize_reg_array")]
     pub cop2_ctl: [u32; 32],
 }
 
@@ -53,6 +53,34 @@ pub struct InstructionRecord {
 /// caches away by file-format version.
 fn zero_regs() -> [u32; 32] {
     [0; 32]
+}
+
+fn deserialize_reg_array<'de, D>(deserializer: D) -> Result<[u32; 32], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    if values.len() != 32 {
+        return Err(D::Error::custom(format!(
+            "expected 32 registers, got {}",
+            values.len()
+        )));
+    }
+    let mut out = [0u32; 32];
+    for (idx, value) in values.into_iter().enumerate() {
+        let Some(n) = value.as_i64().or_else(|| value.as_u64().map(|v| v as i64)) else {
+            return Err(D::Error::custom(format!(
+                "register {idx} is not an integer"
+            )));
+        };
+        out[idx] = if n < 0 {
+            (n as i32) as u32
+        } else {
+            u32::try_from(n)
+                .map_err(|_| D::Error::custom(format!("register {idx} out of u32 range: {n}")))?
+        };
+    }
+    Ok(out)
 }
 
 impl InstructionRecord {
@@ -105,6 +133,25 @@ mod tests {
         let parsed = InstructionRecord::from_json_line(v1).unwrap();
         assert_eq!(parsed.cop2_data, [0u32; 32]);
         assert_eq!(parsed.cop2_ctl, [0u32; 32]);
+    }
+
+    #[test]
+    fn redux_signed_cop2_json_parses_as_twos_complement() {
+        let mut line =
+            r#"{"tick":1,"pc":0,"instr":0,"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"cop2_data":["#
+                .to_string();
+        line.push_str(
+            &std::iter::once("-431".to_string())
+                .chain(std::iter::repeat("0".to_string()).take(31))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        line.push_str(
+            r#"],"cop2_ctl":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
+        );
+
+        let parsed = InstructionRecord::from_json_line(&line).unwrap();
+        assert_eq!(parsed.cop2_data[0], (-431i32) as u32);
     }
 
     #[test]

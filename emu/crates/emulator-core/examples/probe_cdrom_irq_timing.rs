@@ -41,22 +41,33 @@ fn main() {
     let t0 = Instant::now();
     let bios = std::fs::read(&bios_path).expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
-    bus.cdrom.enable_irq_log(max_log as usize);
     if let Some(ref p) = disc_path {
         let disc = disc_support::load_disc_path(&PathBuf::from(p)).expect("disc");
         bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
+    let mut our_log = Vec::with_capacity(max_log as usize);
+    let mut prev_cdrom_istat = bus.irq().stat() & 0x4;
     for _ in 0..n {
         let was_in_isr = cpu.in_isr();
         cpu.step(&mut bus).expect("step");
+        let cur_cdrom_istat = bus.irq().stat() & 0x4;
+        if cur_cdrom_istat != 0 && prev_cdrom_istat == 0 && our_log.len() < max_log as usize {
+            our_log.push((bus.cycles(), bus.cdrom.irq_flag() & 0x7));
+        }
+        prev_cdrom_istat = cur_cdrom_istat;
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
                 cpu.step(&mut bus).expect("isr step");
+                let cur_cdrom_istat = bus.irq().stat() & 0x4;
+                if cur_cdrom_istat != 0 && prev_cdrom_istat == 0 && our_log.len() < max_log as usize
+                {
+                    our_log.push((bus.cycles(), bus.cdrom.irq_flag() & 0x7));
+                }
+                prev_cdrom_istat = cur_cdrom_istat;
             }
         }
     }
-    let our_log = bus.cdrom.cdrom_irq_log.clone();
     eprintln!(
         "[ours] captured {} CDROM IRQs in {:.1}s",
         our_log.len(),

@@ -1,17 +1,11 @@
 //! Framebuffer view for the central panel.
 //!
 //! The PS1 GPU displays a rectangle of VRAM as the active framebuffer.
-//! Full fidelity needs the GP1-0x05 (display start) and GP1-0x08
-//! (display mode) commands decoded into x / y / width / height, plus
-//! 15-vs-24-bit colour depth selection. Phase 4 ships with a fixed
-//! 320×240 view at `(0, 0)` in VRAM — the default BIOS layout — so
-//! anything the emulator writes into the top-left quadrant of VRAM
-//! (fill-rect commands, DMA uploads, the frontend's test pattern)
-//! becomes visible immediately.
-//!
-//! Once the real GPU command decoder + display-start tracking lands
-//! we pull the rectangle from `bus.gpu`. Until then, `_bus` is
-//! accepted as a hook for that migration.
+//! The renderer uploads that active rectangle into a top-left-packed
+//! RGBA texture before this panel draws it. Keeping the central view on
+//! that decoded display texture matters for FMV: 24-bit MDEC frames are
+//! stored in VRAM word-packed form and look wrong if sampled from the raw
+//! 15-bit VRAM viewer texture.
 
 use emulator_core::{Bus, DisplayArea, VRAM_HEIGHT, VRAM_WIDTH};
 
@@ -23,7 +17,7 @@ const DEFAULT_FB_HEIGHT: f32 = 240.0;
 
 pub fn draw(
     ui: &mut egui::Ui,
-    vram_tex: egui::TextureId,
+    display_tex: egui::TextureId,
     bus: Option<&Bus>,
     scale_mode: ScaleMode,
 ) {
@@ -51,10 +45,7 @@ pub fn draw(
 
     theme::viz_frame(ui, "", |ui| {
         let uv = egui::Rect::from_min_size(
-            egui::pos2(
-                area.x as f32 / VRAM_WIDTH as f32,
-                area.y as f32 / VRAM_HEIGHT as f32,
-            ),
+            egui::pos2(0.0, 0.0),
             egui::vec2(
                 area.width as f32 / VRAM_WIDTH as f32,
                 area.height as f32 / VRAM_HEIGHT as f32,
@@ -62,8 +53,8 @@ pub fn draw(
         );
         let tex_size = egui::vec2(area.width as f32, area.height as f32);
         match scale_mode {
-            ScaleMode::Window => paint_image_window(ui, vram_tex, tex_size, uv),
-            ScaleMode::Native => paint_image_native(ui, vram_tex, tex_size, uv),
+            ScaleMode::Window => paint_image_window(ui, display_tex, tex_size, uv),
+            ScaleMode::Native => paint_image_native(ui, display_tex, tex_size, uv),
         }
     });
 }

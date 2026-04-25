@@ -4,8 +4,12 @@
 //! identify which source could plausibly fire a hidden Redux IRQ at a
 //! given step.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::scheduler::EventSlot;
 use emulator_core::{Bus, Cpu};
+use std::path::PathBuf;
 
 fn main() {
     let step: u64 = std::env::args()
@@ -17,10 +21,9 @@ fn main() {
         .expect("usage: probe_irq_sources_at <step> <disc.bin>");
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
-    let disc_bytes = std::fs::read(disc_path).expect("disc readable");
     let mut bus = Bus::new(bios).expect("bus");
-    bus.cdrom
-        .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+    let disc = disc_support::load_disc_path(&PathBuf::from(disc_path)).expect("disc readable");
+    bus.cdrom.insert_disc(Some(disc));
     let mut cpu = Cpu::new();
 
     for _ in 0..step {

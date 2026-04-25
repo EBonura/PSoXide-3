@@ -2,7 +2,11 @@
 //! Useful when commercial games poll BIOS events that Redux wakes via
 //! controller ACK IRQs but our side misses.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::{Bus, Cpu};
+use std::path::PathBuf;
 
 fn main() {
     let n: u64 = std::env::args()
@@ -14,9 +18,8 @@ fn main() {
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc readable");
-        bus.cdrom
-            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(&PathBuf::from(p)).expect("disc readable");
+        bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
     for _ in 0..n {

@@ -297,6 +297,12 @@ impl PortDevice {
         self.pad
     }
 
+    /// Consume the port, extracting its memory card (if any). Used
+    /// when swapping pads in while keeping the card attached.
+    pub fn into_memcard(self) -> Option<MemoryCard> {
+        self.memcard
+    }
+
     fn record_first_byte(&mut self, tx: u8) {
         self.first_byte_histogram[tx as usize] =
             self.first_byte_histogram[tx as usize].saturating_add(1);
@@ -883,10 +889,9 @@ pub const MEMCARD_FRAME_SIZE: usize = 128;
 /// this struct just holds the live bytes and the "NEW" (never
 /// written) flag.
 pub struct MemoryCard {
-    /// Live contents. 128 KiB. Empty-card (fresh) is all `0x00`
-    /// except for the directory and header frames, but games that
-    /// use the BIOS helpers to initialise the card write those
-    /// themselves — we don't prefill.
+    /// Live contents. 128 KiB. Fresh cards use the same formatted
+    /// header/directory layout PCSX-Redux creates for a missing
+    /// memcard file, starting with the `MC` signature in frame 0.
     bytes: Box<[u8; MEMCARD_SIZE]>,
     /// "New card" sticky flag. Hardware sets bit 3 of the flag
     /// byte after power-on until the first successful Write, then
@@ -907,6 +912,11 @@ pub struct MemoryCard {
     /// Byte counter within the current command stream. Resets on
     /// every deselect.
     byte_index: usize,
+    /// Serial data register. Memory-card traffic is full-duplex: the
+    /// byte returned for this transfer is the response prepared by the
+    /// previous transfer. PCSX-Redux models that with `m_spdr`; keep
+    /// the same one-byte delay so BIOS card probes take the same path.
+    spdr: u8,
     /// Whether any Write has landed since construction. Feeds the
     /// `flag_new` transition and lets the frontend know whether to
     /// persist the card on shutdown.
@@ -970,9 +980,6 @@ enum MemcardWriteState {
     /// Send ACK-1.
     SendAck1,
     SendAck2,
-    /// Send end status: `0x47` on success, `0x4E` on checksum
-    /// mismatch.
-    SendEnd,
 }
 
 /// Sub-state for GetID (command 0x53, "S").
@@ -991,7 +998,7 @@ impl MemoryCard {
     /// Build a fresh memory card — all bytes `0x00`, "new" flag set.
     pub fn new() -> Self {
         Self {
-            bytes: Box::new([0u8; MEMCARD_SIZE]),
+            bytes: Self::formatted_bytes(),
             flag_new: true,
             state: MemcardState::Idle,
             frame_msb: 0,
@@ -1000,8 +1007,42 @@ impl MemoryCard {
             write_buffer: [0u8; MEMCARD_FRAME_SIZE],
             write_buffer_len: 0,
             byte_index: 0,
+            spdr: 0xFF,
             dirty: false,
         }
+    }
+
+    fn formatted_bytes() -> Box<[u8; MEMCARD_SIZE]> {
+        let mut bytes = Box::new([0u8; MEMCARD_SIZE]);
+
+        // Matches PCSX-Redux's `MemoryCard::createMcd`: sector 0
+        // starts with the standard "MC" signature and checksum byte.
+        bytes[0] = b'M';
+        bytes[1] = b'C';
+        bytes[0x7f] = 0x0e;
+
+        // Directory frames 1..=15 are marked free/formatted.
+        for frame in 1..=15 {
+            let base = frame * MEMCARD_FRAME_SIZE;
+            bytes[base] = 0xa0;
+            bytes[base + 8] = 0xff;
+            bytes[base + 9] = 0xff;
+            bytes[base + 0x7f] = 0xa0;
+        }
+
+        // Broken-sector replacement area Redux seeds after the
+        // directory. The remaining card bytes stay zeroed.
+        for frame in 16..36 {
+            let base = frame * MEMCARD_FRAME_SIZE;
+            bytes[base] = 0xff;
+            bytes[base + 1] = 0xff;
+            bytes[base + 2] = 0xff;
+            bytes[base + 3] = 0xff;
+            bytes[base + 8] = 0xff;
+            bytes[base + 9] = 0xff;
+        }
+
+        bytes
     }
 
     /// Build a memory card from an existing backing buffer —
@@ -1022,6 +1063,7 @@ impl MemoryCard {
             write_buffer: [0u8; MEMCARD_FRAME_SIZE],
             write_buffer_len: 0,
             byte_index: 0,
+            spdr: 0xFF,
             dirty: false,
         }
     }
@@ -1052,6 +1094,7 @@ impl MemoryCard {
         self.frame_lsb = 0;
         self.write_checksum = 0;
         self.write_buffer_len = 0;
+        self.spdr = 0xFF;
     }
 
     /// Compute the flag byte — `0x08` when new, `0x00` once at
@@ -1068,6 +1111,13 @@ impl MemoryCard {
     /// [`DigitalPad::exchange`]: returns the RX byte + an `ack`
     /// bit asking SIO0 to keep clocking.
     pub fn exchange(&mut self, tx: u8) -> (u8, bool) {
+        let rx = self.spdr;
+        let (next, ack) = self.prepare_next_byte(tx);
+        self.spdr = next;
+        (rx, ack)
+    }
+
+    fn prepare_next_byte(&mut self, tx: u8) -> (u8, bool) {
         self.byte_index = self.byte_index.saturating_add(1);
         match self.state {
             MemcardState::Idle => {
@@ -1121,30 +1171,31 @@ impl MemoryCard {
             RxMsb => {
                 self.frame_msb = tx;
                 self.state = MemcardState::Read(RxLsb);
-                (0x00, true)
+                (tx, true)
             }
             RxLsb => {
                 self.frame_lsb = tx;
                 self.state = MemcardState::Read(SendAck1);
-                (self.frame_msb, true)
+                (0x5C, true)
             }
             SendAck1 => {
                 self.state = MemcardState::Read(SendAck2);
-                (0x5C, true)
+                (0x5D, true)
             }
             SendAck2 => {
                 self.state = MemcardState::Read(EchoMsb);
-                (0x5D, true)
+                (self.frame_msb, true)
             }
             EchoMsb => {
                 self.state = MemcardState::Read(EchoLsb);
-                (self.frame_msb, true)
+                (self.frame_lsb, true)
             }
             EchoLsb => {
-                // Starting the 128 data bytes. Seed checksum.
                 self.write_checksum = self.frame_msb ^ self.frame_lsb;
-                self.state = MemcardState::Read(SendData(0));
-                (self.frame_lsb, true)
+                let byte = self.read_frame_byte(0);
+                self.write_checksum ^= byte;
+                self.state = MemcardState::Read(SendData(1));
+                (byte, true)
             }
             SendData(i) => {
                 let byte = self.read_frame_byte(i);
@@ -1163,7 +1214,7 @@ impl MemoryCard {
             }
             SendEnd => {
                 self.reset();
-                (0x47, false)
+                (0x47, true)
             }
         }
     }
@@ -1182,14 +1233,14 @@ impl MemoryCard {
             RxMsb => {
                 self.frame_msb = tx;
                 self.state = MemcardState::Write(RxLsb);
-                (0x00, true)
+                (tx, true)
             }
             RxLsb => {
                 self.frame_lsb = tx;
                 self.write_checksum = self.frame_msb ^ self.frame_lsb;
                 self.write_buffer_len = 0;
                 self.state = MemcardState::Write(RxData(0));
-                (0x00, true)
+                (tx, true)
             }
             RxData(i) => {
                 self.write_buffer[i as usize] = tx;
@@ -1200,9 +1251,7 @@ impl MemoryCard {
                 } else {
                     self.state = MemcardState::Write(RxChecksum);
                 }
-                // Echo the host's previous byte back on the next
-                // cycle — we simplify and just return 0x00.
-                (0x00, true)
+                (tx, true)
             }
             RxChecksum => {
                 // Compare host checksum to our accumulator. If they
@@ -1211,26 +1260,21 @@ impl MemoryCard {
                 let ok = tx == self.write_checksum;
                 if ok {
                     self.commit_write_buffer();
-                }
-                self.state = MemcardState::Write(if ok {
-                    SendAck1
+                    self.state = MemcardState::Write(SendAck1);
+                    (0x5C, true)
                 } else {
-                    SendAck2 // skip committing; still finish the protocol
-                });
-                (0x00, true)
+                    self.reset();
+                    (0x4E, false)
+                }
             }
             SendAck1 => {
                 self.state = MemcardState::Write(SendAck2);
-                (0x5C, true)
-            }
-            SendAck2 => {
-                self.state = MemcardState::Write(SendEnd);
                 (0x5D, true)
             }
-            SendEnd => {
+            SendAck2 => {
                 let end = if self.dirty { 0x47 } else { 0x4E };
                 self.reset();
-                (end, false)
+                (end, true)
             }
         }
     }
@@ -1277,7 +1321,7 @@ impl MemoryCard {
     fn read_frame_byte(&self, i: u16) -> u8 {
         let frame = ((self.frame_msb as usize) << 8) | (self.frame_lsb as usize);
         let offset = frame * MEMCARD_FRAME_SIZE + (i as usize);
-        self.bytes.get(offset).copied().unwrap_or(0)
+        self.bytes.get(offset).copied().unwrap_or(0xFF)
     }
 
     fn commit_write_buffer(&mut self) {
@@ -1641,10 +1685,11 @@ mod tests {
     #[test]
     fn memcard_get_id_response() {
         let mut card = MemoryCard::new();
-        // First byte: 0x81 (address). Card responds with flag byte.
-        assert_eq!(card.exchange(0x81), (0x08, true)); // NEW flag set
-                                                       // Second byte: 'S' (GetID).
-        assert_eq!(card.exchange(0x53), (0x5A, true));
+        // Memory cards are full-duplex: each transfer returns the byte
+        // prepared by the previous transfer.
+        assert_eq!(card.exchange(0x81), (0xFF, true));
+        assert_eq!(card.exchange(0x53), (0x08, true)); // NEW flag set
+        assert_eq!(card.exchange(0x00), (0x5A, true));
         // Then the 8-byte ID sequence.
         let mut seq = vec![];
         for _ in 0..10 {
@@ -1662,8 +1707,8 @@ mod tests {
         let pattern: Vec<u8> = (0..MEMCARD_FRAME_SIZE).map(|i| (i * 3) as u8).collect();
         let checksum: u8 = pattern.iter().fold(0u8, |a, b| a ^ b) ^ 0x00 ^ 0x00;
         // Protocol: 0x81, 'W' (0x57), 0x00, 0x00, MSB (0x00), LSB (0x00), data*128, checksum
-        assert_eq!(card.exchange(0x81), (0x08, true));
-        assert_eq!(card.exchange(0x57), (0x5A, true));
+        assert_eq!(card.exchange(0x81), (0xFF, true));
+        assert_eq!(card.exchange(0x57), (0x08, true));
         card.exchange(0x00); // id2
         card.exchange(0x00); // pad
         card.exchange(0x00); // MSB
@@ -1687,8 +1732,8 @@ mod tests {
 
         // Read frame 0 back and verify contents match.
         card.reset();
-        assert_eq!(card.exchange(0x81), (0x00, true)); // flag = 0 now
-        assert_eq!(card.exchange(0x52), (0x5A, true)); // 'R'
+        assert_eq!(card.exchange(0x81), (0xFF, true));
+        assert_eq!(card.exchange(0x52), (0x00, true)); // flag = 0 now
         card.exchange(0x00); // id2
         card.exchange(0x00); // pad
         card.exchange(0x00); // MSB

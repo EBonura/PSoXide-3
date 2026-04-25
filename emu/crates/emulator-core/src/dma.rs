@@ -136,6 +136,22 @@ impl Dma {
         }
     }
 
+    /// Read a byte from the DMA register window.
+    ///
+    /// Some games poke global DMA registers byte-wise. In particular,
+    /// WipEout 3 toggles channel-specific DICR IRQ-enable bits through
+    /// `sb` at `DICR+2` while streaming FMV chunks; routing those reads
+    /// through the live register state keeps the later writeback honest.
+    pub fn read8(&self, phys: u32) -> u8 {
+        let word = self.read32(phys & !3);
+        ((word >> ((phys & 3) * 8)) & 0xFF) as u8
+    }
+
+    /// Read a little-endian halfword from the DMA register window.
+    pub fn read16(&self, phys: u32) -> u16 {
+        u16::from_le_bytes([self.read8(phys), self.read8(phys.wrapping_add(1))])
+    }
+
     /// Write a 32-bit word. `phys` must be inside [`Dma::BASE`]..[`Dma::END`].
     ///
     /// Returns `true` when a DICR write transitions the DMA master IRQ
@@ -169,6 +185,50 @@ impl Dma {
                     _ => {}
                 }
                 false
+            }
+        }
+    }
+
+    /// Write a byte to the DMA register window.
+    ///
+    /// Redux lets byte/halfword writes in this range update the raw
+    /// backing register bytes. That is subtly different from a 32-bit
+    /// DICR write: partial writes do not run DICR's write-one-to-clear
+    /// path and do not dispatch DMA channel starts.
+    pub fn write8(&mut self, phys: u32, value: u8) -> bool {
+        let word_addr = phys & !3;
+        let shift = (phys & 3) * 8;
+        let mask = 0xFFu32 << shift;
+        let word = (self.read32(word_addr) & !mask) | ((value as u32) << shift);
+        self.write_raw32(word_addr, word);
+        false
+    }
+
+    /// Write a little-endian halfword to the DMA register window.
+    pub fn write16(&mut self, phys: u32, value: u16) -> bool {
+        let [lo, hi] = value.to_le_bytes();
+        let mut edge = self.write8(phys, lo);
+        edge |= self.write8(phys.wrapping_add(1), hi);
+        edge
+    }
+
+    fn write_raw32(&mut self, phys: u32, value: u32) {
+        let offset = phys - Self::BASE;
+        match offset {
+            Self::DPCR_OFFSET => self.dpcr = value,
+            Self::DICR_OFFSET => self.dicr = value,
+            _ => {
+                let (ch, field) = decode(phys);
+                if ch >= NUM_CHANNELS {
+                    return;
+                }
+                let c = &mut self.channels[ch];
+                match field {
+                    0x0 => c.base = value & 0x00FF_FFFF,
+                    0x4 => c.block_control = value,
+                    0x8 => c.channel_control = value,
+                    _ => {}
+                }
             }
         }
     }
@@ -357,6 +417,28 @@ mod tests {
         let mut dma = Dma::new();
         dma.write32(0x1F80_10F0, 0x0765_4321);
         assert_eq!(dma.read32(0x1F80_10F0), 0x0765_4321);
+    }
+
+    #[test]
+    fn partial_reads_see_live_register_bytes() {
+        let mut dma = Dma::new();
+        dma.write32(0x1F80_10F0, 0x0765_4321);
+        assert_eq!(dma.read8(0x1F80_10F0), 0x21);
+        assert_eq!(dma.read8(0x1F80_10F2), 0x65);
+        assert_eq!(dma.read16(0x1F80_10F1), 0x6543);
+    }
+
+    #[test]
+    fn dicr_byte_write_toggles_channel_irq_enable() {
+        let mut disabled = Dma::new();
+        disabled.write8(0x1F80_10F6, 0x80); // master enable, channel 3 IRQ disabled
+        assert_eq!(disabled.read8(0x1F80_10F6) & 0x08, 0);
+        assert!(!disabled.notify_channel_done(3));
+
+        let mut enabled = Dma::new();
+        enabled.write8(0x1F80_10F6, 0x88); // master enable + channel 3 IRQ enable
+        assert_ne!(enabled.read8(0x1F80_10F6) & 0x08, 0);
+        assert!(enabled.notify_channel_done(3));
     }
 
     #[test]

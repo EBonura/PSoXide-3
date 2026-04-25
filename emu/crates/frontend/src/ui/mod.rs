@@ -16,7 +16,13 @@ pub mod menu;
 use crate::app::AppState;
 
 /// Paint every panel for this frame, in layering order.
-pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::TextureId, dt: f32) {
+pub fn draw_layout(
+    ctx: &egui::Context,
+    state: &mut AppState,
+    vram_tex: egui::TextureId,
+    display_tex: egui::TextureId,
+    dt: f32,
+) {
     state.hud.update(dt, state.cpu.tick());
     state.tick_status(dt);
 
@@ -47,7 +53,7 @@ pub fn draw_layout(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::Te
     }
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        framebuffer::draw(ui, vram_tex, state.bus.as_ref(), state.scale_mode);
+        framebuffer::draw(ui, display_tex, state.bus.as_ref(), state.scale_mode);
     });
 
     state.menu.draw(ctx, dt);

@@ -5,6 +5,9 @@
 //! emulators' fold cycles lets us see which IRQ fires at a different
 //! time even when the surrounding user code is in lockstep.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -35,9 +38,8 @@ fn main() {
     let mut bus = Bus::new(bios).expect("bus");
     bus.cdrom.enable_irq_log(200);
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc");
-        bus.cdrom
-            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(&PathBuf::from(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
     for _ in 0..start {
