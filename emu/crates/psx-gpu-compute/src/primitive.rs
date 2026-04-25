@@ -470,6 +470,88 @@ impl ShadedTri {
     }
 }
 
+/// Textured Gouraud-shaded triangle (`GP0 0x34..=0x37`). Per-vertex
+/// UV + per-vertex 24-bit tint. Texture is sampled per pixel, then
+/// modulated by the barycentrically-interpolated tint. With dither
+/// enabled the modulation runs in 8-bit space and dithers down to
+/// 5-bit BGR15 — matches `emulator-core::modulate_tint_dithered`.
+///
+/// WGSL counterpart in `shaders/shaded_tex_tri.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct ShadedTexTri {
+    pub v0: [i32; 2],
+    pub v1: [i32; 2],
+    pub v2: [i32; 2],
+    pub bbox_min: [i32; 2],
+    pub bbox_max: [i32; 2],
+    /// Per-vertex tint, packed `R | (G << 8) | (B << 16)`.
+    pub c0: u32,
+    pub c1: u32,
+    pub c2: u32,
+    /// Per-vertex UV, `u | (v << 8)`.
+    pub uv0: u32,
+    pub uv1: u32,
+    pub uv2: u32,
+    pub flags: u32,
+    pub clut_x: u32,
+    pub clut_y: u32,
+    pub _pad: u32,
+}
+
+impl ShadedTexTri {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        c0_rgb: (u8, u8, u8),
+        c1_rgb: (u8, u8, u8),
+        c2_rgb: (u8, u8, u8),
+        uv0: (u8, u8),
+        uv1: (u8, u8),
+        uv2: (u8, u8),
+        clut_x: u32,
+        clut_y: u32,
+        flags: PrimFlags,
+        blend_mode: BlendMode,
+    ) -> Self {
+        let min_x = v0.0.min(v1.0).min(v2.0);
+        let min_y = v0.1.min(v1.1).min(v2.1);
+        let max_x = v0.0.max(v1.0).max(v2.0);
+        let max_y = v0.1.max(v1.1).max(v2.1);
+        let pack_uv = |u: u8, v: u8| (u as u32) | ((v as u32) << 8);
+        let pack_rgb =
+            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        Self {
+            v0: [v0.0, v0.1],
+            v1: [v1.0, v1.1],
+            v2: [v2.0, v2.1],
+            bbox_min: [min_x, min_y],
+            bbox_max: [max_x, max_y],
+            c0: pack_rgb(c0_rgb.0, c0_rgb.1, c0_rgb.2),
+            c1: pack_rgb(c1_rgb.0, c1_rgb.1, c1_rgb.2),
+            c2: pack_rgb(c2_rgb.0, c2_rgb.1, c2_rgb.2),
+            uv0: pack_uv(uv0.0, uv0.1),
+            uv1: pack_uv(uv1.0, uv1.1),
+            uv2: pack_uv(uv2.0, uv2.1),
+            flags: pack_flags(flags, blend_mode),
+            clut_x,
+            clut_y,
+            _pad: 0,
+        }
+    }
+
+    pub fn exceeds_hw_extent(&self) -> bool {
+        const MAX_DX: i32 = 1023;
+        const MAX_DY: i32 = 511;
+        let edges = [(self.v0, self.v1), (self.v1, self.v2), (self.v2, self.v0)];
+        edges
+            .iter()
+            .any(|(a, b)| (a[0] - b[0]).abs() > MAX_DX || (a[1] - b[1]).abs() > MAX_DY)
+    }
+}
+
 /// Quick fill (`GP0 0x02`). Writes a single 15bpp colour into a
 /// rectangle, ignoring drawing-area, drawing-offset, mask-check,
 /// mask-set, and semi-trans. The hardware clamps `x`/`w` to 16-pixel
@@ -585,6 +667,15 @@ mod tests {
     fn shaded_tri_struct_pinned_at_64() {
         assert_eq!(std::mem::size_of::<ShadedTri>(), 64);
         assert_eq!(std::mem::size_of::<ShadedTri>() % 16, 0);
+    }
+
+    #[test]
+    fn shaded_tex_tri_struct_pinned_at_80() {
+        // Same 80-byte size as TexTri — they pack the same fields
+        // count: positions + bbox + 3 colours + 3 UVs + flags +
+        // clut + 1 pad = 80.
+        assert_eq!(std::mem::size_of::<ShadedTexTri>() % 16, 0);
+        assert_eq!(std::mem::size_of::<ShadedTexTri>(), 80);
     }
 
     #[test]

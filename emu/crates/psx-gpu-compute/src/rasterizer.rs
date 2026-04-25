@@ -11,7 +11,8 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 
 use crate::primitive::{
-    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTri, TexRect, TexTri, Tpage,
+    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri, TexRect,
+    TexTri, Tpage,
 };
 use crate::vram::VramGpu;
 
@@ -55,6 +56,11 @@ pub struct Rasterizer {
     // (same 3-binding shape: VRAM + prim + draw area).
     shaded_tri_pipeline: wgpu::ComputePipeline,
     shaded_tri_uniform: wgpu::Buffer,
+
+    // Textured-shaded triangle pipeline (B.3.b). Reuses
+    // `tex_tri_bg_layout` (4 bindings: VRAM + prim + draw area + tpage).
+    shaded_tex_tri_pipeline: wgpu::ComputePipeline,
+    shaded_tex_tri_uniform: wgpu::Buffer,
 }
 
 impl Rasterizer {
@@ -370,6 +376,34 @@ impl Rasterizer {
             mapped_at_creation: false,
         });
 
+        // ---------- Textured-shaded triangle pipeline (B.3.b) ----------
+        let shaded_tex_tri_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("psx-rasterizer-shaded-tex-tri-pl"),
+            bind_group_layouts: &[&tex_tri_bg_layout],
+            push_constant_ranges: &[],
+        });
+        let shaded_tex_tri_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("psx-rasterizer-shaded-tex-tri-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/shaded_tex_tri.wgsl").into(),
+            ),
+        });
+        let shaded_tex_tri_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri"),
+                layout: Some(&shaded_tex_tri_pl),
+                module: &shaded_tex_tri_shader,
+                entry_point: Some("rasterize"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let shaded_tex_tri_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-shaded-tex-tri-uniform"),
+            size: std::mem::size_of::<ShadedTexTri>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             device,
             queue,
@@ -390,7 +424,74 @@ impl Rasterizer {
             fill_uniform,
             shaded_tri_pipeline,
             shaded_tri_uniform,
+            shaded_tex_tri_pipeline,
+            shaded_tex_tri_uniform,
         }
+    }
+
+    /// Dispatch one textured Gouraud-shaded triangle. Composes
+    /// texture sampling (`tex_tri`) with per-vertex tint
+    /// interpolation (`shaded_tri`).
+    pub fn dispatch_shaded_tex_tri(
+        &self,
+        vram: &VramGpu,
+        tri: &ShadedTexTri,
+        tpage: &Tpage,
+        area: &DrawArea,
+    ) {
+        if tri.exceeds_hw_extent() {
+            return;
+        }
+        let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
+        let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
+        if bbox_w <= 0 || bbox_h <= 0 {
+            return;
+        }
+        self.queue
+            .write_buffer(&self.shaded_tex_tri_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-shaded-tex-tri-bg"),
+            layout: &self.tex_tri_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.shaded_tex_tri_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.draw_area_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.tpage_uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-shaded-tex-tri-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.shaded_tex_tri_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one Gouraud-shaded triangle. Same coverage rules as
@@ -2481,6 +2582,93 @@ mod tests {
         // GPU shaded path with uniform colour must match GPU mono path
         // bit-for-bit (same coverage, same colour).
         assert_eq!(gpu_shaded, gpu_mono, "GPU uniform-shaded == GPU mono");
+    }
+
+    #[test]
+    fn shaded_tex_tri_axis_aligned_15bpp_matches_cpu_within_tolerance() {
+        // Composes texture sampling + Gouraud-tint modulation.
+        // Same B.2 UV-parity caveat applies; tolerance ≤3/5-bit
+        // per channel (slightly looser than B.2 because tint
+        // interpolation introduces its own rounding step).
+        let v = [(20i32, 20i32), (60, 20), (20, 60)];
+        let uv = [(0u8, 0u8), (32, 0), (0, 32)];
+        // Different per-vertex tints so interpolation is exercised.
+        let c = [(0x80u8, 0x80u8, 0x80u8),
+                 (0xC0, 0xC0, 0xC0),
+                 (0xFFu8, 0xFFu8, 0xFFu8)];
+        let tpage_x = 128u32;
+        let tpage_word = make_tpage_word(tpage_x, 0, 2, 0);
+
+        let mut vram = vec![0u16; 1024 * 512];
+        for vy in 0..32u16 {
+            for ux in 0..32u16 {
+                let val = ((vy as u16) << 5) | (ux as u16) | 0x0001;
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        let pack_rgb = |t: (u8, u8, u8)| {
+            (t.0 as u32) | ((t.1 as u32) << 8) | ((t.2 as u32) << 16)
+        };
+        // 0x34 = textured-shaded triangle, modulated.
+        cpu.gp0_push((0x34u32 << 24) | pack_rgb(c[0]));
+        cpu.gp0_push(pack_xy(v[0]));
+        cpu.gp0_push(uv_pack(uv[0])); // CLUT 0 (unused for 15bpp)
+        cpu.gp0_push(pack_rgb(c[1]));
+        cpu.gp0_push(pack_xy(v[1]));
+        cpu.gp0_push((tpage_word << 16) | uv_pack(uv[1]));
+        cpu.gp0_push(pack_rgb(c[2]));
+        cpu.gp0_push(pack_xy(v[2]));
+        cpu.gp0_push(uv_pack(uv[2]));
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = ShadedTexTri::new(
+            v[0], v[1], v[2],
+            c[0], c[1], c[2],
+            uv[0], uv[1], uv[2],
+            0, 0,
+            PrimFlags::empty(),
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 2);
+        r.dispatch_shaded_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (20, 20), (60, 60));
+        let bbox = 41 * 41;
+        assert!(diffs * 4 < bbox, "shaded-tex coverage: {diffs} / {bbox}");
+        let mut max_chan = 0i32;
+        for y in 20..=60i32 {
+            for x in 20..=60i32 {
+                let i = y as usize * 1024 + x as usize;
+                if cpu_words[i] == gpu_words[i] {
+                    continue;
+                }
+                for shift in [0u32, 5, 10] {
+                    let ca = ((cpu_words[i] >> shift) & 0x1F) as i32;
+                    let cb = ((gpu_words[i] >> shift) & 0x1F) as i32;
+                    max_chan = max_chan.max((ca - cb).abs());
+                }
+            }
+        }
+        // Tolerance is looser than B.2's ±2 because tint
+        // interpolation + tint×texel modulation compound the
+        // per-step rounding error. ±5 in any 5-bit channel = ~16%
+        // intensity, still tight enough to catch real bugs.
+        assert!(
+            max_chan <= 5,
+            "shaded-tex max channel delta: {max_chan} > 5"
+        );
     }
 
     #[test]
