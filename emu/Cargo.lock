@@ -1004,6 +1004,7 @@ dependencies = [
  "pollster",
  "psoxide-settings",
  "psx-gpu-compute",
+ "psx-gpu-render",
  "psx-iso",
  "psx-trace",
  "wgpu",
@@ -2425,6 +2426,18 @@ dependencies = [
  "psoxide-settings",
  "psx-iso",
  "thiserror 1.0.69",
+ "wgpu",
+]
+
+[[package]]
+name = "psx-gpu-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "egui",
+ "egui-wgpu",
+ "emulator-core",
+ "psx-gpu-compute",
  "wgpu",
 ]
 

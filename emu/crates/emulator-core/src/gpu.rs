@@ -154,6 +154,12 @@ pub struct Gpu {
     /// the raw fifo words the packet consumed, so we can replay
     /// the exact inputs to a single draw in isolation.
     pub cmd_log: Vec<GpuCmdLogEntry>,
+    /// Master gate for `cmd_log` pushes. Set by both
+    /// `enable_pixel_tracer` and the lighter `enable_cmd_log`.
+    /// Decoupled from `pixel_owner.is_some()` so the HW renderer can
+    /// capture the GP0 stream without paying for the 2 MiB owner Vec
+    /// or its per-pixel stamping cost.
+    cmd_log_enabled: bool,
     /// The index that will be written into `pixel_owner` for the
     /// NEXT pixel plotted — i.e., the index of the currently-
     /// executing command. Bumped just before each packet dispatch.
@@ -312,6 +318,7 @@ impl Gpu {
             wireframe_enabled: false,
             pixel_owner: None,
             cmd_log: Vec::new(),
+            cmd_log_enabled: false,
             current_cmd_index: 0,
             busy_credit: 0,
             display_start_x: 0,
@@ -462,6 +469,29 @@ impl Gpu {
         self.pixel_owner = Some(vec![SENTINEL_NO_OWNER; VRAM_WIDTH * VRAM_HEIGHT]);
         self.cmd_log.clear();
         self.current_cmd_index = 0;
+        self.cmd_log_enabled = true;
+    }
+
+    /// Enable cmd_log capture WITHOUT allocating the per-pixel owner
+    /// buffer. The HW (wgpu render-pipeline) renderer needs the GP0
+    /// packet stream to drive its draw calls each frame, but doesn't
+    /// need pixel-level provenance — saves the 2 MiB owner Vec and
+    /// the per-`plot_pixel` stamp cost. The bench probes that DO
+    /// want owner tracking still call `enable_pixel_tracer`.
+    ///
+    /// Idempotent: re-enabling clears cmd_log.
+    pub fn enable_cmd_log(&mut self) {
+        self.cmd_log.clear();
+        self.current_cmd_index = 0;
+        self.cmd_log_enabled = true;
+    }
+
+    /// Whether `cmd_log` capture is currently armed (either via
+    /// `enable_cmd_log` or `enable_pixel_tracer`). Lets the
+    /// frontend call `enable_cmd_log` at most once per Bus
+    /// lifetime instead of clobbering the log every frame.
+    pub fn cmd_log_enabled(&self) -> bool {
+        self.cmd_log_enabled
     }
 
     /// Look up which command drew the pixel at (x, y), returning
@@ -901,7 +931,7 @@ impl Gpu {
         // draw-offset / mask). These don't plot pixels but they shift
         // the state that subsequent draws interpret — useful to see
         // in the log when chasing a parity divergence.
-        if self.pixel_owner.is_some() {
+        if self.cmd_log_enabled {
             let index = self.cmd_log.len() as u32;
             self.current_cmd_index = index;
             self.cmd_log.push(GpuCmdLogEntry {
@@ -1010,7 +1040,7 @@ impl Gpu {
         // command log *before* dispatching — `plot_pixel` uses
         // `current_cmd_index` to tag every write, so it must point
         // at the index of the entry we're about to push.
-        if self.pixel_owner.is_some() {
+        if self.cmd_log_enabled {
             let index = self.cmd_log.len() as u32;
             self.current_cmd_index = index;
             self.cmd_log.push(GpuCmdLogEntry {

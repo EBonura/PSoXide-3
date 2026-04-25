@@ -25,161 +25,16 @@ use std::sync::Arc;
 
 use emulator_core::gpu::GpuCmdLogEntry;
 
+use crate::decode::{
+    apply_primitive_tpage, decode_blend_mode, decode_clut, decode_tint, decode_uv, decode_vertex,
+    is_raw_texture, is_semi_trans, rgb24_to_bgr15, sign_extend_11, ReplayState,
+};
 use crate::primitive::{
-    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri,
-    TexQuadBilinear, TexRect, TexTri, Tpage,
+    BlendMode, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri, TexQuadBilinear,
+    TexRect, TexTri, Tpage,
 };
 use crate::rasterizer::Rasterizer;
 use crate::vram::{self, VramGpu};
-
-/// GP0 state we have to track in lockstep with the CPU rasterizer
-/// so triangle / rect dispatches see the right tpage, drawing area,
-/// drawing offset, mask flags, and per-primitive blend mode.
-#[derive(Debug, Clone)]
-pub struct ReplayState {
-    pub draw_area: DrawArea,
-    pub draw_offset_x: i32,
-    pub draw_offset_y: i32,
-    pub tpage: Tpage,
-    /// Active tpage blend mode (decoded from GP0 0xE1 bits 5-6 or
-    /// per-primitive tpage word). Used by mono / shaded primitives
-    /// when their cmd-bit-1 (semi-trans) is set.
-    pub tex_blend_mode: BlendMode,
-    /// `mask_set_on_draw` (GP0 0xE6 bit 0).
-    pub mask_set: bool,
-    /// `mask_check_before_draw` (GP0 0xE6 bit 1).
-    pub mask_check: bool,
-    /// `dither` (GP0 0xE1 bit 9). Affects shaded / textured-shaded.
-    pub dither: bool,
-    /// `tex_rect_flip_x` / `_y` (GP0 0xE1 bits 12 / 13).
-    pub flip_x: bool,
-    pub flip_y: bool,
-}
-
-impl ReplayState {
-    fn new() -> Self {
-        Self {
-            draw_area: DrawArea {
-                left: 0,
-                top: 0,
-                right: 1023,
-                bottom: 511,
-            },
-            draw_offset_x: 0,
-            draw_offset_y: 0,
-            tpage: Tpage::new(0, 0, 0),
-            tex_blend_mode: BlendMode::Average,
-            mask_set: false,
-            mask_check: false,
-            dither: false,
-            flip_x: false,
-            flip_y: false,
-        }
-    }
-
-    fn base_flags(&self) -> PrimFlags {
-        let mut f = PrimFlags::empty();
-        if self.mask_set {
-            f |= PrimFlags::MASK_SET;
-        }
-        if self.mask_check {
-            f |= PrimFlags::MASK_CHECK;
-        }
-        if self.dither {
-            f |= PrimFlags::DITHER;
-        }
-        f
-    }
-
-    fn rect_flip_flags(&self) -> PrimFlags {
-        let mut f = self.base_flags();
-        if self.flip_x {
-            f |= PrimFlags::FLIP_X;
-        }
-        if self.flip_y {
-            f |= PrimFlags::FLIP_Y;
-        }
-        f
-    }
-}
-
-/// Decode helper for "is this primitive raw-textured?". Tested
-/// against bit 0 of the OPCODE byte (= bit 24 of the cmd word) per
-/// PSX-SPX, matching `emulator-core::Gpu::draw_textured_*`.
-fn is_raw_texture(cmd: u32) -> bool {
-    (cmd >> 24) & 1 != 0
-}
-
-/// `prim_is_semi_trans` — bit 1 of the opcode byte (cmd word bit 25).
-fn is_semi_trans(cmd: u32) -> bool {
-    (cmd >> 25) & 1 != 0
-}
-
-fn decode_vertex(state: &ReplayState, word: u32) -> (i32, i32) {
-    // 11-bit signed for both axes, then add the drawing offset.
-    let x = sign_extend_11((word & 0x7FF) as i32) + state.draw_offset_x;
-    let y = sign_extend_11(((word >> 16) & 0x7FF) as i32) + state.draw_offset_y;
-    (x, y)
-}
-
-fn sign_extend_11(v: i32) -> i32 {
-    if v & 0x400 != 0 {
-        v | !0x7FF
-    } else {
-        v & 0x7FF
-    }
-}
-
-fn decode_uv(word: u32) -> (u8, u8) {
-    ((word & 0xFF) as u8, ((word >> 8) & 0xFF) as u8)
-}
-
-fn decode_tint(cmd: u32) -> (u8, u8, u8) {
-    (
-        (cmd & 0xFF) as u8,
-        ((cmd >> 8) & 0xFF) as u8,
-        ((cmd >> 16) & 0xFF) as u8,
-    )
-}
-
-fn decode_clut(word: u32) -> (u32, u32) {
-    let clut_word = (word >> 16) & 0xFFFF;
-    let cx = (clut_word & 0x3F) * 16;
-    let cy = (clut_word >> 6) & 0x1FF;
-    (cx, cy)
-}
-
-fn rgb24_to_bgr15(rgb: u32) -> u16 {
-    let r = ((rgb >> 3) & 0x1F) as u16;
-    let g = (((rgb >> 8) >> 3) & 0x1F) as u16;
-    let b = (((rgb >> 16) >> 3) & 0x1F) as u16;
-    r | (g << 5) | (b << 10)
-}
-
-/// Apply a primitive's tpage word (the high half of UV1 in the GP0
-/// packet) to the replay state, mirroring
-/// `emulator-core::Gpu::apply_primitive_tpage` byte-for-byte.
-fn apply_primitive_tpage(state: &mut ReplayState, uv_word: u32) {
-    let tpage = (uv_word >> 16) & 0xFFFF;
-    let tpage_x = (tpage & 0x0F) * 64;
-    let tpage_y: u32 = if (tpage >> 4) & 1 != 0 { 256 } else { 0 };
-    let tex_depth = (tpage >> 7) & 0x3;
-    state.tpage = Tpage::new(tpage_x, tpage_y, tex_depth);
-    state.tex_blend_mode = decode_blend_mode(tpage >> 5);
-    // CPU `apply_primitive_tpage` also OR-folds dither_enabled
-    // (`tpage |= 0x200` if dither was on globally). We mirror by
-    // leaving `state.dither` as-is — dither only flips off via a
-    // GP0 0xE1, not a primitive's tpage word.
-}
-
-fn decode_blend_mode(bits: u32) -> BlendMode {
-    match bits & 0x3 {
-        0 => BlendMode::Average,
-        1 => BlendMode::Add,
-        2 => BlendMode::Sub,
-        _ => BlendMode::AddQuarter,
-    }
-}
 
 /// Compute backend — owns `VramGpu` + `Rasterizer` plus the replay
 /// state needed to interpret each GP0 packet.

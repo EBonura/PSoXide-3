@@ -9,16 +9,21 @@
 //! The CPU rasterizer in `emulator-core` is the parity oracle. The
 //! compute path is opt-in until it matches pixel-for-pixel.
 
+pub mod decode;
 pub mod primitive;
 pub mod rasterizer;
 pub mod replay;
 pub mod scanline;
 pub mod vram;
 
+pub use decode::{
+    apply_primitive_tpage, decode_blend_mode, decode_clut, decode_tint, decode_uv, decode_vertex,
+    is_raw_texture, is_semi_trans, rgb24_to_bgr15, sign_extend_11, ReplayState,
+};
 pub use primitive::{
     BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri,
     TexQuadBilinear, TexRect, TexTri, Tpage,
 };
 pub use rasterizer::Rasterizer;
-pub use replay::{ComputeBackend, ReplayState};
+pub use replay::ComputeBackend;
 pub use vram::{VramGpu, VramGpuError, VRAM_FORMAT, VRAM_HEIGHT, VRAM_WIDTH};

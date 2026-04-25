@@ -540,19 +540,39 @@ impl ApplicationHandler for Shell {
                 }
 
                 gfx.prepare_vram(state.bus.as_ref().map(|b| &b.gpu.vram));
-                // Display source: GPU VRAM if the user toggled it on,
-                // else the CPU's. The compute output should look
-                // identical to the CPU's; flipping makes that visible.
-                if self.display_gpu_compute && self.compute_backend.is_some() {
-                    gfx.prepare_display_from_words(
-                        self.compute_backend.as_ref().unwrap().download_vram(),
-                        state.bus.as_ref().map(|b| &b.gpu),
-                    );
+
+                // Drive the hardware renderer once per frame —
+                // walks `bus.gpu.cmd_log`, issues wgpu draw calls,
+                // leaves output in `gfx.hw_texture_id()`. cmd_log
+                // is always armed (see Bus initialization below);
+                // when there's no Bus yet we just clear-paint with
+                // an empty log so the central panel still shows
+                // something predictable.
+                let scale_mode = match state.scale_mode {
+                    app::ScaleMode::Native => psx_gpu_render::ScaleMode::Native,
+                    app::ScaleMode::Window => psx_gpu_render::ScaleMode::Window,
+                };
+                // Use the surface size as the panel's worst-case
+                // pixel budget. A future polish pass moves this to
+                // the actual central-panel rect (one-frame latency
+                // — see plan §"Panel rect availability").
+                let panel_size_px = (gfx.config.width.max(1), gfx.config.height.max(1));
+                if let Some(bus) = state.bus.as_mut() {
+                    if !bus.gpu.cmd_log_enabled() {
+                        bus.gpu.enable_cmd_log();
+                    }
+                    let log = std::mem::take(&mut bus.gpu.cmd_log);
+                    gfx.render_hw_frame(&bus.gpu, scale_mode, panel_size_px, &log);
                 } else {
-                    gfx.prepare_display(state.bus.as_ref().map(|b| &b.gpu));
+                    // No bus → render an empty frame so the panel
+                    // is still well-defined (clears to black).
+                    let empty: Vec<emulator_core::gpu::GpuCmdLogEntry> = Vec::new();
+                    let dummy_gpu = emulator_core::Gpu::new();
+                    gfx.render_hw_frame(&dummy_gpu, scale_mode, panel_size_px, &empty);
                 }
+
                 let vram_tex = gfx.vram_texture_id();
-                let display_tex = gfx.display_texture_id();
+                let display_tex = gfx.hw_texture_id();
                 gfx.render(|ctx| app::build_ui(ctx, state, vram_tex, display_tex, dt));
             }
             _ => {
