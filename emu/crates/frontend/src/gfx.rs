@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use emulator_core::{Gpu, Vram, VRAM_HEIGHT, VRAM_WIDTH};
+use emulator_core::{Gpu, VRAM_HEIGHT, VRAM_WIDTH};
 use winit::window::Window;
 
 /// All GPU / windowing state. Built lazily in `App::resumed` because
@@ -131,11 +131,23 @@ impl Graphics {
     /// Upload a full VRAM snapshot to the GPU-side texture. Called once
     /// per frame from `App` before `render`. `None` means "no Bus yet"
     /// — we leave the last texture contents alone (typically zeros).
-    pub fn prepare_vram(&self, vram: Option<&Vram>) {
-        let Some(vram) = vram else {
+    /// Upload a raw 1024×512 BGR15 buffer into the VRAM viewer
+    /// texture. The GPU compute backend feeds this with its
+    /// downloaded VRAM each frame.
+    pub fn prepare_vram_from_words(&self, words: &[u16]) {
+        if words.len() != VRAM_WIDTH * VRAM_HEIGHT {
             return;
-        };
-        let rgba = vram.to_rgba8(0, 0, VRAM_WIDTH as u16, VRAM_HEIGHT as u16);
+        }
+        let mut rgba = Vec::with_capacity(VRAM_WIDTH * VRAM_HEIGHT * 4);
+        for &pixel in words {
+            let r5 = pixel & 0x1F;
+            let g5 = (pixel >> 5) & 0x1F;
+            let b5 = (pixel >> 10) & 0x1F;
+            rgba.push(((r5 << 3) | (r5 >> 2)) as u8);
+            rgba.push(((g5 << 3) | (g5 >> 2)) as u8);
+            rgba.push(((b5 << 3) | (b5 >> 2)) as u8);
+            rgba.push(0xFF);
+        }
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.vram_texture,
@@ -158,53 +170,9 @@ impl Graphics {
     }
 
     /// Upload the GPU's active display rectangle into a top-left-packed
-    /// texture. This is what the central framebuffer panel samples, so
-    /// 24-bit MDEC/FMVs are decoded correctly instead of being viewed as
-    /// raw 15-bit VRAM words.
-    pub fn prepare_display(&self, gpu: Option<&Gpu>) {
-        let Some(gpu) = gpu else {
-            return;
-        };
-        let (rgba, width, height) = gpu.display_rgba8();
-        if width == 0 || height == 0 {
-            return;
-        }
-        let mut packed = vec![0u8; VRAM_WIDTH * VRAM_HEIGHT * 4];
-        let src_stride = width as usize * 4;
-        let dst_stride = VRAM_WIDTH * 4;
-        for row in 0..height as usize {
-            let src = row * src_stride;
-            let dst = row * dst_stride;
-            packed[dst..dst + src_stride].copy_from_slice(&rgba[src..src + src_stride]);
-        }
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.display_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &packed,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(VRAM_WIDTH as u32 * 4),
-                rows_per_image: Some(VRAM_HEIGHT as u32),
-            },
-            wgpu::Extent3d {
-                width: VRAM_WIDTH as u32,
-                height: VRAM_HEIGHT as u32,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-
-    /// Phase C — same as `prepare_display`, but the source pixels
-    /// come from a custom `Vec<u16>` (typically the compute
-    /// backend's VRAM downloaded via `VramGpu::download_full`)
-    /// instead of the CPU rasterizer's VRAM. The display rect /
-    /// 24-bit-mode flag is still pulled from `gpu` (it's the same
-    /// state the framebuffer panel reads); we just substitute the
-    /// VRAM cells.
+    /// texture. The source pixels come from a downloaded GPU compute
+    /// VRAM buffer; the display rect / 24-bit-mode flag is still
+    /// pulled from `gpu` (the same state the framebuffer panel reads).
     pub fn prepare_display_from_words(&self, words: Vec<u16>, gpu: Option<&Gpu>) {
         let Some(gpu) = gpu else {
             return;
