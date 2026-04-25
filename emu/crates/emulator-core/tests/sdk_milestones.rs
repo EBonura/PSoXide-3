@@ -441,7 +441,10 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             // The world textured path now splits projected triangles
             // that would exceed the PS1 hardware extent limits, so the
             // floor stays stable at close and pulled-back camera ranges.
-            final_pc: 0x8001_2768,
+            // Visual hashes unchanged after moving the camera/world
+            // transform math into `psx-engine::WorldCamera`; only code
+            // layout shifted the frame-boundary PC.
+            final_pc: 0x8001_2bac,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:

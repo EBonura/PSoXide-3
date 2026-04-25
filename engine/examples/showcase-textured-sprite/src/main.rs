@@ -15,8 +15,8 @@ extern crate psx_rt;
 use psx_asset::Texture;
 use psx_engine::{
     button, App, Config, Ctx, CullMode, DepthBand, DepthRange, OtFrame, PrimitiveArena,
-    ProjectedVertex, Scene, TexturedViewVertex, ViewVertex, WorldProjection, WorldRenderPass,
-    WorldSurfaceOptions, WorldTriCommand,
+    Scene, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
+    WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{
@@ -24,7 +24,6 @@ use psx_gpu::{
     ot::OrderingTable,
     prim::TriTextured,
 };
-use psx_math::{cos_q12, sin_q12};
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
 static BRICK_BLOB: &[u8] = include_bytes!("../../showcase-fog/assets/brick-wall.psxt");
@@ -94,24 +93,6 @@ static mut TEXTURED_TRIS: [TriTextured; MAX_TEXTURED_TRIS] =
     [const { TRI_ZERO }; MAX_TEXTURED_TRIS];
 static mut WORLD_COMMANDS: [WorldTriCommand; MAX_TEXTURED_TRIS] =
     [WorldTriCommand::EMPTY; MAX_TEXTURED_TRIS];
-
-#[derive(Copy, Clone)]
-struct Vec3 {
-    x: i32,
-    y: i32,
-    z: i32,
-}
-
-#[derive(Copy, Clone)]
-struct Camera {
-    x: i32,
-    y: i32,
-    z: i32,
-    sin_yaw: i32,
-    cos_yaw: i32,
-    sin_pitch: i32,
-    cos_pitch: i32,
-}
 
 struct Showcase {
     font: Option<FontAtlas>,
@@ -289,48 +270,18 @@ fn upload_blend_clut(rect: VramRect, bytes: &[u8]) {
     upload_bytes(rect, &marked[..bytes.len()]);
 }
 
-fn camera_for(yaw: u16, radius: i32) -> Camera {
-    let sx = sin_q12(yaw);
-    let cz = cos_q12(yaw);
-    let target_dy = CAMERA_TARGET_Y - CAMERA_Y;
-    let pitch_len =
-        isqrt_i32(radius.saturating_mul(radius) + target_dy.saturating_mul(target_dy)).max(1);
-    Camera {
-        x: CAMERA_TARGET_X + ((sx * radius) >> 12),
-        y: CAMERA_Y,
-        z: CAMERA_TARGET_Z + ((cz * radius) >> 12),
-        sin_yaw: sx,
-        cos_yaw: cz,
-        sin_pitch: (target_dy * 4096) / pitch_len,
-        cos_pitch: (radius * 4096) / pitch_len,
-    }
-}
-
-fn isqrt_i32(value: i32) -> i32 {
-    if value <= 0 {
-        return 0;
-    }
-
-    let mut bit = 1 << 30;
-    let mut n = value;
-    let mut root = 0;
-    while bit > n {
-        bit >>= 2;
-    }
-    while bit != 0 {
-        if n >= root + bit {
-            n -= root + bit;
-            root = (root >> 1) + bit;
-        } else {
-            root >>= 1;
-        }
-        bit >>= 2;
-    }
-    root
+fn camera_for(yaw: u16, radius: i32) -> WorldCamera {
+    WorldCamera::orbit_yaw(
+        PROJECTION,
+        WorldVertex::new(CAMERA_TARGET_X, CAMERA_TARGET_Y, CAMERA_TARGET_Z),
+        CAMERA_Y,
+        radius,
+        yaw,
+    )
 }
 
 fn draw_room(
-    camera: Camera,
+    camera: WorldCamera,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
@@ -339,7 +290,7 @@ fn draw_room(
 }
 
 fn draw_floor(
-    camera: Camera,
+    camera: WorldCamera,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
@@ -353,22 +304,22 @@ fn draw_floor(
             draw_world_textured(
                 camera,
                 [
-                    Vec3 {
+                    WorldVertex {
                         x: ROOM_EDGES[xi],
                         y: 0,
                         z: ROOM_EDGES[zi],
                     },
-                    Vec3 {
+                    WorldVertex {
                         x: ROOM_EDGES[xi + 1],
                         y: 0,
                         z: ROOM_EDGES[zi],
                     },
-                    Vec3 {
+                    WorldVertex {
                         x: ROOM_EDGES[xi],
                         y: 0,
                         z: ROOM_EDGES[zi + 1],
                     },
-                    Vec3 {
+                    WorldVertex {
                         x: ROOM_EDGES[xi + 1],
                         y: 0,
                         z: ROOM_EDGES[zi + 1],
@@ -387,7 +338,7 @@ fn draw_floor(
 }
 
 fn draw_walls(
-    camera: Camera,
+    camera: WorldCamera,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
@@ -407,7 +358,7 @@ fn draw_walls(
 }
 
 fn draw_z_wall(
-    camera: Camera,
+    camera: WorldCamera,
     z: i32,
     reverse_x: bool,
     material: TextureMaterial,
@@ -425,17 +376,17 @@ fn draw_z_wall(
             let y1 = WALL_Y_EDGES[yi + 1];
             let verts = if reverse_x {
                 [
-                    Vec3 { x: x1, y: y1, z },
-                    Vec3 { x: x0, y: y1, z },
-                    Vec3 { x: x1, y: y0, z },
-                    Vec3 { x: x0, y: y0, z },
+                    WorldVertex { x: x1, y: y1, z },
+                    WorldVertex { x: x0, y: y1, z },
+                    WorldVertex { x: x1, y: y0, z },
+                    WorldVertex { x: x0, y: y0, z },
                 ]
             } else {
                 [
-                    Vec3 { x: x0, y: y1, z },
-                    Vec3 { x: x1, y: y1, z },
-                    Vec3 { x: x0, y: y0, z },
-                    Vec3 { x: x1, y: y0, z },
+                    WorldVertex { x: x0, y: y1, z },
+                    WorldVertex { x: x1, y: y1, z },
+                    WorldVertex { x: x0, y: y0, z },
+                    WorldVertex { x: x1, y: y0, z },
                 ]
             };
             draw_wall_textured(camera, verts, BRICK_U, material, options, world, triangles);
@@ -446,7 +397,7 @@ fn draw_z_wall(
 }
 
 fn draw_x_wall(
-    camera: Camera,
+    camera: WorldCamera,
     x: i32,
     reverse_z: bool,
     material: TextureMaterial,
@@ -464,17 +415,17 @@ fn draw_x_wall(
             let y1 = WALL_Y_EDGES[yi + 1];
             let verts = if reverse_z {
                 [
-                    Vec3 { x, y: y1, z: z1 },
-                    Vec3 { x, y: y1, z: z0 },
-                    Vec3 { x, y: y0, z: z1 },
-                    Vec3 { x, y: y0, z: z0 },
+                    WorldVertex { x, y: y1, z: z1 },
+                    WorldVertex { x, y: y1, z: z0 },
+                    WorldVertex { x, y: y0, z: z1 },
+                    WorldVertex { x, y: y0, z: z0 },
                 ]
             } else {
                 [
-                    Vec3 { x, y: y1, z: z0 },
-                    Vec3 { x, y: y1, z: z1 },
-                    Vec3 { x, y: y0, z: z0 },
-                    Vec3 { x, y: y0, z: z1 },
+                    WorldVertex { x, y: y1, z: z0 },
+                    WorldVertex { x, y: y1, z: z1 },
+                    WorldVertex { x, y: y0, z: z0 },
+                    WorldVertex { x, y: y0, z: z1 },
                 ]
             };
             draw_wall_textured(camera, verts, BRICK_U, material, options, world, triangles);
@@ -486,7 +437,7 @@ fn draw_x_wall(
 
 fn draw_material_pane(
     scene: &Showcase,
-    camera: Camera,
+    camera: WorldCamera,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
@@ -494,7 +445,7 @@ fn draw_material_pane(
 }
 
 fn draw_vertical_square(
-    camera: Camera,
+    camera: WorldCamera,
     base_u: u8,
     material: TextureMaterial,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
@@ -511,22 +462,22 @@ fn draw_vertical_square(
     draw_world_textured(
         camera,
         [
-            Vec3 {
+            WorldVertex {
                 x: x0,
                 y: y1,
                 z: PANEL_Z,
             },
-            Vec3 {
+            WorldVertex {
                 x: x1,
                 y: y1,
                 z: PANEL_Z,
             },
-            Vec3 {
+            WorldVertex {
                 x: x0,
                 y: y0,
                 z: PANEL_Z,
             },
-            Vec3 {
+            WorldVertex {
                 x: x1,
                 y: y0,
                 z: PANEL_Z,
@@ -541,8 +492,8 @@ fn draw_vertical_square(
 }
 
 fn draw_world_textured(
-    camera: Camera,
-    verts: [Vec3; 4],
+    camera: WorldCamera,
+    verts: [WorldVertex; 4],
     base_u: u8,
     material: TextureMaterial,
     options: WorldSurfaceOptions,
@@ -550,30 +501,26 @@ fn draw_world_textured(
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
     let uvs = texture_uvs(base_u);
-    let _ = world.submit_textured_view_quad(
+    let _ = world.submit_textured_world_quad(
         triangles,
-        [
-            textured_view_vertex(camera, verts[0], uvs[0]),
-            textured_view_vertex(camera, verts[1], uvs[1]),
-            textured_view_vertex(camera, verts[2], uvs[2]),
-            textured_view_vertex(camera, verts[3], uvs[3]),
-        ],
-        PROJECTION,
+        camera,
+        verts,
+        uvs,
         material,
         options,
     );
 }
 
 fn draw_wall_textured(
-    camera: Camera,
-    verts: [Vec3; 4],
+    camera: WorldCamera,
+    verts: [WorldVertex; 4],
     base_u: u8,
     material: TextureMaterial,
     options: WorldSurfaceOptions,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
-    if let Some(projected) = project_quad(camera, verts) {
+    if let Some(projected) = camera.project_world_quad(verts) {
         let _ = world.submit_textured_quad(
             triangles,
             projected,
@@ -582,36 +529,6 @@ fn draw_wall_textured(
             options,
         );
     }
-}
-
-fn project_quad(camera: Camera, verts: [Vec3; 4]) -> Option<[ProjectedVertex; 4]> {
-    Some([
-        project_vertex(camera, verts[0])?,
-        project_vertex(camera, verts[1])?,
-        project_vertex(camera, verts[2])?,
-        project_vertex(camera, verts[3])?,
-    ])
-}
-
-fn project_vertex(camera: Camera, v: Vec3) -> Option<ProjectedVertex> {
-    PROJECTION.project_view(view_vertex(camera, v))
-}
-
-fn textured_view_vertex(camera: Camera, v: Vec3, uv: (u8, u8)) -> TexturedViewVertex {
-    TexturedViewVertex::new(view_vertex(camera, v), uv.0 as i32, uv.1 as i32)
-}
-
-fn view_vertex(camera: Camera, v: Vec3) -> ViewVertex {
-    let dx = v.x - camera.x;
-    let dy = v.y - camera.y;
-    let dz = v.z - camera.z;
-
-    let x1 = ((dx * camera.cos_yaw) - (dz * camera.sin_yaw)) >> 12;
-    let z1 = ((-dx * camera.sin_yaw) - (dz * camera.cos_yaw)) >> 12;
-    let y2 = ((dy * camera.cos_pitch) - (z1 * camera.sin_pitch)) >> 12;
-    let z2 = ((dy * camera.sin_pitch) + (z1 * camera.cos_pitch)) >> 12;
-
-    ViewVertex::new(x1, y2, z2)
 }
 
 fn texture_uvs(base_u: u8) -> [(u8, u8); 4] {

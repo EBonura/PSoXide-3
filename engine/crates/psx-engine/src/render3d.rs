@@ -21,6 +21,7 @@ use psx_gte::{
     lighting::{project_lit, ProjectedLit},
     math::Vec3I16,
 };
+use psx_math::{cos_q12, sin_q12};
 
 use crate::render::{DepthBand, DepthRange, DepthSlot, OtFrame, PrimitiveArena};
 
@@ -104,6 +105,34 @@ impl ViewVertex {
     pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
 
     /// Build a camera-space vertex.
+    pub const fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+}
+
+/// CPU-side world-space vertex used by [`WorldCamera`].
+///
+/// This is intentionally raw integer space rather than
+/// [`Vec3World`][crate::Vec3World]'s Q19.12 GTE translation space.
+/// CPU-projected editor/debug/material surfaces often use compact
+/// authored coordinates and a matching focal length; callers choose
+/// that scale as long as every vertex, camera position, and
+/// [`WorldProjection`] uses the same unit.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorldVertex {
+    /// World-space X.
+    pub x: i32,
+    /// World-space Y.
+    pub y: i32,
+    /// World-space Z.
+    pub z: i32,
+}
+
+impl WorldVertex {
+    /// Origin.
+    pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
+
+    /// Build a world-space vertex.
     pub const fn new(x: i32, y: i32, z: i32) -> Self {
         Self { x, y, z }
     }
@@ -193,6 +222,117 @@ impl From<ProjectedLit> for ProjectedVertex {
     }
 }
 
+/// CPU-side perspective camera for authored world surfaces.
+///
+/// The camera stores a simple orbit-style basis: yaw rotates around
+/// the world's Y axis, then pitch tilts the view around the camera's
+/// local X axis. It is deliberately small and fixed-point friendly:
+/// the trigonometric basis is Q0.12, matching `psx-math`'s sine table.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WorldCamera {
+    /// Projection used after world-to-view transformation.
+    pub projection: WorldProjection,
+    /// Camera position in the same world units as submitted surfaces.
+    pub position: WorldVertex,
+    /// Sine of yaw, Q0.12.
+    pub sin_yaw: i32,
+    /// Cosine of yaw, Q0.12.
+    pub cos_yaw: i32,
+    /// Sine of pitch, Q0.12.
+    pub sin_pitch: i32,
+    /// Cosine of pitch, Q0.12.
+    pub cos_pitch: i32,
+}
+
+impl WorldCamera {
+    /// Build a camera from an explicit fixed-point basis.
+    pub const fn from_basis(
+        projection: WorldProjection,
+        position: WorldVertex,
+        sin_yaw: i32,
+        cos_yaw: i32,
+        sin_pitch: i32,
+        cos_pitch: i32,
+    ) -> Self {
+        Self {
+            projection,
+            position,
+            sin_yaw,
+            cos_yaw,
+            sin_pitch,
+            cos_pitch,
+        }
+    }
+
+    /// Build a camera on a horizontal orbit that looks at `target`.
+    ///
+    /// `yaw_q12` is the argument consumed by [`sin_q12`] /
+    /// [`cos_q12`]: 4096 units per full turn. `camera_y` is the
+    /// camera's absolute world-space height. Pitch is derived from
+    /// `target.y - camera_y`, so dollying the radius keeps the target
+    /// centred without per-frame call-site math.
+    pub fn orbit_yaw(
+        projection: WorldProjection,
+        target: WorldVertex,
+        camera_y: i32,
+        radius: i32,
+        yaw_q12: u16,
+    ) -> Self {
+        let sin_yaw = sin_q12(yaw_q12);
+        let cos_yaw = cos_q12(yaw_q12);
+        let target_dy = target.y - camera_y;
+        let pitch_len =
+            isqrt_i32(radius.saturating_mul(radius) + target_dy.saturating_mul(target_dy)).max(1);
+        Self {
+            projection,
+            position: WorldVertex::new(
+                target.x + ((sin_yaw * radius) >> 12),
+                camera_y,
+                target.z + ((cos_yaw * radius) >> 12),
+            ),
+            sin_yaw,
+            cos_yaw,
+            sin_pitch: (target_dy * 4096) / pitch_len,
+            cos_pitch: (radius * 4096) / pitch_len,
+        }
+    }
+
+    /// Transform a world-space vertex into camera-space.
+    pub fn view_vertex(self, vertex: WorldVertex) -> ViewVertex {
+        let dx = vertex.x - self.position.x;
+        let dy = vertex.y - self.position.y;
+        let dz = vertex.z - self.position.z;
+
+        let x1 = ((dx * self.cos_yaw) - (dz * self.sin_yaw)) >> 12;
+        let z1 = ((-dx * self.sin_yaw) - (dz * self.cos_yaw)) >> 12;
+        let y2 = ((dy * self.cos_pitch) - (z1 * self.sin_pitch)) >> 12;
+        let z2 = ((dy * self.sin_pitch) + (z1 * self.cos_pitch)) >> 12;
+
+        ViewVertex::new(x1, y2, z2)
+    }
+
+    /// Transform and project a world-space vertex.
+    pub fn project_world(self, vertex: WorldVertex) -> Option<ProjectedVertex> {
+        self.projection.project_view(self.view_vertex(vertex))
+    }
+
+    /// Transform and project a world-space quad. Returns `None` if
+    /// any corner falls behind the projection near plane.
+    pub fn project_world_quad(self, verts: [WorldVertex; 4]) -> Option<[ProjectedVertex; 4]> {
+        Some([
+            self.project_world(verts[0])?,
+            self.project_world(verts[1])?,
+            self.project_world(verts[2])?,
+            self.project_world(verts[3])?,
+        ])
+    }
+
+    /// Transform a textured world-space vertex to camera-space.
+    pub fn textured_view_vertex(self, vertex: WorldVertex, uv: (u8, u8)) -> TexturedViewVertex {
+        TexturedViewVertex::new(self.view_vertex(vertex), uv.0 as i32, uv.1 as i32)
+    }
+}
+
 /// Shared options for projected world surfaces.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WorldSurfaceOptions {
@@ -271,6 +411,15 @@ pub struct WorldRenderStats {
     pub submitted_triangles: u16,
     /// Triangles rejected by back-face culling.
     pub culled_triangles: u16,
+    /// Triangles that crossed the near plane and were clipped before
+    /// projection.
+    pub clipped_triangles: u16,
+    /// Oversized projected triangles split to satisfy PS1 hardware
+    /// extent limits.
+    pub split_triangles: u16,
+    /// Triangles dropped before packet emission because they were
+    /// fully clipped or could not be made hardware-legal.
+    pub dropped_triangles: u16,
     /// True if the primitive packet arena filled up.
     pub primitive_overflow: bool,
     /// True if the command scratch buffer filled up.
@@ -352,6 +501,12 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
                 split_depth,
             );
         }
+        if projected_textured_exceeds_hw_extent(verts) {
+            return WorldRenderStats {
+                dropped_triangles: 1,
+                ..WorldRenderStats::default()
+            };
+        }
 
         self.submit_textured_triangle_leaf(triangles, verts, material, options)
     }
@@ -365,7 +520,10 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         split_depth: u8,
     ) -> WorldRenderStats {
         let edge = largest_projected_edge(verts);
-        let mut stats = WorldRenderStats::default();
+        let mut stats = WorldRenderStats {
+            split_triangles: 1,
+            ..WorldRenderStats::default()
+        };
 
         let (first, second) = match edge {
             0 => {
@@ -511,7 +669,11 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         let count = clip_textured_triangle_to_near(verts, projection.near_z, &mut clipped);
         let mut stats = WorldRenderStats::default();
         if count < 3 {
+            stats.dropped_triangles = 1;
             return stats;
+        }
+        if count != 3 || !verts.iter().all(|v| v.position.z >= projection.near_z) {
+            stats.clipped_triangles = 1;
         }
 
         let first = self.submit_clipped_textured_triangle(
@@ -569,6 +731,55 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         stats
     }
 
+    /// Transform and submit a textured world-space triangle through
+    /// `camera`.
+    pub fn submit_textured_world_triangle(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTextured>,
+        camera: WorldCamera,
+        verts: [WorldVertex; 3],
+        uvs: [(u8, u8); 3],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+    ) -> WorldRenderStats {
+        self.submit_textured_view_triangle(
+            triangles,
+            [
+                camera.textured_view_vertex(verts[0], uvs[0]),
+                camera.textured_view_vertex(verts[1], uvs[1]),
+                camera.textured_view_vertex(verts[2], uvs[2]),
+            ],
+            camera.projection,
+            material,
+            options,
+        )
+    }
+
+    /// Transform and submit a textured world-space quad through
+    /// `camera`.
+    pub fn submit_textured_world_quad(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTextured>,
+        camera: WorldCamera,
+        verts: [WorldVertex; 4],
+        uvs: [(u8, u8); 4],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+    ) -> WorldRenderStats {
+        self.submit_textured_view_quad(
+            triangles,
+            [
+                camera.textured_view_vertex(verts[0], uvs[0]),
+                camera.textured_view_vertex(verts[1], uvs[1]),
+                camera.textured_view_vertex(verts[2], uvs[2]),
+                camera.textured_view_vertex(verts[3], uvs[3]),
+            ],
+            camera.projection,
+            material,
+            options,
+        )
+    }
+
     fn submit_clipped_textured_triangle(
         &mut self,
         triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -578,13 +789,22 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         options: WorldSurfaceOptions,
     ) -> WorldRenderStats {
         let Some(a) = projection.project_view(verts[0].position) else {
-            return WorldRenderStats::default();
+            return WorldRenderStats {
+                dropped_triangles: 1,
+                ..WorldRenderStats::default()
+            };
         };
         let Some(b) = projection.project_view(verts[1].position) else {
-            return WorldRenderStats::default();
+            return WorldRenderStats {
+                dropped_triangles: 1,
+                ..WorldRenderStats::default()
+            };
         };
         let Some(c) = projection.project_view(verts[2].position) else {
-            return WorldRenderStats::default();
+            return WorldRenderStats {
+                dropped_triangles: 1,
+                ..WorldRenderStats::default()
+            };
         };
         self.submit_textured_triangle(
             triangles,
@@ -1136,6 +1356,13 @@ fn merge_world_stats(stats: &mut WorldRenderStats, next: WorldRenderStats) {
         .submitted_triangles
         .saturating_add(next.submitted_triangles);
     stats.culled_triangles = stats.culled_triangles.saturating_add(next.culled_triangles);
+    stats.clipped_triangles = stats
+        .clipped_triangles
+        .saturating_add(next.clipped_triangles);
+    stats.split_triangles = stats.split_triangles.saturating_add(next.split_triangles);
+    stats.dropped_triangles = stats
+        .dropped_triangles
+        .saturating_add(next.dropped_triangles);
     stats.primitive_overflow |= next.primitive_overflow;
     stats.command_overflow |= next.command_overflow;
 }
@@ -1168,6 +1395,29 @@ fn clamp_u8(value: i32) -> u8 {
     } else {
         value as u8
     }
+}
+
+fn isqrt_i32(value: i32) -> i32 {
+    if value <= 0 {
+        return 0;
+    }
+
+    let mut bit = 1 << 30;
+    let mut n = value;
+    let mut root = 0;
+    while bit > n {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if n >= root + bit {
+            n -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    root
 }
 
 fn sort_for_ot_insert(commands: &mut [GouraudTriCommand]) {
@@ -1355,9 +1605,39 @@ mod tests {
         );
 
         assert!(stats.submitted_triangles > 1);
+        assert!(stats.split_triangles > 0);
+        assert_eq!(stats.dropped_triangles, 0);
         assert!(!stats.primitive_overflow);
         assert!(!stats.command_overflow);
         pass.flush();
+    }
+
+    #[test]
+    fn world_camera_orbit_projects_target_to_screen_center() {
+        let projection = WorldProjection::new(160, 120, 200, 40);
+        let target = WorldVertex::new(0, -90, 0);
+
+        let camera = WorldCamera::orbit_yaw(projection, target, 0, 120, 0);
+        let projected = camera.project_world(target).expect("target in front");
+
+        assert_eq!(projected.sx, 160);
+        assert_eq!(projected.sy, 120);
+        assert!(projected.sz >= projection.near_z);
+    }
+
+    #[test]
+    fn world_camera_projects_world_quad() {
+        let projection = WorldProjection::new(160, 120, 200, 40);
+        let camera = WorldCamera::orbit_yaw(projection, WorldVertex::ZERO, 0, 200, 0);
+
+        let projected = camera.project_world_quad([
+            WorldVertex::new(-10, 10, 0),
+            WorldVertex::new(10, 10, 0),
+            WorldVertex::new(-10, -10, 0),
+            WorldVertex::new(10, -10, 0),
+        ]);
+
+        assert!(projected.is_some());
     }
 
     #[test]

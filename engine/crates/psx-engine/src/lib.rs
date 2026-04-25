@@ -62,8 +62,8 @@ pub use frames::{Frames, Ticks};
 pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
 pub use render3d::{
     CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand,
-    MeshRenderStats, ProjectedVertex, TexturedViewVertex, ViewVertex, WorldProjection,
-    WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,
+    MeshRenderStats, ProjectedVertex, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
+    WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 pub use scene::{Ctx, Scene};
 pub use transform::{ActorTransform, Vec3World};
