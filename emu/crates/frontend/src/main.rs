@@ -488,10 +488,17 @@ impl ApplicationHandler for Shell {
                 // not, when paused — in which case `cmd_log` will
                 // be empty and the loop is a no-op).
                 if let Some(bus) = state.bus.as_mut() {
-                    // Enable the pixel tracer once. It's idempotent:
-                    // a second call resets the cmd_log + owner buffer.
+                    // First-frame setup: enable the pixel tracer so
+                    // `cmd_log` gets populated, and disable CPU
+                    // primitive rasterization so the CPU emulator
+                    // doesn't burn cycles on draws the GPU is also
+                    // doing — bulk writes (fill / VRAM-VRAM copy /
+                    // CPU-VRAM upload) still run on CPU because
+                    // their results land in CPU VRAM, which we sync
+                    // from each frame.
                     if bus.gpu.pixel_owner.is_none() {
                         bus.gpu.enable_pixel_tracer();
+                        bus.gpu.cpu_rasterize_enabled = false;
                     }
                     // Sync VRAM so any uploads / FMV writes / VRAM-to-
                     // VRAM copies are reflected on the compute side

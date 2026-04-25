@@ -159,6 +159,17 @@ pub struct Gpu {
     /// executing command. Bumped just before each packet dispatch.
     current_cmd_index: u32,
 
+    /// When `false`, GP0 primitive ops (polys / lines / rects)
+    /// skip their CPU rasterization entirely — `cmd_log` is still
+    /// captured and bulk writes (fill, VRAM-to-VRAM copy, CPU-to-
+    /// VRAM upload) and state setters still run, so the GPU compute
+    /// path can mirror the bus state via `cmd_log` replay + per-frame
+    /// `sync_vram_from_cpu`. The frontend flips this off at startup
+    /// so each frame doesn't pay the CPU rasterizer cost on top of
+    /// the GPU compute path. Default `true` so tests / parity tools
+    /// keep the CPU rasterizer as the source of truth.
+    pub cpu_rasterize_enabled: bool,
+
     /// Cumulative diagnostic "pseudo-busy" credit for expensive
     /// primitives. This deliberately does *not* affect GPUSTAT:
     /// PCSX-Redux's soft GPU keeps command/DMA-ready bits set even
@@ -313,6 +324,7 @@ impl Gpu {
             pixel_owner: None,
             cmd_log: Vec::new(),
             current_cmd_index: 0,
+            cpu_rasterize_enabled: true,
             busy_credit: 0,
             display_start_x: 0,
             display_start_y: 0,
@@ -1018,6 +1030,17 @@ impl Gpu {
                 opcode: op as u8,
                 fifo: self.gp0_fifo.clone(),
             });
+        }
+        // Primitive ops (polys / lines / rects) only rasterize on the
+        // CPU when `cpu_rasterize_enabled` — when off, the cmd_log
+        // entry above is already pushed and the GPU compute backend
+        // will replay the packet against its own VRAM. Fills, copies,
+        // uploads, and state setters always run because their effects
+        // need to land in CPU VRAM (the GPU compute backend syncs
+        // from CPU VRAM each frame to pick them up).
+        let is_primitive = matches!(op, 0x20..=0x7F);
+        if is_primitive && !self.cpu_rasterize_enabled {
+            return;
         }
         match op {
             // Monochrome fill rect (ignores draw area / offset).
