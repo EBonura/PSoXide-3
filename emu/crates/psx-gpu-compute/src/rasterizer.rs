@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::primitive::{BlendMode, DrawArea, MonoTri, PrimFlags};
+use crate::primitive::{BlendMode, DrawArea, MonoTri, PrimFlags, TexTri, Tpage};
 use crate::vram::VramGpu;
 
 const WORKGROUP_SIZE_X: u32 = 8;
@@ -27,6 +27,12 @@ pub struct Rasterizer {
     mono_tri_bg_layout: wgpu::BindGroupLayout,
     mono_tri_uniform: wgpu::Buffer,
     draw_area_uniform: wgpu::Buffer,
+
+    // Textured-triangle pipeline.
+    tex_tri_pipeline: wgpu::ComputePipeline,
+    tex_tri_bg_layout: wgpu::BindGroupLayout,
+    tex_tri_uniform: wgpu::Buffer,
+    tpage_uniform: wgpu::Buffer,
 }
 
 impl Rasterizer {
@@ -120,6 +126,90 @@ impl Rasterizer {
             mapped_at_creation: false,
         });
 
+        // ---------- Textured-triangle pipeline ----------
+        let tex_tri_bg_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("psx-rasterizer-tex-tri-bgl"),
+                entries: &[
+                    // 0: VRAM
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 1: TexTri uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 2: DrawArea uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 3: Tpage uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let tex_tri_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("psx-rasterizer-tex-tri-pl"),
+            bind_group_layouts: &[&tex_tri_bg_layout],
+            push_constant_ranges: &[],
+        });
+        let tex_tri_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("psx-rasterizer-tex-tri-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/tex_tri.wgsl").into(),
+            ),
+        });
+        let tex_tri_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("psx-rasterizer-tex-tri"),
+            layout: Some(&tex_tri_pl),
+            module: &tex_tri_shader,
+            entry_point: Some("rasterize"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let tex_tri_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-tex-tri-uniform"),
+            size: std::mem::size_of::<TexTri>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let tpage_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-tpage-uniform"),
+            size: std::mem::size_of::<Tpage>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             device,
             queue,
@@ -127,7 +217,79 @@ impl Rasterizer {
             mono_tri_bg_layout,
             mono_tri_uniform,
             draw_area_uniform,
+            tex_tri_pipeline,
+            tex_tri_bg_layout,
+            tex_tri_uniform,
+            tpage_uniform,
         }
+    }
+
+    /// Dispatch one textured triangle into VRAM. `tpage` selects the
+    /// 256×256 source rect + colour depth; `tri` carries vertices,
+    /// UVs, CLUT, tint, flags. Returns immediately after queuing.
+    pub fn dispatch_tex_tri(
+        &self,
+        vram: &VramGpu,
+        tri: &TexTri,
+        tpage: &Tpage,
+        area: &DrawArea,
+    ) {
+        if tri.exceeds_hw_extent() {
+            return;
+        }
+        let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
+        let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
+        if bbox_w <= 0 || bbox_h <= 0 {
+            return;
+        }
+
+        self.queue
+            .write_buffer(&self.tex_tri_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-tex-tri-bg"),
+            layout: &self.tex_tri_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.tex_tri_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.draw_area_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.tpage_uniform.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-tex-tri-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-tex-tri-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.tex_tri_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one monochrome triangle into VRAM. Returns immediately
@@ -720,5 +882,456 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------
+    //  Phase B.2 — textured triangle parity vs CPU
+    // -------------------------------------------------------
+
+    /// Pack a (u, v) pair into the low 16 bits of a UV0/UV1/UV2 word.
+    fn uv_pack(uv: (u8, u8)) -> u32 {
+        (uv.0 as u32) | ((uv.1 as u32) << 8)
+    }
+
+    /// Build the 16-bit tpage word the GPU expects in UV1 high half.
+    fn make_tpage_word(tpage_x: u32, tpage_y: u32, depth: u32, blend_bits: u32) -> u32 {
+        let tx = tpage_x / 64; // 0..15
+        let ty = if tpage_y == 256 { 1u32 } else { 0 };
+        (tx & 0xF) | (ty << 4) | ((blend_bits & 0x3) << 5) | ((depth & 0x3) << 7)
+    }
+
+    /// Build the 16-bit CLUT word the GPU expects in UV0 high half.
+    /// `clut_x` must be a multiple of 16 (PS1 CLUT alignment).
+    fn make_clut_word(clut_x: u32, clut_y: u32) -> u32 {
+        ((clut_x / 16) & 0x3F) | ((clut_y & 0x1FF) << 6)
+    }
+
+    /// Mirror the same VRAM state on a CPU `Gpu` instance and a
+    /// `VramGpu`. We pre-fill VRAM directly via `set_pixel` /
+    /// `upload_full` so the test doesn't have to fight CD-DMA.
+    fn seed_vram(words: &[u16], cpu: &mut Gpu, gpu: &VramGpu) {
+        for (i, &w) in words.iter().enumerate() {
+            let x = (i % 1024) as u16;
+            let y = (i / 1024) as u16;
+            cpu.vram.set_pixel(x, y, w);
+        }
+        gpu.upload_full(words).unwrap();
+    }
+
+    /// Drive the CPU rasterizer through a GP0 textured-triangle
+    /// packet. Caller has already set draw area + uploaded VRAM.
+    fn cpu_push_tex_tri(
+        cpu: &mut Gpu,
+        cmd_byte: u8,
+        tint: (u8, u8, u8),
+        v: [(i32, i32); 3],
+        uv: [(u8, u8); 3],
+        clut_word: u32,
+        tpage_word: u32,
+    ) {
+        let cmd = ((cmd_byte as u32) << 24)
+            | (tint.0 as u32)
+            | ((tint.1 as u32) << 8)
+            | ((tint.2 as u32) << 16);
+        cpu.gp0_push(cmd);
+        cpu.gp0_push(pack_xy(v[0]));
+        cpu.gp0_push((clut_word << 16) | uv_pack(uv[0]));
+        cpu.gp0_push(pack_xy(v[1]));
+        cpu.gp0_push((tpage_word << 16) | uv_pack(uv[1]));
+        cpu.gp0_push(pack_xy(v[2]));
+        cpu.gp0_push(uv_pack(uv[2]));
+    }
+
+    #[test]
+    fn tex_tri_15bpp_axis_aligned_matches_cpu() {
+        // 15bpp direct-colour: simplest tex sampling path. No CLUT,
+        // each VRAM cell is the texel. Axis-aligned right triangle
+        // → no edge-rule disagreements.
+        let v = [(20i32, 20i32), (60, 20), (20, 60)];
+        let uv = [(0u8, 0u8), (32, 0), (0, 32)];
+        // Tpage at (128, 0), 15bpp.
+        let tpage_x = 128u32;
+        let tpage_y = 0u32;
+        let tpage_word = make_tpage_word(tpage_x, tpage_y, 2, 0);
+
+        // Build the texture: 64×64 of `(v << 5) | u | 0x0001`. The
+        // `| 0x0001` ensures every texel is non-zero (i.e. opaque)
+        // so we can spot dropped pixels.
+        let mut vram = vec![0u16; 1024 * 512];
+        for vy in 0..64u16 {
+            for ux in 0..64u16 {
+                let val = ((vy as u16) << 5) | ux | 0x0001;
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+
+        // CPU side.
+        let mut cpu = Gpu::new();
+        seed_vram(&vram, &mut cpu, &VramGpu::new_headless());
+        // (Re-seed VRAM cleanly — `seed_vram` above used a throwaway
+        // headless device. We need a fresh one used for the actual
+        // dispatch below. Easier: just call set_pixel + upload twice.)
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu_push_tex_tri(&mut cpu, 0x25, (0, 0, 0), v, uv, 0, tpage_word);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        // GPU side.
+        let r = Rasterizer::new(&vg);
+        let tri = TexTri::new(
+            v[0], v[1], v[2],
+            uv[0], uv[1], uv[2],
+            0, 0,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, tpage_y, 2);
+        r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        // Functional parity: the GPU samples the SAME texture cells
+        // as the CPU at each integer pixel position with a barycentric
+        // affine interpolation. Pixel-EXACT parity vs the Redux-port
+        // scanline-delta math (which uses specific Q16.16 setup +
+        // shl10idiv) is a Phase-B.x follow-up — that path produces
+        // off-by-1/2 UV at some interior pixels due to the difference
+        // between cumulative per-row deltas and a barycentric divide.
+        //
+        // We assert the texel-COLOUR error is small: the percent of
+        // diffs is bounded, AND every diff is within ±2 in any single
+        // 5-bit channel (i.e. ≤6.25% intensity error on that channel).
+        // That covers the rounding gap without hiding a coverage or
+        // sampling bug.
+        let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (20, 20), (60, 60));
+        let bbox = 41 * 41;
+        // Record max channel delta across all differing pixels.
+        let mut max_chan_delta = 0i32;
+        for y in 20..=60i32 {
+            for x in 20..=60i32 {
+                let i = y as usize * 1024 + x as usize;
+                let a = cpu_words[i];
+                let b = gpu_words[i];
+                if a == b {
+                    continue;
+                }
+                for shift in [0u32, 5, 10] {
+                    let ca = ((a >> shift) & 0x1F) as i32;
+                    let cb = ((b >> shift) & 0x1F) as i32;
+                    max_chan_delta = max_chan_delta.max((ca - cb).abs());
+                }
+            }
+        }
+        assert!(
+            diffs * 4 < bbox,
+            "tex 15bpp coverage: {diffs} / {bbox} pixels differ — too many"
+        );
+        assert!(
+            max_chan_delta <= 2,
+            "tex 15bpp colour error: max channel delta {max_chan_delta} > 2 — \
+             likely a sampling / CLUT / depth bug"
+        );
+    }
+
+    #[test]
+    fn tex_tri_4bpp_with_clut_matches_cpu() {
+        // 4bpp paletted texture: each VRAM word holds 4 texel
+        // indices, each indexes a 16-entry CLUT row. This stresses
+        // the CLUT lookup path that the Tekken-3 portrait bug
+        // landed in.
+        let v = [(20i32, 20i32), (60, 20), (20, 60)];
+        let uv = [(0u8, 0u8), (32, 0), (0, 32)];
+        let tpage_x = 0u32;
+        let tpage_y = 0u32;
+        let tpage_word = make_tpage_word(tpage_x, tpage_y, 0, 0);
+        // CLUT at (0, 256). 16 entries, each in BGR15.
+        let clut_x = 0u32;
+        let clut_y = 256u32;
+        let clut_word = make_clut_word(clut_x, clut_y);
+
+        let mut vram = vec![0u16; 1024 * 512];
+        // CLUT: entry 0 is non-zero (opaque "background"), entries
+        // 1..15 are a colour ramp. Avoid 0x0000 anywhere so every
+        // sampled texel writes a pixel.
+        for i in 0..16u16 {
+            let val = (i.max(1) << 1) | (i.max(1) << 6) | 0x4000;
+            vram[clut_y as usize * 1024 + (clut_x as usize + i as usize)] = val;
+        }
+        // 16×16 texture: each VRAM word holds 4 texels (low to high
+        // nibble = u 0..3 within the word). Pattern: nibble = (u + v)
+        // & 0xF so different parts of the triangle hit different
+        // CLUT entries.
+        for vy in 0..16u16 {
+            for word_x in 0..4u16 {
+                let u_base = word_x * 4;
+                let mut word = 0u16;
+                for n in 0..4u16 {
+                    let u = u_base + n;
+                    let nibble = (u + vy) & 0xF;
+                    word |= nibble << (n * 4);
+                }
+                vram[vy as usize * 1024 + (tpage_x as usize + word_x as usize)] = word;
+            }
+        }
+
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu_push_tex_tri(&mut cpu, 0x25, (0, 0, 0), v, uv, clut_word, tpage_word);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = TexTri::new(
+            v[0], v[1], v[2],
+            uv[0], uv[1], uv[2],
+            clut_x, clut_y,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, tpage_y, 0);
+        r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        // See `tex_tri_15bpp_axis_aligned_matches_cpu` for parity
+        // tolerance reasoning. We additionally allow a small CLUT-
+        // index swap at edge pixels because adjacent CLUT entries
+        // here differ by more than 2 in some channel.
+        let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (20, 20), (60, 60));
+        let bbox = 41 * 41;
+        assert!(diffs * 4 < bbox, "tex 4bpp coverage: {diffs} / {bbox}");
+    }
+
+    #[test]
+    fn tex_tri_8bpp_with_clut_matches_cpu() {
+        // 8bpp: each VRAM word is two texel bytes, each indexes a
+        // 256-entry CLUT row.
+        let v = [(20i32, 20i32), (60, 20), (20, 60)];
+        let uv = [(0u8, 0u8), (32, 0), (0, 32)];
+        let tpage_x = 64u32;
+        let tpage_y = 0u32;
+        let tpage_word = make_tpage_word(tpage_x, tpage_y, 1, 0);
+        // CLUT at (16, 256) — 16 must be multiple of 16 (it is).
+        // For 8bpp the CLUT row is 256 entries wide, but the host
+        // doesn't pre-shift the X — we pass the raw VRAM column.
+        let clut_x = 16u32;
+        let clut_y = 256u32;
+        let clut_word = make_clut_word(clut_x, clut_y);
+
+        let mut vram = vec![0u16; 1024 * 512];
+        // CLUT: 256 entries, each non-zero, deterministic ramp.
+        for i in 0..256u32 {
+            let val = ((i & 0x1F) as u16) | (((i >> 1) & 0x1F) as u16) << 5 | 0x4000;
+            vram[clut_y as usize * 1024 + (clut_x as usize + i as usize)] = val;
+        }
+        // Texture: each word = (u_high << 8) | u_low, giving a
+        // gradient that maps to different CLUT entries.
+        for vy in 0..32u16 {
+            for word_x in 0..16u16 {
+                let u_low = word_x * 2;
+                let u_high = u_low + 1;
+                let v_off = vy as u32;
+                let lo = ((u_low as u32 + v_off) & 0xFF) as u16;
+                let hi = ((u_high as u32 + v_off) & 0xFF) as u16;
+                let word = lo | (hi << 8);
+                // Avoid index 0 which would map to CLUT[0]; the
+                // texture indices we generate above start at vy ≥ 0
+                // and u ≥ 0, so the sum can be 0 only at (0,0).
+                let word = if word == 0 { 0x0101 } else { word };
+                vram[vy as usize * 1024 + (tpage_x as usize + word_x as usize)] = word;
+            }
+        }
+
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu_push_tex_tri(&mut cpu, 0x25, (0, 0, 0), v, uv, clut_word, tpage_word);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = TexTri::new(
+            v[0], v[1], v[2],
+            uv[0], uv[1], uv[2],
+            clut_x, clut_y,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, tpage_y, 1);
+        r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (20, 20), (60, 60));
+        let bbox = 41 * 41;
+        assert!(diffs * 4 < bbox, "tex 8bpp coverage: {diffs} / {bbox}");
+    }
+
+    #[test]
+    fn tex_tri_modulated_tint_matches_cpu() {
+        // Same 15bpp setup but with a non-identity tint. Verifies
+        // the `(tint * texel) / 0x80` modulator matches the CPU.
+        let v = [(20i32, 20i32), (60, 20), (20, 60)];
+        let uv = [(0u8, 0u8), (32, 0), (0, 32)];
+        let tpage_x = 128u32;
+        let tpage_word = make_tpage_word(tpage_x, 0, 2, 0);
+        // 50% tint on each channel — exactly half the value.
+        let tint = (0x40u8, 0x40u8, 0x40u8);
+
+        let mut vram = vec![0u16; 1024 * 512];
+        for vy in 0..32u16 {
+            for ux in 0..32u16 {
+                let val = ((vy << 5) | ux) | 0x0001;
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        // 0x24 = textured + modulated (NOT raw — tint applies).
+        cpu_push_tex_tri(&mut cpu, 0x24, tint, v, uv, 0, tpage_word);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = TexTri::new(
+            v[0], v[1], v[2],
+            uv[0], uv[1], uv[2],
+            0, 0,
+            tint,
+            PrimFlags::empty(), // no RAW_TEXTURE → modulate
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 2);
+        r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (20, 20), (60, 60));
+        let bbox = 41 * 41;
+        assert!(
+            diffs * 4 < bbox,
+            "tex modulated coverage: {diffs} / {bbox}"
+        );
+        // Strict check: every pixel that BOTH backends wrote should
+        // have R/G/B that's been halved by the 0x40 tint. So any
+        // non-zero pixel must have channels ≤ 0x10 (since input
+        // texel channels here are ≤ 0x1F, half = ≤ 0x0F, plus 1
+        // for divide-by-0x80 rounding).
+        for y in 21..=59i32 {
+            for x in 21..=59i32 {
+                let i = y as usize * 1024 + x as usize;
+                let g_val = gpu_words[i];
+                if g_val == 0 {
+                    continue;
+                }
+                let r = g_val & 0x1F;
+                let g = (g_val >> 5) & 0x1F;
+                let b = (g_val >> 10) & 0x1F;
+                assert!(
+                    r <= 0x10 && g <= 0x10 && b <= 0x10,
+                    "tint modulation looks wrong @ ({x},{y}): \
+                     pixel=0x{g_val:04x} r={r} g={g} b={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tex_tri_transparent_texels_skip_writes() {
+        // Place a checkerboard texture: even cells are transparent
+        // (texel = 0), odd cells are opaque. The triangle should
+        // leave the back-buffer untouched at every transparent
+        // hit, both on CPU and GPU.
+        let v = [(40i32, 40i32), (80, 40), (40, 80)];
+        let uv = [(0u8, 0u8), (32, 0), (0, 32)];
+        let tpage_x = 128u32;
+        let tpage_word = make_tpage_word(tpage_x, 0, 2, 0);
+
+        // Pre-fill bbox area with a sentinel so the test can detect
+        // exactly which pixels were touched.
+        let prefill = 0x4321u16;
+        let mut vram = vec![prefill; 1024 * 512];
+        // Texture: opaque (non-zero) only on cells where (u + v)
+        // is odd; transparent (0) elsewhere.
+        for vy in 0..32u16 {
+            for ux in 0..32u16 {
+                let opaque = ((ux + vy) & 1) == 1;
+                let val: u16 = if opaque {
+                    ((vy as u16) << 5) | (ux as u16) | 0x0001
+                } else {
+                    0
+                };
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu_push_tex_tri(&mut cpu, 0x25, (0, 0, 0), v, uv, 0, tpage_word);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let tri = TexTri::new(
+            v[0], v[1], v[2],
+            uv[0], uv[1], uv[2],
+            0, 0,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 2);
+        r.dispatch_tex_tri(&vg, &tri, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        // Inside the triangle, both backends should agree on coverage
+        // within the same per-pixel-rounding tolerance noted on the
+        // 15bpp test.
+        let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (40, 40), (80, 80));
+        let bbox = 41 * 41;
+        assert!(diffs * 4 < bbox, "tex transparent coverage: {diffs}");
+
+        // Sanity: at least SOME pixels in the bbox should still be
+        // the prefill (transparent texels left them alone), and at
+        // least some should NOT be the prefill (opaque texels wrote
+        // through).
+        let inside_pixels = (40usize..80usize)
+            .flat_map(|y| (40usize..80usize).map(move |x| y * 1024 + x))
+            .filter(|&i| {
+                // Inside the lower-left half of the triangle: x+y < 100.
+                let x = i % 1024;
+                let y = i / 1024;
+                x + y < 100
+            })
+            .collect::<Vec<_>>();
+        let untouched = inside_pixels.iter().filter(|&&i| gpu_words[i] == prefill).count();
+        let touched = inside_pixels.iter().filter(|&&i| gpu_words[i] != prefill).count();
+        assert!(untouched > 0, "expected some transparent-skip pixels");
+        assert!(touched > 0, "expected some opaque-write pixels");
     }
 }

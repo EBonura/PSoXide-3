@@ -73,6 +73,12 @@ bitflags::bitflags! {
         /// `mask_set_on_draw` (GP0 0xE6 bit 0). OR bit 15 into every
         /// written pixel.
         const MASK_SET = 1 << 2;
+        /// Raw-texture primitive (cmd-bit-0 set). Skip the per-pixel
+        /// `modulate_tint` step — the texel is written through as-is.
+        /// Equivalent to passing `RAW_TEXTURE_TINT = (0x80,0x80,0x80)`
+        /// to `modulate_tint`, which is the identity case, but the
+        /// shader skips the multiply for clarity and a tiny perf win.
+        const RAW_TEXTURE = 1 << 3;
     }
 }
 
@@ -162,6 +168,133 @@ impl MonoTri {
     }
 }
 
+/// Texture page (the 256×256 sub-rectangle of VRAM that 4bpp/8bpp/
+/// 15bpp texture sampling reads from). Plus per-primitive texture-
+/// window override and bit-depth selector. Wire format mirrors the
+/// CPU `Gpu` state derived from GP0 0xE1 / `apply_primitive_tpage`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct Tpage {
+    /// Tpage origin X (0/64/128/.../960). Multiple of 64.
+    pub tpage_x: u32,
+    /// Tpage origin Y (0 or 256).
+    pub tpage_y: u32,
+    /// 0 = 4bpp (CLUT, 16 cols / 64 entries), 1 = 8bpp (CLUT, 256
+    /// cols / 256 entries), 2 = 15bpp direct colour.
+    pub tex_depth: u32,
+    pub _pad: u32,
+    /// Texture window mask, **already pre-shifted ×8** (matches the
+    /// CPU side which stores `mask_x * 8`). Default 0 = passthrough.
+    pub tex_window_mask_x: u32,
+    pub tex_window_mask_y: u32,
+    pub tex_window_off_x: u32,
+    pub tex_window_off_y: u32,
+}
+
+impl Tpage {
+    /// Default tpage at VRAM origin, 4bpp, no texture window. The
+    /// only fields tests usually need to override are `tpage_x`,
+    /// `tpage_y`, `tex_depth`.
+    pub fn new(tpage_x: u32, tpage_y: u32, tex_depth: u32) -> Self {
+        Self {
+            tpage_x,
+            tpage_y,
+            tex_depth,
+            _pad: 0,
+            tex_window_mask_x: 0,
+            tex_window_mask_y: 0,
+            tex_window_off_x: 0,
+            tex_window_off_y: 0,
+        }
+    }
+}
+
+/// Textured flat-shaded triangle (`GP0 0x24..=0x27`). Three vertices
+/// + three (U, V) texture coordinates + a per-primitive tint + a
+/// CLUT location. The tpage state lives in the separate [`Tpage`]
+/// uniform so multiple textured primitives in a batch can share it.
+///
+/// WGSL counterpart in `shaders/tex_tri.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct TexTri {
+    pub v0: [i32; 2],
+    pub v1: [i32; 2],
+    pub v2: [i32; 2],
+    pub bbox_min: [i32; 2],
+    pub bbox_max: [i32; 2],
+    /// `u0 | (v0 << 8)`. Each axis is 8 bits; the shader extracts
+    /// them then runs through the texture window + 8-bit wrap.
+    pub uv0: u32,
+    pub uv1: u32,
+    pub uv2: u32,
+    /// `R | (G << 8) | (B << 16)`. For raw-texture primitives the
+    /// host should set `RAW_TEXTURE` in `flags` and pass any tint
+    /// here (it'll be ignored).
+    pub tint: u32,
+    /// PrimFlags bits + (BlendMode << 8). See [`pack_flags`].
+    pub flags: u32,
+    /// CLUT origin in VRAM. Only consulted in 4bpp / 8bpp.
+    pub clut_x: u32,
+    pub clut_y: u32,
+    /// Padding so the struct is 16-byte aligned for the uniform
+    /// buffer (see B.1 layout note). Size is pinned to 80 bytes
+    /// by the `tex_tri_struct_is_16_byte_aligned_and_pinned` test.
+    pub _pad: [u32; 3],
+}
+
+impl TexTri {
+    /// Builder: caller has decoded the GP0 packet's vertices, UVs,
+    /// CLUT, and tint into typed fields. Tpage is passed separately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        uv0: (u8, u8),
+        uv1: (u8, u8),
+        uv2: (u8, u8),
+        clut_x: u32,
+        clut_y: u32,
+        tint_rgb: (u8, u8, u8),
+        flags: PrimFlags,
+        blend_mode: BlendMode,
+    ) -> Self {
+        let min_x = v0.0.min(v1.0).min(v2.0);
+        let min_y = v0.1.min(v1.1).min(v2.1);
+        let max_x = v0.0.max(v1.0).max(v2.0);
+        let max_y = v0.1.max(v1.1).max(v2.1);
+        let pack_uv = |u: u8, v: u8| (u as u32) | ((v as u32) << 8);
+        let pack_tint =
+            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        Self {
+            v0: [v0.0, v0.1],
+            v1: [v1.0, v1.1],
+            v2: [v2.0, v2.1],
+            bbox_min: [min_x, min_y],
+            bbox_max: [max_x, max_y],
+            uv0: pack_uv(uv0.0, uv0.1),
+            uv1: pack_uv(uv1.0, uv1.1),
+            uv2: pack_uv(uv2.0, uv2.1),
+            tint: pack_tint(tint_rgb.0, tint_rgb.1, tint_rgb.2),
+            flags: pack_flags(flags, blend_mode),
+            clut_x,
+            clut_y,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Same hardware-extent rule as `MonoTri::exceeds_hw_extent`.
+    pub fn exceeds_hw_extent(&self) -> bool {
+        const MAX_DX: i32 = 1023;
+        const MAX_DY: i32 = 511;
+        let edges = [(self.v0, self.v1), (self.v1, self.v2), (self.v2, self.v0)];
+        edges
+            .iter()
+            .any(|(a, b)| (a[0] - b[0]).abs() > MAX_DX || (a[1] - b[1]).abs() > MAX_DY)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +335,34 @@ mod tests {
         assert_eq!(packed, 0x0000_0301);
         let no_blend = pack_flags(PrimFlags::MASK_SET, BlendMode::Average);
         assert_eq!(no_blend, 0x04);
+    }
+
+    #[test]
+    fn tex_tri_struct_is_16_byte_aligned_and_pinned() {
+        // Pin the struct size — if it ever changes, the WGSL struct
+        // in tex_tri.wgsl needs an explicit update.
+        assert_eq!(std::mem::size_of::<TexTri>() % 16, 0);
+        assert_eq!(std::mem::size_of::<TexTri>(), 80);
+    }
+
+    #[test]
+    fn tpage_struct_is_16_byte_aligned() {
+        assert_eq!(std::mem::size_of::<Tpage>() % 16, 0);
+        assert_eq!(std::mem::size_of::<Tpage>(), 32);
+    }
+
+    #[test]
+    fn tex_tri_packs_uv_in_low_high_bytes() {
+        let t = TexTri::new(
+            (0, 0), (10, 0), (0, 10),
+            (0x12, 0x34), (0x56, 0x78), (0x9A, 0xBC),
+            0, 0,
+            (0x80, 0x80, 0x80),
+            PrimFlags::empty(),
+            BlendMode::Average,
+        );
+        assert_eq!(t.uv0, 0x3412);
+        assert_eq!(t.uv1, 0x7856);
+        assert_eq!(t.uv2, 0xBC9A);
     }
 }
