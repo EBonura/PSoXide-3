@@ -13,6 +13,6 @@ pub mod primitive;
 pub mod rasterizer;
 pub mod vram;
 
-pub use primitive::{BlendMode, DrawArea, MonoTri, PrimFlags, TexTri, Tpage};
+pub use primitive::{BlendMode, DrawArea, MonoRect, MonoTri, PrimFlags, TexRect, TexTri, Tpage};
 pub use rasterizer::Rasterizer;
 pub use vram::{VramGpu, VramGpuError, VRAM_FORMAT, VRAM_HEIGHT, VRAM_WIDTH};

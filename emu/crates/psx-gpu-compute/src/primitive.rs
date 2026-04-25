@@ -79,6 +79,11 @@ bitflags::bitflags! {
         /// to `modulate_tint`, which is the identity case, but the
         /// shader skips the multiply for clarity and a tiny perf win.
         const RAW_TEXTURE = 1 << 3;
+        /// Texture-rect X flip (GP0 0xE1 bit 12). Only consulted by
+        /// the textured-rect shader; ignored by triangles.
+        const FLIP_X = 1 << 4;
+        /// Texture-rect Y flip (GP0 0xE1 bit 13).
+        const FLIP_Y = 1 << 5;
     }
 }
 
@@ -295,6 +300,105 @@ impl TexTri {
     }
 }
 
+/// Monochrome rectangle (`GP0 0x60..=0x63`, plus the fixed-size
+/// 1×1 / 8×8 / 16×16 variants). Top-left corner + `(w, h)` size
+/// + a single 15bpp BGR colour. Same RMW semantics as `MonoTri`.
+///
+/// WGSL counterpart in `shaders/mono_rect.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct MonoRect {
+    pub xy: [i32; 2],
+    pub wh: [u32; 2],
+    pub color: u32,
+    pub flags: u32,
+    pub _pad: [u32; 2],
+}
+
+impl MonoRect {
+    /// Opaque rectangle — no semi-trans, no mask. Width / height of
+    /// zero are dropped (the dispatcher handles this).
+    pub fn opaque(xy: (i32, i32), wh: (u32, u32), color_bgr15: u16) -> Self {
+        Self::new(
+            xy,
+            wh,
+            color_bgr15,
+            PrimFlags::empty(),
+            BlendMode::Average,
+        )
+    }
+
+    pub fn new(
+        xy: (i32, i32),
+        wh: (u32, u32),
+        color_bgr15: u16,
+        flags: PrimFlags,
+        blend_mode: BlendMode,
+    ) -> Self {
+        Self {
+            xy: [xy.0, xy.1],
+            wh: [wh.0, wh.1],
+            color: color_bgr15 as u32,
+            flags: pack_flags(flags, blend_mode),
+            _pad: [0; 2],
+        }
+    }
+}
+
+/// Textured rectangle (`GP0 0x64..=0x67`, plus fixed-size variants).
+/// Direct (U, V) blit from the active tpage with optional X/Y flip
+/// from GP0 0xE1 bits 12/13. Tile coords step linearly — no UV
+/// interpolation, so parity vs the CPU rasterizer is bit-exact.
+///
+/// WGSL counterpart in `shaders/tex_rect.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct TexRect {
+    pub xy: [i32; 2],
+    pub wh: [u32; 2],
+    /// `u_base | (v_base << 8)` — the top-left UV (or bottom-right
+    /// if FLIP_X / FLIP_Y are set, since the flip happens *around*
+    /// the base).
+    pub uv: u32,
+    pub clut_x: u32,
+    pub clut_y: u32,
+    pub tint: u32,
+    /// PrimFlags + (BlendMode << 8). FLIP_X / FLIP_Y are extra bits
+    /// in the same field — see [`PrimFlags`].
+    pub flags: u32,
+    /// Padding to bring the struct to 48 bytes (16-byte aligned for
+    /// uniform buffers). Pinned by `tex_rect_struct_pinned_at_48`.
+    pub _pad: [u32; 3],
+}
+
+impl TexRect {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        xy: (i32, i32),
+        wh: (u32, u32),
+        uv: (u8, u8),
+        clut_x: u32,
+        clut_y: u32,
+        tint_rgb: (u8, u8, u8),
+        flags: PrimFlags,
+        blend_mode: BlendMode,
+    ) -> Self {
+        let pack_uv = |u: u8, v: u8| (u as u32) | ((v as u32) << 8);
+        let pack_tint =
+            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        Self {
+            xy: [xy.0, xy.1],
+            wh: [wh.0, wh.1],
+            uv: pack_uv(uv.0, uv.1),
+            clut_x,
+            clut_y,
+            tint: pack_tint(tint_rgb.0, tint_rgb.1, tint_rgb.2),
+            flags: pack_flags(flags, blend_mode),
+            _pad: [0; 3],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +453,18 @@ mod tests {
     fn tpage_struct_is_16_byte_aligned() {
         assert_eq!(std::mem::size_of::<Tpage>() % 16, 0);
         assert_eq!(std::mem::size_of::<Tpage>(), 32);
+    }
+
+    #[test]
+    fn mono_rect_struct_pinned_at_32() {
+        assert_eq!(std::mem::size_of::<MonoRect>(), 32);
+        assert_eq!(std::mem::size_of::<MonoRect>() % 16, 0);
+    }
+
+    #[test]
+    fn tex_rect_struct_pinned_at_48() {
+        assert_eq!(std::mem::size_of::<TexRect>(), 48);
+        assert_eq!(std::mem::size_of::<TexRect>() % 16, 0);
     }
 
     #[test]

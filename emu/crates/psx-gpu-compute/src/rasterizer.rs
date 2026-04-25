@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::primitive::{BlendMode, DrawArea, MonoTri, PrimFlags, TexTri, Tpage};
+use crate::primitive::{
+    BlendMode, DrawArea, MonoRect, MonoTri, PrimFlags, TexRect, TexTri, Tpage,
+};
 use crate::vram::VramGpu;
 
 const WORKGROUP_SIZE_X: u32 = 8;
@@ -33,6 +35,15 @@ pub struct Rasterizer {
     tex_tri_bg_layout: wgpu::BindGroupLayout,
     tex_tri_uniform: wgpu::Buffer,
     tpage_uniform: wgpu::Buffer,
+
+    // Mono-rectangle pipeline (B.5.a). Reuses `mono_tri_bg_layout`
+    // since the binding shape is identical (VRAM + prim + draw area).
+    mono_rect_pipeline: wgpu::ComputePipeline,
+    mono_rect_uniform: wgpu::Buffer,
+
+    // Textured-rectangle pipeline (B.5.b). Reuses `tex_tri_bg_layout`.
+    tex_rect_pipeline: wgpu::ComputePipeline,
+    tex_rect_uniform: wgpu::Buffer,
 }
 
 impl Rasterizer {
@@ -210,6 +221,64 @@ impl Rasterizer {
             mapped_at_creation: false,
         });
 
+        // ---------- Mono-rectangle pipeline (B.5.a) ----------
+        // Same 3-binding shape as the mono-triangle path: VRAM,
+        // primitive uniform, draw area. Reuse the layout directly.
+        let mono_rect_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("psx-rasterizer-mono-rect-pl"),
+            bind_group_layouts: &[&mono_tri_bg_layout],
+            push_constant_ranges: &[],
+        });
+        let mono_rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("psx-rasterizer-mono-rect-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/mono_rect.wgsl").into(),
+            ),
+        });
+        let mono_rect_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("psx-rasterizer-mono-rect"),
+            layout: Some(&mono_rect_pl),
+            module: &mono_rect_shader,
+            entry_point: Some("rasterize"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let mono_rect_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-mono-rect-uniform"),
+            size: std::mem::size_of::<MonoRect>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // ---------- Textured-rectangle pipeline (B.5.b) ----------
+        // Same 4-binding shape as the textured-triangle path: VRAM,
+        // primitive uniform, draw area, tpage. Reuse the layout.
+        let tex_rect_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("psx-rasterizer-tex-rect-pl"),
+            bind_group_layouts: &[&tex_tri_bg_layout],
+            push_constant_ranges: &[],
+        });
+        let tex_rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("psx-rasterizer-tex-rect-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/tex_rect.wgsl").into(),
+            ),
+        });
+        let tex_rect_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("psx-rasterizer-tex-rect"),
+            layout: Some(&tex_rect_pl),
+            module: &tex_rect_shader,
+            entry_point: Some("rasterize"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let tex_rect_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-tex-rect-uniform"),
+            size: std::mem::size_of::<TexRect>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             device,
             queue,
@@ -221,7 +290,122 @@ impl Rasterizer {
             tex_tri_bg_layout,
             tex_tri_uniform,
             tpage_uniform,
+            mono_rect_pipeline,
+            mono_rect_uniform,
+            tex_rect_pipeline,
+            tex_rect_uniform,
         }
+    }
+
+    /// Dispatch one monochrome rectangle. `xy` is the top-left
+    /// (already includes drawing-offset). Width/height of zero are
+    /// dropped silently to match the CPU rasterizer.
+    pub fn dispatch_mono_rect(&self, vram: &VramGpu, rect: &MonoRect, area: &DrawArea) {
+        if rect.wh[0] == 0 || rect.wh[1] == 0 {
+            return;
+        }
+        self.queue
+            .write_buffer(&self.mono_rect_uniform, 0, bytemuck::bytes_of(rect));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-mono-rect-bg"),
+            layout: &self.mono_tri_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.mono_rect_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.draw_area_uniform.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-mono-rect-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-mono-rect-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.mono_rect_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = rect.wh[0].div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = rect.wh[1].div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Dispatch one textured rectangle. Linear UV stepping (no
+    /// interpolation) → bit-exact texel parity vs the CPU.
+    pub fn dispatch_tex_rect(
+        &self,
+        vram: &VramGpu,
+        rect: &TexRect,
+        tpage: &Tpage,
+        area: &DrawArea,
+    ) {
+        if rect.wh[0] == 0 || rect.wh[1] == 0 {
+            return;
+        }
+        self.queue
+            .write_buffer(&self.tex_rect_uniform, 0, bytemuck::bytes_of(rect));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-tex-rect-bg"),
+            layout: &self.tex_tri_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.tex_rect_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.draw_area_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.tpage_uniform.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-tex-rect-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-tex-rect-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.tex_rect_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = rect.wh[0].div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = rect.wh[1].div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one textured triangle into VRAM. `tpage` selects the
@@ -1333,5 +1517,405 @@ mod tests {
         let touched = inside_pixels.iter().filter(|&&i| gpu_words[i] != prefill).count();
         assert!(untouched > 0, "expected some transparent-skip pixels");
         assert!(touched > 0, "expected some opaque-write pixels");
+    }
+
+    // -------------------------------------------------------
+    //  Phase B.5 — rectangle parity vs CPU
+    // -------------------------------------------------------
+
+    /// Drive the CPU rasterizer for one monochrome rectangle via
+    /// GP0 0x60 (variable-size mono rect, 3-word packet).
+    /// `prefill` paints VRAM before the rect — needed for mask-check
+    /// and semi-trans tests.
+    fn cpu_rasterize_mono_rect(
+        xy: (i32, i32),
+        wh: (u32, u32),
+        color: u16,
+        cmd_byte: u8,
+        tpage_blend_bits: u8,
+        mask_e6: u8,
+        prefill: u16,
+    ) -> Vec<u16> {
+        let mut gpu = Gpu::new();
+        if prefill != 0 {
+            for y in 0..512u16 {
+                for x in 0..1024u16 {
+                    gpu.vram.set_pixel(x, y, prefill);
+                }
+            }
+        }
+        gpu.gp0_push(0xE3000000);
+        gpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        let e1 = 0xE100_0000_u32 | ((tpage_blend_bits as u32) & 0x3) << 5;
+        gpu.gp0_push(e1);
+        gpu.gp0_push(0xE600_0000_u32 | (mask_e6 as u32) & 0x3);
+        let cmd = ((cmd_byte as u32) << 24) | bgr15_to_rgb24(color);
+        gpu.gp0_push(cmd);
+        gpu.gp0_push(((xy.1 as u32) << 16) | (xy.0 as u32 & 0xFFFF));
+        gpu.gp0_push((wh.1 << 16) | (wh.0 & 0xFFFF));
+        gpu.vram.words().to_vec()
+    }
+
+    fn gpu_prefill_full(vg: &VramGpu, value: u16) {
+        if value == 0 {
+            return;
+        }
+        let buf = vec![value; (super::super::VRAM_WIDTH * super::super::VRAM_HEIGHT) as usize];
+        vg.upload_full(&buf).unwrap();
+    }
+
+    #[test]
+    fn mono_rect_basic_opaque_matches_cpu() {
+        // Strict bit-exact parity: rectangles have no interpolation,
+        // so the only sources of disagreement would be coverage or
+        // RMW bugs — neither of which we expect.
+        let xy = (50, 60);
+        let wh = (40u32, 30u32);
+        let color = 0x4321;
+        let cpu = cpu_rasterize_mono_rect(xy, wh, color, 0x60, 0, 0, 0);
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        r.dispatch_mono_rect(
+            &vg,
+            &MonoRect::opaque(xy, wh, color),
+            &DrawArea::full_vram(),
+        );
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "mono rect strict parity");
+    }
+
+    #[test]
+    fn mono_rect_drawing_area_clip_matches_cpu() {
+        // Rect spans (5..55, 5..55) but draw area is (20..40,20..40).
+        let xy = (5i32, 5i32);
+        let wh = (50u32, 50u32);
+        let color = 0x001F; // red
+        let mut cpu_gpu = Gpu::new();
+        cpu_gpu.gp0_push(0xE3000000 | 20 | (20 << 10));
+        cpu_gpu.gp0_push(0xE4000000 | 40 | (40 << 10));
+        cpu_gpu.gp0_push(0xE100_0000);
+        cpu_gpu.gp0_push(0xE600_0000);
+        let cmd = 0x60_000000_u32 | bgr15_to_rgb24(color);
+        cpu_gpu.gp0_push(cmd);
+        cpu_gpu.gp0_push(((xy.1 as u32) << 16) | (xy.0 as u32 & 0xFFFF));
+        cpu_gpu.gp0_push((wh.1 << 16) | (wh.0 & 0xFFFF));
+        let cpu = cpu_gpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        r.dispatch_mono_rect(
+            &vg,
+            &MonoRect::opaque(xy, wh, color),
+            &DrawArea {
+                left: 20,
+                top: 20,
+                right: 40,
+                bottom: 40,
+            },
+        );
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "mono rect clip strict parity");
+    }
+
+    #[test]
+    fn mono_rect_semi_trans_average_matches_cpu() {
+        let xy = (10, 10);
+        let wh = (20u32, 20u32);
+        let color = 0x1234;
+        let prefill = 0x5678;
+        let cpu = cpu_rasterize_mono_rect(xy, wh, color, 0x62, 0, 0, prefill);
+        let vg = VramGpu::new_headless();
+        gpu_prefill_full(&vg, prefill);
+        let r = Rasterizer::new(&vg);
+        r.dispatch_mono_rect(
+            &vg,
+            &MonoRect::new(
+                xy,
+                wh,
+                color,
+                PrimFlags::SEMI_TRANS,
+                BlendMode::Average,
+            ),
+            &DrawArea::full_vram(),
+        );
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "mono rect semi-trans Average parity");
+    }
+
+    #[test]
+    fn mono_rect_mask_check_protects_pixels() {
+        let xy = (10, 10);
+        let wh = (15u32, 15u32);
+        let color = 0x0123;
+        let prefill = 0x8888; // bit 15 set on every pixel
+        let cpu = cpu_rasterize_mono_rect(xy, wh, color, 0x60, 0, 0b10, prefill);
+        let vg = VramGpu::new_headless();
+        gpu_prefill_full(&vg, prefill);
+        let r = Rasterizer::new(&vg);
+        r.dispatch_mono_rect(
+            &vg,
+            &MonoRect::new(
+                xy,
+                wh,
+                color,
+                PrimFlags::MASK_CHECK,
+                BlendMode::Average,
+            ),
+            &DrawArea::full_vram(),
+        );
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "mono rect mask-check parity");
+        // Sanity: nothing should have been written.
+        let i = 12 * 1024 + 12;
+        assert_eq!(gpu[i], prefill);
+    }
+
+    #[test]
+    fn mono_rect_zero_size_is_dropped() {
+        let cpu = cpu_rasterize_mono_rect((10, 10), (0, 5), 0x4321, 0x60, 0, 0, 0);
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        r.dispatch_mono_rect(
+            &vg,
+            &MonoRect::opaque((10, 10), (0, 5), 0x4321),
+            &DrawArea::full_vram(),
+        );
+        let gpu = vg.download_full().unwrap();
+        assert!(cpu.iter().all(|&w| w == 0), "CPU drops zero-width rect");
+        assert!(gpu.iter().all(|&w| w == 0), "GPU drops zero-width rect");
+    }
+
+    /// Drive the CPU rasterizer for a textured rect via GP0 0x64.
+    /// Caller has already set draw area + uploaded VRAM.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_push_tex_rect(
+        cpu: &mut Gpu,
+        cmd_byte: u8,
+        tint: (u8, u8, u8),
+        xy: (i32, i32),
+        wh: (u32, u32),
+        uv: (u8, u8),
+        clut_word: u32,
+        // CPU side picks tpage from the LAST GP0 0xE1 — the rect
+        // packet has no per-prim tpage word. Caller pushes it
+        // separately before calling.
+    ) {
+        let cmd = ((cmd_byte as u32) << 24)
+            | (tint.0 as u32)
+            | ((tint.1 as u32) << 8)
+            | ((tint.2 as u32) << 16);
+        cpu.gp0_push(cmd);
+        cpu.gp0_push(((xy.1 as u32) << 16) | (xy.0 as u32 & 0xFFFF));
+        let uv_clut =
+            ((clut_word & 0xFFFF) << 16) | ((uv.0 as u32) | ((uv.1 as u32) << 8));
+        cpu.gp0_push(uv_clut);
+        cpu.gp0_push((wh.1 << 16) | (wh.0 & 0xFFFF));
+    }
+
+    /// Build the GP0 0xE1 word that sets the active tpage state on
+    /// the CPU side (mirrors what `apply_primitive_tpage` does in
+    /// `tex_tri`, but for rect primitives the host has to push it
+    /// explicitly since rect packets have no per-prim tpage word).
+    fn make_e1_for_tpage(tpage_x: u32, tpage_y: u32, depth: u32) -> u32 {
+        let tx = tpage_x / 64;
+        let ty = if tpage_y == 256 { 1u32 } else { 0 };
+        0xE100_0000 | (tx & 0xF) | (ty << 4) | ((depth & 0x3) << 7)
+    }
+
+    #[test]
+    fn tex_rect_15bpp_basic_matches_cpu_byte_for_byte() {
+        // Bit-exact parity: rect UVs step linearly, no Q16.16
+        // delta math, so CPU and GPU should agree pixel-for-pixel.
+        let xy = (40i32, 30i32);
+        let wh = (32u32, 24u32);
+        let uv = (0u8, 0u8);
+        let tpage_x = 128u32;
+
+        let mut vram = vec![0u16; 1024 * 512];
+        // Distinct colours per cell so any UV miss shows up.
+        for vy in 0..32u16 {
+            for ux in 0..64u16 {
+                let val = ((vy as u16) << 5) | (ux as u16) | 0x0001;
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu.gp0_push(make_e1_for_tpage(tpage_x, 0, 2));
+        cpu.gp0_push(0xE600_0000);
+        // Cmd 0x65 = textured rect, raw flag set.
+        cpu_push_tex_rect(&mut cpu, 0x65, (0, 0, 0), xy, wh, uv, 0);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let rect = TexRect::new(
+            xy, wh, uv, 0, 0,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 2);
+        r.dispatch_tex_rect(&vg, &rect, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        assert_eq!(cpu_words, gpu_words, "tex rect strict parity");
+    }
+
+    #[test]
+    fn tex_rect_x_flip_mirrors_left_right() {
+        // GP0 0xE1 bit 12 = X flip. Each pixel column (dx) reads
+        // texel column (last - dx) instead of dx.
+        let xy = (40i32, 30i32);
+        let wh = (16u32, 16u32);
+        let uv = (0u8, 0u8);
+        let tpage_x = 128u32;
+
+        let mut vram = vec![0u16; 1024 * 512];
+        for vy in 0..32u16 {
+            for ux in 0..32u16 {
+                let val = ((vy as u16) << 5) | (ux as u16) | 0x0001;
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+
+        // CPU: set the X-flip bit in GP0 0xE1 (bit 12 = 0x1000).
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu.gp0_push(make_e1_for_tpage(tpage_x, 0, 2) | 0x1000);
+        cpu.gp0_push(0xE600_0000);
+        cpu_push_tex_rect(&mut cpu, 0x65, (0, 0, 0), xy, wh, uv, 0);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let rect = TexRect::new(
+            xy, wh, uv, 0, 0,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE | PrimFlags::FLIP_X,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 2);
+        r.dispatch_tex_rect(&vg, &rect, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        assert_eq!(cpu_words, gpu_words, "tex rect X-flip strict parity");
+    }
+
+    #[test]
+    fn tex_rect_modulated_tint_matches_cpu_byte_for_byte() {
+        let xy = (40i32, 30i32);
+        let wh = (16u32, 16u32);
+        let uv = (0u8, 0u8);
+        let tpage_x = 128u32;
+        let tint = (0x40u8, 0x40u8, 0x40u8); // halve every channel
+
+        let mut vram = vec![0u16; 1024 * 512];
+        for vy in 0..32u16 {
+            for ux in 0..32u16 {
+                let val = ((vy as u16) << 5) | (ux as u16) | 0x0001;
+                vram[vy as usize * 1024 + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu.gp0_push(make_e1_for_tpage(tpage_x, 0, 2));
+        cpu.gp0_push(0xE600_0000);
+        // 0x64 = textured rect, modulated (NOT raw).
+        cpu_push_tex_rect(&mut cpu, 0x64, tint, xy, wh, uv, 0);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let rect = TexRect::new(
+            xy, wh, uv, 0, 0, tint,
+            PrimFlags::empty(),
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 2);
+        r.dispatch_tex_rect(&vg, &rect, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        assert_eq!(cpu_words, gpu_words, "tex rect modulated strict parity");
+    }
+
+    #[test]
+    fn tex_rect_4bpp_with_clut_matches_cpu_byte_for_byte() {
+        // Tekken-3-style 4bpp paletted rect, the most common 2D-UI
+        // primitive. Strict bit-exact parity here would have caught
+        // the U/V-wrap bug in `sample_texture` immediately.
+        let xy = (40i32, 30i32);
+        let wh = (16u32, 16u32);
+        let uv = (0u8, 0u8);
+        let tpage_x = 0u32;
+        let clut_x = 0u32;
+        let clut_y = 256u32;
+
+        let mut vram = vec![0u16; 1024 * 512];
+        // CLUT: 16 distinct opaque entries.
+        for i in 0..16u16 {
+            let val = (i.max(1) << 1) | (i.max(1) << 6) | 0x4000;
+            vram[clut_y as usize * 1024 + (clut_x as usize + i as usize)] = val;
+        }
+        // 16×16 4bpp texture — 4 nibbles per VRAM word.
+        for vy in 0..16u16 {
+            for word_x in 0..4u16 {
+                let mut word = 0u16;
+                for n in 0..4u16 {
+                    let nibble = ((word_x * 4 + n) + vy) & 0xF;
+                    word |= nibble << (n * 4);
+                }
+                vram[vy as usize * 1024 + (tpage_x as usize + word_x as usize)] = word;
+            }
+        }
+
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        cpu.gp0_push(make_e1_for_tpage(tpage_x, 0, 0));
+        cpu.gp0_push(0xE600_0000);
+        // CLUT word: clut_x/16 in low 6, clut_y in next 9 bits.
+        let clut_word = ((clut_x / 16) & 0x3F) | ((clut_y & 0x1FF) << 6);
+        cpu_push_tex_rect(&mut cpu, 0x65, (0, 0, 0), xy, wh, uv, clut_word);
+        let cpu_words = cpu.vram.words().to_vec();
+
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let rect = TexRect::new(
+            xy, wh, uv, clut_x, clut_y,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, 0, 0);
+        r.dispatch_tex_rect(&vg, &rect, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        assert_eq!(cpu_words, gpu_words, "tex rect 4bpp+CLUT strict parity");
     }
 }
