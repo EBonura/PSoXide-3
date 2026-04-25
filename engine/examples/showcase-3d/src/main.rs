@@ -8,11 +8,11 @@
 //!   tessellated to 6320 tris in its canonical OBJ, decimated
 //!   here to ~225 tris.
 //!
-//! The two objects rotate independently on composite axes with
-//! a GTE-projected starfield behind them, `psx-fx` sparks
-//! drifting through, a deep-space gradient backdrop, and a
-//! BASIC_8×16 HUD tracking frame count + live triangle count +
-//! star count.
+//! The two objects rotate independently on composite axes while a
+//! slightly-raised camera orbits the scene centre. Behind them: a
+//! GTE-projected starfield, `psx-fx` sparks drifting through, a
+//! deep-space gradient backdrop, and a BASIC_8×16 HUD tracking frame
+//! count + live triangle count + star count.
 //!
 //! Validates the end-to-end 3D pipeline under real load:
 //!
@@ -33,7 +33,7 @@ extern crate psx_rt;
 
 use psx_asset::Mesh;
 use psx_engine::{ActorTransform, App, Config, Ctx, Scene, Vec3World};
-use psx_font::{FontAtlas, fonts::BASIC_8X16};
+use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_fx::{LcgRng, ParticlePool, ShakeState};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat, TriGouraud};
@@ -58,8 +58,17 @@ const OT_DEPTH: usize = 8;
 
 /// GTE focal length (H register).
 const PROJ_H: u16 = 280;
-/// Default camera setback.
-const WORLD_Z: i32 = 0x3400;
+/// Scene centre depth in camera space.
+const WORLD_Z: i32 = 0x4800;
+
+/// Camera orbit: 1 coarse GTE angle unit per frame = one revolution
+/// every ~4.3 seconds at 60 Hz.
+const CAMERA_ORBIT_PER_FRAME: u16 = 1;
+
+/// Camera pitch in 256-per-revolution units. This is a small negative
+/// X rotation, equivalent to lifting the camera and looking gently
+/// down at the scene centre.
+const CAMERA_PITCH: u16 = 0xF0;
 
 // ----------------------------------------------------------------------
 // Starfield
@@ -76,11 +85,12 @@ static mut STARS: [Vec3I16; STAR_COUNT] = [Vec3I16::ZERO; STAR_COUNT];
 // Mesh placement
 // ----------------------------------------------------------------------
 
-const SUZANNE_POS: Vec3World = Vec3World::from_raw(-0x1300, 0, WORLD_Z);
-const TEAPOT_POS: Vec3World = Vec3World::from_raw(0x1400, 0, WORLD_Z);
+const SCENE_CENTER: Vec3World = Vec3World::from_raw(0, 0, WORLD_Z);
+const SUZANNE_OFFSET: Vec3World = Vec3World::from_raw(-0x1300, 0, 0);
+const TEAPOT_OFFSET: Vec3World = Vec3World::from_raw(0x1400, 0, 0);
 
 // ----------------------------------------------------------------------
-// Light rig (world-space)
+// Light rig (camera-space)
 // ----------------------------------------------------------------------
 
 /// Three directional lights arranged for studio-ish illumination:
@@ -91,7 +101,7 @@ const TEAPOT_POS: Vec3World = Vec3World::from_raw(0x1400, 0, WORLD_Z);
 /// Directions are Q3.12 unit-ish vectors pointing FROM the surface
 /// TO the light. They're `const`-evaluated so the rig lives in
 /// .rodata — no per-frame rebuild cost.
-/// "Studio" rig in its REFERENCE frame (facing -Z, camera-front).
+/// "Studio" rig in its camera reference frame (facing -Z).
 /// Per frame we rotate this around Y so lights orbit the scene,
 /// ensuring both Suzanne and the teapot see every lighting angle
 /// across a full rotation.
@@ -169,9 +179,7 @@ static mut GOURAUD_TRIS: [TriGouraud; 320] = [const {
 }; 320];
 
 /// Rects for stars + sparks.
-static mut SCENE_RECTS: [RectFlat; 128] = [const {
-    RectFlat::new(0, 0, 0, 0, 0, 0, 0)
-}; 128];
+static mut SCENE_RECTS: [RectFlat; 128] = [const { RectFlat::new(0, 0, 0, 0, 0, 0, 0) }; 128];
 
 static mut BG_QUAD: QuadGouraud = QuadGouraud {
     tag: 0,
@@ -301,18 +309,8 @@ impl Showcase3D {
 
         // Slot 7 (back) — deep-space gradient.
         *bg = QuadGouraud::new(
-            [
-                (0, 0),
-                (SCREEN_W, 0),
-                (0, SCREEN_H),
-                (SCREEN_W, SCREEN_H),
-            ],
-            [
-                (10, 6, 32),
-                (10, 6, 32),
-                (2, 1, 8),
-                (2, 1, 8),
-            ],
+            [(0, 0), (SCREEN_W, 0), (0, SCREEN_H), (SCREEN_W, SCREEN_H)],
+            [(10, 6, 32), (10, 6, 32), (2, 1, 8), (2, 1, 8)],
         );
         ot.add(7, bg, QuadGouraud::WORDS);
 
@@ -362,28 +360,30 @@ impl Showcase3D {
         let suzanne = Mesh::from_bytes(SUZANNE_BLOB).expect("suzanne blob");
         let teapot = Mesh::from_bytes(TEAPOT_BLOB).expect("teapot blob");
 
-        // World-space light rig for this frame — base rig rotated
+        // Camera-space light rig for this frame — base rig rotated
         // around Y at the configured orbit rate so both meshes
         // eventually see every lighting angle. Compose this once per
-        // frame; each object's `for_object` applies on top to take us
-        // into local space.
-        let light_orbit = Mat3I16::rotate_y(
-            (frame.wrapping_mul(LIGHT_ORBIT_PER_FRAME as u32) & 0xFFFF) as u16,
-        );
+        // frame; each object's final view rotation takes us into local
+        // space.
+        let light_orbit =
+            Mat3I16::rotate_y((frame.wrapping_mul(LIGHT_ORBIT_PER_FRAME as u32) & 0xFFFF) as u16);
         let scene_lights = BASE_LIGHTS.rotated(&light_orbit);
+        let view = camera_view(frame);
 
         // --- SUZANNE (slot 5) — two-axis tumble, lit by scene rig ---
         let suz_rot = Mat3I16::rotate_y((frame.wrapping_mul(3) & 0xFFFF) as u16)
             .mul(&Mat3I16::rotate_x((frame.wrapping_mul(2) & 0xFFFF) as u16));
+        let suz_view_rot = view.mul(&suz_rot);
+        let suz_view_pos = camera_space_position(&view, SUZANNE_OFFSET);
         // No per-actor scale (meshes authored at their intended
         // size), so `ActorTransform::at(pos).with_rotation(rot)`
         // leaves scale at 1.0× and `load_gte` folds that identity
         // multiply into the rotation upload in one step.
-        ActorTransform::at(SUZANNE_POS)
-            .with_rotation(suz_rot)
+        ActorTransform::at(suz_view_pos)
+            .with_rotation(suz_view_rot)
             .load_gte();
-        // Rotate world-space lights into Suzanne's local frame + upload.
-        scene_lights.for_object(&suz_rot).load();
+        // Rotate camera-space lights into Suzanne's local frame + upload.
+        scene_lights.for_object(&suz_view_rot).load();
         let suz_proj = unsafe { &mut SUZANNE_PROJ };
         for i in 0..suzanne.vert_count() {
             let v = suzanne.vertex(i as u8);
@@ -395,12 +395,7 @@ impl Showcase3D {
             // the gouraud interpolator blurs any mismatch anyway).
             let material = vertex_material(&suzanne, i as u8);
             let p = psx_gte::lighting::project_lit(v, n, material);
-            suz_proj[i as usize] = (
-                p.sx + shake_dx,
-                p.sy + shake_dy,
-                p.sz,
-                p.r, p.g, p.b,
-            );
+            suz_proj[i as usize] = (p.sx + shake_dx, p.sy + shake_dy, p.sz, p.r, p.g, p.b);
         }
         for face_idx in 0..suzanne.face_count() {
             if tri_idx >= gouraud.len() {
@@ -425,26 +420,21 @@ impl Showcase3D {
         }
 
         // --- TEAPOT (slot 4) — opposite tumble, lit by same rig ---
-        let tea_rot = Mat3I16::rotate_y(
-            (frame.wrapping_mul(4) & 0xFFFF).wrapping_neg() as u16,
-        )
-        .mul(&Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16));
-        ActorTransform::at(TEAPOT_POS)
-            .with_rotation(tea_rot)
+        let tea_rot = Mat3I16::rotate_y((frame.wrapping_mul(4) & 0xFFFF).wrapping_neg() as u16)
+            .mul(&Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16));
+        let tea_view_rot = view.mul(&tea_rot);
+        let tea_view_pos = camera_space_position(&view, TEAPOT_OFFSET);
+        ActorTransform::at(tea_view_pos)
+            .with_rotation(tea_view_rot)
             .load_gte();
-        scene_lights.for_object(&tea_rot).load();
+        scene_lights.for_object(&tea_view_rot).load();
         let tea_proj = unsafe { &mut TEAPOT_PROJ };
         for i in 0..teapot.vert_count() {
             let v = teapot.vertex(i as u8);
             let n = teapot.vertex_normal(i as u8).unwrap_or(Vec3I16::ZERO);
             let material = vertex_material(&teapot, i as u8);
             let p = psx_gte::lighting::project_lit(v, n, material);
-            tea_proj[i as usize] = (
-                p.sx + shake_dx,
-                p.sy + shake_dy,
-                p.sz,
-                p.r, p.g, p.b,
-            );
+            tea_proj[i as usize] = (p.sx + shake_dx, p.sy + shake_dy, p.sz, p.r, p.g, p.b);
         }
         for face_idx in 0..teapot.face_count() {
             if tri_idx >= gouraud.len() {
@@ -487,11 +477,21 @@ impl Showcase3D {
 
         font.draw_text(4, SCREEN_H - 20, "frame", (160, 160, 200));
         let frame_hex = u16_hex((frame & 0xFFFF) as u16);
-        font.draw_text(4 + 8 * 6, SCREEN_H - 20, frame_hex.as_str(), (200, 240, 160));
+        font.draw_text(
+            4 + 8 * 6,
+            SCREEN_H - 20,
+            frame_hex.as_str(),
+            (200, 240, 160),
+        );
 
         font.draw_text(SCREEN_W / 2 - 8 * 3, SCREEN_H - 20, "tri", (160, 160, 200));
         let tri = u16_hex(self.tri_count);
-        font.draw_text(SCREEN_W / 2 + 8, SCREEN_H - 20, tri.as_str(), (240, 200, 160));
+        font.draw_text(
+            SCREEN_W / 2 + 8,
+            SCREEN_H - 20,
+            tri.as_str(),
+            (240, 200, 160),
+        );
 
         font.draw_text(SCREEN_W - 100, SCREEN_H - 20, "stars", (160, 160, 200));
         let stars = u16_hex(STAR_COUNT as u16);
@@ -529,6 +529,28 @@ fn main() -> ! {
 // ----------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------
+
+fn camera_view(frame: u32) -> Mat3I16 {
+    let yaw =
+        Mat3I16::rotate_y((frame.wrapping_mul(CAMERA_ORBIT_PER_FRAME as u32) & 0xFFFF) as u16);
+    let pitch = Mat3I16::rotate_x(CAMERA_PITCH);
+    pitch.mul(&yaw)
+}
+
+fn camera_space_position(view: &Mat3I16, offset: Vec3World) -> Vec3World {
+    let x = transform_axis(view, 0, offset);
+    let y = transform_axis(view, 1, offset);
+    let z = transform_axis(view, 2, offset);
+    Vec3World::from_raw(SCENE_CENTER.x + x, SCENE_CENTER.y + y, SCENE_CENTER.z + z)
+}
+
+fn transform_axis(m: &Mat3I16, row: usize, v: Vec3World) -> i32 {
+    let row = m.row(row);
+    let sum = (row[0] as i64) * (v.x as i64)
+        + (row[1] as i64) * (v.y as i64)
+        + (row[2] as i64) * (v.z as i64);
+    (sum >> 12) as i32
+}
 
 /// 2D cross-product test — triangles wound clockwise on screen
 /// are back-facing and get culled.

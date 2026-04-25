@@ -573,25 +573,21 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         }),
 
         // Now lit via the GTE's NCCS pipeline — 3 directional
-        // world-space lights rotated per-object into local
-        // frames, per-vertex `project_lit` computes both screen
-        // coords (RTPS) and lit colour (NCCS → RGB2). Triangles
-        // emit as `TriGouraud` with per-vertex colours.
-        // Refreshed in Phase 3e after port to `psx-engine`. Both
-        // mesh tumbles (frame×3, frame×2, frame×4) and HUD read
-        // `ctx.frame`, so every pixel on screen shifts with the
-        // end-of-loop frame-counter advance. `spawn_burst` also
-        // pulls from the shared `LcgRng` on a modulo of `frame`
-        // — rebaked wholesale.
+        // camera-space lights rotated per-object into local frames,
+        // per-vertex `project_lit` computes both screen coords
+        // (RTPS) and lit colour (NCCS → RGB2). Triangles emit as
+        // `TriGouraud` with per-vertex colours. Camera now orbits
+        // around the scene centre from a slightly raised angle, so
+        // object positions and rotations include a shared view matrix.
         "showcase-3d" => Some(SdkGolden {
             example: "showcase-3d",
             vblanks: 60,
-            vram_hash: 0x22e2_d410_00a2_32c1,
-            display_hash: 0x3daf_a742_b90a_65cb,
+            vram_hash: 0x6f9a_6ec0_72a5_129a,
+            display_hash: 0xd1e7_7e34_3ba8_f301,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_3170,
+            final_pc: 0x8001_4d38,
             redux_display_hash: None,
         }),
         // PS1-commercial textured-Gouraud pipeline: per-vertex RTPS
