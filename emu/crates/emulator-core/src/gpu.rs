@@ -4050,8 +4050,35 @@ mod tests {
         // V wrap: v=256 → v&0xFF=0 → vram(0,0)=0x1111. v=257 →
         // v&0xFF=1 → vram(0,1) (a different row), confirms v wraps too.
         gpu.vram.set_pixel(0, 1, 0x3333);
-        assert_eq!(gpu.sample_texture(0, 256, 0, 0), Some(0x1111), "v=256 wraps to v=0");
-        assert_eq!(gpu.sample_texture(0, 257, 0, 0), Some(0x3333), "v=257 wraps to v=1");
+        assert_eq!(
+            gpu.sample_texture(0, 256, 0, 0),
+            Some(0x1111),
+            "v=256 wraps to v=0"
+        );
+        assert_eq!(
+            gpu.sample_texture(0, 257, 0, 0),
+            Some(0x3333),
+            "v=257 wraps to v=1"
+        );
+    }
+
+    fn pack_test_vertex(x: i16, y: i16) -> u32 {
+        ((x as u16) as u32) | (((y as u16) as u32) << 16)
+    }
+
+    fn pack_test_uv(u: u8, v: u8, extra: u16) -> u32 {
+        (u as u32) | ((v as u32) << 8) | ((extra as u32) << 16)
+    }
+
+    fn prepare_opaque_15bpp_texture(gpu: &mut Gpu) -> u16 {
+        // 15bpp texture page at x=0, y=256. Keeping texture source
+        // away from the draw area makes these tests easier to reason
+        // about: any low-screen pixel change came from the primitive.
+        const TPAGE_15BPP_Y256: u16 = (1 << 4) | (2 << 7);
+        gpu.write32(GP0_ADDR, 0xE3_00_00_00);
+        gpu.write32(GP0_ADDR, 0xE4_00_00_00 | 0x3FF | (0x1FF << 10));
+        gpu.vram.set_pixel(0, 256, 0x7FFF);
+        TPAGE_15BPP_Y256
     }
 
     #[test]
@@ -4088,6 +4115,76 @@ mod tests {
         // are visited even when one of them looks small.
         assert!(triangle_exceeds_hw_extent((0, 0), (0, 0), (1024, 0)));
         assert!(triangle_exceeds_hw_extent((1024, 0), (0, 0), (0, 0)));
+    }
+
+    #[test]
+    fn oversize_textured_triangle_is_dropped() {
+        // This is the material-viewer lesson in miniature: projected
+        // textured triangles can look mostly sane on screen but still
+        // cross the PS1's per-edge extent limit. Hardware drops the
+        // whole primitive; engines should split before submitting.
+        let mut gpu = Gpu::new();
+        let tpage = prepare_opaque_15bpp_texture(&mut gpu);
+
+        gpu.write32(GP0_ADDR, 0x2500_0000); // raw textured triangle
+        gpu.write32(GP0_ADDR, pack_test_vertex(-1000, 0));
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+        gpu.write32(GP0_ADDR, pack_test_vertex(24, 0)); // dx = 1024 -> drop
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, tpage));
+        gpu.write32(GP0_ADDR, pack_test_vertex(24, 64));
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+
+        assert_eq!(
+            gpu.vram.get_pixel(20, 8),
+            0,
+            "oversize textured triangle should be skipped, not partially drawn",
+        );
+    }
+
+    #[test]
+    fn legal_textured_triangle_one_pixel_under_extent_draws() {
+        let mut gpu = Gpu::new();
+        let tpage = prepare_opaque_15bpp_texture(&mut gpu);
+
+        gpu.write32(GP0_ADDR, 0x2500_0000); // raw textured triangle
+        gpu.write32(GP0_ADDR, pack_test_vertex(-999, 0));
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+        gpu.write32(GP0_ADDR, pack_test_vertex(24, 0)); // dx = 1023 -> keep
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, tpage));
+        gpu.write32(GP0_ADDR, pack_test_vertex(24, 64));
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+
+        assert_ne!(
+            gpu.vram.get_pixel(20, 8),
+            0,
+            "triangle at the exact legal extent should still rasterise",
+        );
+    }
+
+    #[test]
+    fn textured_quad_drops_only_the_oversize_split_half() {
+        // Non-axis-aligned textured quads are split into two triangles.
+        // As with real hardware, the extent rule applies to each half
+        // independently; a bad second half must not erase the good one.
+        let mut gpu = Gpu::new();
+        let tpage = prepare_opaque_15bpp_texture(&mut gpu);
+
+        gpu.write32(GP0_ADDR, 0x2D00_0000); // raw textured quad
+        gpu.write32(GP0_ADDR, pack_test_vertex(10, 10)); // v0
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+        gpu.write32(GP0_ADDR, pack_test_vertex(30, 10)); // v1
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, tpage));
+        gpu.write32(GP0_ADDR, pack_test_vertex(10, 30)); // v2
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+        gpu.write32(GP0_ADDR, pack_test_vertex(30, 522)); // v3: |dy v1->v3| = 512
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+
+        assert_ne!(gpu.vram.get_pixel(14, 14), 0, "legal half should draw");
+        assert_eq!(
+            gpu.vram.get_pixel(28, 120),
+            0,
+            "oversize split half should be skipped independently",
+        );
     }
 
     #[test]
