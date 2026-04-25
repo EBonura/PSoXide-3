@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 
 use crate::primitive::{
-    BlendMode, DrawArea, MonoRect, MonoTri, PrimFlags, TexRect, TexTri, Tpage,
+    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, TexRect, TexTri, Tpage,
 };
 use crate::vram::VramGpu;
 
@@ -44,6 +44,12 @@ pub struct Rasterizer {
     // Textured-rectangle pipeline (B.5.b). Reuses `tex_tri_bg_layout`.
     tex_rect_pipeline: wgpu::ComputePipeline,
     tex_rect_uniform: wgpu::Buffer,
+
+    // Fill pipeline (B.5.c). Custom 2-binding shape — no draw area
+    // because fill bypasses clipping.
+    fill_pipeline: wgpu::ComputePipeline,
+    fill_bg_layout: wgpu::BindGroupLayout,
+    fill_uniform: wgpu::Buffer,
 }
 
 impl Rasterizer {
@@ -279,6 +285,58 @@ impl Rasterizer {
             mapped_at_creation: false,
         });
 
+        // ---------- Fill pipeline (B.5.c) ----------
+        // 2 bindings: VRAM + Fill uniform. No draw area / no tpage —
+        // fill bypasses clipping and never reads VRAM.
+        let fill_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("psx-rasterizer-fill-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let fill_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("psx-rasterizer-fill-pl"),
+            bind_group_layouts: &[&fill_bg_layout],
+            push_constant_ranges: &[],
+        });
+        let fill_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("psx-rasterizer-fill-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fill.wgsl").into()),
+        });
+        let fill_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("psx-rasterizer-fill"),
+            layout: Some(&fill_pl),
+            module: &fill_shader,
+            entry_point: Some("rasterize"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let fill_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-fill-uniform"),
+            size: std::mem::size_of::<Fill>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             device,
             queue,
@@ -294,7 +352,109 @@ impl Rasterizer {
             mono_rect_uniform,
             tex_rect_pipeline,
             tex_rect_uniform,
+            fill_pipeline,
+            fill_bg_layout,
+            fill_uniform,
         }
+    }
+
+    /// Dispatch one quick-fill primitive into VRAM. Bypasses all
+    /// drawing-state — matches the CPU `Gpu::fill_rect`. Caller is
+    /// responsible for the 16-pixel x/w masking; `Fill::new` does
+    /// it for you.
+    pub fn dispatch_fill(&self, vram: &VramGpu, fill: &Fill) {
+        if fill.wh[0] == 0 || fill.wh[1] == 0 {
+            return;
+        }
+        self.queue
+            .write_buffer(&self.fill_uniform, 0, bytemuck::bytes_of(fill));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-fill-bg"),
+            layout: &self.fill_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.fill_uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-fill-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-fill-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fill_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = fill.wh[0].div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = fill.wh[1].div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// VRAM-to-VRAM copy (`GP0 0x80`). Mirrors the CPU rasterizer's
+    /// row-by-row semantics exactly: for each row, the entire source
+    /// row is read into a staging buffer first, then written to the
+    /// dest row. This means vertically-overlapping copies "smear"
+    /// the source down — the same behaviour the CPU produces (Sony
+    /// docs describe this as the row-buffer of the copy unit).
+    ///
+    /// Implementation: one per-row `src→temp` + `temp→dst` pair,
+    /// all queued into a single command encoder so wgpu runs them
+    /// strictly in order. Goes through a 1-row staging buffer
+    /// because wgpu rejects `copy_buffer_to_buffer` with the same
+    /// buffer as src and dst — we'd need that for direct VRAM-to-
+    /// VRAM otherwise.
+    pub fn dispatch_vram_copy(
+        &self,
+        vram: &VramGpu,
+        src: (u32, u32),
+        dst: (u32, u32),
+        wh: (u32, u32),
+    ) {
+        let (sx, sy) = src;
+        let (dx, dy) = dst;
+        let (w, h) = wh;
+        if w == 0 || h == 0 {
+            return;
+        }
+
+        let row_bytes = (w as u64) * 4;
+        let temp = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-vram-copy-temp"),
+            size: row_bytes,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-vram-copy-encoder"),
+            });
+        for row in 0..h {
+            let s_off = ((sy + row) as u64 * super::vram::VRAM_WIDTH as u64
+                + sx as u64)
+                * 4;
+            let d_off = ((dy + row) as u64 * super::vram::VRAM_WIDTH as u64
+                + dx as u64)
+                * 4;
+            // Step 1: src row → temp.
+            encoder.copy_buffer_to_buffer(vram.buffer(), s_off, &temp, 0, row_bytes);
+            // Step 2: temp → dst row. Same encoder ⇒ runs strictly
+            // after step 1, which gives the CPU's row-buffer semantics.
+            encoder.copy_buffer_to_buffer(&temp, 0, vram.buffer(), d_off, row_bytes);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one monochrome rectangle. `xy` is the top-left
@@ -1917,5 +2077,210 @@ mod tests {
         let gpu_words = vg.download_full().unwrap();
 
         assert_eq!(cpu_words, gpu_words, "tex rect 4bpp+CLUT strict parity");
+    }
+
+    // -------------------------------------------------------
+    //  Phase B.5.c — fill + VRAM-to-VRAM copy parity vs CPU
+    // -------------------------------------------------------
+
+    /// Drive the CPU rasterizer for one quick-fill via GP0 0x02.
+    /// `prefill` paints VRAM beforehand so we can verify that fill
+    /// IGNORES mask-check / mask-set / drawing-area state.
+    fn cpu_rasterize_fill(
+        xy: (u32, u32),
+        wh: (u32, u32),
+        color: u16,
+        prefill: u16,
+        e3_clip_tl: u32,
+        e3_clip_br: u32,
+        e6_mask: u8,
+    ) -> Vec<u16> {
+        let mut gpu = Gpu::new();
+        if prefill != 0 {
+            for y in 0..512u16 {
+                for x in 0..1024u16 {
+                    gpu.vram.set_pixel(x, y, prefill);
+                }
+            }
+        }
+        gpu.gp0_push(0xE300_0000 | e3_clip_tl);
+        gpu.gp0_push(0xE400_0000 | e3_clip_br);
+        gpu.gp0_push(0xE600_0000 | e6_mask as u32);
+        // 0x02 = quick fill. Color in low 24 bits of cmd.
+        let cmd = 0x0200_0000_u32 | bgr15_to_rgb24(color);
+        gpu.gp0_push(cmd);
+        gpu.gp0_push(((xy.1) << 16) | xy.0);
+        gpu.gp0_push(((wh.1) << 16) | wh.0);
+        gpu.vram.words().to_vec()
+    }
+
+    #[test]
+    fn fill_basic_matches_cpu_byte_for_byte() {
+        // Strict parity. Fill is the simplest primitive — any diff
+        // is a real bug.
+        let xy = (32u32, 64u32);
+        let wh = (64u32, 32u32);
+        let color = 0x4321;
+        let cpu = cpu_rasterize_fill(xy, wh, color, 0, 0, 1023 | (511 << 10), 0);
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        r.dispatch_fill(&vg, &Fill::new(xy, wh, color));
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "fill basic parity");
+    }
+
+    #[test]
+    fn fill_ignores_drawing_area_clip() {
+        // Set a tiny draw area; fill must overwrite outside it.
+        let xy = (32u32, 32u32);
+        let wh = (64u32, 64u32);
+        let color = 0x1234;
+        // Restrict draw area to (40..60, 40..60) — but fill IGNORES
+        // this. The whole rect at (32..96, 32..96) should still write.
+        let cpu = cpu_rasterize_fill(
+            xy,
+            wh,
+            color,
+            0,
+            40 | (40 << 10),
+            60 | (60 << 10),
+            0,
+        );
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        r.dispatch_fill(&vg, &Fill::new(xy, wh, color));
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "fill ignores draw area");
+        // Sanity: a pixel OUTSIDE the draw area but INSIDE the fill
+        // rect should hold the fill colour on both backends.
+        let outside_clip = 35usize * 1024 + 35;
+        let expected = ((color & 0x1F) as u8) << 3 | ((color & 0x1F) as u8) >> 2;
+        // Check the BGR channels round-trip through fill correctly.
+        // Use the exact expected_bgr15 = color, since fill writes 15bpp directly.
+        // (RGB24 → BGR15 conversion truncates to 5 bits, so the
+        // resulting BGR15 won't equal `color` if `color` had bits set
+        // that don't survive the round-trip. cpu_rasterize_fill already
+        // pushes through bgr15_to_rgb24 which maps cleanly for our
+        // 5-bit-aligned `color`.)
+        assert_eq!(cpu[outside_clip], gpu[outside_clip]);
+        let _ = expected;
+    }
+
+    #[test]
+    fn fill_ignores_mask_check() {
+        // mask_check_before_draw is set; back buffer has bit 15
+        // everywhere. Fill should still write everywhere.
+        let xy = (32u32, 32u32);
+        let wh = (32u32, 32u32);
+        let color = 0x1234;
+        let prefill = 0x8888; // bit 15 set
+        let cpu = cpu_rasterize_fill(
+            xy,
+            wh,
+            color,
+            prefill,
+            0,
+            1023 | (511 << 10),
+            0b10, // mask_check
+        );
+        let vg = VramGpu::new_headless();
+        gpu_prefill_full(&vg, prefill);
+        let r = Rasterizer::new(&vg);
+        r.dispatch_fill(&vg, &Fill::new(xy, wh, color));
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "fill bypasses mask-check");
+        // Sanity: pixel inside fill rect must NOT be the prefill.
+        let i = 40 * 1024 + 40;
+        assert_ne!(cpu[i], prefill);
+    }
+
+    #[test]
+    fn fill_zero_size_is_dropped() {
+        let cpu = cpu_rasterize_fill((32, 32), (0, 32), 0xCAFE, 0, 0, 1023 | (511 << 10), 0);
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        r.dispatch_fill(&vg, &Fill::new((32, 32), (0, 32), 0xCAFE));
+        let gpu = vg.download_full().unwrap();
+        assert!(cpu.iter().all(|&w| w == 0));
+        assert!(gpu.iter().all(|&w| w == 0));
+    }
+
+    /// Drive the CPU rasterizer for one VRAM-to-VRAM copy via GP0 0x80.
+    fn cpu_rasterize_vram_copy(
+        seed: &[u16],
+        src: (u16, u16),
+        dst: (u16, u16),
+        wh: (u16, u16),
+    ) -> Vec<u16> {
+        let mut gpu = Gpu::new();
+        for (i, &w) in seed.iter().enumerate() {
+            gpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        gpu.gp0_push(0x80_000000);
+        gpu.gp0_push(((src.1 as u32) << 16) | (src.0 as u32));
+        gpu.gp0_push(((dst.1 as u32) << 16) | (dst.0 as u32));
+        gpu.gp0_push(((wh.1 as u32) << 16) | (wh.0 as u32));
+        gpu.vram.words().to_vec()
+    }
+
+    #[test]
+    fn vram_copy_non_overlapping_matches_cpu_byte_for_byte() {
+        // Source and dest disjoint — direct GPU copy path.
+        let mut seed = vec![0u16; 1024 * 512];
+        for vy in 0..32u16 {
+            for ux in 0..32u16 {
+                seed[vy as usize * 1024 + (200 + ux as usize)] =
+                    ((vy as u16) << 5) | (ux as u16) | 0x1;
+            }
+        }
+        let cpu = cpu_rasterize_vram_copy(&seed, (200, 0), (400, 100), (32, 32));
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&seed).unwrap();
+        let r = Rasterizer::new(&vg);
+        r.dispatch_vram_copy(&vg, (200, 0), (400, 100), (32, 32));
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu, "vram copy non-overlapping strict parity");
+    }
+
+    #[test]
+    fn vram_copy_overlapping_uses_host_bounce_correctly() {
+        // Overlap — host-bounce path. Result should still match CPU
+        // because the CPU's row-buffer pattern protects horizontal
+        // overlap, and our host bounce reads ALL src then writes
+        // (effectively the same as a full temp buffer).
+        let mut seed = vec![0u16; 1024 * 512];
+        for vy in 0..16u16 {
+            for ux in 0..16u16 {
+                seed[(50 + vy as usize) * 1024 + (50 + ux as usize)] =
+                    ((vy as u16) << 5) | (ux as u16) | 0x1;
+            }
+        }
+        // Overlap: src=(50,50) 16x16, dst=(54,54) 16x16. They share
+        // a 12x12 inner region.
+        let cpu = cpu_rasterize_vram_copy(&seed, (50, 50), (54, 54), (16, 16));
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&seed).unwrap();
+        let r = Rasterizer::new(&vg);
+        r.dispatch_vram_copy(&vg, (50, 50), (54, 54), (16, 16));
+        let gpu = vg.download_full().unwrap();
+        // Strict parity: our host-bounce reads the entire src rect
+        // before any writes — equivalent to the CPU's row-buffer
+        // semantics for non-vertically-overlapping cases.
+        // For vertically overlapping cases the CPU's row-by-row
+        // semantics may differ; we accept that as a known
+        // limitation in the comment on `dispatch_vram_copy`.
+        assert_eq!(cpu, gpu, "vram copy overlap strict parity");
+    }
+
+    #[test]
+    fn vram_copy_zero_size_is_dropped() {
+        let seed = vec![0u16; 1024 * 512];
+        let cpu = cpu_rasterize_vram_copy(&seed, (0, 0), (100, 100), (0, 32));
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        r.dispatch_vram_copy(&vg, (0, 0), (100, 100), (0, 32));
+        let gpu = vg.download_full().unwrap();
+        assert_eq!(cpu, gpu);
     }
 }

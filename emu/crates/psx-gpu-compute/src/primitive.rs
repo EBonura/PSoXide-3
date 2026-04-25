@@ -399,6 +399,43 @@ impl TexRect {
     }
 }
 
+/// Quick fill (`GP0 0x02`). Writes a single 15bpp colour into a
+/// rectangle, ignoring drawing-area, drawing-offset, mask-check,
+/// mask-set, and semi-trans. The hardware clamps `x`/`w` to 16-pixel
+/// alignment — the host should mask before constructing this.
+///
+/// WGSL counterpart in `shaders/fill.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct Fill {
+    /// Top-left, x in [0..1023] aligned to 16, y in [0..511].
+    pub xy: [u32; 2],
+    /// Size, w in [0..1023] aligned to 16, h in [0..511].
+    pub wh: [u32; 2],
+    /// 15bpp BGR colour. Bit 15 is written as-is — caller must
+    /// mask if they need the bit clear.
+    pub color: u32,
+    pub _pad: [u32; 3],
+}
+
+impl Fill {
+    /// Construct a fill primitive. Applies the same hardware-mask
+    /// rules as the CPU rasterizer: x's low 4 bits are cleared,
+    /// w is rounded UP to 16.
+    pub fn new(xy: (u32, u32), wh: (u32, u32), color_bgr15: u16) -> Self {
+        let x = xy.0 & 0x3F0;
+        let y = xy.1 & 0x1FF;
+        let w = (wh.0.saturating_add(0xF)) & 0x3F0;
+        let h = wh.1 & 0x1FF;
+        Self {
+            xy: [x, y],
+            wh: [w, h],
+            color: color_bgr15 as u32,
+            _pad: [0; 3],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +502,24 @@ mod tests {
     fn tex_rect_struct_pinned_at_48() {
         assert_eq!(std::mem::size_of::<TexRect>(), 48);
         assert_eq!(std::mem::size_of::<TexRect>() % 16, 0);
+    }
+
+    #[test]
+    fn fill_struct_pinned_at_32() {
+        assert_eq!(std::mem::size_of::<Fill>(), 32);
+        assert_eq!(std::mem::size_of::<Fill>() % 16, 0);
+    }
+
+    #[test]
+    fn fill_applies_hardware_alignment() {
+        // x low 4 bits cleared; w rounded up to 16. y / h pass through.
+        let f = Fill::new((23, 100), (50, 30), 0x1234);
+        assert_eq!(f.xy, [16, 100], "x masked to 16-pixel alignment");
+        assert_eq!(f.wh, [64, 30], "w rounded UP to next 16");
+        // Already-aligned values pass through.
+        let g = Fill::new((32, 100), (48, 30), 0x1234);
+        assert_eq!(g.xy, [32, 100]);
+        assert_eq!(g.wh, [48, 30]);
     }
 
     #[test]
