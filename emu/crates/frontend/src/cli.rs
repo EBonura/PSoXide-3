@@ -51,6 +51,16 @@ pub struct Cli {
     #[arg(long)]
     pub fullscreen: bool,
 
+    /// Run the experimental compute-shader rasterizer in parallel
+    /// with the CPU rasterizer (Phase C). Per-frame the frontend
+    /// drains the CPU's `cmd_log` and replays each GP0 packet
+    /// through the GPU compute path; the display reads from the
+    /// GPU VRAM. Off by default — opt-in until parity is confirmed
+    /// in a wide enough test set. Press F12 in the GUI to toggle
+    /// at runtime once the bus is wired up.
+    #[arg(long)]
+    pub gpu_compute: bool,
+
     /// Headless subcommand. Omit to launch the GUI.
     #[command(subcommand)]
     pub command: Option<Command>,
