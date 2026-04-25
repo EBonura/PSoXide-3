@@ -4,8 +4,7 @@
 //!
 //! The room uses the two cooked sample textures directly: dark brick
 //! walls and a cobblestone floor. A single upright pane in the centre
-//! shows one material at a time over a muted contrast target, so blend
-//! modes are readable without hiding the room.
+//! shows one material at a time against the actual room.
 
 #![no_std]
 #![no_main]
@@ -54,8 +53,6 @@ const FLOOR_X: i32 = 310;
 const FLOOR_FRONT_Z: i32 = 245;
 const WALL_Z: i32 = -46;
 const WALL_TOP: i32 = 166;
-const TARGET_SIZE: i32 = 164;
-const TARGET_Z: i32 = -12;
 const PANEL_SIZE: i32 = 124;
 const PANEL_BOTTOM: i32 = 20;
 const PANEL_Z: i32 = 0;
@@ -114,7 +111,6 @@ impl Scene for Showcase {
     fn render(&mut self, ctx: &mut Ctx) {
         let camera = camera_for(ctx.frame);
         draw_room(camera);
-        draw_material_target(camera);
         draw_material_pane(self, camera);
         if let Some(font) = self.font.as_ref() {
             self.draw_hud(font);
@@ -136,7 +132,7 @@ impl Showcase {
     const fn new() -> Self {
         Self {
             font: None,
-            sample_idx: SAMPLE_BRICK,
+            sample_idx: SAMPLE_FLOOR,
             blend_idx: 1,
         }
     }
@@ -318,48 +314,6 @@ fn draw_side_walls(camera: Camera) {
     );
 }
 
-fn draw_material_target(camera: Camera) {
-    let half = TARGET_SIZE / 2;
-    let mid_x = 0;
-    let mid_y = PANEL_BOTTOM + PANEL_SIZE / 2;
-    let x0 = -half;
-    let x1 = half;
-    let y0 = PANEL_BOTTOM - ((TARGET_SIZE - PANEL_SIZE) / 2);
-    let y1 = y0 + TARGET_SIZE;
-    draw_target_rect(camera, x0, mid_x, mid_y, y1, (48, 54, 66));
-    draw_target_rect(camera, mid_x, x1, mid_y, y1, (154, 142, 112));
-    draw_target_rect(camera, x0, mid_x, y0, mid_y, (34, 38, 46));
-    draw_target_rect(camera, mid_x, x1, y0, mid_y, (112, 118, 116));
-    draw_target_rect(camera, x0, x1, mid_y - 4, mid_y + 4, (184, 178, 156));
-}
-
-fn draw_target_rect(camera: Camera, x0: i32, x1: i32, y0: i32, y1: i32, color: (u8, u8, u8)) {
-    draw_world_flat(
-        camera,
-        Vec3 {
-            x: x0,
-            y: y1,
-            z: TARGET_Z,
-        },
-        Vec3 {
-            x: x1,
-            y: y1,
-            z: TARGET_Z,
-        },
-        Vec3 {
-            x: x0,
-            y: y0,
-            z: TARGET_Z,
-        },
-        Vec3 {
-            x: x1,
-            y: y0,
-            z: TARGET_Z,
-        },
-        color,
-    );
-}
-
 fn draw_wall_tile(
     camera: Camera,
     x0: i32,
@@ -448,12 +402,6 @@ fn draw_world_textured(
 ) {
     if let Some(verts) = project_quad(camera, [a, b, c, d]) {
         gpu::draw_quad_textured_material(verts, texture_uvs(base_u), material);
-    }
-}
-
-fn draw_world_flat(camera: Camera, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: (u8, u8, u8)) {
-    if let Some(verts) = project_quad(camera, [a, b, c, d]) {
-        gpu::draw_quad_flat(verts, color.0, color.1, color.2);
     }
 }
 

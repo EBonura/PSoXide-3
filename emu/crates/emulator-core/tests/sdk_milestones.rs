@@ -410,8 +410,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-textured-sprite" => Some(SdkGolden {
             example: "showcase-textured-sprite",
             vblanks: 3,
-            vram_hash: 0x8399_4e6e_f396_b478,
-            display_hash: 0x4498_6640_95b8_80f7,
+            vram_hash: 0x051c_f7b5_4170_5ba8,
+            display_hash: 0xcfa0_b955_e477_002c,
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
@@ -419,9 +419,9 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             // single upright material pane. D-pad swaps the texture
             // sample and blend mode while the HUD names the active
             // material. Dark textured walls and a cobblestone floor
-            // frame a muted contrast target, so transparency remains
-            // legible while the room still uses the sample textures.
-            final_pc: 0x8001_4b2c,
+            // keep transparency legible against the actual room
+            // surfaces, without an artificial backing card.
+            final_pc: 0x8001_1504,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:
