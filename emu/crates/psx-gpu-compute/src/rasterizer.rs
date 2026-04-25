@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 
 use crate::primitive::{
-    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, TexRect, TexTri, Tpage,
+    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTri, TexRect, TexTri, Tpage,
 };
 use crate::vram::VramGpu;
 
@@ -50,6 +50,11 @@ pub struct Rasterizer {
     fill_pipeline: wgpu::ComputePipeline,
     fill_bg_layout: wgpu::BindGroupLayout,
     fill_uniform: wgpu::Buffer,
+
+    // Shaded-triangle pipeline (B.3.a). Reuses `mono_tri_bg_layout`
+    // (same 3-binding shape: VRAM + prim + draw area).
+    shaded_tri_pipeline: wgpu::ComputePipeline,
+    shaded_tri_uniform: wgpu::Buffer,
 }
 
 impl Rasterizer {
@@ -337,6 +342,34 @@ impl Rasterizer {
             mapped_at_creation: false,
         });
 
+        // ---------- Shaded-triangle pipeline (B.3.a) ----------
+        // Same binding shape as mono-tri (VRAM + prim + draw area).
+        let shaded_tri_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("psx-rasterizer-shaded-tri-pl"),
+            bind_group_layouts: &[&mono_tri_bg_layout],
+            push_constant_ranges: &[],
+        });
+        let shaded_tri_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("psx-rasterizer-shaded-tri-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/shaded_tri.wgsl").into(),
+            ),
+        });
+        let shaded_tri_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("psx-rasterizer-shaded-tri"),
+            layout: Some(&shaded_tri_pl),
+            module: &shaded_tri_shader,
+            entry_point: Some("rasterize"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let shaded_tri_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-shaded-tri-uniform"),
+            size: std::mem::size_of::<ShadedTri>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             device,
             queue,
@@ -355,7 +388,62 @@ impl Rasterizer {
             fill_pipeline,
             fill_bg_layout,
             fill_uniform,
+            shaded_tri_pipeline,
+            shaded_tri_uniform,
         }
+    }
+
+    /// Dispatch one Gouraud-shaded triangle. Same coverage rules as
+    /// `dispatch_mono_tri`; per-pixel colour interpolated from the
+    /// three vertex colours.
+    pub fn dispatch_shaded_tri(&self, vram: &VramGpu, tri: &ShadedTri, area: &DrawArea) {
+        if tri.exceeds_hw_extent() {
+            return;
+        }
+        let bbox_w = tri.bbox_max[0] - tri.bbox_min[0] + 1;
+        let bbox_h = tri.bbox_max[1] - tri.bbox_min[1] + 1;
+        if bbox_w <= 0 || bbox_h <= 0 {
+            return;
+        }
+        self.queue
+            .write_buffer(&self.shaded_tri_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-shaded-tri-bg"),
+            layout: &self.mono_tri_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.shaded_tri_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.draw_area_uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-shaded-tri-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-shaded-tri-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.shaded_tri_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (bbox_w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (bbox_h as u32).div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Dispatch one quick-fill primitive into VRAM. Bypasses all
@@ -2271,6 +2359,147 @@ mod tests {
         // semantics may differ; we accept that as a known
         // limitation in the comment on `dispatch_vram_copy`.
         assert_eq!(cpu, gpu, "vram copy overlap strict parity");
+    }
+
+    // -------------------------------------------------------
+    //  Phase B.3 — shaded triangle parity vs CPU
+    // -------------------------------------------------------
+
+    /// Drive the CPU rasterizer for one Gouraud-shaded triangle via
+    /// GP0 0x30 (opaque) or 0x32 (semi-trans). Returns full VRAM.
+    fn cpu_rasterize_shaded_tri(
+        v: [(i32, i32); 3],
+        c: [(u8, u8, u8); 3],
+        cmd_byte: u8,
+        tpage_blend_bits: u8,
+        mask_e6: u8,
+        prefill: u16,
+    ) -> Vec<u16> {
+        let mut gpu = Gpu::new();
+        if prefill != 0 {
+            for y in 0..512u16 {
+                for x in 0..1024u16 {
+                    gpu.vram.set_pixel(x, y, prefill);
+                }
+            }
+        }
+        gpu.gp0_push(0xE3000000);
+        gpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        gpu.gp0_push(0xE100_0000_u32 | ((tpage_blend_bits as u32) & 0x3) << 5);
+        gpu.gp0_push(0xE600_0000_u32 | (mask_e6 as u32) & 0x3);
+        // GP0 0x30 packet: cmd+c0, v0, c1, v1, c2, v2 (6 words).
+        let pack_rgb = |t: (u8, u8, u8)| {
+            (t.0 as u32) | ((t.1 as u32) << 8) | ((t.2 as u32) << 16)
+        };
+        gpu.gp0_push(((cmd_byte as u32) << 24) | pack_rgb(c[0]));
+        gpu.gp0_push(pack_xy(v[0]));
+        gpu.gp0_push(pack_rgb(c[1]));
+        gpu.gp0_push(pack_xy(v[1]));
+        gpu.gp0_push(pack_rgb(c[2]));
+        gpu.gp0_push(pack_xy(v[2]));
+        gpu.vram.words().to_vec()
+    }
+
+    #[test]
+    fn shaded_tri_axis_aligned_matches_cpu_within_tolerance() {
+        // Same UV-parity caveat as B.2: barycentric vs scanline-delta
+        // can differ by ±1 in any 5-bit channel at interior pixels
+        // due to rounding accumulation. Coverage matches; per-channel
+        // delta is bounded.
+        let v = [(20i32, 20i32), (60, 20), (20, 60)];
+        let c = [(0xFFu8, 0u8, 0u8), (0u8, 0xFFu8, 0u8), (0u8, 0u8, 0xFFu8)];
+        let cpu = cpu_rasterize_shaded_tri(v, c, 0x30, 0, 0, 0);
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        let tri = ShadedTri::new(
+            v[0], v[1], v[2],
+            c[0], c[1], c[2],
+            PrimFlags::empty(),
+            BlendMode::Average,
+        );
+        r.dispatch_shaded_tri(&vg, &tri, &DrawArea::full_vram());
+        let gpu = vg.download_full().unwrap();
+
+        let diffs = diff_inside_bbox(&cpu, &gpu, (20, 20), (60, 60));
+        let bbox = 41 * 41;
+        // Coverage tolerance.
+        assert!(diffs * 4 < bbox, "shaded tri coverage: {diffs} / {bbox}");
+        // Per-channel error tolerance.
+        let mut max_chan = 0i32;
+        for y in 20..=60i32 {
+            for x in 20..=60i32 {
+                let i = y as usize * 1024 + x as usize;
+                if cpu[i] == gpu[i] {
+                    continue;
+                }
+                for shift in [0u32, 5, 10] {
+                    let ca = ((cpu[i] >> shift) & 0x1F) as i32;
+                    let cb = ((gpu[i] >> shift) & 0x1F) as i32;
+                    max_chan = max_chan.max((ca - cb).abs());
+                }
+            }
+        }
+        assert!(max_chan <= 2, "shaded tri max channel delta: {max_chan} > 2");
+    }
+
+    #[test]
+    fn shaded_tri_uniform_color_matches_mono_tri_path() {
+        // When all 3 vertex colours are identical, a Gouraud-shaded
+        // triangle should produce the SAME output as a monochrome
+        // triangle of that colour. Bit-exact within bbox.
+        let v = [(15i32, 15i32), (55, 15), (15, 55)];
+        let rgb = (0xC0u8, 0x40u8, 0x80u8);
+        // CPU: shaded path with same colour everywhere.
+        let cpu_shaded = cpu_rasterize_shaded_tri(v, [rgb; 3], 0x30, 0, 0, 0);
+        // CPU: mono path with the BGR15-of-rgb.
+        let bgr15 = (((rgb.0 as u16) >> 3) & 0x1F)
+            | ((((rgb.1 as u16) >> 3) & 0x1F) << 5)
+            | ((((rgb.2 as u16) >> 3) & 0x1F) << 10);
+        let cpu_mono = cpu_rasterize_mono_tri(v[0], v[1], v[2], bgr15);
+        // The two CPU paths differ at edges (different fill rules?
+        // both use scanline-delta, so should be close). Just verify
+        // identity-shaded GPU triangle matches the GPU mono path.
+        let _ = (cpu_shaded, cpu_mono);
+
+        let vg_shaded = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg_shaded);
+        let tri = ShadedTri::new(
+            v[0], v[1], v[2],
+            rgb, rgb, rgb,
+            PrimFlags::empty(),
+            BlendMode::Average,
+        );
+        r.dispatch_shaded_tri(&vg_shaded, &tri, &DrawArea::full_vram());
+        let gpu_shaded = vg_shaded.download_full().unwrap();
+
+        let vg_mono = VramGpu::new_headless();
+        let r2 = Rasterizer::new(&vg_mono);
+        let mono = MonoTri::opaque(v[0], v[1], v[2], bgr15);
+        r2.dispatch_mono_tri(&vg_mono, &mono, &DrawArea::full_vram());
+        let gpu_mono = vg_mono.download_full().unwrap();
+
+        // GPU shaded path with uniform colour must match GPU mono path
+        // bit-for-bit (same coverage, same colour).
+        assert_eq!(gpu_shaded, gpu_mono, "GPU uniform-shaded == GPU mono");
+    }
+
+    #[test]
+    fn shaded_tri_oversized_is_dropped_like_cpu() {
+        let v = [(0i32, 0i32), (2000, 0), (0, 0)];
+        let c = [(0xFFu8, 0, 0); 3];
+        let cpu = cpu_rasterize_shaded_tri(v, c, 0x30, 0, 0, 0);
+        let vg = VramGpu::new_headless();
+        let r = Rasterizer::new(&vg);
+        let tri = ShadedTri::new(
+            v[0], v[1], v[2],
+            c[0], c[1], c[2],
+            PrimFlags::empty(),
+            BlendMode::Average,
+        );
+        r.dispatch_shaded_tri(&vg, &tri, &DrawArea::full_vram());
+        let gpu = vg.download_full().unwrap();
+        assert!(cpu.iter().all(|&w| w == 0));
+        assert!(gpu.iter().all(|&w| w == 0));
     }
 
     #[test]

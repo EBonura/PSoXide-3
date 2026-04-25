@@ -84,6 +84,11 @@ bitflags::bitflags! {
         const FLIP_X = 1 << 4;
         /// Texture-rect Y flip (GP0 0xE1 bit 13).
         const FLIP_Y = 1 << 5;
+        /// Apply 4×4 Bayer dither (GP0 0xE1 bit 9). Used by shaded
+        /// + textured-shaded primitives. Per-channel rule:
+        ///   `if rc < 0x1F && (r & 7) > coeff: rc += 1`
+        /// where `coeff = DITHER_COEFFS[(y&3)*4 + (x&3)]`.
+        const DITHER = 1 << 6;
     }
 }
 
@@ -399,6 +404,72 @@ impl TexRect {
     }
 }
 
+/// Gouraud-shaded flat triangle (`GP0 0x30..=0x33`). Three vertices,
+/// each with its own 24-bit RGB colour. The fragment colour is
+/// barycentrically interpolated across the triangle. Same RMW
+/// semantics as `MonoTri`.
+///
+/// Optional dither (when the active tpage has the dither bit set)
+/// is signalled via `PrimFlags::DITHER` and applied in the shader.
+///
+/// WGSL counterpart in `shaders/shaded_tri.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct ShadedTri {
+    pub v0: [i32; 2],
+    pub v1: [i32; 2],
+    pub v2: [i32; 2],
+    pub bbox_min: [i32; 2],
+    pub bbox_max: [i32; 2],
+    /// `R | (G << 8) | (B << 16)` per vertex.
+    pub c0: u32,
+    pub c1: u32,
+    pub c2: u32,
+    pub flags: u32,
+    pub _pad: [u32; 2],
+}
+
+impl ShadedTri {
+    pub fn new(
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        c0_rgb: (u8, u8, u8),
+        c1_rgb: (u8, u8, u8),
+        c2_rgb: (u8, u8, u8),
+        flags: PrimFlags,
+        blend_mode: BlendMode,
+    ) -> Self {
+        let min_x = v0.0.min(v1.0).min(v2.0);
+        let min_y = v0.1.min(v1.1).min(v2.1);
+        let max_x = v0.0.max(v1.0).max(v2.0);
+        let max_y = v0.1.max(v1.1).max(v2.1);
+        let pack_rgb =
+            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        Self {
+            v0: [v0.0, v0.1],
+            v1: [v1.0, v1.1],
+            v2: [v2.0, v2.1],
+            bbox_min: [min_x, min_y],
+            bbox_max: [max_x, max_y],
+            c0: pack_rgb(c0_rgb.0, c0_rgb.1, c0_rgb.2),
+            c1: pack_rgb(c1_rgb.0, c1_rgb.1, c1_rgb.2),
+            c2: pack_rgb(c2_rgb.0, c2_rgb.1, c2_rgb.2),
+            flags: pack_flags(flags, blend_mode),
+            _pad: [0; 2],
+        }
+    }
+
+    pub fn exceeds_hw_extent(&self) -> bool {
+        const MAX_DX: i32 = 1023;
+        const MAX_DY: i32 = 511;
+        let edges = [(self.v0, self.v1), (self.v1, self.v2), (self.v2, self.v0)];
+        edges
+            .iter()
+            .any(|(a, b)| (a[0] - b[0]).abs() > MAX_DX || (a[1] - b[1]).abs() > MAX_DY)
+    }
+}
+
 /// Quick fill (`GP0 0x02`). Writes a single 15bpp colour into a
 /// rectangle, ignoring drawing-area, drawing-offset, mask-check,
 /// mask-set, and semi-trans. The hardware clamps `x`/`w` to 16-pixel
@@ -508,6 +579,12 @@ mod tests {
     fn fill_struct_pinned_at_32() {
         assert_eq!(std::mem::size_of::<Fill>(), 32);
         assert_eq!(std::mem::size_of::<Fill>() % 16, 0);
+    }
+
+    #[test]
+    fn shaded_tri_struct_pinned_at_64() {
+        assert_eq!(std::mem::size_of::<ShadedTri>(), 64);
+        assert_eq!(std::mem::size_of::<ShadedTri>() % 16, 0);
     }
 
     #[test]
