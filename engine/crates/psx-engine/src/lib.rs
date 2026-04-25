@@ -58,7 +58,7 @@ pub mod transform;
 pub use angle::Angle;
 pub use app::{App, Config};
 pub use frames::{Frames, Ticks};
-pub use render::{DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
+pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
 pub use scene::{Ctx, Scene};
 pub use transform::{ActorTransform, Vec3World};
 

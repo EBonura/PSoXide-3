@@ -32,7 +32,10 @@
 extern crate psx_rt;
 
 use psx_asset::Mesh;
-use psx_engine::{ActorTransform, App, Config, Ctx, Scene, Vec3World};
+use psx_engine::{
+    ActorTransform, App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena, Scene,
+    Vec3World,
+};
 use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_fx::{LcgRng, ParticlePool, ShakeState};
 use psx_gpu::ot::OrderingTable;
@@ -54,7 +57,12 @@ static TEAPOT_BLOB: &[u8] = include_bytes!("../assets/teapot.psxm");
 
 const SCREEN_W: i16 = 320;
 const SCREEN_H: i16 = 240;
-const OT_DEPTH: usize = 8;
+const OT_DEPTH: usize = 16;
+const BG_SLOT: usize = OT_DEPTH - 1;
+const STAR_SLOT: usize = OT_DEPTH - 2;
+const WORLD_BAND: DepthBand = DepthBand::new(3, OT_DEPTH - 3);
+const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(0x1800, 0x7800);
+const SPARK_SLOT: usize = 2;
 
 /// GTE focal length (H register).
 const PROJ_H: u16 = 280;
@@ -267,7 +275,6 @@ impl Scene for Showcase3D {
         self.sparks.update(1);
 
         self.build_frame_ot(ctx.frame);
-        unsafe { OT.submit() };
         let font = self.font.as_ref().expect("font uploaded in init");
         self.draw_hud(font, ctx.frame);
     }
@@ -299,26 +306,27 @@ impl Showcase3D {
     }
 
     fn build_frame_ot(&mut self, frame: u32) {
-        let ot = unsafe { &mut OT };
-        let rects = unsafe { &mut SCENE_RECTS };
-        let gouraud = unsafe { &mut GOURAUD_TRIS };
-        let bg = unsafe { &mut BG_QUAD };
-        ot.clear();
+        let mut ot = unsafe { OtFrame::begin(&mut OT) };
+        let mut rects = unsafe { PrimitiveArena::new(&mut SCENE_RECTS) };
+        let mut gouraud = unsafe { PrimitiveArena::new(&mut GOURAUD_TRIS) };
+        let mut backgrounds = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut BG_QUAD)) };
 
         let (shake_dx, shake_dy) = self.shake.tick();
 
-        // Slot 7 (back) — deep-space gradient.
-        *bg = QuadGouraud::new(
+        // Backmost slot — deep-space gradient.
+        let Some(bg) = backgrounds.push(QuadGouraud::new(
             [(0, 0), (SCREEN_W, 0), (0, SCREEN_H), (SCREEN_W, SCREEN_H)],
             [(10, 6, 32), (10, 6, 32), (2, 1, 8), (2, 1, 8)],
-        );
-        ot.add(7, bg, QuadGouraud::WORDS);
+        )) else {
+            return;
+        };
+        ot.add_packet(BG_SLOT, bg);
 
-        // Slot 6 — starfield with a slow whole-scene roll for parallax.
+        // Behind world geometry — starfield with a slow whole-scene
+        // roll for parallax.
         let scene_roll = Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16);
         scene::load_rotation(&scene_roll);
         scene::load_translation(Vec3I32::new(0, 0, 0));
-        let mut rect_idx = 0;
         for i in 0..STAR_COUNT {
             let sv = unsafe { STARS[i] };
             let p = scene::project_vertex(sv);
@@ -332,10 +340,7 @@ impl Showcase3D {
             } else {
                 240
             };
-            if rect_idx >= rects.len() {
-                break;
-            }
-            rects[rect_idx] = RectFlat::new(
+            let Some(rect) = rects.push(RectFlat::new(
                 p.sx + shake_dx,
                 p.sy + shake_dy,
                 1,
@@ -343,15 +348,15 @@ impl Showcase3D {
                 brightness,
                 brightness,
                 brightness,
-            );
-            ot.add(6, &mut rects[rect_idx], RectFlat::WORDS);
-            rect_idx += 1;
+            )) else {
+                break;
+            };
+            ot.add_packet(STAR_SLOT, rect);
         }
 
         // Pre-project both meshes' vertices once, then walk triangle
         // lists. Topologically both meshes share verts heavily — this
         // avoids 4-6× repeated GTE loads per vertex.
-        let mut tri_idx = 0;
 
         // Parse both meshes at frame-start. Parsing is effectively
         // free (zero-copy, just bounds-checks + slice arithmetic on
@@ -398,9 +403,6 @@ impl Showcase3D {
             suz_proj[i as usize] = (p.sx + shake_dx, p.sy + shake_dy, p.sz, p.r, p.g, p.b);
         }
         for face_idx in 0..suzanne.face_count() {
-            if tri_idx >= gouraud.len() {
-                break;
-            }
             let (ia, ib, ic) = suzanne.face(face_idx);
             let (v0, v1, v2) = (
                 suz_proj[ia as usize],
@@ -410,12 +412,14 @@ impl Showcase3D {
             if back_facing(v0, v1, v2) {
                 continue;
             }
-            gouraud[tri_idx] = TriGouraud::new(
+            let Some(tri) = gouraud.push(TriGouraud::new(
                 [(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)],
                 [(v0.3, v0.4, v0.5), (v1.3, v1.4, v1.5), (v2.3, v2.4, v2.5)],
-            );
-            ot.add(5, &mut gouraud[tri_idx], TriGouraud::WORDS);
-            tri_idx += 1;
+            )) else {
+                break;
+            };
+            let slot = WORLD_BAND.slot::<OT_DEPTH>(WORLD_DEPTH_RANGE, face_depth(v0, v1, v2));
+            ot.add_packet_slot(slot, tri);
             self.tri_count += 1;
         }
 
@@ -437,9 +441,6 @@ impl Showcase3D {
             tea_proj[i as usize] = (p.sx + shake_dx, p.sy + shake_dy, p.sz, p.r, p.g, p.b);
         }
         for face_idx in 0..teapot.face_count() {
-            if tri_idx >= gouraud.len() {
-                break;
-            }
             let (ia, ib, ic) = teapot.face(face_idx);
             let (v0, v1, v2) = (
                 tea_proj[ia as usize],
@@ -449,23 +450,27 @@ impl Showcase3D {
             if back_facing(v0, v1, v2) {
                 continue;
             }
-            gouraud[tri_idx] = TriGouraud::new(
+            let Some(tri) = gouraud.push(TriGouraud::new(
                 [(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)],
                 [(v0.3, v0.4, v0.5), (v1.3, v1.4, v1.5), (v2.3, v2.4, v2.5)],
-            );
-            ot.add(4, &mut gouraud[tri_idx], TriGouraud::WORDS);
-            tri_idx += 1;
+            )) else {
+                break;
+            };
+            let slot = WORLD_BAND.slot::<OT_DEPTH>(WORLD_DEPTH_RANGE, face_depth(v0, v1, v2));
+            ot.add_packet_slot(slot, tri);
             self.tri_count += 1;
         }
 
-        // Slot 3 — sparks (in front of meshes).
-        let spark_budget = rects.len().saturating_sub(rect_idx);
-        let _ = self.sparks.render_into_ot(
-            ot,
-            &mut rects[rect_idx..rect_idx + spark_budget],
-            3,
+        // Foreground effects — sparks in front of the meshes.
+        let _ = render_particles(
+            &self.sparks,
+            &mut rects,
+            &mut ot,
+            SPARK_SLOT,
             (shake_dx, shake_dy),
         );
+
+        ot.submit();
     }
 
     fn draw_hud(&self, font: &FontAtlas, frame: u32) {
@@ -560,6 +565,46 @@ fn back_facing(v0: VertProj, v1: VertProj, v2: VertProj) -> bool {
     let bx = (v2.0 as i32) - (v0.0 as i32);
     let by = (v2.1 as i32) - (v0.1 as i32);
     (ax * by - ay * bx) <= 0
+}
+
+fn face_depth(v0: VertProj, v1: VertProj, v2: VertProj) -> i32 {
+    ((v0.2 as i32) + (v1.2 as i32) + (v2.2 as i32)) / 3
+}
+
+fn render_particles<const N: usize, const OT_N: usize>(
+    particles: &ParticlePool<N>,
+    rects: &mut PrimitiveArena<'_, RectFlat>,
+    ot: &mut OtFrame<'_, OT_N>,
+    slot: usize,
+    shake: (i16, i16),
+) -> usize {
+    let mut written = 0;
+    for p in particles.particles() {
+        if !p.alive() {
+            continue;
+        }
+
+        let denom = p.spawn_ttl.max(1) as u16;
+        let scale = p.ttl as u16;
+        let r = ((p.r as u16 * scale) / denom) as u8;
+        let g = ((p.g as u16 * scale) / denom) as u8;
+        let b = ((p.b as u16 * scale) / denom) as u8;
+        let size = if (p.ttl as u16) * 2 > denom { 3 } else { 2 };
+        let Some(rect) = rects.push(RectFlat::new(
+            p.x + shake.0,
+            p.y + shake.1,
+            size,
+            size,
+            r,
+            g,
+            b,
+        )) else {
+            break;
+        };
+        ot.add_packet(slot, rect);
+        written += 1;
+    }
+    written
 }
 
 /// Sample a per-vertex material colour for a lit-mesh vertex.

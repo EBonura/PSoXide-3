@@ -105,17 +105,70 @@ impl DepthRange {
 
     /// Map `depth` into an OT slot for a table with `DEPTH` slots.
     pub fn slot<const DEPTH: usize>(self, depth: i32) -> DepthSlot {
-        if DEPTH <= 1 || self.far <= self.near || depth <= self.near {
+        DepthBand::whole().slot::<DEPTH>(self, depth)
+    }
+}
+
+/// Inclusive subset of an ordering table reserved for one render layer.
+///
+/// Engines often reserve the farthest slot for backgrounds and the
+/// nearest slots for overlays/effects. A band lets a scene map
+/// camera-space depth into only the slots allocated to world
+/// geometry, keeping those layers from fighting each other.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DepthBand {
+    front: usize,
+    back: usize,
+}
+
+impl DepthBand {
+    /// Build an inclusive OT slot band.
+    ///
+    /// `front` is the nearest slot in the band; `back` is the
+    /// farthest. Values are clamped by [`slot`](Self::slot) against
+    /// the actual ordering-table depth.
+    pub const fn new(front: usize, back: usize) -> Self {
+        Self { front, back }
+    }
+
+    /// The whole ordering table.
+    pub const fn whole() -> Self {
+        Self {
+            front: 0,
+            back: usize::MAX,
+        }
+    }
+
+    /// Nearest slot requested by this band.
+    pub const fn front(self) -> usize {
+        self.front
+    }
+
+    /// Farthest slot requested by this band.
+    pub const fn back(self) -> usize {
+        self.back
+    }
+
+    /// Map `depth` through `range` into this inclusive band.
+    pub fn slot<const DEPTH: usize>(self, range: DepthRange, depth: i32) -> DepthSlot {
+        if DEPTH == 0 {
             return DepthSlot::new(0);
         }
-        if depth >= self.far {
-            return DepthSlot::new(DEPTH - 1);
+
+        let max_slot = DEPTH - 1;
+        let front = self.front.min(max_slot);
+        let back = self.back.min(max_slot);
+        if back <= front || range.far <= range.near || depth <= range.near {
+            return DepthSlot::new(front);
+        }
+        if depth >= range.far {
+            return DepthSlot::new(back);
         }
 
-        let span = (self.far - self.near) as i64;
-        let offset = (depth - self.near) as i64;
-        let max_slot = (DEPTH - 1) as i64;
-        DepthSlot::new(((offset * max_slot) / span) as usize)
+        let span = (range.far - range.near) as i64;
+        let offset = (depth - range.near) as i64;
+        let band_slots = (back - front) as i64;
+        DepthSlot::new(front + ((offset * band_slots) / span) as usize)
     }
 }
 
@@ -250,6 +303,26 @@ mod tests {
         assert_eq!(range.slot::<8>(899).index(), 6);
         assert_eq!(range.slot::<8>(900).index(), 7);
         assert_eq!(range.slot::<8>(1200).index(), 7);
+    }
+
+    #[test]
+    fn depth_band_reserves_front_and_back_slots() {
+        let range = DepthRange::new(0, 4000);
+        let band = DepthBand::new(2, 5);
+        assert_eq!(band.slot::<8>(range, -100).index(), 2);
+        assert_eq!(band.slot::<8>(range, 0).index(), 2);
+        assert_eq!(band.slot::<8>(range, 2000).index(), 3);
+        assert_eq!(band.slot::<8>(range, 3999).index(), 4);
+        assert_eq!(band.slot::<8>(range, 4000).index(), 5);
+        assert_eq!(band.slot::<8>(range, 9000).index(), 5);
+    }
+
+    #[test]
+    fn depth_band_clamps_to_table_depth() {
+        let range = DepthRange::new(0, 100);
+        let band = DepthBand::new(6, 99);
+        assert_eq!(band.slot::<8>(range, 0).index(), 6);
+        assert_eq!(band.slot::<8>(range, 100).index(), 7);
     }
 
     #[test]

@@ -54,7 +54,7 @@
 extern crate psx_rt;
 
 use psx_asset::Texture;
-use psx_engine::{App, Config, Ctx, Scene};
+use psx_engine::{App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena, Scene};
 use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, TriTexturedGouraud};
@@ -77,6 +77,8 @@ const PROJ_H: u16 = 280;
 /// range so 32 slots is more than enough to avoid far-ring
 /// triangles overlapping near-ring ones.
 const OT_DEPTH: usize = 32;
+const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 2);
+const GTE_OTZ_RANGE: DepthRange = DepthRange::new(0, ((OT_DEPTH - 2) as i32) << 10);
 
 // ----------------------------------------------------------------------
 // Corridor geometry
@@ -408,7 +410,6 @@ impl Scene for Corridor {
 
     fn render(&mut self, ctx: &mut Ctx) {
         self.build_frame_ot();
-        submit_frame_ot();
         let font = self.font.as_ref().expect("font uploaded in init");
         self.draw_hud(font, ctx.frame);
     }
@@ -425,32 +426,23 @@ fn update_ring_z(frame: u32) {
 }
 
 // ----------------------------------------------------------------------
-// OT build + submit
+// OT build
 // ----------------------------------------------------------------------
-
-#[inline]
-fn ot_slot(otz: u16) -> usize {
-    let slot = (otz as usize) >> 10;
-    if slot >= OT_DEPTH - 1 {
-        OT_DEPTH - 2
-    } else {
-        slot
-    }
-}
 
 impl Corridor {
     fn build_frame_ot(&mut self) {
-        let ot = unsafe { &mut OT };
-        let tris = unsafe { &mut TRIS };
-        let bg = unsafe { &mut BG_QUAD };
-        ot.clear();
+        let mut ot = unsafe { OtFrame::begin(&mut OT) };
+        let mut tris = unsafe { PrimitiveArena::new(&mut TRIS) };
+        let mut backgrounds = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut BG_QUAD)) };
 
         // --- Background — solid fog-colour quad behind everything. ---
-        *bg = QuadGouraud::new(
+        let Some(bg) = backgrounds.push(QuadGouraud::new(
             [(0, 0), (SCREEN_W, 0), (0, SCREEN_H), (SCREEN_W, SCREEN_H)],
             [FOG_CLEAR, FOG_CLEAR, FOG_CLEAR, FOG_CLEAR],
-        );
-        ot.add(OT_DEPTH - 1, bg, QuadGouraud::WORDS);
+        )) else {
+            return;
+        };
+        ot.add_packet(OT_DEPTH - 1, bg);
 
         // --- Scene setup for this frame ---
         // Static light rig — no orbit, no directional lighting. Just
@@ -471,7 +463,6 @@ impl Corridor {
         const MAT: (u8, u8, u8) = (0x80, 0x80, 0x80);
 
         let rings = unsafe { &RING_Z };
-        let mut tri_idx = 0;
         for ring in 0..NUM_RINGS - 1 {
             let z_near = rings[ring];
             let z_far = rings[ring + 1];
@@ -512,11 +503,8 @@ impl Corridor {
                         self.culled_count = self.culled_count.wrapping_add(1);
                         continue;
                     }
-                    if tri_idx >= tris.len() {
-                        break;
-                    }
                     let v = ft.verts;
-                    tris[tri_idx] = TriTexturedGouraud::new(
+                    let Some(tri) = tris.push(TriTexturedGouraud::new(
                         [(v[0].sx, v[0].sy), (v[1].sx, v[1].sy), (v[2].sx, v[2].sy)],
                         *uvs,
                         [
@@ -526,18 +514,18 @@ impl Corridor {
                         ],
                         clut_word,
                         tpage_word,
-                    );
+                    )) else {
+                        break;
+                    };
 
-                    ot.add(
-                        ot_slot(ft.otz),
-                        &mut tris[tri_idx],
-                        TriTexturedGouraud::WORDS,
-                    );
-                    tri_idx += 1;
+                    let slot = WORLD_BAND.slot::<OT_DEPTH>(GTE_OTZ_RANGE, ft.otz as i32);
+                    ot.add_packet_slot(slot, tri);
                     self.tri_count = self.tri_count.wrapping_add(1);
                 }
             }
         }
+
+        ot.submit();
     }
 
     fn draw_hud(&self, font: &FontAtlas, frame: u32) {
@@ -566,10 +554,6 @@ impl Corridor {
         let cull = u16_hex(self.culled_count);
         font.draw_text(SCREEN_W - 56, SCREEN_H - 20, cull.as_str(), (240, 160, 200));
     }
-}
-
-fn submit_frame_ot() {
-    unsafe { &OT }.submit();
 }
 
 // ----------------------------------------------------------------------

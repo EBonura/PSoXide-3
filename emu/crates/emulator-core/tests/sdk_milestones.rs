@@ -349,12 +349,12 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-tri" => Some(SdkGolden {
             example: "hello-tri",
             vblanks: 2,
-            vram_hash: 0xb872_c8b3_8b8e_f208,
-            display_hash: 0x1d9b_e70c_acb5_0241,
+            vram_hash: 0xe2b4_fca3_d005_dbc0,
+            display_hash: 0x29dd_3c79_8152_b324,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_0470,
+            final_pc: 0x8001_0480,
             redux_display_hash: None,
         }),
         // Two 4bpp CLUT textures cooked by `psxed tex` from 512×512
@@ -393,7 +393,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0b90,
+            final_pc: 0x8001_0bb4,
             redux_display_hash: None,
         }),
         "hello-gte" => Some(SdkGolden {
@@ -410,8 +410,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-textured-sprite" => Some(SdkGolden {
             example: "showcase-textured-sprite",
             vblanks: 3,
-            vram_hash: 0x058d_8dd1_155f_7871,
-            display_hash: 0xb56f_aae2_9dc3_c4ea,
+            vram_hash: 0x6f85_7a78_ea7a_f98b,
+            display_hash: 0x6b53_d7bb_40f7_f07a,
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
@@ -421,7 +421,10 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             // material. The room uses short textured side returns and
             // repeated floor tiles so the faster orbit stays readable
             // without artificial backing cards.
-            final_pc: 0x8001_2490,
+            // Migrated from immediate GP0 textured draws to OT-backed
+            // `QuadTextured` packets so the transparent material pane
+            // sorts against the textured room like real scene geometry.
+            final_pc: 0x8001_27a0,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:
@@ -431,8 +434,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-text" => Some(SdkGolden {
             example: "showcase-text",
             vblanks: 4,
-            vram_hash: 0x79ec_03dd_8745_96cb,
-            display_hash: 0x92bb_ba4e_4c01_3e05,
+            vram_hash: 0xb545_ba8f_6fc9_5f7b,
+            display_hash: 0x7f11_de8d_527d_f7c3,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
@@ -440,7 +443,9 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             // plumbing adds ~816 bytes of text-section code, so
             // `main`'s final `lw ra / jr ra` sits further on. VRAM
             // + display bytes-identical — port is pure plumbing.
-            final_pc: 0x8001_0e70,
+            // Refreshed after engine render-helper growth changed
+            // frame-boundary timing for this animation capture.
+            final_pc: 0x8001_0e9c,
             redux_display_hash: None,
         }),
         // hello-audio: SPU init + 4 voices configured + ADPCM
@@ -458,7 +463,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
-            final_pc: 0x8001_0ce8,
+            final_pc: 0x8001_0d0c,
             redux_display_hash: None,
         }),
         // First mini-game. At the 8-VBlank checkpoint the ball
@@ -481,7 +486,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 8,
             spu_samples: 5145,
-            final_pc: 0x8001_179c,
+            final_pc: 0x8001_17c8,
             redux_display_hash: None,
         }),
         // Second mini-game. 60 VBlanks captures one serve-arc +
@@ -507,7 +512,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_3938,
+            final_pc: 0x8001_3968,
             redux_display_hash: None,
         }),
         // Third mini-game. Space Invaders: 5×10 alien grid, ship
@@ -540,7 +545,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 120,
             spu_samples: 88200,
-            final_pc: 0x8001_5934,
+            final_pc: 0x8001_5964,
             redux_display_hash: None,
         }),
         // Flagship 3D showcase. Starfield + Suzanne (Blender
@@ -566,12 +571,14 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-lights" => Some(SdkGolden {
             example: "showcase-lights",
             vblanks: 60,
-            vram_hash: 0xb06b_834b_a396_2f7d,
-            display_hash: 0xc3d9_1f9e_0ae3_ede5,
+            vram_hash: 0xe8e0_4b58_fa66_d538,
+            display_hash: 0x4fb6_ca27_0f7f_b8c0,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_115c,
+            // Engine OT pass now uses `PrimitiveArena` and a shared
+            // depth band for per-face cube sorting.
+            final_pc: 0x8001_186c,
             redux_display_hash: None,
         }),
 
@@ -585,12 +592,14 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-3d" => Some(SdkGolden {
             example: "showcase-3d",
             vblanks: 60,
-            vram_hash: 0x6f9a_6ec0_72a5_129a,
-            display_hash: 0xd1e7_7e34_3ba8_f301,
+            vram_hash: 0x0d33_3808_2273_ef32,
+            display_hash: 0xc9eb_398e_44ff_274a,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_4d38,
+            // Suzanne and teapot now share an engine depth band using
+            // per-face projected SZ instead of fixed object slots.
+            final_pc: 0x8001_50b8,
             redux_display_hash: None,
         }),
         // PS1-commercial textured-Gouraud pipeline: per-vertex RTPS
@@ -613,7 +622,22 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_1418,
+            // Pixels unchanged; render loop now uses `OtFrame`,
+            // `PrimitiveArena`, and `DepthBand` for the GTE OTZ map.
+            final_pc: 0x8001_1780,
+            redux_display_hash: None,
+        }),
+        "showcase-particles" => Some(SdkGolden {
+            example: "showcase-particles",
+            vblanks: 60,
+            vram_hash: 0x8320_acb5_19ff_3047,
+            display_hash: 0xe183_25de_aac2_0540,
+            display_size: (320, 240),
+            vblank_raises: 60,
+            spu_samples: 44100,
+            // Standalone `psx-fx::ParticlePool` demo: fixed pool,
+            // OT-backed RectFlat arena, auto emitter, and HUD.
+            final_pc: 0x8001_0f94,
             redux_display_hash: None,
         }),
         // First engine-domain example. Exercises `App::run`'s
@@ -772,6 +796,14 @@ fn milestone_c_showcase_fog() {
     // forward motion. Covers per-vertex RTPS + NCDS, then NCLIP +
     // AVSZ3, feeding textured-Gouraud tris end-to-end.
     run_sdk_milestone("showcase-fog", 60);
+}
+
+#[test]
+#[ignore = "SDK milestone: showcase-particles roundtrip"]
+fn milestone_c_showcase_particles() {
+    // 60 VBlanks captures the fixed particle pool with the automatic
+    // emitter actively feeding the OT-backed RectFlat arena.
+    run_sdk_milestone("showcase-particles", 60);
 }
 
 #[test]
