@@ -48,9 +48,12 @@ const NEAR_Z: i32 = 48;
 const CAMERA_Y: i32 = 170;
 const ORBIT_RADIUS: i32 = 540;
 const CAMERA_PITCH_Q12: u16 = 4096 - 128;
+const CAMERA_START_YAW: u16 = 220;
+const CAMERA_ORBIT_PER_FRAME: u16 = 1;
 
 const FLOOR_X: i32 = 310;
 const FLOOR_FRONT_Z: i32 = 245;
+const SIDE_FRONT_Z: i32 = 150;
 const WALL_Z: i32 = -46;
 const WALL_TOP: i32 = 166;
 const PANEL_SIZE: i32 = 124;
@@ -61,6 +64,12 @@ const SAMPLE_BRICK: u8 = 0;
 const SAMPLE_FLOOR: u8 = 1;
 const SAMPLE_COUNT: u8 = 2;
 const BLEND_COUNT: u8 = 5;
+const FLOOR_X_EDGES: [i32; 6] = [-FLOOR_X, -186, -62, 62, 186, FLOOR_X];
+const FLOOR_Z_EDGES: [i32; 5] = [WALL_Z, 28, 100, 172, FLOOR_FRONT_Z];
+const WALL_X_EDGES: [i32; 6] = [-FLOOR_X, -186, -62, 62, 186, FLOOR_X];
+const WALL_Y_EDGES: [i32; 3] = [0, 83, WALL_TOP];
+const SIDE_Z_EDGES: [i32; 4] = [WALL_Z, 18, 84, SIDE_FRONT_Z];
+const SIDE_Y_EDGES: [i32; 3] = [0, 74, WALL_TOP - 18];
 
 #[derive(Copy, Clone)]
 struct Vec3 {
@@ -239,7 +248,7 @@ fn upload_blend_clut(rect: VramRect, bytes: &[u8]) {
 }
 
 fn camera_for(frame: u32) -> Camera {
-    let yaw = 220u16.wrapping_add((frame as u16) / 8);
+    let yaw = CAMERA_START_YAW.wrapping_add((frame as u16).wrapping_mul(CAMERA_ORBIT_PER_FRAME));
     let sx = sin_q12(yaw);
     let cz = cos_q12(yaw);
     Camera {
@@ -254,22 +263,29 @@ fn camera_for(frame: u32) -> Camera {
 }
 
 fn draw_room(camera: Camera) {
+    draw_floor(camera);
     draw_wall(camera);
     draw_side_walls(camera);
-    draw_floor(camera);
 }
 
 fn draw_floor(camera: Camera) {
-    let edge = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x42, 0x4a, 0x50));
-    let centre = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x88, 0x88, 0x90));
-    let front_edge = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x34, 0x3a, 0x3e));
-    let front_centre = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x72, 0x72, 0x78));
-    draw_floor_tile(camera, -FLOOR_X, -104, WALL_Z, 96, edge);
-    draw_floor_tile(camera, -104, 104, WALL_Z, 96, centre);
-    draw_floor_tile(camera, 104, FLOOR_X, WALL_Z, 96, edge);
-    draw_floor_tile(camera, -FLOOR_X, -104, 96, FLOOR_FRONT_Z, front_edge);
-    draw_floor_tile(camera, -104, 104, 96, FLOOR_FRONT_Z, front_centre);
-    draw_floor_tile(camera, 104, FLOOR_X, 96, FLOOR_FRONT_Z, front_edge);
+    let material = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x62, 0x66, 0x6c));
+    let mut zi = 0;
+    while zi + 1 < FLOOR_Z_EDGES.len() {
+        let mut xi = 0;
+        while xi + 1 < FLOOR_X_EDGES.len() {
+            draw_floor_tile(
+                camera,
+                FLOOR_X_EDGES[xi],
+                FLOOR_X_EDGES[xi + 1],
+                FLOOR_Z_EDGES[zi],
+                FLOOR_Z_EDGES[zi + 1],
+                material,
+            );
+            xi += 1;
+        }
+        zi += 1;
+    }
 }
 
 fn draw_floor_tile(camera: Camera, x0: i32, x1: i32, z0: i32, z1: i32, material: TextureMaterial) {
@@ -285,33 +301,55 @@ fn draw_floor_tile(camera: Camera, x0: i32, x1: i32, z0: i32, z1: i32, material:
 }
 
 fn draw_wall(camera: Camera) {
-    let edge = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x32, 0x32, 0x38));
-    let centre = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x68, 0x5c, 0x50));
-    draw_wall_tile(camera, -FLOOR_X, -104, 0, WALL_TOP, WALL_Z, edge);
-    draw_wall_tile(camera, -104, 104, 0, WALL_TOP, WALL_Z, centre);
-    draw_wall_tile(camera, 104, FLOOR_X, 0, WALL_TOP, WALL_Z, edge);
+    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x4c, 0x44, 0x40));
+    let mut yi = 0;
+    while yi + 1 < WALL_Y_EDGES.len() {
+        let mut xi = 0;
+        while xi + 1 < WALL_X_EDGES.len() {
+            draw_wall_tile(
+                camera,
+                WALL_X_EDGES[xi],
+                WALL_X_EDGES[xi + 1],
+                WALL_Y_EDGES[yi],
+                WALL_Y_EDGES[yi + 1],
+                WALL_Z,
+                material,
+            );
+            xi += 1;
+        }
+        yi += 1;
+    }
 }
 
 fn draw_side_walls(camera: Camera) {
     let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x28, 0x2c, 0x34));
-    draw_side_wall_tile(
-        camera,
-        -FLOOR_X,
-        WALL_Z,
-        FLOOR_FRONT_Z,
-        0,
-        WALL_TOP - 18,
-        material,
-    );
-    draw_side_wall_tile(
-        camera,
-        FLOOR_X,
-        WALL_Z,
-        FLOOR_FRONT_Z,
-        0,
-        WALL_TOP - 18,
-        material,
-    );
+    if camera.x >= 0 {
+        draw_side_wall(camera, -FLOOR_X, material);
+        draw_side_wall(camera, FLOOR_X, material);
+    } else {
+        draw_side_wall(camera, FLOOR_X, material);
+        draw_side_wall(camera, -FLOOR_X, material);
+    }
+}
+
+fn draw_side_wall(camera: Camera, x: i32, material: TextureMaterial) {
+    let mut yi = 0;
+    while yi + 1 < SIDE_Y_EDGES.len() {
+        let mut zi = 0;
+        while zi + 1 < SIDE_Z_EDGES.len() {
+            draw_side_wall_tile(
+                camera,
+                x,
+                SIDE_Z_EDGES[zi],
+                SIDE_Z_EDGES[zi + 1],
+                SIDE_Y_EDGES[yi],
+                SIDE_Y_EDGES[yi + 1],
+                material,
+            );
+            zi += 1;
+        }
+        yi += 1;
+    }
 }
 
 fn draw_wall_tile(
