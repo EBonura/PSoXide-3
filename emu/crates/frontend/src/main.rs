@@ -139,11 +139,7 @@ impl Default for Shell {
 }
 
 impl Shell {
-    fn new(
-        config_dir: Option<std::path::PathBuf>,
-        fullscreen: bool,
-        gpu_compute: bool,
-    ) -> Self {
+    fn new(config_dir: Option<std::path::PathBuf>, fullscreen: bool, gpu_compute: bool) -> Self {
         let audio = audio::AudioOut::open();
         if let Some(a) = audio.as_ref() {
             eprintln!("[audio] opened host stream @ {} Hz", a.host_sample_rate());
@@ -313,7 +309,7 @@ impl ApplicationHandler for Shell {
                 // so held buttons keep polling as "pressed". Auto-repeat
                 // events are ignored — the key is already down, and the
                 // BIOS polls every frame anyway.
-                if !repeat {
+                if !repeat && !self.state.workspace.is_editor() {
                     if let Some(mask) =
                         key_to_pad_button(&logical_key, &self.state.settings.input.port1)
                     {
@@ -340,7 +336,11 @@ impl ApplicationHandler for Shell {
                         self.display_gpu_compute = !self.display_gpu_compute;
                         eprintln!(
                             "[gpu-compute] display source: {}",
-                            if self.display_gpu_compute { "GPU compute" } else { "CPU rasterizer" }
+                            if self.display_gpu_compute {
+                                "GPU compute"
+                            } else {
+                                "CPU rasterizer"
+                            }
                         );
                     }
                 }
@@ -562,13 +562,21 @@ impl ApplicationHandler for Shell {
                         bus.gpu.enable_cmd_log();
                     }
                     let log = std::mem::take(&mut bus.gpu.cmd_log);
-                    gfx.render_hw_frame(&bus.gpu, scale_mode, panel_size_px, &log);
+                    let vram_words = bus.gpu.vram.words().to_vec();
+                    gfx.render_hw_frame(&bus.gpu, scale_mode, panel_size_px, &log, &vram_words);
                 } else {
                     // No bus → render an empty frame so the panel
                     // is still well-defined (clears to black).
-                    let empty: Vec<emulator_core::gpu::GpuCmdLogEntry> = Vec::new();
+                    let empty_log: Vec<emulator_core::gpu::GpuCmdLogEntry> = Vec::new();
+                    let empty_vram: Vec<u16> = vec![0; 1024 * 512];
                     let dummy_gpu = emulator_core::Gpu::new();
-                    gfx.render_hw_frame(&dummy_gpu, scale_mode, panel_size_px, &empty);
+                    gfx.render_hw_frame(
+                        &dummy_gpu,
+                        scale_mode,
+                        panel_size_px,
+                        &empty_log,
+                        &empty_vram,
+                    );
                 }
 
                 let vram_tex = gfx.vram_texture_id();

@@ -128,14 +128,17 @@ impl Graphics {
     /// Drive the hardware renderer for one frame. Walks `cmd_log`,
     /// issues wgpu draw calls for the supported primitive types,
     /// and leaves the result in the texture exposed by
-    /// [`Graphics::hw_texture_id`]. The central panel paints that
-    /// texture verbatim; no paint-time stretch.
+    /// [`Graphics::hw_texture_id`]. `vram_words` is the CPU
+    /// rasterizer's VRAM (post-frame), uploaded into the GPU-side
+    /// `R16Uint` so textured primitives can sample the right
+    /// texels + CLUT entries.
     pub fn render_hw_frame(
         &mut self,
         gpu: &Gpu,
         scale_mode: psx_gpu_render::ScaleMode,
         panel_size_px: (u32, u32),
         cmd_log: &[emulator_core::gpu::GpuCmdLogEntry],
+        vram_words: &[u16],
     ) {
         self.hw_renderer.render_frame(
             gpu,
@@ -143,6 +146,7 @@ impl Graphics {
             panel_size_px,
             &mut self.egui_renderer,
             cmd_log,
+            vram_words,
         );
     }
 

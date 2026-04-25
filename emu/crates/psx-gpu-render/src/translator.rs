@@ -14,10 +14,11 @@
 
 use emulator_core::gpu::GpuCmdLogEntry;
 use psx_gpu_compute::decode::{
-    apply_primitive_tpage, decode_tint, decode_vertex, rgb24_to_bgr15, ReplayState,
+    apply_primitive_tpage, decode_clut, decode_tint, decode_uv, decode_vertex, is_raw_texture,
+    is_semi_trans, rgb24_to_bgr15, ReplayState,
 };
 
-use crate::pipeline::HwVertex;
+use crate::pipeline::{flags as fbits, HwVertex};
 
 pub struct Translator {
     state: ReplayState,
@@ -59,10 +60,12 @@ impl Translator {
             0x20..=0x23 => self.emit_mono_tri(fifo),
             0x28..=0x2B => self.emit_mono_quad(fifo),
 
-            // ---------- Phase 2+ ---------- (silently skipped)
+            // ---------- Phase 2 primitives ----------
+            0x24..=0x27 => self.emit_tex_tri(fifo),
+            0x2C..=0x2F => self.emit_tex_quad(fifo),
+
+            // ---------- Phase 3+ ---------- (silently skipped)
             // 0x02         => fill rect
-            // 0x24..=0x27  => tex tri
-            // 0x2C..=0x2F  => tex quad
             // 0x30..=0x33  => shaded tri
             // 0x34..=0x37  => shaded-tex tri
             // 0x38..=0x3B  => shaded quad
@@ -186,6 +189,106 @@ impl Translator {
             });
         }
     }
+
+    // ----- Phase 2: textured tris + quads -----
+
+    /// `0x24..=0x27` — textured triangle. Packet:
+    ///   `[cmd+tint, v0, uv0+clut, v1, uv1+tpage, v2, uv2]`
+    /// uv1's high half is the active tpage word; consume it via
+    /// `apply_primitive_tpage` so subsequent primitives see the
+    /// updated tpage.
+    fn emit_tex_tri(&mut self, fifo: &[u32]) {
+        if fifo.len() < 7 {
+            return;
+        }
+        let cmd = fifo[0];
+        let v0 = decode_vertex(&self.state, fifo[1]);
+        let uv0 = decode_uv(fifo[2]);
+        let clut = decode_clut(fifo[2]);
+        let v1 = decode_vertex(&self.state, fifo[3]);
+        let uv1 = decode_uv(fifo[4]);
+        apply_primitive_tpage(&mut self.state, fifo[4]);
+        let v2 = decode_vertex(&self.state, fifo[5]);
+        let uv2 = decode_uv(fifo[6]);
+
+        let prim_flags = self.tex_prim_flags(cmd, clut);
+        let color = tex_tint(cmd);
+        self.push_tex_tri(v0, uv0, v1, uv1, v2, uv2, color, prim_flags);
+    }
+
+    /// `0x2C..=0x2F` — textured quad. Packet:
+    ///   `[cmd+tint, v0, uv0+clut, v1, uv1+tpage, v2, uv2, v3, uv3]`
+    /// Decomposes to two triangles using the same winding the CPU
+    /// rasterizer's `draw_textured_quad` uses (`v0,v1,v2` then
+    /// `v1,v3,v2`), so semi-trans / mask behaviour stays
+    /// pixel-equivalent in later phases.
+    fn emit_tex_quad(&mut self, fifo: &[u32]) {
+        if fifo.len() < 9 {
+            return;
+        }
+        let cmd = fifo[0];
+        let v0 = decode_vertex(&self.state, fifo[1]);
+        let uv0 = decode_uv(fifo[2]);
+        let clut = decode_clut(fifo[2]);
+        let v1 = decode_vertex(&self.state, fifo[3]);
+        let uv1 = decode_uv(fifo[4]);
+        apply_primitive_tpage(&mut self.state, fifo[4]);
+        let v2 = decode_vertex(&self.state, fifo[5]);
+        let uv2 = decode_uv(fifo[6]);
+        let v3 = decode_vertex(&self.state, fifo[7]);
+        let uv3 = decode_uv(fifo[8]);
+
+        let prim_flags = self.tex_prim_flags(cmd, clut);
+        let color = tex_tint(cmd);
+
+        self.push_tex_tri(v0, uv0, v1, uv1, v2, uv2, color, prim_flags);
+        self.push_tex_tri(v1, uv1, v3, uv3, v2, uv2, color, prim_flags);
+    }
+
+    /// Pack the per-primitive state setter bits + vertex flags
+    /// `bits` into the format the shader expects. `clut` is in
+    /// PSX VRAM pixels.
+    fn tex_prim_flags(&self, cmd: u32, clut: (u32, u32)) -> u32 {
+        let tp = &self.state.tpage;
+        let depth = tp.tex_depth;
+        let mut flags = fbits::TEXTURED;
+        flags |= fbits::pack_tpage(tp.tpage_x, tp.tpage_y, depth);
+        flags |= fbits::pack_clut(clut.0, clut.1);
+        if is_raw_texture(cmd) {
+            flags |= fbits::RAW_TEXTURE;
+        }
+        if is_semi_trans(cmd) {
+            // Phase 4 wires this up to a blend-state branch. For
+            // now it's tracked but the pipeline's blend state is
+            // still REPLACE — semi-trans textured pixels render
+            // as opaque. Visible in some FMVs / particle
+            // effects; will land with Phase 4.
+            flags |= fbits::SEMI_TRANS;
+        }
+        flags
+    }
+
+    fn push_tex_tri(
+        &mut self,
+        v0: (i32, i32),
+        uv0: (u8, u8),
+        v1: (i32, i32),
+        uv1: (u8, u8),
+        v2: (i32, i32),
+        uv2: (u8, u8),
+        color: [u8; 4],
+        prim_flags: u32,
+    ) {
+        let make = |v: (i32, i32), uv: (u8, u8)| HwVertex {
+            pos: [v.0 as i16, v.1 as i16],
+            color,
+            uv: [uv.0 as u16, uv.1 as u16],
+            flags: prim_flags,
+        };
+        self.vertices.push(make(v0, uv0));
+        self.vertices.push(make(v1, uv1));
+        self.vertices.push(make(v2, uv2));
+    }
 }
 
 impl Default for Translator {
@@ -205,6 +308,18 @@ impl Default for Translator {
 fn mono_color_rgba8(cmd: u32) -> [u8; 4] {
     let (r, g, b) = decode_tint(cmd & 0x00FF_FFFF);
     let _ = rgb24_to_bgr15; // imported for future BGR15 round-trip
+    [r, g, b, 0xFF]
+}
+
+/// Tint colour for a textured primitive. Same layout as the mono
+/// case (low 24 bits of `cmd`). Used as the modulator on top of
+/// the sampled texel; raw-texture mode skips this and uses
+/// `(0x80, 0x80, 0x80)` semantics, but we leave the original
+/// tint here and let the shader decide whether to modulate
+/// based on the `RAW_TEXTURE` flag bit. Keeps the vertex format
+/// uniform across raw / non-raw primitives.
+fn tex_tint(cmd: u32) -> [u8; 4] {
+    let (r, g, b) = decode_tint(cmd & 0x00FF_FFFF);
     [r, g, b, 0xFF]
 }
 

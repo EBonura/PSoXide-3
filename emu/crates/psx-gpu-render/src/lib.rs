@@ -106,7 +106,10 @@ impl HwRenderer {
     /// `panel_rect` is the egui central-panel rect IN PIXELS that
     /// will receive the output (so we can size the render target
     /// to it for `Window` mode). `gpu` is read for the active
-    /// display area + the drained `cmd_log`.
+    /// display area + the drained `cmd_log`. `vram_words` is the
+    /// CPU rasterizer's VRAM after this frame's draws — uploaded
+    /// to the GPU-side `R16Uint` texture for the fragment shader
+    /// to sample on textured primitives.
     pub fn render_frame(
         &mut self,
         gpu: &Gpu,
@@ -114,6 +117,7 @@ impl HwRenderer {
         panel_size_px: (u32, u32),
         egui_renderer: &mut egui_wgpu::Renderer,
         cmd_log: &[emulator_core::gpu::GpuCmdLogEntry],
+        vram_words: &[u16],
     ) {
         let display = gpu.display_area();
         let (display_w, display_h) = (
@@ -140,7 +144,12 @@ impl HwRenderer {
             bytemuck::bytes_of(&self.globals),
         );
 
-        // Translate cmd_log → vertex stream. Phase 1: only mono tris.
+        // Mirror CPU VRAM into the GPU `R16Uint` so textured
+        // primitives can sample texels + CLUTs correctly. Phase 1
+        // didn't need this; Phase 2's textured primitives do.
+        self.pipeline.upload_vram(&self.queue, vram_words);
+
+        // Translate cmd_log → vertex stream.
         let vertices = self.translator.translate(cmd_log);
         if !vertices.is_empty() {
             self.pipeline
