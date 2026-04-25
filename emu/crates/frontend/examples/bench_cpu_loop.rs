@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use emulator_core::{Bus, Cpu, VRAM_HEIGHT, VRAM_WIDTH};
+use emulator_core::{Bus, Cpu, Gpu, VRAM_HEIGHT, VRAM_WIDTH};
 use psx_iso::Disc;
 
 struct Args {
@@ -44,6 +44,11 @@ struct Args {
     /// when on (just a Vec push per packet); off as a sanity check
     /// that the tracer itself isn't the cost.
     skip_tracer: bool,
+    /// Run a "shadow" Gpu alongside the main one, sync its VRAM
+    /// each frame and replay this frame's cmd_log onto it. Times
+    /// only the replay → an in-context estimate of the CPU
+    /// rasterizer's per-frame cost. Does not affect main emulation.
+    probe_rasterizer: bool,
 }
 
 fn parse_args() -> Args {
@@ -57,6 +62,7 @@ fn parse_args() -> Args {
         warmup: 50_000_000,
         skip_vram_rgba: false,
         skip_tracer: false,
+        probe_rasterizer: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -68,6 +74,7 @@ fn parse_args() -> Args {
             "--warmup" => a.warmup = it.next().unwrap().parse().unwrap(),
             "--skip-vram-rgba" => a.skip_vram_rgba = true,
             "--skip-tracer" => a.skip_tracer = true,
+            "--probe-rasterizer" => a.probe_rasterizer = true,
             other => panic!("unknown arg: {other}"),
         }
     }
@@ -111,10 +118,21 @@ fn main() {
         owner.fill(u32::MAX);
     }
 
+    // Shadow Gpu used by `--probe-rasterizer`. Its VRAM is overwritten
+    // from the main bus each frame, then it replays the cmd_log so
+    // its rasterizer touches the same texture state the main one did.
+    let mut shadow_gpu = if args.probe_rasterizer {
+        Some(Gpu::new())
+    } else {
+        None
+    };
+
     eprintln!("[bench] measuring {} frames...", args.frames);
     let mut t_emu = Duration::ZERO;
     let mut t_vram_rgba = Duration::ZERO;
     let mut t_display_rgba = Duration::ZERO;
+    let mut t_shadow_raster = Duration::ZERO;
+    let mut t_shadow_sync = Duration::ZERO;
     let mut total_packets = 0u64;
     let mut total_display_pixels = 0u64;
     let started = Instant::now();
@@ -137,6 +155,36 @@ fn main() {
         total_packets += log.len() as u64;
         if let Some(owner) = bus.gpu.pixel_owner.as_mut() {
             owner.fill(u32::MAX);
+        }
+
+        // Optional probe: replay the frame's cmd_log on a shadow
+        // Gpu after syncing its VRAM, so the in-context CPU
+        // rasterizer cost is timed in isolation.
+        if let Some(shadow) = shadow_gpu.as_mut() {
+            // Sync VRAM via per-pixel writes — there's no public
+            // bulk-set on `Vram`, but 1024×512 set_pixel calls is
+            // ~0.5 ms here, accounted for separately so it doesn't
+            // pollute the rasterizer number.
+            let t = Instant::now();
+            let main_words = bus.gpu.vram.words();
+            for (i, &w) in main_words.iter().enumerate() {
+                let x = (i % VRAM_WIDTH) as u16;
+                let y = (i / VRAM_WIDTH) as u16;
+                shadow.vram.set_pixel(x, y, w);
+            }
+            t_shadow_sync += t.elapsed();
+
+            // Replay this frame's packets — state setters in the
+            // log re-establish draw_area / tpage / mask flags on
+            // the shadow before each frame's draws, which is what
+            // most PSX games do every frame anyway.
+            let t = Instant::now();
+            for entry in &log {
+                for &w in &entry.fifo {
+                    shadow.gp0_push(w);
+                }
+            }
+            t_shadow_raster += t.elapsed();
         }
 
         // Phase 2: VRAM → RGBA8 (1024×512 = 524288 px). This is
@@ -190,6 +238,24 @@ fn main() {
         pct(t_display_rgba),
         total_display_pixels as f64 / f,
     );
+    if args.probe_rasterizer {
+        let raster_pct_of_emu = 100.0 * t_shadow_raster.as_secs_f64() / t_emu.as_secs_f64();
+        eprintln!();
+        eprintln!("=== Rasterizer probe (shadow Gpu, in-context) ===");
+        eprintln!(
+            "  CPU rasterizer:   {:.2} ms/frame  (~{:.1}% of emulation time)",
+            pf(t_shadow_raster),
+            raster_pct_of_emu,
+        );
+        eprintln!(
+            "  → emulator-core minus rasterizer ≈ {:.2} ms/frame",
+            pf(t_emu) - pf(t_shadow_raster),
+        );
+        eprintln!(
+            "  shadow_sync:      {:.2} ms/frame  (probe overhead, NOT in real frontend)",
+            pf(t_shadow_sync),
+        );
+    }
 
     let total_per_frame_ms = total.as_secs_f64() * 1000.0 / f;
     let budget_60fps = 1000.0 / 60.0;
