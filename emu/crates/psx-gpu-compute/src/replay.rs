@@ -26,8 +26,8 @@ use std::sync::Arc;
 use emulator_core::gpu::GpuCmdLogEntry;
 
 use crate::primitive::{
-    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri, TexRect,
-    TexTri, Tpage,
+    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri,
+    TexQuadBilinear, TexRect, TexTri, Tpage,
 };
 use crate::rasterizer::Rasterizer;
 use crate::vram::VramGpu;
@@ -517,8 +517,28 @@ impl ComputeBackend {
         let uv3 = decode_uv(fifo[8]);
         let tint = decode_tint(cmd & 0x00FF_FFFF);
         let (flags, mode) = self.tex_flags_and_mode(cmd);
-        // Same triangle-split order as `Gpu::draw_textured_quad`:
-        // (v1, v3, v2) then (v0, v1, v2).
+
+        // Phase C bug fix: when the quad is axis-aligned the CPU
+        // rasterizer skips the triangle split and runs a bilinear
+        // UV walk over all four corners. Triangle-split + bary
+        // interpolation produces different pixels for non-affine
+        // UV layouts (Tekken 3 character draws hit this). Mirror
+        // the CPU's fast path here so VRAM stays in sync.
+        if TexQuadBilinear::is_axis_aligned(v0, v1, v2, v3) {
+            let q = TexQuadBilinear::new(
+                v0, v1, v2, v3, uv0, uv1, uv2, uv3, clut_x, clut_y, tint, flags, mode,
+            );
+            self.rasterizer.dispatch_tex_quad_bilinear(
+                &self.vram,
+                &q,
+                &self.state.tpage,
+                &self.state.draw_area,
+            );
+            return;
+        }
+
+        // Non-axis-aligned: fall back to the same triangle split
+        // the CPU uses (v1, v3, v2) then (v0, v1, v2).
         let t1 = TexTri::new(
             v1, v3, v2, uv1, uv3, uv2, clut_x, clut_y, tint, flags, mode,
         );

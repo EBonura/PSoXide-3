@@ -11,8 +11,8 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 
 use crate::primitive::{
-    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri, TexRect,
-    TexTri, Tpage,
+    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri,
+    TexQuadBilinear, TexRect, TexTri, Tpage,
 };
 use crate::scanline::{self, RowState, ScanlineConsts};
 use crate::vram::VramGpu;
@@ -80,6 +80,11 @@ pub struct Rasterizer {
     shaded_tex_tri_scanline_pipeline: wgpu::ComputePipeline,
     shaded_tex_tri_scanline_consts: wgpu::Buffer,
     shaded_tex_tri_scanline_rows: std::cell::RefCell<wgpu::Buffer>,
+
+    // Phase C bug fix: axis-aligned textured quad with bilinear UV.
+    // Same 4-binding shape as tex_tri (VRAM + prim + draw_area + tpage).
+    tex_quad_bilinear_pipeline: wgpu::ComputePipeline,
+    tex_quad_bilinear_uniform: wgpu::Buffer,
 
     // Phase B.x: mono + shaded triangle scanline pipelines. Same
     // 5-binding shape (VRAM + prim + draw area + rows + consts —
@@ -579,6 +584,42 @@ impl Rasterizer {
             mapped_at_creation: false,
         });
 
+        // ---------- Tex-quad bilinear pipeline (Phase C bug fix) ----------
+        // Reuses `tex_tri_bg_layout` (same 4-binding shape: VRAM,
+        // prim uniform, draw area, tpage). Different shader entry +
+        // dedicated prim uniform.
+        let tex_quad_bilinear_pl = device.create_pipeline_layout(
+            &wgpu::PipelineLayoutDescriptor {
+                label: Some("psx-rasterizer-tex-quad-bilinear-pl"),
+                bind_group_layouts: &[&tex_tri_bg_layout],
+                push_constant_ranges: &[],
+            },
+        );
+        let tex_quad_bilinear_shader = device.create_shader_module(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("psx-rasterizer-tex-quad-bilinear-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/tex_quad_bilinear.wgsl").into(),
+                ),
+            },
+        );
+        let tex_quad_bilinear_pipeline = device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("psx-rasterizer-tex-quad-bilinear"),
+                layout: Some(&tex_quad_bilinear_pl),
+                module: &tex_quad_bilinear_shader,
+                entry_point: Some("rasterize"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        );
+        let tex_quad_bilinear_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-rasterizer-tex-quad-bilinear-uniform"),
+            size: std::mem::size_of::<TexQuadBilinear>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // ---------- Mono / Shaded tri scanline pipelines (B.x) ----------
         // 5-binding shape: VRAM + prim + draw area + rows + consts.
         let mono_shaded_scanline_bg_layout =
@@ -732,6 +773,8 @@ impl Rasterizer {
             shaded_tex_tri_scanline_rows: std::cell::RefCell::new(
                 shaded_tex_tri_scanline_rows,
             ),
+            tex_quad_bilinear_pipeline,
+            tex_quad_bilinear_uniform,
             mono_shaded_scanline_bg_layout,
             mono_tri_scanline_pipeline,
             mono_tri_scanline_consts,
@@ -1301,6 +1344,74 @@ impl Rasterizer {
     /// drawing-state — matches the CPU `Gpu::fill_rect`. Caller is
     /// responsible for the 16-pixel x/w masking; `Fill::new` does
     /// it for you.
+    /// Dispatch one axis-aligned textured quad with bilinear UV
+    /// interpolation. The host has already verified the geometry
+    /// is axis-aligned via `TexQuadBilinear::is_axis_aligned`.
+    /// Matches the CPU rasterizer's `rasterize_axis_aligned_textured_quad`
+    /// fast path byte-for-byte.
+    pub fn dispatch_tex_quad_bilinear(
+        &self,
+        vram: &VramGpu,
+        quad: &TexQuadBilinear,
+        tpage: &Tpage,
+        area: &DrawArea,
+    ) -> bool {
+        if quad.exceeds_hw_extent() {
+            return false;
+        }
+        let w = quad.v1[0] - quad.v0[0];
+        let h = quad.v2[1] - quad.v0[1];
+        if w <= 0 || h <= 0 {
+            return false;
+        }
+        self.queue
+            .write_buffer(&self.tex_quad_bilinear_uniform, 0, bytemuck::bytes_of(quad));
+        self.queue
+            .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
+        self.queue
+            .write_buffer(&self.tpage_uniform, 0, bytemuck::bytes_of(tpage));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("psx-rasterizer-tex-quad-bilinear-bg"),
+            layout: &self.tex_tri_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: vram.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.tex_quad_bilinear_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.draw_area_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.tpage_uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-rasterizer-tex-quad-bilinear-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("psx-rasterizer-tex-quad-bilinear-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.tex_quad_bilinear_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups_x = (w as u32).div_ceil(WORKGROUP_SIZE_X);
+            let groups_y = (h as u32).div_ceil(WORKGROUP_SIZE_Y);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        true
+    }
+
     pub fn dispatch_fill(&self, vram: &VramGpu, fill: &Fill) {
         if fill.wh[0] == 0 || fill.wh[1] == 0 {
             return;
@@ -2833,6 +2944,111 @@ mod tests {
         assert_eq!(
             cpu_words, gpu_words,
             "shaded-tex-tri scanline strict parity"
+        );
+    }
+
+    /// Tekken 3 portrait regression. The CPU's
+    /// `rasterize_axis_aligned_textured_quad` fast path uses bilinear
+    /// UV interpolation; the original GPU replay split the quad into
+    /// two barycentric triangles, which produced different pixels
+    /// when the V channel wasn't affine across the four corners
+    /// (UV3.v != UV1.v + UV2.v - UV0.v). Now the replay detects
+    /// axis-aligned + non-affine quads and dispatches the dedicated
+    /// `tex_quad_bilinear` shader. This test pins that path with the
+    /// exact UV layout from the divergent Tekken 3 packet (cmd #9032
+    /// in the boot trace).
+    #[test]
+    fn tex_quad_bilinear_non_affine_uvs_match_cpu() {
+        // Destination quad in the top-left of VRAM; texture parked
+        // in the bottom-right region so the quad's writes can't
+        // corrupt the texels mid-rasterization (a 96×80 quad placed
+        // over its own tpage would self-overwrite at every pixel
+        // whose UV mapped to the destination range).
+        let v = [
+            (50i32, 30i32),
+            (50 + 95, 30),
+            (50, 30 + 79),
+            (50 + 95, 30 + 79),
+        ];
+        // Non-affine V: 0,64,79,79. Triangle-split would produce
+        // wrong pixels here.
+        let uv = [(0u8, 0u8), (95u8, 64u8), (0u8, 79u8), (95u8, 79u8)];
+        let tpage_x = 512u32;
+        let tpage_y = 256u32;
+        let tpage_word = make_tpage_word(tpage_x, tpage_y, 2, 0);
+
+        // 96×80 texture: every cell carries a unique non-zero value
+        // so any UV-step bug shows up.
+        let mut vram = vec![0u16; 1024 * 512];
+        for vy in 0..80u16 {
+            for ux in 0..96u16 {
+                let val = ((vy & 0x1F) << 5) | (ux & 0x1F) | 0x0001;
+                vram[(tpage_y as usize + vy as usize) * 1024
+                    + (tpage_x as usize + ux as usize)] = val;
+            }
+        }
+
+        // CPU: drive the textured-quad packet (op 0x2D = textured,
+        // raw, opaque). Vertex order matches the cmd_log layout.
+        let mut cpu = Gpu::new();
+        for (i, &w) in vram.iter().enumerate() {
+            cpu.vram
+                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+        }
+        cpu.gp0_push(0xE3000000);
+        cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
+        // 0x2D — textured quad, raw texture, opaque.
+        cpu.gp0_push(0x2D000000);
+        cpu.gp0_push(pack_xy(v[0]));
+        cpu.gp0_push(uv_pack(uv[0])); // clut=0
+        cpu.gp0_push(pack_xy(v[1]));
+        cpu.gp0_push((tpage_word << 16) | uv_pack(uv[1]));
+        cpu.gp0_push(pack_xy(v[2]));
+        cpu.gp0_push(uv_pack(uv[2]));
+        cpu.gp0_push(pack_xy(v[3]));
+        cpu.gp0_push(uv_pack(uv[3]));
+        let cpu_words = cpu.vram.words().to_vec();
+
+        // GPU: confirm the axis-aligned detector accepts these
+        // vertices, then dispatch the bilinear shader.
+        assert!(
+            TexQuadBilinear::is_axis_aligned(v[0], v[1], v[2], v[3]),
+            "test geometry must be axis-aligned for the bilinear path"
+        );
+        let vg = VramGpu::new_headless();
+        vg.upload_full(&vram).unwrap();
+        let r = Rasterizer::new(&vg);
+        let quad = TexQuadBilinear::new(
+            v[0], v[1], v[2], v[3],
+            uv[0], uv[1], uv[2], uv[3],
+            0, 0,
+            (0x80, 0x80, 0x80),
+            PrimFlags::RAW_TEXTURE,
+            BlendMode::Average,
+        );
+        let tp = Tpage::new(tpage_x, tpage_y, 2);
+        r.dispatch_tex_quad_bilinear(&vg, &quad, &tp, &DrawArea::full_vram());
+        let gpu_words = vg.download_full().unwrap();
+
+        let mut diffs: Vec<(usize, usize, u16, u16)> = Vec::new();
+        for (i, (&c, &g)) in cpu_words.iter().zip(gpu_words.iter()).enumerate() {
+            if c != g {
+                diffs.push((i % 1024, i / 1024, c, g));
+                if diffs.len() >= 16 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "tex-quad bilinear should match CPU's axis-aligned fast path. \
+             {} diffs (first ≤16 shown):\n{}",
+            diffs.len(),
+            diffs
+                .iter()
+                .map(|(x, y, c, g)| format!("  ({x},{y}) cpu=0x{c:04x} gpu=0x{g:04x}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         );
     }
 

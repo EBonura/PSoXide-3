@@ -552,6 +552,111 @@ impl ShadedTexTri {
     }
 }
 
+/// Axis-aligned textured quad with **bilinear** UV interpolation
+/// across the four corners. Mirrors `emulator-core::Gpu::
+/// rasterize_axis_aligned_textured_quad` byte-for-byte: per row,
+/// `pos_u = left_u0 + row * delta_left_u` and
+/// `right_u = right_u0 + row * delta_right_u`; per pixel within a
+/// row, `delta_u = (right_u - pos_u) / width` and the per-pixel U
+/// is `pos_u + col * delta_u >> 16`.
+///
+/// The CPU dispatches this via the fast path when a textured quad's
+/// vertices form an axis-aligned rectangle (`v0.y == v1.y &&
+/// v2.y == v3.y && v0.x == v2.x && v1.x == v3.x`). Triangle splits
+/// produce different pixels for non-affine UV layouts (the diagonal
+/// `v3.uv = v1.uv + v2.uv - v0.uv` affine condition often fails on
+/// V), so for parity we have to match the bilinear math here.
+///
+/// WGSL counterpart in `shaders/tex_quad_bilinear.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct TexQuadBilinear {
+    /// Top-left, top-right, bottom-left, bottom-right vertices in
+    /// the order the CPU's fast path reads them after the same
+    /// axis-aligned check. All four are screen-space (already
+    /// include drawing offset).
+    pub v0: [i32; 2],
+    pub v1: [i32; 2],
+    pub v2: [i32; 2],
+    pub v3: [i32; 2],
+    /// Same corner ordering as the vertices. UV is `u | (v << 8)`.
+    pub uv0: u32,
+    pub uv1: u32,
+    pub uv2: u32,
+    pub uv3: u32,
+    pub clut_x: u32,
+    pub clut_y: u32,
+    pub tint: u32,
+    pub flags: u32,
+}
+
+impl TexQuadBilinear {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        v3: (i32, i32),
+        uv0: (u8, u8),
+        uv1: (u8, u8),
+        uv2: (u8, u8),
+        uv3: (u8, u8),
+        clut_x: u32,
+        clut_y: u32,
+        tint_rgb: (u8, u8, u8),
+        flags: PrimFlags,
+        blend_mode: BlendMode,
+    ) -> Self {
+        let pack_uv = |u: u8, v: u8| (u as u32) | ((v as u32) << 8);
+        let pack_tint =
+            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        Self {
+            v0: [v0.0, v0.1],
+            v1: [v1.0, v1.1],
+            v2: [v2.0, v2.1],
+            v3: [v3.0, v3.1],
+            uv0: pack_uv(uv0.0, uv0.1),
+            uv1: pack_uv(uv1.0, uv1.1),
+            uv2: pack_uv(uv2.0, uv2.1),
+            uv3: pack_uv(uv3.0, uv3.1),
+            clut_x,
+            clut_y,
+            tint: pack_tint(tint_rgb.0, tint_rgb.1, tint_rgb.2),
+            flags: pack_flags(flags, blend_mode),
+        }
+    }
+
+    /// Test whether a 4-vertex textured quad's geometry matches the
+    /// axis-aligned shape the CPU's fast path expects. Vertex order
+    /// (top-left, top-right, bottom-left, bottom-right) is what the
+    /// CPU's check assumes — see `Gpu::draw_textured_quad`.
+    pub fn is_axis_aligned(
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        v3: (i32, i32),
+    ) -> bool {
+        v0.1 == v1.1 && v2.1 == v3.1 && v0.0 == v2.0 && v1.0 == v3.0
+    }
+
+    /// HW-extent rule: same as triangles, applied to both halves
+    /// (the CPU fast path tests v1/v3/v2 + v0/v1/v2).
+    pub fn exceeds_hw_extent(&self) -> bool {
+        const MAX_DX: i32 = 1023;
+        const MAX_DY: i32 = 511;
+        let edges = [
+            (self.v0, self.v1),
+            (self.v1, self.v2),
+            (self.v2, self.v0),
+            (self.v1, self.v3),
+            (self.v3, self.v2),
+        ];
+        edges
+            .iter()
+            .any(|(a, b)| (a[0] - b[0]).abs() > MAX_DX || (a[1] - b[1]).abs() > MAX_DY)
+    }
+}
+
 /// Quick fill (`GP0 0x02`). Writes a single 15bpp colour into a
 /// rectangle, ignoring drawing-area, drawing-offset, mask-check,
 /// mask-set, and semi-trans. The hardware clamps `x`/`w` to 16-pixel
@@ -661,6 +766,32 @@ mod tests {
     fn fill_struct_pinned_at_32() {
         assert_eq!(std::mem::size_of::<Fill>(), 32);
         assert_eq!(std::mem::size_of::<Fill>() % 16, 0);
+    }
+
+    #[test]
+    fn tex_quad_bilinear_struct_is_16_byte_aligned() {
+        assert_eq!(std::mem::size_of::<TexQuadBilinear>() % 16, 0);
+        assert_eq!(std::mem::size_of::<TexQuadBilinear>(), 64);
+    }
+
+    #[test]
+    fn axis_aligned_detection_matches_cpu_rule() {
+        // The exact case the bisector found: top-left at (482, 352),
+        // top-right at (578, 352), bottom-left at (482, 368),
+        // bottom-right at (578, 368). Should be axis-aligned.
+        assert!(TexQuadBilinear::is_axis_aligned(
+            (482, 352),
+            (578, 352),
+            (482, 368),
+            (578, 368),
+        ));
+        // Skewed (different tops): NOT axis-aligned.
+        assert!(!TexQuadBilinear::is_axis_aligned(
+            (482, 352),
+            (578, 360),
+            (482, 368),
+            (578, 368),
+        ));
     }
 
     #[test]

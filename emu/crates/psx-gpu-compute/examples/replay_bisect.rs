@@ -24,6 +24,7 @@
 
 use std::path::PathBuf;
 
+use emulator_core::gpu::GpuCmdLogEntry;
 use emulator_core::{Bus, Cpu};
 use psx_gpu_compute::ComputeBackend;
 use psx_iso::Disc;
@@ -193,15 +194,35 @@ fn main() {
     let cpu_words: Vec<u16> = bus.gpu.vram.words().to_vec();
     let owner = bus.gpu.pixel_owner.as_ref().expect("tracer enabled");
 
+    // The CPU's `pixel_owner` only stamps writes that go through
+    // `plot_pixel` — i.e., primitive rasterization. Bulk-write
+    // packets (FillRect 0x02, VRAM-to-VRAM 0x80..=0x9F,
+    // CPU-to-VRAM 0xA0..=0xBF) bypass `plot_pixel` and write VRAM
+    // directly, so they leave `owner` stale at the LAST plot-pixel
+    // packet to touch each pixel they overwrite.
+    //
+    // Build an augmented owner that overlays bulk-write footprints
+    // on top of the CPU's plot_pixel-only owner. This way, when a
+    // FillRect later overwrites a pixel that an earlier MonoRect
+    // drew, the bisector attributes the pixel to the FillRect (the
+    // actual last writer), not the MonoRect.
+    let mut owner_aug: Vec<u32> = owner.clone();
+    for entry in &log {
+        if let Some((x, y, w, h)) = bulk_writer_footprint(entry) {
+            stamp_rect(&mut owner_aug, x, y, w, h, entry.index);
+        }
+    }
+
     let mut first_diverge: Option<u32> = None;
     for entry in &log {
         backend.replay_packet(entry);
-        // Find any pixel that BOTH this packet owns (per cpu_log) AND
-        // disagrees between CPU and GPU. That packet is the offender.
+        // Find any pixel that BOTH this packet owns (per augmented
+        // owner) AND disagrees between CPU and GPU. That packet is
+        // the offender.
         let gpu_words = backend.download_vram();
         let mut bad: Vec<(usize, u16, u16)> = Vec::new();
         for (i, (&cpu_w, &gpu_w)) in cpu_words.iter().zip(gpu_words.iter()).enumerate() {
-            if cpu_w != gpu_w && owner[i] == entry.index {
+            if cpu_w != gpu_w && owner_aug[i] == entry.index {
                 bad.push((i, cpu_w, gpu_w));
                 if bad.len() >= 8 {
                     break;
@@ -255,4 +276,66 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001B3);
     }
     h
+}
+
+/// Return the destination-pixel footprint of bulk-write packets that
+/// bypass `plot_pixel` (FillRect, VRAM-to-VRAM copy, CPU-to-VRAM
+/// upload). Returns `None` for ordinary primitives, since those
+/// already get accurate `pixel_owner` stamps from the CPU rasterizer.
+fn bulk_writer_footprint(entry: &GpuCmdLogEntry) -> Option<(u16, u16, u16, u16)> {
+    match entry.opcode {
+        // GP0 0x02 — FillRect. word1 = pos (x 16-aligned, y 9-bit),
+        // word2 = size (w rounded up to 16, h 9-bit).
+        0x02 if entry.fifo.len() >= 3 => {
+            let pos = entry.fifo[1];
+            let size = entry.fifo[2];
+            let x = (pos & 0x3F0) as u16;
+            let y = ((pos >> 16) & 0x1FF) as u16;
+            let w = (((size & 0x3FF) + 0x0F) & !0x0F) as u16;
+            let h = ((size >> 16) & 0x1FF) as u16;
+            Some((x, y, w, h))
+        }
+        // GP0 0x80..=0x9F — VRAM-to-VRAM copy. word2 = dst,
+        // word3 = wh (0 → 1024/512).
+        op if (0x80..=0x9F).contains(&op) && entry.fifo.len() >= 4 => {
+            let dst = entry.fifo[2];
+            let wh = entry.fifo[3];
+            let dx = (dst & 0xFFFF) as u16;
+            let dy = ((dst >> 16) & 0xFFFF) as u16;
+            let raw_w = (wh & 0xFFFF) as u16;
+            let raw_h = ((wh >> 16) & 0xFFFF) as u16;
+            let w = if raw_w == 0 { 1024 } else { raw_w };
+            let h = if raw_h == 0 { 512 } else { raw_h };
+            Some((dx, dy, w, h))
+        }
+        // GP0 0xA0..=0xBF — CPU-to-VRAM upload. word1 = dst,
+        // word2 = wh (0 → 1024/512).
+        op if (0xA0..=0xBF).contains(&op) && entry.fifo.len() >= 3 => {
+            let dst = entry.fifo[1];
+            let wh = entry.fifo[2];
+            let dx = (dst & 0xFFFF) as u16;
+            let dy = ((dst >> 16) & 0xFFFF) as u16;
+            let raw_w = (wh & 0xFFFF) as u16;
+            let raw_h = ((wh >> 16) & 0xFFFF) as u16;
+            let w = if raw_w == 0 { 1024 } else { raw_w };
+            let h = if raw_h == 0 { 512 } else { raw_h };
+            Some((dx, dy, w, h))
+        }
+        _ => None,
+    }
+}
+
+fn stamp_rect(owner: &mut [u32], x: u16, y: u16, w: u16, h: u16, index: u32) {
+    const VRAM_W: u16 = 1024;
+    const VRAM_H: u16 = 512;
+    if w == 0 || h == 0 {
+        return;
+    }
+    for row in 0..h {
+        let py = (y as u32 + row as u32) % VRAM_H as u32;
+        for col in 0..w {
+            let px = (x as u32 + col as u32) % VRAM_W as u32;
+            owner[py as usize * VRAM_W as usize + px as usize] = index;
+        }
+    }
 }

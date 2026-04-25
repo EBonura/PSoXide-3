@@ -16,8 +16,8 @@ pub mod scanline;
 pub mod vram;
 
 pub use primitive::{
-    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri, TexRect,
-    TexTri, Tpage,
+    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri,
+    TexQuadBilinear, TexRect, TexTri, Tpage,
 };
 pub use rasterizer::Rasterizer;
 pub use replay::{ComputeBackend, ReplayState};
