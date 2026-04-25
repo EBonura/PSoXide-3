@@ -838,6 +838,7 @@ name = "emulator-core"
 version = "0.1.0"
 dependencies = [
  "parity-oracle",
+ "psoxide-settings",
  "psx-hw",
  "psx-iso",
  "psx-trace",
@@ -1002,6 +1003,7 @@ dependencies = [
  "gilrs",
  "pollster",
  "psoxide-settings",
+ "psx-gpu-compute",
  "psx-iso",
  "psx-trace",
  "wgpu",
@@ -2223,6 +2225,7 @@ name = "parity-oracle"
 version = "0.1.0"
 dependencies = [
  "emulator-core",
+ "psoxide-settings",
  "psx-iso",
  "psx-trace",
  "serde_json",
@@ -2409,6 +2412,20 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "psx-gpu-compute"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "bytemuck",
+ "emulator-core",
+ "pollster",
+ "psoxide-settings",
+ "psx-iso",
+ "thiserror 1.0.69",
+ "wgpu",
 ]
 
 [[package]]

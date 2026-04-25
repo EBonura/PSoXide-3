@@ -68,14 +68,44 @@ const TRIGGER_THRESHOLD: f32 = 0.5;
 /// The Select+Start combination, precomputed.
 const CHORD_MASK: u16 = button::SELECT | button::START;
 
+/// Gamepad hotplug notification surfaced to the frontend toast.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputNotice {
+    /// A pad became available to gilrs.
+    Connected {
+        /// User-facing controller name reported by gilrs.
+        name: String,
+        /// Mapping source summary, e.g. SDL database vs raw HID.
+        mapping: String,
+    },
+    /// A previously-tracked pad disappeared.
+    Disconnected {
+        /// User-facing controller name captured before disconnect.
+        name: String,
+    },
+}
+
+impl InputNotice {
+    /// Short status-line text for the frontend toast.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Connected { name, mapping } => format!("Gamepad connected: {name} ({mapping})"),
+            Self::Disconnected { name } => format!("Gamepad disconnected: {name}"),
+        }
+    }
+}
+
 /// Per-frame summary returned by [`InputRouter::poll`].
 ///
 /// The shell consumes this to drive both the PSX pad input and
 /// Menu menu navigation in a single call — separate fields rather
 /// than one blob so each consumer's needs are obvious at the call
 /// site.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct InputFrame {
+    /// Hotplug notices drained this frame.
+    pub notices: Vec<InputNotice>,
+
     /// Merged PSX pad-1 bitmask across every connected pad. The
     /// Select + Start bits are masked out during frames when the
     /// chord fires, so in-game Select+Start handlers don't see a
@@ -129,6 +159,9 @@ pub struct InputRouter {
     /// Previous frame's merged mask — used for rising-edge
     /// detection on both the chord and the menu-nav buttons.
     prev_mask: u16,
+    /// Hotplug notices generated during startup before the first
+    /// frame could display them.
+    pending_notices: Vec<InputNotice>,
 }
 
 impl InputRouter {
@@ -165,8 +198,18 @@ impl InputRouter {
         // Pre-seed the tracked-pad map so `is_connected` is honest
         // from frame zero rather than waiting for the first `poll`.
         let mut pads: HashMap<GamepadId, TrackedPad> = HashMap::new();
+        let mut pending_notices = Vec::new();
         if let Some(g) = gilrs.as_ref() {
             for (id, gp) in g.gamepads() {
+                let mapping = if gp.mapping_source() == gilrs::MappingSource::None {
+                    "raw HID".to_string()
+                } else {
+                    "SDL mapping".to_string()
+                };
+                pending_notices.push(InputNotice::Connected {
+                    name: gp.name().to_string(),
+                    mapping,
+                });
                 pads.insert(
                     id,
                     TrackedPad {
@@ -180,6 +223,7 @@ impl InputRouter {
             gilrs,
             pads,
             prev_mask: 0,
+            pending_notices,
         }
     }
 
@@ -192,6 +236,7 @@ impl InputRouter {
         let Some(gilrs) = self.gilrs.as_mut() else {
             return InputFrame::default();
         };
+        let mut notices = std::mem::take(&mut self.pending_notices);
 
         // 1. Drain events, maintaining our connected-pad set.
         while let Some(Event { id, event, .. }) = gilrs.next_event() {
@@ -204,14 +249,17 @@ impl InputRouter {
                     } else {
                         "SDL_GameControllerDB"
                     };
-                    eprintln!(
-                        "[input] connected: id={id:?} name={name:?} mapping={mapping}",
-                    );
+                    eprintln!("[input] connected: id={id:?} name={name:?} mapping={mapping}",);
+                    notices.push(InputNotice::Connected {
+                        name: name.clone(),
+                        mapping: mapping.to_string(),
+                    });
                     self.pads.insert(id, TrackedPad { name });
                 }
                 EventType::Disconnected => {
                     if let Some(p) = self.pads.remove(&id) {
                         eprintln!("[input] disconnected: id={id:?} name={:?}", p.name);
+                        notices.push(InputNotice::Disconnected { name: p.name });
                     }
                 }
                 // Other events (button + axis state) are handled
@@ -262,6 +310,7 @@ impl InputRouter {
         //    pad sees it (no menu_* flag fires for Select alone,
         //    since CHORD_MASK bits aren't in any menu_* field).
         let frame = InputFrame {
+            notices,
             pad1_mask: if chord_active {
                 // Swallow the chord so in-game Select+Start
                 // handlers don't see the menu-open combination.

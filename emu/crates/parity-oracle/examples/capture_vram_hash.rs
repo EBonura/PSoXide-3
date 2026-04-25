@@ -7,11 +7,9 @@
 //! cargo run -p parity-oracle --example capture_vram_hash --release -- 100000000
 //! ```
 //!
-//! Optional `PSOXIDE_DISC=/path/to/game.bin` mounts a disc image —
-//! but the current oracle.lua doesn't wire disc-load through Redux
-//! yet, so this path works only for no-disc milestones (A, B). The
-//! disc-mounting extension lands when Milestone D needs Redux
-//! parity and we probe how Redux's CLI accepts a CD image.
+//! Optional second arg or `PSOXIDE_DISC=/path/to/game.cue` mounts a disc.
+//! Optional `PSOXIDE_REDUX_SCREENSHOT=/tmp/frame.bin` saves the Redux
+//! screenshot bytes plus a `.txt` sidecar.
 
 use parity_oracle::{OracleConfig, ReduxProcess};
 use std::env;
@@ -27,11 +25,20 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .expect("usage: capture_vram_hash <step_count>");
 
+    let disc_path = env::args()
+        .nth(2)
+        .map(PathBuf::from)
+        .or_else(|| env::var("PSOXIDE_DISC").ok().map(PathBuf::from));
+    let screenshot_path = env::var("PSOXIDE_REDUX_SCREENSHOT").ok().map(PathBuf::from);
+
     let bios_path = env::var("PSOXIDE_BIOS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN"));
     let lua = OracleConfig::default_lua_dir().join("oracle.lua");
-    let config = OracleConfig::new(bios_path, lua).expect("Redux binary resolves");
+    let mut config = OracleConfig::new(bios_path, lua).expect("Redux binary resolves");
+    if let Some(path) = disc_path {
+        config = config.with_disc(path);
+    }
 
     let mut redux = ReduxProcess::launch(&config).expect("Redux launches");
     redux.handshake(HANDSHAKE_TIMEOUT).expect("handshake");
@@ -53,6 +60,13 @@ fn main() {
     println!("redux_bpp={}", snap.bpp);
     println!("redux_byte_len={}", snap.byte_len);
     println!("redux_display_fnv1a_64=0x{:016x}", snap.hash);
+
+    if let Some(path) = screenshot_path {
+        redux
+            .screenshot_save(&path, VRAM_HASH_TIMEOUT)
+            .expect("screenshot_save succeeded");
+        println!("redux_screenshot={}", path.display());
+    }
 
     redux.send_command("quit").ok();
     let _ = redux.wait_for_response(Duration::from_secs(5));

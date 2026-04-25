@@ -13,8 +13,7 @@ fn main() {
         .unwrap_or_else(|_| "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN".into());
     let bios = fs::read(&bios_path).expect("BIOS readable");
     let dir = cache::default_dir();
-    let records =
-        cache::load_prefix(&dir, &bios, 20_000_000).expect("no cached trace past 20M");
+    let records = cache::load_prefix(&dir, &bios, 20_000_000).expect("no cached trace past 20M");
 
     let threshold: u64 = env::args()
         .nth(1)
@@ -41,5 +40,8 @@ fn main() {
         }
     }
     println!();
-    println!("Total steps with cycle delta >= {threshold}: {count} out of {}", records.len());
+    println!(
+        "Total steps with cycle delta >= {threshold}: {count} out of {}",
+        records.len()
+    );
 }

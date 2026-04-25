@@ -16,11 +16,13 @@
 //! | [`draw_line_gouraud`]       | 0x50   | 4     | Gouraud line.                  |
 //! | [`draw_quad_textured`]      | 0x2C   | 9     | Flat tint, free UV per vertex. |
 //! | [`draw_quad_textured_gouraud`] | 0x3C | 12   | Per-vertex colour × texel.     |
+//! | [`draw_sprite_material`]    | 0x64   | 4     | Material-aware textured sprite. |
 //!
 //! Textured rectangles (GP0 0x64..=0x7F) are the fastest path for
-//! axis-aligned 1:1 sprites; they live in the `psx-vram` /
-//! `psx-font` crates since their size/clut/tpage fields interact
-//! with the VRAM primitives there.
+//! axis-aligned 1:1 sprites. [`draw_sprite_material`] covers the
+//! common variable-size sprite path; `psx-font` layers atlas helpers
+//! on top. The [`material`] module groups packed CLUT/tpage words
+//! with tint and blend state.
 //!
 //! ## Why split like this
 //!
@@ -35,10 +37,13 @@
 #![warn(missing_docs)]
 
 pub mod framebuf;
+pub mod material;
 pub mod ot;
 pub mod prim;
 
-use psx_hw::gpu::{GpuStat, gp0, gp1, pack_color, pack_vertex, pack_xy};
+use crate::material::TextureMaterial;
+use psx_hw::gpu::pack_texcoord;
+use psx_hw::gpu::{gp0, gp1, pack_color, pack_vertex, pack_xy, GpuStat};
 use psx_io::dma::{self, Channel};
 use psx_io::gpu::{gpustat, wait_cmd_ready, write_gp0, write_gp1};
 use psx_io::timers;
@@ -64,15 +69,30 @@ pub struct Resolution {
 
 impl Resolution {
     /// 320×240 — the default for most PS1 games.
-    pub const R320X240: Self = Self { width: 320, height: 240 };
+    pub const R320X240: Self = Self {
+        width: 320,
+        height: 240,
+    };
     /// 256×240.
-    pub const R256X240: Self = Self { width: 256, height: 240 };
+    pub const R256X240: Self = Self {
+        width: 256,
+        height: 240,
+    };
     /// 512×240.
-    pub const R512X240: Self = Self { width: 512, height: 240 };
+    pub const R512X240: Self = Self {
+        width: 512,
+        height: 240,
+    };
     /// 640×240.
-    pub const R640X240: Self = Self { width: 640, height: 240 };
+    pub const R640X240: Self = Self {
+        width: 640,
+        height: 240,
+    };
     /// 320×256 — PAL's natural vertical resolution.
-    pub const R320X256: Self = Self { width: 320, height: 256 };
+    pub const R320X256: Self = Self {
+        width: 320,
+        height: 256,
+    };
 }
 
 /// Initialise the GPU: reset, set display mode, set display ranges,
@@ -195,10 +215,7 @@ pub fn draw_line_mono(x0: i16, y0: i16, x1: i16, y1: i16, r: u8, g: u8, b: u8) {
 /// Draw a Gouraud-shaded line from `(x0, y0, c0)` to `(x1, y1, c1)`.
 /// The GPU interpolates RGB across the segment. Packet (GP0 0x50,
 /// 4 words): `[cmd+c0, v0, c1, v1]`.
-pub fn draw_line_gouraud(
-    x0: i16, y0: i16, c0: (u8, u8, u8),
-    x1: i16, y1: i16, c1: (u8, u8, u8),
-) {
+pub fn draw_line_gouraud(x0: i16, y0: i16, c0: (u8, u8, u8), x1: i16, y1: i16, c1: (u8, u8, u8)) {
     wait_cmd_ready();
     write_gp0(0x5000_0000 | pack_color(c0.0, c0.1, c0.2));
     write_gp0(pack_vertex(x0, y0));
@@ -243,17 +260,33 @@ pub fn draw_quad_textured(
     tpage_word: u16,
     tint: (u8, u8, u8),
 ) {
+    draw_quad_textured_material(
+        verts,
+        uvs,
+        TextureMaterial::opaque(clut_word, tpage_word, tint),
+    );
+}
+
+/// Draw a textured quad using a [`TextureMaterial`].
+///
+/// This is the material-aware version of [`draw_quad_textured`].
+/// The material supplies the CLUT, tpage, tint, raw-texture bit,
+/// semi-transparent command bit, tpage blend mode, and dither bit.
+pub fn draw_quad_textured_material(
+    verts: [(i16, i16); 4],
+    uvs: [(u8, u8); 4],
+    material: TextureMaterial,
+) {
     wait_cmd_ready();
-    // GP0 0x2C = textured quad, opaque, blended with tint.
-    write_gp0(0x2C00_0000 | pack_color(tint.0, tint.1, tint.2));
+    write_gp0(material.flat_textured_polygon_header(true));
     write_gp0(pack_vertex(verts[0].0, verts[0].1));
-    write_gp0((uvs[0].0 as u32) | ((uvs[0].1 as u32) << 8) | ((clut_word as u32) << 16));
+    write_gp0(pack_texcoord(uvs[0].0, uvs[0].1, material.clut_word()));
     write_gp0(pack_vertex(verts[1].0, verts[1].1));
-    write_gp0((uvs[1].0 as u32) | ((uvs[1].1 as u32) << 8) | ((tpage_word as u32) << 16));
+    write_gp0(pack_texcoord(uvs[1].0, uvs[1].1, material.tpage_word()));
     write_gp0(pack_vertex(verts[2].0, verts[2].1));
-    write_gp0((uvs[2].0 as u32) | ((uvs[2].1 as u32) << 8));
+    write_gp0(pack_texcoord(uvs[2].0, uvs[2].1, 0));
     write_gp0(pack_vertex(verts[3].0, verts[3].1));
-    write_gp0((uvs[3].0 as u32) | ((uvs[3].1 as u32) << 8));
+    write_gp0(pack_texcoord(uvs[3].0, uvs[3].1, 0));
 }
 
 /// Draw a gouraud-shaded textured quad (GP0 0x3C, 12 words).
@@ -276,20 +309,61 @@ pub fn draw_quad_textured_gouraud(
     clut_word: u16,
     tpage_word: u16,
 ) {
+    draw_quad_textured_gouraud_material(
+        verts,
+        uvs,
+        colors,
+        TextureMaterial::new(clut_word, tpage_word),
+    );
+}
+
+/// Draw a Gouraud-shaded textured quad using a [`TextureMaterial`].
+///
+/// The material supplies texture state and blend flags; `colors`
+/// still supplies the per-vertex RGB tint payload.
+pub fn draw_quad_textured_gouraud_material(
+    verts: [(i16, i16); 4],
+    uvs: [(u8, u8); 4],
+    colors: [(u8, u8, u8); 4],
+    material: TextureMaterial,
+) {
     wait_cmd_ready();
-    // GP0 0x3C = gouraud-textured quad, opaque.
-    write_gp0(0x3C00_0000 | pack_color(colors[0].0, colors[0].1, colors[0].2));
+    write_gp0(
+        material.textured_polygon_command(true, true)
+            | pack_color(colors[0].0, colors[0].1, colors[0].2),
+    );
     write_gp0(pack_vertex(verts[0].0, verts[0].1));
-    write_gp0((uvs[0].0 as u32) | ((uvs[0].1 as u32) << 8) | ((clut_word as u32) << 16));
+    write_gp0(pack_texcoord(uvs[0].0, uvs[0].1, material.clut_word()));
     write_gp0(pack_color(colors[1].0, colors[1].1, colors[1].2));
     write_gp0(pack_vertex(verts[1].0, verts[1].1));
-    write_gp0((uvs[1].0 as u32) | ((uvs[1].1 as u32) << 8) | ((tpage_word as u32) << 16));
+    write_gp0(pack_texcoord(uvs[1].0, uvs[1].1, material.tpage_word()));
     write_gp0(pack_color(colors[2].0, colors[2].1, colors[2].2));
     write_gp0(pack_vertex(verts[2].0, verts[2].1));
-    write_gp0((uvs[2].0 as u32) | ((uvs[2].1 as u32) << 8));
+    write_gp0(pack_texcoord(uvs[2].0, uvs[2].1, 0));
     write_gp0(pack_color(colors[3].0, colors[3].1, colors[3].2));
     write_gp0(pack_vertex(verts[3].0, verts[3].1));
-    write_gp0((uvs[3].0 as u32) | ((uvs[3].1 as u32) << 8));
+    write_gp0(pack_texcoord(uvs[3].0, uvs[3].1, 0));
+}
+
+/// Draw a variable-size textured sprite using a [`TextureMaterial`].
+///
+/// Textured rectangles do not embed a per-primitive tpage word, so
+/// this helper applies the material draw mode before emitting the
+/// four-word GP0 0x64 packet.
+pub fn draw_sprite_material(
+    x: i16,
+    y: i16,
+    w: u16,
+    h: u16,
+    uv: (u8, u8),
+    material: TextureMaterial,
+) {
+    material.apply_draw_mode();
+    wait_cmd_ready();
+    write_gp0(material.textured_rect_header());
+    write_gp0(pack_vertex(x, y));
+    write_gp0(pack_texcoord(uv.0, uv.1, material.clut_word()));
+    write_gp0(pack_xy(w, h));
 }
 
 /// Upload raw 16bpp pixels from CPU memory into a VRAM rectangle.

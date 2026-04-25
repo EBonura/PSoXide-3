@@ -10,6 +10,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::{Bus, Cpu};
 use parity_oracle::{OracleConfig, ReduxProcess};
 
@@ -59,9 +62,8 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc");
-        bus.cdrom
-            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(std::path::Path::new(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     if wants_pad {
         bus.attach_digital_pad_port1();
@@ -101,13 +103,13 @@ fn main() {
     let mut our_records: Vec<psx_trace::InstructionRecord> = Vec::with_capacity(window as usize);
     for _ in 0..window {
         let was_in_isr = cpu.in_isr();
-        let mut rec = cpu.step(&mut bus).expect("step");
+        let mut rec = cpu.step_traced(&mut bus).expect("step");
         if wants_pad {
             sync_pad_mask(&mut bus, held_buttons, &pad_pulses, &mut current_pad_mask);
         }
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                let r = cpu.step(&mut bus).expect("isr step");
+                let r = cpu.step_traced(&mut bus).expect("isr step");
                 if wants_pad {
                     sync_pad_mask(&mut bus, held_buttons, &pad_pulses, &mut current_pad_mask);
                 }

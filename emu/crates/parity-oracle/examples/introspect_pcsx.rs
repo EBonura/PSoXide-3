@@ -14,9 +14,7 @@ fn main() {
     let config = OracleConfig::new(bios_path, lua).expect("Redux binary resolves");
 
     let mut redux = ReduxProcess::launch(&config).expect("Redux launches");
-    redux
-        .handshake(Duration::from_secs(10))
-        .expect("handshake");
+    redux.handshake(Duration::from_secs(10)).expect("handshake");
 
     redux.send_command("introspect").expect("send");
     // Oracle emits one line per dumped namespace.

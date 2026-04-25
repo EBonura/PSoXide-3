@@ -1,4 +1,5 @@
-//! Capture Redux's and our display-area pixels at step N, compare
+//! Capture Redux's and our display-area pixels at Redux-style user
+//! step N, compare
 //! byte-for-byte, and report exactly what matches and where. Used
 //! to establish Redux-anchored display parity for milestone
 //! goldens (Sony logo, shell, PlayStation splash, game title) so
@@ -9,11 +10,13 @@
 //! cargo run -p parity-oracle --example display_parity_at --release -- 100000000
 //! ```
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use emulator_core::{Bus, Cpu};
 use parity_oracle::{OracleConfig, ReduxProcess};
-use psx_iso::Disc;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -57,8 +60,8 @@ fn main() {
     let _ = redux.terminate();
 
     let redux_bytes = std::fs::read(&redux_path).expect("read redux bytes");
-    let redux_meta = std::fs::read_to_string(format!("{}.txt", redux_path.display()))
-        .unwrap_or_default();
+    let redux_meta =
+        std::fs::read_to_string(format!("{}.txt", redux_path.display())).unwrap_or_default();
     let (r_w, r_h) = parse_wh(&redux_meta);
     eprintln!(
         "[redux] display {r_w}×{r_h}, {} bytes, hash=0x{:016x}",
@@ -70,14 +73,12 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("bios");
     let mut bus = Bus::new(bios).expect("bus");
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc");
-        bus.cdrom.insert_disc(Some(Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(&PathBuf::from(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
     eprintln!("[ours]  running {n} steps in our emulator...");
-    for _ in 0..n {
-        cpu.step(&mut bus).expect("step");
-    }
+    step_ours_user_steps(&mut cpu, &mut bus, n);
     let (_ours_hash, ours_w, ours_h, ours_len) = bus.gpu.display_hash();
     // Also dump raw bytes for direct comparison.
     let da = bus.gpu.display_area();
@@ -100,7 +101,11 @@ fn main() {
     println!();
     println!("=== Display parity @ step {n} ===");
     println!("dimensions: redux={r_w}×{r_h}  ours={ours_w}×{ours_h}");
-    println!("byte count: redux={}  ours={}", redux_bytes.len(), ours_bytes.len());
+    println!(
+        "byte count: redux={}  ours={}",
+        redux_bytes.len(),
+        ours_bytes.len()
+    );
     if r_w == ours_w && r_h == ours_h {
         byte_compare(&redux_bytes, &ours_bytes, r_w);
     } else {
@@ -129,8 +134,10 @@ fn main() {
         }
         let total_bytes = (w * h * 2) as usize;
         println!("overlap: {w}×{h} = {total_bytes} bytes");
-        println!("differing bytes: {diffs} / {total_bytes} ({:.2}%)",
-            100.0 * diffs as f64 / total_bytes.max(1) as f64);
+        println!(
+            "differing bytes: {diffs} / {total_bytes} ({:.2}%)",
+            100.0 * diffs as f64 / total_bytes.max(1) as f64
+        );
         if let Some((y, x)) = first_diff {
             println!("first diff at (x={x}, y={y})");
         }
@@ -138,6 +145,18 @@ fn main() {
     println!();
     println!("Redux raw bytes: {}", redux_path.display());
     println!("Ours raw bytes:  {}", ours_path.display());
+}
+
+fn step_ours_user_steps(cpu: &mut Cpu, bus: &mut Bus, steps: u64) {
+    for _ in 0..steps {
+        let was_in_isr = cpu.in_isr();
+        cpu.step(bus).expect("step");
+        if !was_in_isr && cpu.in_irq_handler() {
+            while cpu.in_irq_handler() {
+                cpu.step(bus).expect("isr step");
+            }
+        }
+    }
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -174,8 +193,10 @@ fn byte_compare(a: &[u8], b: &[u8], width: u32) {
         }
     }
     let total = a.len().min(b.len());
-    println!("differing bytes: {diffs} / {total} ({:.2}%)",
-        100.0 * diffs as f64 / total.max(1) as f64);
+    println!(
+        "differing bytes: {diffs} / {total} ({:.2}%)",
+        100.0 * diffs as f64 / total.max(1) as f64
+    );
     if let Some(off) = first_diff {
         let px = off / 2;
         let y = px as u32 / width;

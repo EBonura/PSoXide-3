@@ -19,10 +19,10 @@ fn our_trace_to(bios: Vec<u8>, n: usize) -> Vec<InstructionRecord> {
     let mut records = Vec::with_capacity(n);
     while records.len() < n {
         let was_in_isr = cpu.in_isr();
-        let mut rec = cpu.step(&mut bus).expect("step");
+        let mut rec = cpu.step_traced(&mut bus).expect("step");
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                let r = cpu.step(&mut bus).expect("step");
+                let r = cpu.step_traced(&mut bus).expect("step");
                 rec.tick = r.tick;
                 rec.gprs = r.gprs;
             }
@@ -74,7 +74,12 @@ fn main() {
             println!("      pc:    ours=0x{:08x}  theirs=0x{:08x}", u.pc, t.pc);
         }
         if !match_tick {
-            println!("      tick:  ours={:>10}  theirs={:>10}  delta={}", u.tick, t.tick, u.tick as i64 - t.tick as i64);
+            println!(
+                "      tick:  ours={:>10}  theirs={:>10}  delta={}",
+                u.tick,
+                t.tick,
+                u.tick as i64 - t.tick as i64
+            );
         }
         if !match_gprs {
             for r in 0..32 {

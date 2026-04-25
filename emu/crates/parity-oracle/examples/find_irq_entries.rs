@@ -12,8 +12,7 @@ fn main() {
         .unwrap_or_else(|_| "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN".into());
     let bios = fs::read(&bios_path).expect("BIOS readable");
     let dir = cache::default_dir();
-    let records =
-        cache::load_prefix(&dir, &bios, 20_000_000).expect("no cached trace past 20M");
+    let records = cache::load_prefix(&dir, &bios, 20_000_000).expect("no cached trace past 20M");
 
     // Count IRQ entries and print the first few with a few context steps.
     let mut count = 0usize;

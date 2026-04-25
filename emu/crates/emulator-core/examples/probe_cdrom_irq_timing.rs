@@ -11,6 +11,9 @@
 //! Runs silently on both sides; ours takes ~2 s for 100 M steps,
 //! Redux ~3 min.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -38,23 +41,33 @@ fn main() {
     let t0 = Instant::now();
     let bios = std::fs::read(&bios_path).expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
-    bus.cdrom.enable_irq_log(max_log as usize);
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc");
-        bus.cdrom
-            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(&PathBuf::from(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
+    let mut our_log = Vec::with_capacity(max_log as usize);
+    let mut prev_cdrom_istat = bus.irq().stat() & 0x4;
     for _ in 0..n {
         let was_in_isr = cpu.in_isr();
         cpu.step(&mut bus).expect("step");
+        let cur_cdrom_istat = bus.irq().stat() & 0x4;
+        if cur_cdrom_istat != 0 && prev_cdrom_istat == 0 && our_log.len() < max_log as usize {
+            our_log.push((bus.cycles(), bus.cdrom.irq_flag() & 0x7));
+        }
+        prev_cdrom_istat = cur_cdrom_istat;
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
                 cpu.step(&mut bus).expect("isr step");
+                let cur_cdrom_istat = bus.irq().stat() & 0x4;
+                if cur_cdrom_istat != 0 && prev_cdrom_istat == 0 && our_log.len() < max_log as usize
+                {
+                    our_log.push((bus.cycles(), bus.cdrom.irq_flag() & 0x7));
+                }
+                prev_cdrom_istat = cur_cdrom_istat;
             }
         }
     }
-    let our_log = bus.cdrom.cdrom_irq_log.clone();
     eprintln!(
         "[ours] captured {} CDROM IRQs in {:.1}s",
         our_log.len(),
@@ -92,7 +105,12 @@ fn main() {
     );
     println!("{}", "-".repeat(60));
     let irq_names = [
-        "NONE", "DataReady", "Complete", "Acknowledge", "DataEnd", "Error",
+        "NONE",
+        "DataReady",
+        "Complete",
+        "Acknowledge",
+        "DataEnd",
+        "Error",
     ];
     let pairs = our_log.len().min(redux_log.len());
     let mut first_diff: Option<usize> = None;
@@ -100,10 +118,7 @@ fn main() {
         let (ot, oty) = our_log[i];
         let (_rs, rt, rty) = redux_log[i];
         let delta = ot as i64 - rt as i64;
-        let oname = irq_names
-            .get(oty as usize)
-            .copied()
-            .unwrap_or("?");
+        let oname = irq_names.get(oty as usize).copied().unwrap_or("?");
         let marker = if delta != 0 && first_diff.is_none() {
             first_diff = Some(i);
             " <<<"
@@ -111,13 +126,14 @@ fn main() {
             ""
         };
         let flags = if oty != rty {
-            format!(" (type diff: redux={})", irq_names.get(rty as usize).copied().unwrap_or("?"))
+            format!(
+                " (type diff: redux={})",
+                irq_names.get(rty as usize).copied().unwrap_or("?")
+            )
         } else {
             String::new()
         };
-        println!(
-            "{i:>4}  {oname:<9}  {ot:>13}  {rt:>13}  {delta:>+10}{marker}{flags}"
-        );
+        println!("{i:>4}  {oname:<9}  {ot:>13}  {rt:>13}  {delta:>+10}{marker}{flags}");
     }
     if our_log.len() != redux_log.len() {
         println!();

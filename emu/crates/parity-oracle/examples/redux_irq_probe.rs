@@ -25,10 +25,7 @@ fn bios_path() -> PathBuf {
 }
 
 fn main() {
-    let mut checkpoints: Vec<u32> = env::args()
-        .skip(1)
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let mut checkpoints: Vec<u32> = env::args().skip(1).filter_map(|s| s.parse().ok()).collect();
     if checkpoints.is_empty() {
         checkpoints = vec![100_000, 500_000, 2_000_000, 6_000_000, 10_000_000];
     }
@@ -40,7 +37,11 @@ fn main() {
     redux.handshake(HANDSHAKE_TIMEOUT).expect("handshake");
 
     let total: u32 = *checkpoints.last().unwrap();
-    eprintln!("[probe] {} checkpoints, total {} steps", checkpoints.len(), total);
+    eprintln!(
+        "[probe] {} checkpoints, total {} steps",
+        checkpoints.len(),
+        total
+    );
     let start = Instant::now();
 
     let mut at: u32 = 0;

@@ -136,19 +136,40 @@ impl Dma {
         }
     }
 
+    /// Read a byte from the DMA register window.
+    ///
+    /// Some games poke global DMA registers byte-wise. In particular,
+    /// WipEout 3 toggles channel-specific DICR IRQ-enable bits through
+    /// `sb` at `DICR+2` while streaming FMV chunks; routing those reads
+    /// through the live register state keeps the later writeback honest.
+    pub fn read8(&self, phys: u32) -> u8 {
+        let word = self.read32(phys & !3);
+        ((word >> ((phys & 3) * 8)) & 0xFF) as u8
+    }
+
+    /// Read a little-endian halfword from the DMA register window.
+    pub fn read16(&self, phys: u32) -> u16 {
+        u16::from_le_bytes([self.read8(phys), self.read8(phys.wrapping_add(1))])
+    }
+
     /// Write a 32-bit word. `phys` must be inside [`Dma::BASE`]..[`Dma::END`].
-    /// Channel-control start bits are *recorded* (Phase 2g is scaffolding
-    /// only) but no transfer actually fires — peripheral subsystems
-    /// claim that work as they come online.
-    pub fn write32(&mut self, phys: u32, value: u32) {
+    ///
+    /// Returns `true` when a DICR write transitions the DMA master IRQ
+    /// flag from clear to set, matching Redux's `psxhw.cc` side effect.
+    /// Channel-control start bits are recorded here; transfer execution
+    /// is still owned by the bus/peripheral layer.
+    pub fn write32(&mut self, phys: u32, value: u32) -> bool {
         let offset = phys - Self::BASE;
         match offset {
-            Self::DPCR_OFFSET => self.dpcr = value,
+            Self::DPCR_OFFSET => {
+                self.dpcr = value;
+                false
+            }
             Self::DICR_OFFSET => self.write_dicr(value),
             _ => {
                 let (ch, field) = decode(phys);
                 if ch >= NUM_CHANNELS {
-                    return;
+                    return false;
                 }
                 let c = &mut self.channels[ch];
                 match field {
@@ -158,10 +179,54 @@ impl Dma {
                         c.channel_control = value;
                         if (value >> 24) & 1 != 0 {
                             self.start_trigger_counts[ch] += 1;
-                            self.chcr_write_count[ch] =
-                                self.chcr_write_count[ch].saturating_add(1);
+                            self.chcr_write_count[ch] = self.chcr_write_count[ch].saturating_add(1);
                         }
                     }
+                    _ => {}
+                }
+                false
+            }
+        }
+    }
+
+    /// Write a byte to the DMA register window.
+    ///
+    /// Redux lets byte/halfword writes in this range update the raw
+    /// backing register bytes. That is subtly different from a 32-bit
+    /// DICR write: partial writes do not run DICR's write-one-to-clear
+    /// path and do not dispatch DMA channel starts.
+    pub fn write8(&mut self, phys: u32, value: u8) -> bool {
+        let word_addr = phys & !3;
+        let shift = (phys & 3) * 8;
+        let mask = 0xFFu32 << shift;
+        let word = (self.read32(word_addr) & !mask) | ((value as u32) << shift);
+        self.write_raw32(word_addr, word);
+        false
+    }
+
+    /// Write a little-endian halfword to the DMA register window.
+    pub fn write16(&mut self, phys: u32, value: u16) -> bool {
+        let [lo, hi] = value.to_le_bytes();
+        let mut edge = self.write8(phys, lo);
+        edge |= self.write8(phys.wrapping_add(1), hi);
+        edge
+    }
+
+    fn write_raw32(&mut self, phys: u32, value: u32) {
+        let offset = phys - Self::BASE;
+        match offset {
+            Self::DPCR_OFFSET => self.dpcr = value,
+            Self::DICR_OFFSET => self.dicr = value,
+            _ => {
+                let (ch, field) = decode(phys);
+                if ch >= NUM_CHANNELS {
+                    return;
+                }
+                let c = &mut self.channels[ch];
+                match field {
+                    0x0 => c.base = value & 0x00FF_FFFF,
+                    0x4 => c.block_control = value,
+                    0x8 => c.channel_control = value,
                     _ => {}
                 }
             }
@@ -177,38 +242,51 @@ impl Default for Dma {
 
 // --- DICR semantics ---
 //
-// Layout (Nocash):
+// Layout (Redux/PCSX-style):
 //   bits  0..5  : Unknown (R/W)
 //   bits  6..14 : Reserved (always 0)
-//   bit   15    : Bus-error flag (R, W1C)
+//   bit   15    : Bus-error flag
 //   bits 16..22 : Per-channel IRQ enable (R/W) — DMA0..DMA6
 //   bit   23    : IRQ master enable (R/W)
 //   bits 24..30 : Per-channel IRQ flag (R, W1C) — DMA0..DMA6
-//   bit   31    : IRQ master flag (R) — derived:
-//                 (bit15) | (bit23 & ((bits16..22) & (bits24..30) != 0))
+//   bit   31    : IRQ master flag (stored by Redux, not purely derived)
 //
-// The R/W bits are stored verbatim. The W1C bits (15, 24..30) are
-// cleared by writing a `1` (and preserved by writing `0`), which is the
-// inverse of the natural u32 store. Bit 31 is read-only and computed.
+// Redux stores bit 31 explicitly and raises IRQ 8 from two places:
+// DMA completion and CPU writes to DICR that make the master flag
+// transition. Matching that detail matters because BIOS code can leave
+// a per-channel flag pending while toggling the master enable later.
 impl Dma {
     const DICR_RW_MASK: u32 = 0x00FF_003F;
-    const DICR_W1C_MASK: u32 = 0x7F00_8000;
+    const DICR_FLAG_MASK: u32 = 0x7F00_0000;
     const DICR_MASTER_ENABLE: u32 = 1 << 23;
-    const DICR_BUS_ERROR: u32 = 1 << 15;
+    const DICR_MASTER_FLAG: u32 = 1 << 31;
+    const DICR_ERROR_OR_FLAGS: u32 = 0x7F00_8000;
 
-    fn write_dicr(&mut self, value: u32) {
-        let prev = self.dicr;
-        let rw = value & Self::DICR_RW_MASK;
-        let preserved_flags = prev & Self::DICR_W1C_MASK & !value;
-        self.dicr = rw | preserved_flags;
+    fn write_dicr(&mut self, value: u32) -> bool {
+        // Direct port of Redux `psxhw.cc` DICR write handling:
+        // - bits 24..30 are write-1-to-clear flags
+        // - bits 0..5 and 16..23 are regular writable state
+        // - writing master-enable while a flag is pending raises IRQ 8
+        let mut icr = self.dicr;
+        let ack_mask = (value & Self::DICR_FLAG_MASK) ^ Self::DICR_FLAG_MASK;
+        let was_not_triggered = icr & Self::DICR_MASTER_FLAG == 0;
+        let has_error = value & 0x0000_8000 != 0;
+        let is_enabled = value & Self::DICR_MASTER_ENABLE != 0;
+
+        icr &= ack_mask;
+        icr |= value & Self::DICR_RW_MASK;
+
+        let mut triggered = false;
+        if (icr & Self::DICR_ERROR_OR_FLAGS) != 0 && (has_error || is_enabled) {
+            icr |= Self::DICR_MASTER_FLAG;
+            triggered = true;
+        }
+        self.dicr = icr;
+        was_not_triggered && triggered
     }
 
     fn dicr_with_master_flag(&self) -> u32 {
-        let enabled = (self.dicr >> 16) & 0x7F;
-        let pending = (self.dicr >> 24) & 0x7F;
-        let any_irq = self.dicr & Self::DICR_MASTER_ENABLE != 0 && (enabled & pending) != 0;
-        let master_flag = self.dicr & Self::DICR_BUS_ERROR != 0 || any_irq;
-        (self.dicr & 0x7FFF_FFFF) | ((master_flag as u32) << 31)
+        self.dicr
     }
 
     /// Notify the DICR that DMA channel `ch` has completed. Sets the
@@ -220,14 +298,17 @@ impl Dma {
         if ch >= NUM_CHANNELS {
             return false;
         }
+        if self.dicr & Self::DICR_MASTER_ENABLE == 0 {
+            return false;
+        }
         let enable_bit = 1 << (16 + ch);
         if self.dicr & enable_bit == 0 {
             return false;
         }
-        let prev_master = self.dicr_with_master_flag() >> 31;
+        let prev_master = self.dicr & Self::DICR_MASTER_FLAG != 0;
         self.dicr |= 1 << (24 + ch);
-        let new_master = self.dicr_with_master_flag() >> 31;
-        prev_master == 0 && new_master == 1
+        self.dicr |= Self::DICR_MASTER_FLAG;
+        !prev_master
     }
 }
 
@@ -339,13 +420,35 @@ mod tests {
     }
 
     #[test]
+    fn partial_reads_see_live_register_bytes() {
+        let mut dma = Dma::new();
+        dma.write32(0x1F80_10F0, 0x0765_4321);
+        assert_eq!(dma.read8(0x1F80_10F0), 0x21);
+        assert_eq!(dma.read8(0x1F80_10F2), 0x65);
+        assert_eq!(dma.read16(0x1F80_10F1), 0x6543);
+    }
+
+    #[test]
+    fn dicr_byte_write_toggles_channel_irq_enable() {
+        let mut disabled = Dma::new();
+        disabled.write8(0x1F80_10F6, 0x80); // master enable, channel 3 IRQ disabled
+        assert_eq!(disabled.read8(0x1F80_10F6) & 0x08, 0);
+        assert!(!disabled.notify_channel_done(3));
+
+        let mut enabled = Dma::new();
+        enabled.write8(0x1F80_10F6, 0x88); // master enable + channel 3 IRQ enable
+        assert_ne!(enabled.read8(0x1F80_10F6) & 0x08, 0);
+        assert!(enabled.notify_channel_done(3));
+    }
+
+    #[test]
     fn dicr_rw_bits_roundtrip_w1c_bits_dont() {
         // Configure all enables + master, leave flags clear. R/W bits
         // round-trip; W1C bits (15, 24..30) ignore writes-of-zero.
         let mut dma = Dma::new();
         dma.write32(0x1F80_10F4, 0x00FF_0000); // enables 16..23
-        // Read-back includes the computed master flag in bit 31 — clear
-        // here because no per-channel flag is set.
+                                               // Read-back includes the computed master flag in bit 31 — clear
+                                               // here because no per-channel flag is set.
         assert_eq!(dma.read32(0x1F80_10F4), 0x00FF_0000);
     }
 
@@ -383,6 +486,18 @@ mod tests {
         let dicr = dma.read32(0x1F80_10F4);
         assert_eq!(dicr & (1 << 24), 0, "flag cleared by W1C");
         assert_eq!(dicr & (1 << 31), 0, "master flag follows");
+    }
+
+    #[test]
+    fn dicr_write_can_raise_master_irq_edge() {
+        let mut dma = Dma::new();
+        // Simulate a pending GPU-DMA flag with the channel enable set,
+        // but master IRQ still clear. Redux raises IRQ 8 when software
+        // writes DICR with master enable in this state.
+        dma.dicr = (1 << (16 + 2)) | (1 << (24 + 2));
+        let edge = dma.write32(0x1F80_10F4, (1 << (16 + 2)) | (1 << 23));
+        assert!(edge, "DICR write should create a master IRQ edge");
+        assert!(dma.read32(0x1F80_10F4) & (1 << 31) != 0);
     }
 
     #[test]

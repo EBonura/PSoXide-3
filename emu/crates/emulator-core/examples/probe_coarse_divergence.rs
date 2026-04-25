@@ -15,6 +15,9 @@
 //! needs to trace `INTERVAL` records (~250 KiB, ~0.3 s), not the
 //! full run.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -72,9 +75,8 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("BIOS");
     let mut bus = Bus::new(bios).expect("bus");
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc");
-        bus.cdrom
-            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(&PathBuf::from(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     if wants_pad {
         bus.attach_digital_pad_port1();

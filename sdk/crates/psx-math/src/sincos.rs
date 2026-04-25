@@ -2,9 +2,10 @@
 //!
 //! A Q0.12 angle represents one full revolution in a 12-bit
 //! unsigned: `0..4096` maps linearly onto `0°..360°`. This
-//! matches the PSX GTE's `ONE` / `4096` angle precision and keeps
-//! the lookup table small — 256 entries is enough for ~1.4° of
-//! angular resolution, which is invisible at 8-pixel glyph scale.
+//! matches the PSX GTE's `ONE` / `4096` angle precision. The lookup
+//! table stays compact at 256 entries, and `sin_q12` linearly
+//! interpolates between entries so every Q0.12 angle step produces a
+//! distinct result when the table slope permits it.
 //!
 //! Values are Q1.12 fixed-point: `4096` = 1.0, `-4096` = -1.0.
 //!
@@ -25,8 +26,9 @@
 /// 256-entry sine table, Q1.12 fixed-point (one revolution).
 ///
 /// Index = `(angle_q12 >> 4) & 0xFF`, where `angle_q12` is a u16
-/// in `[0, 4096)` mapping linearly to `[0°, 360°)`. Values are
-/// i16 in `[-4096, 4096]`.
+/// in `[0, 4096)` mapping linearly to `[0°, 360°)`. `sin_q12`
+/// interpolates using the low 4 angle bits. Values are i16 in
+/// `[-4096, 4096]`.
 pub const SIN_TABLE: [i16; 256] = [
         0,   101,   201,   301,   401,   501,   601,   700,
       799,   897,   995,  1092,  1189,  1285,  1380,  1474,
@@ -65,10 +67,12 @@ pub const SIN_TABLE: [i16; 256] = [
 /// `sin(angle_q12)` as a Q1.12 value. Input wraps modulo 4096.
 #[inline]
 pub fn sin_q12(angle_q12: u16) -> i32 {
-    // Angle input quantum is 16× finer than the 256-entry table,
-    // so we drop the bottom 4 bits. Nearest-neighbour lookup at
-    // this resolution gives ~1.4° steps — invisible for text.
-    SIN_TABLE[((angle_q12 >> 4) & 0xFF) as usize] as i32
+    let angle = angle_q12 & 0x0FFF;
+    let idx = (angle >> 4) as usize;
+    let frac = (angle & 0x000F) as i32;
+    let a = SIN_TABLE[idx] as i32;
+    let b = SIN_TABLE[(idx + 1) & 0xFF] as i32;
+    a + (((b - a) * frac) / 16)
 }
 
 /// `cos(angle_q12)` as a Q1.12 value, implemented as
@@ -104,5 +108,20 @@ mod tests {
         // 4096 is one full revolution; the u16 wrap makes it 0.
         assert_eq!(sin_q12(4096), sin_q12(0));
         assert_eq!(sin_q12(5120), sin_q12(1024));
+    }
+
+    #[test]
+    fn interpolates_low_angle_bits() {
+        assert_eq!(sin_q12(0), SIN_TABLE[0] as i32);
+        assert!(sin_q12(1) > sin_q12(0));
+        assert!(sin_q12(1) < SIN_TABLE[1] as i32);
+        assert_eq!(sin_q12(16), SIN_TABLE[1] as i32);
+    }
+
+    #[test]
+    fn interpolates_across_table_wrap() {
+        assert!(sin_q12(4095) < 0);
+        assert!(sin_q12(4095) > SIN_TABLE[255] as i32);
+        assert_eq!(sin_q12(4096), 0);
     }
 }

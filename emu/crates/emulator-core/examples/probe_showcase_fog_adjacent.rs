@@ -1,10 +1,5 @@
-//! Dump two consecutive showcase-fog frames across the ring-wrap
-//! boundary so we can see exactly what changes frame-to-frame.
-//!
-//! Ring wrap period = RING_SPACING / SCROLL_SPEED = 0x500 / 0x20 =
-//! 40 frames. So wraps happen at frames 40, 80, 120, ... We dump
-//! frames around frame 40 (both sides) plus two deep mid-run frames
-//! to confirm non-wrap frames are continuous.
+//! Dump neighbouring showcase-fog frames around scroll-wrap points so
+//! we can see exactly what changes frame-to-frame.
 use emulator_core::{Bus, Cpu};
 use psx_iso::Exe;
 use std::io::Write;
@@ -23,12 +18,11 @@ fn main() {
     let mut cpu = Cpu::new();
     cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
 
-    // Around the first wrap (frame 40) + a non-wrap neighbourhood.
-    // Wrap expected around frame 41 (ring_spacing / scroll_speed = 40 steps).
-    // Dump 20 consecutive frames spanning two potential wrap points.
+    // RING_SPACING / SCROLL_SPEED is about 162 frames. Dump groups
+    // around two wraps to check that the one-tile phase reset is clean.
     let sample_targets: &[u64] = &[
-        35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-        75, 76, 77, 78, 79, 80, 81, 82, 83, 84,
+        157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 319, 320, 321, 322, 323, 324, 325, 326,
+        327, 328,
     ];
     let mut cycles_at_last_pump = 0u64;
     for &target in sample_targets {

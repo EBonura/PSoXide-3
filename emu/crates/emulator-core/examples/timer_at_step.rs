@@ -24,17 +24,23 @@ fn main() {
     let mut cpu = Cpu::new();
 
     for _ in 0..target {
+        let was_in_isr = cpu.in_isr();
         cpu.step(&mut bus).expect("step");
+        if !was_in_isr && cpu.in_irq_handler() {
+            while cpu.in_irq_handler() {
+                cpu.step(&mut bus).expect("isr step");
+            }
+        }
     }
 
     println!("=== Timer-bank state at step {target} ===");
     println!("cycles: {}", bus.cycles());
     println!();
     for i in 0..3 {
-        let base = 0x1F80_1100 + (i as u32) * 0x10;
-        let counter = bus.timers().read32(base);
-        let mode = bus.timers().read32(base + 4);
-        let target_val = bus.timers().read32(base + 8);
+        let t = &bus.timers().timers[i];
+        let counter = t.counter & 0xFFFF;
+        let mode = t.mode & 0xFFFF;
+        let target_val = t.target & 0xFFFF;
         let source = (mode >> 8) & 0x3;
         let source_name = match (i, source) {
             (0, 0) | (0, 2) => "system",
@@ -45,7 +51,6 @@ fn main() {
             (2, 2) | (2, 3) => "sys/8",
             _ => "?",
         };
-        let t = &bus.timers().timers[i];
         println!(
             "Timer {i}: counter={counter:>5} (0x{counter:04x})  \
              mode=0x{mode:08x}  target={target_val:>5} (0x{target_val:04x})  \

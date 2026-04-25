@@ -17,9 +17,8 @@
 //!
 //! What's on screen:
 //!
-//! 1. **Room floor + back wall** — two big `TriFlat` slabs at the
-//!    edges, giving the light flow something to play across.
-//! 2. **6 scaled cubes** on the floor — different heights + XZ
+//! 1. **Dark-room backdrop** — a Gouraud gradient behind the scene.
+//! 2. **6 scaled cubes** — different heights + XZ
 //!    positions, one canonical cube mesh `include_bytes!`'d from
 //!    `assets/cube.psxm` (cooked from a face-split OBJ so per-face
 //!    normals come out of `psxed --compute-normals` flat).
@@ -41,10 +40,14 @@
 extern crate psx_rt;
 
 use psx_asset::Mesh;
-use psx_engine::{ActorTransform, App, Config, Ctx, Scene, Vec3World};
-use psx_font::{FontAtlas, fonts::BASIC_8X16};
+use psx_engine::{
+    ActorTransform, App, Config, Ctx, DepthBand, DepthRange, GouraudMeshOptions, GouraudRenderPass,
+    GouraudTriCommand, OtFrame, PrimitiveArena, Scene, Vec3World,
+};
+use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_gpu::ot::OrderingTable;
-use psx_gpu::prim::{QuadGouraud, RectFlat, TriFlat, TriGouraud};
+use psx_gpu::prim::{QuadGouraud, RectFlat, TriGouraud};
+use psx_gte::lighting::ProjectedLit;
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene;
 use psx_math::sincos;
@@ -56,7 +59,11 @@ use psx_vram::{Clut, TexDepth, Tpage};
 
 const SCREEN_W: i16 = 320;
 const SCREEN_H: i16 = 240;
-const OT_DEPTH: usize = 8;
+const OT_DEPTH: usize = 16;
+const BG_SLOT: usize = OT_DEPTH - 1;
+const WORLD_BAND: DepthBand = DepthBand::new(3, OT_DEPTH - 3);
+const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(0x1800, 0x8000);
+const LIGHT_MARKER_SLOT: usize = 2;
 
 const PROJ_H: u16 = 280;
 /// Camera setback — tuned so the cubes sit comfortably in the
@@ -89,7 +96,9 @@ const LIGHT_RADIUS_SQ: i32 = 0x1800_0000;
 /// "reference distance" the dot product divides by to turn its
 /// N · D magnitude (which carries distance) into a rough
 /// direction-only scalar.
-const RADIUS_LINEAR: i64 = 0x4E00;
+const RADIUS_LINEAR: i32 = 0x4E00;
+const LIGHT_ATT_DENOM_Q12: i32 = LIGHT_RADIUS_SQ >> 12;
+const LIGHT_DELTA_LIMIT: i32 = 0x4F00;
 
 /// Per-channel ambient term, added before clamping. Dim blueish
 /// so shadowed faces read as "in the dark room" rather than
@@ -188,8 +197,8 @@ struct Lighting {
 
 static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
 
-/// Gouraud cube tris + 2 flat floor/wall tris: 6 cubes × 12 tris =
-/// 72 tris, plus room. 96 slots = headroom.
+/// Gouraud cube tris: 4 cubes × 12 tris = 48. 96 slots leaves
+/// headroom for a denser layout later.
 static mut GOURAUD_TRIS: [TriGouraud; 96] = [const {
     TriGouraud {
         tag: 0,
@@ -202,23 +211,11 @@ static mut GOURAUD_TRIS: [TriGouraud; 96] = [const {
     }
 }; 96];
 
-/// Flat tris for the floor + back wall.
-static mut FLAT_TRIS: [TriFlat; 8] = [const {
-    TriFlat {
-        tag: 0,
-        color_cmd: 0,
-        v0: 0,
-        v1: 0,
-        v2: 0,
-    }
-}; 8];
-
 /// Rects for light position markers (one per light — small bright
 /// square at each light's projected screen pos so the viewer can
 /// see where the lights are).
-static mut LIGHT_MARKERS: [RectFlat; 16] = [const {
-    RectFlat::new(0, 0, 0, 0, 0, 0, 0)
-}; 16];
+static mut LIGHT_MARKERS: [RectFlat; 16] = [const { RectFlat::new(0, 0, 0, 0, 0, 0, 0) }; 16];
+static mut GOURAUD_COMMANDS: [GouraudTriCommand; 96] = [GouraudTriCommand::EMPTY; 96];
 
 static mut BG_QUAD: QuadGouraud = QuadGouraud {
     tag: 0,
@@ -232,10 +229,16 @@ static mut BG_QUAD: QuadGouraud = QuadGouraud {
     v3: 0,
 };
 
-/// Per-cube projected vertex cache: (sx, sy, sz, r, g, b).
-type VertProj = (i16, i16, u16, u8, u8, u8);
-const EMPTY_VERT: VertProj = (0, 0, 0, 0, 0, 0);
-static mut CUBE_PROJ: [VertProj; 32] = [EMPTY_VERT; 32];
+/// Per-cube projected vertex cache.
+const EMPTY_VERT: ProjectedLit = ProjectedLit {
+    sx: 0,
+    sy: 0,
+    sz: 0,
+    r: 0,
+    g: 0,
+    b: 0,
+};
+static mut CUBE_PROJ: [ProjectedLit; 32] = [EMPTY_VERT; 32];
 
 // ----------------------------------------------------------------------
 // Per-vertex CPU lighting
@@ -270,28 +273,30 @@ fn light_vertex(
         let dy = (light.pos.y as i32) - (world_pos.y as i32);
         let dz = (light.pos.z as i32) - (world_pos.z as i32);
 
-        // Distance squared, in i64 to avoid overflow (each
-        // component can be up to ~0x3000, squared ≈ 0x900_0000,
-        // sum up to ~0x1B00_0000 — fits i32 but tight. i64 keeps
-        // headroom for wider scenes.)
-        let dist_sq = (dx as i64) * (dx as i64)
-            + (dy as i64) * (dy as i64)
-            + (dz as i64) * (dz as i64);
+        if dx < -LIGHT_DELTA_LIMIT
+            || dx > LIGHT_DELTA_LIMIT
+            || dy < -LIGHT_DELTA_LIMIT
+            || dy > LIGHT_DELTA_LIMIT
+            || dz < -LIGHT_DELTA_LIMIT
+            || dz > LIGHT_DELTA_LIMIT
+        {
+            continue;
+        }
 
-        if dist_sq > LIGHT_RADIUS_SQ as i64 {
+        let dist_sq = dx * dx + dy * dy + dz * dz;
+
+        if dist_sq > LIGHT_RADIUS_SQ {
             continue;
         }
 
         // Quadratic attenuation: 1 at dist=0, 0 at dist²=RADIUS_SQ.
         // att in [0, 0x1000]
-        let att_q12 = (((LIGHT_RADIUS_SQ as i64 - dist_sq) << 12)
-            / LIGHT_RADIUS_SQ as i64) as i32;
+        let att_q12 = ((LIGHT_RADIUS_SQ - dist_sq) / LIGHT_ATT_DENOM_Q12).clamp(0, 0x1000);
 
         // Un-normalised N · D. Components of N are Q3.12, D's are
         // raw world units. Result is in Q3.12 × world-units.
-        let dot_unnorm = (world_normal.x as i64) * (dx as i64)
-            + (world_normal.y as i64) * (dy as i64)
-            + (world_normal.z as i64) * (dz as i64);
+        let dot_unnorm =
+            (world_normal.x as i32) * dx + (world_normal.y as i32) * dy + (world_normal.z as i32) * dz;
 
         // Facing-away? Skip.
         if dot_unnorm <= 0 {
@@ -307,11 +312,11 @@ fn light_vertex(
         // Dividing the Q3.12 dot (which carries distance in its
         // magnitude) by `RADIUS_LINEAR` rescales it into a rough
         // Q3.12 direction-intensity in `[0, ~0x1000]`.
-        let intensity_q12 = (dot_unnorm / RADIUS_LINEAR) as i32;
+        let intensity_q12 = dot_unnorm / RADIUS_LINEAR;
 
         // Modulate by quadratic attenuation and normal magnitude.
         // `lit_scalar` is in Q3.12, roughly [0, 0x1000].
-        let lit_scalar = ((intensity_q12 as i64 * att_q12 as i64) >> 12) as i32;
+        let lit_scalar = (intensity_q12 * att_q12) >> 12;
         // Clamp before accumulating — single lights shouldn't
         // saturate the channel on their own.
         let lit_scalar = lit_scalar.clamp(0, 0x1000);
@@ -354,14 +359,13 @@ impl Scene for Lighting {
         let phases: [(i16, u16, i16, u16); NUM_LIGHTS] = [
             // (orbit_radius, frames_per_rev_scale, y_height, phase_deg)
             (0x2400, 16, 0x0400, 0),
-            (0x2800, 20, 0x0C00, 1024), // 90°
+            (0x2800, 20, 0x0C00, 1024),  // 90°
             (0x1E00, 24, -0x0400, 2048), // 180°
-            (0x2C00, 18, 0x0800, 3072), // 270°
+            (0x2C00, 18, 0x0800, 3072),  // 270°
         ];
         for i in 0..NUM_LIGHTS {
             let (r, speed, y, phase) = phases[i];
-            let angle = (ctx.frame.wrapping_mul(speed as u32) as u16)
-                .wrapping_add(phase);
+            let angle = (ctx.frame.wrapping_mul(speed as u32) as u16).wrapping_add(phase);
             // Q1.12 sin/cos scaled by Q3.12 radius → Q4.24 position,
             // shift right 12 to bring back to Q3.12.
             let x = ((sincos::cos_q12(angle) * r as i32) >> 12) as i16;
@@ -372,7 +376,6 @@ impl Scene for Lighting {
 
     fn render(&mut self, ctx: &mut Ctx) {
         self.build_frame_ot(ctx.frame);
-        unsafe { OT.submit() };
         let font = self.font.as_ref().expect("font uploaded in init");
         self.draw_hud(font, ctx.frame);
     }
@@ -380,34 +383,27 @@ impl Scene for Lighting {
 
 impl Lighting {
     fn build_frame_ot(&mut self, frame: u32) {
-        let ot = unsafe { &mut OT };
-        let gouraud = unsafe { &mut GOURAUD_TRIS };
-        let flats = unsafe { &mut FLAT_TRIS };
-        let markers = unsafe { &mut LIGHT_MARKERS };
-        let bg = unsafe { &mut BG_QUAD };
-        ot.clear();
+        let mut ot = unsafe { OtFrame::begin(&mut OT) };
+        let mut gouraud = unsafe { PrimitiveArena::new(&mut GOURAUD_TRIS) };
+        let mut markers = unsafe { PrimitiveArena::new(&mut LIGHT_MARKERS) };
+        let mut backgrounds = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut BG_QUAD)) };
 
         let cube = Mesh::from_bytes(CUBE_BLOB).expect("cube blob");
 
-        // Slot 7 — dark-room gradient backdrop.
-        *bg = QuadGouraud::new(
-            [
-                (0, 0),
-                (SCREEN_W, 0),
-                (0, SCREEN_H),
-                (SCREEN_W, SCREEN_H),
-            ],
-            [
-                (16, 10, 24),
-                (16, 10, 24),
-                (4, 2, 8),
-                (4, 2, 8),
-            ],
-        );
-        ot.add(7, bg, QuadGouraud::WORDS);
+        // Backmost slot — dark-room gradient backdrop.
+        let Some(bg) = backgrounds.push(QuadGouraud::new(
+            [(0, 0), (SCREEN_W, 0), (0, SCREEN_H), (SCREEN_W, SCREEN_H)],
+            [(16, 10, 24), (16, 10, 24), (4, 2, 8), (4, 2, 8)],
+        )) else {
+            return;
+        };
+        ot.add_packet(BG_SLOT, bg);
 
-        // Slot 5 — all 6 cube instances, CPU-lit + GTE-projected.
-        let mut tri_idx = 0;
+        let mesh_options = GouraudMeshOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE);
+        let mut world_pass =
+            unsafe { GouraudRenderPass::new(&mut ot, &mut gouraud, &mut GOURAUD_COMMANDS) };
+
+        // World band — all cube instances, CPU-lit + GTE-projected.
         for instance in &CUBE_LAYOUT {
             // Per-instance: compose Y-spin rotation × identity (no
             // other rotation). `frame * spin` gives the current angle.
@@ -450,66 +446,45 @@ impl Lighting {
                 // World-space normal: rotation only (no translation,
                 // no scale — scale would stretch the normal length).
                 let nrot = Vec3I16::new(
-                    mat_row_dot(&rot, 0, nl)
-                        .clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                    mat_row_dot(&rot, 1, nl)
-                        .clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                    mat_row_dot(&rot, 2, nl)
-                        .clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    mat_row_dot(&rot, 0, nl).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    mat_row_dot(&rot, 1, nl).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    mat_row_dot(&rot, 2, nl).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 );
 
                 let (r, g, b) = light_vertex(&self.lights, world_pos, nrot);
 
                 // Project via GTE (actor transform already loaded).
                 let p = scene::project_vertex(vl);
-                cube_proj[vi as usize] = (p.sx, p.sy, p.sz, r, g, b);
+                cube_proj[vi as usize] = ProjectedLit {
+                    sx: p.sx,
+                    sy: p.sy,
+                    sz: p.sz,
+                    r,
+                    g,
+                    b,
+                };
             }
 
-            // Emit triangles with per-vertex lit colours.
-            for face_idx in 0..cube.face_count() {
-                if tri_idx >= gouraud.len() {
-                    break;
-                }
-                let (ia, ib, ic) = cube.face(face_idx);
-                let (v0, v1, v2) = (
-                    cube_proj[ia as usize],
-                    cube_proj[ib as usize],
-                    cube_proj[ic as usize],
-                );
-                if back_facing(v0, v1, v2) {
-                    continue;
-                }
-                gouraud[tri_idx] = TriGouraud::new(
-                    [(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)],
-                    [
-                        (v0.3, v0.4, v0.5),
-                        (v1.3, v1.4, v1.5),
-                        (v2.3, v2.4, v2.5),
-                    ],
-                );
-                ot.add(5, &mut gouraud[tri_idx], TriGouraud::WORDS);
-                tri_idx += 1;
-                self.tri_count += 1;
-            }
+            let cube_stats = world_pass.submit_projected_mesh(&cube, cube_proj, mesh_options);
+            self.tri_count = self
+                .tri_count
+                .saturating_add(cube_stats.submitted_triangles);
         }
+        world_pass.flush();
 
-        // Slot 3 — visible light position markers (small bright
+        // Foreground — visible light position markers (small bright
         // squares at each light's projected screen position, colour
         // matches the light's colour). Use a direct-to-screen path —
         // identity rotation + zero translation — to project light
         // positions cleanly.
         scene::load_rotation(&Mat3I16::IDENTITY);
         scene::load_translation(Vec3I32::new(0, 0, 0));
-        let mut marker_idx = 0;
         for light in &self.lights {
-            if marker_idx >= markers.len() {
-                break;
-            }
             let p = scene::project_vertex(light.pos);
             if p.sx < 4 || p.sx > SCREEN_W - 4 || p.sy < 4 || p.sy > SCREEN_H - 4 {
                 continue;
             }
-            markers[marker_idx] = RectFlat::new(
+            let Some(marker) = markers.push(RectFlat::new(
                 p.sx - 2,
                 p.sy - 2,
                 4,
@@ -517,12 +492,13 @@ impl Lighting {
                 light.colour.0,
                 light.colour.1,
                 light.colour.2,
-            );
-            ot.add(3, &mut markers[marker_idx], RectFlat::WORDS);
-            marker_idx += 1;
+            )) else {
+                break;
+            };
+            ot.add_packet(LIGHT_MARKER_SLOT, marker);
         }
 
-        let _ = flats;
+        ot.submit();
     }
 
     fn draw_hud(&self, font: &FontAtlas, frame: u32) {
@@ -532,11 +508,21 @@ impl Lighting {
 
         font.draw_text(4, SCREEN_H - 20, "frame", (160, 160, 200));
         let frame_hex = u16_hex((frame & 0xFFFF) as u16);
-        font.draw_text(4 + 8 * 6, SCREEN_H - 20, frame_hex.as_str(), (200, 240, 160));
+        font.draw_text(
+            4 + 8 * 6,
+            SCREEN_H - 20,
+            frame_hex.as_str(),
+            (200, 240, 160),
+        );
 
         font.draw_text(SCREEN_W / 2 - 8 * 3, SCREEN_H - 20, "tri", (160, 160, 200));
         let tri = u16_hex(self.tri_count);
-        font.draw_text(SCREEN_W / 2 + 8, SCREEN_H - 20, tri.as_str(), (240, 200, 160));
+        font.draw_text(
+            SCREEN_W / 2 + 8,
+            SCREEN_H - 20,
+            tri.as_str(),
+            (240, 200, 160),
+        );
 
         font.draw_text(SCREEN_W - 100, SCREEN_H - 20, "cubes", (160, 160, 200));
         let cubes = u16_hex(NUM_CUBES as u16);
@@ -569,14 +555,6 @@ fn mat_row_dot(m: &Mat3I16, r: usize, v: Vec3I16) -> i32 {
     sum >> 12
 }
 
-fn back_facing(v0: VertProj, v1: VertProj, v2: VertProj) -> bool {
-    let ax = (v1.0 as i32) - (v0.0 as i32);
-    let ay = (v1.1 as i32) - (v0.1 as i32);
-    let bx = (v2.0 as i32) - (v0.0 as i32);
-    let by = (v2.1 as i32) - (v0.1 as i32);
-    (ax * by - ay * bx) <= 0
-}
-
 // ----------------------------------------------------------------------
 // Entry point
 // ----------------------------------------------------------------------
@@ -589,10 +567,10 @@ fn main() -> ! {
         // are highly saturated so a cube sitting near one light reads
         // as clearly "that colour" rather than a neutral blend.
         lights: [
-            PointLight::new(Vec3I16::ZERO, (255, 40, 40)),   // red
-            PointLight::new(Vec3I16::ZERO, (40, 255, 60)),   // green
-            PointLight::new(Vec3I16::ZERO, (60, 100, 255)),  // blue
-            PointLight::new(Vec3I16::ZERO, (255, 220, 40)),  // yellow
+            PointLight::new(Vec3I16::ZERO, (255, 40, 40)),  // red
+            PointLight::new(Vec3I16::ZERO, (40, 255, 60)),  // green
+            PointLight::new(Vec3I16::ZERO, (60, 100, 255)), // blue
+            PointLight::new(Vec3I16::ZERO, (255, 220, 40)), // yellow
         ],
         font: None,
     };

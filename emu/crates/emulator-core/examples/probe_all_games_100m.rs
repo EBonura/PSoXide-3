@@ -65,14 +65,20 @@ fn main() {
         EXPECTED_SONY_LOGO_HASH,
     );
     println!();
-    println!("{:<14} {:>14} {:>20}  {}", "game", "our_cycles", "display_hash", "match");
+    println!(
+        "{:<14} {:>14} {:>20}  {}",
+        "game", "our_cycles", "display_hash", "match"
+    );
     println!("{}", "-".repeat(80));
     let mut all_pass = true;
     for (name, disc_path) in games {
         let mut bus = Bus::new(bios.clone()).expect("bus");
         if !disc_path.is_empty() {
             if !std::path::Path::new(disc_path).exists() {
-                println!("{:<14} {:>14} {:>20}  {}", name, "-", "MISSING DISC", "skip");
+                println!(
+                    "{:<14} {:>14} {:>20}  {}",
+                    name, "-", "MISSING DISC", "skip"
+                );
                 continue;
             }
             let disc = std::fs::read(disc_path).expect("disc readable");
@@ -92,7 +98,9 @@ fn main() {
         }
         let (hash, _w, _h, _len) = bus.gpu.display_hash();
         let matches = hash == EXPECTED_SONY_LOGO_HASH;
-        if !matches { all_pass = false; }
+        if !matches {
+            all_pass = false;
+        }
         println!(
             "{:<14} {:>14} {:>20}  {}",
             name,

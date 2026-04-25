@@ -21,17 +21,20 @@ fn main() {
                     let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
                     let ascii: String = chunk
                         .iter()
-                        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                        .map(|&b| {
+                            if (0x20..0x7f).contains(&b) {
+                                b as char
+                            } else {
+                                '.'
+                            }
+                        })
                         .collect();
                     println!("  {}  {}", hex.join(" "), ascii);
                 }
                 // Specific fields.
                 if lba == 16 && user.len() >= 180 {
                     // Root directory record starts at user[156].
-                    println!(
-                        "  root-dir record byte 0 (length):  0x{:02x}",
-                        user[156]
-                    );
+                    println!("  root-dir record byte 0 (length):  0x{:02x}", user[156]);
                     let lba_le = u32::from_le_bytes([user[158], user[159], user[160], user[161]]);
                     let lba_be = u32::from_be_bytes([user[162], user[163], user[164], user[165]]);
                     let len_le = u32::from_le_bytes([user[166], user[167], user[168], user[169]]);

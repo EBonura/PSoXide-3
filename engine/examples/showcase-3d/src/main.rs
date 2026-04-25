@@ -8,11 +8,11 @@
 //!   tessellated to 6320 tris in its canonical OBJ, decimated
 //!   here to ~225 tris.
 //!
-//! The two objects rotate independently on composite axes with
-//! a GTE-projected starfield behind them, `psx-fx` sparks
-//! drifting through, a deep-space gradient backdrop, and a
-//! BASIC_8×16 HUD tracking frame count + live triangle count +
-//! star count.
+//! The two objects rotate independently on composite axes while a
+//! slightly-raised camera orbits the scene centre. Behind them: a
+//! GTE-projected starfield, `psx-fx` sparks drifting through, a
+//! deep-space gradient backdrop, and a BASIC_8×16 HUD tracking frame
+//! count + live triangle count + star count.
 //!
 //! Validates the end-to-end 3D pipeline under real load:
 //!
@@ -32,12 +32,15 @@
 extern crate psx_rt;
 
 use psx_asset::Mesh;
-use psx_engine::{ActorTransform, App, Config, Ctx, Scene, Vec3World};
-use psx_font::{FontAtlas, fonts::BASIC_8X16};
+use psx_engine::{
+    ActorTransform, App, Config, Ctx, DepthBand, DepthPolicy, DepthRange, GouraudMeshOptions,
+    GouraudRenderPass, GouraudTriCommand, OtFrame, PrimitiveArena, Scene, Vec3World,
+};
+use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_fx::{LcgRng, ParticlePool, ShakeState};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat, TriGouraud};
-use psx_gte::lighting::{Light, LightRig};
+use psx_gte::lighting::{Light, LightRig, ProjectedLit};
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene;
 use psx_vram::{Clut, TexDepth, Tpage};
@@ -54,12 +57,26 @@ static TEAPOT_BLOB: &[u8] = include_bytes!("../assets/teapot.psxm");
 
 const SCREEN_W: i16 = 320;
 const SCREEN_H: i16 = 240;
-const OT_DEPTH: usize = 8;
+const OT_DEPTH: usize = 128;
+const BG_SLOT: usize = OT_DEPTH - 1;
+const STAR_SLOT: usize = OT_DEPTH - 2;
+const WORLD_BAND: DepthBand = DepthBand::new(3, OT_DEPTH - 3);
+const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(0x1800, 0x7800);
+const SPARK_SLOT: usize = 2;
 
 /// GTE focal length (H register).
 const PROJ_H: u16 = 280;
-/// Default camera setback.
-const WORLD_Z: i32 = 0x3400;
+/// Scene centre depth in camera space.
+const WORLD_Z: i32 = 0x4800;
+
+/// Camera orbit: 1 coarse GTE angle unit per frame = one revolution
+/// every ~4.3 seconds at 60 Hz.
+const CAMERA_ORBIT_PER_FRAME: u16 = 1;
+
+/// Camera pitch in 256-per-revolution units. This is a small negative
+/// X rotation, equivalent to lifting the camera and looking gently
+/// down at the scene centre.
+const CAMERA_PITCH: u16 = 0xF0;
 
 // ----------------------------------------------------------------------
 // Starfield
@@ -76,11 +93,12 @@ static mut STARS: [Vec3I16; STAR_COUNT] = [Vec3I16::ZERO; STAR_COUNT];
 // Mesh placement
 // ----------------------------------------------------------------------
 
-const SUZANNE_POS: Vec3World = Vec3World::from_raw(-0x1300, 0, WORLD_Z);
-const TEAPOT_POS: Vec3World = Vec3World::from_raw(0x1400, 0, WORLD_Z);
+const SCENE_CENTER: Vec3World = Vec3World::from_raw(0, 0, WORLD_Z);
+const SUZANNE_OFFSET: Vec3World = Vec3World::from_raw(-0x1300, 0, 0);
+const TEAPOT_OFFSET: Vec3World = Vec3World::from_raw(0x1400, 0, 0);
 
 // ----------------------------------------------------------------------
-// Light rig (world-space)
+// Light rig (camera-space)
 // ----------------------------------------------------------------------
 
 /// Three directional lights arranged for studio-ish illumination:
@@ -91,7 +109,7 @@ const TEAPOT_POS: Vec3World = Vec3World::from_raw(0x1400, 0, WORLD_Z);
 /// Directions are Q3.12 unit-ish vectors pointing FROM the surface
 /// TO the light. They're `const`-evaluated so the rig lives in
 /// .rodata — no per-frame rebuild cost.
-/// "Studio" rig in its REFERENCE frame (facing -Z, camera-front).
+/// "Studio" rig in its camera reference frame (facing -Z).
 /// Per frame we rotate this around Y so lights orbit the scene,
 /// ensuring both Suzanne and the teapot see every lighting angle
 /// across a full rotation.
@@ -169,9 +187,8 @@ static mut GOURAUD_TRIS: [TriGouraud; 320] = [const {
 }; 320];
 
 /// Rects for stars + sparks.
-static mut SCENE_RECTS: [RectFlat; 128] = [const {
-    RectFlat::new(0, 0, 0, 0, 0, 0, 0)
-}; 128];
+static mut SCENE_RECTS: [RectFlat; 128] = [const { RectFlat::new(0, 0, 0, 0, 0, 0, 0) }; 128];
+static mut GOURAUD_COMMANDS: [GouraudTriCommand; 320] = [GouraudTriCommand::EMPTY; 320];
 
 static mut BG_QUAD: QuadGouraud = QuadGouraud {
     tag: 0,
@@ -189,15 +206,21 @@ static mut BG_QUAD: QuadGouraud = QuadGouraud {
 /// Topology shares verts 4-6× per face, so doing the GTE work
 /// once per vertex rather than per triangle face is a big win.
 ///
-/// Tuple layout: (sx, sy, sz, r, g, b). The three colour channels
+/// Projected screen-space + lit vertices. The three colour channels
 /// are the GTE's NCCS output for this vertex + the current
 /// object-local light rig — they drive the Gouraud interpolator
 /// on each triangle.
-type VertProj = (i16, i16, u16, u8, u8, u8);
-const EMPTY_VERT: VertProj = (0, 0, 0, 0, 0, 0);
+const EMPTY_VERT: ProjectedLit = ProjectedLit {
+    sx: 0,
+    sy: 0,
+    sz: 0,
+    r: 0,
+    g: 0,
+    b: 0,
+};
 
-static mut SUZANNE_PROJ: [VertProj; 128] = [EMPTY_VERT; 128];
-static mut TEAPOT_PROJ: [VertProj; 128] = [EMPTY_VERT; 128];
+static mut SUZANNE_PROJ: [ProjectedLit; 128] = [EMPTY_VERT; 128];
+static mut TEAPOT_PROJ: [ProjectedLit; 128] = [EMPTY_VERT; 128];
 
 // ----------------------------------------------------------------------
 // Scene impl
@@ -259,7 +282,6 @@ impl Scene for Showcase3D {
         self.sparks.update(1);
 
         self.build_frame_ot(ctx.frame);
-        unsafe { OT.submit() };
         let font = self.font.as_ref().expect("font uploaded in init");
         self.draw_hud(font, ctx.frame);
     }
@@ -291,36 +313,27 @@ impl Showcase3D {
     }
 
     fn build_frame_ot(&mut self, frame: u32) {
-        let ot = unsafe { &mut OT };
-        let rects = unsafe { &mut SCENE_RECTS };
-        let gouraud = unsafe { &mut GOURAUD_TRIS };
-        let bg = unsafe { &mut BG_QUAD };
-        ot.clear();
+        let mut ot = unsafe { OtFrame::begin(&mut OT) };
+        let mut rects = unsafe { PrimitiveArena::new(&mut SCENE_RECTS) };
+        let mut gouraud = unsafe { PrimitiveArena::new(&mut GOURAUD_TRIS) };
+        let mut backgrounds = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut BG_QUAD)) };
 
         let (shake_dx, shake_dy) = self.shake.tick();
 
-        // Slot 7 (back) — deep-space gradient.
-        *bg = QuadGouraud::new(
-            [
-                (0, 0),
-                (SCREEN_W, 0),
-                (0, SCREEN_H),
-                (SCREEN_W, SCREEN_H),
-            ],
-            [
-                (10, 6, 32),
-                (10, 6, 32),
-                (2, 1, 8),
-                (2, 1, 8),
-            ],
-        );
-        ot.add(7, bg, QuadGouraud::WORDS);
+        // Backmost slot — deep-space gradient.
+        let Some(bg) = backgrounds.push(QuadGouraud::new(
+            [(0, 0), (SCREEN_W, 0), (0, SCREEN_H), (SCREEN_W, SCREEN_H)],
+            [(10, 6, 32), (10, 6, 32), (2, 1, 8), (2, 1, 8)],
+        )) else {
+            return;
+        };
+        ot.add_packet(BG_SLOT, bg);
 
-        // Slot 6 — starfield with a slow whole-scene roll for parallax.
+        // Behind world geometry — starfield with a slow whole-scene
+        // roll for parallax.
         let scene_roll = Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16);
         scene::load_rotation(&scene_roll);
         scene::load_translation(Vec3I32::new(0, 0, 0));
-        let mut rect_idx = 0;
         for i in 0..STAR_COUNT {
             let sv = unsafe { STARS[i] };
             let p = scene::project_vertex(sv);
@@ -334,10 +347,7 @@ impl Showcase3D {
             } else {
                 240
             };
-            if rect_idx >= rects.len() {
-                break;
-            }
-            rects[rect_idx] = RectFlat::new(
+            let Some(rect) = rects.push(RectFlat::new(
                 p.sx + shake_dx,
                 p.sy + shake_dy,
                 1,
@@ -345,15 +355,15 @@ impl Showcase3D {
                 brightness,
                 brightness,
                 brightness,
-            );
-            ot.add(6, &mut rects[rect_idx], RectFlat::WORDS);
-            rect_idx += 1;
+            )) else {
+                break;
+            };
+            ot.add_packet(STAR_SLOT, rect);
         }
 
         // Pre-project both meshes' vertices once, then walk triangle
         // lists. Topologically both meshes share verts heavily — this
         // avoids 4-6× repeated GTE loads per vertex.
-        let mut tri_idx = 0;
 
         // Parse both meshes at frame-start. Parsing is effectively
         // free (zero-copy, just bounds-checks + slice arithmetic on
@@ -362,120 +372,68 @@ impl Showcase3D {
         let suzanne = Mesh::from_bytes(SUZANNE_BLOB).expect("suzanne blob");
         let teapot = Mesh::from_bytes(TEAPOT_BLOB).expect("teapot blob");
 
-        // World-space light rig for this frame — base rig rotated
+        // Camera-space light rig for this frame — base rig rotated
         // around Y at the configured orbit rate so both meshes
         // eventually see every lighting angle. Compose this once per
-        // frame; each object's `for_object` applies on top to take us
-        // into local space.
-        let light_orbit = Mat3I16::rotate_y(
-            (frame.wrapping_mul(LIGHT_ORBIT_PER_FRAME as u32) & 0xFFFF) as u16,
-        );
+        // frame; each object's final view rotation takes us into local
+        // space.
+        let light_orbit =
+            Mat3I16::rotate_y((frame.wrapping_mul(LIGHT_ORBIT_PER_FRAME as u32) & 0xFFFF) as u16);
         let scene_lights = BASE_LIGHTS.rotated(&light_orbit);
+        let view = camera_view(frame);
+        let mesh_options = GouraudMeshOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE)
+            .with_depth_policy(DepthPolicy::Average)
+            .with_screen_offset((shake_dx, shake_dy));
+        let mut world_pass =
+            unsafe { GouraudRenderPass::new(&mut ot, &mut gouraud, &mut GOURAUD_COMMANDS) };
 
-        // --- SUZANNE (slot 5) — two-axis tumble, lit by scene rig ---
+        // --- SUZANNE — two-axis tumble, lit by scene rig ---
         let suz_rot = Mat3I16::rotate_y((frame.wrapping_mul(3) & 0xFFFF) as u16)
             .mul(&Mat3I16::rotate_x((frame.wrapping_mul(2) & 0xFFFF) as u16));
+        let suz_view_rot = view.mul(&suz_rot);
+        let suz_view_pos = camera_space_position(&view, SUZANNE_OFFSET);
         // No per-actor scale (meshes authored at their intended
         // size), so `ActorTransform::at(pos).with_rotation(rot)`
         // leaves scale at 1.0× and `load_gte` folds that identity
         // multiply into the rotation upload in one step.
-        ActorTransform::at(SUZANNE_POS)
-            .with_rotation(suz_rot)
+        ActorTransform::at(suz_view_pos)
+            .with_rotation(suz_view_rot)
             .load_gte();
-        // Rotate world-space lights into Suzanne's local frame + upload.
-        scene_lights.for_object(&suz_rot).load();
-        let suz_proj = unsafe { &mut SUZANNE_PROJ };
-        for i in 0..suzanne.vert_count() {
-            let v = suzanne.vertex(i as u8);
-            let n = suzanne.vertex_normal(i as u8).unwrap_or(Vec3I16::ZERO);
-            // Per-face palette still lives in the blob; we use it as
-            // the material RGBC so the lit output carries the face's
-            // tint. We average this per-vertex: assign vert colour
-            // from the first face that references it (good enough —
-            // the gouraud interpolator blurs any mismatch anyway).
-            let material = vertex_material(&suzanne, i as u8);
-            let p = psx_gte::lighting::project_lit(v, n, material);
-            suz_proj[i as usize] = (
-                p.sx + shake_dx,
-                p.sy + shake_dy,
-                p.sz,
-                p.r, p.g, p.b,
-            );
-        }
-        for face_idx in 0..suzanne.face_count() {
-            if tri_idx >= gouraud.len() {
-                break;
-            }
-            let (ia, ib, ic) = suzanne.face(face_idx);
-            let (v0, v1, v2) = (
-                suz_proj[ia as usize],
-                suz_proj[ib as usize],
-                suz_proj[ic as usize],
-            );
-            if back_facing(v0, v1, v2) {
-                continue;
-            }
-            gouraud[tri_idx] = TriGouraud::new(
-                [(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)],
-                [(v0.3, v0.4, v0.5), (v1.3, v1.4, v1.5), (v2.3, v2.4, v2.5)],
-            );
-            ot.add(5, &mut gouraud[tri_idx], TriGouraud::WORDS);
-            tri_idx += 1;
-            self.tri_count += 1;
-        }
+        // Rotate camera-space lights into Suzanne's local frame + upload.
+        scene_lights.for_object(&suz_view_rot).load();
+        let suz_stats =
+            world_pass.submit_lit_mesh(&suzanne, unsafe { &mut SUZANNE_PROJ }, mesh_options);
+        self.tri_count = self
+            .tri_count
+            .saturating_add(suz_stats.submitted_triangles);
 
-        // --- TEAPOT (slot 4) — opposite tumble, lit by same rig ---
-        let tea_rot = Mat3I16::rotate_y(
-            (frame.wrapping_mul(4) & 0xFFFF).wrapping_neg() as u16,
-        )
-        .mul(&Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16));
-        ActorTransform::at(TEAPOT_POS)
-            .with_rotation(tea_rot)
+        // --- TEAPOT — opposite tumble, lit by same rig ---
+        let tea_rot = Mat3I16::rotate_y((frame.wrapping_mul(4) & 0xFFFF).wrapping_neg() as u16)
+            .mul(&Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16));
+        let tea_view_rot = view.mul(&tea_rot);
+        let tea_view_pos = camera_space_position(&view, TEAPOT_OFFSET);
+        ActorTransform::at(tea_view_pos)
+            .with_rotation(tea_view_rot)
             .load_gte();
-        scene_lights.for_object(&tea_rot).load();
-        let tea_proj = unsafe { &mut TEAPOT_PROJ };
-        for i in 0..teapot.vert_count() {
-            let v = teapot.vertex(i as u8);
-            let n = teapot.vertex_normal(i as u8).unwrap_or(Vec3I16::ZERO);
-            let material = vertex_material(&teapot, i as u8);
-            let p = psx_gte::lighting::project_lit(v, n, material);
-            tea_proj[i as usize] = (
-                p.sx + shake_dx,
-                p.sy + shake_dy,
-                p.sz,
-                p.r, p.g, p.b,
-            );
-        }
-        for face_idx in 0..teapot.face_count() {
-            if tri_idx >= gouraud.len() {
-                break;
-            }
-            let (ia, ib, ic) = teapot.face(face_idx);
-            let (v0, v1, v2) = (
-                tea_proj[ia as usize],
-                tea_proj[ib as usize],
-                tea_proj[ic as usize],
-            );
-            if back_facing(v0, v1, v2) {
-                continue;
-            }
-            gouraud[tri_idx] = TriGouraud::new(
-                [(v0.0, v0.1), (v1.0, v1.1), (v2.0, v2.1)],
-                [(v0.3, v0.4, v0.5), (v1.3, v1.4, v1.5), (v2.3, v2.4, v2.5)],
-            );
-            ot.add(4, &mut gouraud[tri_idx], TriGouraud::WORDS);
-            tri_idx += 1;
-            self.tri_count += 1;
-        }
+        scene_lights.for_object(&tea_view_rot).load();
+        let tea_stats =
+            world_pass.submit_lit_mesh(&teapot, unsafe { &mut TEAPOT_PROJ }, mesh_options);
+        self.tri_count = self
+            .tri_count
+            .saturating_add(tea_stats.submitted_triangles);
 
-        // Slot 3 — sparks (in front of meshes).
-        let spark_budget = rects.len().saturating_sub(rect_idx);
-        let _ = self.sparks.render_into_ot(
-            ot,
-            &mut rects[rect_idx..rect_idx + spark_budget],
-            3,
+        world_pass.flush();
+
+        // Foreground effects — sparks in front of the meshes.
+        let _ = render_particles(
+            &self.sparks,
+            &mut rects,
+            &mut ot,
+            SPARK_SLOT,
             (shake_dx, shake_dy),
         );
+
+        ot.submit();
     }
 
     fn draw_hud(&self, font: &FontAtlas, frame: u32) {
@@ -487,11 +445,21 @@ impl Showcase3D {
 
         font.draw_text(4, SCREEN_H - 20, "frame", (160, 160, 200));
         let frame_hex = u16_hex((frame & 0xFFFF) as u16);
-        font.draw_text(4 + 8 * 6, SCREEN_H - 20, frame_hex.as_str(), (200, 240, 160));
+        font.draw_text(
+            4 + 8 * 6,
+            SCREEN_H - 20,
+            frame_hex.as_str(),
+            (200, 240, 160),
+        );
 
         font.draw_text(SCREEN_W / 2 - 8 * 3, SCREEN_H - 20, "tri", (160, 160, 200));
         let tri = u16_hex(self.tri_count);
-        font.draw_text(SCREEN_W / 2 + 8, SCREEN_H - 20, tri.as_str(), (240, 200, 160));
+        font.draw_text(
+            SCREEN_W / 2 + 8,
+            SCREEN_H - 20,
+            tri.as_str(),
+            (240, 200, 160),
+        );
 
         font.draw_text(SCREEN_W - 100, SCREEN_H - 20, "stars", (160, 160, 200));
         let stars = u16_hex(STAR_COUNT as u16);
@@ -530,37 +498,61 @@ fn main() -> ! {
 // Helpers
 // ----------------------------------------------------------------------
 
-/// 2D cross-product test — triangles wound clockwise on screen
-/// are back-facing and get culled.
-fn back_facing(v0: VertProj, v1: VertProj, v2: VertProj) -> bool {
-    let ax = (v1.0 as i32) - (v0.0 as i32);
-    let ay = (v1.1 as i32) - (v0.1 as i32);
-    let bx = (v2.0 as i32) - (v0.0 as i32);
-    let by = (v2.1 as i32) - (v0.1 as i32);
-    (ax * by - ay * bx) <= 0
+fn camera_view(frame: u32) -> Mat3I16 {
+    let yaw =
+        Mat3I16::rotate_y((frame.wrapping_mul(CAMERA_ORBIT_PER_FRAME as u32) & 0xFFFF) as u16);
+    let pitch = Mat3I16::rotate_x(CAMERA_PITCH);
+    pitch.mul(&yaw)
 }
 
-/// Sample a per-vertex material colour for a lit-mesh vertex.
-///
-/// The cooked mesh stores per-*face* colours, not per-vertex.
-/// For a Gouraud-lit render we need a per-vertex material — we
-/// walk the triangle list and take the colour from the first
-/// face that references this vertex. Vertices shared between
-/// differently-coloured faces get the first-seen face's tint;
-/// the gouraud interpolator then blurs the result so it reads
-/// as a smooth palette.
-///
-/// Shared between Suzanne and the teapot — the pre-engine
-/// version was called `suzanne_vertex_material` but did the same
-/// thing for both meshes; renamed here to the role-based name.
-fn vertex_material(mesh: &Mesh, vert: u8) -> (u8, u8, u8) {
-    for f in 0..mesh.face_count() {
-        let (a, b, c) = mesh.face(f);
-        if a == vert || b == vert || c == vert {
-            return mesh.face_color(f).unwrap_or((128, 128, 128));
+fn camera_space_position(view: &Mat3I16, offset: Vec3World) -> Vec3World {
+    let x = transform_axis(view, 0, offset);
+    let y = transform_axis(view, 1, offset);
+    let z = transform_axis(view, 2, offset);
+    Vec3World::from_raw(SCENE_CENTER.x + x, SCENE_CENTER.y + y, SCENE_CENTER.z + z)
+}
+
+fn transform_axis(m: &Mat3I16, row: usize, v: Vec3World) -> i32 {
+    let row = m.row(row);
+    let sum =
+        (row[0] as i32) * v.x + (row[1] as i32) * v.y + (row[2] as i32) * v.z;
+    (sum >> 12) as i32
+}
+
+fn render_particles<const N: usize, const OT_N: usize>(
+    particles: &ParticlePool<N>,
+    rects: &mut PrimitiveArena<'_, RectFlat>,
+    ot: &mut OtFrame<'_, OT_N>,
+    slot: usize,
+    shake: (i16, i16),
+) -> usize {
+    let mut written = 0;
+    for p in particles.particles() {
+        if !p.alive() {
+            continue;
         }
+
+        let denom = p.spawn_ttl.max(1) as u16;
+        let scale = p.ttl as u16;
+        let r = ((p.r as u16 * scale) / denom) as u8;
+        let g = ((p.g as u16 * scale) / denom) as u8;
+        let b = ((p.b as u16 * scale) / denom) as u8;
+        let size = if (p.ttl as u16) * 2 > denom { 3 } else { 2 };
+        let Some(rect) = rects.push(RectFlat::new(
+            p.x + shake.0,
+            p.y + shake.1,
+            size,
+            size,
+            r,
+            g,
+            b,
+        )) else {
+            break;
+        };
+        ot.add_packet(slot, rect);
+        written += 1;
     }
-    (128, 128, 128)
+    written
 }
 
 // ----------------------------------------------------------------------

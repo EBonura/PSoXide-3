@@ -21,7 +21,9 @@ fn main() {
     let mut cpu = Cpu::new();
 
     for _ in 0..600_000_000u64 {
-        if cpu.step(&mut bus).is_err() { break; }
+        if cpu.step(&mut bus).is_err() {
+            break;
+        }
     }
 
     // Pixel (80, 120) — where Redux draws the 'N' in NAUGHTY.
@@ -37,16 +39,28 @@ fn main() {
 
     // Focus on commands in the last ~2% of the log — these draw
     // the current frame. Earlier commands draw prior frames.
-    let start = bus.gpu.cmd_log.len().saturating_sub(bus.gpu.cmd_log.len() / 50);
+    let start = bus
+        .gpu
+        .cmd_log
+        .len()
+        .saturating_sub(bus.gpu.cmd_log.len() / 50);
     println!("Scanning last-frame commands (index >= {start})...");
     let mut hits = 0;
     for e in bus.gpu.cmd_log.iter().skip(start) {
-        if touches_pixel(e.opcode, &e.fifo, target_vram_x as i32, target_vram_y as i32) {
+        if touches_pixel(
+            e.opcode,
+            &e.fifo,
+            target_vram_x as i32,
+            target_vram_y as i32,
+        ) {
             hits += 1;
             if hits <= 50 {
                 println!(
                     "idx={:>7}  op=0x{:02x}  word[0]=0x{:08x}  ({})",
-                    e.index, e.opcode, e.fifo[0], opcode_name(e.opcode),
+                    e.index,
+                    e.opcode,
+                    e.fifo[0],
+                    opcode_name(e.opcode),
                 );
             }
         }
@@ -83,7 +97,9 @@ fn main() {
     // saw (256, 120) and flag glyphs with raw Y that maps inside
     // the banner.
     println!();
-    println!("TEXTURED_rect_16x16 likely targeting the banner area (screen y=105..140 assuming oy=120):");
+    println!(
+        "TEXTURED_rect_16x16 likely targeting the banner area (screen y=105..140 assuming oy=120):"
+    );
     // Candidate raw Y range: y_raw where 105 <= (y_raw + 120) <= 140
     // → y_raw in -15..20. Also (y_raw + 120 + 16) > 105 → y_raw > -31.
     let mut banner_hits = 0;
@@ -153,7 +169,9 @@ fn touches_pixel(op: u8, fifo: &[u32], target_x: i32, target_y: i32) -> bool {
         _ => None,
     };
     if is_tex_rect || is_mono_rect {
-        if fifo.len() < 2 { return false; }
+        if fifo.len() < 2 {
+            return false;
+        }
         // word 1: xy (11-bit each)
         let pos = fifo[1];
         let x = sign_extend_11((pos & 0x7FF) as i32);
@@ -169,7 +187,9 @@ fn touches_pixel(op: u8, fifo: &[u32], target_x: i32, target_y: i32) -> bool {
             // Variable-size: w/h word lives AFTER uv/clut (if tex) or
             // is the next word for mono.
             let wh_idx = if is_tex_rect { 3 } else { 2 };
-            if fifo.len() <= wh_idx { return false; }
+            if fifo.len() <= wh_idx {
+                return false;
+            }
             let wh = fifo[wh_idx];
             ((wh & 0xFFFF) as i32, ((wh >> 16) & 0xFFFF) as i32)
         };
@@ -185,36 +205,48 @@ fn touches_pixel(op: u8, fifo: &[u32], target_x: i32, target_y: i32) -> bool {
     if matches!(op, 0x20..=0x3F) {
         // Extract vertex offsets depending on opcode shape.
         let vtx_indices: &[usize] = match op {
-            0x20..=0x23 => &[1, 2, 3],            // mono_tri
-            0x24..=0x27 => &[1, 3, 5],            // textured_tri
-            0x28..=0x2B => &[1, 2, 3, 4],         // mono_quad
-            0x2C..=0x2F => &[1, 3, 5, 7],         // textured_quad
-            0x30..=0x33 => &[1, 3, 5],            // shaded_tri
-            0x34..=0x37 => &[1, 4, 7],            // textured_shaded_tri
-            0x38..=0x3B => &[1, 3, 5, 7],         // shaded_quad
-            0x3C..=0x3F => &[1, 4, 7, 10],        // textured_shaded_quad
+            0x20..=0x23 => &[1, 2, 3],     // mono_tri
+            0x24..=0x27 => &[1, 3, 5],     // textured_tri
+            0x28..=0x2B => &[1, 2, 3, 4],  // mono_quad
+            0x2C..=0x2F => &[1, 3, 5, 7],  // textured_quad
+            0x30..=0x33 => &[1, 3, 5],     // shaded_tri
+            0x34..=0x37 => &[1, 4, 7],     // textured_shaded_tri
+            0x38..=0x3B => &[1, 3, 5, 7],  // shaded_quad
+            0x3C..=0x3F => &[1, 4, 7, 10], // textured_shaded_quad
             _ => return false,
         };
-        let mut min_x = i32::MAX; let mut max_x = i32::MIN;
-        let mut min_y = i32::MAX; let mut max_y = i32::MIN;
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
         for &v in vtx_indices {
-            if v >= fifo.len() { return false; }
+            if v >= fifo.len() {
+                return false;
+            }
             let w = fifo[v];
             let x = sign_extend_11((w & 0x7FF) as i32);
             let y = sign_extend_11(((w >> 16) & 0x7FF) as i32);
-            min_x = min_x.min(x); max_x = max_x.max(x);
-            min_y = min_y.min(y); max_y = max_y.max(y);
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
         }
         let ox = 256;
         let oy = 120;
-        return target_x >= min_x + ox && target_x <= max_x + ox
-            && target_y >= min_y + oy && target_y <= max_y + oy;
+        return target_x >= min_x + ox
+            && target_x <= max_x + ox
+            && target_y >= min_y + oy
+            && target_y <= max_y + oy;
     }
     false
 }
 
 fn sign_extend_11(v: i32) -> i32 {
-    if v & 0x400 != 0 { v | !0x7FF } else { v & 0x7FF }
+    if v & 0x400 != 0 {
+        v | !0x7FF
+    } else {
+        v & 0x7FF
+    }
 }
 
 fn opcode_name(op: u8) -> &'static str {

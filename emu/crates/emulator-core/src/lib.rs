@@ -12,10 +12,11 @@ pub mod bus;
 pub mod cdrom;
 pub mod cpu;
 pub mod dma;
+pub mod fastboot;
 pub mod gpu;
 pub mod gte;
-pub mod irq;
 pub mod hle_bios;
+pub mod irq;
 pub mod mdec;
 pub mod mmio_trace;
 pub mod pad;
@@ -29,11 +30,15 @@ pub use bus::{Bus, BusError};
 pub use cdrom::CdRom;
 pub use cpu::{Cpu, ExecutionError};
 pub use dma::{Dma, DmaChannel};
+pub use fastboot::{
+    fast_boot_disc, fast_boot_disc_with_hle, warm_bios_for_disc_fast_boot, DiscFastBootInfo,
+    DISC_FAST_BOOT_WARMUP_STEPS,
+};
 pub use gpu::{DisplayArea, Gpu};
 pub use gte::Gte;
 pub use irq::{Irq, IrqSource};
 pub use mmio_trace::{MmioKind, MmioTrace};
-pub use pad::{ButtonState, DigitalPad, PortDevice, button};
+pub use pad::{button, ButtonState, DigitalPad, PortDevice};
 pub use sio::Sio0;
 pub use spu::{Spu, XaDecoderState};
 pub use timers::{Timer, Timers};

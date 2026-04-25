@@ -1,0 +1,24 @@
+[package]
+name    = "showcase-particles"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "showcase-particles"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[dependencies]
+psx-engine = { path = "../../crates/psx-engine" }
+psx-font   = { path = "../../../sdk/crates/psx-font" }
+psx-fx     = { path = "../../../sdk/crates/psx-fx" }
+psx-gpu    = { path = "../../../sdk/crates/psx-gpu" }
+psx-math   = { path = "../../../sdk/crates/psx-math" }
+psx-rt     = { path = "../../../sdk/crates/psx-rt" }
+psx-vram   = { path = "../../../sdk/crates/psx-vram" }

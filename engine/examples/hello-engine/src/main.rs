@@ -10,6 +10,8 @@
 //!   framebuffer) between the two.
 //! - `Angle` (Q0.16) feeds the SDK's 4096-per-rev sincos LUT
 //!   through its converter, with no unit-mismatch footguns.
+//! - `OtFrame` and `PrimitiveArena` wrap the SDK ordering-table
+//!   ceremony in engine-facing render helpers.
 //!
 //! Scene geometry: one drifting quad + one "hello, engine" banner
 //! near the top. Cross-pad moves the quad vertically so the pad
@@ -21,7 +23,7 @@
 
 extern crate psx_rt;
 
-use psx_engine::{Angle, App, Config, Ctx, Scene, button};
+use psx_engine::{Angle, App, Config, Ctx, OtFrame, PrimitiveArena, Scene, button};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, RectFlat};
 use psx_math::sincos;
@@ -87,19 +89,20 @@ impl Scene for Game {
     }
 
     fn render(&mut self, ctx: &mut Ctx) {
-        let ot = unsafe { &mut OT };
-        let quad = unsafe { &mut QUAD };
-        let bg = unsafe { &mut BG };
-        ot.clear();
+        let mut ot = unsafe { OtFrame::begin(&mut OT) };
+        let mut quads = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut QUAD)) };
+        let mut backgrounds = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut BG)) };
 
         // Background gradient quad — dim blue top, near-black
         // bottom. Gouraud across four vertices; showcases the OT
         // + QuadGouraud pipeline alongside the engine plumbing.
-        *bg = QuadGouraud::new(
+        let Some(bg) = backgrounds.push(QuadGouraud::new(
             [(0, 0), (320, 0), (0, 240), (320, 240)],
             [(8, 16, 48), (8, 16, 48), (0, 0, 8), (0, 0, 8)],
-        );
-        ot.add(3, bg, QuadGouraud::WORDS);
+        )) else {
+            return;
+        };
+        ot.add_packet(3, bg);
 
         // Foreground: a 24×24 solid quad oscillating horizontally
         // via `Angle`. `per_frames(N).mul_frame(frame)` is the
@@ -110,8 +113,10 @@ impl Scene for Game {
         let cx = 160 - 12 + dx as i16;
         let cy = 120 - 12 + self.y_offset;
 
-        *quad = RectFlat::new(cx, cy, 24, 24, 0xE0, 0x60, 0x20);
-        ot.add(1, quad, RectFlat::WORDS);
+        let Some(quad) = quads.push(RectFlat::new(cx, cy, 24, 24, 0xE0, 0x60, 0x20)) else {
+            return;
+        };
+        ot.add_packet(1, quad);
 
         ot.submit();
     }

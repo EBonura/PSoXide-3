@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use emulator_core::{Vram, VRAM_HEIGHT, VRAM_WIDTH};
+use emulator_core::{Gpu, Vram, VRAM_HEIGHT, VRAM_WIDTH};
 use winit::window::Window;
 
 /// All GPU / windowing state. Built lazily in `App::resumed` because
@@ -29,6 +29,11 @@ pub struct Graphics {
     /// Egui-side handle for the VRAM texture; panels reference it via
     /// [`Graphics::vram_texture_id`].
     vram_texture_id: egui::TextureId,
+    /// Top-left-packed RGBA8 texture of the active display area. Unlike
+    /// the VRAM texture, this respects 24-bit framebuffer mode.
+    display_texture: wgpu::Texture,
+    /// Egui handle for the active display texture.
+    display_texture_id: egui::TextureId,
 }
 
 impl Graphics {
@@ -83,23 +88,17 @@ impl Graphics {
         );
         let mut egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
 
-        let vram_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("psoxide3-vram"),
-            size: wgpu::Extent3d {
-                width: VRAM_WIDTH as u32,
-                height: VRAM_HEIGHT as u32,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let vram_texture = create_rgba_texture(&device, "psoxide3-vram");
         let vram_view = vram_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let vram_texture_id =
             egui_renderer.register_native_texture(&device, &vram_view, wgpu::FilterMode::Nearest);
+        let display_texture = create_rgba_texture(&device, "psoxide3-display");
+        let display_view = display_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let display_texture_id = egui_renderer.register_native_texture(
+            &device,
+            &display_view,
+            wgpu::FilterMode::Nearest,
+        );
 
         Self {
             window,
@@ -112,6 +111,8 @@ impl Graphics {
             egui_renderer,
             vram_texture,
             vram_texture_id,
+            display_texture,
+            display_texture_id,
         }
     }
 
@@ -119,6 +120,12 @@ impl Graphics {
     /// window; safe to pass to panels once per frame.
     pub fn vram_texture_id(&self) -> egui::TextureId {
         self.vram_texture_id
+    }
+
+    /// Egui handle for the active display texture. Stable for the life of
+    /// the window.
+    pub fn display_texture_id(&self) -> egui::TextureId {
+        self.display_texture_id
     }
 
     /// Upload a full VRAM snapshot to the GPU-side texture. Called once
@@ -137,6 +144,107 @@ impl Graphics {
                 aspect: wgpu::TextureAspect::All,
             },
             &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(VRAM_WIDTH as u32 * 4),
+                rows_per_image: Some(VRAM_HEIGHT as u32),
+            },
+            wgpu::Extent3d {
+                width: VRAM_WIDTH as u32,
+                height: VRAM_HEIGHT as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Upload the GPU's active display rectangle into a top-left-packed
+    /// texture. This is what the central framebuffer panel samples, so
+    /// 24-bit MDEC/FMVs are decoded correctly instead of being viewed as
+    /// raw 15-bit VRAM words.
+    pub fn prepare_display(&self, gpu: Option<&Gpu>) {
+        let Some(gpu) = gpu else {
+            return;
+        };
+        let (rgba, width, height) = gpu.display_rgba8();
+        if width == 0 || height == 0 {
+            return;
+        }
+        let mut packed = vec![0u8; VRAM_WIDTH * VRAM_HEIGHT * 4];
+        let src_stride = width as usize * 4;
+        let dst_stride = VRAM_WIDTH * 4;
+        for row in 0..height as usize {
+            let src = row * src_stride;
+            let dst = row * dst_stride;
+            packed[dst..dst + src_stride].copy_from_slice(&rgba[src..src + src_stride]);
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.display_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &packed,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(VRAM_WIDTH as u32 * 4),
+                rows_per_image: Some(VRAM_HEIGHT as u32),
+            },
+            wgpu::Extent3d {
+                width: VRAM_WIDTH as u32,
+                height: VRAM_HEIGHT as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Phase C — same as `prepare_display`, but the source pixels
+    /// come from a custom `Vec<u16>` (typically the compute
+    /// backend's VRAM downloaded via `VramGpu::download_full`)
+    /// instead of the CPU rasterizer's VRAM. The display rect /
+    /// 24-bit-mode flag is still pulled from `gpu` (it's the same
+    /// state the framebuffer panel reads); we just substitute the
+    /// VRAM cells.
+    pub fn prepare_display_from_words(&self, words: Vec<u16>, gpu: Option<&Gpu>) {
+        let Some(gpu) = gpu else {
+            return;
+        };
+        if words.len() != VRAM_WIDTH * VRAM_HEIGHT {
+            return;
+        }
+        let da = gpu.display_area();
+        if da.width == 0 || da.height == 0 {
+            return;
+        }
+        // 16bpp BGR15 readback, bit-replicated to RGB888 — same
+        // expansion `Vram::to_rgba8` does on the CPU side.
+        let eff_w = da.width.min(VRAM_WIDTH as u16 - da.x) as usize;
+        let eff_h = da.height.min(VRAM_HEIGHT as u16 - da.y) as usize;
+        let mut packed = vec![0u8; VRAM_WIDTH * VRAM_HEIGHT * 4];
+        let dst_stride = VRAM_WIDTH * 4;
+        for row in 0..eff_h {
+            let src_row = (da.y as usize + row) * VRAM_WIDTH + da.x as usize;
+            let dst_off = row * dst_stride;
+            for col in 0..eff_w {
+                let pix = words[src_row + col];
+                let r5 = (pix & 0x1F) as u8;
+                let g5 = ((pix >> 5) & 0x1F) as u8;
+                let b5 = ((pix >> 10) & 0x1F) as u8;
+                let i = dst_off + col * 4;
+                packed[i] = (r5 << 3) | (r5 >> 2);
+                packed[i + 1] = (g5 << 3) | (g5 >> 2);
+                packed[i + 2] = (b5 << 3) | (b5 >> 2);
+                packed[i + 3] = 0xFF;
+            }
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.display_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &packed,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(VRAM_WIDTH as u32 * 4),
@@ -247,4 +355,21 @@ impl Graphics {
         self.window.pre_present_notify();
         output.present();
     }
+}
+
+fn create_rgba_texture(device: &wgpu::Device, label: &'static str) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: VRAM_WIDTH as u32,
+            height: VRAM_HEIGHT as u32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
 }

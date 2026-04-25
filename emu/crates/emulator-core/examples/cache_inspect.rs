@@ -13,7 +13,8 @@ use std::path::PathBuf;
 
 const MAGIC: &[u8; 8] = b"PSXTRACE";
 const HEADER_BYTES: u64 = 8 + 4 + 4 + 8; // magic + version + reserved + count
-const RECORD_BYTES: u64 = 8 + 4 + 4 + 32 * 4; // 144
+const RECORD_BYTES_V1: u64 = 8 + 4 + 4 + 32 * 4; // 144
+const RECORD_BYTES_V2: u64 = 8 + 4 + 4 + 32 * 4 + 32 * 4 + 32 * 4; // 400
 
 fn main() {
     let target: u64 = std::env::args()
@@ -25,23 +26,36 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
 
-    let path = PathBuf::from(
-        "/Users/ebonura/Desktop/repos/psoxide/emu/crates/emulator-core/target/parity-cache/redux-32b1a0fa4db70c8f-50000000.bin",
-    );
+    let path = std::env::args()
+        .nth(3)
+        .map(PathBuf::from)
+        .or_else(find_longest_cache)
+        .expect("cache path arg or target/parity-cache/redux-*.bin");
+    eprintln!("[cache-inspect] {}", path.display());
     let file = File::open(&path).expect("open cache");
     let mut r = BufReader::new(file);
 
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic).unwrap();
     assert_eq!(&magic, MAGIC);
+    let mut u32buf = [0u8; 4];
+    r.read_exact(&mut u32buf).unwrap();
+    let version = u32::from_le_bytes(u32buf);
+    r.read_exact(&mut u32buf).unwrap(); // reserved
+    let record_bytes = match version {
+        1 => RECORD_BYTES_V1,
+        2 => RECORD_BYTES_V2,
+        other => panic!("unsupported cache version {other}"),
+    };
+    eprintln!("[cache-inspect] version={version} record_bytes={record_bytes}");
 
     let start = target.saturating_sub(window);
     let end = target + window;
 
     for idx in start..=end {
-        let off = HEADER_BYTES + idx * RECORD_BYTES;
+        let off = HEADER_BYTES + idx * record_bytes;
         r.seek(SeekFrom::Start(off)).unwrap();
-        let mut buf = [0u8; 144];
+        let mut buf = vec![0u8; record_bytes as usize];
         r.read_exact(&mut buf).unwrap();
         let tick = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pc = u32::from_le_bytes(buf[8..12].try_into().unwrap());
@@ -57,4 +71,39 @@ fn main() {
             gprs[26], gprs[27], gprs[2]
         );
     }
+}
+
+fn find_longest_cache() -> Option<PathBuf> {
+    let base = std::env::var("CARGO_TARGET_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"));
+    let dir = base.join("parity-cache");
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("redux-") || !name.ends_with(".bin") {
+            continue;
+        }
+        let Some(step_text) = name
+            .strip_suffix(".bin")
+            .and_then(|s| s.rsplit_once('-').map(|(_, steps)| steps))
+        else {
+            continue;
+        };
+        let Ok(steps) = step_text.parse::<u64>() else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|(best_steps, _)| steps > *best_steps)
+            .unwrap_or(true)
+        {
+            best = Some((steps, path));
+        }
+    }
+    best.map(|(_, path)| path)
 }

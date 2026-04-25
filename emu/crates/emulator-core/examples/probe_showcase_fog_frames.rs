@@ -1,5 +1,5 @@
-//! Dump showcase-fog frames so we can verify the corridor scrolls
-//! forward smoothly with fog closing the far end.
+//! Dump showcase-fog frames so we can inspect the segmented corridor
+//! moving slowly forward through the far fog.
 use emulator_core::{Bus, Cpu};
 use psx_iso::Exe;
 use std::io::Write;
@@ -18,9 +18,8 @@ fn main() {
     let mut cpu = Cpu::new();
     cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
 
-    // Light-orbit period is ~1024 frames (frame >> 2 → 256 angle
-    // units per full turn). Sample at ~1/8 revolution intervals so
-    // we can see the light sweep across the walls.
+    // Sample across multiple scroll phases so texture density, fog,
+    // and the one-segment wrap stay easy to inspect.
     let sample_targets: &[u64] = &[16, 128, 256, 384, 512, 640, 768, 900];
     let mut cycles_at_last_pump = 0u64;
     for &target in sample_targets {

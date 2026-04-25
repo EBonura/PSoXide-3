@@ -10,7 +10,10 @@
 //!   framebuffer) to the scene;
 //! - a canonical [`Angle`] unit so we stop hitting the recurring
 //!   "256-per-revolution vs 4096-per-revolution" angle-mismatch bug
-//!   that cost an afternoon on showcase-fog's light orbit.
+//!   that cost an afternoon on showcase-fog's light orbit;
+//! - render helpers for ordering-table frames and fixed primitive
+//!   arenas, so games can build PS1 painter's-algorithm command
+//!   streams without rewriting OT ceremony in every scene.
 //!
 //! The engine is `no_std`, has no allocator dependency, and compiles
 //! only for `target_arch = "mips"` (host stubs mirror the SDK's
@@ -47,6 +50,8 @@
 pub mod angle;
 pub mod app;
 pub mod frames;
+pub mod render;
+pub mod render3d;
 pub mod scene;
 pub mod sfx;
 pub mod transform;
@@ -54,6 +59,12 @@ pub mod transform;
 pub use angle::Angle;
 pub use app::{App, Config};
 pub use frames::{Frames, Ticks};
+pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
+pub use render3d::{
+    CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand,
+    MeshRenderStats, ProjectedVertex, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
+    WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+};
 pub use scene::{Ctx, Scene};
 pub use transform::{ActorTransform, Vec3World};
 
@@ -62,4 +73,3 @@ pub use transform::{ActorTransform, Vec3World};
 /// `is_held` don't need a direct `psx-pad` dep just for the button
 /// names.
 pub use psx_pad::button;
-

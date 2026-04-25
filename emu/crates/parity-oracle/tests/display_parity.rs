@@ -42,7 +42,8 @@ use parity_oracle::{OracleConfig, ReduxProcess};
 use psx_iso::Disc;
 
 const DEFAULT_BIOS: &str = "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN";
-const CRASH_DISC: &str = "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
+const CRASH_DISC: &str =
+    "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
 const TEKKEN_DISC: &str =
     "/Users/ebonura/Downloads/ps1 games/Tekken 3 (USA)/Tekken 3 (USA) (Track 1).bin";
 const GT2_DISC: &str =
@@ -69,7 +70,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// capturing.
 #[derive(Clone, Copy, Debug)]
 struct Checkpoint {
-    /// Instruction count from cold boot.
+    /// Redux-style user-step count from cold boot.
     steps: u64,
     /// Human-readable label; shows up in the report + PPM filenames.
     name: &'static str,
@@ -118,11 +119,7 @@ fn report_dir() -> PathBuf {
 /// to ours at each stop, and dump the report. Panics if any
 /// checkpoint exceeds its threshold — exactly what we want out of
 /// a regression test.
-fn run_parity_suite(
-    suite: &str,
-    disc_path: Option<&str>,
-    checkpoints: &[Checkpoint],
-) {
+fn run_parity_suite(suite: &str, disc_path: Option<&str>, checkpoints: &[Checkpoint]) {
     assert!(!checkpoints.is_empty());
     if let Some(p) = disc_path {
         if !Path::new(p).exists() {
@@ -134,7 +131,10 @@ fn run_parity_suite(
     // Both emulators need the BIOS.
     let bios_file = bios_path();
     if !bios_file.exists() {
-        eprintln!("[parity] skip {suite}: BIOS not found at {}", bios_file.display());
+        eprintln!(
+            "[parity] skip {suite}: BIOS not found at {}",
+            bios_file.display()
+        );
         return;
     }
 
@@ -171,7 +171,10 @@ fn run_parity_suite(
 
     let mut results: Vec<CheckpointResult> = Vec::with_capacity(checkpoints.len());
     for cp in checkpoints {
-        assert!(cp.steps > cursor_steps, "checkpoints must be strictly increasing");
+        assert!(
+            cp.steps > cursor_steps,
+            "checkpoints must be strictly increasing"
+        );
         let delta = cp.steps - cursor_steps;
 
         // --- Redux: silent run forward, then screenshot_save.
@@ -182,8 +185,7 @@ fn run_parity_suite(
             .screenshot_save(&redux_bin, Duration::from_secs(60))
             .expect("screenshot save");
         let redux_bytes = fs::read(&redux_bin).expect("read redux bin");
-        let meta = fs::read_to_string(format!("{}.txt", redux_bin.display()))
-            .unwrap_or_default();
+        let meta = fs::read_to_string(format!("{}.txt", redux_bin.display())).unwrap_or_default();
         let (rw, rh) = parse_wh(&meta);
 
         // --- Ours: step forward `delta` more instructions, pumping
@@ -193,7 +195,9 @@ fn run_parity_suite(
         if let Some(s) = stopped_at {
             panic!(
                 "{}:{}: ours CPU errored at sub-step {s}/{delta} (pc=0x{:08x})",
-                suite, cp.name, cpu.pc(),
+                suite,
+                cp.name,
+                cpu.pc(),
             );
         }
         let (our_hash, our_w, our_h, our_len) = bus.gpu.display_hash();
@@ -244,27 +248,36 @@ fn run_parity_suite(
         // together to localise regressions without rerunning the suite.
         let our_bin = report.join(format!("{}_ours.bin", cp.name));
         fs::write(&our_bin, &our_bytes).expect("write ours bin");
-        write_ppm(&report.join(format!("{}_ours.ppm", cp.name)),
-                  our_w as usize, our_h as usize,
-                  |x, y| bgr15_to_rgb(&our_bytes, x, y, our_w as usize));
+        write_ppm(
+            &report.join(format!("{}_ours.ppm", cp.name)),
+            our_w as usize,
+            our_h as usize,
+            |x, y| bgr15_to_rgb(&our_bytes, x, y, our_w as usize),
+        );
         if (rw, rh) == (our_w, our_h) {
-            write_ppm(&report.join(format!("{}_redux.ppm", cp.name)),
-                      rw as usize, rh as usize,
-                      |x, y| bgr15_to_rgb(&redux_bytes, x, y, rw as usize));
-            write_ppm(&report.join(format!("{}_mask.ppm", cp.name)),
-                      rw as usize, rh as usize,
-                      |x, y| {
-                          let off = (y * rw as usize + x) * 2;
-                          let r = u16::from_le_bytes([redux_bytes[off], redux_bytes[off + 1]]);
-                          let o = u16::from_le_bytes([our_bytes[off], our_bytes[off + 1]]);
-                          if r != o {
-                              (0xFF, 0x00, 0x00)
-                          } else {
-                              let rgb = bgr15_to_rgb(&our_bytes, x, y, rw as usize);
-                              let dim = |c: u8| (c as u16 * 3 / 10) as u8;
-                              (dim(rgb.0), dim(rgb.1), dim(rgb.2))
-                          }
-                      });
+            write_ppm(
+                &report.join(format!("{}_redux.ppm", cp.name)),
+                rw as usize,
+                rh as usize,
+                |x, y| bgr15_to_rgb(&redux_bytes, x, y, rw as usize),
+            );
+            write_ppm(
+                &report.join(format!("{}_mask.ppm", cp.name)),
+                rw as usize,
+                rh as usize,
+                |x, y| {
+                    let off = (y * rw as usize + x) * 2;
+                    let r = u16::from_le_bytes([redux_bytes[off], redux_bytes[off + 1]]);
+                    let o = u16::from_le_bytes([our_bytes[off], our_bytes[off + 1]]);
+                    if r != o {
+                        (0xFF, 0x00, 0x00)
+                    } else {
+                        let rgb = bgr15_to_rgb(&our_bytes, x, y, rw as usize);
+                        let dim = |c: u8| (c as u16 * 3 / 10) as u8;
+                        (dim(rgb.0), dim(rgb.1), dim(rgb.2))
+                    }
+                },
+            );
         }
 
         results.push(CheckpointResult {
@@ -292,21 +305,43 @@ fn run_parity_suite(
     writeln!(f, "Parity suite: {}", suite).unwrap();
     writeln!(f, "Disc: {}", disc_path.unwrap_or("<none>")).unwrap();
     writeln!(f, "").unwrap();
-    writeln!(f, "{:<20} {:>10} {:>10} {:>8} {:>7}  size_ok  first_diff",
-        "checkpoint", "steps", "diff_bytes", "pct", "thresh").unwrap();
+    writeln!(
+        f,
+        "{:<20} {:>10} {:>10} {:>8} {:>7}  size_ok  first_diff",
+        "checkpoint", "steps", "diff_bytes", "pct", "thresh"
+    )
+    .unwrap();
     for r in &results {
-        let size_ok = if r.our_size == r.redux_size { "yes" } else { "NO " };
-        let fd = r.first_diff.map(|(y, x)| format!("({x},{y})")).unwrap_or("-".into());
-        writeln!(f, "{:<20} {:>10} {:>10} {:>7.2}% {:>6.1}%    {}     {}",
-            r.checkpoint.name, r.checkpoint.steps,
-            r.diff_bytes, r.diverge_pct, r.checkpoint.max_diverge_pct,
-            size_ok, fd,
-        ).unwrap();
+        let size_ok = if r.our_size == r.redux_size {
+            "yes"
+        } else {
+            "NO "
+        };
+        let fd = r
+            .first_diff
+            .map(|(y, x)| format!("({x},{y})"))
+            .unwrap_or("-".into());
+        writeln!(
+            f,
+            "{:<20} {:>10} {:>10} {:>7.2}% {:>6.1}%    {}     {}",
+            r.checkpoint.name,
+            r.checkpoint.steps,
+            r.diff_bytes,
+            r.diverge_pct,
+            r.checkpoint.max_diverge_pct,
+            size_ok,
+            fd,
+        )
+        .unwrap();
     }
     writeln!(f, "").unwrap();
     for r in &results {
-        writeln!(f, "{}:  our_hash=0x{:016x}  redux_hash=0x{:016x}",
-            r.checkpoint.name, r.our_hash, r.redux_hash).unwrap();
+        writeln!(
+            f,
+            "{}:  our_hash=0x{:016x}  redux_hash=0x{:016x}",
+            r.checkpoint.name, r.our_hash, r.redux_hash
+        )
+        .unwrap();
     }
     eprintln!("[parity/{}] report: {}", suite, report.display());
 
@@ -317,17 +352,24 @@ fn run_parity_suite(
         if r.our_size != r.redux_size {
             failures.push(format!(
                 "{}/{}: display size mismatch — ours={}×{} redux={}×{}",
-                suite, r.checkpoint.name,
-                r.our_size.0, r.our_size.1, r.redux_size.0, r.redux_size.1,
+                suite,
+                r.checkpoint.name,
+                r.our_size.0,
+                r.our_size.1,
+                r.redux_size.0,
+                r.redux_size.1,
             ));
         }
         if r.diverge_pct > r.checkpoint.max_diverge_pct {
             failures.push(format!(
                 "{}/{}: {:.2}% diverging bytes exceeds threshold {:.1}% \
                  (see {}/{}_mask.ppm)",
-                suite, r.checkpoint.name,
-                r.diverge_pct, r.checkpoint.max_diverge_pct,
-                report.display(), r.checkpoint.name,
+                suite,
+                r.checkpoint.name,
+                r.diverge_pct,
+                r.checkpoint.max_diverge_pct,
+                report.display(),
+                r.checkpoint.name,
             ));
         }
     }
@@ -340,9 +382,12 @@ fn run_parity_suite(
     }
 }
 
-/// Step our CPU forward `delta` instructions, pumping SPU every
-/// ~560k cycles to mirror the frontend's per-frame cadence. Returns
-/// the sub-step the CPU errored at, or `None` on clean finish.
+/// Step our CPU forward `delta` Redux-style user steps, pumping SPU
+/// every ~560k cycles to mirror the frontend's per-frame cadence.
+/// Redux's `stepIn` breakpoint sits in user code, so an IRQ entered
+/// by a user instruction is folded into that same outer step; mirror
+/// that here or visual checkpoints compare different timelines.
+/// Returns the sub-step the CPU errored at, or `None` on clean finish.
 fn step_ours(
     cpu: &mut Cpu,
     bus: &mut Bus,
@@ -350,16 +395,33 @@ fn step_ours(
     cycles_at_last_pump: &mut u64,
 ) -> Option<u64> {
     for i in 0..delta {
-        if cpu.step(bus).is_err() {
+        let was_in_isr = cpu.in_isr();
+        if step_once_and_pump(cpu, bus, cycles_at_last_pump).is_err() {
             return Some(i);
         }
-        if bus.cycles() - *cycles_at_last_pump > 560_000 {
-            *cycles_at_last_pump = bus.cycles();
-            bus.run_spu_samples(735);
-            let _ = bus.spu.drain_audio();
+        if !was_in_isr && cpu.in_irq_handler() {
+            while cpu.in_irq_handler() {
+                if step_once_and_pump(cpu, bus, cycles_at_last_pump).is_err() {
+                    return Some(i);
+                }
+            }
         }
     }
     None
+}
+
+fn step_once_and_pump(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    cycles_at_last_pump: &mut u64,
+) -> Result<(), emulator_core::ExecutionError> {
+    cpu.step(bus)?;
+    if bus.cycles() - *cycles_at_last_pump > 560_000 {
+        *cycles_at_last_pump = bus.cycles();
+        bus.run_spu_samples(735);
+        let _ = bus.spu.drain_audio();
+    }
+    Ok(())
 }
 
 /// Compare two equally-sized framebuffers. Returns
@@ -416,15 +478,14 @@ fn bgr15_to_rgb(buf: &[u8], x: usize, y: usize, w: usize) -> (u8, u8, u8) {
     let r5 = (pix & 0x1F) as u8;
     let g5 = ((pix >> 5) & 0x1F) as u8;
     let b5 = ((pix >> 10) & 0x1F) as u8;
-    ((r5 << 3) | (r5 >> 2), (g5 << 3) | (g5 >> 2), (b5 << 3) | (b5 >> 2))
+    (
+        (r5 << 3) | (r5 >> 2),
+        (g5 << 3) | (g5 >> 2),
+        (b5 << 3) | (b5 >> 2),
+    )
 }
 
-fn write_ppm(
-    path: &Path,
-    w: usize,
-    h: usize,
-    pixel: impl Fn(usize, usize) -> (u8, u8, u8),
-) {
+fn write_ppm(path: &Path, w: usize, h: usize, pixel: impl Fn(usize, usize) -> (u8, u8, u8)) {
     let mut f = fs::File::create(path).expect("create ppm");
     writeln!(f, "P6\n{w} {h}\n255").unwrap();
     let mut buf = Vec::with_capacity(w * h * 3);
@@ -465,10 +526,26 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 #[ignore = "requires PCSX-Redux + BIOS; ~3min in release"]
 fn parity_bios_boot() {
     let schedule = [
-        Checkpoint { steps:  50_000_000, name: "early_boot", max_diverge_pct: 0.05 },
-        Checkpoint { steps: 100_000_000, name: "sony_logo",  max_diverge_pct: 0.05 },
-        Checkpoint { steps: 200_000_000, name: "logo_hold",  max_diverge_pct: 0.05 },
-        Checkpoint { steps: 500_000_000, name: "shell",      max_diverge_pct: 0.20 },
+        Checkpoint {
+            steps: 50_000_000,
+            name: "early_boot",
+            max_diverge_pct: 0.05,
+        },
+        Checkpoint {
+            steps: 100_000_000,
+            name: "sony_logo",
+            max_diverge_pct: 0.05,
+        },
+        Checkpoint {
+            steps: 200_000_000,
+            name: "logo_hold",
+            max_diverge_pct: 0.05,
+        },
+        Checkpoint {
+            steps: 500_000_000,
+            name: "shell",
+            max_diverge_pct: 0.20,
+        },
     ];
     run_parity_suite("bios", None, &schedule);
 }
@@ -487,10 +564,26 @@ fn parity_bios_boot() {
 #[ignore = "requires PCSX-Redux + Crash disc; ~8min in release"]
 fn parity_crash_boot() {
     let schedule = [
-        Checkpoint { steps: 100_000_000, name: "sony_logo",    max_diverge_pct: 0.05 },
-        Checkpoint { steps: 200_000_000, name: "disc_handoff", max_diverge_pct: 2.00 },
-        Checkpoint { steps: 400_000_000, name: "game_boot",    max_diverge_pct: 10.00 },
-        Checkpoint { steps: 600_000_000, name: "intro_early",  max_diverge_pct: 20.00 },
+        Checkpoint {
+            steps: 100_000_000,
+            name: "sony_logo",
+            max_diverge_pct: 0.05,
+        },
+        Checkpoint {
+            steps: 200_000_000,
+            name: "disc_handoff",
+            max_diverge_pct: 2.00,
+        },
+        Checkpoint {
+            steps: 400_000_000,
+            name: "game_boot",
+            max_diverge_pct: 10.00,
+        },
+        Checkpoint {
+            steps: 600_000_000,
+            name: "intro_early",
+            max_diverge_pct: 20.00,
+        },
     ];
     run_parity_suite("crash", Some(CRASH_DISC), &schedule);
 }
@@ -503,10 +596,26 @@ fn parity_crash_boot() {
 #[ignore = "requires PCSX-Redux + Tekken 3 disc; ~4min in release"]
 fn parity_tekken_boot() {
     let schedule = [
-        Checkpoint { steps: 100_000_000, name: "sony_logo",    max_diverge_pct: 0.05 },
-        Checkpoint { steps: 300_000_000, name: "disc_handoff", max_diverge_pct: 10.00 },
-        Checkpoint { steps: 500_000_000, name: "licensed",     max_diverge_pct: 40.00 },
-        Checkpoint { steps: 800_000_000, name: "licensed_hold", max_diverge_pct: 40.00 },
+        Checkpoint {
+            steps: 100_000_000,
+            name: "sony_logo",
+            max_diverge_pct: 0.05,
+        },
+        Checkpoint {
+            steps: 300_000_000,
+            name: "disc_handoff",
+            max_diverge_pct: 10.00,
+        },
+        Checkpoint {
+            steps: 500_000_000,
+            name: "licensed",
+            max_diverge_pct: 40.00,
+        },
+        Checkpoint {
+            steps: 800_000_000,
+            name: "licensed_hold",
+            max_diverge_pct: 40.00,
+        },
     ];
     run_parity_suite("tekken", Some(TEKKEN_DISC), &schedule);
 }
@@ -530,9 +639,11 @@ fn sony_logo_schedule() -> &'static [Checkpoint] {
     // Budget is pinned tight (0.05%) — the renderer is pixel-
     // exact here, so any divergence implies a CPU/memory-timing
     // regression worth diagnosing.
-    &[
-        Checkpoint { steps: 100_000_000, name: "sony_logo", max_diverge_pct: 0.05 },
-    ]
+    &[Checkpoint {
+        steps: 100_000_000,
+        name: "sony_logo",
+        max_diverge_pct: 0.05,
+    }]
 }
 
 #[test]

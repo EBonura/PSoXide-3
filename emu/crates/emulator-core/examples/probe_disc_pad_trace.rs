@@ -21,8 +21,12 @@
 //!   --features emulator-core/trace-mmio --release -- 120000000
 //! ```
 
-use emulator_core::{Bus, Cpu};
-use psx_iso::Disc;
+#[path = "support/disc.rs"]
+mod disc_support;
+
+use emulator_core::{
+    fast_boot_disc_with_hle, warm_bios_for_disc_fast_boot, Bus, Cpu, DISC_FAST_BOOT_WARMUP_STEPS,
+};
 use std::path::PathBuf;
 
 #[cfg(feature = "trace-mmio")]
@@ -47,8 +51,18 @@ struct PadMaskChange {
 }
 
 fn main() {
-    let steps: u64 = std::env::args()
-        .nth(1)
+    let mut fastboot = false;
+    let mut positional = Vec::new();
+    for arg in std::env::args().skip(1) {
+        if arg == "--fastboot" {
+            fastboot = true;
+        } else {
+            positional.push(arg);
+        }
+    }
+
+    let steps: u64 = positional
+        .first()
         .and_then(|s| s.parse().ok())
         .unwrap_or(120_000_000);
 
@@ -76,13 +90,22 @@ fn main() {
         .unwrap_or_default();
 
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
-    let disc = std::fs::read(&disc_path).expect("disc readable");
-
     let mut bus = Bus::new(bios).expect("bus");
-    bus.cdrom.insert_disc(Some(Disc::from_bin(disc)));
+    let mut cpu = Cpu::new();
+    let disc =
+        disc_support::load_disc_path(std::path::Path::new(&disc_path)).expect("disc readable");
+    if fastboot {
+        warm_bios_for_disc_fast_boot(&mut bus, &mut cpu, DISC_FAST_BOOT_WARMUP_STEPS)
+            .expect("BIOS warmup");
+        let info = fast_boot_disc_with_hle(&mut bus, &mut cpu, &disc, false).expect("fast boot");
+        println!(
+            "fastboot={} entry=0x{:08x} payload={}B",
+            info.boot_path, info.initial_pc, info.payload_len
+        );
+    }
+    bus.cdrom.insert_disc(Some(disc));
     bus.attach_digital_pad_port1();
 
-    let mut cpu = Cpu::new();
     let mut cycles_at_last_pump = 0u64;
     let mut current_pad_mask = None;
     let mut pad_mask_changes = Vec::new();

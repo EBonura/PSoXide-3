@@ -224,7 +224,9 @@ pub fn viz_frame<R>(
         .inner_margin(egui::Margin::ZERO)
         .outer_margin(egui::Margin::same(4))
         .show(ui, |ui| {
-            pane_header(ui, title);
+            if !title.is_empty() {
+                pane_header(ui, title);
+            }
             let inner_resp = egui::Frame::NONE
                 .fill(BG)
                 .inner_margin(egui::Margin::same(4))

@@ -70,6 +70,12 @@ fn main() {
     let kon_raw_hi = bus.spu.read16(0x1F80_1D8A);
     let koff_raw_lo = bus.spu.read16(0x1F80_1D8C);
     let koff_raw_hi = bus.spu.read16(0x1F80_1D8E);
-    eprintln!("KON  = 0x{:08x}", ((kon_raw_hi as u32) << 16) | kon_raw_lo as u32);
-    eprintln!("KOFF = 0x{:08x}", ((koff_raw_hi as u32) << 16) | koff_raw_lo as u32);
+    eprintln!(
+        "KON  = 0x{:08x}",
+        ((kon_raw_hi as u32) << 16) | kon_raw_lo as u32
+    );
+    eprintln!(
+        "KOFF = 0x{:08x}",
+        ((koff_raw_hi as u32) << 16) | koff_raw_lo as u32
+    );
 }

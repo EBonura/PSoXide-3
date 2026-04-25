@@ -17,12 +17,17 @@ pub const TERMINAL: char = '\u{e183}';
 pub const HASH: char = '\u{e0eb}';
 
 pub const MONITOR: char = '\u{e11d}';
+pub const MAXIMIZE: char = '\u{e112}';
+pub const MINIMIZE: char = '\u{e11a}';
 pub const CPU: char = '\u{e1cf}';
 pub const LAYERS: char = '\u{e529}';
 pub const HARD_DRIVE: char = '\u{e0ed}';
 pub const GAMEPAD_2: char = '\u{e0df}';
 pub const GRID: char = '\u{e0e9}';
 pub const SAVE: char = '\u{e14d}';
+pub const VOLUME_1: char = '\u{e1aa}';
+pub const VOLUME_2: char = '\u{e1ab}';
+pub const VOLUME_X: char = '\u{e1ac}';
 
 pub const EYE: char = '\u{e0ba}';
 pub const EYE_OFF: char = '\u{e0bb}';

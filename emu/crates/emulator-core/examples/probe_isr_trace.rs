@@ -17,8 +17,7 @@ fn main() {
     let bios = std::fs::read(&bios_path).expect("BIOS readable");
 
     let dir = cache::default_dir();
-    let trace = cache::load_prefix(&dir, &bios, 50_000_000)
-        .expect("No cached trace long enough");
+    let trace = cache::load_prefix(&dir, &bios, 50_000_000).expect("No cached trace long enough");
 
     let target_step: usize = std::env::var("PSOXIDE_ISR_AT")
         .ok()
@@ -39,10 +38,10 @@ fn main() {
     // retire as step `target_step`.
     for _i in 0..target_step {
         let was_in_isr = cpu.in_isr();
-        let _ = cpu.step(&mut bus).expect("step");
+        let _ = cpu.step_traced(&mut bus).expect("step");
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                let _ = cpu.step(&mut bus).expect("step");
+                let _ = cpu.step_traced(&mut bus).expect("step");
             }
         }
     }
@@ -65,9 +64,7 @@ fn main() {
     let was_in_isr = cpu.in_isr();
     let pc_before = cpu.pc();
     let cycles_before = bus.cycles();
-    eprintln!(
-        "Starting: pc=0x{pc_before:08x}  cycles={cycles_before}  in_isr={was_in_isr}",
-    );
+    eprintln!("Starting: pc=0x{pc_before:08x}  cycles={cycles_before}  in_isr={was_in_isr}",);
 
     // Dump bus state before stepping — which IRQs are pending?
     let istat = bus.irq().stat();
@@ -89,8 +86,17 @@ fn main() {
     // rate.
     let raise_counts = bus.irq().raise_counts();
     let names = [
-        "VBlank", "Gpu", "Cdrom", "Dma", "Timer0", "Timer1", "Timer2",
-        "Controller", "Sio", "Spu", "Lightpen",
+        "VBlank",
+        "Gpu",
+        "Cdrom",
+        "Dma",
+        "Timer0",
+        "Timer1",
+        "Timer2",
+        "Controller",
+        "Sio",
+        "Spu",
+        "Lightpen",
     ];
     eprintln!("  IRQ raise histogram to this point:");
     for (i, &n) in raise_counts.iter().enumerate() {
@@ -108,10 +114,14 @@ fn main() {
     };
     eprintln!("  cycles={cycles}, expected VBlank count at this cycle: {expected_vblanks}");
 
-    let rec = cpu.step(&mut bus).expect("step");
+    let rec = cpu.step_traced(&mut bus).expect("step");
     eprintln!(
         "  [main] pc=0x{:08x}  tick={}  (delta={})  in_isr={}  in_irq={}",
-        rec.pc, rec.tick, rec.tick - cycles_before, cpu.in_isr(), cpu.in_irq_handler(),
+        rec.pc,
+        rec.tick,
+        rec.tick - cycles_before,
+        cpu.in_isr(),
+        cpu.in_irq_handler(),
     );
 
     if !was_in_isr && cpu.in_irq_handler() {
@@ -119,7 +129,7 @@ fn main() {
         while cpu.in_irq_handler() {
             let prev_cycles = bus.cycles();
             let prev_pc = cpu.pc();
-            let r = cpu.step(&mut bus).expect("step");
+            let r = cpu.step_traced(&mut bus).expect("step");
             isr_step += 1;
             eprintln!(
                 "  [isr #{isr_step}] pc=0x{prev_pc:08x} → 0x{:08x}  instr at fetch=0x?  tick={} (+{})  in_irq={}",
@@ -130,7 +140,10 @@ fn main() {
                 break;
             }
         }
-        eprintln!("=== ISR done in {isr_step} instructions, final tick={} ===", bus.cycles());
+        eprintln!(
+            "=== ISR done in {isr_step} instructions, final tick={} ===",
+            bus.cycles()
+        );
     } else {
         eprintln!("(No ISR was folded in at this step.)");
     }
@@ -138,8 +151,7 @@ fn main() {
     eprintln!();
     eprintln!(
         "Redux says step {target_step} should end at tick {} with pc={:08x}.",
-        trace[target_step].tick,
-        trace[target_step].pc,
+        trace[target_step].tick, trace[target_step].pc,
     );
     eprintln!(
         "We end at tick {} with pc=0x{:08x}. Delta tick: {:+}.",
@@ -163,12 +175,21 @@ fn main() {
         // subsystem raised the IRQ.
         let pre_istat = bus.irq().stat();
         let pre_imask = bus.irq().mask();
-        let _rec = cpu.step(&mut bus).expect("step");
+        let _rec = cpu.step_traced(&mut bus).expect("step");
         if !was_in_isr && cpu.in_irq_handler() {
             // Bit name lookup.
             let names = [
-                "VBlank", "Gpu", "Cdrom", "Dma", "Timer0", "Timer1", "Timer2",
-                "Controller", "Sio", "Spu", "Lightpen",
+                "VBlank",
+                "Gpu",
+                "Cdrom",
+                "Dma",
+                "Timer0",
+                "Timer1",
+                "Timer2",
+                "Controller",
+                "Sio",
+                "Spu",
+                "Lightpen",
             ];
             let pending = pre_istat & pre_imask;
             let mut which = vec![];
@@ -189,7 +210,7 @@ fn main() {
             }
             let mut isr_len = 0;
             while cpu.in_irq_handler() {
-                let _ = cpu.step(&mut bus).expect("step");
+                let _ = cpu.step_traced(&mut bus).expect("step");
                 isr_len += 1;
             }
             eprintln!(

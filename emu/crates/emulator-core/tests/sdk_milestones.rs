@@ -247,6 +247,15 @@ pub fn side_load_and_hash(exe_path: &Path, vblanks: u64) -> Option<SdkExampleSta
 /// specific subsystem that regressed.
 fn assert_sdk_golden(state: &SdkExampleState, golden: &SdkGolden) {
     let name = golden.example;
+    if state.display_size != golden.display_size
+        || state.vblank_raises != golden.vblank_raises
+        || state.display_hash != golden.display_hash
+        || state.vram_hash != golden.vram_hash
+        || state.spu_samples != golden.spu_samples
+        || state.final_pc != golden.final_pc
+    {
+        print_capture(state, golden.example, golden.vblanks);
+    }
     assert_eq!(
         state.display_size, golden.display_size,
         "{name}: display dimensions changed — GP1 display-mode regression",
@@ -296,7 +305,10 @@ fn print_capture(state: &SdkExampleState, example: &str, vblanks: u64) {
     eprintln!("        vblanks: {vblanks},");
     eprintln!("        vram_hash: 0x{:016x},", state.vram_hash);
     eprintln!("        display_hash: 0x{:016x},", state.display_hash);
-    eprintln!("        display_size: ({}, {}),", state.display_size.0, state.display_size.1);
+    eprintln!(
+        "        display_size: ({}, {}),",
+        state.display_size.0, state.display_size.1
+    );
     eprintln!("        vblank_raises: {},", state.vblank_raises);
     eprintln!("        spu_samples: {},", state.spu_samples);
     eprintln!("        final_pc: 0x{:08x},", state.final_pc);
@@ -346,12 +358,12 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-tri" => Some(SdkGolden {
             example: "hello-tri",
             vblanks: 2,
-            vram_hash: 0xb872_c8b3_8b8e_f208,
-            display_hash: 0x1d9b_e70c_acb5_0241,
+            vram_hash: 0xe2b4_fca3_d005_dbc0,
+            display_hash: 0x29dd_3c79_8152_b324,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_0470,
+            final_pc: 0x8001_0480,
             redux_display_hash: None,
         }),
         // Two 4bpp CLUT textures cooked by `psxed tex` from 512×512
@@ -363,23 +375,23 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-tex" => Some(SdkGolden {
             example: "hello-tex",
             vblanks: 2,
-            vram_hash: 0x1291_2e30_2641_3e9f,
+            vram_hash: 0x7d8c_c1a8_3fd6_ee47,
             display_hash: 0x6b0c_8a05_afca_2bae,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_1298,
+            final_pc: 0x8001_130c,
             redux_display_hash: None,
         }),
         "hello-ot" => Some(SdkGolden {
             example: "hello-ot",
             vblanks: 2,
-            vram_hash: 0xa8fc_3c26_d9a2_ee80,
-            display_hash: 0xdb22_e03e_82dc_86be,
+            vram_hash: 0x759a_f51d_8acc_34c1,
+            display_hash: 0xd1dd_e059_00c0_5be3,
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_05a0,
+            final_pc: 0x8001_05e4,
             redux_display_hash: None,
         }),
         "hello-input" => Some(SdkGolden {
@@ -390,7 +402,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0b90,
+            final_pc: 0x8001_0bb4,
             redux_display_hash: None,
         }),
         "hello-gte" => Some(SdkGolden {
@@ -401,21 +413,38 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 2,
             spu_samples: 735,
-            final_pc: 0x8001_0ae0,
+            final_pc: 0x8001_0acc,
             redux_display_hash: None,
         }),
         "showcase-textured-sprite" => Some(SdkGolden {
             example: "showcase-textured-sprite",
             vblanks: 3,
-            vram_hash: 0xa521_4f52_d0cd_b221,
-            display_hash: 0x37bd_e306_ae08_a28d,
+            vram_hash: 0x4258_6aa5_5493_4f74,
+            display_hash: 0xc949_202f_e476_f5ce,
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
-            // 0x55c -> 0x7ec after Phase 3e: `App::run` + `Scene`
-            // plumbing shifts `main`'s return site. Bytes-identical
-            // VRAM + display confirm the port is pure plumbing.
-            final_pc: 0x8001_07ec,
+            // Interactive material viewer: a compact room with a
+            // single upright material pane. Face buttons swap the
+            // texture sample and blend mode while the HUD names the
+            // active material. World geometry is now authored as quads but
+            // submitted through `WorldRenderPass` as independently
+            // culled/sorted textured triangles: 3x3 floor, four
+            // backface-culled walls, and a double-sided material card.
+            // Floor/card surfaces use near-plane clipping; walls use
+            // the stricter all-corners-projected path to avoid giant
+            // behind-camera slabs during the orbit.
+            // The camera no longer auto-orbits: D-pad rotates/dollies
+            // the view while face buttons keep material selection.
+            // Pitch is derived from the dolly radius so the view keeps
+            // looking at the centre of the material card.
+            // The world textured path now splits projected triangles
+            // that would exceed the PS1 hardware extent limits, so the
+            // floor stays stable at close and pulled-back camera ranges.
+            // Visual hashes unchanged after moving the camera/world
+            // transform math into `psx-engine::WorldCamera`; only code
+            // layout shifted the frame-boundary PC.
+            final_pc: 0x8001_2bac,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:
@@ -425,8 +454,8 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-text" => Some(SdkGolden {
             example: "showcase-text",
             vblanks: 4,
-            vram_hash: 0x79ec_03dd_8745_96cb,
-            display_hash: 0x92bb_ba4e_4c01_3e05,
+            vram_hash: 0xb545_ba8f_6fc9_5f7b,
+            display_hash: 0x7f11_de8d_527d_f7c3,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
@@ -434,7 +463,9 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             // plumbing adds ~816 bytes of text-section code, so
             // `main`'s final `lw ra / jr ra` sits further on. VRAM
             // + display bytes-identical — port is pure plumbing.
-            final_pc: 0x8001_0e70,
+            // Refreshed after engine render-helper growth changed
+            // frame-boundary timing for this animation capture.
+            final_pc: 0x8001_0e9c,
             redux_display_hash: None,
         }),
         // hello-audio: SPU init + 4 voices configured + ADPCM
@@ -452,7 +483,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
-            final_pc: 0x8001_0ce8,
+            final_pc: 0x8001_0d0c,
             redux_display_hash: None,
         }),
         // First mini-game. At the 8-VBlank checkpoint the ball
@@ -475,7 +506,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 8,
             spu_samples: 5145,
-            final_pc: 0x8001_179c,
+            final_pc: 0x8001_17c8,
             redux_display_hash: None,
         }),
         // Second mini-game. 60 VBlanks captures one serve-arc +
@@ -501,7 +532,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_3938,
+            final_pc: 0x8001_3968,
             redux_display_hash: None,
         }),
         // Third mini-game. Space Invaders: 5×10 alien grid, ship
@@ -534,7 +565,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             display_size: (320, 240),
             vblank_raises: 120,
             spu_samples: 88200,
-            final_pc: 0x8001_5934,
+            final_pc: 0x8001_5964,
             redux_display_hash: None,
         }),
         // Flagship 3D showcase. Starfield + Suzanne (Blender
@@ -560,72 +591,79 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-lights" => Some(SdkGolden {
             example: "showcase-lights",
             vblanks: 60,
-            vram_hash: 0x4058_93e4_75f3_5230,
-            display_hash: 0xc6dc_b875_f7e6_0798,
+            vram_hash: 0x393c_1b7b_a3ff_b8bd,
+            display_hash: 0xcbb2_2705_0c4f_7575,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_10dc,
+            // Engine `GouraudRenderPass` now owns culling, depth
+            // policy, command sorting, and OT insertion for the
+            // CPU-lit cube layer.
+            final_pc: 0x8001_147c,
             redux_display_hash: None,
         }),
 
         // Now lit via the GTE's NCCS pipeline — 3 directional
-        // world-space lights rotated per-object into local
-        // frames, per-vertex `project_lit` computes both screen
-        // coords (RTPS) and lit colour (NCCS → RGB2). Triangles
-        // emit as `TriGouraud` with per-vertex colours.
-        // Refreshed in Phase 3e after port to `psx-engine`. Both
-        // mesh tumbles (frame×3, frame×2, frame×4) and HUD read
-        // `ctx.frame`, so every pixel on screen shifts with the
-        // end-of-loop frame-counter advance. `spawn_burst` also
-        // pulls from the shared `LcgRng` on a modulo of `frame`
-        // — rebaked wholesale.
+        // camera-space lights rotated per-object into local frames,
+        // per-vertex `project_lit` computes both screen coords
+        // (RTPS) and lit colour (NCCS → RGB2). Triangles emit as
+        // `TriGouraud` with per-vertex colours. Camera now orbits
+        // around the scene centre from a slightly raised angle, so
+        // object positions and rotations include a shared view matrix.
         "showcase-3d" => Some(SdkGolden {
             example: "showcase-3d",
             vblanks: 60,
-            vram_hash: 0x22e2_d410_00a2_32c1,
-            display_hash: 0x3daf_a742_b90a_65cb,
+            vram_hash: 0xbf7e_537c_28b4_ca87,
+            display_hash: 0x9eb4_a149_9747_33f9,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_3170,
+            // Suzanne and teapot now share an engine depth band using
+            // per-face projected SZ instead of fixed object slots.
+            // The engine `GouraudRenderPass` sorts all opaque mesh
+            // triangles before OT insertion, so same-slot order is
+            // deterministic across both meshes instead of source-order.
+            // The showcase uses 128 OT slots to make depth-bucket
+            // artifacts easier to inspect under real GTE load.
+            final_pc: 0x8001_3b7c,
             redux_display_hash: None,
         }),
-        // Full PS1-commercial textured-Gouraud pipeline: RTPT +
-        // NCLIP + AVSZ3 + NCDT feeds per-vertex lit+fogged colours
-        // into textured-Gouraud triangles (GP0 0x34). Brick walls
-        // + cobblestone floor sampled from two cooked PSXT
-        // textures in a shared tpage, tiled per ring, modulated by
-        // NCDT's fog gradient. The Silent-Hill-era look, rendered
-        // through hardware ops only.
-        // PS1-commercial textured-Gouraud pipeline: RTPT + NCLIP +
-        // AVSZ3 + NCDT feeds per-vertex depth-cue-blended colours
-        // into textured-Gouraud triangles (GP0 0x34). Brick walls
-        // + cobblestone floor sampled from two cooked PSXT
-        // textures in a shared tpage, modulated by NCDT's fog
-        // gradient. Pure ambient lighting (no directional or
-        // orbit) — the fog is the only visual variable. Static
-        // corridor — no camera scroll, so no ring-wrap discontinuity.
-        // Per-vertex fog via 3× RTPS + 3× NCDS + NCLIP + AVSZ3.
-        // Each vertex gets its own IR0 (depth-cue weight) so the
-        // texture-Gouraud tint interpolates smoothly across each
-        // wall. Two rings (no intermediate segments) → walls are
-        // single continuous quads from near to far, no seams at
-        // tile boundaries.
-        // Refreshed in Phase 3e after port to `psx-engine`. The HUD
-        // reads `ctx.frame` directly, so the displayed hex frame #
-        // is off-by-one from the pre-engine demo (which incremented
-        // at start-of-update rather than end-of-loop). Geometry is
-        // identical — the hash drift is confined to the HUD row.
+        // PS1-commercial textured-Gouraud pipeline: per-vertex RTPS
+        // + NCDS feeds depth-cue-blended colours into textured-Gouraud
+        // triangles (GP0 0x34), followed by NCLIP + AVSZ3 for cull
+        // and OT placement. Brick walls + cobblestone floor are
+        // sampled from two cooked PSXT textures in a shared tpage.
+        // Scrolling 16-ring corridor: each ring gap maps the full
+        // 64x64 tile once, avoiding hardware UV repeat while reducing
+        // the long-poly affine stretch of the old single-quad version.
+        // Refreshed after restoring segmented geometry and slow
+        // forward motion.
+        // The display hash now covers 120 textured-Gouraud tris
+        // instead of the temporary 8-tri single-quad corridor.
         "showcase-fog" => Some(SdkGolden {
             example: "showcase-fog",
             vblanks: 60,
-            vram_hash: 0xb370_c6da_8371_68e5,
-            display_hash: 0x2b4d_221d_5825_016b,
+            vram_hash: 0x6f2c_e3f9_b389_3e6d,
+            display_hash: 0x1e65_dee2_c74a_167f,
             display_size: (320, 240),
             vblank_raises: 60,
             spu_samples: 44100,
-            final_pc: 0x8001_1988,
+            // Pixels unchanged; render loop now uses `OtFrame`,
+            // `PrimitiveArena`, and `DepthBand` for the GTE OTZ map.
+            final_pc: 0x8001_130c,
+            redux_display_hash: None,
+        }),
+        "showcase-particles" => Some(SdkGolden {
+            example: "showcase-particles",
+            vblanks: 60,
+            vram_hash: 0x8320_acb5_19ff_3047,
+            display_hash: 0xe183_25de_aac2_0540,
+            display_size: (320, 240),
+            vblank_raises: 60,
+            spu_samples: 44100,
+            // Standalone `psx-fx::ParticlePool` demo: fixed pool,
+            // OT-backed RectFlat arena, auto emitter, and HUD.
+            final_pc: 0x8001_0f94,
             redux_display_hash: None,
         }),
         // First engine-domain example. Exercises `App::run`'s
@@ -634,12 +672,12 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "hello-engine" => Some(SdkGolden {
             example: "hello-engine",
             vblanks: 4,
-            vram_hash: 0xf7c6_35c6_c967_2d25,
-            display_hash: 0xb2d4_083b_0bd1_1125,
+            vram_hash: 0xed9a_1715_859f_f925,
+            display_hash: 0xcf68_7a3c_953c_2d25,
             display_size: (320, 240),
             vblank_raises: 4,
             spu_samples: 2205,
-            final_pc: 0x8001_0770,
+            final_pc: 0x8001_07d8,
             redux_display_hash: None,
         }),
         _ => None,
@@ -780,11 +818,18 @@ fn milestone_c_showcase_text() {
 #[test]
 #[ignore = "SDK milestone: showcase-fog roundtrip"]
 fn milestone_c_showcase_fog() {
-    // 60 VBlanks captures the corridor after ~1 s of forward
-    // dolly — multiple ring-wraps in, light rig orbited a visible
-    // amount, fog gradient fully lit across all rings. Covers
-    // RTPT + NCLIP + AVSZ3 + NCDT end-to-end.
+    // 60 VBlanks captures the segmented corridor after ~1 s of slow
+    // forward motion. Covers per-vertex RTPS + NCDS, then NCLIP +
+    // AVSZ3, feeding textured-Gouraud tris end-to-end.
     run_sdk_milestone("showcase-fog", 60);
+}
+
+#[test]
+#[ignore = "SDK milestone: showcase-particles roundtrip"]
+fn milestone_c_showcase_particles() {
+    // 60 VBlanks captures the fixed particle pool with the automatic
+    // emitter actively feeding the OT-backed RectFlat arena.
+    run_sdk_milestone("showcase-particles", 60);
 }
 
 #[test]

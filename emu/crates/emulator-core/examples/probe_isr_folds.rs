@@ -5,6 +5,9 @@
 //! emulators' fold cycles lets us see which IRQ fires at a different
 //! time even when the surrounding user code is in lockstep.
 
+#[path = "support/disc.rs"]
+mod disc_support;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -35,9 +38,8 @@ fn main() {
     let mut bus = Bus::new(bios).expect("bus");
     bus.cdrom.enable_irq_log(200);
     if let Some(ref p) = disc_path {
-        let disc_bytes = std::fs::read(p).expect("disc");
-        bus.cdrom
-            .insert_disc(Some(psx_iso::Disc::from_bin(disc_bytes)));
+        let disc = disc_support::load_disc_path(&PathBuf::from(p)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
     }
     let mut cpu = Cpu::new();
     for _ in 0..start {
@@ -53,11 +55,11 @@ fn main() {
     let mut our_folds: Vec<(u64, u64, u64)> = Vec::new(); // (step, cycle, delta)
     for i in 0..window {
         let was_in_isr = cpu.in_isr();
-        let rec = cpu.step(&mut bus).expect("step");
+        let rec = cpu.step_traced(&mut bus).expect("step");
         let mut tick = rec.tick;
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                let r = cpu.step(&mut bus).expect("isr step");
+                let r = cpu.step_traced(&mut bus).expect("isr step");
                 tick = r.tick;
             }
         }
@@ -91,9 +93,7 @@ fn main() {
         "[redux] ff done in {:.1}s, tracing {window} steps...",
         t0.elapsed().as_secs_f64()
     );
-    let trace = redux
-        .step(window, TRACE_STEP_TIMEOUT)
-        .expect("step trace");
+    let trace = redux.step(window, TRACE_STEP_TIMEOUT).expect("step trace");
     redux.send_command("quit").ok();
     let _ = redux.wait_for_response(Duration::from_secs(2));
     let _ = redux.terminate();
@@ -128,7 +128,14 @@ fn main() {
     }
     println!();
     println!("=== Our CDROM IRQ log ===");
-    let names = ["None", "DataReady", "Complete", "Acknowledge", "DataEnd", "Error"];
+    let names = [
+        "None",
+        "DataReady",
+        "Complete",
+        "Acknowledge",
+        "DataEnd",
+        "Error",
+    ];
     for (i, &(cyc, ty)) in our_log.iter().enumerate() {
         let name = names.get(ty as usize).copied().unwrap_or("?");
         println!("  #{i:>3}  cyc={cyc:>12}  {name}");

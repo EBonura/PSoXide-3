@@ -31,9 +31,7 @@ fn main() {
     }
 
     // Then step `window` more times, dumping state.
-    println!(
-        "step  pc         sr         cause      epc        istat  imask  in_irq",
-    );
+    println!("step  pc         sr         cause      epc        istat  imask  in_irq",);
     for i in 0..window {
         let pc_before = cpu.pc();
         let sr_before = cpu.cop0()[12];

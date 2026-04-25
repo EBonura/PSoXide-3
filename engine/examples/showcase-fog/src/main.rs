@@ -3,14 +3,14 @@
 //!
 //! Every frame, for every triangle, the GTE executes:
 //!
-//!   RTPT  → project 3 vertices in one op
+//!   RTPS  → project 1 vertex, producing its own depth-cue weight
 //!   NCLIP → hardware back-face cull
 //!   AVSZ3 → average-Z key for ordering-table insertion
-//!   NCDT  → lit + depth-cue colour for all 3 vertices
+//!   NCDS  → lit + depth-cue colour for that vertex
 //!
-//! The three NCDT-produced per-vertex colours become the per-vertex
+//! The three NCDS-produced per-vertex colours become the per-vertex
 //! *tint* on a **textured Gouraud** triangle (GP0 0x34), so the GPU
-//! multiplies each sampled texel by its interpolated NCDT colour.
+//! multiplies each sampled texel by its interpolated NCDS colour.
 //! Result: textures that properly light and fog — near walls show
 //! crisp brick, far walls dissolve into the fog colour — the
 //! Silent-Hill-era look achieved through hardware ops only.
@@ -18,10 +18,9 @@
 //! # Scene
 //!
 //! A square corridor receding into the distance. 16 rings of wall
-//! segments — ceiling / floor / left / right — scroll toward the
-//! camera; when a ring crosses the near plane, it wraps to the far
-//! end. A single warm directional light orbits slowly around the
-//! Y axis so each wall sees the highlight sweep past.
+//! segments — ceiling / floor / left / right — scroll slowly toward
+//! the camera and wrap once per segment. Lighting is ambient-only so
+//! the texture tiling and fog gradient stay easy to judge.
 //!
 //! # Textures
 //!
@@ -55,14 +54,14 @@
 extern crate psx_rt;
 
 use psx_asset::Texture;
-use psx_engine::{App, Config, Ctx, Scene};
-use psx_font::{FontAtlas, fonts::BASIC_8X16};
+use psx_engine::{App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena, Scene};
+use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, TriTexturedGouraud};
-use psx_gte::lighting::{Light, LightRig, project_triangle_fogged};
+use psx_gte::lighting::{project_triangle_fogged, Light, LightRig};
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene;
-use psx_vram::{Clut, TexDepth, Tpage, VramRect, upload_bytes};
+use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
 // ----------------------------------------------------------------------
 // Screen + projection constants
@@ -78,20 +77,23 @@ const PROJ_H: u16 = 280;
 /// range so 32 slots is more than enough to avoid far-ring
 /// triangles overlapping near-ring ones.
 const OT_DEPTH: usize = 32;
+const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 2);
+const GTE_OTZ_RANGE: DepthRange = DepthRange::new(0, ((OT_DEPTH - 2) as i32) << 10);
 
 // ----------------------------------------------------------------------
 // Corridor geometry
 // ----------------------------------------------------------------------
 
-/// Two rings — one at the near plane, one at the far end. The
-/// whole corridor is drawn as 4 big textured quads (one per side
-/// + floor + ceiling), each spanning the full length. This
-/// trades affine-texture "wobble" (the classic PS1 look on long
-/// polys) for **zero segment seams** — a single texture from
-/// near to far per wall, no restart points for banding to form
-/// at. Per-vertex fog then interpolates smoothly across the
-/// whole wall: bright brick near, dissolves into fog at far.
-const NUM_RINGS: usize = 2;
+/// Sixteen rings, fifteen segment gaps. Each gap maps the full
+/// 64x64 wall texture once instead of asking the GPU to repeat UVs
+/// across a huge polygon. This is the PS1-friendly tradeoff: more
+/// polygons, much less affine texture stretch.
+const NUM_RINGS: usize = 16;
+const RING_GAPS: usize = NUM_RINGS - 1;
+
+/// World units per visible frame. One full tile pass takes roughly
+/// 2.7 seconds at 60 Hz, slow enough to inspect segment seams.
+const SCROLL_SPEED: i32 = 0x08;
 
 /// World-space half-dimensions of the corridor cross-section.
 /// Chosen so near-ring walls extend off-screen (the camera is
@@ -100,13 +102,14 @@ const NUM_RINGS: usize = 2;
 const CORR_HALF_W: i16 = 0x0780;
 const CORR_HALF_H: i16 = 0x0500;
 
-/// Z of the corridor's near wall edge and its far wall edge.
-/// With 2 rings, `RING_Z = [NEAR, FAR]` and every wall becomes
-/// one giant quad spanning the full corridor length.
+/// Z of the corridor's near wall edge and its far wall edge. Rings
+/// are distributed evenly across this span; the final ring lands one
+/// world unit short because the range does not divide cleanly by 15,
+/// which is visually irrelevant and keeps the intended far-fog tuning.
 const NEAR_CAM_Z: i32 = 0x0800;
 const FAR_CAM_Z: i32 = 0x5400;
 const FIRST_RING_Z: i32 = NEAR_CAM_Z;
-const RING_SPACING: i32 = FAR_CAM_Z - NEAR_CAM_Z;
+const RING_SPACING: i32 = (FAR_CAM_Z - NEAR_CAM_Z) / (RING_GAPS as i32);
 
 // ----------------------------------------------------------------------
 // Fog parameters
@@ -143,10 +146,9 @@ const FOG_CLEAR: (u8, u8, u8) = (
 ///   divisor_far  = (H << 16) / 0x5400 ≈ 0x0350
 ///
 /// Target: **0% fog at the near plane, 100% at the far plane.**
-/// With only a single wall quad per side (no segment seams), the
-/// gradient reads as continuous atmospheric haze; the near edge
-/// of each wall can be fully crisp since per-vertex Gouraud
-/// interpolation smoothly blends to full fog at the far edge.
+/// Each ring vertex gets its own depth-cue weight, so neighbouring
+/// segments agree at shared Z boundaries. The texture intentionally
+/// restarts once per segment, while the fog gradient remains smooth.
 ///
 /// Solving:
 ///   0x2300 * DQA + DQB = 0          (IR0 = 0 at near)
@@ -171,10 +173,10 @@ const ZSF4: i16 = 0x0400;
 /// lit walls" rather than "foggy corridor". Pure ambient + fog
 /// reads unambiguously as atmospheric depth.
 ///
-/// NCDT still runs on every triangle — it just computes the
+/// NCDS still runs on every vertex — it just computes the
 /// "lit" term as ambient-only (no directional contribution),
 /// then layers the depth-cue blend on top. The full
-/// RTPT → NCLIP → AVSZ3 → NCDT pipeline is still exercised.
+/// RTPS → NCDS → NCLIP → AVSZ3 pipeline is still exercised.
 ///
 /// BK is in **Q19.12**; `0x1000` is the "identity-brightness"
 /// value that leaves a `(128, 128, 128)` RGBC unmodulated at
@@ -331,10 +333,9 @@ struct Corridor {
     culled_count: u16,
 }
 
-/// Absolute Z of each ring, sorted ascending (index 0 = nearest
-/// the camera). The two-ring setup makes these constants after
-/// init — kept as `static mut` to match the pre-engine shape and
-/// leave room for a scrolling implementation later.
+/// Absolute Z of each ring, sorted ascending (index 0 = nearest the
+/// camera). Updated every frame from the scroll phase, and kept as
+/// `static mut` because the old demo shape expects stable storage.
 static mut RING_Z: [i32; NUM_RINGS] = init_ring_z();
 
 const fn init_ring_z() -> [i32; NUM_RINGS] {
@@ -398,7 +399,9 @@ impl Scene for Corridor {
         self.font = Some(FontAtlas::upload(&BASIC_8X16, FONT_TPAGE, FONT_CLUT));
     }
 
-    fn update(&mut self, _ctx: &mut Ctx) {
+    fn update(&mut self, ctx: &mut Ctx) {
+        update_ring_z(ctx.frame);
+
         // Reset per-frame counters. `build_frame_ot` will repopulate
         // them during render.
         self.tri_count = 0;
@@ -407,44 +410,40 @@ impl Scene for Corridor {
 
     fn render(&mut self, ctx: &mut Ctx) {
         self.build_frame_ot();
-        submit_frame_ot();
         let font = self.font.as_ref().expect("font uploaded in init");
         self.draw_hud(font, ctx.frame);
     }
 }
 
-// ----------------------------------------------------------------------
-// OT build + submit
-// ----------------------------------------------------------------------
-
-#[inline]
-fn ot_slot(otz: u16) -> usize {
-    let slot = (otz as usize) >> 10;
-    if slot >= OT_DEPTH - 1 {
-        OT_DEPTH - 2
-    } else {
-        slot
+fn update_ring_z(frame: u32) {
+    let spacing = RING_SPACING as u32;
+    let phase = (((frame % spacing) * (SCROLL_SPEED as u32)) % spacing) as i32;
+    let rings = unsafe { &mut RING_Z };
+    let mut i = 0;
+    while i < NUM_RINGS {
+        rings[i] = FIRST_RING_Z + (i as i32) * RING_SPACING - phase;
+        i += 1;
     }
 }
 
+// ----------------------------------------------------------------------
+// OT build
+// ----------------------------------------------------------------------
+
 impl Corridor {
     fn build_frame_ot(&mut self) {
-        let ot = unsafe { &mut OT };
-        let tris = unsafe { &mut TRIS };
-        let bg = unsafe { &mut BG_QUAD };
-        ot.clear();
+        let mut ot = unsafe { OtFrame::begin(&mut OT) };
+        let mut tris = unsafe { PrimitiveArena::new(&mut TRIS) };
+        let mut backgrounds = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut BG_QUAD)) };
 
         // --- Background — solid fog-colour quad behind everything. ---
-        *bg = QuadGouraud::new(
-            [
-                (0, 0),
-                (SCREEN_W, 0),
-                (0, SCREEN_H),
-                (SCREEN_W, SCREEN_H),
-            ],
+        let Some(bg) = backgrounds.push(QuadGouraud::new(
+            [(0, 0), (SCREEN_W, 0), (0, SCREEN_H), (SCREEN_W, SCREEN_H)],
             [FOG_CLEAR, FOG_CLEAR, FOG_CLEAR, FOG_CLEAR],
-        );
-        ot.add(OT_DEPTH - 1, bg, QuadGouraud::WORDS);
+        )) else {
+            return;
+        };
+        ot.add_packet(OT_DEPTH - 1, bg);
 
         // --- Scene setup for this frame ---
         // Static light rig — no orbit, no directional lighting. Just
@@ -457,15 +456,14 @@ impl Corridor {
         // slot. Semi-transparency bit = 0 (opaque).
         let tpage_word = TEX_TPAGE.uv_tpage_word(0);
 
-        // Material `(128, 128, 128)` makes NCDT produce "identity" vertex
+        // Material `(128, 128, 128)` makes NCDS produce "identity" vertex
         // tints at full light — the textured-Gouraud primitive's
         // tint-multiply then passes texels unmodulated. At deep fog the
-        // NCDT vertex tint approaches FC (fog colour), darkening and
+        // NCDS vertex tint approaches FC (fog colour), darkening and
         // blue-shifting texels so the far end fades into the clear.
         const MAT: (u8, u8, u8) = (0x80, 0x80, 0x80);
 
         let rings = unsafe { &RING_Z };
-        let mut tri_idx = 0;
         for ring in 0..NUM_RINGS - 1 {
             let z_near = rings[ring];
             let z_far = rings[ring + 1];
@@ -506,11 +504,8 @@ impl Corridor {
                         self.culled_count = self.culled_count.wrapping_add(1);
                         continue;
                     }
-                    if tri_idx >= tris.len() {
-                        break;
-                    }
                     let v = ft.verts;
-                    tris[tri_idx] = TriTexturedGouraud::new(
+                    let Some(tri) = tris.push(TriTexturedGouraud::new(
                         [(v[0].sx, v[0].sy), (v[1].sx, v[1].sy), (v[2].sx, v[2].sy)],
                         *uvs,
                         [
@@ -520,41 +515,46 @@ impl Corridor {
                         ],
                         clut_word,
                         tpage_word,
-                    );
+                    )) else {
+                        break;
+                    };
 
-                    ot.add(ot_slot(ft.otz), &mut tris[tri_idx], TriTexturedGouraud::WORDS);
-                    tri_idx += 1;
+                    let slot = WORLD_BAND.slot::<OT_DEPTH>(GTE_OTZ_RANGE, ft.otz as i32);
+                    ot.add_packet_slot(slot, tri);
                     self.tri_count = self.tri_count.wrapping_add(1);
                 }
             }
         }
+
+        ot.submit();
     }
 
     fn draw_hud(&self, font: &FontAtlas, frame: u32) {
         font.draw_text(4, 4, "SHOWCASE-FOG", (220, 220, 250));
-        font.draw_text(
-            SCREEN_W - 168,
-            4,
-            "RTPT NCLIP AVSZ3 NCDT",
-            (160, 200, 240),
-        );
+        font.draw_text(SCREEN_W - 168, 4, "RTPS NCDS NCLIP AVSZ3", (160, 200, 240));
 
         font.draw_text(4, SCREEN_H - 20, "frame", (160, 160, 200));
         let frame_hex = u16_hex((frame & 0xFFFF) as u16);
-        font.draw_text(4 + 8 * 6, SCREEN_H - 20, frame_hex.as_str(), (200, 240, 160));
+        font.draw_text(
+            4 + 8 * 6,
+            SCREEN_H - 20,
+            frame_hex.as_str(),
+            (200, 240, 160),
+        );
 
         font.draw_text(SCREEN_W / 2 - 8 * 3, SCREEN_H - 20, "tri", (160, 160, 200));
         let tri = u16_hex(self.tri_count);
-        font.draw_text(SCREEN_W / 2 + 8, SCREEN_H - 20, tri.as_str(), (240, 200, 160));
+        font.draw_text(
+            SCREEN_W / 2 + 8,
+            SCREEN_H - 20,
+            tri.as_str(),
+            (240, 200, 160),
+        );
 
         font.draw_text(SCREEN_W - 104, SCREEN_H - 20, "cull", (160, 160, 200));
         let cull = u16_hex(self.culled_count);
         font.draw_text(SCREEN_W - 56, SCREEN_H - 20, cull.as_str(), (240, 160, 200));
     }
-}
-
-fn submit_frame_ot() {
-    unsafe { &OT }.submit();
 }
 
 // ----------------------------------------------------------------------

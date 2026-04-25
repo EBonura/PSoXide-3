@@ -292,6 +292,13 @@ pub struct EmulatorSettings {
     /// fine. Flipping the default brings the two paths into agreement.
     #[serde(default = "default_hle_for_side_load")]
     pub hle_bios_for_side_load: bool,
+    /// Boot discs by first letting the real BIOS initialize its RAM
+    /// kernel state, then loading the `SYSTEM.CNF` PSX-EXE directly
+    /// and leaving the disc mounted for normal CD-ROM commands. This
+    /// is the default while BIOS-disc handoff parity is still under
+    /// investigation; set to `false` to force the real BIOS logo path.
+    #[serde(default = "default_fast_boot_disc")]
+    pub fast_boot_disc: bool,
     /// If set, the run loop paces itself to real-time instead of
     /// running flat-out. Defaults to false — we want flat-out
     /// speed for parity / debugging. A future audio feature will
@@ -304,10 +311,15 @@ fn default_hle_for_side_load() -> bool {
     true
 }
 
+fn default_fast_boot_disc() -> bool {
+    true
+}
+
 impl Default for EmulatorSettings {
     fn default() -> Self {
         Self {
             hle_bios_for_side_load: default_hle_for_side_load(),
+            fast_boot_disc: default_fast_boot_disc(),
             real_time_pacing: false,
         }
     }

@@ -24,7 +24,10 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use emulator_core::{Bus, Cpu};
+use emulator_core::{
+    fast_boot_disc_with_hle, spu::SAMPLE_CYCLES, warm_bios_for_disc_fast_boot, Bus, Cpu,
+    DISC_FAST_BOOT_WARMUP_STEPS,
+};
 use psoxide_settings::{
     library::{GameKind, LibraryEntry},
     ConfigPaths, Library, Settings,
@@ -47,6 +50,16 @@ pub struct Cli {
     /// given — subcommands always run windowless.
     #[arg(long)]
     pub fullscreen: bool,
+
+    /// Run the experimental compute-shader rasterizer in parallel
+    /// with the CPU rasterizer (Phase C). Per-frame the frontend
+    /// drains the CPU's `cmd_log` and replays each GP0 packet
+    /// through the GPU compute path; the display reads from the
+    /// GPU VRAM. Off by default — opt-in until parity is confirmed
+    /// in a wide enough test set. Press F12 in the GUI to toggle
+    /// at runtime once the bus is wired up.
+    #[arg(long)]
+    pub gpu_compute: bool,
 
     /// Headless subcommand. Omit to launch the GUI.
     #[command(subcommand)]
@@ -93,6 +106,10 @@ pub struct LaunchArgs {
     /// Number of CPU instructions to retire before stopping.
     #[arg(long, default_value_t = 100_000_000)]
     pub steps: u64,
+    /// Force the real BIOS disc boot path instead of direct
+    /// SYSTEM.CNF fast boot.
+    #[arg(long)]
+    pub bios_boot: bool,
     /// Print an FNV-1a-64 VRAM hash at the end. Same algorithm the
     /// milestone regression tests use, so a CLI run + a unit test
     /// should produce identical numbers.
@@ -285,6 +302,7 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
             let bytes = std::fs::read(&game_path).map_err(|e| e.to_string())?;
             let exe = Exe::parse(&bytes).map_err(|e| format!("parse EXE: {e:?}"))?;
             bus.load_exe_payload(exe.load_addr, &exe.payload);
+            bus.clear_exe_bss(exe.bss_addr, exe.bss_size);
             cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
             if settings.emulator.hle_bios_for_side_load {
                 bus.enable_hle_bios();
@@ -299,11 +317,26 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
         }
         "bin" | "iso" => {
             let bytes = std::fs::read(&game_path).map_err(|e| e.to_string())?;
-            bus.cdrom.insert_disc(Some(Disc::from_bin(bytes)));
+            let disc = Disc::from_bin(bytes);
+            maybe_fast_boot_disc(
+                &mut bus,
+                &mut cpu,
+                &disc,
+                &game_path,
+                settings.emulator.fast_boot_disc && !args.bios_boot,
+            );
+            bus.cdrom.insert_disc(Some(disc));
             eprintln!("[cli] mounted disc {}", game_path.display());
         }
         "cue" => {
             let disc = psoxide_settings::library::load_disc_from_cue(&game_path)?;
+            maybe_fast_boot_disc(
+                &mut bus,
+                &mut cpu,
+                &disc,
+                &game_path,
+                settings.emulator.fast_boot_disc && !args.bios_boot,
+            );
             bus.cdrom.insert_disc(Some(disc));
             eprintln!("[cli] mounted cue-backed disc {}", game_path.display());
         }
@@ -315,11 +348,21 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
     // Step the CPU. Report early on opcode errors — they're usually
     // "we hit an unimplemented instruction" and worth surfacing.
     let mut stopped_at: Option<u64> = None;
+    let mut audio_cycle_accum = 0u64;
     for i in 0..args.steps {
+        let cycles_before = bus.cycles();
         if let Err(e) = cpu.step(&mut bus) {
             eprintln!("[cli] step {i} failed: {e:?}");
             stopped_at = Some(i);
             break;
+        }
+        audio_cycle_accum =
+            audio_cycle_accum.saturating_add(bus.cycles().saturating_sub(cycles_before));
+        let sample_count = (audio_cycle_accum / SAMPLE_CYCLES) as usize;
+        audio_cycle_accum %= SAMPLE_CYCLES;
+        if sample_count > 0 {
+            bus.run_spu_samples(sample_count);
+            let _ = bus.spu.drain_audio();
         }
     }
 
@@ -353,6 +396,39 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn maybe_fast_boot_disc(
+    bus: &mut Bus,
+    cpu: &mut Cpu,
+    disc: &Disc,
+    path: &std::path::Path,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    if let Err(e) = warm_bios_for_disc_fast_boot(bus, cpu, DISC_FAST_BOOT_WARMUP_STEPS) {
+        eprintln!(
+            "[cli] BIOS warmup failed for {} ({e:?}); leaving BIOS boot fallback in place",
+            path.display()
+        );
+        return;
+    }
+    match fast_boot_disc_with_hle(bus, cpu, disc, false) {
+        Ok(info) => eprintln!(
+            "[cli] warm-fast-booted {} via {} entry=0x{:08x} load=0x{:08x} payload={}B",
+            path.display(),
+            info.boot_path,
+            info.initial_pc,
+            info.load_addr,
+            info.payload_len
+        ),
+        Err(e) => eprintln!(
+            "[cli] fast boot unavailable for {} ({e:?}); falling back to BIOS boot",
+            path.display()
+        ),
+    }
 }
 
 fn fmt_empty(s: &str) -> String {

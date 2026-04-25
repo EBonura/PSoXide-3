@@ -5,6 +5,7 @@ members = [
     "crates/frontend",
     "crates/parity-oracle",
     "crates/psoxide-settings",
+    "crates/psx-gpu-compute",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ psx-trace = { path = "../crates/psx-trace" }
 emulator-core    = { path = "crates/emulator-core" }
 parity-oracle    = { path = "crates/parity-oracle" }
 psoxide-settings = { path = "crates/psoxide-settings" }
+psx-gpu-compute  = { path = "crates/psx-gpu-compute" }
 
 thiserror  = "1.0"
 serde      = { version = "1.0", features = ["derive"] }

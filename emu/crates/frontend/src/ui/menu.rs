@@ -39,6 +39,9 @@ pub enum MenuAction {
     StepOne,
     /// Reseat the CPU at its reset vector.
     Reset,
+    /// Toggle warm SYSTEM.CNF disc fast boot. When disabled, discs
+    /// boot through the full BIOS logo path.
+    ToggleFastBoot,
     /// Paint a test pattern into VRAM (dev aid until the GPU renders).
     FillVramTestPattern,
     /// Launch a game by its stable library ID. The app layer
@@ -192,7 +195,11 @@ impl MenuState {
         }
 
         // Try to preserve the user's category if it still exists.
-        if let Some(idx) = self.categories.iter().position(|c| c.name == current_cat_name) {
+        if let Some(idx) = self
+            .categories
+            .iter()
+            .position(|c| c.name == current_cat_name)
+        {
             self.category_index = idx;
         } else {
             self.category_index = 0;
@@ -207,13 +214,27 @@ impl MenuState {
     /// Rebuild categories with a fresh "Run"/"Pause" label. Called
     /// when `AppState.running` flips.
     pub fn sync_run_label(&mut self, running: bool) {
-        if let Some(system) = self
-            .categories
-            .iter_mut()
-            .find(|c| c.name == "System")
-        {
+        if let Some(system) = self.categories.iter_mut().find(|c| c.name == "System") {
             if let Some(item) = system.items.first_mut() {
-                item.label = if running { "Pause".into() } else { "Run".into() };
+                item.label = if running {
+                    "Pause".into()
+                } else {
+                    "Run".into()
+                };
+            }
+        }
+    }
+
+    /// Update the System category's disc fast-boot value after the
+    /// persisted setting changes.
+    pub fn sync_fast_boot_label(&mut self, enabled: bool) {
+        if let Some(system) = self.categories.iter_mut().find(|c| c.name == "System") {
+            if let Some(item) = system
+                .items
+                .iter_mut()
+                .find(|item| item.action == MenuAction::ToggleFastBoot)
+            {
+                item.value = Some(if enabled { "On" } else { "Off" }.into());
             }
         }
     }
@@ -271,6 +292,7 @@ impl MenuState {
     /// tests use it to assert the menu is populated correctly
     /// without driving input events.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn selected_action(&self) -> Option<&MenuAction> {
         self.categories
             .get(self.category_index)
@@ -601,6 +623,11 @@ fn build_system_category(running: bool) -> Category {
                 action: MenuAction::Reset,
                 value: None,
             },
+            MenuItem {
+                label: "Fast boot discs".into(),
+                action: MenuAction::ToggleFastBoot,
+                value: Some("On".into()),
+            },
         ],
     }
 }
@@ -678,7 +705,10 @@ mod tests {
             MenuAction::LaunchGame("g1".to_string())
         );
         // Refresh row is appended after the actual entries.
-        assert_eq!(s.categories[0].items.last().unwrap().action, MenuAction::RescanLibrary);
+        assert_eq!(
+            s.categories[0].items.last().unwrap().action,
+            MenuAction::RescanLibrary
+        );
         assert_eq!(s.categories[1].items[0].label, "hello-tri");
     }
 
@@ -702,6 +732,33 @@ mod tests {
     }
 
     #[test]
+    fn sync_fast_boot_label_flips_system_value() {
+        let mut s = MenuState::new();
+        let fast_boot = s.categories[2]
+            .items
+            .iter()
+            .find(|item| item.action == MenuAction::ToggleFastBoot)
+            .unwrap();
+        assert_eq!(fast_boot.value.as_deref(), Some("On"));
+
+        s.sync_fast_boot_label(false);
+        let fast_boot = s.categories[2]
+            .items
+            .iter()
+            .find(|item| item.action == MenuAction::ToggleFastBoot)
+            .unwrap();
+        assert_eq!(fast_boot.value.as_deref(), Some("Off"));
+
+        s.sync_fast_boot_label(true);
+        let fast_boot = s.categories[2]
+            .items
+            .iter()
+            .find(|item| item.action == MenuAction::ToggleFastBoot)
+            .unwrap();
+        assert_eq!(fast_boot.value.as_deref(), Some("On"));
+    }
+
+    #[test]
     fn navigation_stays_in_bounds() {
         let mut s = MenuState::new();
         // Populate some games so there's something to navigate.
@@ -713,14 +770,20 @@ mod tests {
             ],
             &[],
         );
-        let right = MenuInput { right: true, ..Default::default() };
+        let right = MenuInput {
+            right: true,
+            ..Default::default()
+        };
         s.update(&right); // → Examples
         s.update(&right); // → System
         s.update(&right); // → Debug
         s.update(&right); // → Quit
         s.update(&right); // past end — should clamp
         assert_eq!(s.current_category(), Some("Quit"));
-        let left = MenuInput { left: true, ..Default::default() };
+        let left = MenuInput {
+            left: true,
+            ..Default::default()
+        };
         for _ in 0..10 {
             s.update(&left);
         }

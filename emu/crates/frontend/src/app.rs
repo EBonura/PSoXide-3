@@ -6,7 +6,9 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 
-use emulator_core::{Bus, Cpu};
+use emulator_core::{
+    fast_boot_disc_with_hle, warm_bios_for_disc_fast_boot, Bus, Cpu, DISC_FAST_BOOT_WARMUP_STEPS,
+};
 use psoxide_settings::library::{GameKind, Region};
 use psoxide_settings::{ConfigPaths, Library, LibraryEntry, Settings};
 use psx_iso::{Disc, Exe, SECTOR_BYTES};
@@ -57,19 +59,17 @@ impl Default for PanelVisibility {
 /// window. Toggled from the debug toolbar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleMode {
-    /// Stretch to fit the available area while preserving aspect
-    /// ratio. Fractional scale factors — smooth but may visibly
-    /// interpolate on integer-pixel art.
-    Fit,
-    /// Integer-multiple scale (1×, 2×, 3×, …) fitting inside the
-    /// available area. Pixel-perfect — the PSX's native res shows
-    /// with no interpolation or stretch. Letterboxes as needed.
-    Integer,
+    /// Fill the available area at CRT aspect. This is the normal
+    /// “use the whole window” presentation; scaling is fractional.
+    Window,
+    /// Show exactly one host pixel per PSX framebuffer pixel.
+    /// Useful when inspecting the original output resolution.
+    Native,
 }
 
 impl Default for ScaleMode {
     fn default() -> Self {
-        Self::Fit
+        Self::Window
     }
 }
 
@@ -77,9 +77,8 @@ impl Default for ScaleMode {
 /// single-threaded, UI reads state in-place per frame.
 pub struct AppState {
     pub panels: PanelVisibility,
-    /// How the framebuffer scales — `Fit` (stretch with aspect
-    /// preserved) vs `Integer` (1×/2×/3× pixel-perfect, letterbox
-    /// as needed). Toggled via the debug toolbar.
+    /// How the framebuffer scales — full-window presentation vs
+    /// exact 1× native pixels. Toggled via the debug toolbar.
     pub scale_mode: ScaleMode,
     pub cpu: Cpu,
     /// Optional because we let the frontend run without a BIOS for UI
@@ -132,6 +131,11 @@ pub struct AppState {
     /// "Scan complete: 54 games", etc. Displayed beneath the
     /// library panel; cleared after a few frames.
     pub status_message: Option<(String, f32)>,
+    /// Host-audio gain controlled from the toolbar. `1.0` is unity.
+    pub audio_volume: f32,
+    /// Toolbar mute latch. Kept separate from `audio_volume` so
+    /// unmuting restores the prior level.
+    pub audio_muted: bool,
 }
 
 impl Default for AppState {
@@ -177,6 +181,7 @@ impl AppState {
         let bus = load_bus(&settings).map(|mut bus| {
             if let Some(exe) = load_exe() {
                 bus.load_exe_payload(exe.load_addr, &exe.payload);
+                bus.clear_exe_bss(exe.bss_addr, exe.bss_size);
                 cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
                 bus.enable_hle_bios();
                 bus.attach_digital_pad_port1();
@@ -207,6 +212,8 @@ impl AppState {
             paths,
             current_game: None,
             status_message: None,
+            audio_volume: 1.0,
+            audio_muted: false,
         };
         // Startup auto-rescan: always run when the SDK-examples dir
         // exists so stale `library.ron` entries (e.g. cargo
@@ -230,6 +237,8 @@ impl AppState {
         // possibly-rescanned) library so the user sees entries
         // immediately instead of a "No games found" placeholder.
         out.refresh_menu_library();
+        out.menu
+            .sync_fast_boot_label(out.settings.emulator.fast_boot_disc);
         out
     }
 }
@@ -252,6 +261,7 @@ impl AppState {
             std::fs::read(&bios_path).map_err(|e| format!("BIOS {}: {e}", bios_path.display()))?;
         let mut bus = Bus::new(bios).map_err(|e| format!("BIOS rejected: {e}"))?;
         let mut cpu = Cpu::new();
+        let mut boot_mode = "EXE";
 
         match entry.kind {
             GameKind::Exe => {
@@ -259,6 +269,7 @@ impl AppState {
                     .map_err(|e| format!("{}: {e}", entry.path.display()))?;
                 let exe = Exe::parse(&bytes).map_err(|e| format!("parse EXE: {e:?}"))?;
                 bus.load_exe_payload(exe.load_addr, &exe.payload);
+                bus.clear_exe_bss(exe.bss_addr, exe.bss_size);
                 cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
                 // HLE BIOS is effectively mandatory for side-loaded
                 // EXEs: the kernel's syscall tables (A0 / B0 / C0)
@@ -283,7 +294,15 @@ impl AppState {
                         entry.path.display()
                     ));
                 }
-                bus.cdrom.insert_disc(Some(Disc::from_bin(bytes)));
+                let disc = Disc::from_bin(bytes);
+                boot_mode = maybe_fast_boot_disc(
+                    &mut bus,
+                    &mut cpu,
+                    &disc,
+                    entry,
+                    self.settings.emulator.fast_boot_disc,
+                );
+                bus.cdrom.insert_disc(Some(disc));
                 bus.attach_digital_pad_port1();
                 // Load + attach the per-game memory card on port 1.
                 // File lives under `<config>/games/<id>/memcard-1.mcd`;
@@ -297,6 +316,13 @@ impl AppState {
             }
             GameKind::DiscCue => {
                 let disc = psoxide_settings::library::load_disc_from_cue(&entry.path)?;
+                boot_mode = maybe_fast_boot_disc(
+                    &mut bus,
+                    &mut cpu,
+                    &disc,
+                    entry,
+                    self.settings.emulator.fast_boot_disc,
+                );
                 bus.cdrom.insert_disc(Some(disc));
                 bus.attach_digital_pad_port1();
                 self.paths
@@ -328,7 +354,7 @@ impl AppState {
         self.current_game = Some(entry.clone());
         self.menu.sync_run_label(true);
         self.status_message = Some((
-            format!("Launched: {}", entry.title),
+            format!("Launched: {} ({boot_mode})", entry.title),
             STATUS_MESSAGE_TTL_SECS,
         ));
         Ok(())
@@ -531,6 +557,29 @@ impl AppState {
             .map_err(|e| format!("save settings.ron: {e}"))
     }
 
+    /// Flip the disc fast-boot preference, keep the Menu label in
+    /// sync, and persist immediately so the next launch uses the
+    /// requested path even if the app exits abruptly.
+    pub fn toggle_fast_boot_disc(&mut self) {
+        let enabled = !self.settings.emulator.fast_boot_disc;
+        self.settings.emulator.fast_boot_disc = enabled;
+        self.menu.sync_fast_boot_label(enabled);
+
+        let msg = if enabled {
+            "Fast boot enabled: PS logo skipped on disc launch"
+        } else {
+            "Fast boot disabled: BIOS logo shown on disc launch"
+        };
+
+        match self.save_settings() {
+            Ok(()) => self.status_message_set(msg),
+            Err(e) => {
+                eprintln!("[frontend] {e}");
+                self.status_message_set(format!("{msg} (settings save failed)"));
+            }
+        }
+    }
+
     /// Flush any dirty memory-card state on port 1 back to its
     /// `<config>/games/<id>/memcard-1.mcd` file. A no-op when no
     /// card is attached or when no writes have landed since load.
@@ -575,6 +624,15 @@ impl AppState {
     /// Menu without allocating a whole notification subsystem.
     pub fn status_message_set(&mut self, msg: impl Into<String>) {
         self.status_message = Some((msg.into(), STATUS_MESSAGE_TTL_SECS));
+    }
+
+    /// Current output gain after the mute latch is applied.
+    pub fn effective_audio_volume(&self) -> f32 {
+        if self.audio_muted {
+            0.0
+        } else {
+            self.audio_volume.clamp(0.0, 1.5)
+        }
     }
 }
 
@@ -657,6 +715,11 @@ pub fn step_one_frame(state: &mut AppState) {
         return;
     };
 
+    // Only fill `exec_history` when the registers panel is open —
+    // otherwise the 404-byte `InstructionRecord` per step is pure
+    // overhead. The panel is closed by default on first run, so
+    // most users get the fast `step()` path automatically.
+    let trace = state.panels.registers;
     let target_cycles = bus.cycles().saturating_add(CYCLES_PER_FRAME);
     for _ in 0..max_steps {
         if bus.cycles() >= target_cycles {
@@ -672,16 +735,61 @@ pub fn step_one_frame(state: &mut AppState) {
             break;
         }
 
-        match state.cpu.step(bus) {
-            Ok(record) => {
-                push_history(&mut state.exec_history, record);
+        let result = if trace {
+            match state.cpu.step_traced(bus) {
+                Ok(record) => {
+                    push_history(&mut state.exec_history, record);
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
-            Err(_) => {
-                state.running = false;
-                state.menu.sync_run_label(false);
-                state.menu.open = true;
-                break;
-            }
+        } else {
+            state.cpu.step(bus)
+        };
+        if result.is_err() {
+            state.running = false;
+            state.menu.sync_run_label(false);
+            state.menu.open = true;
+            break;
+        }
+    }
+}
+
+fn maybe_fast_boot_disc(
+    bus: &mut Bus,
+    cpu: &mut Cpu,
+    disc: &Disc,
+    entry: &LibraryEntry,
+    enabled: bool,
+) -> &'static str {
+    if !enabled {
+        return "BIOS boot";
+    }
+    if let Err(e) = warm_bios_for_disc_fast_boot(bus, cpu, DISC_FAST_BOOT_WARMUP_STEPS) {
+        eprintln!(
+            "[frontend] BIOS warmup failed for {} ({e:?}); falling back to BIOS boot",
+            entry.path.display()
+        );
+        return "BIOS boot";
+    }
+    match fast_boot_disc_with_hle(bus, cpu, disc, false) {
+        Ok(info) => {
+            eprintln!(
+                "[frontend] warm-fast-booted {} via {} entry=0x{:08x} load=0x{:08x} payload={}B",
+                entry.path.display(),
+                info.boot_path,
+                info.initial_pc,
+                info.load_addr,
+                info.payload_len
+            );
+            "fast boot"
+        }
+        Err(e) => {
+            eprintln!(
+                "[frontend] fast boot unavailable for {} ({e:?}); falling back to BIOS boot",
+                entry.path.display()
+            );
+            "BIOS boot"
         }
     }
 }
@@ -784,6 +892,12 @@ fn load_disc() -> Option<Disc> {
 
 /// Build all panels/overlays for one frame. Called from `gfx::Graphics::render`
 /// inside the egui context. `dt` drives Menu animations.
-pub fn build_ui(ctx: &egui::Context, state: &mut AppState, vram_tex: egui::TextureId, dt: f32) {
-    ui::draw_layout(ctx, state, vram_tex, dt);
+pub fn build_ui(
+    ctx: &egui::Context,
+    state: &mut AppState,
+    vram_tex: egui::TextureId,
+    display_tex: egui::TextureId,
+    dt: f32,
+) {
+    ui::draw_layout(ctx, state, vram_tex, display_tex, dt);
 }

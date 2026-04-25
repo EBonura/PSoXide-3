@@ -43,8 +43,8 @@ fn main() {
     let max_steps: Option<usize> = std::env::args().nth(1).and_then(|s| s.parse().ok());
     let dir = cache::default_dir();
     eprintln!("[cache] loading trace from {}", dir.display());
-    let mut trace = cache::load_longest(&dir, &bios)
-        .expect("No cached trace — run `generate_trace` first");
+    let mut trace =
+        cache::load_longest(&dir, &bios).expect("No cached trace — run `generate_trace` first");
     if let Some(cap) = max_steps {
         if trace.len() > cap {
             trace.truncate(cap);
@@ -81,10 +81,10 @@ fn main() {
         // walker, otherwise Redux's "step 19472417" (= NOP + entire
         // VBlank ISR) appears to us as just "NOP".
         let was_in_isr = cpu.in_isr();
-        let mut our_rec = cpu.step(&mut bus).expect("step");
+        let mut our_rec = cpu.step_traced(&mut bus).expect("step");
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                let r = cpu.step(&mut bus).expect("step");
+                let r = cpu.step_traced(&mut bus).expect("step");
                 our_rec.tick = r.tick;
                 our_rec.gprs = r.gprs;
             }
@@ -111,7 +111,10 @@ fn main() {
                 );
             }
             if our_rec.pc != expected.pc {
-                println!("  pc:    ours=0x{:08x}  redux=0x{:08x}", our_rec.pc, expected.pc);
+                println!(
+                    "  pc:    ours=0x{:08x}  redux=0x{:08x}",
+                    our_rec.pc, expected.pc
+                );
             }
             if our_rec.instr != expected.instr {
                 println!(

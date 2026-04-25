@@ -19,12 +19,16 @@ use psx_iso::Exe;
 use std::path::PathBuf;
 
 fn main() {
-    let name = std::env::args().nth(1).unwrap_or_else(|| "hello-tri".into());
+    let name = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "hello-tri".into());
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("bios");
-    let exe_path = PathBuf::from("/Users/ebonura/Desktop/repos/psoxide/build/examples/mipsel-sony-psx/release")
-        .join(format!("{name}.exe"));
-    let exe_bytes = std::fs::read(&exe_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", exe_path.display()));
+    let exe_path = PathBuf::from(
+        "/Users/ebonura/Desktop/repos/psoxide/build/examples/mipsel-sony-psx/release",
+    )
+    .join(format!("{name}.exe"));
+    let exe_bytes =
+        std::fs::read(&exe_path).unwrap_or_else(|e| panic!("read {}: {e}", exe_path.display()));
     let exe = Exe::parse(&exe_bytes).expect("parse");
 
     // Mirror `AppState::launch_entry` line-for-line:
@@ -51,7 +55,8 @@ fn main() {
     let (display_hash, w, h, _) = bus.gpu.display_hash();
     println!(
         "{name}: display={w}×{h}  hash=0x{:016x}  final_pc=0x{:08x}",
-        display_hash, cpu.pc(),
+        display_hash,
+        cpu.pc(),
     );
 
     // Also count how many primitive writes hit GPU — a blank frame
@@ -61,9 +66,7 @@ fn main() {
     let draw_ops: u32 = (0x20..=0x7F).map(|op| hist[op as usize]).sum();
     let fill_ops = hist[0x02];
     let line_ops: u32 = (0x40..=0x5F).map(|op| hist[op as usize]).sum();
-    println!(
-        "  GP0 draw ops: primitives={draw_ops} (fills={fill_ops}, lines={line_ops})",
-    );
+    println!("  GP0 draw ops: primitives={draw_ops} (fills={fill_ops}, lines={line_ops})",);
     if draw_ops == 0 {
         println!("  ✗ ZERO draw primitives — EXE didn't render anything.");
     } else {

@@ -11,7 +11,7 @@
 //!
 //! Usage:
 //! ```bash
-//! cargo run -p emulator-core --example probe_pixel_trace --release -- <steps> <x> <y>
+//! cargo run -p emulator-core --example probe_pixel_trace --release -- <steps> <x> <y> [disc]
 //! # e.g.:
 //! cargo run -p emulator-core --example probe_pixel_trace --release -- 900000000 210 26
 //! ```
@@ -19,39 +19,48 @@
 //! The coordinates are in DISPLAY space (not VRAM) — they're shifted
 //! into VRAM via the current `display_area()` before lookup.
 
-use emulator_core::{Bus, Cpu};
-use psx_iso::Disc;
+#[path = "support/disc.rs"]
+mod disc_support;
+
+use emulator_core::{spu::SAMPLE_CYCLES, Bus, Cpu};
 use std::env;
+use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let steps: u64 = args.get(1).and_then(|s| s.parse().ok())
-        .expect("usage: probe_pixel_trace <steps> <x> <y>");
-    let x: u16 = args.get(2).and_then(|s| s.parse().ok())
-        .expect("usage: probe_pixel_trace <steps> <x> <y>");
-    let y: u16 = args.get(3).and_then(|s| s.parse().ok())
-        .expect("usage: probe_pixel_trace <steps> <x> <y>");
+    let steps: u64 = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .expect("usage: probe_pixel_trace <steps> <x> <y> [disc]");
+    let x: u16 = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .expect("usage: probe_pixel_trace <steps> <x> <y> [disc]");
+    let y: u16 = args
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .expect("usage: probe_pixel_trace <steps> <x> <y> [disc]");
+    let disc_path = args.get(4).map(PathBuf::from);
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
-    let disc = std::fs::read(
-        "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin",
-    )
-    .expect("disc");
     let mut bus = Bus::new(bios).expect("bus");
-    bus.cdrom.insert_disc(Some(Disc::from_bin(disc)));
+    if let Some(path) = disc_path {
+        let disc = disc_support::load_disc_path(&path).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
+    } else {
+        let fallback =
+            "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
+        let disc = disc_support::load_disc_path(std::path::Path::new(fallback)).expect("disc");
+        bus.cdrom.insert_disc(Some(disc));
+    }
     bus.gpu.enable_pixel_tracer();
     let mut cpu = Cpu::new();
 
-    let mut cycles_at_last_pump = 0u64;
+    let mut audio_cycle_accum = 0u64;
     eprintln!("[pixel_trace] running {steps} CPU steps with tracer armed...");
     for _ in 0..steps {
-        if cpu.step(&mut bus).is_err() {
+        if step_user_step(&mut cpu, &mut bus, &mut audio_cycle_accum).is_err() {
             break;
-        }
-        if bus.cycles() - cycles_at_last_pump > 560_000 {
-            cycles_at_last_pump = bus.cycles();
-            bus.run_spu_samples(735);
-            let _ = bus.spu.drain_audio();
         }
     }
 
@@ -66,9 +75,7 @@ fn main() {
         "display origin = ({}, {}) size = {}×{}",
         da.x, da.y, da.width, da.height,
     );
-    println!(
-        "target display pixel = ({x}, {y}) → VRAM ({vram_x}, {vram_y})",
-    );
+    println!("target display pixel = ({x}, {y}) → VRAM ({vram_x}, {vram_y})",);
     println!("current pixel value  = 0x{pixel_value:04x}");
     println!("cmd_log size         = {}", bus.gpu.cmd_log.len());
     println!();
@@ -82,7 +89,11 @@ fn main() {
         Some(entry) => {
             println!("--- Last command to write this pixel ---");
             println!("index   = {}", entry.index);
-            println!("opcode  = 0x{:02x} ({})", entry.opcode, opcode_name(entry.opcode));
+            println!(
+                "opcode  = 0x{:02x} ({})",
+                entry.opcode,
+                opcode_name(entry.opcode)
+            );
             println!("fifo ({} words):", entry.fifo.len());
             for (i, w) in entry.fifo.iter().enumerate() {
                 println!("  [{i}] = 0x{w:08x}");
@@ -94,7 +105,10 @@ fn main() {
 
     // Also dump the 5 commands before and after — useful when the
     // divergence is actually a neighbour's bleed / overwrite.
-    let owner_idx = bus.gpu.pixel_owner_at(vram_x, vram_y).map(|e| e.index as i64);
+    let owner_idx = bus
+        .gpu
+        .pixel_owner_at(vram_x, vram_y)
+        .map(|e| e.index as i64);
     if let Some(idx) = owner_idx {
         println!();
         println!("--- Nearby commands (opcode + first FIFO word) ---");
@@ -109,7 +123,10 @@ fn main() {
             let mark = if i == idx { ">>>" } else { "   " };
             println!(
                 "{mark} idx={:>7}  op=0x{:02x}  word[0]=0x{:08x}  ({})",
-                e.index, e.opcode, e.fifo[0], opcode_name(e.opcode),
+                e.index,
+                e.opcode,
+                e.fifo[0],
+                opcode_name(e.opcode),
             );
         }
         // Also scan AHEAD for any primitives that should draw ON TOP
@@ -131,15 +148,16 @@ fn main() {
                 if non_shaded_tri_count < 10 {
                     println!(
                         "    idx={:>7}  op=0x{:02x}  word[0]=0x{:08x}  ({})",
-                        e.index, e.opcode, e.fifo[0], opcode_name(e.opcode),
+                        e.index,
+                        e.opcode,
+                        e.fifo[0],
+                        opcode_name(e.opcode),
                     );
                 }
                 non_shaded_tri_count += 1;
             }
         }
-        println!(
-            "  Total non-shaded-tri commands in next 400: {non_shaded_tri_count}",
-        );
+        println!("  Total non-shaded-tri commands in next 400: {non_shaded_tri_count}",);
         println!("  Opcode histogram:");
         for (op, count) in histogram.iter() {
             println!("    op=0x{op:02x} ({:>20}) : {count}", opcode_name(*op));
@@ -160,14 +178,32 @@ fn main() {
         let lookback_start = idx;
         for back in (0..=lookback_start).rev() {
             let e = &bus.gpu.cmd_log[back as usize];
-            let mut emit = |label: &str| println!("  {label:<22} = 0x{:08x}", e.fifo[0]);
+            let emit = |label: &str| println!("  {label:<22} = 0x{:08x}", e.fifo[0]);
             match e.opcode {
-                0xE1 if !seen_e1 => { emit("E1 draw_mode"); seen_e1 = true; }
-                0xE2 if !seen_e2 => { emit("E2 tex_window"); seen_e2 = true; }
-                0xE3 if !seen_e3 => { emit("E3 draw_area_tl"); seen_e3 = true; }
-                0xE4 if !seen_e4 => { emit("E4 draw_area_br"); seen_e4 = true; }
-                0xE5 if !seen_e5 => { emit("E5 draw_offset"); seen_e5 = true; }
-                0xE6 if !seen_e6 => { emit("E6 mask_bits"); seen_e6 = true; }
+                0xE1 if !seen_e1 => {
+                    emit("E1 draw_mode");
+                    seen_e1 = true;
+                }
+                0xE2 if !seen_e2 => {
+                    emit("E2 tex_window");
+                    seen_e2 = true;
+                }
+                0xE3 if !seen_e3 => {
+                    emit("E3 draw_area_tl");
+                    seen_e3 = true;
+                }
+                0xE4 if !seen_e4 => {
+                    emit("E4 draw_area_br");
+                    seen_e4 = true;
+                }
+                0xE5 if !seen_e5 => {
+                    emit("E5 draw_offset");
+                    seen_e5 = true;
+                }
+                0xE6 if !seen_e6 => {
+                    emit("E6 mask_bits");
+                    seen_e6 = true;
+                }
                 _ => {}
             }
             if seen_e1 && seen_e2 && seen_e3 && seen_e4 && seen_e5 && seen_e6 {
@@ -191,21 +227,45 @@ fn main() {
             // Try to decode screen vertices for a triangle-shaped packet.
             if matches!(owner.opcode, 0x24..=0x27 | 0x30..=0x33 | 0x34..=0x37) {
                 let (v0, v1, v2) = triangle_vertices(owner.opcode, &owner.fifo);
-                println!(
-                    "  screen v0 = ({}, {})",
-                    v0.0 + ox, v0.1 + oy,
-                );
-                println!(
-                    "  screen v1 = ({}, {})",
-                    v1.0 + ox, v1.1 + oy,
-                );
-                println!(
-                    "  screen v2 = ({}, {})",
-                    v2.0 + ox, v2.1 + oy,
-                );
+                println!("  screen v0 = ({}, {})", v0.0 + ox, v0.1 + oy,);
+                println!("  screen v1 = ({}, {})", v1.0 + ox, v1.1 + oy,);
+                println!("  screen v2 = ({}, {})", v2.0 + ox, v2.1 + oy,);
             }
         }
     }
+}
+
+fn step_user_step(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    audio_cycle_accum: &mut u64,
+) -> Result<(), emulator_core::ExecutionError> {
+    let was_in_isr = cpu.in_isr();
+    step_one_and_pump_audio(cpu, bus, audio_cycle_accum)?;
+    if !was_in_isr && cpu.in_irq_handler() {
+        while cpu.in_irq_handler() {
+            step_one_and_pump_audio(cpu, bus, audio_cycle_accum)?;
+        }
+    }
+    Ok(())
+}
+
+fn step_one_and_pump_audio(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    audio_cycle_accum: &mut u64,
+) -> Result<(), emulator_core::ExecutionError> {
+    let cycles_before = bus.cycles();
+    cpu.step(bus)?;
+    *audio_cycle_accum =
+        audio_cycle_accum.saturating_add(bus.cycles().saturating_sub(cycles_before));
+    let sample_count = (*audio_cycle_accum / SAMPLE_CYCLES) as usize;
+    *audio_cycle_accum %= SAMPLE_CYCLES;
+    if sample_count > 0 {
+        bus.run_spu_samples(sample_count);
+        let _ = bus.spu.drain_audio();
+    }
+    Ok(())
 }
 
 fn triangle_vertices(op: u8, fifo: &[u32]) -> ((i32, i32), (i32, i32), (i32, i32)) {
@@ -290,13 +350,29 @@ fn decode_packet(op: u8, fifo: &[u32]) {
         0x30..=0x33 => {
             // Shaded tri: [c0+cmd, v0, c1, v1, c2, v2]
             if fifo.len() >= 6 {
-                println!("  c0=(r={}, g={}, b={})  v0={:?}", cmd_tint_r, cmd_tint_g, cmd_tint_b, decode_xy(fifo[1]));
+                println!(
+                    "  c0=(r={}, g={}, b={})  v0={:?}",
+                    cmd_tint_r,
+                    cmd_tint_g,
+                    cmd_tint_b,
+                    decode_xy(fifo[1])
+                );
                 let c1 = fifo[2] & 0x00FF_FFFF;
                 let c2 = fifo[4] & 0x00FF_FFFF;
-                println!("  c1=(r={}, g={}, b={})  v1={:?}",
-                    c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF, decode_xy(fifo[3]));
-                println!("  c2=(r={}, g={}, b={})  v2={:?}",
-                    c2 & 0xFF, (c2 >> 8) & 0xFF, (c2 >> 16) & 0xFF, decode_xy(fifo[5]));
+                println!(
+                    "  c1=(r={}, g={}, b={})  v1={:?}",
+                    c1 & 0xFF,
+                    (c1 >> 8) & 0xFF,
+                    (c1 >> 16) & 0xFF,
+                    decode_xy(fifo[3])
+                );
+                println!(
+                    "  c2=(r={}, g={}, b={})  v2={:?}",
+                    c2 & 0xFF,
+                    (c2 >> 8) & 0xFF,
+                    (c2 >> 16) & 0xFF,
+                    decode_xy(fifo[5])
+                );
             }
         }
         0x34..=0x37 => {
@@ -309,15 +385,33 @@ fn decode_packet(op: u8, fifo: &[u32]) {
                 let uv2 = fifo[8];
                 let clut = (uv0 >> 16) & 0xFFFF;
                 let tpage = (uv1 >> 16) & 0xFFFF;
-                println!("  c0=(r={}, g={}, b={})  v0={:?}  uv0=({}, {})",
-                    cmd_tint_r, cmd_tint_g, cmd_tint_b, decode_xy(fifo[1]),
-                    uv0 & 0xFF, (uv0 >> 8) & 0xFF);
-                println!("  c1=(r={}, g={}, b={})  v1={:?}  uv1=({}, {})",
-                    c1 & 0xFF, (c1 >> 8) & 0xFF, (c1 >> 16) & 0xFF, decode_xy(fifo[4]),
-                    uv1 & 0xFF, (uv1 >> 8) & 0xFF);
-                println!("  c2=(r={}, g={}, b={})  v2={:?}  uv2=({}, {})",
-                    c2 & 0xFF, (c2 >> 8) & 0xFF, (c2 >> 16) & 0xFF, decode_xy(fifo[7]),
-                    uv2 & 0xFF, (uv2 >> 8) & 0xFF);
+                println!(
+                    "  c0=(r={}, g={}, b={})  v0={:?}  uv0=({}, {})",
+                    cmd_tint_r,
+                    cmd_tint_g,
+                    cmd_tint_b,
+                    decode_xy(fifo[1]),
+                    uv0 & 0xFF,
+                    (uv0 >> 8) & 0xFF
+                );
+                println!(
+                    "  c1=(r={}, g={}, b={})  v1={:?}  uv1=({}, {})",
+                    c1 & 0xFF,
+                    (c1 >> 8) & 0xFF,
+                    (c1 >> 16) & 0xFF,
+                    decode_xy(fifo[4]),
+                    uv1 & 0xFF,
+                    (uv1 >> 8) & 0xFF
+                );
+                println!(
+                    "  c2=(r={}, g={}, b={})  v2={:?}  uv2=({}, {})",
+                    c2 & 0xFF,
+                    (c2 >> 8) & 0xFF,
+                    (c2 >> 16) & 0xFF,
+                    decode_xy(fifo[7]),
+                    uv2 & 0xFF,
+                    (uv2 >> 8) & 0xFF
+                );
                 println!("  clut={:>16}", fmt_clut(clut));
                 println!("  tpage={:>15}", fmt_tpage(tpage));
             }
@@ -333,8 +427,13 @@ fn decode_packet(op: u8, fifo: &[u32]) {
                         let vi = fifo[i * 2 + 1];
                         (ci, vi)
                     };
-                    println!("  c{i}=(r={}, g={}, b={})  v{i}={:?}",
-                        c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, decode_xy(v));
+                    println!(
+                        "  c{i}=(r={}, g={}, b={})  v{i}={:?}",
+                        c & 0xFF,
+                        (c >> 8) & 0xFF,
+                        (c >> 16) & 0xFF,
+                        decode_xy(v)
+                    );
                 }
             }
         }
@@ -349,7 +448,11 @@ fn decode_xy(w: u32) -> (i32, i32) {
 }
 
 fn sign_extend_11(v: i32) -> i32 {
-    if v & 0x400 != 0 { v | !0x7FF } else { v & 0x7FF }
+    if v & 0x400 != 0 {
+        v | !0x7FF
+    } else {
+        v & 0x7FF
+    }
 }
 
 fn fmt_clut(clut: u32) -> String {

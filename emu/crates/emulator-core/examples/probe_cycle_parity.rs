@@ -65,7 +65,8 @@ fn main() {
             .filter_map(|s| s.trim().parse().ok())
             .collect();
         println!("(override) running crash at {steps:?}");
-        let disc = "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
+        let disc =
+            "/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin";
         let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
         let mut bus = Bus::new(bios).expect("bus");
         let disc_bytes = std::fs::read(disc).expect("disc");
@@ -75,15 +76,13 @@ fn main() {
         let mut cursor = 0u64;
         for target in steps {
             while cursor < target {
-                if cpu.step(&mut bus).is_err() { break; }
-                cursor += 1;
-                if bus.cycles() - cycles_at_last_pump > 560_000 {
-                    cycles_at_last_pump = bus.cycles();
-                    bus.run_spu_samples(735);
-                    let _ = bus.spu.drain_audio();
+                if step_user_step(&mut cpu, &mut bus, &mut cycles_at_last_pump).is_err() {
+                    break;
                 }
+                cursor += 1;
             }
-            println!("crash step={target:>12}  our_cycles={:>14}  cpi={:.4}",
+            println!(
+                "crash step={target:>12}  our_cycles={:>14}  cpi={:.4}",
                 bus.cycles(),
                 bus.cycles() as f64 / target as f64,
             );
@@ -92,8 +91,10 @@ fn main() {
     }
 
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("BIOS");
-    println!("{:<8} {:>12} {:>14} {:>14} {:>10} {:>10}",
-        "scenario", "steps", "our_cycles", "redux_tick", "delta", "pct_off");
+    println!(
+        "{:<8} {:>12} {:>14} {:>14} {:>10} {:>10}",
+        "scenario", "steps", "our_cycles", "redux_tick", "delta", "pct_off"
+    );
     println!("{}", "-".repeat(76));
     for (name, disc_path, checkpoints) in scenarios {
         let mut bus = Bus::new(bios.clone()).expect("bus");
@@ -107,16 +108,11 @@ fn main() {
 
         for (target_step, redux_tick) in *checkpoints {
             while cursor < *target_step {
-                if cpu.step(&mut bus).is_err() {
+                if step_user_step(&mut cpu, &mut bus, &mut cycles_at_last_pump).is_err() {
                     eprintln!("[{name}] CPU errored at step {cursor}");
                     return;
                 }
                 cursor += 1;
-                if bus.cycles() - cycles_at_last_pump > 560_000 {
-                    cycles_at_last_pump = bus.cycles();
-                    bus.run_spu_samples(735);
-                    let _ = bus.spu.drain_audio();
-                }
             }
             let our = bus.cycles();
             let delta = our as i64 - *redux_tick as i64;
@@ -127,4 +123,33 @@ fn main() {
             );
         }
     }
+}
+
+fn step_user_step(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    cycles_at_last_pump: &mut u64,
+) -> Result<(), emulator_core::ExecutionError> {
+    let was_in_isr = cpu.in_isr();
+    step_one_and_pump(cpu, bus, cycles_at_last_pump)?;
+    if !was_in_isr && cpu.in_irq_handler() {
+        while cpu.in_irq_handler() {
+            step_one_and_pump(cpu, bus, cycles_at_last_pump)?;
+        }
+    }
+    Ok(())
+}
+
+fn step_one_and_pump(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    cycles_at_last_pump: &mut u64,
+) -> Result<(), emulator_core::ExecutionError> {
+    cpu.step(bus)?;
+    if bus.cycles() - *cycles_at_last_pump > 560_000 {
+        *cycles_at_last_pump = bus.cycles();
+        bus.run_spu_samples(735);
+        let _ = bus.spu.drain_audio();
+    }
+    Ok(())
 }

@@ -155,8 +155,9 @@ impl Sio0 {
             ack_end_deadline: None,
             ack_delay_ticks: PAD_ACK_DELAY_TICKS,
             port1: crate::pad::PortDevice::empty()
-                .with_pad(crate::pad::DigitalPad::new()),
-            port2: crate::pad::PortDevice::empty(),
+                .with_pad(crate::pad::DigitalPad::new())
+                .with_memcard(crate::pad::MemoryCard::new()),
+            port2: crate::pad::PortDevice::empty().with_memcard(crate::pad::MemoryCard::new()),
             last_joyn: false,
         }
     }
@@ -209,6 +210,86 @@ impl Sio0 {
         let p = self.pending_irq;
         self.pending_irq = false;
         p
+    }
+
+    /// Snapshot the software-visible STAT register without consuming
+    /// any FIFO state. Diagnostic-only.
+    pub fn debug_stat(&self) -> u32 {
+        self.stat()
+    }
+
+    /// Diagnostic-only copy of the raw CTRL register.
+    pub fn debug_ctrl(&self) -> u16 {
+        self.ctrl
+    }
+
+    /// Whether `service_sio0` would currently raise a controller IRQ
+    /// edge to the bus.
+    pub fn debug_pending_irq(&self) -> bool {
+        self.pending_irq
+    }
+
+    /// Sticky IRQ bit exposed in `STAT`.
+    pub fn debug_irq_latched(&self) -> bool {
+        self.irq_latched
+    }
+
+    /// Whether a TX byte is currently shifting.
+    pub fn debug_transfer_busy(&self) -> bool {
+        self.transfer_busy
+    }
+
+    /// Whether the transfer phase finished and the ACK delay is in
+    /// flight.
+    pub fn debug_awaiting_ack(&self) -> bool {
+        self.awaiting_ack
+    }
+
+    /// Absolute cycle where the current byte transfer completes.
+    pub fn debug_transfer_deadline(&self) -> Option<u64> {
+        self.transfer_deadline
+    }
+
+    /// Absolute cycle where the next ACK pulse should begin.
+    pub fn debug_ack_deadline(&self) -> Option<u64> {
+        self.ack_deadline
+    }
+
+    /// Absolute cycle where the current ACK pulse ends.
+    pub fn debug_ack_end_deadline(&self) -> Option<u64> {
+        self.ack_end_deadline
+    }
+
+    /// Earliest pending state-machine deadline across the three
+    /// timers, or `None` if SIO0 is idle. The bus uses this to
+    /// (re)schedule [`EventSlot::Sio`] so the per-instruction
+    /// `Bus::tick` poll can be retired in favour of one event-driven
+    /// wake-up. Mirrors the role of `intCycle[PSXINT_SIO]` in
+    /// PCSX-Redux's `branchTest`.
+    pub fn next_deadline(&self) -> Option<u64> {
+        let mut next: Option<u64> = None;
+        let consider = |cur: &mut Option<u64>, candidate: Option<u64>| {
+            if let Some(c) = candidate {
+                *cur = Some(match cur {
+                    Some(prev) => (*prev).min(c),
+                    None => c,
+                });
+            }
+        };
+        consider(&mut next, self.transfer_deadline);
+        consider(&mut next, self.ack_deadline);
+        consider(&mut next, self.ack_end_deadline);
+        next
+    }
+
+    /// RX slot contents, if a byte is waiting to be read.
+    pub fn debug_rx(&self) -> Option<u8> {
+        self.rx
+    }
+
+    /// Next TX byte queued behind the active transfer.
+    pub fn debug_queued_tx(&self) -> Option<u8> {
+        self.queued_tx
     }
 
     /// `true` when `phys` falls within the SIO0 register window.
@@ -267,8 +348,7 @@ impl Sio0 {
                     self.transfer_busy = false;
                     if self.pending_ack {
                         self.awaiting_ack = true;
-                        self.ack_deadline =
-                            Some(deadline.saturating_add(self.ack_delay_ticks));
+                        self.ack_deadline = Some(deadline.saturating_add(self.ack_delay_ticks));
                     }
                     if let Some(value) = self.queued_tx.take() {
                         self.start_transfer_at(value, deadline, false);
@@ -283,6 +363,11 @@ impl Sio0 {
                 if deadline <= now {
                     self.ack_deadline = None;
                     self.awaiting_ack = false;
+                    // Keep IRQ and visible ACK/DSR in phase. Crash's
+                    // BIOS pad handler samples the ACK level while it
+                    // services the interrupt; raising IRQ at RX-ready
+                    // time makes digital polls stop before the high
+                    // button byte.
                     self.ack_input = true;
                     self.ack_end_deadline = Some(deadline.saturating_add(ACK_PULSE_TICKS));
                     if self.ctrl & ctrl_bit::ACK_IRQ_ENABLE != 0 {
@@ -614,9 +699,7 @@ mod tests {
 
         // TX 0x00 → RX buttons2 (CROSS = bit 14 pressed → wire 0xBF)
         sio.write8(Sio0::BASE, 0x00);
-        sio.tick(
-            4 * (DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS) + DEFAULT_TRANSFER_TICKS,
-        );
+        sio.tick(4 * (DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS) + DEFAULT_TRANSFER_TICKS);
         assert_eq!(sio.pop_rx(), 0xBF);
     }
 
@@ -638,10 +721,18 @@ mod tests {
         sio.write16(Sio0::BASE + 0xA, ctrl_bit::JOYN_OUTPUT);
         sio.write8(Sio0::BASE, 0x01);
         sio.tick(DEFAULT_TRANSFER_TICKS);
-        assert_eq!(sio.pop_rx(), 0xFF, "port 1 select byte gets the dummy response");
+        assert_eq!(
+            sio.pop_rx(),
+            0xFF,
+            "port 1 select byte gets the dummy response"
+        );
         sio.write8(Sio0::BASE, 0x42);
         sio.tick(DEFAULT_TRANSFER_TICKS * 2);
-        assert_eq!(sio.pop_rx(), 0x41, "port 1 pad responds on the command byte");
+        assert_eq!(
+            sio.pop_rx(),
+            0x41,
+            "port 1 pad responds on the command byte"
+        );
     }
 
     #[test]
@@ -659,13 +750,28 @@ mod tests {
         sio.tick(DEFAULT_TRANSFER_TICKS);
 
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_eq!(stat & stat_bit::ACK_INPUT, 0, "ACK must wait for the ACK phase");
-        assert_eq!(stat & stat_bit::IRQ, 0, "IRQ bit must stay low until ACK");
-        assert!(!sio.take_pending_irq(), "bus IRQ should not fire before ACK");
+        assert_eq!(
+            stat & stat_bit::ACK_INPUT,
+            0,
+            "ACK must wait for the ACK phase"
+        );
+        assert_eq!(
+            stat & stat_bit::IRQ,
+            0,
+            "IRQ bit must stay low until ACK"
+        );
+        assert!(
+            !sio.take_pending_irq(),
+            "bus IRQ should not fire before ACK"
+        );
 
         sio.tick(DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_ne!(stat & stat_bit::ACK_INPUT, 0, "ACK input should be visible");
+        assert_ne!(
+            stat & stat_bit::ACK_INPUT,
+            0,
+            "ACK input should be visible"
+        );
         assert_ne!(stat & stat_bit::IRQ, 0, "STAT IRQ bit should latch");
         assert!(sio.take_pending_irq(), "bus should see one IRQ edge");
         assert!(!sio.take_pending_irq(), "IRQ edge should be single-shot");
@@ -687,9 +793,20 @@ mod tests {
         sio.tick(DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);
 
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_ne!(stat & stat_bit::ACK_INPUT, 0, "ACK input should still be visible");
-        assert_eq!(stat & stat_bit::IRQ, 0, "IRQ bit should stay low without enable");
-        assert!(!sio.take_pending_irq(), "bus IRQ must stay quiet without enable");
+        assert_ne!(
+            stat & stat_bit::ACK_INPUT,
+            0,
+            "ACK input should be visible"
+        );
+        assert_eq!(
+            stat & stat_bit::IRQ,
+            0,
+            "IRQ bit should stay low without enable"
+        );
+        assert!(
+            !sio.take_pending_irq(),
+            "bus IRQ must stay quiet without enable"
+        );
     }
 
     #[test]
@@ -748,7 +865,10 @@ mod tests {
         // Match psx-pad's init sequence: ACK any stale IRQ, then
         // assert JOYN with TX/RX enabled on port 1.
         sio.write16(Sio0::BASE + 0xA, ctrl_bit::ACK);
-        sio.write16(Sio0::BASE + 0xA, (1 << 0) | ctrl_bit::JOYN_OUTPUT | (1 << 2));
+        sio.write16(
+            Sio0::BASE + 0xA,
+            (1 << 0) | ctrl_bit::JOYN_OUTPUT | (1 << 2),
+        );
 
         assert_eq!(exchange_sdk_style(&mut sio, &mut now, 0x01), 0xFF);
         assert_eq!(exchange_sdk_style(&mut sio, &mut now, 0x42), 0x41);
@@ -768,15 +888,27 @@ mod tests {
 
         sio.write8_at(Sio0::BASE, 0x01, 10);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_eq!(stat & stat_bit::TX_READY_2, 0, "transfer should drop TX_READY_2");
+        assert_eq!(
+            stat & stat_bit::TX_READY_2,
+            0,
+            "transfer should drop TX_READY_2"
+        );
 
         sio.tick(10 + 0x88 * 8);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_eq!(stat & stat_bit::TX_READY_2, 0, "ACK wait should still look busy");
+        assert_eq!(
+            stat & stat_bit::TX_READY_2,
+            0,
+            "ACK wait should still look busy"
+        );
 
         sio.tick(10 + 0x88 * 8 + PAD_ACK_DELAY_TICKS);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_ne!(stat & stat_bit::TX_READY_2, 0, "port should go ready after ACK");
+        assert_ne!(
+            stat & stat_bit::TX_READY_2,
+            0,
+            "port should go ready after ACK"
+        );
     }
 
     #[test]
@@ -789,11 +921,19 @@ mod tests {
 
         sio.write8_at(Sio0::BASE, 0x01, 10);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_ne!(stat & stat_bit::TX_READY_1, 0, "queue slot should stay free during first byte");
+        assert_ne!(
+            stat & stat_bit::TX_READY_1,
+            0,
+            "queue slot should stay free during first byte"
+        );
 
         sio.write8_at(Sio0::BASE, 0x42, 11);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_eq!(stat & stat_bit::TX_READY_1, 0, "second write should fill the one-byte queue");
+        assert_eq!(
+            stat & stat_bit::TX_READY_1,
+            0,
+            "second write should fill the one-byte queue"
+        );
 
         sio.tick(10 + DEFAULT_TRANSFER_TICKS);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();

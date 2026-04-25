@@ -131,9 +131,9 @@ pub const CD_VOL_R: u32 = 0x1F80_1DB2;
 pub const EXT_VOL_L: u32 = 0x1F80_1DB4;
 /// External audio input volume Right.
 pub const EXT_VOL_R: u32 = 0x1F80_1DB6;
-/// Current Main Volume Left (read-only mirror of main_vol_l after sweep).
+/// Current Main Volume Left backing register.
 pub const CURRENT_MAIN_VOL_L: u32 = 0x1F80_1DB8;
-/// Current Main Volume Right.
+/// Current Main Volume Right backing register.
 pub const CURRENT_MAIN_VOL_R: u32 = 0x1F80_1DBA;
 
 /// Start of reverb configuration area (32 × 16-bit coefficient regs).
@@ -732,6 +732,10 @@ pub struct Spu {
     main_vol_l: VolumeEnvelope,
     /// Main output volume Right.
     main_vol_r: VolumeEnvelope,
+    /// Current-main-volume registers. PCSX-Redux stores these in its
+    /// raw SPU regArea; main-volume writes do not update them.
+    current_main_vol_l: u16,
+    current_main_vol_r: u16,
     /// Reverb output volume Left.
     reverb_vol_l: VolumeEnvelope,
     /// Reverb output volume Right.
@@ -845,6 +849,8 @@ impl Spu {
             transfer_ctrl: 0x0004,
             main_vol_l: VolumeEnvelope::new(),
             main_vol_r: VolumeEnvelope::new(),
+            current_main_vol_l: 0,
+            current_main_vol_r: 0,
             reverb_vol_l: VolumeEnvelope::new(),
             reverb_vol_r: VolumeEnvelope::new(),
             cd_vol_l: VolumeEnvelope::new(),
@@ -1053,8 +1059,10 @@ impl Spu {
             return self.read_voice_reg(v, off);
         }
         match phys {
-            MAIN_VOL_L | CURRENT_MAIN_VOL_L => self.main_vol_l.reg_read(),
-            MAIN_VOL_R | CURRENT_MAIN_VOL_R => self.main_vol_r.reg_read(),
+            MAIN_VOL_L => self.main_vol_l.reg_read(),
+            MAIN_VOL_R => self.main_vol_r.reg_read(),
+            CURRENT_MAIN_VOL_L => self.current_main_vol_l,
+            CURRENT_MAIN_VOL_R => self.current_main_vol_r,
             REVERB_VOL_L => self.reverb_vol_l.reg_read(),
             REVERB_VOL_R => self.reverb_vol_r.reg_read(),
             KON_LO => self.kon_raw as u16,
@@ -1103,6 +1111,8 @@ impl Spu {
         match phys {
             MAIN_VOL_L => self.main_vol_l.write(value),
             MAIN_VOL_R => self.main_vol_r.write(value),
+            CURRENT_MAIN_VOL_L => self.current_main_vol_l = value,
+            CURRENT_MAIN_VOL_R => self.current_main_vol_r = value,
             REVERB_VOL_L => self.reverb_vol_l.write_signed_q15(value),
             REVERB_VOL_R => self.reverb_vol_r.write_signed_q15(value),
             KON_LO => self.queue_kon(value, 0),
@@ -2187,6 +2197,25 @@ mod tests {
         assert_eq!(s.read16(VOICE_BASE + voice_offset::ADSR_CURRENT), 1);
         s.voices[0].phase = AdsrPhase::Off;
         assert_eq!(s.read16(VOICE_BASE + voice_offset::ADSR_CURRENT), 1);
+    }
+
+    #[test]
+    fn current_main_volume_regs_do_not_mirror_main_volume() {
+        let mut s = Spu::new();
+        s.write16(MAIN_VOL_L, 0x3FFF);
+        s.write16(MAIN_VOL_R, 0x2000);
+
+        assert_eq!(s.read16(MAIN_VOL_L), 0x3FFF);
+        assert_eq!(s.read16(MAIN_VOL_R), 0x2000);
+        assert_eq!(s.read16(CURRENT_MAIN_VOL_L), 0);
+        assert_eq!(s.read16(CURRENT_MAIN_VOL_R), 0);
+
+        s.write16(CURRENT_MAIN_VOL_L, 0x1111);
+        s.write16(CURRENT_MAIN_VOL_R, 0x2222);
+        assert_eq!(s.read16(CURRENT_MAIN_VOL_L), 0x1111);
+        assert_eq!(s.read16(CURRENT_MAIN_VOL_R), 0x2222);
+        assert_eq!(s.read16(MAIN_VOL_L), 0x3FFF);
+        assert_eq!(s.read16(MAIN_VOL_R), 0x2000);
     }
 
     // -- KON / KOFF / ENDX --

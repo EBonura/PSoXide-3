@@ -9,14 +9,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
+name = "psx-asset"
+version = "0.1.0"
+dependencies = [
+ "psx-gte",
+ "psxed-format",
+]
+
+[[package]]
 name = "psx-engine"
 version = "0.1.0"
 dependencies = [
+ "psx-asset",
  "psx-gpu",
  "psx-gte",
  "psx-math",
  "psx-pad",
  "psx-spu",
+ "psx-vram",
+]
+
+[[package]]
+name = "psx-font"
+version = "0.1.0"
+dependencies = [
+ "psx-gpu",
+ "psx-hw",
+ "psx-io",
+ "psx-math",
  "psx-vram",
 ]
 
@@ -83,13 +103,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "psxed-format"
+version = "0.1.0"
+
+[[package]]
 name = "showcase-textured-sprite"
 version = "0.1.0"
 dependencies = [
+ "psx-asset",
  "psx-engine",
+ "psx-font",
  "psx-gpu",
- "psx-hw",
- "psx-io",
+ "psx-math",
  "psx-rt",
  "psx-vram",
 ]

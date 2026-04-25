@@ -13,7 +13,8 @@ const HEADER_BYTES: u64 = 8 + 4 + 4 + 8;
 const RECORD_BYTES: u64 = 144;
 
 fn read_record(r: &mut BufReader<File>, idx: u64) -> (u64, u32, u32, [u32; 32]) {
-    r.seek(SeekFrom::Start(HEADER_BYTES + idx * RECORD_BYTES)).unwrap();
+    r.seek(SeekFrom::Start(HEADER_BYTES + idx * RECORD_BYTES))
+        .unwrap();
     let mut buf = [0u8; 144];
     r.read_exact(&mut buf).unwrap();
     let tick = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -28,8 +29,14 @@ fn read_record(r: &mut BufReader<File>, idx: u64) -> (u64, u32, u32, [u32; 32]) 
 }
 
 fn main() {
-    let a: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).expect("need step A");
-    let b: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).expect("need step B");
+    let a: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("need step A");
+    let b: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .expect("need step B");
     let path = PathBuf::from(
         "/Users/ebonura/Desktop/repos/psoxide/emu/crates/emulator-core/target/parity-cache/redux-32b1a0fa4db70c8f-50000000.bin",
     );

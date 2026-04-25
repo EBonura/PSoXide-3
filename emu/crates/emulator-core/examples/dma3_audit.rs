@@ -74,13 +74,25 @@ fn main() {
         // system_identifier at +8
         let sys_id: String = (0..32)
             .map(|i| bus.try_read8(pvd_base + 8 + i).unwrap_or(0))
-            .map(|b| if (0x20..0x7f).contains(&b) { b as char } else { '?' })
+            .map(|b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '?'
+                }
+            })
             .collect();
         println!("  system_id:     '{}'", sys_id.trim_end());
         // volume_identifier at +40
         let vol_id: String = (0..32)
             .map(|i| bus.try_read8(pvd_base + 40 + i).unwrap_or(0))
-            .map(|b| if (0x20..0x7f).contains(&b) { b as char } else { '?' })
+            .map(|b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '?'
+                }
+            })
             .collect();
         println!("  volume_id:     '{}'", vol_id.trim_end());
         // Root-dir record at +156.
@@ -109,9 +121,7 @@ fn main() {
         let chcr = bus.read32(0x1F801088);
         let bcr = bus.read32(0x1F801084);
         let madr = bus.read32(0x1F801080);
-        println!(
-            "  DMA3  MADR=0x{madr:08x}  BCR=0x{bcr:08x}  CHCR=0x{chcr:08x}",
-        );
+        println!("  DMA3  MADR=0x{madr:08x}  BCR=0x{bcr:08x}  CHCR=0x{chcr:08x}",);
         println!(
             "  CDROM data_fifo_pops = {}  (each pop = 1 MMIO byte-read \
              from 0x1F801802; a full sector is 2048)",

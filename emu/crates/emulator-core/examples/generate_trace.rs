@@ -44,7 +44,10 @@ fn main() {
         return;
     }
 
-    eprintln!("[generate_trace] launching Redux for {n} steps → {}", target.display());
+    eprintln!(
+        "[generate_trace] launching Redux for {n} steps → {}",
+        target.display()
+    );
     let lua = OracleConfig::default_lua_dir().join("oracle.lua");
     let config = OracleConfig::new(bios_path, lua).expect("Redux binary resolves");
     let mut redux = ReduxProcess::launch(&config).expect("Redux launches");

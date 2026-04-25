@@ -135,9 +135,11 @@ const RESPONSE_FIFO_DEPTH: usize = 16;
 ///
 /// - `AddIrqQueue(m_cmd, 0x800)` — universal first-response delay
 ///   (L1284). Every command's ack fires 2048 cycles after issue.
-/// - `AddIrqQueue(CdlInit + 0x100, 20480)` — Init / GetID second
-///   response, ~4.4 µs, observed across boot roms (L900, and the
-///   shellopen path L938 scheduleCDLidIRQ(20480)).
+/// - `AddIrqQueue(CdlID + 0x100, 20480)` — GetID second response,
+///   ~4.4 µs, observed across boot roms (L900). `CdlInit` (`0x1C`)
+///   uses the separate lid/rescan path instead of a second CDROM IRQ.
+/// - `AddIrqQueue(CdlReset + 0x100, 4100000)` — Reset (`0x0A`)
+///   completion. MGS polls this INT2 before it starts issuing reads.
 /// - `cdReadTime = psxClockSpeed / 75` — one PSX CD-frame period
 ///   (L135). Redux schedules the first ReadN/ReadS sector at
 ///   `cdReadTime` in double-speed mode, then chains steady-state
@@ -146,9 +148,15 @@ const RESPONSE_FIFO_DEPTH: usize = 16;
 ///   SeekL / SeekP second response (L875). If the target is already
 ///   seeked, quick ack; otherwise a full seek-time equivalent.
 const FIRST_RESPONSE_CYCLES: u64 = 0x800; // 2048
-const INIT_SECOND_RESPONSE_CYCLES: u64 = 20_480;
+const IRQ_RESCHEDULE_CYCLES: u64 = 0x100;
 const GETID_SECOND_RESPONSE_CYCLES: u64 = 20_480;
+const RESET_SECOND_RESPONSE_CYCLES: u64 = 4_100_000;
 const SEEK_SECOND_RESPONSE_CYCLES: u64 = CD_READ_TIME * 4; // ≈ 1,806,336
+const PAUSE_COMPLETE_CYCLES_STANDBY: u64 = 7_000;
+const PAUSE_COMPLETE_CYCLES_ACTIVE: u64 = 1_000_000;
+const LID_BOOTSTRAP_CYCLES: u64 = 20_480;
+const LID_PREPARE_SPINUP_CYCLES: u64 = CD_READ_TIME * 150;
+const LID_PREPARE_SEEK_CYCLES: u64 = CD_READ_TIME * 26;
 /// PSX system clock / CD frames per second. `33_868_800 / 75`.
 /// Redux's `cdReadTime`.
 const CD_READ_TIME: u64 = 451_584;
@@ -164,17 +172,63 @@ struct XaCoding {
     nbits: u8,
 }
 
+/// A chained response scheduled when this event fires. Redux enqueues
+/// a command's long-running completion from inside the first-response
+/// interrupt handler, so the second deadline is relative to the actual
+/// first IRQ service cycle rather than the original command write.
+#[derive(Debug, Clone)]
+struct PendingFollowup {
+    command: u8,
+    delay: u64,
+    irq: IrqType,
+    bytes: Vec<u8>,
+}
+
 /// A deferred response: when `bus.cycles` passes `deadline` (an
 /// absolute bus-cycle count), the event's bytes land in the response
-/// FIFO and its IRQ type fires. Scheduler helpers compute the
-/// absolute deadline at issue time from `scheduling_cycle` threaded
-/// through [`CdRom::write8_at`]; matches Redux's `AddIrqQueue` which
-/// anchors on `m_regs.cycle` at the command-port write.
+/// FIFO and its IRQ type fires.
 #[derive(Debug, Clone)]
 struct PendingEvent {
+    command: u8,
     deadline: u64,
     irq: IrqType,
     bytes: Vec<u8>,
+    followup: Option<PendingFollowup>,
+}
+
+/// One command-port write captured for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdRomCommandLogEntry {
+    /// Bus cycle when the command byte was written.
+    pub cycle: u64,
+    /// Command byte written to `0x1F801801`.
+    pub command: u8,
+    /// Parameter FIFO contents drained by this command.
+    pub params: [u8; PARAM_FIFO_DEPTH],
+    /// Number of valid bytes in [`CdRomCommandLogEntry::params`].
+    pub param_len: u8,
+}
+
+/// One IRQ response packet delivered by the controller, captured for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdRomResponseLogEntry {
+    /// Bus cycle when the response IRQ packet was latched.
+    pub cycle: u64,
+    /// IRQ type associated with this packet.
+    pub irq: IrqType,
+    /// Response FIFO contents published by this packet.
+    pub bytes: [u8; RESPONSE_FIFO_DEPTH],
+    /// Number of valid bytes in [`CdRomResponseLogEntry::bytes`].
+    pub len: u8,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DriveState {
+    Stopped,
+    Standby,
+    LidOpen,
+    RescanCd,
+    PrepareCd,
 }
 
 /// CD-ROM controller state.
@@ -192,6 +246,10 @@ pub struct CdRom {
     /// Response FIFO — command responses arrive here for software
     /// to pop via `0x1F80_1801`.
     responses: VecDeque<u8>,
+    /// Command/parameter transmission busy latch (status bit 7).
+    /// Redux sets this when a command byte is written, then clears it
+    /// when the corresponding interrupt packet is materialized.
+    command_busy: bool,
     /// IRQ enable mask — low 3 bits; an IRQ fires only if its type
     /// bit is enabled. BIOS writes via `0x1F80_1802 idx=1`.
     irq_mask: u8,
@@ -201,6 +259,14 @@ pub struct CdRom {
     /// Scheduled events waiting for their cycle deadlines. Processed
     /// in order by [`CdRom::tick`].
     pending: VecDeque<PendingEvent>,
+    /// Internal lid / rescan timer. Redux drives this via a separate
+    /// interrupt slot (`PSXINT_CDRLID`) rather than a visible CDROM
+    /// IRQ packet.
+    lid_deadline: Option<u64>,
+    /// `CdlInit` starts the lid/rescan path when its ACK is serviced,
+    /// not at command-write time.
+    lid_bootstrap_pending: bool,
+    drive_state: DriveState,
     /// `true` once the BIOS has sent an `Init` command and the
     /// motor has completed spinning up. Gates commands that need the
     /// motor (Seek, Read, Play).
@@ -212,6 +278,10 @@ pub struct CdRom {
     /// Most-recent SetLoc BCD target (minute, second, frame). Used
     /// by SeekL / ReadN to know where to go.
     setloc_msf: (u8, u8, u8),
+    /// Whether a new SetLoc target is waiting to be applied to the
+    /// live read/play head. Redux doesn't move immediately on SetLoc;
+    /// it latches the target and consumes it on Seek/Read/Play.
+    setloc_pending: bool,
     /// Total commands dispatched since reset — diagnostic counter.
     commands_dispatched: u64,
     /// Diagnostic histogram of each command byte seen — `[0x00..=0x1F]`
@@ -222,6 +292,15 @@ pub struct CdRom {
     /// — used by the `cdrom_probe` example to log exactly which
     /// command was just issued at each `commands_dispatched` bump.
     last_command: u8,
+    /// Bounded command log. Disabled by default; probes opt in with
+    /// [`CdRom::enable_command_log`] when command parameters matter.
+    command_log: Vec<CdRomCommandLogEntry>,
+    /// Max length of [`CdRom::command_log`].
+    command_log_cap: usize,
+    /// Bounded response-packet log for diagnostics.
+    response_log: Vec<CdRomResponseLogEntry>,
+    /// Max length of [`CdRom::response_log`].
+    response_log_cap: usize,
     /// Total bytes popped from the data FIFO via MMIO reads.
     /// Diagnostic. If this grows in lockstep with DataReady events
     /// the BIOS is actually consuming the sectors we delivered; if
@@ -264,6 +343,16 @@ pub struct CdRom {
     /// reads at `0x1F80_1802` or by DMA channel 3. Filled by each
     /// DataReady event during an active ReadN / ReadS.
     data_fifo: VecDeque<u8>,
+    /// Redux's DRQSTS/data-ready latch (status bit 6). A fresh sector
+    /// sets this even before software has armed a transfer via the
+    /// request register; stray reads with no transfer armed clear it
+    /// back down without consuming the buffered bytes.
+    data_fifo_ready: bool,
+    /// Set by request-register bit 7 (`0x1F80_1803` index 0). MMIO
+    /// data reads may only drain the current sector while this is
+    /// armed; DMA3 reads the transfer buffer once a sector is ready,
+    /// matching Redux's `m_read` gate rather than the request latch.
+    data_transfer_active: bool,
     /// Last read sector header (MM, SS, FF, mode) — returned by
     /// `GetlocL` after the drive has actually delivered a sector.
     last_sector_header: [u8; 4],
@@ -276,8 +365,21 @@ pub struct CdRom {
     /// Set while a read is in progress; controls whether new
     /// DataReady events chain into further sectors.
     reading: bool,
+    /// Redux delays one sector event by `cdReadTime / 2` if the CPU's
+    /// CDROM IRQ bit is still pending when the next read interrupt
+    /// matures. This latch prevents repeated long delays for the same
+    /// sector; it resets after a sector is actually delivered.
+    read_rescheduled: bool,
     /// Next sector LBA to deliver during an active read.
     read_lba: u32,
+    /// Redux tracks whether the drive has already completed a seek and
+    /// uses that to pick the short 0x800-cycle SeekL/SeekP follow-up
+    /// path on subsequent seeks.
+    seek_done: bool,
+    /// Redux inserts a long delay before the second sector after a
+    /// relocated read starts (`m_locationChanged`). Without it we
+    /// stream multiple sectors where the hardware only delivered one.
+    location_changed: bool,
     /// Last SetMode byte written by the CPU. Bit layout:
     ///   0: CD-DA enable (for Play command)
     ///   1: auto-pause on track boundary
@@ -344,6 +446,7 @@ impl CdRom {
             drive_status: 0,
             params: VecDeque::with_capacity(PARAM_FIFO_DEPTH),
             responses: VecDeque::with_capacity(RESPONSE_FIFO_DEPTH),
+            command_busy: false,
             // Redux initializes m_reg2 (the CDROM IRQ mask) to 0x1F on
             // reset (cdrom.cc:1562) so all five IRQ types are enabled
             // out of the gate. We used to start at 0, which blocked every
@@ -356,12 +459,20 @@ impl CdRom {
             irq_mask: 0x1F,
             irq_flag: 0,
             pending: VecDeque::new(),
+            lid_deadline: None,
+            lid_bootstrap_pending: false,
+            drive_state: DriveState::Stopped,
             motor_on: false,
             disc_present: false,
             setloc_msf: (0, 0, 0),
+            setloc_pending: false,
             commands_dispatched: 0,
             command_hist: [0; 32],
             last_command: 0,
+            command_log: Vec::new(),
+            command_log_cap: 0,
+            response_log: Vec::new(),
+            response_log_cap: 0,
             data_fifo_pops: 0,
             scheduling_cycle: 0,
             irq_type_counts: [0; 6],
@@ -370,11 +481,16 @@ impl CdRom {
             sector_events_scheduled: 0,
             disc: None,
             data_fifo: VecDeque::new(),
+            data_fifo_ready: false,
+            data_transfer_active: false,
             last_sector_header: [0; 4],
             last_sector_subheader: [0; 4],
             last_sector_header_valid: false,
             reading: false,
+            read_rescheduled: false,
             read_lba: 0,
+            seek_done: false,
+            location_changed: false,
             // Power-on mode: double-speed, no XA, data-only 2048-byte
             // sectors. Matches the BIOS's probe-time expectation — it
             // issues SetMode 0x80 (double-speed) before its first
@@ -415,6 +531,27 @@ impl CdRom {
         self.cd_audio.len()
     }
 
+    /// Live SetMode byte — diagnostic for XA / raw-sector streaming.
+    pub fn debug_mode(&self) -> u8 {
+        self.mode
+    }
+
+    /// Live XA file/channel filter — diagnostic for STR/XA streams.
+    pub fn debug_xa_filter(&self) -> (u8, u8) {
+        (self.xa_filter_file, self.xa_filter_channel)
+    }
+
+    /// Next LBA the active ReadN/ReadS stream will try to deliver.
+    pub fn debug_read_lba(&self) -> u32 {
+        self.read_lba
+    }
+
+    /// Last sector header/subheader delivered by the drive.
+    pub fn debug_last_sector(&self) -> Option<([u8; 4], [u8; 4])> {
+        self.last_sector_header_valid
+            .then_some((self.last_sector_header, self.last_sector_subheader))
+    }
+
     fn commit_attenuator(&mut self) {
         self.attenuator_left_to_left = self.attenuator_left_to_left_t;
         self.attenuator_left_to_right = self.attenuator_left_to_right_t;
@@ -428,6 +565,26 @@ impl CdRom {
         self.xa_left.reset();
         self.xa_right.reset();
         self.cd_audio.clear();
+    }
+
+    fn clear_data_fifo(&mut self) {
+        self.data_fifo.clear();
+        self.data_fifo_ready = false;
+        self.data_transfer_active = false;
+    }
+
+    fn pop_data_fifo_byte(&mut self) -> u8 {
+        if !self.data_transfer_active {
+            self.data_fifo_ready = false;
+            return 0;
+        }
+
+        let byte = self.data_fifo.pop_front().unwrap_or(0);
+        if self.data_fifo.is_empty() {
+            self.data_fifo_ready = false;
+            self.data_transfer_active = false;
+        }
+        byte
     }
 
     fn attenuate_xa_samples(&self, samples: &mut [(i16, i16)]) {
@@ -466,9 +623,17 @@ impl CdRom {
         self.disc = disc;
         self.disc_present = self.disc.is_some();
         self.motor_on = self.disc_present;
+        self.drive_state = if self.disc_present {
+            DriveState::Standby
+        } else {
+            DriveState::Stopped
+        };
+        self.lid_deadline = None;
+        self.lid_bootstrap_pending = false;
         self.reading = false;
+        self.read_rescheduled = false;
         self.drive_status &= !drive_status_bit::PLAYING;
-        self.data_fifo.clear();
+        self.clear_data_fifo();
         self.cd_audio.clear();
         self.last_sector_header = [0; 4];
         self.last_sector_subheader = [0; 4];
@@ -494,7 +659,7 @@ impl CdRom {
             // 0x1F80_1802 — data FIFO (any index).
             (2, _) => {
                 self.data_fifo_pops = self.data_fifo_pops.saturating_add(1);
-                self.data_fifo.pop_front().unwrap_or(0)
+                self.pop_data_fifo_byte()
             }
             // 0x1F80_1803 — index-dependent:
             //   idx=0 → interrupt enable,
@@ -513,7 +678,7 @@ impl CdRom {
         // variant. For parity-correct scheduling, the bus uses
         // `write8_at` instead so command-port writes carry the
         // current bus cycle through to the CDROM scheduler.
-        self.write8_at(phys, value, 0);
+        let _ = self.write8_at(phys, value, 0);
     }
 
     /// Like [`write8`], but threads the bus cycle through so
@@ -524,7 +689,7 @@ impl CdRom {
     /// next tick" scheme lost the BIAS + memory-access cycles of
     /// the SB that issued the command — surfaced as a 5-cycle late
     /// IRQ dispatch at parity step 89,198,894.
-    pub fn write8_at(&mut self, phys: u32, value: u8, now: u64) {
+    pub fn write8_at(&mut self, phys: u32, value: u8, now: u64) -> bool {
         let offset = (phys - BASE) as u8;
         match (offset, self.index) {
             // 0x1F80_1800 write — set the index.
@@ -538,7 +703,10 @@ impl CdRom {
             // 0x1F80_1802 idx=0 — parameter FIFO push.
             (2, 0) => self.push_param(value),
             // 0x1F80_1802 idx=1 — interrupt enable.
-            (2, 1) => self.irq_mask = value & 0x1F,
+            (2, 1) => {
+                self.irq_mask = value & 0x1F;
+                return self.should_wake_cpu();
+            }
             // 0x1F80_1802 idx=2/3 — audio volume.
             (2, 2) => self.attenuator_left_to_left_t = value,
             (2, 3) => self.attenuator_right_to_left_t = value,
@@ -549,6 +717,13 @@ impl CdRom {
                 // Bit 6 = BFRD (reset). If set, clear parameter FIFO.
                 if value & 0x40 != 0 {
                     self.params.clear();
+                }
+                // Bit 7 arms the sector-transfer buffer. Redux gates
+                // both MMIO reads and DMA behind this request latch
+                // instead of exposing any queued sector bytes
+                // immediately when DataReady fires.
+                if value & 0x80 != 0 && !self.data_transfer_active {
+                    self.data_transfer_active = true;
                 }
             }
             // 0x1F80_1803 idx=1 — acknowledge interrupts (write-1-to-
@@ -568,6 +743,7 @@ impl CdRom {
             }
             _ => {}
         }
+        false
     }
 
     /// Compose the MMIO status byte from live FIFO + index state.
@@ -582,11 +758,14 @@ impl CdRom {
         if !self.responses.is_empty() {
             s |= status_bit::RESPONSE_FIFO_NOT_EMPTY;
         }
-        if !self.data_fifo.is_empty() {
+        if self.data_fifo_ready {
             s |= status_bit::DATA_FIFO_NOT_EMPTY;
         }
-        // Transmission busy (bit 7) + ADPCM busy (bit 2) come from
-        // subsystems not yet wired in; both zero for now.
+        if self.command_busy {
+            s |= status_bit::TRANSMISSION_BUSY;
+        }
+        // ADPCM busy (bit 2) comes from a subsystem we don't expose
+        // yet; keep it clear for now.
         s
     }
 
@@ -613,6 +792,11 @@ impl CdRom {
         if (command as usize) < self.command_hist.len() {
             self.command_hist[command as usize] += 1;
         }
+        // Real hardware exposes only one live response packet. A new
+        // command drops any unread bytes from the prior packet instead
+        // of appending another logical response stream behind them.
+        self.responses.clear();
+        self.command_busy = true;
         // Stash the issue-time cycle so each `schedule_*_response`
         // call below resolves its absolute deadline against the
         // right anchor, without threading `now` through every
@@ -622,6 +806,17 @@ impl CdRom {
         // Drain parameters into a local vec — handlers need them and
         // pop-order matches push-order.
         let params: Vec<u8> = self.params.drain(..).collect();
+        if self.command_log.len() < self.command_log_cap {
+            let mut logged_params = [0u8; PARAM_FIFO_DEPTH];
+            let n = params.len().min(PARAM_FIFO_DEPTH);
+            logged_params[..n].copy_from_slice(&params[..n]);
+            self.command_log.push(CdRomCommandLogEntry {
+                cycle: now,
+                command,
+                params: logged_params,
+                param_len: n as u8,
+            });
+        }
 
         match command {
             // Sync / NOP — acts as GetStat.
@@ -643,8 +838,9 @@ impl CdRom {
             0x08 => self.cmd_stop(),
             // Pause: halt reads but keep motor on.
             0x09 => self.cmd_pause(),
-            // Init: reset drive + spin motor + clear mode.
-            0x0A => self.cmd_init(),
+            // Reset: abort in-flight drive activity, spin the motor,
+            // and complete after Redux's long reset delay.
+            0x0A => self.cmd_reset(),
             // Mute / Demute.
             0x0B => self.cmd_mute(true),
             0x0C => self.cmd_mute(false),
@@ -683,8 +879,8 @@ impl CdRom {
             // for INT2 (Complete), stranding MGS / Crash at the
             // Sony splash.
             0x1E => self.cmd_read_toc(),
-            // Reset — abort in-flight drive activity.
-            0x1C => self.cmd_reset(),
+            // Init — lid/rescan state machine; no CPU-visible INT2.
+            0x1C => self.cmd_init(),
             _ => self.cmd_getstat(),
         }
     }
@@ -696,47 +892,161 @@ impl CdRom {
     /// Redux's `AddIrqQueue` which anchors on `m_regs.cycle` at the
     /// moment of the cmd-port write.
     fn schedule_first_response(&mut self, bytes: Vec<u8>) {
-        self.pending.push_back(PendingEvent {
+        self.insert_pending_event(PendingEvent {
+            command: self.last_command,
             deadline: self.scheduling_cycle.saturating_add(FIRST_RESPONSE_CYCLES),
             irq: IrqType::Acknowledge,
             bytes,
+            followup: None,
+        });
+    }
+
+    fn schedule_first_complete_response(&mut self, bytes: Vec<u8>) {
+        self.insert_pending_event(PendingEvent {
+            command: self.last_command,
+            deadline: self.scheduling_cycle.saturating_add(FIRST_RESPONSE_CYCLES),
+            irq: IrqType::Complete,
+            bytes,
+            followup: None,
         });
     }
 
     /// Schedule a second-response IRQ. `additional_delay` is time
-    /// *after* the first response — so the actual cycle delta from
-    /// command issue is `FIRST_RESPONSE_CYCLES + additional_delay`.
+    /// *after* the first response interrupt actually fires. Matches
+    /// Redux's `AddIrqQueue(cmd + 0x100, delay)` path inside the
+    /// first-response handler.
     fn schedule_second_response(&mut self, bytes: Vec<u8>, additional_delay: u64) {
-        self.pending.push_back(PendingEvent {
-            deadline: self
-                .scheduling_cycle
-                .saturating_add(FIRST_RESPONSE_CYCLES)
-                .saturating_add(additional_delay),
-            irq: IrqType::Complete,
-            bytes,
-        });
+        self.chain_followup(IrqType::Complete, bytes, additional_delay);
     }
 
     /// Like [`schedule_second_response`] but the IRQ type is Error
     /// (INT5). Used for the second reply of commands that fail because
     /// the disc isn't present.
     fn schedule_second_error(&mut self, bytes: Vec<u8>, additional_delay: u64) {
-        self.pending.push_back(PendingEvent {
-            deadline: self
-                .scheduling_cycle
-                .saturating_add(FIRST_RESPONSE_CYCLES)
-                .saturating_add(additional_delay),
-            irq: IrqType::Error,
-            bytes,
-        });
+        self.chain_followup(IrqType::Error, bytes, additional_delay);
     }
 
     fn schedule_error_response(&mut self, bytes: Vec<u8>) {
-        self.pending.push_back(PendingEvent {
+        self.insert_pending_event(PendingEvent {
+            command: self.last_command,
             deadline: self.scheduling_cycle.saturating_add(FIRST_RESPONSE_CYCLES),
             irq: IrqType::Error,
             bytes,
+            followup: None,
         });
+    }
+
+    fn chain_followup(&mut self, irq: IrqType, bytes: Vec<u8>, delay: u64) {
+        if let Some(idx) = self
+            .pending
+            .iter()
+            .rposition(|ev| ev.irq == IrqType::Acknowledge && ev.followup.is_none())
+        {
+            self.pending[idx].followup = Some(PendingFollowup {
+                command: self.last_command,
+                delay,
+                irq,
+                bytes,
+            });
+            return;
+        }
+        // Fallback for probes/tests that inject events directly.
+        self.insert_pending_event(PendingEvent {
+            command: self.last_command,
+            deadline: self.scheduling_cycle.saturating_add(delay),
+            irq,
+            bytes,
+            followup: None,
+        });
+    }
+
+    fn insert_pending_event(&mut self, event: PendingEvent) {
+        let idx = self
+            .pending
+            .iter()
+            .position(|existing| existing.deadline > event.deadline)
+            .unwrap_or(self.pending.len());
+        self.pending.insert(idx, event);
+    }
+
+    fn drop_pending_command_irq(&mut self, command: u8, irq: IrqType) -> bool {
+        let before = self.pending.len();
+        self.pending
+            .retain(|event| !(event.command == command && event.irq == irq));
+        let mut dropped = self.pending.len() != before;
+        for event in self.pending.iter_mut() {
+            if event
+                .followup
+                .as_ref()
+                .is_some_and(|followup| followup.command == command && followup.irq == irq)
+            {
+                event.followup = None;
+                dropped = true;
+            }
+        }
+        dropped
+    }
+
+    fn schedule_lid_transition_at(&mut self, now: u64, delay: u64) {
+        self.lid_deadline = Some(now.saturating_add(delay));
+    }
+
+    fn tick_lid_state_machine(&mut self, cycles_now: u64) {
+        while let Some(deadline) = self.lid_deadline {
+            if deadline >= cycles_now {
+                break;
+            }
+            self.lid_deadline = None;
+            match self.drive_state {
+                DriveState::Stopped => {}
+                DriveState::Standby => {
+                    self.drive_status &= !drive_status_bit::SEEKING;
+                    if !self.disc_present {
+                        self.drive_status |= drive_status_bit::SHELL_OPEN;
+                        self.drive_state = DriveState::LidOpen;
+                    }
+                }
+                DriveState::LidOpen => {
+                    if self.disc_present {
+                        // SHELL_OPEN stays sticky until a subsequent
+                        // GetStat consumes it.
+                        self.drive_state = DriveState::RescanCd;
+                        self.schedule_lid_transition_at(cycles_now, CD_READ_TIME * 105);
+                    } else {
+                        self.schedule_lid_transition_at(cycles_now, CD_READ_TIME * 3);
+                    }
+                }
+                DriveState::RescanCd => {
+                    self.motor_on = true;
+                    self.drive_state = DriveState::PrepareCd;
+                    self.schedule_lid_transition_at(cycles_now, LID_PREPARE_SPINUP_CYCLES);
+                }
+                DriveState::PrepareCd => {
+                    self.drive_status |= drive_status_bit::SEEKING;
+                    self.drive_state = DriveState::Standby;
+                    self.schedule_lid_transition_at(cycles_now, LID_PREPARE_SEEK_CYCLES);
+                }
+            }
+        }
+    }
+
+    /// Stop the live sector stream and strip any queued DataReady work
+    /// from both the pending queue and ACK followups. Redux cancels the
+    /// read interrupt source on ReadN/Pause/Seek/Init/Reset; without
+    /// this, stale sectors from an older stream can leak into the next
+    /// command sequence.
+    fn cancel_pending_data_ready_events(&mut self) {
+        self.pending.retain(|ev| ev.irq != IrqType::DataReady);
+        for ev in self.pending.iter_mut() {
+            if ev
+                .followup
+                .as_ref()
+                .is_some_and(|f| f.irq == IrqType::DataReady)
+            {
+                ev.followup = None;
+            }
+        }
+        self.read_rescheduled = false;
     }
 
     fn stat_byte(&self) -> u8 {
@@ -753,11 +1063,28 @@ impl CdRom {
     fn cmd_getstat(&mut self) {
         let stat = self.stat_byte();
         self.schedule_first_response(vec![stat]);
+        // Redux keeps STATUS_SHELLOPEN sticky until GetStat observes
+        // it, then clears the latched bit after producing the reply
+        // unless the lid is genuinely still open.
+        if self.drive_state != DriveState::LidOpen {
+            self.drive_status &= !drive_status_bit::SHELL_OPEN;
+        }
     }
 
     fn cmd_setloc(&mut self, params: &[u8]) {
         if params.len() >= 3 {
-            self.setloc_msf = (params[0], params[1], params[2]);
+            let next_msf = (params[0], params[1], params[2]);
+            let next_lba = msf_to_lba(next_msf.0, next_msf.1, next_msf.2);
+            let current_lba = if self.read_lba != 0 {
+                self.read_lba
+            } else {
+                msf_to_lba(self.setloc_msf.0, self.setloc_msf.1, self.setloc_msf.2)
+            };
+            if next_lba.abs_diff(current_lba) > 16 {
+                self.seek_done = false;
+            }
+            self.setloc_msf = next_msf;
+            self.setloc_pending = true;
         }
         let stat = self.stat_byte();
         self.schedule_first_response(vec![stat]);
@@ -821,7 +1148,12 @@ impl CdRom {
 
     fn cmd_stop(&mut self) {
         self.motor_on = false;
+        self.drive_state = DriveState::Stopped;
+        self.lid_deadline = None;
+        self.lid_bootstrap_pending = false;
         self.reading = false;
+        self.cancel_pending_data_ready_events();
+        self.location_changed = false;
         self.drive_status &= !drive_status_bit::PLAYING;
         self.reset_xa_stream();
         self.schedule_first_response(vec![self.stat_byte()]);
@@ -830,6 +1162,8 @@ impl CdRom {
     }
 
     fn cmd_pause(&mut self) {
+        let was_motor_on = self.motor_on;
+        let ack_stat = self.stat_byte();
         // Pause halts the sector-read chain but leaves the motor on.
         // Missing this flip meant DataReady events kept chaining
         // `load_next_sector + schedule_sector_event` indefinitely
@@ -837,15 +1171,30 @@ impl CdRom {
         // pending queue that burned the entire CPU budget on
         // peripheral-scheduling overhead.
         self.reading = false;
+        self.cancel_pending_data_ready_events();
+        self.location_changed = false;
         self.drive_status &= !drive_status_bit::PLAYING;
         self.reset_xa_stream();
-        self.schedule_first_response(vec![self.stat_byte()]);
+        self.schedule_first_response(vec![ack_stat]);
         let stat = self.stat_byte();
-        self.schedule_second_response(vec![stat], SEEK_SECOND_RESPONSE_CYCLES);
+        // Redux uses a short ~7000-cycle follow-up when the drive is
+        // already spun up ("standby"), and a much longer completion
+        // only when pausing from a stopped / not-ready state. MGS hits
+        // the standby path: without the short follow-up, Redux raises a
+        // general CDROM IRQ ~7k cycles later and we don't.
+        let delay = if was_motor_on {
+            PAUSE_COMPLETE_CYCLES_STANDBY
+        } else if self.mode & 0x80 != 0 {
+            PAUSE_COMPLETE_CYCLES_ACTIVE * 2
+        } else {
+            PAUSE_COMPLETE_CYCLES_ACTIVE
+        };
+        self.schedule_second_response(vec![stat], delay);
     }
 
     fn cmd_motor_on(&mut self) {
         self.motor_on = true;
+        self.drive_state = DriveState::Standby;
         self.schedule_first_response(vec![self.stat_byte()]);
     }
 
@@ -877,19 +1226,25 @@ impl CdRom {
         // DataReady chains from a previous ReadN don't keep firing
         // across the reset boundary.
         self.reading = false;
+        self.cancel_pending_data_ready_events();
+        self.location_changed = false;
         self.drive_status &= !drive_status_bit::PLAYING;
-        self.data_fifo.clear();
+        self.clear_data_fifo();
         self.reset_xa_stream();
         self.muted = false;
         self.last_sector_header = [0; 4];
         self.last_sector_subheader = [0; 4];
         self.last_sector_header_valid = false;
-        // 1st response: current (pre-spin) stat.
+        // Redux returns only the pre-init ACK here; the later 20480
+        // cycle work happens on the lid/rescan state machine, not as a
+        // second CPU-visible CDROM completion IRQ.
         self.schedule_first_response(vec![self.stat_byte()]);
-        // Spin up and post-init stat.
+        self.seek_done = true;
         self.motor_on = true;
-        let stat = self.stat_byte();
-        self.schedule_second_response(vec![stat], INIT_SECOND_RESPONSE_CYCLES);
+        self.drive_status |= drive_status_bit::SHELL_OPEN;
+        self.drive_state = DriveState::RescanCd;
+        self.lid_deadline = None;
+        self.lid_bootstrap_pending = true;
     }
 
     fn cmd_set_session(&mut self, _params: &[u8]) {
@@ -903,28 +1258,65 @@ impl CdRom {
     }
 
     fn cmd_reset(&mut self) {
-        self.pending.clear();
+        let ack_pending = self.drop_pending_command_irq(0x0A, IrqType::Acknowledge);
+        let complete_pending = self.drop_pending_command_irq(0x0A, IrqType::Complete);
         self.responses.clear();
         self.reading = false;
-        self.drive_status &= !drive_status_bit::PLAYING;
-        self.data_fifo.clear();
+        self.cancel_pending_data_ready_events();
+        self.seek_done = true;
+        self.setloc_pending = false;
+        self.location_changed = false;
+        self.drive_status &= !(drive_status_bit::PLAYING
+            | drive_status_bit::READING
+            | drive_status_bit::SEEKING
+            | drive_status_bit::ERROR
+            | drive_status_bit::SEEK_ERROR);
+        self.clear_data_fifo();
         self.reset_xa_stream();
         self.last_sector_header = [0; 4];
         self.last_sector_subheader = [0; 4];
         self.last_sector_header_valid = false;
-        self.motor_on = false;
-        self.drive_status = 0;
+        self.mode = 0x20;
+        self.motor_on = true;
+        self.drive_state = DriveState::Standby;
+        self.lid_deadline = None;
+        self.lid_bootstrap_pending = false;
+        self.drive_status |= drive_status_bit::MOTOR_ON;
         self.muted = false;
-        self.schedule_first_response(vec![self.stat_byte()]);
+        let stat = self.stat_byte();
+        if complete_pending && !ack_pending {
+            // Redux's `m_irqRepeated` path leaves `m_irq` pointing at
+            // CdlReset+0x100. The replacement 0x800-cycle interrupt
+            // therefore publishes the pending completion, not another
+            // ACK. RE2's BIOS reset loop depends on seeing that INT2.
+            self.schedule_first_complete_response(vec![stat]);
+        } else {
+            self.schedule_first_response(vec![stat]);
+            self.schedule_second_response(vec![stat], RESET_SECOND_RESPONSE_CYCLES);
+        }
     }
 
     fn cmd_seek(&mut self) {
         // Need a disc / motor. Without disc we still "seek" but it
         // succeeds immediately on the real drive — BIOS rarely calls
         // SeekL without a disc.
+        self.reading = false;
+        self.cancel_pending_data_ready_events();
+        self.location_changed = false;
         self.schedule_first_response(vec![self.stat_byte()]);
-        let stat = self.stat_byte() | drive_status_bit::SEEKING;
-        self.schedule_second_response(vec![stat], SEEK_SECOND_RESPONSE_CYCLES);
+        // Redux's seek-complete interrupt clears STATUS_SEEK before
+        // publishing the second response (`playInterrupt`), so the
+        // BIOS observes the motor/rotating bit only once the seek is
+        // done. Returning SEEK here makes the license boot path think
+        // the drive is still unsettled.
+        let stat = self.stat_byte() & !drive_status_bit::SEEKING;
+        let delay = if self.seek_done {
+            0x800
+        } else {
+            SEEK_SECOND_RESPONSE_CYCLES
+        };
+        self.schedule_second_response(vec![stat], delay);
+        self.seek_done = true;
     }
 
     fn cmd_read(&mut self) {
@@ -940,46 +1332,44 @@ impl CdRom {
             self.schedule_second_error(vec![stat, 0x80], FIRST_RESPONSE_CYCLES);
             return;
         }
+        self.cancel_pending_data_ready_events();
         self.drive_status &= !drive_status_bit::PLAYING;
-        let was_reading = self.reading;
         self.reading = true;
+        self.read_rescheduled = false;
+        self.seek_done = true;
         self.xa_first_sector = 1;
         self.schedule_first_response(vec![self.stat_byte()]);
-        let (m, s, f) = self.setloc_msf;
-        self.read_lba = msf_to_lba(m, s, f);
-        // Only seed a fresh DataReady chain if we weren't already
-        // streaming. Real hardware treats cmd_read-while-reading as
-        // "retarget the same drive to a new LBA" — the running
-        // stream continues from the new location, one chain total.
-        // Our earlier impl scheduled a fresh DataReady on every
-        // cmd_read, which turned MGS's 1663 back-to-back reads into
-        // 1663 parallel sector chains firing concurrently (hundreds
-        // of thousands of DataReady events, burning ISR cycles and
-        // preventing the game from ever finishing its loader).
-        if !was_reading {
-            self.schedule_sector_event();
+        if self.setloc_pending {
+            let (m, s, f) = self.setloc_msf;
+            self.read_lba = msf_to_lba(m, s, f);
+            self.setloc_pending = false;
+            self.location_changed = true;
+        } else if self.read_lba == 0 {
+            let (m, s, f) = self.setloc_msf;
+            self.read_lba = msf_to_lba(m, s, f);
         }
-    }
-
-    /// Enqueue the next DataReady event for the in-flight read. The
-    /// event carries a single stat byte; the actual sector data is
-    /// copied into `data_fifo` when the event fires (in `tick`).
-    ///
-    /// Called from `cmd_read` (where `scheduling_cycle` is fresh).
-    /// `tick` chains further sectors via `schedule_sector_event_at`
-    /// so each DataReady is anchored on the event's firing cycle,
-    /// not the original `cmd_read` cycle.
-    fn schedule_sector_event(&mut self) {
-        let base = self.scheduling_cycle;
-        self.schedule_sector_event_at(base, self.initial_sector_read_cycles());
+        // Redux arms the first ReadN/ReadS sector from inside the
+        // command ACK handler (`interrupt()`), not from the original
+        // command write. Chaining it off the ACK keeps the first
+        // DataReady deadline anchored on the actual ACK service cycle
+        // rather than `scheduling_cycle`, which otherwise lands the
+        // first sector ~0x800 cycles too early and makes MGS service
+        // a CDROM IRQ before Redux does.
+        self.chain_followup(
+            IrqType::DataReady,
+            vec![self.stat_byte()],
+            self.initial_sector_read_cycles(),
+        );
     }
 
     fn schedule_sector_event_at(&mut self, base_cycle: u64, delay: u64) {
         let stat = self.stat_byte();
-        self.pending.push_back(PendingEvent {
+        self.insert_pending_event(PendingEvent {
+            command: 0x06,
             deadline: base_cycle.saturating_add(delay),
             irq: IrqType::DataReady,
             bytes: vec![stat],
+            followup: None,
         });
         self.sector_events_scheduled = self.sector_events_scheduled.saturating_add(1);
     }
@@ -1053,6 +1443,8 @@ impl CdRom {
                             self.cd_audio.extend(samples.iter().copied());
                             self.xa_first_sector = 0;
                             self.data_fifo.clear();
+                            self.data_fifo_ready = false;
+                            self.data_transfer_active = false;
                             return false;
                         }
                         self.xa_first_sector = -1;
@@ -1060,6 +1452,8 @@ impl CdRom {
                 }
 
                 self.data_fifo.clear();
+                self.data_fifo_ready = false;
+                self.data_transfer_active = false;
                 let whole_sector = self.mode & 0x20 != 0;
                 let sector_mode = raw[15];
                 if whole_sector {
@@ -1075,6 +1469,8 @@ impl CdRom {
                 } else {
                     self.data_fifo.extend(raw[24..24 + 2048].iter().copied());
                 }
+                self.data_fifo_ready = !self.data_fifo.is_empty();
+                self.data_transfer_active = false;
                 return !suppress_data_ready;
             }
 
@@ -1082,6 +1478,11 @@ impl CdRom {
         }
         // Past end of disc — stop the read and leave the FIFO empty.
         self.reading = false;
+        self.read_rescheduled = false;
+        self.location_changed = false;
+        self.data_fifo.clear();
+        self.data_fifo_ready = false;
+        self.data_transfer_active = false;
         true
     }
 
@@ -1253,6 +1654,7 @@ impl CdRom {
         }
         self.motor_on = true;
         self.reading = false;
+        self.read_rescheduled = false;
         self.drive_status |= drive_status_bit::PLAYING;
         self.schedule_first_response(vec![self.stat_byte()]);
     }
@@ -1278,25 +1680,18 @@ impl CdRom {
 
     fn cmd_getid(&mut self) {
         if self.disc_present {
-            // Licensed PS1 disc response: 8 bytes.
-            //   [0]: stat (0x02 = motor on)
-            //   [1]: flags (0x00 = licensed)
-            //   [2]: disc type (0x20 = mode-2 data)
-            //   [3]: reserved 0
-            //   [4..=7]: region code
-            //
-            // Region comes from the disc's license sector (LBA 4
-            // user-data), which carries the same "Sony Computer
-            // Entertainment Amer/Euro/Inc." strings the BIOS checks.
-            // Falling back to SCEA keeps homebrew / synthetic discs on
-            // the permissive US path instead of spuriously rejecting.
+            // Match PCSX-Redux's BIOS-visible response exactly:
+            // stat, licensed flags clear, two reserved zeros, then a
+            // benign four-byte controller ID. The BIOS has already
+            // verified the region/license string by reading the early
+            // data sectors; returning SCEA/SCEE here made every local
+            // disc reach the license screen and then fall back to the
+            // shell's repeated Init loop instead of continuing into the
+            // filesystem boot path.
             let stat = self.stat_byte();
-            let region = self.disc.as_ref().map(disc_region_code).unwrap_or(*b"SCEA");
             self.schedule_first_response(vec![stat]);
             self.schedule_second_response(
-                vec![
-                    0x02, 0x00, 0x20, 0x00, region[0], region[1], region[2], region[3],
-                ],
+                vec![stat, 0x00, 0x00, 0x00, b'P', b'C', b'S', b'X'],
                 GETID_SECOND_RESPONSE_CYCLES,
             );
         } else {
@@ -1324,10 +1719,24 @@ impl CdRom {
     /// Returns `true` if this call raised an IRQ that was previously
     /// clear — the caller (Bus) uses that to poke `IrqSource::Cdrom`.
     pub fn tick(&mut self, cycles_now: u64) -> bool {
+        self.tick_with_irq_pending(cycles_now, false)
+    }
+
+    /// Variant used by the full bus: Redux's CD read interrupt also
+    /// sees the CPU interrupt controller and applies one extra sector
+    /// delay if the CDROM IRQ bit is still pending there.
+    pub fn tick_with_irq_pending(&mut self, cycles_now: u64, cdrom_irq_pending: bool) -> bool {
         let mut raised = false;
 
+        self.tick_lid_state_machine(cycles_now);
+
         while let Some(front) = self.pending.front() {
-            if front.deadline > cycles_now {
+            // Redux's scheduled interrupt queue only dispatches when
+            // `target < cycle` (see `R3000Acpu::branchTest`). CDROM
+            // responses live on that queue, unlike root counters /
+            // VBlank which update on equality. Keep CDROM strict so a
+            // BIOS poll on the exact target cycle still sees no IRQ.
+            if front.deadline >= cycles_now {
                 break;
             }
 
@@ -1350,12 +1759,21 @@ impl CdRom {
                 // Bump the front event's deadline slightly so the
                 // next tick re-checks, rather than spinning on an
                 // already-due event every tick until the ack lands.
-                // Matches the prior "check again in ~200 cycles"
-                // cadence without ever re-running the event body.
-                let delay = FIRST_RESPONSE_CYCLES / 10;
-                if let Some(front_mut) = self.pending.front_mut() {
-                    front_mut.deadline = cycles_now.saturating_add(delay);
+                // Matches Redux's `irqReschedule` cadence exactly
+                // without ever re-running the event body.
+                let delay = IRQ_RESCHEDULE_CYCLES;
+                if let Some(mut ev) = self.pending.pop_front() {
+                    ev.deadline = cycles_now.saturating_add(delay);
+                    self.insert_pending_event(ev);
                 }
+                break;
+            }
+            if front.irq == IrqType::DataReady && cdrom_irq_pending && !self.read_rescheduled {
+                if let Some(mut ev) = self.pending.pop_front() {
+                    ev.deadline = cycles_now.saturating_add(CD_READ_TIME / 2);
+                    self.insert_pending_event(ev);
+                }
+                self.read_rescheduled = true;
                 break;
             }
 
@@ -1380,18 +1798,40 @@ impl CdRom {
             let mut should_raise_irq = true;
             if ev.irq == IrqType::DataReady {
                 should_raise_irq = self.load_next_sector();
+                self.read_rescheduled = false;
                 if self.reading {
-                    self.schedule_sector_event_at(cycles_now, self.sector_read_cycles());
+                    let delay = if self.location_changed {
+                        self.location_changed = false;
+                        self.sector_read_cycles().saturating_mul(30)
+                    } else {
+                        self.sector_read_cycles()
+                    };
+                    self.schedule_sector_event_at(cycles_now, delay);
                 }
             }
             if !should_raise_irq {
                 continue;
             }
+            // Like Redux's `m_result`, each IRQ publishes a fresh
+            // packet rather than appending to any unread prior bytes.
+            self.responses.clear();
             for b in ev.bytes.iter().copied() {
                 if self.responses.len() < RESPONSE_FIFO_DEPTH {
                     self.responses.push_back(b);
                 }
             }
+            if self.response_log.len() < self.response_log_cap {
+                let mut bytes = [0u8; RESPONSE_FIFO_DEPTH];
+                let n = ev.bytes.len().min(RESPONSE_FIFO_DEPTH);
+                bytes[..n].copy_from_slice(&ev.bytes[..n]);
+                self.response_log.push(CdRomResponseLogEntry {
+                    cycle: cycles_now,
+                    irq: ev.irq,
+                    bytes,
+                    len: n as u8,
+                });
+            }
+            self.command_busy = false;
             // Raise IRQ. The flag-gate above already guaranteed
             // irq_flag was 0 on entry.
             self.irq_flag = ev.irq as u8;
@@ -1403,6 +1843,19 @@ impl CdRom {
             // long production runs don't bloat memory.
             if self.cdrom_irq_log.len() < self.cdrom_irq_log_cap {
                 self.cdrom_irq_log.push((cycles_now, ev.irq as u8));
+            }
+            if let Some(followup) = ev.followup {
+                self.insert_pending_event(PendingEvent {
+                    command: followup.command,
+                    deadline: cycles_now.saturating_add(followup.delay),
+                    irq: followup.irq,
+                    bytes: followup.bytes,
+                    followup: None,
+                });
+            }
+            if self.lid_bootstrap_pending && ev.irq == IrqType::Acknowledge {
+                self.lid_bootstrap_pending = false;
+                self.schedule_lid_transition_at(cycles_now, LID_BOOTSTRAP_CYCLES);
             }
             raised = true;
             // Hardware can only latch one IRQ at a time; subsequent
@@ -1422,6 +1875,28 @@ impl CdRom {
     /// Per-command histogram (indexed by command byte) — same purpose.
     pub fn command_histogram(&self) -> &[u32; 32] {
         &self.command_hist
+    }
+
+    /// Enable bounded command logging for diagnostics.
+    pub fn enable_command_log(&mut self, cap: usize) {
+        self.command_log_cap = cap;
+        self.command_log.clear();
+    }
+
+    /// Captured command-port writes, up to the configured cap.
+    pub fn command_log(&self) -> &[CdRomCommandLogEntry] {
+        &self.command_log
+    }
+
+    /// Enable bounded response-packet logging for diagnostics.
+    pub fn enable_response_log(&mut self, cap: usize) {
+        self.response_log_cap = cap;
+        self.response_log.clear();
+    }
+
+    /// Captured response IRQ packets, up to the configured cap.
+    pub fn response_log(&self) -> &[CdRomResponseLogEntry] {
+        &self.response_log
     }
 
     /// Current raw IRQ-flag (for diagnostics).
@@ -1468,6 +1943,19 @@ impl CdRom {
         self.pending.len()
     }
 
+    /// Absolute cycle used as the base for the most recent command's
+    /// response scheduling. Diagnostic-only.
+    pub fn scheduling_cycle(&self) -> u64 {
+        self.scheduling_cycle
+    }
+
+    /// Front pending event as `(deadline, irq_type)`. Lets probes
+    /// compare the next latched CDROM action against Redux without
+    /// exposing the full private queue.
+    pub fn next_pending_event(&self) -> Option<(u64, IrqType)> {
+        self.pending.front().map(|ev| (ev.deadline, ev.irq))
+    }
+
     /// Enable per-raise logging up to `cap` entries. Probes call
     /// this once before running; afterward, read `cdrom_irq_log`.
     pub fn enable_irq_log(&mut self, cap: usize) {
@@ -1498,18 +1986,60 @@ impl CdRom {
         self.data_fifo_pops
     }
 
+    /// `true` when the request register's bit-7 latch has armed the
+    /// current sector buffer for MMIO/DMA consumption.
+    pub fn data_transfer_armed(&self) -> bool {
+        self.data_transfer_active
+    }
+
+    /// `true` when the sector-buffer status bit is currently set.
+    /// Diagnostic-only; the buffered byte count can remain nonzero
+    /// after an unarmed data-port read drops the ready latch.
+    pub fn data_fifo_ready(&self) -> bool {
+        self.data_fifo_ready
+    }
+
     /// Pull one byte from the data FIFO — used by DMA channel 3's
     /// block-read path to drain a sector into RAM. Returns `0` when
     /// the FIFO is empty (hardware returns stale-bus bytes; `0` is
     /// a safe stand-in).
     pub fn pop_data_byte(&mut self) -> u8 {
         self.data_fifo_pops = self.data_fifo_pops.saturating_add(1);
-        self.data_fifo.pop_front().unwrap_or(0)
+        self.pop_data_fifo_byte()
+    }
+
+    /// Pull one byte for DMA3. Redux gates CDROM DMA on the sector
+    /// ready flag (`m_read`), not on the request-register transfer
+    /// latch that controls MMIO reads, so DMA drains the buffered
+    /// sector directly.
+    pub fn pop_dma_data_byte(&mut self) -> u8 {
+        self.data_fifo_pops = self.data_fifo_pops.saturating_add(1);
+        let byte = self.data_fifo.pop_front().unwrap_or(0);
+        if self.data_fifo.is_empty() {
+            self.data_fifo_ready = false;
+            self.data_transfer_active = false;
+        }
+        byte
     }
 
     /// Number of bytes currently buffered in the data FIFO.
     pub fn data_fifo_len(&self) -> usize {
         self.data_fifo.len()
+    }
+
+    /// Current sector-buffer length expressed as DMA words. Used when
+    /// software programs a zero-sized CDROM DMA and expects the drive
+    /// to fall back to the active sector size (2048/2340 bytes).
+    pub fn data_fifo_words(&self) -> u32 {
+        self.data_fifo.len().div_ceil(4) as u32
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_seed_data_fifo(&mut self, bytes: &[u8], ready: bool, armed: bool) {
+        self.data_fifo.clear();
+        self.data_fifo.extend(bytes.iter().copied());
+        self.data_fifo_ready = ready;
+        self.data_transfer_active = armed;
     }
 }
 
@@ -1524,6 +2054,7 @@ impl Default for CdRom {
 // can use them.
 use psx_iso::{bin_to_bcd, lba_to_msf};
 
+#[cfg(test)]
 fn disc_region_code(disc: &Disc) -> [u8; 4] {
     let Some(user) = disc.read_sector_user(4) else {
         return *b"SCEA";
@@ -1771,6 +2302,83 @@ mod tests {
     }
 
     #[test]
+    fn data_fifo_read_without_transfer_request_returns_zero_and_keeps_buffered_sector() {
+        let mut cd = CdRom::new();
+        cd.data_fifo.extend([0x12, 0x34]);
+        cd.data_fifo_ready = true;
+
+        assert_ne!(cd.read8(BASE) & status_bit::DATA_FIFO_NOT_EMPTY, 0);
+        assert_eq!(cd.read8(BASE + 2), 0);
+        assert_eq!(cd.data_fifo_len(), 2);
+        assert_eq!(cd.data_fifo.front().copied(), Some(0x12));
+        assert_eq!(cd.read8(BASE) & status_bit::DATA_FIFO_NOT_EMPTY, 0);
+    }
+
+    #[test]
+    fn request_register_bit7_arms_transfer_until_sector_buffer_drains() {
+        let mut cd = CdRom::new();
+        cd.data_fifo.extend([0x12, 0x34]);
+        cd.data_fifo_ready = true;
+
+        cd.write8(BASE + 3, 0x80);
+        assert_eq!(cd.read8(BASE + 2), 0x12);
+        assert_ne!(cd.read8(BASE) & status_bit::DATA_FIFO_NOT_EMPTY, 0);
+        assert_eq!(cd.read8(BASE + 2), 0x34);
+        assert_eq!(cd.read8(BASE) & status_bit::DATA_FIFO_NOT_EMPTY, 0);
+        assert!(!cd.data_transfer_active);
+        assert_eq!(cd.read8(BASE + 2), 0);
+    }
+
+    #[test]
+    fn irq_mask_write_reports_wake_for_latched_unmasked_irq() {
+        let mut cd = CdRom::new();
+        cd.irq_flag = IrqType::DataReady as u8;
+        cd.irq_mask = 0;
+        cd.index = 1;
+
+        assert!(!cd.write8_at(BASE + 2, 0, 0));
+        assert!(cd.write8_at(BASE + 2, 1, 0));
+    }
+
+    #[test]
+    fn new_command_discards_unread_response_and_sets_busy_bit() {
+        let mut cd = CdRom::new();
+        cd.responses.push_back(0x55);
+
+        cd.queue_command(0x01, 123);
+
+        assert!(
+            cd.responses.is_empty(),
+            "new command should replace old packet"
+        );
+        assert_ne!(
+            cd.read8(BASE) & status_bit::TRANSMISSION_BUSY,
+            0,
+            "status bit 7 should latch while the command is pending"
+        );
+    }
+
+    #[test]
+    fn delivered_irq_packet_replaces_stale_bytes_and_clears_busy_bit() {
+        let mut cd = CdRom::new();
+        cd.command_busy = true;
+        cd.responses.push_back(0x11);
+        cd.insert_pending_event(PendingEvent {
+            command: 0x01,
+            deadline: 100,
+            irq: IrqType::Acknowledge,
+            bytes: vec![0xAA, 0xBB],
+            followup: None,
+        });
+
+        assert!(cd.tick(101));
+        assert_eq!(cd.read8(BASE + 1), 0xAA);
+        assert_eq!(cd.read8(BASE + 1), 0xBB);
+        assert_eq!(cd.read8(BASE + 1), 0);
+        assert_eq!(cd.read8(BASE) & status_bit::TRANSMISSION_BUSY, 0);
+    }
+
+    #[test]
     fn irq_ack_clears_only_written_bits() {
         let mut cd = CdRom::new();
         cd.irq_flag = 0x1F;
@@ -1789,6 +2397,77 @@ mod tests {
         assert_eq!(cd.drive_status & drive_status_bit::SHELL_OPEN, 0);
         assert!(!cd.motor_on);
         assert!(!cd.disc_present);
+    }
+
+    #[test]
+    fn init_only_queues_ack_and_latches_shell_open() {
+        let mut cd = CdRom::new();
+        cd.scheduling_cycle = 1_000;
+
+        cd.cmd_init();
+
+        assert_eq!(cd.pending.len(), 1);
+        let ack = cd.pending.front().expect("Init ACK pending");
+        assert_eq!(ack.irq, IrqType::Acknowledge);
+        assert!(ack.followup.is_none(), "Init should not invent INT2");
+        assert!(cd.motor_on, "Init should spin the motor up");
+        assert_eq!(
+            cd.drive_status & drive_status_bit::SHELL_OPEN,
+            drive_status_bit::SHELL_OPEN
+        );
+        assert!(cd.seek_done, "Init resets the seek latch to DONE");
+    }
+
+    #[test]
+    fn init_ack_bootstraps_lid_rescan_state_machine() {
+        let mut cd = CdRom::new();
+        cd.insert_disc(Some(Disc::from_bin(vec![0u8; psx_iso::SECTOR_BYTES])));
+        cd.scheduling_cycle = 1_000;
+
+        cd.cmd_init();
+        assert!(cd.lid_bootstrap_pending);
+        assert_eq!(cd.drive_state, DriveState::RescanCd);
+
+        let ack_cycle = 1_000 + FIRST_RESPONSE_CYCLES + 1;
+        assert!(cd.tick(ack_cycle));
+        assert!(!cd.lid_bootstrap_pending);
+        assert_eq!(cd.lid_deadline, Some(ack_cycle + LID_BOOTSTRAP_CYCLES));
+
+        let rescan_cycle = ack_cycle + LID_BOOTSTRAP_CYCLES + 1;
+        assert!(!cd.tick(rescan_cycle));
+        assert_eq!(cd.drive_state, DriveState::PrepareCd);
+        assert_eq!(
+            cd.lid_deadline,
+            Some(rescan_cycle + LID_PREPARE_SPINUP_CYCLES)
+        );
+
+        let prepare_cycle = rescan_cycle + LID_PREPARE_SPINUP_CYCLES + 1;
+        assert!(!cd.tick(prepare_cycle));
+        assert_eq!(cd.drive_state, DriveState::Standby);
+        assert_ne!(cd.drive_status & drive_status_bit::SEEKING, 0);
+
+        let settle_cycle = prepare_cycle + LID_PREPARE_SEEK_CYCLES + 1;
+        assert!(!cd.tick(settle_cycle));
+        assert_eq!(cd.drive_state, DriveState::Standby);
+        assert_eq!(cd.drive_status & drive_status_bit::SEEKING, 0);
+    }
+
+    #[test]
+    fn getstat_reports_then_clears_shell_open_sticky_bit() {
+        let mut cd = CdRom::new();
+        cd.drive_status |= drive_status_bit::SHELL_OPEN;
+        cd.scheduling_cycle = 1_000;
+
+        cd.cmd_getstat();
+
+        assert_eq!(cd.drive_status & drive_status_bit::SHELL_OPEN, 0);
+        assert!(cd.tick(1_000 + FIRST_RESPONSE_CYCLES + 1));
+        let stat = cd.read8(BASE + 1);
+        assert_eq!(
+            stat & drive_status_bit::SHELL_OPEN,
+            drive_status_bit::SHELL_OPEN
+        );
+        assert_eq!(cd.read8(BASE + 1), 0);
     }
 
     #[test]
@@ -1873,6 +2552,22 @@ mod tests {
     }
 
     #[test]
+    fn load_next_sector_sets_ready_latch_but_leaves_transfer_disarmed() {
+        let mut cd = CdRom::new();
+        let raw = raw_sector([0x00, 0x02, 0x00, 0x02], [0; 4], 0x6C);
+        cd.insert_disc(Some(Disc::from_bin(raw)));
+
+        cd.load_next_sector();
+
+        assert!(cd.data_fifo_ready);
+        assert!(!cd.data_transfer_active);
+        assert_ne!(cd.read8(BASE) & status_bit::DATA_FIFO_NOT_EMPTY, 0);
+        assert_eq!(cd.pop_data_byte(), 0);
+        assert_eq!(cd.data_fifo_len(), 2048);
+        assert_eq!(cd.data_fifo.front().copied(), Some(0x6C));
+    }
+
+    #[test]
     fn sector_read_cycles_match_redux_initial_and_stream_cadence() {
         let mut cd = CdRom::new();
         // Default mode = 0x80 → double-speed.
@@ -1899,19 +2594,26 @@ mod tests {
         cd.scheduling_cycle = 1_000;
 
         cd.cmd_read();
-        assert_eq!(cd.pending.len(), 2); // command ACK + first DataReady
+        assert_eq!(cd.pending.len(), 1); // command ACK only; first DataReady is chained off it
+        assert_eq!(
+            cd.pending.front().map(|ev| ev.irq),
+            Some(IrqType::Acknowledge)
+        );
+
+        assert!(cd.tick(1_000 + FIRST_RESPONSE_CYCLES + 1));
         let first_data_ready = cd
             .pending
             .iter()
             .find(|ev| ev.irq == IrqType::DataReady)
-            .expect("first DataReady scheduled");
-        assert_eq!(first_data_ready.deadline, 1_000 + CD_READ_TIME);
-
-        assert!(cd.tick(1_000 + FIRST_RESPONSE_CYCLES));
+            .expect("first DataReady scheduled from ACK fire time");
+        assert_eq!(
+            first_data_ready.deadline,
+            1_000 + FIRST_RESPONSE_CYCLES + 1 + CD_READ_TIME
+        );
         cd.irq_flag = 0;
         cd.responses.clear();
 
-        assert!(cd.tick(1_000 + CD_READ_TIME));
+        assert!(cd.tick(1_000 + FIRST_RESPONSE_CYCLES + 1 + CD_READ_TIME + 1));
         let next_data_ready = cd
             .pending
             .iter()
@@ -1919,8 +2621,34 @@ mod tests {
             .expect("steady DataReady scheduled");
         assert_eq!(
             next_data_ready.deadline,
-            1_000 + CD_READ_TIME + CD_READ_TIME / 2
+            1_000 + FIRST_RESPONSE_CYCLES + 1 + CD_READ_TIME + 1 + CD_READ_TIME / 2
         );
+    }
+
+    #[test]
+    fn dataready_waits_once_when_cpu_cdrom_irq_is_still_pending() {
+        let mut cd = CdRom::new();
+        cd.insert_disc(Some(Disc::from_bin(vec![0u8; psx_iso::SECTOR_BYTES * 4])));
+        cd.scheduling_cycle = 1_000;
+
+        cd.cmd_read();
+        let ack_cycle = 1_000 + FIRST_RESPONSE_CYCLES + 1;
+        assert!(cd.tick(ack_cycle));
+        cd.irq_flag = 0;
+        cd.responses.clear();
+
+        let first_due = ack_cycle + CD_READ_TIME + 1;
+        assert!(!cd.tick_with_irq_pending(first_due, true));
+        let delayed_deadline = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::DataReady)
+            .expect("DataReady should be delayed, not delivered")
+            .deadline;
+        assert_eq!(delayed_deadline, first_due + CD_READ_TIME / 2);
+
+        assert!(cd.tick_with_irq_pending(delayed_deadline + 1, true));
+        assert_eq!(cd.irq_flag, IrqType::DataReady as u8);
     }
 
     #[test]
@@ -1936,12 +2664,12 @@ mod tests {
         cd.scheduling_cycle = 1_000;
 
         cd.cmd_read();
-        assert!(cd.tick(1_000 + FIRST_RESPONSE_CYCLES));
+        assert!(cd.tick(1_000 + FIRST_RESPONSE_CYCLES + 1));
         cd.irq_flag = 0;
         cd.responses.clear();
 
         assert!(
-            !cd.tick(1_000 + CD_READ_TIME),
+            !cd.tick(1_000 + FIRST_RESPONSE_CYCLES + 1 + CD_READ_TIME + 1),
             "Redux suppresses DataReady IRQs for STRSND XA audio sectors"
         );
         assert_eq!(cd.irq_flag, 0);
@@ -1958,7 +2686,146 @@ mod tests {
             .expect("suppressed audio sector should still chain the read stream");
         assert_eq!(
             next_data_ready.deadline,
-            1_000 + CD_READ_TIME + CD_READ_TIME / 2
+            1_000 + FIRST_RESPONSE_CYCLES + 1 + CD_READ_TIME + 1 + CD_READ_TIME / 2
+        );
+    }
+
+    #[test]
+    fn pause_on_spun_up_drive_uses_short_followup_delay() {
+        let mut cd = CdRom::new();
+        cd.motor_on = true;
+        cd.reading = true;
+        cd.scheduling_cycle = 1_000;
+        cd.insert_pending_event(PendingEvent {
+            command: 0x06,
+            deadline: 50_000,
+            irq: IrqType::DataReady,
+            bytes: vec![0x20],
+            followup: None,
+        });
+
+        cd.cmd_pause();
+        assert_eq!(
+            cd.pending.len(),
+            1,
+            "Pause should cancel the in-flight read chain"
+        );
+
+        let ack_deadline = 1_000 + FIRST_RESPONSE_CYCLES;
+        assert!(cd.tick(ack_deadline + 1));
+        assert_eq!(
+            cd.read8(BASE + 1),
+            drive_status_bit::MOTOR_ON | drive_status_bit::READING,
+            "Pause ACK should report the pre-pause read state"
+        );
+        cd.irq_flag = 0;
+        let pause_complete = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::Complete)
+            .expect("pause completion chained off ACK");
+        assert_eq!(
+            pause_complete.deadline,
+            ack_deadline + 1 + PAUSE_COMPLETE_CYCLES_STANDBY
+        );
+    }
+
+    #[test]
+    fn seek_command_uses_short_followup_after_drive_has_seeked_once() {
+        let mut cd = CdRom::new();
+        cd.seek_done = true;
+        cd.scheduling_cycle = 1_000;
+
+        cd.cmd_seek();
+
+        let ack_deadline = 1_000 + FIRST_RESPONSE_CYCLES;
+        assert!(cd.tick(ack_deadline + 1));
+        let seek_complete = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::Complete)
+            .expect("seek completion chained off ACK");
+        assert_eq!(seek_complete.deadline, ack_deadline + 1 + 0x800);
+    }
+
+    #[test]
+    fn setloc_far_target_clears_seek_done_and_marks_pending() {
+        let mut cd = CdRom::new();
+        cd.seek_done = true;
+        cd.read_lba = 200;
+
+        cd.cmd_setloc(&[0x00, 0x02, 0x16]);
+
+        assert!(
+            !cd.seek_done,
+            "far SetLoc should force the next seek slow-path"
+        );
+        assert!(
+            cd.setloc_pending,
+            "SetLoc should latch until Read/Play consumes it"
+        );
+    }
+
+    #[test]
+    fn read_command_cancels_old_stream_and_rearms_first_sector() {
+        let mut cd = CdRom::new();
+        cd.insert_disc(Some(Disc::from_bin(vec![0u8; psx_iso::SECTOR_BYTES * 32])));
+        cd.reading = true;
+        cd.scheduling_cycle = 1_000;
+        cd.setloc_msf = (0x00, 0x02, 0x16);
+        cd.setloc_pending = true;
+        cd.insert_pending_event(PendingEvent {
+            command: 0x06,
+            deadline: 50_000,
+            irq: IrqType::DataReady,
+            bytes: vec![0x20],
+            followup: None,
+        });
+
+        cd.cmd_read();
+
+        assert!(
+            cd.pending.iter().all(|ev| ev.irq != IrqType::DataReady),
+            "stale DataReady events from the previous stream must be cancelled"
+        );
+        let ack = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::Acknowledge)
+            .expect("ReadN ACK present");
+        let followup = ack.followup.as_ref().expect("first sector chained off ACK");
+        assert_eq!(followup.irq, IrqType::DataReady);
+        assert_eq!(followup.delay, cd.initial_sector_read_cycles());
+    }
+
+    #[test]
+    fn relocated_read_stretches_second_sector_gap() {
+        let mut cd = CdRom::new();
+        cd.insert_disc(Some(Disc::from_bin(vec![0u8; psx_iso::SECTOR_BYTES * 64])));
+        cd.scheduling_cycle = 1_000;
+        cd.setloc_msf = (0x00, 0x02, 0x16);
+        cd.setloc_pending = true;
+
+        cd.cmd_read();
+
+        let ack_deadline = 1_000 + FIRST_RESPONSE_CYCLES;
+        assert!(cd.tick(ack_deadline + 1));
+        cd.irq_flag = 0;
+
+        let first_sector_deadline = ack_deadline + 1 + CD_READ_TIME;
+        assert!(cd.tick(first_sector_deadline + 1));
+        let next_sector = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::DataReady)
+            .expect("read stream should continue after first sector");
+        assert_eq!(
+            next_sector.deadline,
+            first_sector_deadline + 1 + (CD_READ_TIME / 2) * 30
+        );
+        assert!(
+            !cd.location_changed,
+            "the long-gap latch should clear once it has stretched one sector"
         );
     }
 
@@ -2189,29 +3056,170 @@ mod tests {
     }
 
     #[test]
-    fn reset_cancels_read_and_clears_fifo() {
+    fn reset_cancels_read_and_completes_with_motor_on() {
         let mut cd = CdRom::new();
         cd.motor_on = true;
         cd.reading = true;
         cd.data_fifo.push_back(0xAB);
         cd.pending.push_back(PendingEvent {
+            command: 0x06,
             deadline: 123,
             irq: IrqType::DataReady,
             bytes: vec![0x20],
+            followup: None,
         });
 
         cd.cmd_reset();
-        cd.tick(10_000_000);
+        assert!(cd.tick(FIRST_RESPONSE_CYCLES + 1));
+        assert_eq!(cd.irq_flag, IrqType::Acknowledge as u8);
+        cd.write8(BASE, 1);
+        cd.write8(BASE + 3, 0x1F);
+        assert_eq!(cd.irq_flag, 0);
+        assert!(cd.tick(FIRST_RESPONSE_CYCLES + RESET_SECOND_RESPONSE_CYCLES + 2));
+        assert_eq!(cd.irq_flag, IrqType::Complete as u8);
 
-        assert!(!cd.motor_on);
+        assert!(cd.motor_on);
         assert!(!cd.reading);
         assert!(cd.data_fifo.is_empty());
         assert_eq!(
             cd.pending.len(),
             0,
-            "reset should leave only its own ack already delivered"
+            "reset ACK and completion should both be delivered"
         );
-        assert_eq!(cd.read8(BASE + 1), 0x00);
+        assert_eq!(
+            cd.read8(BASE + 1) & drive_status_bit::MOTOR_ON,
+            drive_status_bit::MOTOR_ON
+        );
+    }
+
+    #[test]
+    fn repeated_reset_before_ack_reschedules_one_long_completion() {
+        let mut cd = CdRom::new();
+        cd.last_command = 0x0A;
+        cd.scheduling_cycle = 100;
+        cd.cmd_reset();
+
+        cd.scheduling_cycle = 1_000;
+        cd.cmd_reset();
+        assert_eq!(
+            count_pending_command_irq(&cd, 0x0A, IrqType::Acknowledge),
+            1
+        );
+        assert_eq!(count_pending_command_irq(&cd, 0x0A, IrqType::Complete), 1);
+        let ack = cd
+            .pending
+            .iter()
+            .find(|event| event.command == 0x0A && event.irq == IrqType::Acknowledge)
+            .expect("reset ACK");
+        assert_eq!(ack.deadline, 1_000 + FIRST_RESPONSE_CYCLES);
+        assert_eq!(
+            ack.followup.as_ref().map(|f| (f.command, f.irq, f.delay)),
+            Some((0x0A, IrqType::Complete, RESET_SECOND_RESPONSE_CYCLES))
+        );
+
+        assert!(!cd.tick(100 + FIRST_RESPONSE_CYCLES + 1));
+        assert!(cd.tick(1_000 + FIRST_RESPONSE_CYCLES + 1));
+        cd.irq_flag = 0;
+        cd.responses.clear();
+        assert_eq!(count_pending_command_irq(&cd, 0x0A, IrqType::Complete), 1);
+    }
+
+    #[test]
+    fn repeated_reset_while_completion_pending_publishes_completion() {
+        let mut cd = CdRom::new();
+        cd.last_command = 0x0A;
+        cd.scheduling_cycle = 100;
+        cd.cmd_reset();
+
+        assert!(cd.tick(100 + FIRST_RESPONSE_CYCLES + 1));
+        cd.irq_flag = 0;
+        cd.responses.clear();
+
+        cd.scheduling_cycle = 2_000_000;
+        cd.cmd_reset();
+        assert_eq!(
+            count_pending_command_irq(&cd, 0x0A, IrqType::Acknowledge),
+            0
+        );
+        assert_eq!(count_pending_command_irq(&cd, 0x0A, IrqType::Complete), 1);
+        let complete = cd
+            .pending
+            .iter()
+            .find(|event| event.command == 0x0A && event.irq == IrqType::Complete)
+            .expect("reset completion after pending completion");
+        assert_eq!(complete.deadline, 2_000_000 + FIRST_RESPONSE_CYCLES);
+        assert!(complete.followup.is_none());
+    }
+
+    #[test]
+    fn pending_events_are_kept_sorted_by_deadline() {
+        let mut cd = CdRom::new();
+        cd.insert_pending_event(PendingEvent {
+            command: 0x06,
+            deadline: 300,
+            irq: IrqType::DataReady,
+            bytes: vec![0x20],
+            followup: None,
+        });
+        cd.insert_pending_event(PendingEvent {
+            command: 0x01,
+            deadline: 100,
+            irq: IrqType::Acknowledge,
+            bytes: vec![0x00],
+            followup: None,
+        });
+        cd.insert_pending_event(PendingEvent {
+            command: 0x01,
+            deadline: 200,
+            irq: IrqType::Complete,
+            bytes: vec![0x00],
+            followup: None,
+        });
+
+        let deadlines = cd.pending.iter().map(|ev| ev.deadline).collect::<Vec<_>>();
+        assert_eq!(deadlines, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn followup_chains_to_latest_ack_even_with_later_events_present() {
+        let mut cd = CdRom::new();
+        cd.insert_pending_event(PendingEvent {
+            command: 0x06,
+            deadline: 300,
+            irq: IrqType::DataReady,
+            bytes: vec![0x20],
+            followup: None,
+        });
+        cd.insert_pending_event(PendingEvent {
+            command: 0x01,
+            deadline: 100,
+            irq: IrqType::Acknowledge,
+            bytes: vec![0x00],
+            followup: None,
+        });
+
+        cd.chain_followup(IrqType::Complete, vec![0x01], 77);
+
+        let ack = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::Acknowledge)
+            .expect("ack event present");
+        let data_ready = cd
+            .pending
+            .iter()
+            .find(|ev| ev.irq == IrqType::DataReady)
+            .expect("later event present");
+        assert_eq!(
+            ack.followup
+                .as_ref()
+                .map(|f| (f.delay, f.irq, f.bytes.clone())),
+            Some((77, IrqType::Complete, vec![0x01]))
+        );
+        assert!(
+            data_ready.followup.is_none(),
+            "later event must stay untouched"
+        );
     }
 
     #[test]
@@ -2225,5 +3233,19 @@ mod tests {
 
         let disc = Disc::from_bin(bytes);
         assert_eq!(disc_region_code(&disc), *b"SCEE");
+    }
+
+    fn count_pending_command_irq(cd: &CdRom, command: u8, irq: IrqType) -> usize {
+        cd.pending
+            .iter()
+            .map(|event| {
+                usize::from(event.command == command && event.irq == irq)
+                    + usize::from(
+                        event.followup.as_ref().is_some_and(|followup| {
+                            followup.command == command && followup.irq == irq
+                        }),
+                    )
+            })
+            .sum()
     }
 }

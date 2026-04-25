@@ -159,20 +159,11 @@ pub struct Gpu {
     /// executing command. Bumped just before each packet dispatch.
     current_cmd_index: u32,
 
-    /// Cumulative "pseudo-busy" credit. Incremented by each
-    /// primitive rasterisation proportionally to its pixel count;
-    /// decremented by `set_idle_cycles` each time the frontend
-    /// advances the GPU clock. When > 0, GPUSTAT bit 26
-    /// (command-FIFO ready) and bit 28 (DMA-block ready) both
-    /// clear, so games polling for "GPU idle" before pushing the
-    /// next packet see a realistic 0→1 transition instead of an
-    /// always-ready register.
-    ///
-    /// Real hardware's busy flag is driven by the command-FIFO
-    /// fill level and by an internal rasteriser "work credit".
-    /// This approximation is enough for games that do the common
-    /// "wait for GPU" spin on bit 26 right after issuing a big
-    /// draw batch.
+    /// Cumulative diagnostic "pseudo-busy" credit for expensive
+    /// primitives. This deliberately does *not* affect GPUSTAT:
+    /// PCSX-Redux's soft GPU keeps command/DMA-ready bits set even
+    /// while software has just kicked a large copy/fill, and games
+    /// like WipEout 2097 poll those bits during boot.
     busy_credit: u64,
 
     // --- Display area (GP1 0x05 / 0x06 / 0x07 / 0x08) ---
@@ -225,6 +216,11 @@ pub struct Gpu {
     /// diagnostics see whether the BIOS is flipping buffers or just
     /// repeatedly re-writing the same location.
     display_start_history: std::collections::BTreeSet<(u16, u16)>,
+    /// Distinct raw GP1 0x08 display-mode values seen since reset.
+    display_mode_history: std::collections::BTreeSet<u32>,
+    /// Recent GP1 writes in chronological order. Diagnostic only; capped
+    /// so long FMV probes do not grow without bound.
+    gp1_write_history: Vec<u32>,
 }
 
 /// Public snapshot of the GPU's display configuration, read by the
@@ -236,7 +232,7 @@ pub struct DisplayArea {
     pub x: u16,
     /// VRAM Y of the top-left displayed pixel.
     pub y: u16,
-    /// Horizontal resolution in pixels (one of 256/320/384/512/640).
+    /// Horizontal resolution in pixels (one of 256/320/368/384/512/640).
     pub width: u16,
     /// Vertical resolution in pixels (240 or 480 interlaced).
     pub height: u16,
@@ -343,6 +339,8 @@ impl Gpu {
             gp0_opcode_hist: [0; 256],
             gp1_opcode_hist: [0; 256],
             display_start_history: std::collections::BTreeSet::new(),
+            display_mode_history: std::collections::BTreeSet::new(),
+            gp1_write_history: Vec::new(),
         }
     }
 
@@ -350,6 +348,16 @@ impl Gpu {
     /// for telling a re-write loop from a front/back-buffer flip.
     pub fn display_start_history(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
         self.display_start_history.iter().copied()
+    }
+
+    /// Distinct raw GP1 0x08 display-mode values seen since reset.
+    pub fn display_mode_history(&self) -> impl Iterator<Item = u32> + '_ {
+        self.display_mode_history.iter().copied()
+    }
+
+    /// Recent raw GP1 writes in chronological order. Diagnostic.
+    pub fn gp1_write_history(&self) -> &[u32] {
+        &self.gp1_write_history
     }
 
     /// Snapshot of the GP0 opcode histogram — per-byte count of
@@ -451,10 +459,7 @@ impl Gpu {
     /// Idempotent: re-enabling resets the tracer to empty.
     pub fn enable_pixel_tracer(&mut self) {
         const SENTINEL_NO_OWNER: u32 = u32::MAX;
-        self.pixel_owner = Some(vec![
-            SENTINEL_NO_OWNER;
-            VRAM_WIDTH * VRAM_HEIGHT
-        ]);
+        self.pixel_owner = Some(vec![SENTINEL_NO_OWNER; VRAM_WIDTH * VRAM_HEIGHT]);
         self.cmd_log.clear();
         self.current_cmd_index = 0;
     }
@@ -466,7 +471,9 @@ impl Gpu {
     /// single command in isolation.
     pub fn pixel_owner_at(&self, x: u16, y: u16) -> Option<&GpuCmdLogEntry> {
         let pixel_owner = self.pixel_owner.as_ref()?;
-        let idx = pixel_owner.get(y as usize * VRAM_WIDTH + x as usize).copied()?;
+        let idx = pixel_owner
+            .get(y as usize * VRAM_WIDTH + x as usize)
+            .copied()?;
         if idx == u32::MAX {
             return None;
         }
@@ -522,12 +529,7 @@ impl Gpu {
                     let g = (((pixel >> 5) & 0x1F) as u8) << 3;
                     let b = (((pixel >> 10) & 0x1F) as u8) << 3;
                     // Replicate high 3 bits into low 3 for fuller range.
-                    out.extend_from_slice(&[
-                        r | (r >> 5),
-                        g | (g >> 5),
-                        b | (b >> 5),
-                        0xFF,
-                    ]);
+                    out.extend_from_slice(&[r | (r >> 5), g | (g >> 5), b | (b >> 5), 0xFF]);
                 }
             }
         }
@@ -549,7 +551,7 @@ impl Gpu {
     pub fn read32(&mut self, phys: u32) -> Option<u32> {
         match phys {
             GP0_ADDR => Some(self.read_gpuread()),
-            GP1_ADDR => Some(self.status.read(self.vram_download.is_some(), self.busy_credit > 0)),
+            GP1_ADDR => Some(self.status.read(self.vram_download.is_some())),
             _ => None,
         }
     }
@@ -614,6 +616,10 @@ impl Gpu {
             GP1_ADDR => {
                 let op = ((value >> 24) & 0xFF) as usize;
                 self.gp1_opcode_hist[op] = self.gp1_opcode_hist[op].saturating_add(1);
+                if self.gp1_write_history.len() == 512 {
+                    self.gp1_write_history.remove(0);
+                }
+                self.gp1_write_history.push(value);
                 self.apply_gp1_display(value);
                 self.status.gp1_write(value);
                 true
@@ -775,14 +781,24 @@ impl Gpu {
             // actual pixel count is derived together with V-range in
             // [`Gpu::effective_display_height`].
             0x08 => {
-                let hres = match value & 0x3 {
-                    0 => 256,
-                    1 => 320,
-                    2 => 512,
-                    3 => 640,
-                    _ => unreachable!(),
+                self.display_mode_history.insert(value);
+                let hres = if value & (1 << 6) != 0 {
+                    match value & 0x3 {
+                        0 => 368,
+                        1 => 384,
+                        2 => 512,
+                        3 => 640,
+                        _ => unreachable!(),
+                    }
+                } else {
+                    match value & 0x3 {
+                        0 => 256,
+                        1 => 320,
+                        2 => 512,
+                        3 => 640,
+                        _ => unreachable!(),
+                    }
                 };
-                let hres = if value & (1 << 6) != 0 { 384 } else { hres };
                 self.display_width = hres;
                 self.display_height_480 = value & (1 << 2) != 0;
                 self.display_24bpp = value & (1 << 4) != 0;
@@ -989,8 +1005,7 @@ impl Gpu {
     /// in `gp0_fifo`. Dispatches on the opcode in word 0.
     fn execute_gp0_packet(&mut self) {
         let op = (self.gp0_fifo[0] >> 24) & 0xFF;
-        self.gp0_opcode_hist[op as usize] =
-            self.gp0_opcode_hist[op as usize].saturating_add(1);
+        self.gp0_opcode_hist[op as usize] = self.gp0_opcode_hist[op as usize].saturating_add(1);
         // If the pixel tracer is armed, stamp this packet into the
         // command log *before* dispatching — `plot_pixel` uses
         // `current_cmd_index` to tag every write, so it must point
@@ -1119,8 +1134,9 @@ impl Gpu {
         self.rasterize_triangle(v0, v1, v2, color, mode);
     }
 
-    /// GP0 0x28..=0x2B — monochrome 4-vertex quad, split into two
-    /// triangles `(v0, v1, v2)` + `(v1, v2, v3)`.
+    /// GP0 0x28..=0x2B — monochrome 4-vertex quad. Redux draws the
+    /// lower/right half first, then the upper/left half, so pixels on
+    /// the shared diagonal are owned by `(v0, v1, v2)`.
     fn draw_monochrome_quad(&mut self) {
         let cmd = self.gp0_fifo[0];
         let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
@@ -1129,8 +1145,8 @@ impl Gpu {
         let v1 = self.decode_vertex(self.gp0_fifo[2]);
         let v2 = self.decode_vertex(self.gp0_fifo[3]);
         let v3 = self.decode_vertex(self.gp0_fifo[4]);
+        self.rasterize_triangle(v1, v3, v2, color, mode);
         self.rasterize_triangle(v0, v1, v2, color, mode);
-        self.rasterize_triangle(v1, v2, v3, color, mode);
     }
 
     /// GP0 0x30..=0x33 — Gouraud triangle. Per-vertex RGB24 colours,
@@ -1149,8 +1165,8 @@ impl Gpu {
     }
 
     /// GP0 0x38..=0x3B — Gouraud quad. 4 × (colour+vertex) =
-    /// 8 words, split into two shaded triangles sharing the middle
-    /// edge (v1–v2).
+    /// 8 words, split in Redux order so the first half wins the
+    /// shared diagonal.
     fn draw_shaded_quad(&mut self) {
         let cmd = self.gp0_fifo[0];
         let c0 = cmd & 0x00FF_FFFF;
@@ -1162,8 +1178,8 @@ impl Gpu {
         let v2 = self.decode_vertex(self.gp0_fifo[5]);
         let c3 = self.gp0_fifo[6] & 0x00FF_FFFF;
         let v3 = self.decode_vertex(self.gp0_fifo[7]);
+        self.rasterize_shaded_triangle(v1, v3, v2, c1, c3, c2, mode);
         self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2, mode);
-        self.rasterize_shaded_triangle(v1, v2, v3, c1, c2, c3, mode);
     }
 
     /// GP0 0x60..=0x63 — monochrome variable-size rectangle.
@@ -1214,11 +1230,7 @@ impl Gpu {
         } else {
             split_tint(cmd & 0x00FF_FFFF)
         };
-        self.paint_textured_rect(
-            x, y, w, h, u0, v0, clut_word,
-            prim_is_semi_trans(cmd),
-            tint,
-        );
+        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word, prim_is_semi_trans(cmd), tint);
     }
 
     /// Fixed-size textured rect (1×1, 8×8, 16×16).
@@ -1241,11 +1253,7 @@ impl Gpu {
         } else {
             split_tint(cmd & 0x00FF_FFFF)
         };
-        self.paint_textured_rect(
-            x, y, w, h, u0, v0, clut_word,
-            prim_is_semi_trans(cmd),
-            tint,
-        );
+        self.paint_textured_rect(x, y, w, h, u0, v0, clut_word, prim_is_semi_trans(cmd), tint);
     }
 
     /// Plot a textured rectangle. Each destination pixel samples a
@@ -1331,6 +1339,17 @@ impl Gpu {
     /// tiling set non-zero mask/offset to reuse a sub-rectangle of
     /// the tpage across multiple primitives.
     fn sample_texture(&self, u: u16, v: u16, clut_x: u16, clut_y: u16) -> Option<u16> {
+        // PSX-SPX: the GPU's U/V counters are 8 bits — texture pages
+        // wrap every 256 texels horizontally and vertically. Callers
+        // pass u16 because rasterizer interpolation works in a wider
+        // domain, so we mask down to 8 bits *before* the texture
+        // window. Without this, a sprite or polygon whose `U + dx`
+        // exceeds 255 reads VRAM PAST the tpage edge — typically the
+        // neighbouring tpage's data, garbage texels, or a different
+        // CLUT-driven byte. Visible as smeared / corrupted 2D sprites
+        // (Tekken 3 character portraits, BIOS dialog frames).
+        let u = u & 0xFF;
+        let v = v & 0xFF;
         // Apply the texture window — PSX-SPX:
         //   U' = (U AND NOT(mask_x * 8)) OR ((offset_x * 8) AND (mask_x * 8))
         // but both `mask_*` and `offset_*` are already pre-shifted (×8)
@@ -1504,8 +1523,7 @@ impl Gpu {
         );
     }
 
-    /// GP0 0x2C..=0x2F — textured quad. 9 words; split into two
-    /// textured triangles sharing v1–v2.
+    /// GP0 0x2C..=0x2F — textured quad. 9 words; split in Redux order.
     fn draw_textured_quad(&mut self) {
         let cmd = self.gp0_fifo[0];
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
@@ -1532,8 +1550,13 @@ impl Gpu {
         } else {
             split_tint(cmd & 0x00FF_FFFF)
         };
+        if self.rasterize_axis_aligned_textured_quad(
+            v0, v1, v2, v3, t0, t1, t2, t3, clut_word, semi, tint,
+        ) {
+            return;
+        }
+        self.rasterize_textured_triangle(v1, v3, v2, t1, t3, t2, clut_word, semi, tint);
         self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word, semi, tint);
-        self.rasterize_textured_triangle(v1, v2, v3, t1, t2, t3, clut_word, semi, tint);
     }
 
     /// GP0 0x34..=0x37 — textured + Gouraud-shaded triangle.
@@ -1579,7 +1602,7 @@ impl Gpu {
     }
 
     /// GP0 0x3C..=0x3F — textured + Gouraud-shaded quad. 12 words;
-    /// split into two textured-shaded triangles sharing edge v1–v2.
+    /// split in Redux order.
     /// Words: `[cmd+c0, v0, uv0+clut, c1, v1, uv1+texpage, c2, v2, uv2,
     ///          c3, v3, uv3]`.
     fn draw_textured_shaded_quad(&mut self) {
@@ -1608,11 +1631,107 @@ impl Gpu {
         // not bit 0 of the full cmd word.
         let raw = (cmd >> 24) & 1 != 0;
         self.rasterize_textured_shaded_triangle(
-            v0, v1, v2, t0, t1, t2, c0, c1, c2, clut_word, semi, raw,
+            v1, v3, v2, t1, t3, t2, c1, c3, c2, clut_word, semi, raw,
         );
         self.rasterize_textured_shaded_triangle(
-            v1, v2, v3, t1, t2, t3, c1, c2, c3, clut_word, semi, raw,
+            v0, v1, v2, t0, t1, t2, c0, c1, c2, clut_word, semi, raw,
         );
+    }
+
+    /// Fast path for the common 2D-sprite case: a flat textured quad
+    /// whose vertex order is top-left, top-right, bottom-left,
+    /// bottom-right. Redux renders flat textured quads with a true
+    /// four-edge scanline walker, not by splitting the primitive into
+    /// two triangles; using the same row-wide UV interpolation removes
+    /// diagonal sampling seams in BIOS text and loading-screen sprites.
+    #[allow(clippy::too_many_arguments)]
+    fn rasterize_axis_aligned_textured_quad(
+        &mut self,
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        v3: (i32, i32),
+        t0: (u16, u16),
+        t1: (u16, u16),
+        t2: (u16, u16),
+        t3: (u16, u16),
+        clut_word: u16,
+        semi_trans: bool,
+        tint: (u32, u32, u32),
+    ) -> bool {
+        if self.wireframe_enabled {
+            return false;
+        }
+        if v0.1 != v1.1 || v2.1 != v3.1 || v0.0 != v2.0 || v1.0 != v3.0 {
+            return false;
+        }
+        if triangle_exceeds_hw_extent(v1, v3, v2) || triangle_exceeds_hw_extent(v0, v1, v2) {
+            return true;
+        }
+        let left = v0.0;
+        let right = v1.0;
+        let top = v0.1;
+        let bottom = v2.1;
+        let width = right - left;
+        let height = bottom - top;
+        if width <= 0 || height <= 0 {
+            return true;
+        }
+
+        let draw_left = self.draw_area_left as i32;
+        let draw_right = self.draw_area_right as i32;
+        let draw_top = self.draw_area_top as i32;
+        let draw_bottom = self.draw_area_bottom as i32;
+        let y_start = top.max(draw_top);
+        let y_end = (bottom - 1).min(draw_bottom);
+        let x_start = left.max(draw_left);
+        let x_end = (right - 1).min(draw_right);
+        if y_start > y_end || x_start > x_end {
+            return true;
+        }
+
+        let clut_x = (clut_word & 0x3F) * 16;
+        let clut_y = (clut_word >> 6) & 0x1FF;
+        let tpage_mode = self.tex_blend_mode;
+        let left_u0 = (t0.0 as i64) << 16;
+        let left_v0 = (t0.1 as i64) << 16;
+        let right_u0 = (t1.0 as i64) << 16;
+        let right_v0 = (t1.1 as i64) << 16;
+        let delta_left_u = (((t2.0 as i64) << 16) - left_u0) / height as i64;
+        let delta_left_v = (((t2.1 as i64) << 16) - left_v0) / height as i64;
+        let delta_right_u = (((t3.0 as i64) << 16) - right_u0) / height as i64;
+        let delta_right_v = (((t3.1 as i64) << 16) - right_v0) / height as i64;
+
+        for py in y_start..=y_end {
+            let row = (py - top) as i64;
+            let mut pos_u = left_u0 + row * delta_left_u;
+            let mut pos_v = left_v0 + row * delta_left_v;
+            let right_u = right_u0 + row * delta_right_u;
+            let right_v = right_v0 + row * delta_right_v;
+            let delta_u = (right_u - pos_u) / width as i64;
+            let delta_v = (right_v - pos_v) / width as i64;
+            if x_start > left {
+                let skip = (x_start - left) as i64;
+                pos_u += skip * delta_u;
+                pos_v += skip * delta_v;
+            }
+            for px in x_start..=x_end {
+                let u = (pos_u >> 16) as u16;
+                let v = (pos_v >> 16) as u16;
+                if let Some(texel) = self.sample_texture(u, v, clut_x, clut_y) {
+                    let shaded = modulate_tint(texel, tint.0, tint.1, tint.2);
+                    let mode = if semi_trans && (texel & 0x8000) != 0 {
+                        tpage_mode
+                    } else {
+                        BlendMode::Opaque
+                    };
+                    self.plot_pixel(px as u16, py as u16, shaded, mode);
+                }
+                pos_u += delta_u;
+                pos_v += delta_v;
+            }
+        }
+        true
     }
 
     /// Rasterize a triangle with per-vertex tint colours AND per-vertex
@@ -1666,12 +1785,8 @@ impl Gpu {
             (t1.0 as i32, t1.1 as i32),
             (t2.0 as i32, t2.1 as i32),
         ];
-        let Some(mut setup) = setup_sections(
-            [v0.0, v1.0, v2.0],
-            [v0.1, v1.1, v2.1],
-            v_rgb,
-            v_uv,
-        ) else {
+        let Some(mut setup) = setup_sections([v0.0, v1.0, v2.0], [v0.1, v1.1, v2.1], v_rgb, v_uv)
+        else {
             return;
         };
 
@@ -1871,12 +1986,9 @@ impl Gpu {
             (t1.0 as i32, t1.1 as i32),
             (t2.0 as i32, t2.1 as i32),
         ];
-        let Some(mut setup) = setup_sections(
-            [v0.0, v1.0, v2.0],
-            [v0.1, v1.1, v2.1],
-            [(0, 0, 0); 3],
-            v_uv,
-        ) else {
+        let Some(mut setup) =
+            setup_sections([v0.0, v1.0, v2.0], [v0.1, v1.1, v2.1], [(0, 0, 0); 3], v_uv)
+        else {
             return;
         };
 
@@ -1977,12 +2089,9 @@ impl Gpu {
             (r(c1), g(c1), b(c1)),
             (r(c2), g(c2), b(c2)),
         ];
-        let Some(mut setup) = setup_sections(
-            [v0.0, v1.0, v2.0],
-            [v0.1, v1.1, v2.1],
-            v_rgb,
-            [(0, 0); 3],
-        ) else {
+        let Some(mut setup) =
+            setup_sections([v0.0, v1.0, v2.0], [v0.1, v1.1, v2.1], v_rgb, [(0, 0); 3])
+        else {
             return;
         };
 
@@ -2478,7 +2587,6 @@ fn gp0_packet_size(op: u8) -> usize {
     }
 }
 
-
 // ======================================================================
 // Scanline-delta triangle rasterizer
 // ======================================================================
@@ -2570,12 +2678,18 @@ struct SlTriSetup {
     right_section_height: i32,
 
     // --- Gouraud colour at left edge, current scanline (Q16.16). ---
-    left_r: i64, left_g: i64, left_b: i64,
-    delta_left_r: i64, delta_left_g: i64, delta_left_b: i64,
+    left_r: i64,
+    left_g: i64,
+    left_b: i64,
+    delta_left_r: i64,
+    delta_left_g: i64,
+    delta_left_b: i64,
 
     // --- UV at left edge, current scanline (Q16.16). ---
-    left_u: i64, left_v: i64,
-    delta_left_u: i64, delta_left_v: i64,
+    left_u: i64,
+    left_v: i64,
+    delta_left_u: i64,
+    delta_left_v: i64,
 
     // --- Per-column (per-X) deltas, computed once at setup time. ---
     //
@@ -2743,9 +2857,15 @@ fn setup_sections(
         };
     }
     // Sort by y ascending: bubble sort is fine for n=3.
-    if verts[0].y > verts[1].y { verts.swap(0, 1); }
-    if verts[0].y > verts[2].y { verts.swap(0, 2); }
-    if verts[1].y > verts[2].y { verts.swap(1, 2); }
+    if verts[0].y > verts[1].y {
+        verts.swap(0, 1);
+    }
+    if verts[0].y > verts[2].y {
+        verts.swap(0, 2);
+    }
+    if verts[1].y > verts[2].y {
+        verts.swap(1, 2);
+    }
 
     let v1 = &verts[0]; // top
     let v2 = &verts[1]; // middle
@@ -2773,15 +2893,27 @@ fn setup_sections(
         right_array: [0; 3],
         left_section: 0,
         right_section: 0,
-        left_x: 0, right_x: 0,
-        delta_left_x: 0, delta_right_x: 0,
-        left_section_height: 0, right_section_height: 0,
-        left_r: 0, left_g: 0, left_b: 0,
-        delta_left_r: 0, delta_left_g: 0, delta_left_b: 0,
-        left_u: 0, left_v: 0,
-        delta_left_u: 0, delta_left_v: 0,
-        delta_col_r: 0, delta_col_g: 0, delta_col_b: 0,
-        delta_col_u: 0, delta_col_v: 0,
+        left_x: 0,
+        right_x: 0,
+        delta_left_x: 0,
+        delta_right_x: 0,
+        left_section_height: 0,
+        right_section_height: 0,
+        left_r: 0,
+        left_g: 0,
+        left_b: 0,
+        delta_left_r: 0,
+        delta_left_g: 0,
+        delta_left_b: 0,
+        left_u: 0,
+        left_v: 0,
+        delta_left_u: 0,
+        delta_left_v: 0,
+        delta_col_r: 0,
+        delta_col_g: 0,
+        delta_col_b: 0,
+        delta_col_u: 0,
+        delta_col_v: 0,
         y_min: v1.y,
         y_max: v3.y - 1, // top-left rule: bottom row excluded
     };
@@ -2899,9 +3031,15 @@ fn dither_rgb(r: i32, g: i32, b: i32, x: i32, y: i32) -> u16 {
     // without it pure-white pixels would get stuck rounding up past
     // 0x1F and wrapping (or in Redux's case, indexing past the
     // precomputed LUT).
-    if rc < 0x1F && (r & 7) > coeff { rc += 1; }
-    if gc < 0x1F && (g & 7) > coeff { gc += 1; }
-    if bc < 0x1F && (b & 7) > coeff { bc += 1; }
+    if rc < 0x1F && (r & 7) > coeff {
+        rc += 1;
+    }
+    if gc < 0x1F && (g & 7) > coeff {
+        gc += 1;
+    }
+    if bc < 0x1F && (b & 7) > coeff {
+        bc += 1;
+    }
     (bc << 10) as u16 | ((gc << 5) as u16) | rc as u16
 }
 
@@ -3040,11 +3178,7 @@ fn modulate_tint_dithered(
 /// 128)` directly — one code path through [`modulate_tint`].
 #[inline]
 fn split_tint(tint24: u32) -> (u32, u32, u32) {
-    (
-        tint24 & 0xFF,
-        (tint24 >> 8) & 0xFF,
-        (tint24 >> 16) & 0xFF,
-    )
+    (tint24 & 0xFF, (tint24 >> 8) & 0xFF, (tint24 >> 16) & 0xFF)
 }
 
 /// Identity tint — pass-through for raw-texture primitives. Each
@@ -3078,12 +3212,12 @@ fn blend_pixel(bg: u16, fg: u16, mode: BlendMode) -> u16 {
         BlendMode::Opaque => unreachable!(),
         // Half-back + half-front — per-channel right-shift before
         // summing, matching Redux's `& 0x7bde >> 1` pattern.
-        BlendMode::Average => ((br >> 1) + (fr >> 1), (bgg >> 1) + (fgg >> 1), (bb >> 1) + (fb >> 1)),
-        BlendMode::Add => (
-            (br + fr).min(31),
-            (bgg + fgg).min(31),
-            (bb + fb).min(31),
+        BlendMode::Average => (
+            (br >> 1) + (fr >> 1),
+            (bgg >> 1) + (fgg >> 1),
+            (bb >> 1) + (fb >> 1),
         ),
+        BlendMode::Add => ((br + fr).min(31), (bgg + fgg).min(31), (bb + fb).min(31)),
         BlendMode::Sub => ((br - fr).max(0), (bgg - fgg).max(0), (bb - fb).max(0)),
         // Full-back + quarter-front — `fg / 4` via integer division
         // is the same as Redux's `(fg & 0x1c) >> 2` for 5-bit
@@ -3129,28 +3263,22 @@ impl GpuStatus {
         //          showed Redux is the authority and starts at 0.
         // Ready bits 26/28 are filled in by `read`; VRAM-ready (27) is
         // gated on an active VRAM→CPU transfer.
-        Self {
-            raw: 0x1480_2000,
-        }
+        Self { raw: 0x1480_2000 }
     }
 
     /// Compose the observable GPUSTAT word. `vram_send_ready` is the
     /// live "is a VRAM→CPU transfer in progress and has pixels
-    /// waiting" flag owned by the GPU proper; `busy` is the
-    /// "pseudo-busy" flag from `Gpu::is_busy`.
-    fn read(&self, vram_send_ready: bool, busy: bool) -> u32 {
+    /// waiting" flag owned by the GPU proper.
+    fn read(&self, vram_send_ready: bool) -> u32 {
         let mut ret = self.raw;
 
         // Ready bits: 26 (cmd FIFO ready) + 28 (DMA block ready).
-        // Set when idle; cleared under `busy`. Bit 27 (VRAM→CPU
-        // ready) is only set while software is actually pulling
-        // pixels from a GPUREAD; Redux's default is 0 and the
-        // BIOS polls this bit to detect transfer completion.
-        if !busy {
-            ret |= 0x1400_0000;
-        } else {
-            ret &= !0x1400_0000;
-        }
+        // Redux's soft GPU keeps both set on every status read.
+        // Bit 27 (VRAM→CPU ready) is only set while software is
+        // actually pulling pixels from GPUREAD; Redux's default is
+        // 0 and BIOS/game code polls this bit to detect transfer
+        // completion.
+        ret |= 0x1400_0000;
         if vram_send_ready {
             ret |= 0x0800_0000;
         } else {
@@ -3227,6 +3355,7 @@ mod tests {
     #[test]
     fn read_status_has_always_ready_bits() {
         let mut gpu = Gpu::new();
+        gpu.charge_busy(10_000);
         let stat = gpu.read32(GP1_ADDR).unwrap();
         // Bits 26 (cmd ready) + 28 (DMA block ready) are always set.
         // Bit 27 (VRAM→CPU ready) is gated on an active transfer;
@@ -3243,7 +3372,11 @@ mod tests {
         gpu.write32(GP0_ADDR, 0); // xy
         gpu.write32(GP0_ADDR, 0x0001_0001); // 1x1 size
         let stat = gpu.read32(GP1_ADDR).unwrap();
-        assert_eq!(stat & 0x0800_0000, 0x0800_0000, "bit 27 set during transfer");
+        assert_eq!(
+            stat & 0x0800_0000,
+            0x0800_0000,
+            "bit 27 set during transfer"
+        );
     }
 
     #[test]
@@ -3269,6 +3402,17 @@ mod tests {
         gpu.write32(GP1_ADDR, 0x0300_0000);
         let stat_enabled = gpu.read32(GP1_ADDR).unwrap();
         assert_eq!(stat_enabled & (1 << 23), 0);
+    }
+
+    #[test]
+    fn gp1_extended_hres_zero_is_368_pixels() {
+        let mut gpu = Gpu::new();
+        gpu.write32(GP1_ADDR, 0x0703_c000); // v-range 0..240
+        gpu.write32(GP1_ADDR, 0x0800_0060); // hres2=1, hres1=0
+        assert_eq!(gpu.display_area().width, 368);
+
+        gpu.write32(GP1_ADDR, 0x0800_0061); // hres2=1, hres1=1
+        assert_eq!(gpu.display_area().width, 384);
     }
 
     #[test]
@@ -3429,10 +3573,7 @@ mod tests {
             prim_blend_mode(0x2000_0000, BlendMode::Add),
             BlendMode::Opaque
         );
-        assert_eq!(
-            prim_blend_mode(0x2200_0000, BlendMode::Add),
-            BlendMode::Add
-        );
+        assert_eq!(prim_blend_mode(0x2200_0000, BlendMode::Add), BlendMode::Add);
     }
 
     #[test]
@@ -3640,8 +3781,7 @@ mod tests {
         //   5,5,5       | (1,0)  |   0   |     1          1          1   (5 > 0? yes)
         //   5,5,5       | (2,0)  |   6   |     0          0          0   (5 > 6? no)
 
-        let check = |r: i32, g: i32, b: i32, x: i32, y: i32,
-                     er: u16, eg: u16, eb: u16| {
+        let check = |r: i32, g: i32, b: i32, x: i32, y: i32, er: u16, eg: u16, eb: u16| {
             let v = dither_rgb(r, g, b, x, y);
             assert_eq!(v & 0x1F, er, "R mismatch for ({r},{g},{b})@({x},{y})");
             assert_eq!((v >> 5) & 0x1F, eg, "G mismatch");
@@ -3731,7 +3871,7 @@ mod tests {
         // Draw area: full VRAM.
         gpu.write32(GP0_ADDR, 0xE3_00_00_00); // top-left 0,0
         gpu.write32(GP0_ADDR, 0xE4_00_03_FF); // bot-right 1023,0 (one row)
-        // Mono line: white, from (0,0) to (9,0).
+                                              // Mono line: white, from (0,0) to (9,0).
         gpu.write32(GP0_ADDR, 0x40_FF_FF_FF); // cmd + white
         gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
         gpu.write32(GP0_ADDR, 0x0000_0009); // v1 = (9, 0)
@@ -3836,7 +3976,8 @@ mod tests {
         // All others set to non-zero so we can be sure the transparency
         // comes from CLUT[5]=0 and not from a wrong index.
         for e in 0..16u16 {
-            gpu.vram.set_pixel(0x200 + e, 0, if e == 5 { 0x0000 } else { 0x7FFF });
+            gpu.vram
+                .set_pixel(0x200 + e, 0, if e == 5 { 0x0000 } else { 0x7FFF });
         }
         assert_eq!(
             gpu.sample_texture(0, 0, 0x200, 0),
@@ -3876,15 +4017,76 @@ mod tests {
     }
 
     #[test]
+    fn sample_texture_uv_wrap_at_256_per_psx_spx() {
+        // Regression: the PS1's GPU walks U/V through an 8-bit counter,
+        // so a tpage wraps every 256 texels horizontally and vertically.
+        // The rasterizer adds a width-bounded `dx` to the base U/V and
+        // can pass values >= 256 here; without the explicit `& 0xFF`
+        // we read VRAM PAST the tpage edge and pull garbage from the
+        // neighbouring tpage. Visible as smeared 2D sprites in pre-fight
+        // loading screens (Tekken 3 character portraits) and corrupt
+        // BIOS dialog frames.
+        //
+        // Test: in 15bpp mode, place a recognisable colour at tpage
+        // origin (u,v)=(0,0) and a different colour at host VRAM
+        // (256,0) — outside the tpage. Sampling at u=256 must return
+        // the FIRST colour (wrap), not the second.
+        let mut gpu = Gpu::new();
+        gpu.tex_depth = 2; // 15bpp — one VRAM word per texel
+        gpu.tex_page_x = 0;
+        gpu.tex_page_y = 0;
+        gpu.vram.set_pixel(0, 0, 0x1111); // tpage origin
+        gpu.vram.set_pixel(256, 0, 0x2222); // outside the tpage
+        assert_eq!(
+            gpu.sample_texture(256, 0, 0, 0),
+            Some(0x1111),
+            "u=256 should wrap to u=0 within the tpage"
+        );
+        assert_eq!(
+            gpu.sample_texture(257, 0, 0, 0),
+            None,
+            "u=257 should wrap to u=1 → vram(1,0)=0 → transparent"
+        );
+        // V wrap: v=256 → v&0xFF=0 → vram(0,0)=0x1111. v=257 →
+        // v&0xFF=1 → vram(0,1) (a different row), confirms v wraps too.
+        gpu.vram.set_pixel(0, 1, 0x3333);
+        assert_eq!(
+            gpu.sample_texture(0, 256, 0, 0),
+            Some(0x1111),
+            "v=256 wraps to v=0"
+        );
+        assert_eq!(
+            gpu.sample_texture(0, 257, 0, 0),
+            Some(0x3333),
+            "v=257 wraps to v=1"
+        );
+    }
+
+    fn pack_test_vertex(x: i16, y: i16) -> u32 {
+        ((x as u16) as u32) | (((y as u16) as u32) << 16)
+    }
+
+    fn pack_test_uv(u: u8, v: u8, extra: u16) -> u32 {
+        (u as u32) | ((v as u32) << 8) | ((extra as u32) << 16)
+    }
+
+    fn prepare_opaque_15bpp_texture(gpu: &mut Gpu) -> u16 {
+        // 15bpp texture page at x=0, y=256. Keeping texture source
+        // away from the draw area makes these tests easier to reason
+        // about: any low-screen pixel change came from the primitive.
+        const TPAGE_15BPP_Y256: u16 = (1 << 4) | (2 << 7);
+        gpu.write32(GP0_ADDR, 0xE3_00_00_00);
+        gpu.write32(GP0_ADDR, 0xE4_00_00_00 | 0x3FF | (0x1FF << 10));
+        gpu.vram.set_pixel(0, 256, 0x7FFF);
+        TPAGE_15BPP_Y256
+    }
+
+    #[test]
     fn extent_boundary_inclusive_keeps_triangle() {
         // Exactly 1023 / 511 deltas are *kept* — only strictly greater
         // is dropped. This matches the hardware spec that the punch
         // list quotes ("|Δx| > 1023 or |Δy| > 511").
-        assert!(!triangle_exceeds_hw_extent(
-            (0, 0),
-            (1023, 0),
-            (0, 511),
-        ));
+        assert!(!triangle_exceeds_hw_extent((0, 0), (1023, 0), (0, 511),));
     }
 
     #[test]
@@ -3916,6 +4118,76 @@ mod tests {
     }
 
     #[test]
+    fn oversize_textured_triangle_is_dropped() {
+        // This is the material-viewer lesson in miniature: projected
+        // textured triangles can look mostly sane on screen but still
+        // cross the PS1's per-edge extent limit. Hardware drops the
+        // whole primitive; engines should split before submitting.
+        let mut gpu = Gpu::new();
+        let tpage = prepare_opaque_15bpp_texture(&mut gpu);
+
+        gpu.write32(GP0_ADDR, 0x2500_0000); // raw textured triangle
+        gpu.write32(GP0_ADDR, pack_test_vertex(-1000, 0));
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+        gpu.write32(GP0_ADDR, pack_test_vertex(24, 0)); // dx = 1024 -> drop
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, tpage));
+        gpu.write32(GP0_ADDR, pack_test_vertex(24, 64));
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+
+        assert_eq!(
+            gpu.vram.get_pixel(20, 8),
+            0,
+            "oversize textured triangle should be skipped, not partially drawn",
+        );
+    }
+
+    #[test]
+    fn legal_textured_triangle_one_pixel_under_extent_draws() {
+        let mut gpu = Gpu::new();
+        let tpage = prepare_opaque_15bpp_texture(&mut gpu);
+
+        gpu.write32(GP0_ADDR, 0x2500_0000); // raw textured triangle
+        gpu.write32(GP0_ADDR, pack_test_vertex(-999, 0));
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+        gpu.write32(GP0_ADDR, pack_test_vertex(24, 0)); // dx = 1023 -> keep
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, tpage));
+        gpu.write32(GP0_ADDR, pack_test_vertex(24, 64));
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+
+        assert_ne!(
+            gpu.vram.get_pixel(20, 8),
+            0,
+            "triangle at the exact legal extent should still rasterise",
+        );
+    }
+
+    #[test]
+    fn textured_quad_drops_only_the_oversize_split_half() {
+        // Non-axis-aligned textured quads are split into two triangles.
+        // As with real hardware, the extent rule applies to each half
+        // independently; a bad second half must not erase the good one.
+        let mut gpu = Gpu::new();
+        let tpage = prepare_opaque_15bpp_texture(&mut gpu);
+
+        gpu.write32(GP0_ADDR, 0x2D00_0000); // raw textured quad
+        gpu.write32(GP0_ADDR, pack_test_vertex(10, 10)); // v0
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+        gpu.write32(GP0_ADDR, pack_test_vertex(30, 10)); // v1
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, tpage));
+        gpu.write32(GP0_ADDR, pack_test_vertex(10, 30)); // v2
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+        gpu.write32(GP0_ADDR, pack_test_vertex(30, 522)); // v3: |dy v1->v3| = 512
+        gpu.write32(GP0_ADDR, pack_test_uv(0, 0, 0));
+
+        assert_ne!(gpu.vram.get_pixel(14, 14), 0, "legal half should draw");
+        assert_eq!(
+            gpu.vram.get_pixel(28, 120),
+            0,
+            "oversize split half should be skipped independently",
+        );
+    }
+
+    #[test]
     fn oversize_monochrome_triangle_is_dropped() {
         // Submit a triangle whose v0→v1 edge is 1500px wide via the
         // GP0 monochrome-tri command. Hardware drops it; we should
@@ -3925,7 +4197,7 @@ mod tests {
         gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
         gpu.write32(GP0_ADDR, 0x0000_05DC); // v1 = (1500, 0) — 1500 > 1023
         gpu.write32(GP0_ADDR, 0x0064_0064); // v2 = (100, 100)
-        // No pixel anywhere along the would-be triangle should be set.
+                                            // No pixel anywhere along the would-be triangle should be set.
         for x in [0u16, 50, 100, 500, 1000, 1500] {
             assert_eq!(
                 gpu.vram.get_pixel(x, 0),
@@ -3947,7 +4219,7 @@ mod tests {
         gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
         gpu.write32(GP0_ADDR, 0x0000_0010); // v1 = (16, 0)
         gpu.write32(GP0_ADDR, 0x0010_0000); // v2 = (0, 16)
-        // v3 = (16, 600) — |v3.y - v1.y| = 600 > 511, second triangle drops.
+                                            // v3 = (16, 600) — |v3.y - v1.y| = 600 > 511, second triangle drops.
         gpu.write32(GP0_ADDR, 0x0258_0010);
         // Sane half wrote pixels.
         assert_ne!(gpu.vram.get_pixel(1, 1), 0, "first half should rasterise");

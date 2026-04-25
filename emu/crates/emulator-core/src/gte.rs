@@ -57,7 +57,11 @@ impl Cmd {
     }
 
     fn shift(&self) -> u32 {
-        if self.sf { 12 } else { 0 }
+        if self.sf {
+            12
+        } else {
+            0
+        }
     }
 }
 
@@ -674,10 +678,8 @@ impl Gte {
 
     /// `AVSZ4` — average of all four Z values. Same shape as AVSZ3.
     fn op_avsz4(&mut self) {
-        let sum = (self.sz[0] as i64)
-            + (self.sz[1] as i64)
-            + (self.sz[2] as i64)
-            + (self.sz[3] as i64);
+        let sum =
+            (self.sz[0] as i64) + (self.sz[1] as i64) + (self.sz[2] as i64) + (self.sz[3] as i64);
         let mac0 = (self.zsf4 as i64) * sum;
         self.mac0 = self.check_mac0(mac0);
         self.otz = self.saturate_otz(mac0 >> 12);
@@ -709,8 +711,8 @@ impl Gte {
             let temp = self.check_mac((i + 1) as u8, diff) >> sf;
             let ir = self.saturate_value_for_ir(temp as i32, false);
             let _ = self.saturate_ir_flag_only((i + 1) as u8, temp as i32, false);
-            let combined = self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (ir as i64))
-                >> sf;
+            let combined =
+                self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (ir as i64)) >> sf;
             self.mac[i] = combined as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, combined as i32, cmd.lm);
         }
@@ -736,8 +738,8 @@ impl Gte {
             let temp = self.check_mac((i + 1) as u8, diff) >> sf;
             let _ = self.saturate_ir_flag_only((i + 1) as u8, temp as i32, false);
             let ir = self.saturate_value_for_ir(temp as i32, false);
-            let combined = self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (ir as i64))
-                >> sf;
+            let combined =
+                self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (ir as i64)) >> sf;
             self.mac[i] = combined as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, combined as i32, cmd.lm);
         }
@@ -978,8 +980,7 @@ impl Gte {
     fn op_gpf(&mut self, cmd: Cmd) {
         let sf = cmd.shift();
         for i in 0..3 {
-            let mac =
-                self.check_mac((i + 1) as u8, (self.ir0 as i64) * (self.ir[i] as i64)) >> sf;
+            let mac = self.check_mac((i + 1) as u8, (self.ir0 as i64) * (self.ir[i] as i64)) >> sf;
             self.mac[i] = mac as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, mac as i32, cmd.lm);
         }
@@ -994,9 +995,10 @@ impl Gte {
             // pre-existing MAC value is treated as a fixed-point with
             // the same scaling as the new product).
             let base = (self.mac[i] as i64) << sf;
-            let mac =
-                self.check_mac((i + 1) as u8, base + (self.ir0 as i64) * (self.ir[i] as i64))
-                    >> sf;
+            let mac = self.check_mac(
+                (i + 1) as u8,
+                base + (self.ir0 as i64) * (self.ir[i] as i64),
+            ) >> sf;
             self.mac[i] = mac as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, mac as i32, cmd.lm);
         }
@@ -1203,7 +1205,15 @@ impl Gte {
         let z = (sz3 as u16).leading_zeros();
         let n = h << z;
         let d = sz3 << z;
-        let table_index = ((d.wrapping_sub(0x7FC0)) >> 7) as usize & 0xFF;
+        // Table index is `(d - 0x7FC0) >> 7`, range 0..=256 (UNR_TABLE
+        // has 257 entries). A `& 0xFF` mask aliases index 256 →
+        // index 0, which corrupts the reciprocal whenever the
+        // normalised divisor lands in {0xFFFE, 0xFFFF}: table[256]=0x00
+        // gives u=0x101 (smallest seed) but table[0]=0xFF gives
+        // u=0x200 (largest), producing a divisor ~2000× too small and
+        // collapsing projected vertices toward the screen offset.
+        // Matches Redux's `gte_divide` and PSX-SPX exactly.
+        let table_index = (d.wrapping_sub(0x7FC0) >> 7) as usize;
         let u = (UNR_TABLE[table_index] as u32) + 0x101;
         let d = (0x2000080u32.wrapping_sub(d.wrapping_mul(u))) >> 8;
         let d = (0x80u32.wrapping_add(d.wrapping_mul(u))) >> 8;
@@ -1232,8 +1242,16 @@ impl Gte {
                 let r = (self.rgbc[0] as i16) << 4;
                 [
                     [-r, r, self.ir0],
-                    [self.rotation[0][2], self.rotation[0][2], self.rotation[0][2]],
-                    [self.rotation[1][1], self.rotation[1][1], self.rotation[1][1]],
+                    [
+                        self.rotation[0][2],
+                        self.rotation[0][2],
+                        self.rotation[0][2],
+                    ],
+                    [
+                        self.rotation[1][1],
+                        self.rotation[1][1],
+                        self.rotation[1][1],
+                    ],
                 ]
             }
         }
@@ -1293,7 +1311,11 @@ fn pack_irgb(ir: &[i16; 3]) -> u32 {
 /// leading ones. The returned count is in 1..=32.
 fn leading_count_signed(value: u32) -> u32 {
     let test = if (value as i32) < 0 { !value } else { value };
-    if test == 0 { 32 } else { test.leading_zeros() }
+    if test == 0 {
+        32
+    } else {
+        test.leading_zeros()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1415,7 +1437,7 @@ mod tests {
         g.write_control(4, 0x1000);
         // V0 = (0, 0, 0)
         g.execute(0x0180_0001); // RTPS sf=1
-        // Flag should record divide overflow (sz3=0, h=0 still triggers).
+                                // Flag should record divide overflow (sz3=0, h=0 still triggers).
         assert!(g.read_control(31) & flag::DIV_OVERFLOW != 0);
     }
 
@@ -1437,12 +1459,12 @@ mod tests {
         g.write_data(17, 0x0100); // SZ1
         g.write_data(18, 0x0200); // SZ2
         g.write_data(19, 0x0300); // SZ3
-        // ZSF3 = 0x555 — close enough to 0x1000/3 to land OTZ near the
-        // simple arithmetic mean.
+                                  // ZSF3 = 0x555 — close enough to 0x1000/3 to land OTZ near the
+                                  // simple arithmetic mean.
         g.write_control(29, 0x0555);
         g.execute(0x2D); // AVSZ3
-        // MAC0 = 0x555 * (0x100 + 0x200 + 0x300) = 0x555 * 0x600 = 0x1FFE00.
-        // OTZ = 0x1FFE00 >> 12 = 0x1FF.
+                         // MAC0 = 0x555 * (0x100 + 0x200 + 0x300) = 0x555 * 0x600 = 0x1FFE00.
+                         // OTZ = 0x1FFE00 >> 12 = 0x1FF.
         assert_eq!(g.read_data(24) as i32, 0x1FFE00);
         assert_eq!(g.read_data(7), 0x1FF);
     }
@@ -1817,6 +1839,38 @@ mod tests {
     }
 
     #[test]
+    fn rtps_unr_table_index_256_is_not_aliased() {
+        // Regression: when the normalised SZ3 lands in {0xFFFE, 0xFFFF}
+        // the UNR-table index is 256 — the upper bound of the
+        // 257-entry table. A defensive `& 0xFF` mask on the index
+        // aliased it to 0, swapping the smallest reciprocal multiplier
+        // (table[256]=0x00 → u=0x101) for the largest
+        // (table[0]=0xFF → u=0x200). The resulting divisor was about
+        // 2000× too small, which collapses the projected vertex
+        // toward (OFX>>16, OFY>>16) — visually "triangles exploding
+        // to the screen centre". Pin the boundary so the mask can't
+        // sneak back in.
+        let mut g = Gte::new();
+        install_identity_rotation(&mut g);
+        // V0 = (0x100, 0, 0x7FFF). With identity rotation and sf=1,
+        // MAC3 = V.z = 0x7FFF, so SZ3 = 0x7FFF; leading_zeros
+        // normalises that to d = 0xFFFE which exercises table[256].
+        g.write_data(0, pack_xy_i16(0x100, 0));
+        g.write_data(1, 0x7FFF);
+        g.write_control(24, 0); // OFX
+        g.write_control(25, 0); // OFY
+        g.write_control(26, 0x4000); // H
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x01));
+        assert_eq!(g.read_data(19), 0x7FFF, "SZ3 fixture");
+        // Correct divisor is 0x8001 (≈(H<<16)/SZ3=0x8000.4, rounded
+        // up by Newton-Raphson). With the buggy mask divisor=0x4 and
+        // SX2 collapses to 0. Expected SX2 = (0x8001*0x100)>>16 = 0x80.
+        let sxy2 = g.read_data(14);
+        let sx2 = (sxy2 & 0xFFFF) as i16;
+        assert_eq!(sx2, 0x80, "SX2 should be 0x80, was {sx2:#x}");
+    }
+
+    #[test]
     fn unknown_opcode_leaves_all_registers_clear() {
         // Regression: make sure an invalid opcode doesn't accidentally
         // flip flag bits from prior execution of a zeroed sub-path.
@@ -1845,7 +1899,10 @@ mod tests {
         assert_eq!(g.read_data(25) as i32, 1, "MAC1 from clean stage 2");
         assert_eq!(g.read_data(9), 1, "IR1 from clean stage 2");
         // Stage 1 IR saturation: (FC<<12 + 0x1000*1) >> 12 ≈ 2^28 → IR_SAT.
-        assert!(g.read_control(31) & flag::IR1_SAT != 0, "IR1_SAT from stage 1");
+        assert!(
+            g.read_control(31) & flag::IR1_SAT != 0,
+            "IR1_SAT from stage 1"
+        );
     }
 
     #[test]

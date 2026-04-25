@@ -37,10 +37,78 @@ fn main() {
     println!("data_fifo_pops   : {}", bus.cdrom.data_fifo_pops());
     println!("sector_events    : {}", bus.cdrom.sector_events_scheduled);
     println!("pending_queue_len: {}", bus.cdrom.pending_queue_len());
+    if let Some((deadline, irq)) = bus.cdrom.next_pending_event() {
+        println!(
+            "next_pending     : {:?} at {deadline} (in {})",
+            irq,
+            deadline as i64 - bus.cycles() as i64
+        );
+    }
+    println!("irq_stat         : 0x{:03x}", bus.irq().stat());
+    println!("irq_mask         : 0x{:03x}", bus.irq().mask());
+
+    let irq_names = [
+        "VBlank",
+        "Gpu",
+        "Cdrom",
+        "Dma",
+        "Timer0",
+        "Timer1",
+        "Timer2",
+        "Controller",
+        "Sio",
+        "Spu",
+        "Lightpen",
+    ];
+    println!();
+    println!("irq raises:");
+    for (name, count) in irq_names.iter().zip(bus.irq().raise_counts()) {
+        if count > 0 {
+            println!("  {name:<10} {count}");
+        }
+    }
 
     println!();
-    println!("=== CDROM IRQ log ({} entries) ===", bus.cdrom.cdrom_irq_log.len());
-    let names = ["None", "DataReady", "Complete", "Acknowledge", "DataEnd", "Error"];
+    println!("scheduler:");
+    use emulator_core::scheduler::EventSlot;
+    for slot in [
+        EventSlot::Sio,
+        EventSlot::Sio1,
+        EventSlot::Cdr,
+        EventSlot::CdRead,
+        EventSlot::GpuDma,
+        EventSlot::MdecOutDma,
+        EventSlot::SpuDma,
+        EventSlot::MdecInDma,
+        EventSlot::GpuOtcDma,
+        EventSlot::CdrDma,
+        EventSlot::CdrPlay,
+        EventSlot::CdrDbuf,
+        EventSlot::CdrLid,
+        EventSlot::SpuAsync,
+        EventSlot::VBlank,
+    ] {
+        if let Some(target) = bus.scheduler.target(slot) {
+            println!(
+                "  {slot:?}: target={target} in {}",
+                target as i64 - bus.cycles() as i64
+            );
+        }
+    }
+
+    println!();
+    println!(
+        "=== CDROM IRQ log ({} entries) ===",
+        bus.cdrom.cdrom_irq_log.len()
+    );
+    let names = [
+        "None",
+        "DataReady",
+        "Complete",
+        "Acknowledge",
+        "DataEnd",
+        "Error",
+    ];
     for (i, &(cyc, ty)) in bus.cdrom.cdrom_irq_log.iter().enumerate() {
         let name = names.get(ty as usize).copied().unwrap_or("?");
         println!("  #{i:>3} cyc={cyc:>12} type={ty} ({name})");

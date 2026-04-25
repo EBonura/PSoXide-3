@@ -8,6 +8,7 @@
 //! Builders (`new` constructors) zero the tag; [`crate::ot::OrderingTable::add`]
 //! fills it in during insertion with `(words_after_tag << 24) | next`.
 
+use crate::material::TextureMaterial;
 use psx_hw::gpu::{gp0, pack_color, pack_texcoord, pack_vertex, pack_xy};
 
 /// Flat-shaded triangle. 5 words (tag + 4 data).
@@ -33,8 +34,7 @@ impl TriFlat {
     pub const fn new(verts: [(i16, i16); 3], r: u8, g: u8, b: u8) -> Self {
         Self {
             tag: 0,
-            color_cmd: gp0::polygon_opcode(false, false, false, false, false)
-                | pack_color(r, g, b),
+            color_cmd: gp0::polygon_opcode(false, false, false, false, false) | pack_color(r, g, b),
             v0: pack_vertex(verts[0].0, verts[0].1),
             v1: pack_vertex(verts[1].0, verts[1].1),
             v2: pack_vertex(verts[2].0, verts[2].1),
@@ -108,8 +108,7 @@ impl QuadFlat {
     pub const fn new(verts: [(i16, i16); 4], r: u8, g: u8, b: u8) -> Self {
         Self {
             tag: 0,
-            color_cmd: gp0::polygon_opcode(false, true, false, false, false)
-                | pack_color(r, g, b),
+            color_cmd: gp0::polygon_opcode(false, true, false, false, false) | pack_color(r, g, b),
             v0: pack_vertex(verts[0].0, verts[0].1),
             v1: pack_vertex(verts[1].0, verts[1].1),
             v2: pack_vertex(verts[2].0, verts[2].1),
@@ -268,13 +267,22 @@ impl TriTextured {
         tpage: u16,
         tint: (u8, u8, u8),
     ) -> Self {
+        Self::with_material(verts, uvs, TextureMaterial::opaque(clut, tpage, tint))
+    }
+
+    /// Build a textured triangle using a [`TextureMaterial`].
+    pub const fn with_material(
+        verts: [(i16, i16); 3],
+        uvs: [(u8, u8); 3],
+        material: TextureMaterial,
+    ) -> Self {
         Self {
             tag: 0,
-            color_cmd: 0x2400_0000 | pack_color(tint.0, tint.1, tint.2),
+            color_cmd: material.flat_textured_polygon_header(false),
             v0: pack_vertex(verts[0].0, verts[0].1),
-            uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, clut),
+            uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, material.clut_word()),
             v1: pack_vertex(verts[1].0, verts[1].1),
-            uv1_tpage: pack_texcoord(uvs[1].0, uvs[1].1, tpage),
+            uv1_tpage: pack_texcoord(uvs[1].0, uvs[1].1, material.tpage_word()),
             v2: pack_vertex(verts[2].0, verts[2].1),
             uv2: pack_texcoord(uvs[2].0, uvs[2].1, 0),
         }
@@ -328,17 +336,27 @@ impl TriTexturedGouraud {
         clut: u16,
         tpage: u16,
     ) -> Self {
+        Self::with_material(verts, uvs, colors, TextureMaterial::new(clut, tpage))
+    }
+
+    /// Build a textured Gouraud triangle using a [`TextureMaterial`].
+    pub const fn with_material(
+        verts: [(i16, i16); 3],
+        uvs: [(u8, u8); 3],
+        colors: [(u8, u8, u8); 3],
+        material: TextureMaterial,
+    ) -> Self {
         let (r0, g0, b0) = colors[0];
         let (r1, g1, b1) = colors[1];
         let (r2, g2, b2) = colors[2];
         Self {
             tag: 0,
-            color0_cmd: 0x3400_0000 | pack_color(r0, g0, b0),
+            color0_cmd: material.textured_polygon_command(true, false) | pack_color(r0, g0, b0),
             v0: pack_vertex(verts[0].0, verts[0].1),
-            uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, clut),
+            uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, material.clut_word()),
             color1: pack_color(r1, g1, b1),
             v1: pack_vertex(verts[1].0, verts[1].1),
-            uv1_tpage: pack_texcoord(uvs[1].0, uvs[1].1, tpage),
+            uv1_tpage: pack_texcoord(uvs[1].0, uvs[1].1, material.tpage_word()),
             color2: pack_color(r2, g2, b2),
             v2: pack_vertex(verts[2].0, verts[2].1),
             uv2: pack_texcoord(uvs[2].0, uvs[2].1, 0),
@@ -386,13 +404,22 @@ impl QuadTextured {
         tpage: u16,
         tint: (u8, u8, u8),
     ) -> Self {
+        Self::with_material(verts, uvs, TextureMaterial::opaque(clut, tpage, tint))
+    }
+
+    /// Build a textured quad using a [`TextureMaterial`].
+    pub const fn with_material(
+        verts: [(i16, i16); 4],
+        uvs: [(u8, u8); 4],
+        material: TextureMaterial,
+    ) -> Self {
         Self {
             tag: 0,
-            color_cmd: 0x2C00_0000 | pack_color(tint.0, tint.1, tint.2),
+            color_cmd: material.flat_textured_polygon_header(true),
             v0: pack_vertex(verts[0].0, verts[0].1),
-            uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, clut),
+            uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, material.clut_word()),
             v1: pack_vertex(verts[1].0, verts[1].1),
-            uv1_tpage: pack_texcoord(uvs[1].0, uvs[1].1, tpage),
+            uv1_tpage: pack_texcoord(uvs[1].0, uvs[1].1, material.tpage_word()),
             v2: pack_vertex(verts[2].0, verts[2].1),
             uv2: pack_texcoord(uvs[2].0, uvs[2].1, 0),
             v3: pack_vertex(verts[3].0, verts[3].1),
@@ -434,11 +461,30 @@ impl Sprite {
         g: u8,
         b: u8,
     ) -> Self {
+        let material = TextureMaterial::opaque(clut, 0, (r, g, b));
+        Self::with_material(x, y, w, h, uv, material)
+    }
+
+    /// Build a textured sprite using a [`TextureMaterial`].
+    ///
+    /// Sprite packets do not carry a tpage word. The material's CLUT,
+    /// tint, raw-texture bit, and semi-transparent command bit are
+    /// encoded in the packet; the caller must set the matching draw
+    /// mode before OT submission if the sprite samples a non-current
+    /// tpage.
+    pub const fn with_material(
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+        uv: (u8, u8),
+        material: TextureMaterial,
+    ) -> Self {
         Self {
             tag: 0,
-            color_cmd: 0x6400_0000 | pack_color(r, g, b),
+            color_cmd: material.textured_rect_header(),
             xy: pack_vertex(x, y),
-            uv_clut: pack_texcoord(uv.0, uv.1, clut),
+            uv_clut: pack_texcoord(uv.0, uv.1, material.clut_word()),
             wh: pack_xy(w, h),
         }
     }

@@ -29,8 +29,10 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+pub mod boot;
 pub mod exe;
 pub mod iso9660;
+pub use boot::{load_boot_exe_from_disc, BootError, BootExe};
 pub use exe::{Exe, ExeError, EXE_HEADER_BYTES};
 pub use iso9660::{default_system_cnf, IsoBuilder, IsoFile};
 

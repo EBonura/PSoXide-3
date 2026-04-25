@@ -67,12 +67,15 @@ const MODE_REACHED_WRAP: u32 = 1 << 12;
 pub struct Timers {
     /// Per-counter state. Index 0 / 1 / 2 corresponds to Timer 0 / 1 / 2.
     pub timers: [Timer; 3],
-    /// Has a VBlank fired since the most recent Timer 1 mode
-    /// write? Timer 1 with sync-mode-3 (pause until VBlank) uses
-    /// this to unlock the counter on the first VBlank after a
-    /// mode write. Cleared by `set_mode_for_timer1` (implicit via
-    /// write_mode); set by `notify_vblank`.
-    vblank_seen: bool,
+    /// Bus cycle at which the timers were last advanced. Used by
+    /// `advance_to` so the bus can drive timer state lazily —
+    /// once per branch-test scheduler drain and on demand from
+    /// MMIO read paths — instead of paying the per-instruction
+    /// 3-counter accumulator/divider cost. Mirrors PCSX-Redux's
+    /// `Counters::set` / `update` model where each counter holds
+    /// `cycleStart` and the live count is `(cycle - cycleStart) /
+    /// rate` evaluated lazily.
+    last_advance_cycle: u64,
 }
 
 impl Timers {
@@ -129,12 +132,6 @@ impl Timers {
                 t.accum = 0;
                 t.last_reset_cycle = now;
                 t.mode_write_count = t.mode_write_count.saturating_add(1);
-                // A mode write on Timer 1 re-arms the VBlank-wait
-                // latch — sync-mode-3 needs to re-pause until the
-                // next VBlank after each reconfig.
-                if idx == 1 {
-                    self.vblank_seen = false;
-                }
             }
             0x8 => t.target = v16,
             _ => {}
@@ -159,19 +156,50 @@ impl Timers {
                 fired |= 1 << i;
             }
         }
+        self.last_advance_cycle = self.last_advance_cycle.saturating_add(cycles);
         fired
+    }
+
+    /// Advance the timer bank to the absolute cycle `now`, using the
+    /// time elapsed since the last advance. Equivalent to calling
+    /// `tick(delta, ...)` where `delta = now - last_advance_cycle`.
+    /// Returns the same 3-bit "fired" bitmap.
+    ///
+    /// This is the lazy entry point: bus calls it once per
+    /// scheduler drain (instead of every `Bus::tick`), and read /
+    /// write paths that observe timer state call it first so the
+    /// values they see match the cycle they observe at.
+    pub fn advance_to(&mut self, now: u64, hsync_period: u64, dot_clock_divisor: u64) -> u8 {
+        let delta = now.saturating_sub(self.last_advance_cycle);
+        if delta == 0 {
+            return 0;
+        }
+        let mut fired: u8 = 0;
+        for i in 0..3 {
+            if self.advance_timer(i, delta, hsync_period, dot_clock_divisor) {
+                fired |= 1 << i;
+            }
+        }
+        self.last_advance_cycle = now;
+        fired
+    }
+
+    /// Sync the lazy clock to `now` without advancing any state.
+    /// Used by the bus when it discards skipped cycles (e.g.
+    /// post-warmup resets in tests) — calling this prevents
+    /// `advance_to` from later seeing a huge backlog and trying
+    /// to fast-forward through millions of cycles in one go.
+    #[allow(dead_code)]
+    pub fn sync_clock_to(&mut self, now: u64) {
+        self.last_advance_cycle = now;
     }
 
     /// Is this timer currently paused per its sync-mode bits?
     ///
-    /// We don't have per-pixel or per-scanline state, so timer 0's
-    /// HBlank modes fall back to "never paused" (most accurate for
-    /// a typical game: HBlank is a brief window each scanline, so
-    /// "pause in HBlank" = rarely paused). Timer 1 sync-mode-3
-    /// ("pause until VBlank") respects `vblank_seen`; sync-mode-0
-    /// ("pause in VBlank") falls back to "never paused" for the
-    /// same reason — VBlank is a ~10% duty cycle window. Timer 2
-    /// modes 1/2 are honest-pauses.
+    /// Redux does not model Timer 0/1 sync pauses; it only changes the
+    /// selected clock rate and handles Timer 1 sync-mode-1's VBlank
+    /// reset. Match that behavior for lockstep. Timer 2 modes 1/2 are
+    /// honest pauses.
     fn is_timer_paused(&self, idx: usize) -> bool {
         let t = &self.timers[idx];
         if t.mode & MODE_SYNC_ENABLE == 0 {
@@ -179,9 +207,6 @@ impl Timers {
         }
         let sync = (t.mode >> 1) & 3;
         match (idx, sync) {
-            // Timer 1 sync-mode-3: pause until first VBlank after
-            // mode write.
-            (1, 3) => !self.vblank_seen,
             // Timer 2 sync-mode-1 / 2: stop counter.
             (2, 1) | (2, 2) => true,
             _ => false,
@@ -189,11 +214,9 @@ impl Timers {
     }
 
     /// Pulse a VBlank event to the timer bank. Called by the bus
-    /// when `EventSlot::VBlank` fires. Timer 1 with sync-mode-3
-    /// ("pause until VBlank, then free-run") unlocks on this pulse;
-    /// sync-mode-1 ("reset at VBlank") resets its counter to 0.
+    /// when `EventSlot::VBlank` fires. Timer 1 sync-mode-1 ("reset at
+    /// VBlank") resets its counter to 0.
     pub fn notify_vblank(&mut self) {
-        self.vblank_seen = true;
         // Sync-mode-1 for Timer 1: reset on VBlank.
         let t1 = &mut self.timers[1];
         if t1.mode & MODE_SYNC_ENABLE != 0 && ((t1.mode >> 1) & 3) == 1 {
@@ -396,17 +419,16 @@ mod tests {
     }
 
     #[test]
-    fn timer1_sync_mode_3_pauses_until_vblank() {
+    fn timer1_sync_mode_3_free_runs_like_redux() {
         let mut t = Timers::new();
-        // Sync enable + sync mode 3 (pause until VBlank).
+        // Redux ignores the Timer 1 sync-mode-3 pause and only uses
+        // the selected clock source/rate.
         t.write32(0x1F80_1114, MODE_SYNC_ENABLE | (3 << 1), 0);
-        // Ticks before VBlank should not advance the counter.
-        t.tick(500, 2146, 8);
-        assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 0);
-        // VBlank pulse unpauses it.
-        t.notify_vblank();
         t.tick(500, 2146, 8);
         assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 500);
+        t.notify_vblank();
+        t.tick(500, 2146, 8);
+        assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 1000);
     }
 
     #[test]

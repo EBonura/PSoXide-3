@@ -209,6 +209,30 @@ impl Scheduler {
         }
     }
 
+    /// Remove and return `slot` when its target is `<= now`.
+    ///
+    /// Most Redux scheduled interrupts are strict (`target < cycle`),
+    /// which is what [`Scheduler::take_due`] models. Root counters are
+    /// different: `branchTest` calls `Counters::update()` when
+    /// `cycle >= m_psxNextCounter`. VBlank is currently represented as
+    /// a scheduler slot in PSoXide, so the bus uses this helper to keep
+    /// counter/VBlank timing inclusive without weakening DMA/CDROM
+    /// interrupt timing.
+    pub fn take_slot_due_inclusive(&mut self, slot: EventSlot, now: u64) -> Option<u64> {
+        let mask = 1 << slot.bit();
+        if self.active & mask == 0 {
+            return None;
+        }
+        let target = self.targets[slot as usize];
+        if target > now {
+            return None;
+        }
+        self.active &= !mask;
+        self.recompute_lowest();
+        self.total_fired = self.total_fired.saturating_add(1);
+        Some(target)
+    }
+
     /// Remove and return the earliest-deadline slot whose target is
     /// `< now`, along with that original target cycle. `None` if
     /// nothing's due. Callers invoke this in a loop to drain every
@@ -244,6 +268,38 @@ impl Scheduler {
                 best_idx = Some(idx);
             }
             bits &= bits - 1; // clear lowest set bit
+        }
+
+        let idx = best_idx?;
+        self.active &= !(1 << idx);
+        self.recompute_lowest();
+        self.total_fired = self.total_fired.saturating_add(1);
+        EventSlot::from_index(idx).map(|s| (s, best_target))
+    }
+
+    /// Like [`Scheduler::take_due`], but ignores slots whose bits are
+    /// set in `excluded_mask`. Used by the per-instruction bias tick
+    /// for events that Redux only services from `branchTest`.
+    pub fn take_due_excluding(&mut self, now: u64, excluded_mask: u32) -> Option<(EventSlot, u64)> {
+        let active = self.active & !excluded_mask;
+        if active == 0 {
+            return None;
+        }
+
+        let mut best_idx: Option<u32> = None;
+        let mut best_target = u64::MAX;
+        let mut bits = active;
+        while bits != 0 {
+            let idx = bits.trailing_zeros();
+            let target = self.targets[idx as usize];
+            if target <= now && target < best_target {
+                best_target = target;
+                best_idx = Some(idx);
+            }
+            bits &= bits - 1;
+        }
+        if now <= best_target {
+            return None;
         }
 
         let idx = best_idx?;
