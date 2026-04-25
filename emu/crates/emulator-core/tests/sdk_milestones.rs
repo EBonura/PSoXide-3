@@ -410,17 +410,17 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         "showcase-textured-sprite" => Some(SdkGolden {
             example: "showcase-textured-sprite",
             vblanks: 3,
-            vram_hash: 0x168c_26b1_3039_550f,
-            display_hash: 0xfdde_c56b_1850_7edb,
+            vram_hash: 0x7a5d_3c8c_0dea_3943,
+            display_hash: 0x2364_0e95_38f4_999b,
             display_size: (320, 240),
             vblank_raises: 3,
             spu_samples: 1470,
-            // Material-system showcase: a flat textured plane with
-            // smaller upright material cards over high-contrast backing
-            // colours while the camera slowly orbits around them. Uses
-            // the cooked brick/floor PSXT samples for opaque, average,
-            // additive, subtractive, and quarter-additive materials.
-            final_pc: 0x8001_4a90,
+            // Material-system showcase: a compact flat-shaded booth
+            // with small upright textured material cards over
+            // high-contrast backing colours. Keeps the blend modes
+            // legible without making the demo a textured fill-rate
+            // stress test.
+            final_pc: 0x8001_4850,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:
