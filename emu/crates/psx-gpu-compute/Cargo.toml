@@ -9,11 +9,13 @@ repository.workspace  = true
 path = "src/lib.rs"
 
 [dependencies]
-wgpu      = { workspace = true }
-pollster  = { workspace = true }
-bytemuck  = { version = "1.16", features = ["derive"] }
-bitflags  = "2.6"
-thiserror = { workspace = true }
+emulator-core = { workspace = true }
+wgpu          = { workspace = true }
+pollster      = { workspace = true }
+bytemuck      = { version = "1.16", features = ["derive"] }
+bitflags      = "2.6"
+thiserror     = { workspace = true }
 
 [dev-dependencies]
-emulator-core = { workspace = true }
+psoxide-settings = { workspace = true }
+psx-iso          = { workspace = true }

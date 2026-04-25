@@ -11,6 +11,7 @@
 
 pub mod primitive;
 pub mod rasterizer;
+pub mod replay;
 pub mod scanline;
 pub mod vram;
 
@@ -19,4 +20,5 @@ pub use primitive::{
     TexTri, Tpage,
 };
 pub use rasterizer::Rasterizer;
+pub use replay::{ComputeBackend, ReplayState};
 pub use vram::{VramGpu, VramGpuError, VRAM_FORMAT, VRAM_HEIGHT, VRAM_WIDTH};

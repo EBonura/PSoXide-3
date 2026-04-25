@@ -2422,6 +2422,8 @@ dependencies = [
  "bytemuck",
  "emulator-core",
  "pollster",
+ "psoxide-settings",
+ "psx-iso",
  "thiserror 1.0.69",
  "wgpu",
 ]

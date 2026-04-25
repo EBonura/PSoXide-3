@@ -24,10 +24,13 @@
 use std::sync::Arc;
 
 use emulator_core::gpu::GpuCmdLogEntry;
-use psx_gpu_compute::{
-    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, Rasterizer, ShadedTexTri,
-    ShadedTri, TexRect, TexTri, Tpage, VramGpu,
+
+use crate::primitive::{
+    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri, TexRect,
+    TexTri, Tpage,
 };
+use crate::rasterizer::Rasterizer;
+use crate::vram::VramGpu;
 
 /// GP0 state we have to track in lockstep with the CPU rasterizer
 /// so triangle / rect dispatches see the right tpage, drawing area,
