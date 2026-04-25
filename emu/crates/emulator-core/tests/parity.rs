@@ -54,13 +54,13 @@ fn our_trace(
         // the start of this step? Matches Redux's `m_wasInISR`
         // captured by `startStepping()` before the interpreter runs.
         let was_in_isr = cpu.in_isr();
-        let mut rec = match cpu.step(&mut bus) {
+        let mut rec = match cpu.step_traced(&mut bus) {
             Ok(r) => r,
             Err(e) => return (records, Some(e)),
         };
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                match cpu.step(&mut bus) {
+                match cpu.step_traced(&mut bus) {
                     Ok(r) => {
                         // Fold post-IRQ state forward as if the
                         // handler ran atomically. COP2 must come

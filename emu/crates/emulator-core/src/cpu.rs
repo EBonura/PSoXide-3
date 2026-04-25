@@ -38,6 +38,18 @@ pub enum ExecutionError {
     },
 }
 
+/// Lightweight return value of `Cpu::execute_one`. Carries just
+/// the per-instruction trace payload that differs between the
+/// HLE-BIOS shortcut path (`pc` is the BIOS-call entry, `instr` is 0)
+/// and the normal interpreter path (`pc` is the pre-execution PC,
+/// `instr` is the fetched word). Lets `step_traced` build a full
+/// `InstructionRecord` without `step` paying for the 256-byte COP2
+/// snapshot or the 128-byte GPRs copy.
+struct ExecutedInstruction {
+    record_pc: u32,
+    record_instr: u32,
+}
+
 /// MIPS R3000A CPU state.
 pub struct Cpu {
     pc: u32,
@@ -291,9 +303,43 @@ impl Cpu {
         bus.read32(self.pc)
     }
 
-    /// Execute one instruction and return a trace record of the state
-    /// after retirement.
-    pub fn step(&mut self, bus: &mut Bus) -> Result<InstructionRecord, ExecutionError> {
+    /// Execute one instruction. Production hot path — does NOT
+    /// allocate an `InstructionRecord` (404 bytes returned by value
+    /// per call accounted for ~10% of frontend frame time before
+    /// this gate). Use [`Cpu::step_traced`] when you actually need
+    /// the post-retirement register snapshot (parity tests, the
+    /// debug-UI single-step button).
+    #[inline]
+    pub fn step(&mut self, bus: &mut Bus) -> Result<(), ExecutionError> {
+        self.execute_one(bus).map(|_| ())
+    }
+
+    /// Execute one instruction and return a full register snapshot
+    /// after retirement. Allocates 404 bytes per call.
+    #[inline]
+    pub fn step_traced(&mut self, bus: &mut Bus) -> Result<InstructionRecord, ExecutionError> {
+        let outcome = self.execute_one(bus)?;
+        let (cop2_data, cop2_ctl) = self.snapshot_cop2();
+        Ok(InstructionRecord {
+            // Trace records report bus cycles (same unit Redux's
+            // `m_regs.cycle` uses). `self.tick` keeps counting
+            // retired instructions for diagnostics.
+            tick: bus.cycles(),
+            pc: outcome.record_pc,
+            instr: outcome.record_instr,
+            gprs: self.gprs,
+            cop2_data,
+            cop2_ctl,
+        })
+    }
+
+    /// Execute one instruction. Returns the data needed to build an
+    /// `InstructionRecord` if the caller wants one — `pc` and `instr`
+    /// at retirement (these differ between the HLE-BIOS shortcut
+    /// and the normal interpreter path). Both `step` and
+    /// `step_traced` go through here, so the interpreter logic
+    /// stays in one place.
+    fn execute_one(&mut self, bus: &mut Bus) -> Result<ExecutedInstruction, ExecutionError> {
         // Diagnostic only — track how many steps the IRQ pin was high.
         // We deliberately do NOT mirror the pin into `cop0[13].IP[2]`:
         // PCSX-Redux's CAUSE register is only written at exception
@@ -322,17 +368,9 @@ impl Cpu {
                 self.committing_load = None;
                 bus.tick(2);
                 self.tick += 1;
-                let (cop2_data, cop2_ctl) = self.snapshot_cop2();
-                return Ok(InstructionRecord {
-                    // Trace records report bus cycles (same unit Redux's
-                    // `m_regs.cycle` uses). `self.tick` keeps counting
-                    // retired instructions for diagnostics.
-                    tick: bus.cycles(),
-                    pc: self.pc,
-                    instr: 0,
-                    gprs: self.gprs,
-                    cop2_data,
-                    cop2_ctl,
+                return Ok(ExecutedInstruction {
+                    record_pc: self.pc,
+                    record_instr: 0,
                 });
             }
         }
@@ -419,20 +457,9 @@ impl Cpu {
         }
 
         self.tick += 1;
-        let (cop2_data, cop2_ctl) = self.snapshot_cop2();
-        Ok(InstructionRecord {
-            // Report bus cycles, not retired-instruction count — the
-            // psx-trace docs call this field a "cycle count", Redux's
-            // oracle populates it from `m_regs.cycle`, and our IRQ
-            // timing is already driven off `bus.cycles()`. Before this
-            // change our tick was step-index-based and silently
-            // diverged from Redux's by a factor of ~2.3.
-            tick: bus.cycles(),
-            pc: pc_before,
-            instr,
-            gprs: self.gprs,
-            cop2_data,
-            cop2_ctl,
+        Ok(ExecutedInstruction {
+            record_pc: pc_before,
+            record_instr: instr,
         })
     }
 
@@ -1667,7 +1694,7 @@ mod tests {
         // lui $t0, 0x0013 → $t0 = 0x0013_0000, PC += 4
         let mut bus = Bus::new(synthetic_bios_with_first_word(0x3C08_0013)).unwrap();
         let mut cpu = Cpu::new();
-        let record = cpu.step(&mut bus).expect("lui decodes");
+        let record = cpu.step_traced(&mut bus).expect("lui decodes");
 
         assert_eq!(record.pc, 0xBFC0_0000);
         assert_eq!(record.instr, 0x3C08_0013);
@@ -1684,7 +1711,7 @@ mod tests {
         // opcode=0x0F, rt=0, imm=0xDEAD → 0x3C00_DEAD
         let mut bus = Bus::new(synthetic_bios_with_first_word(0x3C00_DEAD)).unwrap();
         let mut cpu = Cpu::new();
-        let record = cpu.step(&mut bus).expect("lui to r0 decodes");
+        let record = cpu.step_traced(&mut bus).expect("lui to r0 decodes");
         assert_eq!(record.gprs[0], 0);
     }
 
@@ -1707,7 +1734,7 @@ mod tests {
         // SLL $0, $0, 0 with all fields zero is the canonical NOP.
         let mut bus = Bus::new(synthetic_bios_with_first_word(0x0000_0000)).unwrap();
         let mut cpu = Cpu::new();
-        let record = cpu.step(&mut bus).expect("nop decodes");
+        let record = cpu.step_traced(&mut bus).expect("nop decodes");
         assert_eq!(cpu.pc(), 0xBFC0_0004);
         assert!(record.gprs.iter().all(|&v| v == 0));
     }
@@ -1719,7 +1746,7 @@ mod tests {
         let mut bus = Bus::new(synthetic_bios_with_first_word(0x3528_ABCD)).unwrap();
         let mut cpu = Cpu::new();
         cpu.gprs[9] = 0xFFFF_0000; // $t1 = 0xFFFF0000
-        let record = cpu.step(&mut bus).expect("ori decodes");
+        let record = cpu.step_traced(&mut bus).expect("ori decodes");
         assert_eq!(record.gprs[8], 0xFFFF_ABCD);
     }
 
@@ -1749,7 +1776,7 @@ mod tests {
 
         cpu.step(&mut bus).expect("lw");
         cpu.step(&mut bus).expect("addiu in delay slot");
-        let record = cpu.step(&mut bus).expect("nop reveals state");
+        let record = cpu.step_traced(&mut bus).expect("nop reveals state");
 
         assert_eq!(record.gprs[9], 1, "addiu must survive LW's delay");
     }

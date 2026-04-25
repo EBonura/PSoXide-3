@@ -48,7 +48,7 @@ fn main() {
     );
 
     let before_cycles = bus.cycles();
-    let rec = cpu.step(&mut bus).expect("next user step");
+    let rec = cpu.step_traced(&mut bus).expect("next user step");
     println!(
         "user raw pc=0x{:08x} instr=0x{:08x} tick={} next_pc=0x{:08x} in_irq={} istat=0x{:03x} cdflag=0x{:02x} lastcmd=0x{:02x}",
         rec.pc,
@@ -78,7 +78,7 @@ fn main() {
         }
         let instr = bus.peek_instruction(pc).unwrap_or(0xdead_beef);
         let cycles_before = bus.cycles();
-        let rec = cpu.step(&mut bus).expect("isr step");
+        let rec = cpu.step_traced(&mut bus).expect("isr step");
         raw += 1;
         if print_range.map_or(true, |(lo, hi)| (lo..=hi).contains(&pc)) {
             println!(

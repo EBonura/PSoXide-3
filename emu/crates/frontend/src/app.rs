@@ -715,6 +715,11 @@ pub fn step_one_frame(state: &mut AppState) {
         return;
     };
 
+    // Only fill `exec_history` when the registers panel is open —
+    // otherwise the 404-byte `InstructionRecord` per step is pure
+    // overhead. The panel is closed by default on first run, so
+    // most users get the fast `step()` path automatically.
+    let trace = state.panels.registers;
     let target_cycles = bus.cycles().saturating_add(CYCLES_PER_FRAME);
     for _ in 0..max_steps {
         if bus.cycles() >= target_cycles {
@@ -730,16 +735,22 @@ pub fn step_one_frame(state: &mut AppState) {
             break;
         }
 
-        match state.cpu.step(bus) {
-            Ok(record) => {
-                push_history(&mut state.exec_history, record);
+        let result = if trace {
+            match state.cpu.step_traced(bus) {
+                Ok(record) => {
+                    push_history(&mut state.exec_history, record);
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
-            Err(_) => {
-                state.running = false;
-                state.menu.sync_run_label(false);
-                state.menu.open = true;
-                break;
-            }
+        } else {
+            state.cpu.step(bus)
+        };
+        if result.is_err() {
+            state.running = false;
+            state.menu.sync_run_label(false);
+            state.menu.open = true;
+            break;
         }
     }
 }

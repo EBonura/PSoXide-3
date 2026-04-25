@@ -103,13 +103,13 @@ fn main() {
     let mut our_records: Vec<psx_trace::InstructionRecord> = Vec::with_capacity(window as usize);
     for _ in 0..window {
         let was_in_isr = cpu.in_isr();
-        let mut rec = cpu.step(&mut bus).expect("step");
+        let mut rec = cpu.step_traced(&mut bus).expect("step");
         if wants_pad {
             sync_pad_mask(&mut bus, held_buttons, &pad_pulses, &mut current_pad_mask);
         }
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                let r = cpu.step(&mut bus).expect("isr step");
+                let r = cpu.step_traced(&mut bus).expect("isr step");
                 if wants_pad {
                     sync_pad_mask(&mut bus, held_buttons, &pad_pulses, &mut current_pad_mask);
                 }

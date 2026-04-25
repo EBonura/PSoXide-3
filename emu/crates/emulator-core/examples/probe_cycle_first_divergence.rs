@@ -81,10 +81,10 @@ fn main() {
         // walker, otherwise Redux's "step 19472417" (= NOP + entire
         // VBlank ISR) appears to us as just "NOP".
         let was_in_isr = cpu.in_isr();
-        let mut our_rec = cpu.step(&mut bus).expect("step");
+        let mut our_rec = cpu.step_traced(&mut bus).expect("step");
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                let r = cpu.step(&mut bus).expect("step");
+                let r = cpu.step_traced(&mut bus).expect("step");
                 our_rec.tick = r.tick;
                 our_rec.gprs = r.gprs;
             }

@@ -33,7 +33,7 @@ fn main() {
     let mut records_len = 0;
     while records_len <= n {
         let was_in_isr = cpu.in_isr();
-        let rec = cpu.step(&mut bus).expect("step");
+        let rec = cpu.step_traced(&mut bus).expect("step");
         let mut final_pc = cpu.pc();
         let mut final_cyc = bus.cycles();
         let mut isr_steps = 0usize;

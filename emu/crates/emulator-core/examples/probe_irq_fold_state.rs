@@ -54,7 +54,7 @@ fn run_local(start: u64, disc_path: &PathBuf) {
 
     print_local_snapshot("before", &cpu, &mut bus);
     let before = bus.cycles();
-    let rec = cpu.step(&mut bus).expect("local user step");
+    let rec = cpu.step_traced(&mut bus).expect("local user step");
     println!(
         "ours step: pc=0x{:08x} instr=0x{:08x} tick={} next_pc=0x{:08x} in_irq={}",
         rec.pc,
@@ -65,7 +65,7 @@ fn run_local(start: u64, disc_path: &PathBuf) {
     );
     let mut raw = 0u64;
     while cpu.in_irq_handler() {
-        let rec = cpu.step(&mut bus).expect("local isr step");
+        let rec = cpu.step_traced(&mut bus).expect("local isr step");
         raw += 1;
         if raw <= 8 || raw % 500 == 0 {
             println!(

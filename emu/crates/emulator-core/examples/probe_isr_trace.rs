@@ -38,10 +38,10 @@ fn main() {
     // retire as step `target_step`.
     for _i in 0..target_step {
         let was_in_isr = cpu.in_isr();
-        let _ = cpu.step(&mut bus).expect("step");
+        let _ = cpu.step_traced(&mut bus).expect("step");
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                let _ = cpu.step(&mut bus).expect("step");
+                let _ = cpu.step_traced(&mut bus).expect("step");
             }
         }
     }
@@ -114,7 +114,7 @@ fn main() {
     };
     eprintln!("  cycles={cycles}, expected VBlank count at this cycle: {expected_vblanks}");
 
-    let rec = cpu.step(&mut bus).expect("step");
+    let rec = cpu.step_traced(&mut bus).expect("step");
     eprintln!(
         "  [main] pc=0x{:08x}  tick={}  (delta={})  in_isr={}  in_irq={}",
         rec.pc,
@@ -129,7 +129,7 @@ fn main() {
         while cpu.in_irq_handler() {
             let prev_cycles = bus.cycles();
             let prev_pc = cpu.pc();
-            let r = cpu.step(&mut bus).expect("step");
+            let r = cpu.step_traced(&mut bus).expect("step");
             isr_step += 1;
             eprintln!(
                 "  [isr #{isr_step}] pc=0x{prev_pc:08x} → 0x{:08x}  instr at fetch=0x?  tick={} (+{})  in_irq={}",
@@ -175,7 +175,7 @@ fn main() {
         // subsystem raised the IRQ.
         let pre_istat = bus.irq().stat();
         let pre_imask = bus.irq().mask();
-        let _rec = cpu.step(&mut bus).expect("step");
+        let _rec = cpu.step_traced(&mut bus).expect("step");
         if !was_in_isr && cpu.in_irq_handler() {
             // Bit name lookup.
             let names = [
@@ -210,7 +210,7 @@ fn main() {
             }
             let mut isr_len = 0;
             while cpu.in_irq_handler() {
-                let _ = cpu.step(&mut bus).expect("step");
+                let _ = cpu.step_traced(&mut bus).expect("step");
                 isr_len += 1;
             }
             eprintln!(

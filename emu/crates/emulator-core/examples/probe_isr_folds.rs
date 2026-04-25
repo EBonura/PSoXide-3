@@ -55,11 +55,11 @@ fn main() {
     let mut our_folds: Vec<(u64, u64, u64)> = Vec::new(); // (step, cycle, delta)
     for i in 0..window {
         let was_in_isr = cpu.in_isr();
-        let rec = cpu.step(&mut bus).expect("step");
+        let rec = cpu.step_traced(&mut bus).expect("step");
         let mut tick = rec.tick;
         if !was_in_isr && cpu.in_irq_handler() {
             while cpu.in_irq_handler() {
-                let r = cpu.step(&mut bus).expect("isr step");
+                let r = cpu.step_traced(&mut bus).expect("isr step");
                 tick = r.tick;
             }
         }

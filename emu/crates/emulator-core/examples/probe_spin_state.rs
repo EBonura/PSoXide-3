@@ -101,7 +101,7 @@ fn main() {
         let before_cycles = bus.cycles();
         let before_irq_stat = bus.irq().stat();
         let before_irq_handler = cpu.in_irq_handler();
-        let rec = cpu.step(&mut bus).expect("advance one step");
+        let rec = cpu.step_traced(&mut bus).expect("advance one step");
         println!(
             "before pc=0x{before_pc:08x} instr=0x{before_instr:08x} cycles={before_cycles} irq_stat=0x{before_irq_stat:03x} in_irq={}",
             before_irq_handler as u8

@@ -77,9 +77,10 @@ fn main() {
     let disc = load_disc(&disc_path);
     bus.cdrom.insert_disc(Some(disc));
     bus.gpu.enable_pixel_tracer();
-    if disable_cpu_raster {
-        bus.gpu.cpu_rasterize_enabled = false;
-    }
+    // `--disable-cpu-raster` was wired to a runtime flag that has
+    // since been reverted; leaving the CLI flag in for back-compat
+    // but it's now a no-op.
+    let _ = disable_cpu_raster;
 
     let mut backend = ComputeBackend::new_headless();
 

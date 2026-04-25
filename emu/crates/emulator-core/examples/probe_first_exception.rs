@@ -48,7 +48,7 @@ fn main() {
 
     for step in 1..=limit {
         let cycles_before = bus.cycles();
-        let rec = cpu.step(&mut bus).expect("step");
+        let rec = cpu.step_traced(&mut bus).expect("step");
         if recent.len() == 48 {
             recent.pop_front();
         }

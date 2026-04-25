@@ -358,10 +358,10 @@ fn run_ours_checkpoints(
 
 fn step_user(cpu: &mut Cpu, bus: &mut Bus) -> Result<InstructionRecord, ExecutionError> {
     let was_in_isr = cpu.in_isr();
-    let mut rec = cpu.step(bus)?;
+    let mut rec = cpu.step_traced(bus)?;
     if !was_in_isr && cpu.in_irq_handler() {
         while cpu.in_irq_handler() {
-            let r = cpu.step(bus)?;
+            let r = cpu.step_traced(bus)?;
             rec.tick = r.tick;
             rec.gprs = r.gprs;
             rec.cop2_data = snapshot_cop2(cpu).0;

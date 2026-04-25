@@ -74,7 +74,7 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
         }
         StepOne => {
             if let Some(bus) = state.bus.as_mut() {
-                if let Ok(record) = state.cpu.step(bus) {
+                if let Ok(record) = state.cpu.step_traced(bus) {
                     crate::app::push_history(&mut state.exec_history, record);
                 }
             }
