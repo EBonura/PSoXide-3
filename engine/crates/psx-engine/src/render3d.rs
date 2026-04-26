@@ -138,6 +138,44 @@ impl WorldVertex {
     }
 }
 
+/// Uniform Q12 scale from dense model-local units to engine world units.
+///
+/// Imported characters can spend the full signed-16-bit vertex range on
+/// their own local detail while rooms keep using stable 1024-unit grid
+/// sectors. This helper applies the scale without requiring 64-bit
+/// multiplication on the PS1 runtime path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LocalToWorldScale {
+    q12: i32,
+}
+
+impl LocalToWorldScale {
+    /// Identity scale.
+    pub const IDENTITY: Self = Self { q12: 0x1000 };
+
+    /// Build from a Q12 header value. Zero means unspecified and maps to
+    /// identity for compatibility with older cooked blobs.
+    pub const fn from_q12(q12: u16) -> Self {
+        if q12 == 0 {
+            Self::IDENTITY
+        } else {
+            Self { q12: q12 as i32 }
+        }
+    }
+
+    /// Raw Q12 scale value.
+    pub const fn q12(self) -> u16 {
+        self.q12 as u16
+    }
+
+    /// Apply the scale to one signed coordinate.
+    pub fn apply(self, value: i32) -> i32 {
+        let whole = value >> 12;
+        let frac = value - (whole << 12);
+        whole.saturating_mul(self.q12) + ((frac * self.q12) >> 12)
+    }
+}
+
 /// Textured camera-space vertex used by near-plane clipping.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TexturedViewVertex {
@@ -1118,13 +1156,15 @@ impl<'a, 'ot, 'arena, const OT_DEPTH: usize> GouraudRenderPass<'a, 'ot, 'arena, 
     ) -> MeshRenderStats {
         let mut stats = MeshRenderStats::default();
         let mesh_verts = mesh.vert_count() as usize;
-        let project_count = mesh_verts.min(projected_vertices.len()).min(256);
+        let project_count = mesh_verts
+            .min(projected_vertices.len())
+            .min(u16::MAX as usize);
         stats.vertex_overflow = mesh_verts > project_count;
         stats.projected_vertices = project_count as u16;
 
         let mut vi = 0;
         while vi < project_count {
-            let vert = vi as u8;
+            let vert = vi as u16;
             let p = project_lit(
                 mesh.vertex(vert),
                 mesh.vertex_normal(vert).unwrap_or(options.default_normal),
@@ -1247,7 +1287,7 @@ impl<'a, 'ot, 'arena, const OT_DEPTH: usize> GouraudRenderPass<'a, 'ot, 'arena, 
     }
 }
 
-fn vertex_material(mesh: &Mesh<'_>, vert: u8, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
+fn vertex_material(mesh: &Mesh<'_>, vert: u16, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
     let mut face_idx = 0;
     while face_idx < mesh.face_count() {
         let (a, b, c) = mesh.face(face_idx);
@@ -1604,6 +1644,18 @@ mod tests {
         assert_eq!(DepthPolicy::Average.depth(verts), 400);
         assert_eq!(DepthPolicy::Nearest.depth(verts), 100);
         assert_eq!(DepthPolicy::Farthest.depth(verts), 700);
+    }
+
+    #[test]
+    fn local_to_world_scale_applies_q12_without_i64() {
+        let half = LocalToWorldScale::from_q12(0x0800);
+        assert_eq!(half.apply(8192), 4096);
+        assert_eq!(half.apply(-8192), -4096);
+        assert_eq!(half.apply(4095), 2047);
+
+        let identity = LocalToWorldScale::from_q12(0);
+        assert_eq!(identity.q12(), 0x1000);
+        assert_eq!(identity.apply(-12345), -12345);
     }
 
     #[test]

@@ -39,7 +39,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-use psx_gte::math::Vec3I16;
+use psx_gte::math::{Vec3I16, Vec3I32};
+
+const MESH_VERSION_U8_INDICES: u16 = 1;
+const MESH_U8_INDEX_STRIDE: usize = 3;
+const MESH_U16_INDEX_STRIDE: usize = 6;
 
 /// Errors `Mesh::from_bytes` can return for a malformed blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,19 +65,24 @@ pub enum ParseError {
     TableOverflow,
     /// World-grid header fields are inconsistent.
     InvalidWorldLayout,
+    /// Model header/table fields are inconsistent.
+    InvalidModelLayout,
+    /// Animation header/table fields are inconsistent.
+    InvalidAnimationLayout,
 }
 
 /// A parsed 3D mesh backed by slices into the caller's cooked blob.
 ///
 /// Cheap to construct (just bounds-checks the header + computes
-/// sub-slice offsets). Cheap to pass around — four `&[u8]` slices
-/// + a flags `u16` + the counts.
+/// sub-slice offsets). Cheap to pass around — table `&[u8]` slices,
+/// an index stride, a flags `u16`, and the counts.
 #[derive(Copy, Clone, Debug)]
 pub struct Mesh<'a> {
     verts: &'a [u8],
     indices: &'a [u8],
     face_colors: Option<&'a [u8]>,
     vertex_normals: Option<&'a [u8]>,
+    index_stride: u8,
     vert_count: u16,
     face_count: u16,
     flags: u16,
@@ -92,9 +101,11 @@ impl<'a> Mesh<'a> {
             return Err(ParseError::WrongMagic);
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != psxed_format::mesh::VERSION {
-            return Err(ParseError::UnsupportedVersion(version));
-        }
+        let index_stride = match version {
+            MESH_VERSION_U8_INDICES => MESH_U8_INDEX_STRIDE,
+            psxed_format::mesh::VERSION => MESH_U16_INDEX_STRIDE,
+            _ => return Err(ParseError::UnsupportedVersion(version)),
+        };
         let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
         let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let payload_start = psxed_format::AssetHeader::SIZE;
@@ -124,7 +135,7 @@ impl<'a> Mesh<'a> {
         let verts = &bytes[off..off + vert_bytes];
         off += vert_bytes;
 
-        let index_bytes = (face_count as usize) * 3;
+        let index_bytes = (face_count as usize) * index_stride;
         if off + index_bytes > bytes.len() {
             return Err(ParseError::TableOverflow);
         }
@@ -159,6 +170,7 @@ impl<'a> Mesh<'a> {
             indices,
             face_colors,
             vertex_normals,
+            index_stride: index_stride as u8,
             vert_count,
             face_count,
             flags,
@@ -201,7 +213,7 @@ impl<'a> Mesh<'a> {
     /// the render path branch-free, callers who care can
     /// check against [`Self::vert_count`] first.
     #[inline]
-    pub fn vertex(&self, i: u8) -> Vec3I16 {
+    pub fn vertex(&self, i: u16) -> Vec3I16 {
         let idx = i as usize;
         if idx >= self.vert_count as usize {
             return Vec3I16::ZERO;
@@ -216,17 +228,25 @@ impl<'a> Mesh<'a> {
     /// Triangle `i`'s three vertex indices. Returns `(0, 0, 0)`
     /// for an out-of-range index.
     #[inline]
-    pub fn face(&self, i: u16) -> (u8, u8, u8) {
+    pub fn face(&self, i: u16) -> (u16, u16, u16) {
         let idx = i as usize;
         if idx >= self.face_count as usize {
             return (0, 0, 0);
         }
-        let base = idx * 3;
-        (
-            self.indices[base],
-            self.indices[base + 1],
-            self.indices[base + 2],
-        )
+        let base = idx * self.index_stride as usize;
+        if self.index_stride as usize == MESH_U16_INDEX_STRIDE {
+            (
+                u16::from_le_bytes([self.indices[base], self.indices[base + 1]]),
+                u16::from_le_bytes([self.indices[base + 2], self.indices[base + 3]]),
+                u16::from_le_bytes([self.indices[base + 4], self.indices[base + 5]]),
+            )
+        } else {
+            (
+                self.indices[base] as u16,
+                self.indices[base + 1] as u16,
+                self.indices[base + 2] as u16,
+            )
+        }
     }
 
     /// Triangle `i`'s flat colour, or `None` if the blob doesn't
@@ -248,7 +268,7 @@ impl<'a> Mesh<'a> {
     /// introduces sub-ULP error but the GTE lighting path is
     /// tolerant).
     #[inline]
-    pub fn vertex_normal(&self, i: u8) -> Option<Vec3I16> {
+    pub fn vertex_normal(&self, i: u16) -> Option<Vec3I16> {
         let normals = self.vertex_normals?;
         let idx = i as usize;
         if idx >= self.vert_count as usize {
@@ -260,6 +280,486 @@ impl<'a> Mesh<'a> {
         let z = i16::from_le_bytes([normals[base + 4], normals[base + 5]]);
         Some(Vec3I16::new(x, y, z))
     }
+}
+
+/// A parsed textured 3D model backed by slices into the caller's
+/// cooked `.psxmdl` blob.
+///
+/// This is intentionally a low-level view. It exposes the tables the
+/// renderer needs — joints, materials, rigid parts, vertices, and
+/// faces — without allocating or converting the whole model at load
+/// time.
+#[derive(Copy, Clone, Debug)]
+pub struct Model<'a> {
+    joints: &'a [u8],
+    materials: &'a [u8],
+    parts: &'a [u8],
+    vertices: &'a [u8],
+    faces: &'a [u8],
+    joint_count: u16,
+    material_count: u16,
+    part_count: u16,
+    vertex_count: u16,
+    face_count: u16,
+    texture_width: u16,
+    texture_height: u16,
+    local_to_world_q12: u16,
+    flags: u16,
+}
+
+impl<'a> Model<'a> {
+    /// Parse a cooked `.psxmdl` blob.
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, ParseError> {
+        use psxed_format::model::{
+            JointRecord, MaterialRecord, ModelHeader, PartRecord, FACE_RECORD_SIZE, MAGIC, VERSION,
+            VERTEX_RECORD_SIZE,
+        };
+
+        if bytes.len() < psxed_format::AssetHeader::SIZE {
+            return Err(ParseError::Truncated);
+        }
+        let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if magic != MAGIC {
+            return Err(ParseError::WrongMagic);
+        }
+        let version = read_u16(bytes, 4);
+        if version != VERSION {
+            return Err(ParseError::UnsupportedVersion(version));
+        }
+        let flags = read_u16(bytes, 6);
+        let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let payload_start = psxed_format::AssetHeader::SIZE;
+        let actual_payload = bytes.len().saturating_sub(payload_start);
+        if payload_len as usize != actual_payload {
+            return Err(ParseError::InvalidPayloadLen {
+                declared: payload_len,
+                actual: actual_payload,
+            });
+        }
+        if actual_payload < ModelHeader::SIZE {
+            return Err(ParseError::Truncated);
+        }
+
+        let mh = &bytes[payload_start..payload_start + ModelHeader::SIZE];
+        let joint_count = read_u16(mh, 0);
+        let part_count = read_u16(mh, 2);
+        let vertex_count = read_u16(mh, 4);
+        let face_count = read_u16(mh, 6);
+        let material_count = read_u16(mh, 8);
+        let texture_width = read_u16(mh, 10);
+        let texture_height = read_u16(mh, 12);
+        let local_to_world_q12 = read_u16(mh, 14);
+
+        let mut off = payload_start + ModelHeader::SIZE;
+
+        let joint_bytes = checked_table_bytes(joint_count, JointRecord::SIZE)?;
+        let joints = take_table(bytes, &mut off, joint_bytes)?;
+
+        let material_bytes = checked_table_bytes(material_count, MaterialRecord::SIZE)?;
+        let materials = take_table(bytes, &mut off, material_bytes)?;
+
+        let part_bytes = checked_table_bytes(part_count, PartRecord::SIZE)?;
+        let parts = take_table(bytes, &mut off, part_bytes)?;
+
+        let vertex_bytes = checked_table_bytes(vertex_count, VERTEX_RECORD_SIZE)?;
+        let vertices = take_table(bytes, &mut off, vertex_bytes)?;
+
+        let face_bytes = checked_table_bytes(face_count, FACE_RECORD_SIZE)?;
+        let faces = take_table(bytes, &mut off, face_bytes)?;
+
+        if off != bytes.len() {
+            return Err(ParseError::InvalidModelLayout);
+        }
+        validate_model_parts(parts, joint_count, material_count, vertex_count, face_count)?;
+        validate_model_faces(faces, vertex_count)?;
+
+        Ok(Self {
+            joints,
+            materials,
+            parts,
+            vertices,
+            faces,
+            joint_count,
+            material_count,
+            part_count,
+            vertex_count,
+            face_count,
+            texture_width,
+            texture_height,
+            local_to_world_q12,
+            flags,
+        })
+    }
+
+    /// Model feature flags (see [`psxed_format::model::flags`]).
+    #[inline]
+    pub fn flags(&self) -> u16 {
+        self.flags
+    }
+
+    /// Number of joint records.
+    #[inline]
+    pub fn joint_count(&self) -> u16 {
+        self.joint_count
+    }
+
+    /// Number of material records.
+    #[inline]
+    pub fn material_count(&self) -> u16 {
+        self.material_count
+    }
+
+    /// Number of rigid part records.
+    #[inline]
+    pub fn part_count(&self) -> u16 {
+        self.part_count
+    }
+
+    /// Number of vertex records.
+    #[inline]
+    pub fn vertex_count(&self) -> u16 {
+        self.vertex_count
+    }
+
+    /// Number of triangle records.
+    #[inline]
+    pub fn face_count(&self) -> u16 {
+        self.face_count
+    }
+
+    /// Primary texture width in texels.
+    #[inline]
+    pub fn texture_width(&self) -> u16 {
+        self.texture_width
+    }
+
+    /// Primary texture height in texels.
+    #[inline]
+    pub fn texture_height(&self) -> u16 {
+        self.texture_height
+    }
+
+    /// Suggested uniform scale from model-local units to engine world units.
+    ///
+    /// `0x1000` is identity. Older blobs may store zero in the reserved
+    /// header slot; those are treated as identity.
+    #[inline]
+    pub fn local_to_world_q12(&self) -> u16 {
+        if self.local_to_world_q12 == 0 {
+            psxed_format::model::DEFAULT_LOCAL_TO_WORLD_Q12
+        } else {
+            self.local_to_world_q12
+        }
+    }
+
+    /// Joint record by index.
+    pub fn joint(&self, index: u16) -> Option<ModelJoint> {
+        if index >= self.joint_count {
+            return None;
+        }
+        let base = index as usize * psxed_format::model::JointRecord::SIZE;
+        let bytes = self
+            .joints
+            .get(base..base + psxed_format::model::JointRecord::SIZE)?;
+        Some(ModelJoint {
+            parent: read_u16(bytes, 0),
+        })
+    }
+
+    /// Material record by index.
+    pub fn material(&self, index: u16) -> Option<ModelMaterial> {
+        if index >= self.material_count {
+            return None;
+        }
+        let base = index as usize * psxed_format::model::MaterialRecord::SIZE;
+        let bytes = self
+            .materials
+            .get(base..base + psxed_format::model::MaterialRecord::SIZE)?;
+        Some(ModelMaterial {
+            texture_index: read_u16(bytes, 0),
+            flags: read_u16(bytes, 2),
+            base_color: [bytes[4], bytes[5], bytes[6], bytes[7]],
+        })
+    }
+
+    /// Rigid part record by index.
+    pub fn part(&self, index: u16) -> Option<ModelPart> {
+        if index >= self.part_count {
+            return None;
+        }
+        let base = index as usize * psxed_format::model::PartRecord::SIZE;
+        let bytes = self
+            .parts
+            .get(base..base + psxed_format::model::PartRecord::SIZE)?;
+        Some(ModelPart {
+            joint_index: read_u16(bytes, 0),
+            first_vertex: read_u16(bytes, 2),
+            vertex_count: read_u16(bytes, 4),
+            first_face: read_u16(bytes, 6),
+            face_count: read_u16(bytes, 8),
+            material_index: read_u16(bytes, 10),
+        })
+    }
+
+    /// Vertex record by global vertex index.
+    pub fn vertex(&self, index: u16) -> Option<ModelVertex> {
+        if index >= self.vertex_count {
+            return None;
+        }
+        let base = index as usize * psxed_format::model::VERTEX_RECORD_SIZE;
+        let bytes = self
+            .vertices
+            .get(base..base + psxed_format::model::VERTEX_RECORD_SIZE)?;
+        Some(ModelVertex {
+            position: Vec3I16::new(read_i16(bytes, 0), read_i16(bytes, 2), read_i16(bytes, 4)),
+            normal: Vec3I16::new(read_i16(bytes, 6), read_i16(bytes, 8), read_i16(bytes, 10)),
+            uv: (bytes[12], bytes[13]),
+        })
+    }
+
+    /// Triangle indices by global face index.
+    pub fn face(&self, index: u16) -> Option<(u16, u16, u16)> {
+        if index >= self.face_count {
+            return None;
+        }
+        let base = index as usize * psxed_format::model::FACE_RECORD_SIZE;
+        let bytes = self
+            .faces
+            .get(base..base + psxed_format::model::FACE_RECORD_SIZE)?;
+        Some((read_u16(bytes, 0), read_u16(bytes, 2), read_u16(bytes, 4)))
+    }
+}
+
+/// Decoded model joint record.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModelJoint {
+    parent: u16,
+}
+
+impl ModelJoint {
+    /// Parent joint index, or `None` for a root joint.
+    #[inline]
+    pub fn parent(&self) -> Option<u16> {
+        if self.parent == psxed_format::model::NO_JOINT {
+            None
+        } else {
+            Some(self.parent)
+        }
+    }
+}
+
+/// Decoded model material record.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModelMaterial {
+    texture_index: u16,
+    flags: u16,
+    base_color: [u8; 4],
+}
+
+impl ModelMaterial {
+    /// Texture slot index.
+    #[inline]
+    pub fn texture_index(&self) -> u16 {
+        self.texture_index
+    }
+
+    /// Material flags.
+    #[inline]
+    pub fn flags(&self) -> u16 {
+        self.flags
+    }
+
+    /// Base colour/tint as RGBA8.
+    #[inline]
+    pub fn base_color(&self) -> [u8; 4] {
+        self.base_color
+    }
+}
+
+/// Decoded rigid part record.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModelPart {
+    joint_index: u16,
+    first_vertex: u16,
+    vertex_count: u16,
+    first_face: u16,
+    face_count: u16,
+    material_index: u16,
+}
+
+impl ModelPart {
+    /// Joint whose animation pose applies to this part.
+    #[inline]
+    pub fn joint_index(&self) -> u16 {
+        self.joint_index
+    }
+
+    /// First global vertex owned by this part.
+    #[inline]
+    pub fn first_vertex(&self) -> u16 {
+        self.first_vertex
+    }
+
+    /// Number of vertices owned by this part.
+    #[inline]
+    pub fn vertex_count(&self) -> u16 {
+        self.vertex_count
+    }
+
+    /// First global triangle owned by this part.
+    #[inline]
+    pub fn first_face(&self) -> u16 {
+        self.first_face
+    }
+
+    /// Number of triangles owned by this part.
+    #[inline]
+    pub fn face_count(&self) -> u16 {
+        self.face_count
+    }
+
+    /// Material slot used by this part.
+    #[inline]
+    pub fn material_index(&self) -> u16 {
+        self.material_index
+    }
+}
+
+/// Decoded textured model vertex.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModelVertex {
+    /// Model-local position. The cooked importer may use a much denser
+    /// scale here than world/grid units; use [`Model::local_to_world_q12`]
+    /// when placing the model directly into world space.
+    pub position: Vec3I16,
+    /// Q3.12 model-space normal.
+    pub normal: Vec3I16,
+    /// 8-bit texture coordinates.
+    pub uv: (u8, u8),
+}
+
+/// A parsed rigid-skeletal animation backed by slices into the
+/// caller's cooked `.psxanim` blob.
+#[derive(Copy, Clone, Debug)]
+pub struct Animation<'a> {
+    poses: &'a [u8],
+    joint_count: u16,
+    frame_count: u16,
+    sample_rate_hz: u16,
+}
+
+impl<'a> Animation<'a> {
+    /// Parse a cooked `.psxanim` blob.
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, ParseError> {
+        use psxed_format::animation::{AnimationHeader, MAGIC, POSE_RECORD_SIZE, VERSION};
+
+        if bytes.len() < psxed_format::AssetHeader::SIZE {
+            return Err(ParseError::Truncated);
+        }
+        let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if magic != MAGIC {
+            return Err(ParseError::WrongMagic);
+        }
+        let version = read_u16(bytes, 4);
+        if version != VERSION {
+            return Err(ParseError::UnsupportedVersion(version));
+        }
+        let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let payload_start = psxed_format::AssetHeader::SIZE;
+        let actual_payload = bytes.len().saturating_sub(payload_start);
+        if payload_len as usize != actual_payload {
+            return Err(ParseError::InvalidPayloadLen {
+                declared: payload_len,
+                actual: actual_payload,
+            });
+        }
+        if actual_payload < AnimationHeader::SIZE {
+            return Err(ParseError::Truncated);
+        }
+
+        let ah = &bytes[payload_start..payload_start + AnimationHeader::SIZE];
+        let joint_count = read_u16(ah, 0);
+        let frame_count = read_u16(ah, 2);
+        let sample_rate_hz = read_u16(ah, 4);
+        if joint_count == 0 || frame_count == 0 || sample_rate_hz == 0 {
+            return Err(ParseError::InvalidAnimationLayout);
+        }
+
+        let mut off = payload_start + AnimationHeader::SIZE;
+        let pose_count = (joint_count as usize)
+            .checked_mul(frame_count as usize)
+            .ok_or(ParseError::TableOverflow)?;
+        let pose_bytes = pose_count
+            .checked_mul(POSE_RECORD_SIZE)
+            .ok_or(ParseError::TableOverflow)?;
+        let poses = take_table(bytes, &mut off, pose_bytes)?;
+        if off != bytes.len() {
+            return Err(ParseError::InvalidAnimationLayout);
+        }
+
+        Ok(Self {
+            poses,
+            joint_count,
+            frame_count,
+            sample_rate_hz,
+        })
+    }
+
+    /// Number of joint poses per frame.
+    #[inline]
+    pub fn joint_count(&self) -> u16 {
+        self.joint_count
+    }
+
+    /// Number of sampled frames.
+    #[inline]
+    pub fn frame_count(&self) -> u16 {
+        self.frame_count
+    }
+
+    /// Integer sample rate in Hz.
+    #[inline]
+    pub fn sample_rate_hz(&self) -> u16 {
+        self.sample_rate_hz
+    }
+
+    /// Joint pose at `frame_index`, `joint_index`.
+    pub fn pose(&self, frame_index: u16, joint_index: u16) -> Option<JointPose> {
+        if frame_index >= self.frame_count || joint_index >= self.joint_count {
+            return None;
+        }
+        let flat = frame_index as usize * self.joint_count as usize + joint_index as usize;
+        let base = flat * psxed_format::animation::POSE_RECORD_SIZE;
+        let bytes = self
+            .poses
+            .get(base..base + psxed_format::animation::POSE_RECORD_SIZE)?;
+        let mut matrix = [[0i16; 3]; 3];
+        let mut off = 0;
+        for col in matrix.iter_mut() {
+            for cell in col.iter_mut() {
+                *cell = read_i16(bytes, off);
+                off += 2;
+            }
+        }
+        let translation = Vec3I32::new(
+            read_i32(bytes, off),
+            read_i32(bytes, off + 4),
+            read_i32(bytes, off + 8),
+        );
+        Some(JointPose {
+            matrix,
+            translation,
+        })
+    }
+}
+
+/// Decoded joint pose matrix.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct JointPose {
+    /// Q3.12 column-major 3×3 transform.
+    pub matrix: [[i16; 3]; 3],
+    /// Q3.12 translation vector.
+    pub translation: Vec3I32,
 }
 
 /// A parsed 2D texture backed by slices into the caller's cooked
@@ -737,9 +1237,85 @@ fn material_or_none(material: u16) -> Option<u16> {
     }
 }
 
+fn checked_table_bytes(count: u16, stride: usize) -> Result<usize, ParseError> {
+    (count as usize)
+        .checked_mul(stride)
+        .ok_or(ParseError::TableOverflow)
+}
+
+fn take_table<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8], ParseError> {
+    let end = offset.checked_add(len).ok_or(ParseError::TableOverflow)?;
+    if end > bytes.len() {
+        return Err(ParseError::TableOverflow);
+    }
+    let table = &bytes[*offset..end];
+    *offset = end;
+    Ok(table)
+}
+
+fn validate_model_parts(
+    parts: &[u8],
+    joint_count: u16,
+    material_count: u16,
+    vertex_count: u16,
+    face_count: u16,
+) -> Result<(), ParseError> {
+    let size = psxed_format::model::PartRecord::SIZE;
+    let count = parts.len() / size;
+    for index in 0..count {
+        let base = index * size;
+        let joint_index = read_u16(parts, base);
+        let first_vertex = read_u16(parts, base + 2);
+        let part_vertex_count = read_u16(parts, base + 4);
+        let first_face = read_u16(parts, base + 6);
+        let part_face_count = read_u16(parts, base + 8);
+        let material_index = read_u16(parts, base + 10);
+
+        if joint_index != psxed_format::model::NO_JOINT && joint_index >= joint_count {
+            return Err(ParseError::InvalidModelLayout);
+        }
+        if material_index >= material_count {
+            return Err(ParseError::InvalidModelLayout);
+        }
+        let Some(vertex_end) = first_vertex.checked_add(part_vertex_count) else {
+            return Err(ParseError::InvalidModelLayout);
+        };
+        if vertex_end > vertex_count {
+            return Err(ParseError::InvalidModelLayout);
+        }
+        let Some(face_end) = first_face.checked_add(part_face_count) else {
+            return Err(ParseError::InvalidModelLayout);
+        };
+        if face_end > face_count {
+            return Err(ParseError::InvalidModelLayout);
+        }
+    }
+    Ok(())
+}
+
+fn validate_model_faces(faces: &[u8], vertex_count: u16) -> Result<(), ParseError> {
+    let size = psxed_format::model::FACE_RECORD_SIZE;
+    let count = faces.len() / size;
+    for index in 0..count {
+        let base = index * size;
+        let a = read_u16(faces, base);
+        let b = read_u16(faces, base + 2);
+        let c = read_u16(faces, base + 4);
+        if a >= vertex_count || b >= vertex_count || c >= vertex_count {
+            return Err(ParseError::InvalidModelLayout);
+        }
+    }
+    Ok(())
+}
+
 #[inline]
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+#[inline]
+fn read_i16(bytes: &[u8], offset: usize) -> i16 {
+    i16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 
 #[inline]
@@ -778,6 +1354,9 @@ fn validate_sector_wall_ranges(sectors: &[u8], wall_count: u16) -> Result<(), Pa
     }
     Ok(())
 }
+
+#[cfg(test)]
+extern crate std;
 
 #[cfg(test)]
 mod tests {
@@ -860,6 +1439,111 @@ mod tests {
             Texture::from_bytes(&bad),
             Err(ParseError::WrongMagic)
         ));
+    }
+
+    #[test]
+    fn model_round_trip_minimal_textured_part() {
+        use psxed_format::model;
+
+        let payload_len = model::ModelHeader::SIZE
+            + model::JointRecord::SIZE
+            + model::MaterialRecord::SIZE
+            + model::PartRecord::SIZE
+            + 3 * model::VERTEX_RECORD_SIZE
+            + model::FACE_RECORD_SIZE;
+        let mut buf = std::vec::Vec::new();
+        buf.extend_from_slice(&model::MAGIC);
+        buf.extend_from_slice(&model::VERSION.to_le_bytes());
+        buf.extend_from_slice(
+            &(model::flags::HAS_NORMALS | model::flags::HAS_UVS | model::flags::RIGID_SKINNED)
+                .to_le_bytes(),
+        );
+        buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
+
+        buf.extend_from_slice(&1u16.to_le_bytes()); // joints
+        buf.extend_from_slice(&1u16.to_le_bytes()); // parts
+        buf.extend_from_slice(&3u16.to_le_bytes()); // vertices
+        buf.extend_from_slice(&1u16.to_le_bytes()); // faces
+        buf.extend_from_slice(&1u16.to_le_bytes()); // materials
+        buf.extend_from_slice(&128u16.to_le_bytes());
+        buf.extend_from_slice(&128u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+
+        buf.extend_from_slice(&model::NO_JOINT.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        for value in [0u16, 0, 3, 0, 1, 0] {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        for (x, y, u, v) in [(0i16, 0i16, 0u8, 0u8), (4096, 0, 127, 0), (0, 4096, 0, 127)] {
+            buf.extend_from_slice(&x.to_le_bytes());
+            buf.extend_from_slice(&y.to_le_bytes());
+            buf.extend_from_slice(&0i16.to_le_bytes());
+            buf.extend_from_slice(&0i16.to_le_bytes());
+            buf.extend_from_slice(&4096i16.to_le_bytes());
+            buf.extend_from_slice(&0i16.to_le_bytes());
+            buf.push(u);
+            buf.push(v);
+        }
+        for index in [0u16, 1, 2] {
+            buf.extend_from_slice(&index.to_le_bytes());
+        }
+
+        let model = Model::from_bytes(&buf).expect("parse model");
+        assert_eq!(model.joint_count(), 1);
+        assert_eq!(model.part_count(), 1);
+        assert_eq!(model.vertex_count(), 3);
+        assert_eq!(model.face_count(), 1);
+        assert_eq!(model.texture_width(), 128);
+        assert_eq!(
+            model.local_to_world_q12(),
+            psxed_format::model::DEFAULT_LOCAL_TO_WORLD_Q12
+        );
+        assert_eq!(model.joint(0).unwrap().parent(), None);
+        assert_eq!(
+            model.material(0).unwrap().base_color(),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(model.part(0).unwrap().face_count(), 1);
+        assert_eq!(model.vertex(1).unwrap().uv, (127, 0));
+        assert_eq!(model.face(0), Some((0, 1, 2)));
+    }
+
+    #[test]
+    fn animation_round_trip_pose_table() {
+        use psxed_format::animation;
+
+        let payload_len = animation::AnimationHeader::SIZE + 2 * animation::POSE_RECORD_SIZE;
+        let mut buf = std::vec::Vec::new();
+        buf.extend_from_slice(&animation::MAGIC);
+        buf.extend_from_slice(&animation::VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // joints
+        buf.extend_from_slice(&2u16.to_le_bytes()); // frames
+        buf.extend_from_slice(&15u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+
+        for frame in 0..2i32 {
+            for value in [4096i16, 0, 0, 0, 4096, 0, 0, 0, 4096] {
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in [frame * 100, frame * 200, frame * 300] {
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+
+        let animation = Animation::from_bytes(&buf).expect("parse animation");
+        assert_eq!(animation.joint_count(), 1);
+        assert_eq!(animation.frame_count(), 2);
+        assert_eq!(animation.sample_rate_hz(), 15);
+        let pose = animation.pose(1, 0).unwrap();
+        assert_eq!(pose.matrix[0][0], 4096);
+        assert_eq!(pose.translation, Vec3I32::new(100, 200, 300));
     }
 
     #[test]
@@ -966,8 +1650,8 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_via_cooked_blob() {
-        // Construct a proper blob programmatically: 2 verts, 0 faces.
+    fn parses_legacy_v1_cooked_blob() {
+        // Construct a proper v1 blob programmatically: 2 verts, 0 faces.
         // (0 faces is legal; we just want to check header parses.)
         let mut buf: [u8; 12 + 8 + 2 * 6] = [0; 32];
         buf[0..4].copy_from_slice(&psxed_format::mesh::MAGIC);
@@ -990,5 +1674,30 @@ mod tests {
         assert_eq!(v0.x, 0x0100);
         let v1 = m.vertex(1);
         assert_eq!(v1.y, 0x0200);
+    }
+
+    #[test]
+    fn parses_v2_u16_indices() {
+        const VERTS: usize = 260;
+        const FACES: usize = 1;
+        const PAYLOAD_LEN: usize = psxed_format::mesh::MeshHeader::SIZE + VERTS * 6 + FACES * 6;
+        const INDEX_OFFSET: usize =
+            psxed_format::AssetHeader::SIZE + psxed_format::mesh::MeshHeader::SIZE + VERTS * 6;
+
+        let mut buf = [0u8; psxed_format::AssetHeader::SIZE + PAYLOAD_LEN];
+        buf[0..4].copy_from_slice(&psxed_format::mesh::MAGIC);
+        buf[4..6].copy_from_slice(&psxed_format::mesh::VERSION.to_le_bytes());
+        buf[6..8].copy_from_slice(&0u16.to_le_bytes());
+        buf[8..12].copy_from_slice(&(PAYLOAD_LEN as u32).to_le_bytes());
+        buf[12..14].copy_from_slice(&(VERTS as u16).to_le_bytes());
+        buf[14..16].copy_from_slice(&(FACES as u16).to_le_bytes());
+
+        buf[INDEX_OFFSET..INDEX_OFFSET + 2].copy_from_slice(&0u16.to_le_bytes());
+        buf[INDEX_OFFSET + 2..INDEX_OFFSET + 4].copy_from_slice(&255u16.to_le_bytes());
+        buf[INDEX_OFFSET + 4..INDEX_OFFSET + 6].copy_from_slice(&259u16.to_le_bytes());
+
+        let mesh = Mesh::from_bytes(&buf).expect("parse v2 mesh");
+        assert_eq!(mesh.vert_count(), VERTS as u16);
+        assert_eq!(mesh.face(0), (0, 255, 259));
     }
 }

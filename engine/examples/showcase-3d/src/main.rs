@@ -219,8 +219,10 @@ const EMPTY_VERT: ProjectedLit = ProjectedLit {
     b: 0,
 };
 
-static mut SUZANNE_PROJ: [ProjectedLit; 128] = [EMPTY_VERT; 128];
-static mut TEAPOT_PROJ: [ProjectedLit; 128] = [EMPTY_VERT; 128];
+const MESH_PROJECTED_CAP: usize = 1024;
+
+static mut SUZANNE_PROJ: [ProjectedLit; MESH_PROJECTED_CAP] = [EMPTY_VERT; MESH_PROJECTED_CAP];
+static mut TEAPOT_PROJ: [ProjectedLit; MESH_PROJECTED_CAP] = [EMPTY_VERT; MESH_PROJECTED_CAP];
 
 // ----------------------------------------------------------------------
 // Scene impl
@@ -403,9 +405,7 @@ impl Showcase3D {
         scene_lights.for_object(&suz_view_rot).load();
         let suz_stats =
             world_pass.submit_lit_mesh(&suzanne, unsafe { &mut SUZANNE_PROJ }, mesh_options);
-        self.tri_count = self
-            .tri_count
-            .saturating_add(suz_stats.submitted_triangles);
+        self.tri_count = self.tri_count.saturating_add(suz_stats.submitted_triangles);
 
         // --- TEAPOT — opposite tumble, lit by same rig ---
         let tea_rot = Mat3I16::rotate_y((frame.wrapping_mul(4) & 0xFFFF).wrapping_neg() as u16)
@@ -418,9 +418,7 @@ impl Showcase3D {
         scene_lights.for_object(&tea_view_rot).load();
         let tea_stats =
             world_pass.submit_lit_mesh(&teapot, unsafe { &mut TEAPOT_PROJ }, mesh_options);
-        self.tri_count = self
-            .tri_count
-            .saturating_add(tea_stats.submitted_triangles);
+        self.tri_count = self.tri_count.saturating_add(tea_stats.submitted_triangles);
 
         world_pass.flush();
 
@@ -514,8 +512,7 @@ fn camera_space_position(view: &Mat3I16, offset: Vec3World) -> Vec3World {
 
 fn transform_axis(m: &Mat3I16, row: usize, v: Vec3World) -> i32 {
     let row = m.row(row);
-    let sum =
-        (row[0] as i32) * v.x + (row[1] as i32) * v.y + (row[2] as i32) * v.z;
+    let sum = (row[0] as i32) * v.x + (row[1] as i32) * v.y + (row[2] as i32) * v.z;
     (sum >> 12) as i32
 }
 

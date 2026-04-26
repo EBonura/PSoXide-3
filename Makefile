@@ -20,6 +20,7 @@
         game-breakout run-game-breakout \
         game-invaders run-game-invaders \
         showcase-3d run-showcase-3d \
+        showcase-model run-showcase-model \
         showcase-lights run-showcase-lights \
         showcase-fog run-showcase-fog \
         showcase-particles run-showcase-particles \
@@ -58,6 +59,7 @@ help:
 	@echo "    make game-breakout - build the Breakout mini-game"
 	@echo "    make game-invaders - build the Space Invaders mini-game"
 	@echo "    make showcase-3d    - build the 3D geometry showcase"
+	@echo "    make showcase-model - build the animated native-model demo"
 	@echo "    make showcase-lights - build the 4-point-light demo"
 	@echo "    make showcase-fog   - build the fog / full-GTE-pipeline demo"
 	@echo "    make showcase-particles - build the particle-pool demo"
@@ -75,6 +77,7 @@ help:
 	@echo "    make run-game-breakout - build + side-load the Breakout mini-game"
 	@echo "    make run-game-invaders - build + side-load the Space Invaders mini-game"
 	@echo "    make run-showcase-3d - build + side-load the 3D geometry showcase"
+	@echo "    make run-showcase-model - build + side-load the animated model demo"
 	@echo "    make run-showcase-lights - build + side-load the 4-point-light demo"
 	@echo "    make run-showcase-fog - build + side-load the fog demo"
 	@echo "    make run-showcase-particles - build + side-load the particle demo"
@@ -172,6 +175,9 @@ game-invaders:
 showcase-3d: assets
 	cd engine/examples/showcase-3d && cargo build --release
 
+showcase-model:
+	cd engine/examples/showcase-model && cargo build --release
+
 showcase-lights: assets
 	cd engine/examples/showcase-lights && cargo build --release
 
@@ -231,7 +237,7 @@ assets: psxed
 	$(call cook_texture,$(SHOWCASE_FOG)/vendor/brick-wall.jpg,$(SHOWCASE_FOG)/assets/brick-wall.psxt,64x64,4)
 	$(call cook_texture,$(SHOWCASE_FOG)/vendor/floor.jpg,$(SHOWCASE_FOG)/assets/floor.psxt,64x64,4)
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-lights showcase-fog showcase-particles hello-engine
+examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-model showcase-lights showcase-fog showcase-particles hello-engine
 	@echo ""
 	@echo "Built SDK examples:"
 	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
@@ -275,6 +281,9 @@ run-game-invaders: game-invaders
 
 run-showcase-3d: showcase-3d
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-3d.exe cargo run -p frontend --release
+
+run-showcase-model: showcase-model
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-model.exe cargo run -p frontend --release
 
 run-showcase-lights: showcase-lights
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-lights.exe cargo run -p frontend --release

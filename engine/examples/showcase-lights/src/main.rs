@@ -295,8 +295,9 @@ fn light_vertex(
 
         // Un-normalised N · D. Components of N are Q3.12, D's are
         // raw world units. Result is in Q3.12 × world-units.
-        let dot_unnorm =
-            (world_normal.x as i32) * dx + (world_normal.y as i32) * dy + (world_normal.z as i32) * dz;
+        let dot_unnorm = (world_normal.x as i32) * dx
+            + (world_normal.y as i32) * dy
+            + (world_normal.z as i32) * dz;
 
         // Facing-away? Skip.
         if dot_unnorm <= 0 {
@@ -428,10 +429,8 @@ impl Lighting {
             let rot_scaled = actor.scaled_rotation();
             let cube_proj = unsafe { &mut CUBE_PROJ };
             for vi in 0..cube.vert_count() {
-                let vl = cube.vertex(vi as u8);
-                let nl = cube
-                    .vertex_normal(vi as u8)
-                    .unwrap_or(Vec3I16::new(0, 0x1000, 0));
+                let vl = cube.vertex(vi);
+                let nl = cube.vertex_normal(vi).unwrap_or(Vec3I16::new(0, 0x1000, 0));
 
                 // World-space position: rot_scaled × local + translation.
                 let wx = mat_row_dot(&rot_scaled, 0, vl) + instance.position.x;

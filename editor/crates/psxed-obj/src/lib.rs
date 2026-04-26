@@ -109,12 +109,23 @@ pub enum Error {
     /// OBJ source text is not valid UTF-8.
     InvalidUtf8,
     /// A `v`/`f` line couldn't be parsed (malformed number, missing field, …).
-    ParseLine { line_no: usize, reason: &'static str },
-    /// Post-decimation mesh has more than 255 vertices — indices
-    /// don't fit in `u8`. Pick a smaller grid.
-    TooManyVerts { count: usize },
+    ParseLine {
+        /// One-based source line number.
+        line_no: usize,
+        /// Short parse failure description.
+        reason: &'static str,
+    },
+    /// Post-decimation mesh has more than 65535 vertices — indices
+    /// don't fit in PSXM v2's `u16` index table.
+    TooManyVerts {
+        /// Vertex count after optional decimation.
+        count: usize,
+    },
     /// Post-decimation mesh has more than 65535 triangles.
-    TooManyFaces { count: usize },
+    TooManyFaces {
+        /// Triangle count after optional decimation.
+        count: usize,
+    },
     /// Mesh has zero triangles after parse/decimate.
     Empty,
 }
@@ -128,7 +139,7 @@ impl std::fmt::Display for Error {
             }
             Error::TooManyVerts { count } => write!(
                 f,
-                "{count} verts exceeds u8 index range; pick a smaller grid"
+                "{count} verts exceeds u16 index range; split or decimate the mesh"
             ),
             Error::TooManyFaces { count } => {
                 write!(f, "{count} faces exceeds u16 face-count field")
@@ -286,8 +297,32 @@ pub fn cluster_decimate(
     faces: &[[usize; 3]],
     grid: u32,
 ) -> (Vec<[f32; 3]>, Vec<[usize; 3]>) {
+    let face_data = vec![(); faces.len()];
+    let (verts, faces, _) = cluster_decimate_with_face_data(verts, faces, &face_data, grid);
+    (verts, faces)
+}
+
+/// Vertex-cluster decimation that carries one payload item per
+/// source face through the surviving output triangle list.
+///
+/// This is useful for importers that preserve material assignment
+/// or baked face colours. If a triangle collapses to a degenerate
+/// face, its payload is dropped. If multiple source triangles collapse
+/// to the same output triangle, the first payload wins, matching the
+/// deterministic first-face behaviour of [`cluster_decimate`].
+pub fn cluster_decimate_with_face_data<T: Clone>(
+    verts: &[[f32; 3]],
+    faces: &[[usize; 3]],
+    face_data: &[T],
+    grid: u32,
+) -> (Vec<[f32; 3]>, Vec<[usize; 3]>, Vec<T>) {
+    assert_eq!(
+        faces.len(),
+        face_data.len(),
+        "face_data must match face count"
+    );
     if verts.is_empty() || grid == 0 {
-        return (verts.to_vec(), faces.to_vec());
+        return (verts.to_vec(), faces.to_vec(), face_data.to_vec());
     }
     // Axis-aligned bounds.
     let mut xmin = f32::INFINITY;
@@ -340,8 +375,9 @@ pub fn cluster_decimate(
 
     // Remap faces; drop degenerates + dedupe.
     let mut out_faces = Vec::new();
+    let mut out_face_data = Vec::new();
     let mut seen: HashSet<[usize; 3]> = HashSet::new();
-    for f in faces {
+    for (f, data) in faces.iter().zip(face_data) {
         let ca = cell_of(&verts[f[0]]);
         let cb = cell_of(&verts[f[1]]);
         let cc = cell_of(&verts[f[2]]);
@@ -355,9 +391,10 @@ pub fn cluster_decimate(
         key.sort_unstable();
         if seen.insert(key) {
             out_faces.push([ia, ib, ic]);
+            out_face_data.push(data.clone());
         }
     }
-    (out_verts, out_faces)
+    (out_verts, out_faces, out_face_data)
 }
 
 // ----------------------------------------------------------------------
@@ -393,10 +430,7 @@ fn normal_to_q3_12(v: f32) -> i16 {
 /// — we don't normalise per-face, so big faces contribute more.
 /// This matches the standard practice for smooth shading of
 /// low-poly meshes.
-pub fn compute_vertex_normals(
-    verts: &[[f32; 3]],
-    faces: &[[usize; 3]],
-) -> Vec<[f32; 3]> {
+pub fn compute_vertex_normals(verts: &[[f32; 3]], faces: &[[usize; 3]]) -> Vec<[f32; 3]> {
     let mut accum: Vec<[f32; 3]> = vec![[0.0; 3]; verts.len()];
     for f in faces {
         let v0 = verts[f[0]];
@@ -447,7 +481,7 @@ pub fn encode_psxm(
     if faces.is_empty() {
         return Err(Error::Empty);
     }
-    if verts.len() > 255 {
+    if verts.len() > u16::MAX as usize {
         return Err(Error::TooManyVerts { count: verts.len() });
     }
     if faces.len() > u16::MAX as usize {
@@ -462,7 +496,7 @@ pub fn encode_psxm(
 
     // Compute payload size + flag bits.
     let vert_bytes = (vert_count as usize) * 6;
-    let index_bytes = (face_count as usize) * 3;
+    let index_bytes = (face_count as usize) * 6;
     let color_bytes = if cfg.include_face_colors {
         (face_count as usize) * 3
     } else {
@@ -509,9 +543,9 @@ pub fn encode_psxm(
 
     // Index table.
     for f in faces {
-        buf.push(f[0] as u8);
-        buf.push(f[1] as u8);
-        buf.push(f[2] as u8);
+        buf.extend_from_slice(&(f[0] as u16).to_le_bytes());
+        buf.extend_from_slice(&(f[1] as u16).to_le_bytes());
+        buf.extend_from_slice(&(f[2] as u16).to_le_bytes());
     }
 
     // Face colours.
@@ -568,10 +602,47 @@ f 1 2 3
         .unwrap();
         // Magic + version + flags + payload_len + mesh header + 3 verts + 1 face + 1 colour.
         assert_eq!(&bytes[..4], b"PSXM");
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 1);
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            psxed_format::mesh::VERSION
+        );
         assert_eq!(
             u16::from_le_bytes([bytes[6], bytes[7]]),
             psxed_format::mesh::flags::HAS_FACE_COLORS
+        );
+    }
+
+    #[test]
+    fn encodes_u16_indices() {
+        let verts: Vec<[f32; 3]> = (0..260).map(|i| [i as f32, 0.0, 0.0]).collect();
+        let faces = vec![[0, 255, 259]];
+        let bytes = encode_psxm(
+            &verts,
+            &faces,
+            None,
+            &Config {
+                decimate_grid: None,
+                palette: Palette::Warm,
+                include_face_colors: false,
+                include_normals: false,
+            },
+        )
+        .unwrap();
+
+        let index_offset = psxed_format::AssetHeader::SIZE
+            + psxed_format::mesh::MeshHeader::SIZE
+            + verts.len() * 6;
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            psxed_format::mesh::VERSION
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[index_offset + 2], bytes[index_offset + 3]]),
+            255
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[index_offset + 4], bytes[index_offset + 5]]),
+            259
         );
     }
 
@@ -595,8 +666,7 @@ f 1 2 3
     fn computed_normals_point_in_face_direction() {
         // Unit-triangle in XY plane — all vertex normals should
         // equal the face normal (0, 0, 1) after averaging.
-        let verts: Vec<[f32; 3]> =
-            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let verts: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let faces: Vec<[usize; 3]> = vec![[0, 1, 2]];
         let normals = compute_vertex_normals(&verts, &faces);
         for n in &normals {

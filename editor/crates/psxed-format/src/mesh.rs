@@ -19,8 +19,8 @@
 //!     y: i16 LE
 //!     z: i16 LE
 //!
-//!   Index table: face_count × 3 bytes
-//!     a, b, c: u8 each
+//!   Index table: face_count × 6 bytes
+//!     a, b, c: u16 LE each
 //!
 //!   Face-colour table: face_count × 3 bytes  (only if FLAG_HAS_FACE_COLORS set)
 //!     r, g, b: u8 each
@@ -29,20 +29,24 @@
 //!     nx, ny, nz: i16 LE  (Q3.12 unit vector)
 //! ```
 //!
-//! Total file size: `12 + 8 + (vert_count * 6) + (face_count * 3)
+//! Total file size: `12 + 8 + (vert_count * 6) + (face_count * 6)
 //! [ + (face_count * 3) if has_face_colors ]
 //! [ + (vert_count * 6) if has_normals ]`.
 //!
 //! Every multi-byte integer is little-endian; bytes are tightly
 //! packed (no alignment padding). That lets the runtime parser
 //! just take slices into the blob without unpacking.
+//!
+//! Version 1 used a `face_count × 3` byte index table (`u8`
+//! indices). The runtime parser still accepts it for existing
+//! cooked assets; editors should emit the current version.
 
 /// ASCII magic identifying the `.psxm` format.
 pub const MAGIC: [u8; 4] = *b"PSXM";
 
 /// Current mesh format revision. Runtime parser rejects values
 /// it doesn't know; editor always writes this value.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Mesh-specific feature flags (stored in `AssetHeader::flags`).
 pub mod flags {
@@ -74,9 +78,13 @@ impl MeshHeader {
     pub const SIZE: usize = 8;
 
     /// Build a header. The caller is responsible for ensuring
-    /// `vert_count * 6 + face_count * 3 + optional_colors` matches
+    /// `vert_count * 6 + face_count * 6 + optional_colors` matches
     /// the actual payload size.
     pub const fn new(vert_count: u16, face_count: u16) -> Self {
-        Self { vert_count, face_count, _reserved: 0 }
+        Self {
+            vert_count,
+            face_count,
+            _reserved: 0,
+        }
     }
 }

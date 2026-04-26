@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/psxed-format",
+    "crates/psxed-gltf",
     "crates/psxed-obj",
     "crates/psxed-project",
     "crates/psxed-tex",
@@ -16,6 +17,7 @@ repository = "https://github.com/EBonura/PSoXide"
 
 [workspace.dependencies]
 psxed-format = { path = "crates/psxed-format" }
+psxed-gltf   = { path = "crates/psxed-gltf" }
 psxed-obj    = { path = "crates/psxed-obj" }
 psxed-project = { path = "crates/psxed-project" }
 psxed-tex    = { path = "crates/psxed-tex" }

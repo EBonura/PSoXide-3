@@ -12,5 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 psxed-format = { workspace = true }
+psxed-gltf   = { workspace = true }
 psxed-obj    = { workspace = true }
 psxed-tex    = { workspace = true }

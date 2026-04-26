@@ -43,7 +43,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod animation;
 pub mod mesh;
+pub mod model;
 pub mod texture;
 pub mod world;
 
@@ -71,6 +73,11 @@ impl AssetHeader {
 
     /// Build a header with the given fields, no encoding happens.
     pub const fn new(magic: [u8; 4], version: u16, flags: u16, payload_len: u32) -> Self {
-        Self { magic, version, flags, payload_len }
+        Self {
+            magic,
+            version,
+            flags,
+            payload_len,
+        }
     }
 }
