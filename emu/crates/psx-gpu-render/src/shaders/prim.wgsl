@@ -16,6 +16,8 @@
 //   bit      22   TEXTURED
 //   bit      23   RAW_TEXTURE     (skip tint modulate)
 //   bit      24   SEMI_TRANS
+//   bit      25   TEX_OPAQUE_PASS (discard STP texels)
+//   bit      26   TEX_SEMI_PASS   (keep only STP texels)
 
 const VRAM_W: u32 = 1024u;
 const VRAM_H: u32 =  512u;
@@ -44,8 +46,8 @@ struct VertexOut {
 
 const FLAG_TEXTURED:    u32 = 1u << 22u;
 const FLAG_RAW_TEXTURE: u32 = 1u << 23u;
-// FLAG_SEMI_TRANS lives in the host-side blend-batch routing, the
-// shader doesn't sample it.
+const FLAG_TEX_OPAQUE_PASS: u32 = 1u << 25u;
+const FLAG_TEX_SEMI_PASS:   u32 = 1u << 26u;
 
 @vertex
 fn vs_main(in: VertexIn) -> VertexOut {
@@ -162,6 +164,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let uv8 = page_uv(in.uv);
     let texel = sample_texel(in.flags, uv8);
     if texel == 0u {
+        discard;
+    }
+    let stp = (texel & 0x8000u) != 0u;
+    if ((in.flags & FLAG_TEX_OPAQUE_PASS) != 0u) && stp {
+        discard;
+    }
+    if ((in.flags & FLAG_TEX_SEMI_PASS) != 0u) && !stp {
         discard;
     }
     let raw = (in.flags & FLAG_RAW_TEXTURE) != 0u;

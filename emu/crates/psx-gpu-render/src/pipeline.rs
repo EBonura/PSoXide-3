@@ -43,11 +43,15 @@ pub struct HwVertex {
 /// bit      22   TEXTURED                      else flat color
 /// bit      23   RAW_TEXTURE                   skip tint modulate
 /// bit      24   SEMI_TRANS                    routed to a non-Opaque batch
+/// bit      25   TEX_OPAQUE_PASS               discard STP texels
+/// bit      26   TEX_SEMI_PASS                 keep only STP texels
 /// ```
 pub mod flags {
     pub const TEXTURED: u32 = 1 << 22;
     pub const RAW_TEXTURE: u32 = 1 << 23;
     pub const SEMI_TRANS: u32 = 1 << 24;
+    pub const TEX_OPAQUE_PASS: u32 = 1 << 25;
+    pub const TEX_SEMI_PASS: u32 = 1 << 26;
 
     /// Pack tpage origin (in pixels) into the flag bits.
     /// `tpage_x` must be a multiple of 64 (PSX alignment),

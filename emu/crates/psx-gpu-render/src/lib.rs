@@ -158,13 +158,15 @@ impl HwRenderer {
     /// shader reads for textured primitives.
     pub fn render_frame(
         &mut self,
-        _gpu: &Gpu,
+        gpu: &Gpu,
         cmd_log: &[emulator_core::gpu::GpuCmdLogEntry],
         vram_words: &[u16],
     ) {
         self.pipeline.upload_vram(&self.queue, vram_words);
 
-        let frame = self.translator.translate(cmd_log);
+        let frame = self
+            .translator
+            .translate_with_wireframe(cmd_log, gpu.wireframe_enabled);
         if frame.total() > 0 {
             self.pipeline
                 .upload_vertices(&self.queue, bytemuck::cast_slice(frame.vertices));

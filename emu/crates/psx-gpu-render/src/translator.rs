@@ -50,6 +50,10 @@ impl TranslatedFrame<'_> {
 
 pub struct Translator {
     state: ReplayState,
+    /// Frontend debug mode mirroring `Gpu::wireframe_enabled`.
+    /// Filled polygons become edge strips; rectangles remain filled
+    /// to match the CPU rasterizer's debug path.
+    wireframe: bool,
     /// Ordered vertex stream for the current frame. This preserves
     /// GP0 command order, which matters for semi-transparency and
     /// overlapping UI primitives.
@@ -63,6 +67,7 @@ impl Translator {
     pub fn new() -> Self {
         Self {
             state: ReplayState::new(),
+            wireframe: false,
             flat: Vec::with_capacity(4 * 1024),
             runs: Vec::with_capacity(1024),
         }
@@ -72,6 +77,17 @@ impl Translator {
     /// laid out as one slice per `BlendKind`. The slices borrow
     /// from `self`; copy out before the next call.
     pub fn translate(&mut self, log: &[GpuCmdLogEntry]) -> TranslatedFrame<'_> {
+        self.translate_with_wireframe(log, false)
+    }
+
+    /// Same as [`Translator::translate`], with the frontend's
+    /// wireframe debug flag applied to polygon primitives.
+    pub fn translate_with_wireframe(
+        &mut self,
+        log: &[GpuCmdLogEntry],
+        wireframe: bool,
+    ) -> TranslatedFrame<'_> {
+        self.wireframe = wireframe;
         self.flat.clear();
         self.runs.clear();
         for entry in log {
@@ -263,7 +279,11 @@ impl Translator {
         let v0 = decode_vertex(&self.state, fifo[1]);
         let v1 = decode_vertex(&self.state, fifo[2]);
         let v2 = decode_vertex(&self.state, fifo[3]);
-        self.push_tri(v0, v1, v2, color, kind);
+        if self.wireframe {
+            self.push_wire_tri(v0, color, v1, color, v2, color, kind);
+        } else {
+            self.push_tri(v0, v1, v2, color, kind);
+        }
     }
 
     fn emit_mono_quad(&mut self, fifo: &[u32]) {
@@ -281,8 +301,13 @@ impl Translator {
         // (`Gpu::draw_monochrome_quad`): lower/right half first, then
         // upper/left, so pixels on the shared diagonal are owned by
         // (v0, v1, v2).
-        self.push_tri(v1, v3, v2, color, kind);
-        self.push_tri(v0, v1, v2, color, kind);
+        if self.wireframe {
+            self.push_wire_tri(v1, color, v3, color, v2, color, kind);
+            self.push_wire_tri(v0, color, v1, color, v2, color, kind);
+        } else {
+            self.push_tri(v1, v3, v2, color, kind);
+            self.push_tri(v0, v1, v2, color, kind);
+        }
     }
 
     fn push_tri(
@@ -306,6 +331,52 @@ impl Translator {
                 },
             );
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_wire_tri(
+        &mut self,
+        v0: (i32, i32),
+        c0: [u8; 4],
+        v1: (i32, i32),
+        c1: [u8; 4],
+        v2: (i32, i32),
+        c2: [u8; 4],
+        kind: BlendKind,
+    ) {
+        self.push_line_strip(v0, c0, v1, c1, kind);
+        self.push_line_strip(v1, c1, v2, c2, kind);
+        self.push_line_strip(v2, c2, v0, c0, kind);
+    }
+
+    fn push_line_strip(
+        &mut self,
+        v0: (i32, i32),
+        c0: [u8; 4],
+        v1: (i32, i32),
+        c1: [u8; 4],
+        kind: BlendKind,
+    ) {
+        if v0 == v1 {
+            let v2 = (v0.0 + 1, v0.1);
+            let v3 = (v0.0, v0.1 + 1);
+            let v4 = (v0.0 + 1, v0.1 + 1);
+            self.push_shaded_tri(v0, c0, v2, c0, v3, c0, 0, kind);
+            self.push_shaded_tri(v2, c0, v4, c0, v3, c0, 0, kind);
+            return;
+        }
+
+        // The CPU debug path plots Bresenham pixels. The HW path is
+        // triangle-only, so model each edge as a one-PSX-pixel strip.
+        // That keeps the outline visible at any internal scale while
+        // avoiding optional wgpu line/polygon-mode features.
+        let dx = (v1.0 - v0.0).abs();
+        let dy = (v1.1 - v0.1).abs();
+        let (ox, oy) = if dx >= dy { (0, 1) } else { (1, 0) };
+        let v0b = (v0.0 + ox, v0.1 + oy);
+        let v1b = (v1.0 + ox, v1.1 + oy);
+        self.push_shaded_tri(v0, c0, v1, c1, v0b, c0, 0, kind);
+        self.push_shaded_tri(v1, c1, v1b, c1, v0b, c0, 0, kind);
     }
 
     // ----- Phase 2: textured tris + quads -----
@@ -332,7 +403,11 @@ impl Translator {
         let prim_flags = self.tex_prim_flags(cmd, clut);
         let color = tex_tint(cmd);
         let kind = self.blend_kind(cmd);
-        self.push_tex_tri(v0, uv0, v1, uv1, v2, uv2, color, prim_flags, kind);
+        if self.wireframe {
+            self.push_wire_tri(v0, color, v1, color, v2, color, BlendKind::Opaque);
+        } else {
+            self.push_tex_tri_psx(v0, uv0, v1, uv1, v2, uv2, color, prim_flags, kind);
+        }
     }
 
     /// `0x2C..=0x2F` — textured quad. Packet:
@@ -361,8 +436,13 @@ impl Translator {
         let color = tex_tint(cmd);
         let kind = self.blend_kind(cmd);
 
-        self.push_tex_tri(v0, uv0, v1, uv1, v2, uv2, color, prim_flags, kind);
-        self.push_tex_tri(v1, uv1, v3, uv3, v2, uv2, color, prim_flags, kind);
+        if self.wireframe {
+            self.push_wire_tri(v0, color, v1, color, v2, color, BlendKind::Opaque);
+            self.push_wire_tri(v1, color, v3, color, v2, color, BlendKind::Opaque);
+        } else {
+            self.push_tex_tri_psx(v0, uv0, v1, uv1, v2, uv2, color, prim_flags, kind);
+            self.push_tex_tri_psx(v1, uv1, v3, uv3, v2, uv2, color, prim_flags, kind);
+        }
     }
 
     /// Pack the per-primitive state setter bits + vertex flags
@@ -378,14 +458,59 @@ impl Translator {
             flags |= fbits::RAW_TEXTURE;
         }
         if is_semi_trans(cmd) {
-            // Phase 4 wires this up to a blend-state branch. For
-            // now it's tracked but the pipeline's blend state is
-            // still REPLACE — semi-trans textured pixels render
-            // as opaque. Visible in some FMVs / particle
-            // effects; will land with Phase 4.
+            // Textured semi-transparency is split into an opaque
+            // non-STP pass and a blended STP-only pass at emission
+            // time. Keep the primitive bit here so debug dumps can
+            // still identify the original GP0 state.
             flags |= fbits::SEMI_TRANS;
         }
         flags
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_tex_tri_psx(
+        &mut self,
+        v0: (i32, i32),
+        uv0: (u8, u8),
+        v1: (i32, i32),
+        uv1: (u8, u8),
+        v2: (i32, i32),
+        uv2: (u8, u8),
+        color: [u8; 4],
+        prim_flags: u32,
+        kind: BlendKind,
+    ) {
+        if kind == BlendKind::Opaque {
+            self.push_tex_tri(v0, uv0, v1, uv1, v2, uv2, color, prim_flags, kind);
+            return;
+        }
+
+        // Textured PS1 semi-transparency is per texel: cmd-bit semi-trans
+        // enables blending only for sampled texels whose bit 15 is set.
+        // Fixed-function blending is per draw, so emit the primitive twice:
+        // solid texels first, then STP texels through the requested blend.
+        self.push_tex_tri(
+            v0,
+            uv0,
+            v1,
+            uv1,
+            v2,
+            uv2,
+            color,
+            prim_flags | fbits::TEX_OPAQUE_PASS,
+            BlendKind::Opaque,
+        );
+        self.push_tex_tri(
+            v0,
+            uv0,
+            v1,
+            uv1,
+            v2,
+            uv2,
+            color,
+            prim_flags | fbits::TEX_SEMI_PASS,
+            kind,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -431,7 +556,11 @@ impl Translator {
         let v1 = decode_vertex(&self.state, fifo[3]);
         let c2 = mono_color_rgba8(fifo[4]);
         let v2 = decode_vertex(&self.state, fifo[5]);
-        self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0, kind);
+        if self.wireframe {
+            self.push_wire_tri(v0, c0, v1, c1, v2, c2, kind);
+        } else {
+            self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0, kind);
+        }
     }
 
     /// `0x38..=0x3B` — Gouraud-shaded quad.
@@ -450,8 +579,13 @@ impl Translator {
         let v2 = decode_vertex(&self.state, fifo[5]);
         let c3 = mono_color_rgba8(fifo[6]);
         let v3 = decode_vertex(&self.state, fifo[7]);
-        self.push_shaded_tri(v1, c1, v3, c3, v2, c2, 0, kind);
-        self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0, kind);
+        if self.wireframe {
+            self.push_wire_tri(v1, c1, v3, c3, v2, c2, kind);
+            self.push_wire_tri(v0, c0, v1, c1, v2, c2, kind);
+        } else {
+            self.push_shaded_tri(v1, c1, v3, c3, v2, c2, 0, kind);
+            self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0, kind);
+        }
     }
 
     /// `0x34..=0x37` — Gouraud + textured triangle.
@@ -475,7 +609,11 @@ impl Translator {
 
         let prim_flags = self.tex_prim_flags(cmd, clut);
         let kind = self.blend_kind(cmd);
-        self.push_tex_tri_shaded(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags, kind);
+        if self.wireframe {
+            self.push_wire_tri(v0, c0, v1, c1, v2, c2, BlendKind::Opaque);
+        } else {
+            self.push_tex_tri_shaded_psx(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags, kind);
+        }
     }
 
     /// `0x3C..=0x3F` — Gouraud + textured quad. Words:
@@ -503,8 +641,13 @@ impl Translator {
 
         let prim_flags = self.tex_prim_flags(cmd, clut);
         let kind = self.blend_kind(cmd);
-        self.push_tex_tri_shaded(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags, kind);
-        self.push_tex_tri_shaded(v1, uv1, c1, v3, uv3, c3, v2, uv2, c2, prim_flags, kind);
+        if self.wireframe {
+            self.push_wire_tri(v0, c0, v1, c1, v2, c2, BlendKind::Opaque);
+            self.push_wire_tri(v1, c1, v3, c3, v2, c2, BlendKind::Opaque);
+        } else {
+            self.push_tex_tri_shaded_psx(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags, kind);
+            self.push_tex_tri_shaded_psx(v1, uv1, c1, v3, uv3, c3, v2, uv2, c2, prim_flags, kind);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -529,6 +672,54 @@ impl Translator {
         self.push_vertex(kind, clip, make(v0, c0));
         self.push_vertex(kind, clip, make(v1, c1));
         self.push_vertex(kind, clip, make(v2, c2));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_tex_tri_shaded_psx(
+        &mut self,
+        v0: (i32, i32),
+        uv0: (u8, u8),
+        c0: [u8; 4],
+        v1: (i32, i32),
+        uv1: (u8, u8),
+        c1: [u8; 4],
+        v2: (i32, i32),
+        uv2: (u8, u8),
+        c2: [u8; 4],
+        prim_flags: u32,
+        kind: BlendKind,
+    ) {
+        if kind == BlendKind::Opaque {
+            self.push_tex_tri_shaded(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags, kind);
+            return;
+        }
+
+        self.push_tex_tri_shaded(
+            v0,
+            uv0,
+            c0,
+            v1,
+            uv1,
+            c1,
+            v2,
+            uv2,
+            c2,
+            prim_flags | fbits::TEX_OPAQUE_PASS,
+            BlendKind::Opaque,
+        );
+        self.push_tex_tri_shaded(
+            v0,
+            uv0,
+            c0,
+            v1,
+            uv1,
+            c1,
+            v2,
+            uv2,
+            c2,
+            prim_flags | fbits::TEX_SEMI_PASS,
+            kind,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -709,8 +900,8 @@ impl Translator {
         let p_b = (x + w, y);
         let p_c = (x, y + h);
         let p_d = (x + w, y + h);
-        self.push_tex_tri(p_a, uv_a, p_b, uv_b, p_c, uv_c, color, prim_flags, kind);
-        self.push_tex_tri(p_b, uv_b, p_d, uv_d, p_c, uv_c, color, prim_flags, kind);
+        self.push_tex_tri_psx(p_a, uv_a, p_b, uv_b, p_c, uv_c, color, prim_flags, kind);
+        self.push_tex_tri_psx(p_b, uv_b, p_d, uv_d, p_c, uv_c, color, prim_flags, kind);
     }
 }
 
@@ -768,5 +959,148 @@ fn sign_extend_11(v: i32) -> i32 {
         v | !0x7FF
     } else {
         v & 0x7FF
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emulator_core::gpu::GpuCmdLogEntry;
+
+    fn entry(opcode: u8, fifo: Vec<u32>) -> GpuCmdLogEntry {
+        GpuCmdLogEntry {
+            index: 0,
+            opcode,
+            fifo,
+        }
+    }
+
+    fn xy(x: u16, y: u16) -> u32 {
+        u32::from(x) | (u32::from(y) << 16)
+    }
+
+    fn uv(u: u8, v: u8, high: u16) -> u32 {
+        u32::from(u) | (u32::from(v) << 8) | (u32::from(high) << 16)
+    }
+
+    #[test]
+    fn opaque_textured_tri_emits_one_opaque_pass() {
+        let log = [entry(
+            0x24,
+            vec![
+                0x2480_8080,
+                xy(10, 10),
+                uv(0, 0, 0),
+                xy(20, 10),
+                uv(8, 0, 0),
+                xy(10, 20),
+                uv(0, 8, 0),
+            ],
+        )];
+        let mut translator = Translator::new();
+        let frame = translator.translate(&log);
+
+        assert_eq!(frame.total(), 3);
+        assert_eq!(frame.runs.len(), 1);
+        assert_eq!(frame.runs[0].kind, BlendKind::Opaque);
+        assert_eq!(frame.runs[0].count, 3);
+        for v in frame.vertices {
+            assert_eq!(v.flags & fbits::TEX_OPAQUE_PASS, 0);
+            assert_eq!(v.flags & fbits::TEX_SEMI_PASS, 0);
+        }
+    }
+
+    #[test]
+    fn semi_trans_textured_tri_splits_opaque_and_stp_passes() {
+        let log = [entry(
+            0x26,
+            vec![
+                0x2680_8080,
+                xy(10, 10),
+                uv(0, 0, 0),
+                xy(20, 10),
+                uv(8, 0, 0),
+                xy(10, 20),
+                uv(0, 8, 0),
+            ],
+        )];
+        let mut translator = Translator::new();
+        let frame = translator.translate(&log);
+
+        assert_eq!(frame.total(), 6);
+        assert_eq!(frame.runs.len(), 2);
+        assert_eq!(frame.runs[0].kind, BlendKind::Opaque);
+        assert_eq!(frame.runs[0].start, 0);
+        assert_eq!(frame.runs[0].count, 3);
+        assert_eq!(frame.runs[1].kind, BlendKind::Average);
+        assert_eq!(frame.runs[1].start, 3);
+        assert_eq!(frame.runs[1].count, 3);
+
+        for v in &frame.vertices[0..3] {
+            assert_ne!(v.flags & fbits::SEMI_TRANS, 0);
+            assert_ne!(v.flags & fbits::TEX_OPAQUE_PASS, 0);
+            assert_eq!(v.flags & fbits::TEX_SEMI_PASS, 0);
+        }
+        for v in &frame.vertices[3..6] {
+            assert_ne!(v.flags & fbits::SEMI_TRANS, 0);
+            assert_eq!(v.flags & fbits::TEX_OPAQUE_PASS, 0);
+            assert_ne!(v.flags & fbits::TEX_SEMI_PASS, 0);
+        }
+    }
+
+    #[test]
+    fn wireframe_mono_tri_emits_edge_strips() {
+        let log = [entry(
+            0x20,
+            vec![0x20FF_FFFF, xy(10, 10), xy(20, 10), xy(10, 20)],
+        )];
+        let mut translator = Translator::new();
+        let frame = translator.translate_with_wireframe(&log, true);
+
+        assert_eq!(frame.total(), 18);
+        assert_eq!(frame.runs.len(), 1);
+        assert_eq!(frame.runs[0].kind, BlendKind::Opaque);
+        assert_eq!(frame.runs[0].count, 18);
+        for v in frame.vertices {
+            assert_eq!(v.flags, 0);
+        }
+    }
+
+    #[test]
+    fn wireframe_textured_tri_ignores_texture_and_stays_opaque() {
+        let log = [entry(
+            0x26,
+            vec![
+                0x2680_8080,
+                xy(10, 10),
+                uv(0, 0, 0),
+                xy(20, 10),
+                uv(8, 0, 0),
+                xy(10, 20),
+                uv(0, 8, 0),
+            ],
+        )];
+        let mut translator = Translator::new();
+        let frame = translator.translate_with_wireframe(&log, true);
+
+        assert_eq!(frame.total(), 18);
+        assert_eq!(frame.runs.len(), 1);
+        assert_eq!(frame.runs[0].kind, BlendKind::Opaque);
+        assert_eq!(frame.runs[0].count, 18);
+        for v in frame.vertices {
+            assert_eq!(v.flags, 0);
+        }
+    }
+
+    #[test]
+    fn wireframe_leaves_rectangles_filled() {
+        let log = [entry(0x60, vec![0x60FF_FFFF, xy(10, 10), xy(16, 16)])];
+        let mut translator = Translator::new();
+        let frame = translator.translate_with_wireframe(&log, true);
+
+        assert_eq!(frame.total(), 6);
+        assert_eq!(frame.runs.len(), 1);
+        assert_eq!(frame.runs[0].kind, BlendKind::Opaque);
+        assert_eq!(frame.runs[0].count, 6);
     }
 }
