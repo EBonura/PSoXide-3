@@ -409,12 +409,19 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
     }
 
     if let Some(path) = args.dump_hw {
-        dump_hw_ppm(&bus, &path)?;
-        eprintln!(
-            "[cli] HW renderer → {} ({} cmd_log entries replayed)",
-            path.display(),
-            bus.gpu.cmd_log.len()
-        );
+        let used_24bpp_fallback = dump_hw_ppm(&bus, &path)?;
+        if used_24bpp_fallback {
+            eprintln!(
+                "[cli] HW renderer → {} (24bpp display fallback)",
+                path.display()
+            );
+        } else {
+            eprintln!(
+                "[cli] HW renderer → {} ({} cmd_log entries replayed)",
+                path.display(),
+                bus.gpu.cmd_log.len()
+            );
+        }
     }
 
     Ok(())
@@ -481,7 +488,14 @@ fn region_label(e: &LibraryEntry) -> &'static str {
     }
 }
 
-fn dump_hw_ppm(bus: &Bus, path: &std::path::Path) -> Result<(), String> {
+fn dump_hw_ppm(bus: &Bus, path: &std::path::Path) -> Result<bool, String> {
+    let display = bus.gpu.display_area();
+    if display.bpp24 {
+        let (rgba, w, h) = bus.gpu.display_rgba8();
+        write_rgb_ppm_from_rgba(path, w, h, &rgba)?;
+        return Ok(true);
+    }
+
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..Default::default()
@@ -507,7 +521,6 @@ fn dump_hw_ppm(bus: &Bus, path: &std::path::Path) -> Result<(), String> {
     let vram_words: Vec<u16> = bus.gpu.vram.words().to_vec();
     hw.render_frame(&bus.gpu, &bus.gpu.cmd_log, &vram_words);
 
-    let display = bus.gpu.display_area();
     let s = hw.internal_scale();
     let (w, h, rgba) = hw.read_subrect_rgba8(
         display.x as u32 * s,
@@ -515,6 +528,16 @@ fn dump_hw_ppm(bus: &Bus, path: &std::path::Path) -> Result<(), String> {
         display.width as u32 * s,
         display.height as u32 * s,
     );
+    write_rgb_ppm_from_rgba(path, w, h, &rgba)?;
+    Ok(false)
+}
+
+fn write_rgb_ppm_from_rgba(
+    path: &std::path::Path,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) -> Result<(), String> {
     use std::io::Write;
     let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
     writeln!(f, "P6\n{w} {h}\n255").map_err(|e| e.to_string())?;

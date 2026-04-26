@@ -10,6 +10,12 @@ use emulator_core::{Gpu, Vram, VRAM_HEIGHT, VRAM_WIDTH};
 use psx_gpu_render::HwRenderer;
 use winit::window::Window;
 
+/// Largest logical display window the PSX exposes. The 24bpp fallback
+/// texture is allocated once at this size and each frame uploads the
+/// active display area into its top-left corner.
+pub const MAX_DISPLAY_WIDTH: u32 = 640;
+pub const MAX_DISPLAY_HEIGHT: u32 = 480;
+
 /// All GPU / windowing state. Built lazily in `App::resumed` because
 /// winit 0.30 + macOS requires the window to be created inside the
 /// `resumed()` callback, not before.
@@ -30,10 +36,18 @@ pub struct Graphics {
     /// Egui-side handle for the VRAM texture; panels reference it via
     /// [`Graphics::vram_texture_id`].
     vram_texture_id: egui::TextureId,
+    /// Packed visible framebuffer used only for 24bpp display modes.
+    /// The HW target is VRAM-cell-shaped, but 24bpp video packs RGB
+    /// bytes across cells, so presentation needs this CPU decode path.
+    display_texture: wgpu::Texture,
+    /// Egui-side handle for the 24bpp display fallback texture.
+    display_texture_id: egui::TextureId,
     /// Hardware renderer — issues per-primitive wgpu draw calls
     /// from the frame's `cmd_log` into a VRAM-shaped texture. Both
     /// Native and Window framebuffer modes use this path; the only
-    /// difference is the internal resolution multiplier.
+    /// difference is the internal resolution multiplier. 24bpp video
+    /// presentation falls back to [`Gpu::display_rgba8`] until the HW
+    /// presenter has a packed-RGB decode shader.
     hw_renderer: HwRenderer,
 }
 
@@ -94,6 +108,14 @@ impl Graphics {
         let vram_texture_id =
             egui_renderer.register_native_texture(&device, &vram_view, wgpu::FilterMode::Nearest);
 
+        let display_texture = create_display_texture(&device);
+        let display_view = display_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let display_texture_id = egui_renderer.register_native_texture(
+            &device,
+            &display_view,
+            wgpu::FilterMode::Nearest,
+        );
+
         let hw_renderer = HwRenderer::new(device.clone(), queue.clone(), &mut egui_renderer);
 
         Self {
@@ -107,6 +129,8 @@ impl Graphics {
             egui_renderer,
             vram_texture,
             vram_texture_id,
+            display_texture,
+            display_texture_id,
             hw_renderer,
         }
     }
@@ -115,6 +139,11 @@ impl Graphics {
     /// window; safe to pass to panels once per frame.
     pub fn vram_texture_id(&self) -> egui::TextureId {
         self.vram_texture_id
+    }
+
+    /// Egui handle for the packed 24bpp display fallback texture.
+    pub fn display_texture_id(&self) -> egui::TextureId {
+        self.display_texture_id
     }
 
     /// Egui handle for the hardware-renderer target.
@@ -177,6 +206,67 @@ impl Graphics {
             wgpu::Extent3d {
                 width: VRAM_WIDTH as u32,
                 height: VRAM_HEIGHT as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Upload the CPU-decoded display area for 24bpp presentation.
+    /// Normal 15bpp/CLUT rendering stays on the HW target; this path
+    /// exists because PS1 24bpp display pixels are packed as byte
+    /// triplets across 16-bit VRAM cells.
+    pub fn prepare_24bpp_display(&self, gpu: Option<&Gpu>) {
+        let Some(gpu) = gpu else {
+            self.clear_display_texture();
+            return;
+        };
+        if !gpu.display_area().bpp24 {
+            return;
+        }
+        let (rgba, width, height) = gpu.display_rgba8();
+        if width == 0 || height == 0 || rgba.is_empty() {
+            self.clear_display_texture();
+            return;
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.display_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn clear_display_texture(&self) {
+        let rgba = vec![0u8; (MAX_DISPLAY_WIDTH * MAX_DISPLAY_HEIGHT * 4) as usize];
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.display_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(MAX_DISPLAY_WIDTH * 4),
+                rows_per_image: Some(MAX_DISPLAY_HEIGHT),
+            },
+            wgpu::Extent3d {
+                width: MAX_DISPLAY_WIDTH,
+                height: MAX_DISPLAY_HEIGHT,
                 depth_or_array_layers: 1,
             },
         );
@@ -287,6 +377,23 @@ fn create_rgba_texture(device: &wgpu::Device, label: &'static str) -> wgpu::Text
         size: wgpu::Extent3d {
             width: VRAM_WIDTH as u32,
             height: VRAM_HEIGHT as u32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn create_display_texture(device: &wgpu::Device) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("psoxide3-display-24bpp"),
+        size: wgpu::Extent3d {
+            width: MAX_DISPLAY_WIDTH,
+            height: MAX_DISPLAY_HEIGHT,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,

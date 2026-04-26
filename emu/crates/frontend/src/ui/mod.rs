@@ -21,6 +21,7 @@ pub fn draw_layout(
     state: &mut AppState,
     vram_tex: egui::TextureId,
     display_tex: egui::TextureId,
+    framebuffer_source: framebuffer::FramebufferSource,
     dt: f32,
 ) {
     state.hud.update(dt, state.cpu.tick());
@@ -63,6 +64,7 @@ pub fn draw_layout(
         framebuffer::draw(
             ui,
             display_tex,
+            framebuffer_source,
             state.bus.as_ref(),
             &mut state.framebuffer_present_size_px,
         );

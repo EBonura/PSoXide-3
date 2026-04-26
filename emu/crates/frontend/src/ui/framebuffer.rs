@@ -1,11 +1,12 @@
 //! Framebuffer view for the central panel.
 //!
-//! The central panel presents the hardware renderer's VRAM-shaped
-//! target. Native and high-resolution modes share this path and only
-//! differ by the renderer's internal scale.
+//! The central panel usually presents the hardware renderer's
+//! VRAM-shaped target. 24bpp video frames use a packed CPU-decoded
+//! display texture because RGB888 pixels straddle 16-bit VRAM cells.
 
 use emulator_core::{Bus, DisplayArea};
 
+use crate::gfx::{MAX_DISPLAY_HEIGHT, MAX_DISPLAY_WIDTH};
 use crate::theme;
 
 const DEFAULT_FB_WIDTH: f32 = 320.0;
@@ -17,9 +18,21 @@ const DEFAULT_FB_HEIGHT: f32 = 240.0;
 /// squash horizontally on a real CRT, not stretch into 16:9.
 const CRT_ASPECT: f32 = 4.0 / 3.0;
 
+/// Which texture layout the framebuffer is currently sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramebufferSource {
+    /// Packed visible display at texture origin, produced by
+    /// `Gpu::display_rgba8` for 24bpp video modes.
+    CpuDisplay,
+    /// VRAM-shaped hardware-renderer target. The active display area
+    /// lives at its real PSX VRAM coordinates.
+    HardwareVram,
+}
+
 pub fn draw(
     ui: &mut egui::Ui,
     display_tex: egui::TextureId,
+    source: FramebufferSource,
     bus: Option<&Bus>,
     present_size_px: &mut (u32, u32),
 ) {
@@ -57,16 +70,25 @@ pub fn draw(
             (rect.height() * pixels_per_point).round().max(1.0) as u32,
         );
 
-        let uv = egui::Rect::from_min_max(
-            egui::pos2(
-                area.x as f32 / psx_gpu_render::VRAM_WIDTH as f32,
-                area.y as f32 / psx_gpu_render::VRAM_HEIGHT as f32,
+        let uv = match source {
+            FramebufferSource::CpuDisplay => egui::Rect::from_min_max(
+                egui::pos2(0.0, 0.0),
+                egui::pos2(
+                    area.width as f32 / MAX_DISPLAY_WIDTH as f32,
+                    area.height as f32 / MAX_DISPLAY_HEIGHT as f32,
+                ),
             ),
-            egui::pos2(
-                (area.x + area.width) as f32 / psx_gpu_render::VRAM_WIDTH as f32,
-                (area.y + area.height) as f32 / psx_gpu_render::VRAM_HEIGHT as f32,
+            FramebufferSource::HardwareVram => egui::Rect::from_min_max(
+                egui::pos2(
+                    area.x as f32 / psx_gpu_render::VRAM_WIDTH as f32,
+                    area.y as f32 / psx_gpu_render::VRAM_HEIGHT as f32,
+                ),
+                egui::pos2(
+                    (area.x + area.width) as f32 / psx_gpu_render::VRAM_WIDTH as f32,
+                    (area.y + area.height) as f32 / psx_gpu_render::VRAM_HEIGHT as f32,
+                ),
             ),
-        );
+        };
 
         ui.allocate_rect(avail, egui::Sense::hover());
         egui::Image::new((display_tex, rect.size()))
