@@ -10,6 +10,12 @@ use emulator_core::{Gpu, Vram, VRAM_HEIGHT, VRAM_WIDTH};
 use psx_gpu_render::HwRenderer;
 use winit::window::Window;
 
+/// Largest logical display window the PSX exposes. The visible
+/// framebuffer texture is allocated once at this size and each frame
+/// uploads the active display area into its top-left corner.
+pub const MAX_DISPLAY_WIDTH: u32 = 640;
+pub const MAX_DISPLAY_HEIGHT: u32 = 480;
+
 /// All GPU / windowing state. Built lazily in `App::resumed` because
 /// winit 0.30 + macOS requires the window to be created inside the
 /// `resumed()` callback, not before.
@@ -30,9 +36,18 @@ pub struct Graphics {
     /// Egui-side handle for the VRAM texture; panels reference it via
     /// [`Graphics::vram_texture_id`].
     vram_texture_id: egui::TextureId,
+    /// Packed visible framebuffer texture. Unlike `vram_texture`,
+    /// this uses [`Gpu::display_rgba8`] so 24 bpp display modes and
+    /// display-window clipping are presented exactly like the CPU
+    /// reference path.
+    display_texture: wgpu::Texture,
+    /// Egui-side handle for the visible framebuffer texture.
+    display_texture_id: egui::TextureId,
     /// Hardware renderer — issues per-primitive wgpu draw calls
-    /// from the frame's `cmd_log` into a window-resolution texture.
-    /// Replaces the old `prepare_display` CPU-blit path entirely.
+    /// from the frame's `cmd_log` into a VRAM-shaped texture.
+    /// Kept live for diagnostics / parity work, but the user-visible
+    /// framebuffer remains CPU-backed until this path mirrors every
+    /// VRAM upload/copy operation.
     hw_renderer: HwRenderer,
 }
 
@@ -93,6 +108,14 @@ impl Graphics {
         let vram_texture_id =
             egui_renderer.register_native_texture(&device, &vram_view, wgpu::FilterMode::Nearest);
 
+        let display_texture = create_display_texture(&device);
+        let display_view = display_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let display_texture_id = egui_renderer.register_native_texture(
+            &device,
+            &display_view,
+            wgpu::FilterMode::Nearest,
+        );
+
         let hw_renderer = HwRenderer::new(device.clone(), queue.clone(), &mut egui_renderer);
 
         Self {
@@ -106,6 +129,8 @@ impl Graphics {
             egui_renderer,
             vram_texture,
             vram_texture_id,
+            display_texture,
+            display_texture_id,
             hw_renderer,
         }
     }
@@ -116,38 +141,45 @@ impl Graphics {
         self.vram_texture_id
     }
 
-    /// Egui handle for the hardware renderer's output texture.
-    /// The id is stable for the life of the window even though the
-    /// underlying wgpu texture is re-allocated whenever the
-    /// requested target size changes (window resize, display-rect
-    /// change, scale-mode toggle).
+    /// Egui handle for the CPU-reference visible framebuffer texture.
+    pub fn display_texture_id(&self) -> egui::TextureId {
+        self.display_texture_id
+    }
+
+    /// Egui handle for the high-resolution hardware renderer target.
     pub fn hw_texture_id(&self) -> egui::TextureId {
         self.hw_renderer.texture_id()
     }
 
     /// Drive the hardware renderer for one frame. Walks `cmd_log`,
     /// issues wgpu draw calls for the supported primitive types,
-    /// and leaves the result in the texture exposed by
-    /// [`Graphics::hw_texture_id`]. `vram_words` is the CPU
-    /// rasterizer's VRAM (post-frame), uploaded into the GPU-side
-    /// `R16Uint` so textured primitives can sample the right
-    /// texels + CLUT entries.
+    /// and leaves the result in the renderer's VRAM-shaped target.
+    /// `vram_words` is the CPU rasterizer's VRAM (post-frame),
+    /// uploaded into the GPU-side `R16Uint` so textured primitives
+    /// can sample the right texels + CLUT entries.
     pub fn render_hw_frame(
         &mut self,
         gpu: &Gpu,
-        scale_mode: psx_gpu_render::ScaleMode,
-        panel_size_px: (u32, u32),
         cmd_log: &[emulator_core::gpu::GpuCmdLogEntry],
         vram_words: &[u16],
     ) {
-        self.hw_renderer.render_frame(
-            gpu,
-            scale_mode,
-            panel_size_px,
-            &mut self.egui_renderer,
-            cmd_log,
-            vram_words,
-        );
+        self.hw_renderer.render_frame(gpu, cmd_log, vram_words);
+    }
+
+    /// Pick the right internal-resolution multiplier for the current
+    /// scale-mode + panel size and reallocate the HW target to it
+    /// if changed. Cheap when the size is stable; reallocation
+    /// clears the target so the frontend may want to flush a fresh
+    /// frame after toggling.
+    pub fn update_hw_scale(
+        &mut self,
+        scale_mode: psx_gpu_render::ScaleMode,
+        panel_size_px: (u32, u32),
+        display_size: (u32, u32),
+    ) {
+        let s = psx_gpu_render::HwRenderer::scale_for(scale_mode, panel_size_px, display_size);
+        self.hw_renderer
+            .set_internal_scale(s, Some(&mut self.egui_renderer));
     }
 
     /// Upload a full VRAM snapshot to the GPU-side texture. Called once
@@ -174,6 +206,64 @@ impl Graphics {
             wgpu::Extent3d {
                 width: VRAM_WIDTH as u32,
                 height: VRAM_HEIGHT as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Upload the current visible display area into the packed
+    /// framebuffer texture. This is the authoritative presentation
+    /// source for the frontend because it includes CPU→VRAM uploads,
+    /// VRAM→VRAM copies, and 24 bpp display decoding.
+    pub fn prepare_display(&self, gpu: Option<&Gpu>) {
+        let Some(gpu) = gpu else {
+            self.clear_display_texture();
+            return;
+        };
+        let (rgba, width, height) = gpu.display_rgba8();
+        if width == 0 || height == 0 || rgba.is_empty() {
+            self.clear_display_texture();
+            return;
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.display_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn clear_display_texture(&self) {
+        let rgba = vec![0u8; (MAX_DISPLAY_WIDTH * MAX_DISPLAY_HEIGHT * 4) as usize];
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.display_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(MAX_DISPLAY_WIDTH * 4),
+                rows_per_image: Some(MAX_DISPLAY_HEIGHT),
+            },
+            wgpu::Extent3d {
+                width: MAX_DISPLAY_WIDTH,
+                height: MAX_DISPLAY_HEIGHT,
                 depth_or_array_layers: 1,
             },
         );
@@ -284,6 +374,23 @@ fn create_rgba_texture(device: &wgpu::Device, label: &'static str) -> wgpu::Text
         size: wgpu::Extent3d {
             width: VRAM_WIDTH as u32,
             height: VRAM_HEIGHT as u32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn create_display_texture(device: &wgpu::Device) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("psoxide3-display"),
+        size: wgpu::Extent3d {
+            width: MAX_DISPLAY_WIDTH,
+            height: MAX_DISPLAY_HEIGHT,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,

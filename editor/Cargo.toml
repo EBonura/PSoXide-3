@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/psxed-format",
     "crates/psxed-obj",
+    "crates/psxed-project",
     "crates/psxed-tex",
+    "crates/psxed-ui",
     "crates/psxed",
 ]
 
@@ -15,4 +17,9 @@ repository = "https://github.com/EBonura/PSoXide"
 [workspace.dependencies]
 psxed-format = { path = "crates/psxed-format" }
 psxed-obj    = { path = "crates/psxed-obj" }
+psxed-project = { path = "crates/psxed-project" }
 psxed-tex    = { path = "crates/psxed-tex" }
+psxed-ui     = { path = "crates/psxed-ui" }
+
+egui  = "0.31"
+serde = { version = "1.0", features = ["derive"] }

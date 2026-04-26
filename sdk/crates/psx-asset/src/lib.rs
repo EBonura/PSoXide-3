@@ -46,14 +46,21 @@ use psx_gte::math::Vec3I16;
 pub enum ParseError {
     /// Blob shorter than the minimum header sizes.
     Truncated,
-    /// `AssetHeader::magic` doesn't match `PSXM`.
+    /// `AssetHeader::magic` doesn't match the expected asset kind.
     WrongMagic,
     /// Format version newer than this parser supports.
     UnsupportedVersion(u16),
     /// Declared payload_len disagrees with the actual byte length.
-    InvalidPayloadLen { declared: u32, actual: usize },
+    InvalidPayloadLen {
+        /// Payload length declared in the common asset header.
+        declared: u32,
+        /// Actual payload byte count after the common asset header.
+        actual: usize,
+    },
     /// Vertex or face table wouldn't fit in the remaining payload.
     TableOverflow,
+    /// World-grid header fields are inconsistent.
+    InvalidWorldLayout,
 }
 
 /// A parsed 3D mesh backed by slices into the caller's cooked blob.
@@ -388,6 +395,390 @@ impl<'a> Texture<'a> {
     }
 }
 
+/// A parsed `.psxw` grid-world backed by slices into the cooked blob.
+///
+/// This is the runtime view of the binary format, not the higher-level engine
+/// `psx_engine::GridWorld` model. It keeps parsing zero-copy and lets engine
+/// code pull sectors and walls by value as needed.
+#[derive(Copy, Clone, Debug)]
+pub struct World<'a> {
+    sectors: &'a [u8],
+    walls: &'a [u8],
+    width: u16,
+    depth: u16,
+    sector_size: i32,
+    material_count: u16,
+    wall_count: u16,
+    ambient_color: [u8; 3],
+    flags: u8,
+}
+
+impl<'a> World<'a> {
+    /// Parse a cooked `.psxw` blob.
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, ParseError> {
+        use psxed_format::world::{WorldHeader, MAGIC, VERSION};
+
+        if bytes.len() < psxed_format::AssetHeader::SIZE {
+            return Err(ParseError::Truncated);
+        }
+        let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if magic != MAGIC {
+            return Err(ParseError::WrongMagic);
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != VERSION {
+            return Err(ParseError::UnsupportedVersion(version));
+        }
+        let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let payload_start = psxed_format::AssetHeader::SIZE;
+        let actual_payload = bytes.len().saturating_sub(payload_start);
+        if payload_len as usize != actual_payload {
+            return Err(ParseError::InvalidPayloadLen {
+                declared: payload_len,
+                actual: actual_payload,
+            });
+        }
+        if actual_payload < WorldHeader::SIZE {
+            return Err(ParseError::Truncated);
+        }
+
+        let wh = &bytes[payload_start..payload_start + WorldHeader::SIZE];
+        let width = read_u16(wh, 0);
+        let depth = read_u16(wh, 2);
+        let sector_size = read_i32(wh, 4);
+        let sector_count = read_u16(wh, 8);
+        let material_count = read_u16(wh, 10);
+        let wall_count = read_u16(wh, 12);
+        let ambient_color = [wh[14], wh[15], wh[16]];
+        let flags = wh[17];
+
+        let expected_sectors = (width as usize)
+            .checked_mul(depth as usize)
+            .ok_or(ParseError::InvalidWorldLayout)?;
+        if sector_count as usize != expected_sectors {
+            return Err(ParseError::InvalidWorldLayout);
+        }
+
+        let mut off = payload_start + WorldHeader::SIZE;
+        let sector_bytes = (sector_count as usize)
+            .checked_mul(psxed_format::world::SectorRecord::SIZE)
+            .ok_or(ParseError::TableOverflow)?;
+        if off + sector_bytes > bytes.len() {
+            return Err(ParseError::TableOverflow);
+        }
+        let sectors = &bytes[off..off + sector_bytes];
+        off += sector_bytes;
+
+        let wall_bytes = (wall_count as usize)
+            .checked_mul(psxed_format::world::WallRecord::SIZE)
+            .ok_or(ParseError::TableOverflow)?;
+        if off + wall_bytes > bytes.len() {
+            return Err(ParseError::TableOverflow);
+        }
+        let walls = &bytes[off..off + wall_bytes];
+        off += wall_bytes;
+        if off != bytes.len() {
+            return Err(ParseError::InvalidWorldLayout);
+        }
+
+        validate_sector_wall_ranges(sectors, wall_count)?;
+
+        Ok(Self {
+            sectors,
+            walls,
+            width,
+            depth,
+            sector_size,
+            material_count,
+            wall_count,
+            ambient_color,
+            flags,
+        })
+    }
+
+    /// Width in grid sectors.
+    #[inline]
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    /// Depth in grid sectors.
+    #[inline]
+    pub fn depth(&self) -> u16 {
+        self.depth
+    }
+
+    /// Engine units per sector.
+    #[inline]
+    pub fn sector_size(&self) -> i32 {
+        self.sector_size
+    }
+
+    /// Number of material slots referenced by the world.
+    #[inline]
+    pub fn material_count(&self) -> u16 {
+        self.material_count
+    }
+
+    /// Number of wall records in the world.
+    #[inline]
+    pub fn wall_count(&self) -> u16 {
+        self.wall_count
+    }
+
+    /// Ambient RGB color.
+    #[inline]
+    pub fn ambient_color(&self) -> [u8; 3] {
+        self.ambient_color
+    }
+
+    /// Whether fog/depth cue is enabled for this world.
+    #[inline]
+    pub fn fog_enabled(&self) -> bool {
+        self.flags & psxed_format::world::world_flags::FOG_ENABLED != 0
+    }
+
+    /// Sector at a coordinate, returning `None` for empty cells or out of range.
+    pub fn sector(&self, x: u16, z: u16) -> Option<WorldSector> {
+        if x >= self.width || z >= self.depth {
+            return None;
+        }
+        let index = x as usize * self.depth as usize + z as usize;
+        let sector = self.sector_record(index)?;
+        if sector.has_geometry() {
+            Some(sector)
+        } else {
+            None
+        }
+    }
+
+    /// Sector record by flat `[x * depth + z]` index, including empty cells.
+    pub fn sector_record(&self, index: usize) -> Option<WorldSector> {
+        let size = psxed_format::world::SectorRecord::SIZE;
+        let base = index.checked_mul(size)?;
+        let end = base.checked_add(size)?;
+        let bytes = self.sectors.get(base..end)?;
+        Some(WorldSector::decode(bytes))
+    }
+
+    /// Wall record by global wall index.
+    pub fn wall(&self, index: u16) -> Option<WorldWall> {
+        if index >= self.wall_count {
+            return None;
+        }
+        let size = psxed_format::world::WallRecord::SIZE;
+        let base = index as usize * size;
+        let end = base.checked_add(size)?;
+        let bytes = self.walls.get(base..end)?;
+        Some(WorldWall::decode(bytes))
+    }
+
+    /// Wall record by sector-local wall index.
+    pub fn sector_wall(&self, sector: WorldSector, local_index: u16) -> Option<WorldWall> {
+        if local_index >= sector.wall_count {
+            return None;
+        }
+        self.wall(sector.first_wall.checked_add(local_index)?)
+    }
+}
+
+/// One decoded world sector record.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WorldSector {
+    flags: u8,
+    floor_split: u8,
+    ceiling_split: u8,
+    floor_material: u16,
+    ceiling_material: u16,
+    first_wall: u16,
+    wall_count: u16,
+    floor_heights: [i32; 4],
+    ceiling_heights: [i32; 4],
+}
+
+impl WorldSector {
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            flags: bytes[0],
+            floor_split: bytes[1],
+            ceiling_split: bytes[2],
+            floor_material: read_u16(bytes, 4),
+            ceiling_material: read_u16(bytes, 6),
+            first_wall: read_u16(bytes, 8),
+            wall_count: read_u16(bytes, 10),
+            floor_heights: read_i32x4(bytes, 12),
+            ceiling_heights: read_i32x4(bytes, 28),
+        }
+    }
+
+    /// True if this sector has any floor, ceiling, or wall geometry.
+    #[inline]
+    pub fn has_geometry(&self) -> bool {
+        self.has_floor() || self.has_ceiling() || self.wall_count != 0
+    }
+
+    /// True if this sector has a floor face.
+    #[inline]
+    pub fn has_floor(&self) -> bool {
+        self.flags & psxed_format::world::sector_flags::HAS_FLOOR != 0
+    }
+
+    /// True if this sector has a ceiling face.
+    #[inline]
+    pub fn has_ceiling(&self) -> bool {
+        self.flags & psxed_format::world::sector_flags::HAS_CEILING != 0
+    }
+
+    /// True if the floor face is walkable.
+    #[inline]
+    pub fn floor_walkable(&self) -> bool {
+        self.flags & psxed_format::world::sector_flags::FLOOR_WALKABLE != 0
+    }
+
+    /// Floor diagonal split id.
+    #[inline]
+    pub fn floor_split(&self) -> u8 {
+        self.floor_split
+    }
+
+    /// Floor material slot.
+    #[inline]
+    pub fn floor_material(&self) -> Option<u16> {
+        material_or_none(self.floor_material)
+    }
+
+    /// Floor corner heights `[NW, NE, SE, SW]`.
+    #[inline]
+    pub fn floor_heights(&self) -> [i32; 4] {
+        self.floor_heights
+    }
+
+    /// Ceiling diagonal split id.
+    #[inline]
+    pub fn ceiling_split(&self) -> u8 {
+        self.ceiling_split
+    }
+
+    /// Ceiling material slot.
+    #[inline]
+    pub fn ceiling_material(&self) -> Option<u16> {
+        material_or_none(self.ceiling_material)
+    }
+
+    /// Ceiling corner heights `[NW, NE, SE, SW]`.
+    #[inline]
+    pub fn ceiling_heights(&self) -> [i32; 4] {
+        self.ceiling_heights
+    }
+
+    /// First global wall index for this sector.
+    #[inline]
+    pub fn first_wall(&self) -> u16 {
+        self.first_wall
+    }
+
+    /// Number of walls belonging to this sector.
+    #[inline]
+    pub fn wall_count(&self) -> u16 {
+        self.wall_count
+    }
+}
+
+/// One decoded world wall record.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WorldWall {
+    direction: u8,
+    flags: u8,
+    material: u16,
+    heights: [i32; 4],
+}
+
+impl WorldWall {
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            direction: bytes[0],
+            flags: bytes[1],
+            material: read_u16(bytes, 4),
+            heights: read_i32x4(bytes, 8),
+        }
+    }
+
+    /// Direction id, see `psxed_format::world::direction`.
+    #[inline]
+    pub fn direction(&self) -> u8 {
+        self.direction
+    }
+
+    /// Whether this wall blocks collision.
+    #[inline]
+    pub fn solid(&self) -> bool {
+        self.flags & psxed_format::world::wall_flags::SOLID != 0
+    }
+
+    /// Material slot.
+    #[inline]
+    pub fn material(&self) -> u16 {
+        self.material
+    }
+
+    /// Wall heights `[bottom-left, bottom-right, top-right, top-left]`.
+    #[inline]
+    pub fn heights(&self) -> [i32; 4] {
+        self.heights
+    }
+}
+
+#[inline]
+fn material_or_none(material: u16) -> Option<u16> {
+    if material == psxed_format::world::NO_MATERIAL {
+        None
+    } else {
+        Some(material)
+    }
+}
+
+#[inline]
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+#[inline]
+fn read_i32(bytes: &[u8], offset: usize) -> i32 {
+    i32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+#[inline]
+fn read_i32x4(bytes: &[u8], offset: usize) -> [i32; 4] {
+    [
+        read_i32(bytes, offset),
+        read_i32(bytes, offset + 4),
+        read_i32(bytes, offset + 8),
+        read_i32(bytes, offset + 12),
+    ]
+}
+
+fn validate_sector_wall_ranges(sectors: &[u8], wall_count: u16) -> Result<(), ParseError> {
+    let size = psxed_format::world::SectorRecord::SIZE;
+    let count = sectors.len() / size;
+    for index in 0..count {
+        let base = index * size;
+        let first_wall = read_u16(sectors, base + 8);
+        let sector_wall_count = read_u16(sectors, base + 10);
+        let Some(end) = first_wall.checked_add(sector_wall_count) else {
+            return Err(ParseError::InvalidWorldLayout);
+        };
+        if end > wall_count {
+            return Err(ParseError::InvalidWorldLayout);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +859,109 @@ mod tests {
         assert!(matches!(
             Texture::from_bytes(&bad),
             Err(ParseError::WrongMagic)
+        ));
+    }
+
+    #[test]
+    fn world_round_trip_1x1_with_wall() {
+        use psxed_format::world;
+
+        let payload_len =
+            (world::WorldHeader::SIZE + world::SectorRecord::SIZE + world::WallRecord::SIZE) as u32;
+        let mut buf = [0u8; 12 + 20 + 44 + 24];
+        buf[0..4].copy_from_slice(&world::MAGIC);
+        buf[4..6].copy_from_slice(&world::VERSION.to_le_bytes());
+        buf[6..8].copy_from_slice(&0u16.to_le_bytes());
+        buf[8..12].copy_from_slice(&payload_len.to_le_bytes());
+
+        buf[12..14].copy_from_slice(&1u16.to_le_bytes()); // width
+        buf[14..16].copy_from_slice(&1u16.to_le_bytes()); // depth
+        buf[16..20].copy_from_slice(&world::SECTOR_SIZE.to_le_bytes());
+        buf[20..22].copy_from_slice(&1u16.to_le_bytes()); // sectors
+        buf[22..24].copy_from_slice(&2u16.to_le_bytes()); // materials
+        buf[24..26].copy_from_slice(&1u16.to_le_bytes()); // walls
+        buf[26..29].copy_from_slice(&[32, 32, 40]);
+        buf[29] = world::world_flags::FOG_ENABLED;
+
+        let sector = 12 + world::WorldHeader::SIZE;
+        buf[sector] = world::sector_flags::HAS_FLOOR | world::sector_flags::FLOOR_WALKABLE;
+        buf[sector + 1] = world::split::NORTH_WEST_SOUTH_EAST;
+        buf[sector + 4..sector + 6].copy_from_slice(&0u16.to_le_bytes());
+        buf[sector + 6..sector + 8].copy_from_slice(&world::NO_MATERIAL.to_le_bytes());
+        buf[sector + 8..sector + 10].copy_from_slice(&0u16.to_le_bytes());
+        buf[sector + 10..sector + 12].copy_from_slice(&1u16.to_le_bytes());
+
+        let wall = sector + world::SectorRecord::SIZE;
+        buf[wall] = world::direction::NORTH;
+        buf[wall + 1] = world::wall_flags::SOLID;
+        buf[wall + 4..wall + 6].copy_from_slice(&1u16.to_le_bytes());
+        buf[wall + 8..wall + 12].copy_from_slice(&0i32.to_le_bytes());
+        buf[wall + 12..wall + 16].copy_from_slice(&0i32.to_le_bytes());
+        buf[wall + 16..wall + 20].copy_from_slice(&1024i32.to_le_bytes());
+        buf[wall + 20..wall + 24].copy_from_slice(&1024i32.to_le_bytes());
+
+        let world = World::from_bytes(&buf).expect("parse world");
+        assert_eq!(world.width(), 1);
+        assert_eq!(world.depth(), 1);
+        assert_eq!(world.sector_size(), psxed_format::world::SECTOR_SIZE);
+        assert_eq!(world.material_count(), 2);
+        assert_eq!(world.wall_count(), 1);
+        assert_eq!(world.ambient_color(), [32, 32, 40]);
+        assert!(world.fog_enabled());
+
+        let sector = world.sector(0, 0).unwrap();
+        assert!(sector.has_floor());
+        assert!(sector.floor_walkable());
+        assert_eq!(sector.floor_material(), Some(0));
+        assert_eq!(sector.ceiling_material(), None);
+        assert_eq!(sector.wall_count(), 1);
+
+        let wall = world.sector_wall(sector, 0).unwrap();
+        assert_eq!(wall.direction(), psxed_format::world::direction::NORTH);
+        assert!(wall.solid());
+        assert_eq!(wall.material(), 1);
+        assert_eq!(wall.heights(), [0, 0, 1024, 1024]);
+    }
+
+    #[test]
+    fn world_rejects_bad_sector_count() {
+        use psxed_format::world;
+
+        let mut buf = [0u8; 12 + 20];
+        buf[0..4].copy_from_slice(&world::MAGIC);
+        buf[4..6].copy_from_slice(&world::VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&(world::WorldHeader::SIZE as u32).to_le_bytes());
+        buf[12..14].copy_from_slice(&1u16.to_le_bytes());
+        buf[14..16].copy_from_slice(&1u16.to_le_bytes());
+        buf[16..20].copy_from_slice(&world::SECTOR_SIZE.to_le_bytes());
+        buf[20..22].copy_from_slice(&2u16.to_le_bytes());
+
+        assert!(matches!(
+            World::from_bytes(&buf),
+            Err(ParseError::InvalidWorldLayout)
+        ));
+    }
+
+    #[test]
+    fn world_rejects_wall_range_outside_table() {
+        use psxed_format::world;
+
+        let payload_len = (world::WorldHeader::SIZE + world::SectorRecord::SIZE) as u32;
+        let mut buf = [0u8; 12 + 20 + 44];
+        buf[0..4].copy_from_slice(&world::MAGIC);
+        buf[4..6].copy_from_slice(&world::VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&payload_len.to_le_bytes());
+        buf[12..14].copy_from_slice(&1u16.to_le_bytes());
+        buf[14..16].copy_from_slice(&1u16.to_le_bytes());
+        buf[16..20].copy_from_slice(&world::SECTOR_SIZE.to_le_bytes());
+        buf[20..22].copy_from_slice(&1u16.to_le_bytes());
+
+        let sector = 12 + world::WorldHeader::SIZE;
+        buf[sector + 10..sector + 12].copy_from_slice(&1u16.to_le_bytes());
+
+        assert!(matches!(
+            World::from_bytes(&buf),
+            Err(ParseError::InvalidWorldLayout)
         ));
     }
 

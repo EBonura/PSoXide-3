@@ -54,10 +54,9 @@ pub struct Cli {
     /// Run the experimental compute-shader rasterizer in parallel
     /// with the CPU rasterizer (Phase C). Per-frame the frontend
     /// drains the CPU's `cmd_log` and replays each GP0 packet
-    /// through the GPU compute path; the display reads from the
-    /// GPU VRAM. Off by default — opt-in until parity is confirmed
-    /// in a wide enough test set. Press F12 in the GUI to toggle
-    /// at runtime once the bus is wired up.
+    /// through the GPU compute path. Off by default — opt-in until
+    /// parity is confirmed in a wide enough test set. Press F12 in
+    /// the GUI to toggle at runtime once the bus is wired up.
     #[arg(long)]
     pub gpu_compute: bool,
 
@@ -119,6 +118,13 @@ pub struct LaunchArgs {
     /// Lets you eyeball the boot state without firing up the GUI.
     #[arg(long)]
     pub dump_vram: Option<PathBuf>,
+    /// Optional path to dump the HW renderer's output as a PPM. Spins
+    /// up a headless wgpu device, replays the cumulative `cmd_log`
+    /// through the same pipeline the live GUI uses, and writes the
+    /// result. Use this to regression-test the HW pipeline without
+    /// a window or screen-capture permission.
+    #[arg(long)]
+    pub dump_hw: Option<PathBuf>,
 }
 
 /// Entry point. Dispatches on `cli.command`; returns `Ok(())` on
@@ -291,6 +297,12 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
     let mut bus = Bus::new(bios).map_err(|e| format!("BIOS rejected: {e}"))?;
     let mut cpu = Cpu::new();
 
+    // `--dump-hw` needs the GP0 packet log armed; it stays off by
+    // default to avoid the per-instruction push cost.
+    if args.dump_hw.is_some() {
+        bus.gpu.enable_cmd_log();
+    }
+
     // Dispatch on extension: .bin = disc, .exe = homebrew side-load.
     let ext = game_path
         .extension()
@@ -304,9 +316,10 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
             bus.load_exe_payload(exe.load_addr, &exe.payload);
             bus.clear_exe_bss(exe.bss_addr, exe.bss_size);
             cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
-            if settings.emulator.hle_bios_for_side_load {
-                bus.enable_hle_bios();
-            }
+            // Match the GUI launch path: side-loaded EXEs need the
+            // HLE syscall tables even for users with old settings.ron
+            // files where the former preference is still false.
+            bus.enable_hle_bios();
             bus.attach_digital_pad_port1();
             eprintln!(
                 "[cli] side-loaded {} — entry=0x{:08x} payload={}B",
@@ -395,6 +408,15 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
         eprintln!("[cli] VRAM → {}", path.display());
     }
 
+    if let Some(path) = args.dump_hw {
+        dump_hw_ppm(&bus, &path)?;
+        eprintln!(
+            "[cli] HW renderer → {} ({} cmd_log entries replayed)",
+            path.display(),
+            bus.gpu.cmd_log.len()
+        );
+    }
+
     Ok(())
 }
 
@@ -457,6 +479,53 @@ fn region_label(e: &LibraryEntry) -> &'static str {
         Region::NtscJ => "NTSC-J",
         Region::Unknown => "unknown",
     }
+}
+
+fn dump_hw_ppm(bus: &Bus, path: &std::path::Path) -> Result<(), String> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..Default::default()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .ok_or_else(|| "no compatible wgpu adapter".to_string())?;
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("psoxide-hw-dump-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+        },
+        None,
+    ))
+    .map_err(|e| format!("request device: {e:?}"))?;
+
+    let mut hw = psx_gpu_render::HwRenderer::new_headless(device, queue);
+    let vram_words: Vec<u16> = bus.gpu.vram.words().to_vec();
+    hw.render_frame(&bus.gpu, &bus.gpu.cmd_log, &vram_words);
+
+    let display = bus.gpu.display_area();
+    let s = hw.internal_scale();
+    let (w, h, rgba) = hw.read_subrect_rgba8(
+        display.x as u32 * s,
+        display.y as u32 * s,
+        display.width as u32 * s,
+        display.height as u32 * s,
+    );
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    writeln!(f, "P6\n{w} {h}\n255").map_err(|e| e.to_string())?;
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for chunk in rgba.chunks_exact(4) {
+        rgb.push(chunk[0]);
+        rgb.push(chunk[1]);
+        rgb.push(chunk[2]);
+    }
+    f.write_all(&rgb).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn dump_vram_ppm(bus: &Bus, path: &std::path::Path) -> Result<(), String> {

@@ -442,9 +442,10 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             // that would exceed the PS1 hardware extent limits, so the
             // floor stays stable at close and pulled-back camera ranges.
             // Visual hashes unchanged after moving the camera/world
-            // transform math into `psx-engine::WorldCamera`; only code
+            // transform math into `psx-engine::WorldCamera`, then after
+            // adding material-derived world render layers; only code
             // layout shifted the frame-boundary PC.
-            final_pc: 0x8001_2bac,
+            final_pc: 0x8001_2cf4,
             redux_display_hash: None,
         }),
         // showcase-text exercises all 6 draw paths in psx-font:

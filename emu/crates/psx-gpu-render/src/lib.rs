@@ -1,155 +1,169 @@
 //! PSX hardware renderer — wgpu render pipeline that draws each
-//! GP0 primitive as one or more triangles at the host resolution,
-//! producing internal-resolution upscaling for free.
+//! GP0 primitive at the internal-resolution multiple of native PSX
+//! VRAM, producing fractional upscaling for free.
 //!
-//! Sibling to `psx-gpu-compute`. The compute backend exists for
-//! parity testing (it matches the CPU rasterizer pixel-for-pixel
-//! at native resolution). This crate is for *display*: it does
-//! NOT need to match VRAM byte-for-byte; it needs to look right
-//! on screen at any window size.
+//! ## Architecture
 //!
-//! Architecture:
+//! The HW target is **VRAM-shaped**: a `(1024 · S) × (512 · S)`
+//! texture (S = internal-resolution multiplier). PSX vertex coords
+//! map directly into this VRAM space; the display shown to the user
+//! is just a sub-rect read of the texture (the PSX `display_area`,
+//! scaled by S). This mirrors real hardware — the GPU draws into
+//! persistent VRAM and the CRT scans out a window of it.
 //!
-//! - One render pipeline (vertex + fragment shaders), one shader
-//!   file. Native vs Window scaling is a *render-target sizing*
-//!   choice — the same pipeline runs in both modes, only the
-//!   output texture's dimensions differ. This honours the user's
-//!   "one flexible pipeline" constraint.
-//! - The translator walks `Gpu::cmd_log` exactly like
-//!   `psx-gpu-compute::ComputeBackend::replay_packet`, sharing
-//!   `psx-gpu-compute::decode::ReplayState` so state setters
-//!   (`0xE0..=0xE6`) advance identically across backends.
-//! - Phase 1: only flat-color mono triangles / quads (`0x20..=0x2B`).
-//!   Other primitive types are silently dropped (their state still
-//!   updates `ReplayState`).
+//! Consequences:
+//! - **VRAM persistence works for free.** A demo that draws once at
+//!   boot and then just present-flips keeps its pixels because we
+//!   never clear the target between frames.
+//! - **Native↔Window is a single knob (S).** S=1 → 1024×512 texture
+//!   → tiny PSX-native rasterisation; the display sub-rect (e.g.
+//!   320×240) gets scaled up by Nearest at egui paint = "big crisp
+//!   PSX pixels". S=N → N× rasterisation density; the display
+//!   sub-rect is N× larger and paints at ~1:1 = "sharp host edges".
+//! - **One pipeline for everything.** The vertex shader divides by
+//!   constant `(1024, 512)` regardless of S. The wgpu viewport
+//!   tracks the texture's pixel dims, so density follows S
+//!   automatically — no shader maths changes when S does.
 //!
-//! See `/Users/ebonura/.claude/plans/toasty-snacking-noodle.md` for
-//! the staged plan.
+//! ## Sibling crates
+//!
+//! - `psx-gpu-compute` — compute-shader rasterizer that matches the
+//!   CPU rasterizer pixel-for-pixel; the parity oracle for the
+//!   shared decode path (`psx-gpu-compute::decode`).
+//! - `emulator-core` — owns `Gpu` (CPU rasterizer + VRAM + cmd_log)
+//!   and `Bus`.
 
 pub mod pipeline;
 pub mod target;
 pub mod translator;
 
 pub use pipeline::{BlendKind, HwPipeline, HwVertex};
-pub use target::RenderTarget;
-pub use translator::{TranslatedFrame, Translator};
+pub use target::{RenderTarget, MAX_SCALE, VRAM_HEIGHT, VRAM_WIDTH};
+pub use translator::{DrawRun, TranslatedFrame, Translator};
 
 use emulator_core::Gpu;
 
-/// Top-level HW renderer. Owns the wgpu pipeline + the output
-/// texture. The frontend creates one, feeds it `cmd_log` each
-/// frame, and reads back an `egui::TextureId` for the central
-/// panel to paint.
+/// Top-level HW renderer. Owns the wgpu pipeline + the VRAM-shaped
+/// target. The frontend creates one, calls [`HwRenderer::render_frame`]
+/// each frame, and the egui central panel reads
+/// [`HwRenderer::texture_id`] (paired with the display-area UV
+/// sub-rect — the renderer doesn't care about display size, only
+/// the PSX-VRAM space the primitives live in).
 ///
-/// `wgpu::Device` and `wgpu::Queue` are internally reference-
-/// counted in wgpu 24, so cloning them into the renderer is cheap.
+/// `wgpu::Device` and `wgpu::Queue` are internally reference-counted
+/// in wgpu 24, so cloning them into the renderer is cheap.
 pub struct HwRenderer {
     device: wgpu::Device,
-    queue:  wgpu::Queue,
+    queue: wgpu::Queue,
     pipeline: HwPipeline,
     target: RenderTarget,
     translator: Translator,
-    /// Most recent global uniforms — written once per frame after
-    /// the target is resized.
-    globals: pipeline::Globals,
 }
 
-/// What the toolbar's `Native ↔ Window` toggle picks. Mirrors the
-/// frontend's `app::ScaleMode`; redeclared here so this crate
-/// doesn't have to depend on `frontend`. The frontend converts
-/// from its own enum to ours when it calls `render_frame`.
+/// Toolbar Native↔Window selector. Mirrors the frontend's
+/// `app::ScaleMode` so this crate doesn't depend on `frontend`.
+/// The renderer translates this + a panel-size hint into an
+/// internal-resolution multiplier S in [`HwRenderer::scale_for`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ScaleMode {
-    /// 1:1 PSX pixels — output texture sized exactly to the active
-    /// display rect.
+    /// Internal scale = 1. Display sub-rect rendered at PSX-native
+    /// pixel density; egui Nearest scales up at paint = chunky
+    /// retro pixels.
     Native,
-    /// Output texture sized to the largest 4:3 box that fits the
-    /// available central-panel rect, so primitives rasterize at
-    /// host resolution with sharp edges at any window size.
+    /// Internal scale chosen from the current presentation/display
+    /// pixel budget, clamped to `[1, MAX_SCALE]`. Display sub-rect
+    /// rasterised near host density = sharp edges at any window size.
     Window,
 }
 
 impl HwRenderer {
-    /// Build the renderer on top of an existing `wgpu::Device` /
-    /// `Queue` (typically the frontend's swap-chain device, so the
-    /// output texture can be sampled by egui without bouncing
-    /// through CPU memory). The target texture is registered with
-    /// the supplied `egui_wgpu::Renderer`; calling
-    /// `RenderTarget::texture_id` later returns the stable handle
-    /// the central panel paints.
+    /// Live constructor — registers the target with `egui_renderer`
+    /// so the central panel can paint it. Initial scale = 1; bump
+    /// it via [`HwRenderer::set_internal_scale`] on toggle/resize.
     pub fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,
         egui_renderer: &mut egui_wgpu::Renderer,
     ) -> Self {
         let pipeline = HwPipeline::new(&device);
-        let target = RenderTarget::new(&device, egui_renderer);
+        let target = RenderTarget::new(&device, &queue, egui_renderer);
         Self {
             device,
             queue,
             pipeline,
             target,
             translator: Translator::new(),
-            globals: pipeline::Globals::zero(),
         }
     }
 
-    /// `egui::TextureId` of the output texture. Stable for the
-    /// life of the `HwRenderer` (re-registered on resize, but
-    /// the id is updated in place).
+    /// Headless constructor — no surface, no egui registration.
+    /// Used by the parity harness and any CLI dump path.
+    pub fn new_headless(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let pipeline = HwPipeline::new(&device);
+        let target = RenderTarget::new_headless(&device, &queue);
+        Self {
+            device,
+            queue,
+            pipeline,
+            target,
+            translator: Translator::new(),
+        }
+    }
+
+    /// Stable `egui::TextureId` of the VRAM-shaped target. The
+    /// frontend's central panel reads this every frame, paired with
+    /// a UV sub-rect = `display_area / VRAM_DIMS`.
     pub fn texture_id(&self) -> egui::TextureId {
         self.target.texture_id()
     }
 
-    /// Render one frame.
-    ///
-    /// `panel_rect` is the egui central-panel rect IN PIXELS that
-    /// will receive the output (so we can size the render target
-    /// to it for `Window` mode). `gpu` is read for the active
-    /// display area + the drained `cmd_log`. `vram_words` is the
-    /// CPU rasterizer's VRAM after this frame's draws — uploaded
-    /// to the GPU-side `R16Uint` texture for the fragment shader
-    /// to sample on textured primitives.
+    /// Current internal-resolution multiplier in effect.
+    pub fn internal_scale(&self) -> u32 {
+        self.target.scale()
+    }
+
+    /// Map [`ScaleMode`] + presentation/display dims to an internal
+    /// scale. `Native` → 1; `Window` → the smallest integer scale
+    /// that covers the current framebuffer presentation budget,
+    /// capped at [`MAX_SCALE`]. Pure function so the frontend can
+    /// test scaling decisions without wgpu state.
+    pub fn scale_for(mode: ScaleMode, panel_size_px: (u32, u32), display_size: (u32, u32)) -> u32 {
+        match mode {
+            ScaleMode::Native => 1,
+            ScaleMode::Window => {
+                let sx = panel_size_px.0.max(1) as f32 / display_size.0.max(1) as f32;
+                let sy = panel_size_px.1.max(1) as f32 / display_size.1.max(1) as f32;
+                (sx.max(sy).ceil() as u32).clamp(1, MAX_SCALE)
+            }
+        }
+    }
+
+    /// Reallocate the target to the requested internal scale. Cheap
+    /// when unchanged. Reallocation clears the new texture to opaque
+    /// black; in-flight VRAM contents are lost — frontend may want
+    /// to flush a fresh full-frame redraw after toggling.
+    pub fn set_internal_scale(
+        &mut self,
+        scale: u32,
+        egui_renderer: Option<&mut egui_wgpu::Renderer>,
+    ) {
+        self.target
+            .ensure_scale(&self.device, &self.queue, egui_renderer, scale);
+    }
+
+    /// Render one frame's `cmd_log` into the persistent VRAM target.
+    /// Always loads the existing texture — never clears — so PSX
+    /// VRAM-style persistence holds across frames. `vram_words` is
+    /// the CPU rasterizer's VRAM (post-frame) which the fragment
+    /// shader reads for textured primitives.
     pub fn render_frame(
         &mut self,
-        gpu: &Gpu,
-        scale_mode: ScaleMode,
-        panel_size_px: (u32, u32),
-        egui_renderer: &mut egui_wgpu::Renderer,
+        _gpu: &Gpu,
         cmd_log: &[emulator_core::gpu::GpuCmdLogEntry],
         vram_words: &[u16],
     ) {
-        let display = gpu.display_area();
-        let (display_w, display_h) = (
-            display.width.max(1) as u32,
-            display.height.max(1) as u32,
-        );
-        let (target_w, target_h) = match scale_mode {
-            ScaleMode::Native => (display_w, display_h),
-            ScaleMode::Window => Self::compute_window_target_size(panel_size_px, display_w, display_h),
-        };
-
-        self.target
-            .ensure(&self.device, egui_renderer, target_w, target_h);
-
-        self.globals = pipeline::Globals {
-            display_origin: [display.x as f32, display.y as f32],
-            display_size: [display_w as f32, display_h as f32],
-            target_size: [target_w as f32, target_h as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.queue.write_buffer(
-            self.pipeline.globals_buffer(),
-            0,
-            bytemuck::bytes_of(&self.globals),
-        );
-
-        // Mirror CPU VRAM into the GPU `R16Uint` so textured
-        // primitives can sample texels + CLUTs correctly. Phase 1
-        // didn't need this; Phase 2's textured primitives do.
         self.pipeline.upload_vram(&self.queue, vram_words);
 
-        // Translate cmd_log → per-blend-kind sorted vertex stream.
         let frame = self.translator.translate(cmd_log);
         if frame.total() > 0 {
             self.pipeline
@@ -168,7 +182,8 @@ impl HwRenderer {
                     view: self.target.view(),
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        // PSX VRAM is persistent — never clear.
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -179,48 +194,100 @@ impl HwRenderer {
             pass.set_bind_group(0, self.pipeline.bind_group(), &[]);
             pass.set_vertex_buffer(0, self.pipeline.vertex_buffer().slice(..));
 
-            // One draw per non-empty blend batch. Average and
-            // AddQuarter use the blend constant — bind the right
-            // value before their pipelines run. The other modes
-            // ignore the constant so binding it is a no-op.
-            let mut start: u32 = 0;
-            for i in 0..pipeline::BlendKind::COUNT {
-                let count = frame.counts[i];
-                if count == 0 {
-                    start += count;
+            let scale = self.target.scale();
+            let (target_w, target_h) = self.target.size();
+            for run in frame.runs {
+                if run.count == 0 || run.clip[0] > run.clip[2] || run.clip[1] > run.clip[3] {
                     continue;
                 }
-                let kind = match i {
-                    0 => pipeline::BlendKind::Opaque,
-                    1 => pipeline::BlendKind::Average,
-                    2 => pipeline::BlendKind::Add,
-                    3 => pipeline::BlendKind::Sub,
-                    _ => pipeline::BlendKind::AddQuarter,
-                };
-                pass.set_pipeline(self.pipeline.pipeline(kind));
-                pass.set_blend_constant(self.pipeline.blend_constant(kind));
-                pass.draw(start..(start + count), 0..1);
-                start += count;
+                let x = run.clip[0] as u32 * scale;
+                let y = run.clip[1] as u32 * scale;
+                let right = ((run.clip[2] as u32 + 1) * scale).min(target_w);
+                let bottom = ((run.clip[3] as u32 + 1) * scale).min(target_h);
+                if right <= x || bottom <= y {
+                    continue;
+                }
+                pass.set_scissor_rect(x, y, right - x, bottom - y);
+                pass.set_pipeline(self.pipeline.pipeline(run.kind));
+                pass.set_blend_constant(self.pipeline.blend_constant(run.kind));
+                pass.draw(run.start..(run.start + run.count), 0..1);
             }
         }
         self.queue.submit(Some(encoder.finish()));
     }
 
-    /// Largest 4:3 rect that fits inside the available panel rect,
-    /// rounded to integer pixels. Same formula the old
-    /// `paint_image_window` used at paint-time, just lifted into
-    /// render-target sizing so the rasterizer produces exactly that
-    /// many pixels (no paint-time stretch).
-    fn compute_window_target_size(
-        panel: (u32, u32),
-        _display_w: u32,
-        _display_h: u32,
-    ) -> (u32, u32) {
-        const CRT_ASPECT: f32 = 4.0 / 3.0;
-        let pw = panel.0.max(1) as f32;
-        let ph = panel.1.max(1) as f32;
-        let h = ph.min(pw / CRT_ASPECT);
-        let w = h * CRT_ASPECT;
-        (w.round().max(1.0) as u32, h.round().max(1.0) as u32)
+    /// Synchronously read back the entire VRAM-shaped target as
+    /// tightly-packed RGBA8 (sRGB color space, since `TARGET_FORMAT`
+    /// is `Rgba8UnormSrgb`). Issues a blocking `device.poll(Wait)`
+    /// — for headless/parity use, never the per-frame loop.
+    pub fn read_pixels_rgba8(&self) -> (u32, u32, Vec<u8>) {
+        let (w, h) = self.target.size();
+        self.read_subrect_rgba8(0, 0, w, h)
+    }
+
+    /// Read back a `(w × h)` sub-rect of the target starting at
+    /// `(x, y)` in target-pixel coordinates (i.e. PSX VRAM coords ×
+    /// internal scale). Designed for parity-style display-sub-rect
+    /// extraction: pass `(display.x * S, display.y * S, display.w *
+    /// S, display.h * S)` to grab exactly the user-visible region.
+    pub fn read_subrect_rgba8(&self, x: u32, y: u32, w: u32, h: u32) -> (u32, u32, Vec<u8>) {
+        let (tw, th) = self.target.size();
+        let x = x.min(tw);
+        let y = y.min(th);
+        let w = w.min(tw - x);
+        let h = h.min(th - y);
+        if w == 0 || h == 0 {
+            return (0, 0, Vec::new());
+        }
+        let unpadded_bpr = w * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bpr = unpadded_bpr.div_ceil(align) * align;
+        let buffer_size = (padded_bpr * h) as wgpu::BufferAddress;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-hw-readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-hw-readback-encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.target.texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback"));
+        self.device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((unpadded_bpr * h) as usize);
+        for row in 0..h {
+            let start = (row * padded_bpr) as usize;
+            let end = start + unpadded_bpr as usize;
+            out.extend_from_slice(&data[start..end]);
+        }
+        drop(data);
+        buffer.unmap();
+        (w, h, out)
     }
 }

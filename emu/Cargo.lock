@@ -1007,6 +1007,7 @@ dependencies = [
  "psx-gpu-render",
  "psx-iso",
  "psx-trace",
+ "psxed-ui",
  "wgpu",
  "winit",
 ]
@@ -2437,7 +2438,9 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "emulator-core",
+ "pollster",
  "psx-gpu-compute",
+ "psx-iso",
  "wgpu",
 ]
 
@@ -2458,6 +2461,27 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "psxed-format"
+version = "0.1.0"
+
+[[package]]
+name = "psxed-project"
+version = "0.1.0"
+dependencies = [
+ "psxed-format",
+ "ron",
+ "serde",
+]
+
+[[package]]
+name = "psxed-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "psxed-project",
 ]
 
 [[package]]

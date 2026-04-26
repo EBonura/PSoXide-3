@@ -45,6 +45,7 @@
 
 pub mod mesh;
 pub mod texture;
+pub mod world;
 
 /// Shared header that prefixes every cooked asset file.
 ///

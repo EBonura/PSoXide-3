@@ -1,0 +1,3123 @@
+//! egui editor workspace for PSoXide.
+//!
+//! The frontend owns the window/Menu. This crate owns the editor panels and
+//! the in-memory authoring document they manipulate.
+
+mod icons;
+
+use std::path::{Path, PathBuf};
+
+use egui::{
+    Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Rect, RichText, Sense, Stroke,
+    StrokeKind, Vec2,
+};
+use psxed_project::{
+    GridDirection, MaterialResource, NodeId, NodeKind, NodeRow, ProjectDocument, PsxBlendMode,
+    Resource, ResourceData, ResourceId, WorldGrid,
+};
+
+/// Embedded editor workspace state.
+pub struct EditorWorkspace {
+    project: ProjectDocument,
+    project_path: Option<PathBuf>,
+    selected_node: NodeId,
+    selected_resource: Option<ResourceId>,
+    scene_filter: String,
+    file_filter: String,
+    resource_search: String,
+    bottom_tab: BottomTab,
+    resource_filter: ResourceFilter,
+    active_tool: ViewTool,
+    snap_to_grid: bool,
+    snap_units: u16,
+    show_grid: bool,
+    view_2d: bool,
+    viewport_pan: Vec2,
+    viewport_zoom: f32,
+    dirty: bool,
+    status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewTool {
+    Select,
+    Move,
+    Rotate,
+    Scale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BottomTab {
+    Resources,
+    AssetBrowser,
+    Output,
+    Console,
+}
+
+impl BottomTab {
+    const ALL: [Self; 4] = [
+        Self::Resources,
+        Self::AssetBrowser,
+        Self::Output,
+        Self::Console,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Resources => "Resources",
+            Self::AssetBrowser => "Asset Browser",
+            Self::Output => "Output",
+            Self::Console => "Console",
+        }
+    }
+
+    const fn icon(self) -> char {
+        match self {
+            Self::Resources => icons::LAYERS,
+            Self::AssetBrowser => icons::FOLDER,
+            Self::Output => icons::TERMINAL,
+            Self::Console => icons::TERMINAL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceFilter {
+    All,
+    Texture,
+    Material,
+    Mesh,
+    Room,
+    Other,
+}
+
+impl ResourceFilter {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All Resources",
+            Self::Texture => "Texture",
+            Self::Material => "Material",
+            Self::Mesh => "Mesh",
+            Self::Room => "Room",
+            Self::Other => "Other",
+        }
+    }
+
+    const fn icon(self) -> char {
+        match self {
+            Self::All => icons::LAYERS,
+            Self::Texture => icons::PALETTE,
+            Self::Material => icons::BLEND,
+            Self::Mesh => icons::BOX,
+            Self::Room => icons::GRID,
+            Self::Other => icons::FILE,
+        }
+    }
+
+    fn matches(self, data: &ResourceData) -> bool {
+        match self {
+            Self::All => true,
+            Self::Texture => matches!(data, ResourceData::Texture { .. }),
+            Self::Material => matches!(data, ResourceData::Material(_)),
+            Self::Mesh => matches!(data, ResourceData::Mesh { .. }),
+            Self::Room => matches!(data, ResourceData::Scene { .. }),
+            Self::Other => matches!(
+                data,
+                ResourceData::Script { .. } | ResourceData::Audio { .. }
+            ),
+        }
+    }
+}
+
+const DEFAULT_VIEWPORT_ZOOM: f32 = 96.0;
+const MIN_VIEWPORT_ZOOM: f32 = 24.0;
+const MAX_VIEWPORT_ZOOM: f32 = 220.0;
+
+const STUDIO_BG: Color32 = Color32::from_rgb(12, 16, 21);
+const STUDIO_TOP_BAR: Color32 = Color32::from_rgb(18, 22, 28);
+const STUDIO_PANEL: Color32 = Color32::from_rgb(17, 22, 28);
+const STUDIO_PANEL_DARK: Color32 = Color32::from_rgb(13, 17, 22);
+const STUDIO_INPUT: Color32 = Color32::from_rgb(11, 15, 20);
+const STUDIO_VIEWPORT: Color32 = Color32::from_rgb(12, 24, 31);
+const STUDIO_BORDER: Color32 = Color32::from_rgb(41, 51, 63);
+const STUDIO_BORDER_DARK: Color32 = Color32::from_rgb(28, 36, 45);
+const STUDIO_TEXT: Color32 = Color32::from_rgb(220, 229, 238);
+const STUDIO_TEXT_WEAK: Color32 = Color32::from_rgb(142, 154, 168);
+const STUDIO_ACCENT: Color32 = Color32::from_rgb(45, 177, 207);
+const STUDIO_ACCENT_DIM: Color32 = Color32::from_rgb(17, 82, 101);
+const STUDIO_GOLD: Color32 = Color32::from_rgb(238, 197, 119);
+const STUDIO_ROOM_FLOOR: Color32 = Color32::from_rgb(119, 132, 143);
+const STUDIO_ROOM_WALL: Color32 = Color32::from_rgb(126, 73, 43);
+
+fn apply_studio_visuals(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.style_mut(|style| {
+        style.spacing.item_spacing = Vec2::new(6.0, 4.0);
+        style.spacing.button_padding = Vec2::new(8.0, 3.0);
+        style.spacing.interact_size = Vec2::new(30.0, 22.0);
+        style.spacing.window_margin = Margin::same(6);
+        style.spacing.menu_margin = Margin::symmetric(8, 5);
+        style.spacing.indent = 16.0;
+        style.visuals = studio_visuals();
+    });
+}
+
+fn studio_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.override_text_color = Some(STUDIO_TEXT);
+    visuals.panel_fill = STUDIO_PANEL_DARK;
+    visuals.window_fill = STUDIO_PANEL;
+    visuals.window_stroke = Stroke::new(1.0, STUDIO_BORDER);
+    visuals.window_corner_radius = CornerRadius::same(3);
+    visuals.menu_corner_radius = CornerRadius::same(3);
+    visuals.faint_bg_color = Color32::from_rgb(20, 27, 35);
+    visuals.extreme_bg_color = STUDIO_INPUT;
+    visuals.code_bg_color = Color32::from_rgb(16, 21, 27);
+    visuals.hyperlink_color = STUDIO_ACCENT;
+    visuals.selection.bg_fill = STUDIO_ACCENT_DIM;
+    visuals.selection.stroke = Stroke::new(1.0, STUDIO_ACCENT);
+    visuals.button_frame = true;
+    visuals.collapsing_header_frame = false;
+    visuals.indent_has_left_vline = true;
+    visuals.slider_trailing_fill = true;
+
+    visuals.widgets.noninteractive.bg_fill = STUDIO_PANEL;
+    visuals.widgets.noninteractive.weak_bg_fill = STUDIO_PANEL_DARK;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, STUDIO_BORDER);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, STUDIO_TEXT);
+    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(3);
+
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(20, 28, 36);
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(18, 26, 34);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, STUDIO_BORDER);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, STUDIO_TEXT);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(3);
+
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(28, 46, 57);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(23, 38, 48);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(65, 95, 112));
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(3);
+
+    visuals.widgets.active.bg_fill = STUDIO_ACCENT_DIM;
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(18, 92, 113);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, STUDIO_ACCENT);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.active.corner_radius = CornerRadius::same(3);
+
+    visuals.widgets.open.bg_fill = Color32::from_rgb(20, 30, 38);
+    visuals.widgets.open.weak_bg_fill = Color32::from_rgb(20, 30, 38);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, STUDIO_BORDER);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0, STUDIO_TEXT);
+    visuals.widgets.open.corner_radius = CornerRadius::same(3);
+    visuals
+}
+
+fn top_bar_frame() -> Frame {
+    Frame::new()
+        .fill(STUDIO_TOP_BAR)
+        .stroke(Stroke::new(1.0, STUDIO_BORDER_DARK))
+        .inner_margin(Margin::symmetric(10, 4))
+}
+
+fn dock_frame() -> Frame {
+    Frame::new()
+        .fill(STUDIO_PANEL_DARK)
+        .stroke(Stroke::new(1.0, STUDIO_BORDER))
+        .inner_margin(Margin::symmetric(6, 6))
+}
+
+fn section_frame() -> Frame {
+    Frame::new()
+        .fill(STUDIO_PANEL)
+        .stroke(Stroke::new(1.0, STUDIO_BORDER))
+        .corner_radius(CornerRadius::same(3))
+        .inner_margin(Margin::symmetric(8, 7))
+}
+
+fn viewport_frame() -> Frame {
+    Frame::new()
+        .fill(STUDIO_BG)
+        .stroke(Stroke::new(1.0, STUDIO_BORDER))
+        .inner_margin(Margin::same(4))
+}
+
+fn panel_heading(ui: &mut egui::Ui, icon: char, label: &str) {
+    ui.horizontal(|ui| {
+        ui.label(icons::text(icon, 15.0).color(STUDIO_ACCENT));
+        ui.label(RichText::new(label).strong().color(STUDIO_TEXT));
+    });
+}
+
+impl EditorWorkspace {
+    /// Create a workspace with a starter project.
+    pub fn new() -> Self {
+        Self {
+            project: ProjectDocument::starter(),
+            project_path: None,
+            selected_node: NodeId::ROOT,
+            selected_resource: None,
+            scene_filter: String::new(),
+            file_filter: String::new(),
+            resource_search: String::new(),
+            bottom_tab: BottomTab::Resources,
+            resource_filter: ResourceFilter::All,
+            active_tool: ViewTool::Select,
+            snap_to_grid: true,
+            snap_units: 16,
+            show_grid: true,
+            view_2d: true,
+            viewport_pan: Vec2::ZERO,
+            viewport_zoom: DEFAULT_VIEWPORT_ZOOM,
+            dirty: false,
+            status: "Editor ready".to_string(),
+        }
+    }
+
+    /// Create a workspace backed by `project_path`, loading the project
+    /// if it already exists or seeding a starter project otherwise.
+    pub fn open_or_new(project_path: impl Into<PathBuf>) -> Self {
+        let path = project_path.into();
+        let mut workspace = Self::new();
+        workspace.project_path = Some(path.clone());
+
+        if path.exists() {
+            if let Err(error) = workspace.load_from_path(&path) {
+                workspace.status = format!("Could not load project: {error}");
+                workspace.dirty = false;
+            }
+        } else {
+            workspace.dirty = true;
+            workspace.status = format!("New project at {}", short_path(&path));
+        }
+
+        workspace
+    }
+
+    /// Current project document.
+    pub fn project(&self) -> &ProjectDocument {
+        &self.project
+    }
+
+    /// True when the project has unsaved edits.
+    pub const fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Set or replace the path used by [`EditorWorkspace::save`].
+    pub fn set_project_path(&mut self, path: impl Into<PathBuf>) {
+        self.project_path = Some(path.into());
+    }
+
+    /// Save to the currently configured project path.
+    pub fn save(&mut self) -> Result<(), String> {
+        let path = self
+            .project_path
+            .clone()
+            .ok_or_else(|| "no editor project path configured".to_string())?;
+        self.save_to_path(path)
+    }
+
+    /// Save only when the project contains unsaved edits.
+    pub fn save_if_dirty(&mut self) -> Result<bool, String> {
+        if !self.dirty {
+            return Ok(false);
+        }
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Save to a specific path and make that the current project path.
+    pub fn save_to_path(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        let path = path.as_ref();
+        self.project
+            .save_to_path(path)
+            .map_err(|error| error.to_string())?;
+        self.project_path = Some(path.to_path_buf());
+        self.dirty = false;
+        self.status = format!("Saved {}", short_path(path));
+        Ok(())
+    }
+
+    /// Load a project from disk and make that the current project path.
+    pub fn load_from_path(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        let path = path.as_ref();
+        self.project = ProjectDocument::load_from_path(path).map_err(|error| error.to_string())?;
+        self.project_path = Some(path.to_path_buf());
+        self.selected_node = NodeId::ROOT;
+        self.selected_resource = None;
+        self.dirty = false;
+        self.status = format!("Loaded {}", short_path(path));
+        Ok(())
+    }
+
+    /// Draw the full editor workspace.
+    pub fn draw(&mut self, ctx: &egui::Context) {
+        apply_studio_visuals(ctx);
+        self.draw_menu_bar(ctx);
+        self.draw_action_bar(ctx);
+        self.draw_left_dock(ctx);
+        self.draw_inspector(ctx);
+        self.draw_content_browser(ctx);
+        self.draw_viewport(ctx);
+    }
+
+    fn draw_menu_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("psxed_menu_bar")
+            .exact_height(35.0)
+            .frame(top_bar_frame())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for menu in ["File", "Edit", "View", "Project", "Build", "Help"] {
+                        ui.menu_button(menu, |_ui| {});
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new("PSoXide Studio").strong());
+                        ui.separator();
+                        ui.label(if self.dirty {
+                            "Unsaved changes"
+                        } else {
+                            "Saved"
+                        });
+                    });
+                });
+            });
+    }
+
+    fn draw_action_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("psxed_action_bar")
+            .exact_height(43.0)
+            .frame(top_bar_frame())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(icons::label(icons::FILE_PLUS, "New")).clicked() {
+                        self.reset_project();
+                    }
+                    if ui.button(icons::label(icons::SAVE, "Save")).clicked() {
+                        if let Err(error) = self.save() {
+                            self.status = format!("Save failed: {error}");
+                        }
+                    }
+                    if ui
+                        .button(icons::label(icons::ROTATE_CCW, "Reload"))
+                        .clicked()
+                    {
+                        self.reload_project();
+                    }
+                    if ui.button(icons::label(icons::FOCUS, "Frame")).clicked() {
+                        self.frame_viewport();
+                    }
+                    if ui.button(icons::label(icons::PLAY, "Playtest")).clicked() {
+                        self.status = "Playtest preview pending scene cook".to_string();
+                    }
+
+                    ui.separator();
+                    let project_label = if self.dirty {
+                        format!("{} *", self.project.name)
+                    } else {
+                        self.project.name.clone()
+                    };
+                    ui.label(project_label);
+                    ui.separator();
+
+                    if ui
+                        .button(icons::label(icons::CIRCLE_DOT, "Add Node"))
+                        .clicked()
+                    {
+                        self.add_child(NodeKind::Node3D, "Node3D");
+                    }
+                    if ui.button(icons::label(icons::GRID, "Add Room")).clicked() {
+                        self.add_grid_world_child();
+                    }
+                    if ui.button(icons::label(icons::BOX, "Add Mesh")).clicked() {
+                        let material = self.project.material_options().first().map(|(id, _)| *id);
+                        self.add_child(
+                            NodeKind::MeshInstance {
+                                mesh: None,
+                                material,
+                            },
+                            "MeshInstance",
+                        );
+                    }
+                    if ui.button(icons::label(icons::SUN, "Add Light")).clicked() {
+                        self.add_child(
+                            NodeKind::Light {
+                                color: [255, 240, 210],
+                                intensity: 1.0,
+                                radius: 4096.0,
+                            },
+                            "Light",
+                        );
+                    }
+                    if ui
+                        .button(icons::label(icons::MAP_PIN, "Add Spawn"))
+                        .clicked()
+                    {
+                        self.add_child(NodeKind::SpawnPoint { player: true }, "Player Spawn");
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(&self.status).color(STUDIO_TEXT_WEAK));
+                    });
+                });
+            });
+    }
+
+    fn draw_left_dock(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("psxed_left_dock")
+            .resizable(true)
+            .default_width(280.0)
+            .min_width(220.0)
+            .frame(dock_frame())
+            .show(ctx, |ui| {
+                section_frame().show(ui, |ui| self.draw_scene_tree_panel(ui));
+                ui.add_space(6.0);
+                section_frame().show(ui, |ui| self.draw_filesystem_panel(ui));
+            });
+    }
+
+    fn draw_scene_tree_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(icons::text(icons::LAYERS, 15.0).color(STUDIO_ACCENT));
+            ui.label(RichText::new("Scene").strong().color(STUDIO_TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(icons::text(icons::PLUS, 14.0)))
+                    .on_hover_text("Add Node")
+                    .clicked()
+                {
+                    self.add_child(NodeKind::Node3D, "Node3D");
+                }
+            });
+        });
+        ui.add(
+            egui::TextEdit::singleline(&mut self.scene_filter)
+                .hint_text("Filter nodes")
+                .desired_width(f32::INFINITY),
+        );
+        ui.separator();
+
+        let rows = self.project.active_scene().hierarchy_rows();
+        let filter = self.scene_filter.to_ascii_lowercase();
+        egui::ScrollArea::vertical()
+            .id_salt("psxed_scene_tree")
+            .max_height(285.0)
+            .show(ui, |ui| {
+                for row in rows {
+                    if !filter.is_empty()
+                        && !row.name.to_ascii_lowercase().contains(&filter)
+                        && !row.kind.to_ascii_lowercase().contains(&filter)
+                    {
+                        continue;
+                    }
+                    if draw_scene_node_row(ui, &row, self.selected_node == row.id).clicked() {
+                        self.selected_node = row.id;
+                        self.selected_resource = None;
+                    }
+                }
+            });
+
+        ui.horizontal(|ui| {
+            if ui.button(icons::label(icons::COPY, "Duplicate")).clicked() {
+                self.duplicate_selected();
+            }
+            let can_delete = self.selected_node != NodeId::ROOT;
+            if ui
+                .add_enabled(
+                    can_delete,
+                    egui::Button::new(icons::label(icons::TRASH, "Delete")),
+                )
+                .clicked()
+            {
+                self.delete_selected();
+            }
+        });
+
+        ui.separator();
+        draw_scene_group(
+            ui,
+            icons::GRID,
+            "Rooms",
+            count_nodes(&self.project, |kind| {
+                matches!(kind, NodeKind::Room { .. } | NodeKind::GridWorld { .. })
+            }),
+        );
+        draw_scene_group(
+            ui,
+            icons::SUN,
+            "Lights",
+            count_nodes(&self.project, |kind| matches!(kind, NodeKind::Light { .. })),
+        );
+        draw_scene_group(
+            ui,
+            icons::MAP_PIN,
+            "Spawns",
+            count_nodes(&self.project, |kind| {
+                matches!(kind, NodeKind::SpawnPoint { .. })
+            }),
+        );
+        draw_scene_group(
+            ui,
+            icons::BOX,
+            "Meshes",
+            count_nodes(&self.project, |kind| {
+                matches!(kind, NodeKind::MeshInstance { .. })
+            }),
+        );
+    }
+
+    fn draw_filesystem_panel(&mut self, ui: &mut egui::Ui) {
+        panel_heading(ui, icons::FOLDER, "FileSystem");
+        ui.separator();
+        let rows = project_filesystem_rows(&self.project);
+        let mut clicked_resource = None;
+        egui::ScrollArea::vertical()
+            .id_salt("psxed_filesystem")
+            .max_height(190.0)
+            .show(ui, |ui| {
+                let filter = self.file_filter.to_ascii_lowercase();
+                for row in &rows {
+                    if draw_project_file_row(ui, row, self.selected_resource, &filter) {
+                        clicked_resource = row.resource;
+                    }
+                }
+            });
+        if let Some(id) = clicked_resource {
+            self.selected_resource = Some(id);
+            self.selected_node = NodeId::ROOT;
+            if let Some(name) = self.project.resource_name(id) {
+                self.status = format!("Selected {name}");
+            }
+        }
+        ui.add(
+            egui::TextEdit::singleline(&mut self.file_filter)
+                .hint_text("Filter files")
+                .desired_width(f32::INFINITY),
+        );
+    }
+
+    fn draw_inspector(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("psxed_inspector")
+            .resizable(true)
+            .default_width(320.0)
+            .min_width(240.0)
+            .frame(dock_frame())
+            .show(ctx, |ui| {
+                panel_heading(ui, icons::SCAN, "Inspector");
+                ui.separator();
+
+                if let Some(resource_id) = self.selected_resource {
+                    self.draw_resource_inspector(ui, resource_id);
+                    return;
+                }
+
+                let material_options = self.project.material_options();
+                let selected = self.selected_node;
+                let Some(node) = self.project.active_scene_mut().node_mut(selected) else {
+                    ui.weak("No node selected");
+                    return;
+                };
+
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    draw_inline_icon(
+                        ui,
+                        node_lucide_icon(node.kind.label(), node.id == NodeId::ROOT),
+                        node_lucide_color(node.kind.label(), node.id == NodeId::ROOT, true),
+                    );
+                    ui.strong(format!("{} #{}", node.kind.label(), node.id.raw()));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    changed |= ui.text_edit_singleline(&mut node.name).changed();
+                });
+                ui.separator();
+
+                egui::CollapsingHeader::new(icons::label(icons::MOVE, "Transform"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |=
+                            transform_editor(ui, "Position", &mut node.transform.translation, 1.0);
+                        changed |= transform_editor(
+                            ui,
+                            "Rotation",
+                            &mut node.transform.rotation_degrees,
+                            1.0,
+                        );
+                        changed |= transform_editor(ui, "Scale", &mut node.transform.scale, 0.05);
+                    });
+
+                egui::CollapsingHeader::new(icons::label(icons::CIRCLE_DOT, "Node Properties"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= draw_node_kind_editor(ui, &mut node.kind, &material_options);
+                    });
+
+                egui::CollapsingHeader::new(icons::label(icons::BOX, "Render"))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Draw Mode");
+                            ui.label(node_draw_mode(&node.kind));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Ordering");
+                            ui.label("World OT");
+                        });
+                    });
+
+                egui::CollapsingHeader::new(icons::label(icons::SCAN, "PS1 Details"))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Texture Format");
+                            ui.label("4bpp Indexed");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Transform");
+                            ui.label("Fixed point");
+                        });
+                    });
+
+                egui::CollapsingHeader::new(icons::label(icons::WAYPOINT, "Node"))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Path");
+                            ui.label(format!("/Root/{}", node.name));
+                        });
+                    });
+                if changed {
+                    self.mark_dirty();
+                }
+            });
+    }
+
+    fn draw_resource_inspector(&mut self, ui: &mut egui::Ui, id: ResourceId) {
+        let Some(resource) = self.project.resource_mut(id) else {
+            ui.weak("Resource missing");
+            return;
+        };
+
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            draw_inline_icon(
+                ui,
+                resource_lucide_icon(&resource.data),
+                resource_lucide_color(&resource.data, true),
+            );
+            ui.strong(format!("{} #{}", resource.data.label(), resource.id.raw()));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            changed |= ui.text_edit_singleline(&mut resource.name).changed();
+        });
+        ui.separator();
+
+        match &mut resource.data {
+            ResourceData::Texture {
+                source_path,
+                width,
+                height,
+                indexed_depth,
+            } => {
+                egui::CollapsingHeader::new(icons::label(icons::FILE, "Import"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label("Source");
+                        changed |= ui.text_edit_singleline(source_path).changed();
+                    });
+                egui::CollapsingHeader::new(icons::label(icons::PALETTE, "PS1 Texture"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Size");
+                            changed |= ui
+                                .add(egui::DragValue::new(width).speed(1.0).range(1..=256))
+                                .changed();
+                            ui.label("x");
+                            changed |= ui
+                                .add(egui::DragValue::new(height).speed(1.0).range(1..=256))
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Indexed depth");
+                            changed |= ui
+                                .add(egui::DragValue::new(indexed_depth).speed(1.0).range(4..=8))
+                                .changed();
+                        });
+                    });
+            }
+            ResourceData::Material(material) => {
+                egui::CollapsingHeader::new(icons::label(icons::BLEND, "Material"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= blend_mode_editor(ui, &mut material.blend_mode);
+                        changed |= color_editor(ui, "Tint", &mut material.tint);
+                        changed |= ui
+                            .checkbox(&mut material.double_sided, "Double sided")
+                            .changed();
+                        ui.label(match material.texture {
+                            Some(texture) => format!("Texture resource #{}", texture.raw()),
+                            None => "No texture assigned".to_string(),
+                        });
+                    });
+            }
+            ResourceData::Mesh { source_path }
+            | ResourceData::Scene { source_path }
+            | ResourceData::Script { source_path }
+            | ResourceData::Audio { source_path } => {
+                egui::CollapsingHeader::new(icons::label(icons::FILE, "Import"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label("Source");
+                        changed |= ui.text_edit_singleline(source_path).changed();
+                    });
+            }
+        }
+
+        if changed {
+            self.mark_dirty();
+        }
+    }
+
+    fn draw_content_browser(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("psxed_content_browser")
+            .resizable(true)
+            .default_height(240.0)
+            .min_height(160.0)
+            .frame(dock_frame())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for tab in BottomTab::ALL {
+                        ui.selectable_value(
+                            &mut self.bottom_tab,
+                            tab,
+                            icons::label(tab.icon(), tab.label()),
+                        );
+                    }
+                    ui.separator();
+                    if ui.button(icons::label(icons::BLEND, "Material")).clicked() {
+                        let id = self.project.add_resource(
+                            "New Material",
+                            ResourceData::Material(MaterialResource::opaque(None)),
+                        );
+                        self.selected_resource = Some(id);
+                        self.status = "Added material".to_string();
+                        self.mark_dirty();
+                    }
+                    if ui.button(icons::label(icons::PALETTE, "Texture")).clicked() {
+                        let id = self.project.add_resource(
+                            "New Texture",
+                            ResourceData::Texture {
+                                source_path: "textures/new.png".to_string(),
+                                width: 64,
+                                height: 64,
+                                indexed_depth: 4,
+                            },
+                        );
+                        self.selected_resource = Some(id);
+                        self.status = "Added texture".to_string();
+                        self.mark_dirty();
+                    }
+                });
+                ui.separator();
+
+                match self.bottom_tab {
+                    BottomTab::Resources => self.draw_resources_tab(ui),
+                    BottomTab::AssetBrowser => draw_placeholder_panel(
+                        ui,
+                        "Asset Browser",
+                        "Import folders and cook queues will live here.",
+                    ),
+                    BottomTab::Output => draw_placeholder_panel(
+                        ui,
+                        "Output",
+                        "Scene cook and playtest logs will stream here.",
+                    ),
+                    BottomTab::Console => draw_placeholder_panel(
+                        ui,
+                        "Console",
+                        "Runtime/editor diagnostics will land here.",
+                    ),
+                }
+            });
+    }
+
+    fn draw_resources_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            section_frame().show(ui, |ui| {
+                ui.set_width(165.0);
+                panel_heading(ui, icons::LAYERS, "Favorites");
+                ui.selectable_value(
+                    &mut self.resource_filter,
+                    ResourceFilter::All,
+                    icons::label(ResourceFilter::All.icon(), "All Resources"),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(icons::text(icons::SCAN, 12.0).color(STUDIO_TEXT_WEAK));
+                    ui.label(RichText::new("By Type").color(STUDIO_TEXT_WEAK));
+                });
+                for (filter, count) in resource_filter_counts(&self.project) {
+                    ui.selectable_value(
+                        &mut self.resource_filter,
+                        filter,
+                        format!("{} ({count})", icons::label(filter.icon(), filter.label())),
+                    );
+                }
+            });
+
+            ui.add_space(4.0);
+
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.resource_search)
+                        .hint_text("Filter resources")
+                        .desired_width(460.0),
+                );
+                let mut clicked = None;
+                egui::ScrollArea::horizontal()
+                    .id_salt("psxed_resource_cards")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let search = self.resource_search.to_ascii_lowercase();
+                            for resource in self.project.resources.iter().filter(|resource| {
+                                resource_matches_filter(
+                                    resource,
+                                    self.resource_filter,
+                                    search.as_str(),
+                                )
+                            }) {
+                                if draw_resource_card(
+                                    ui,
+                                    &self.project,
+                                    resource,
+                                    self.selected_resource == Some(resource.id),
+                                )
+                                .clicked()
+                                {
+                                    clicked = Some(resource.id);
+                                }
+                            }
+                        });
+                    });
+                if let Some(id) = clicked {
+                    self.selected_resource = Some(id);
+                    self.selected_node = NodeId::ROOT;
+                }
+            });
+
+            ui.add_space(4.0);
+
+            section_frame().show(ui, |ui| {
+                ui.set_width(230.0);
+                panel_heading(ui, icons::PALETTE, "Texture Atlas (PS1)");
+                draw_atlas_preview(ui, &self.project);
+                ui.label(RichText::new("Atlas: default.atlas (256x256)").color(STUDIO_TEXT_WEAK));
+                ui.label(RichText::new("Mode: 4bpp Indexed").color(STUDIO_TEXT_WEAK));
+            });
+        });
+    }
+
+    fn draw_viewport(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(viewport_frame())
+            .show(ctx, |ui| {
+                self.draw_viewport_tabs(ui);
+                ui.separator();
+                self.draw_viewport_toolbar(ui);
+                ui.separator();
+
+                let size = ui.available_size();
+                let size = Vec2::new(size.x.max(320.0), size.y.max(240.0));
+                let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+
+                if response.dragged_by(egui::PointerButton::Middle)
+                    || response.dragged_by(egui::PointerButton::Secondary)
+                {
+                    self.viewport_pan += ui.input(|input| input.pointer.delta());
+                }
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    self.drag_selected_node(ui.input(|input| input.pointer.delta()));
+                }
+
+                if response.hovered() {
+                    let scroll = ui.input(|input| input.raw_scroll_delta.y);
+                    if scroll.abs() > f32::EPSILON {
+                        let pointer = ui
+                            .input(|input| input.pointer.hover_pos())
+                            .unwrap_or_else(|| rect.center());
+                        let before =
+                            ViewportTransform::new(rect, self.viewport_pan, self.viewport_zoom)
+                                .screen_to_world(pointer);
+                        let zoom_factor = (1.0 + scroll * 0.0015).clamp(0.75, 1.25);
+                        self.viewport_zoom = (self.viewport_zoom * zoom_factor)
+                            .clamp(MIN_VIEWPORT_ZOOM, MAX_VIEWPORT_ZOOM);
+                        let after =
+                            ViewportTransform::new(rect, self.viewport_pan, self.viewport_zoom)
+                                .world_to_screen(before);
+                        self.viewport_pan += pointer - after;
+                    }
+                }
+
+                let transform = ViewportTransform::new(rect, self.viewport_pan, self.viewport_zoom);
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, STUDIO_VIEWPORT);
+                if self.show_grid {
+                    draw_world_grid(&painter, transform);
+                }
+
+                let hits =
+                    draw_scene_viewport(&painter, transform, &self.project, self.selected_node);
+
+                if response.clicked_by(egui::PointerButton::Primary) {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let world = transform.screen_to_world(pos);
+                        if let Some(hit) = hits.iter().rev().find(|hit| hit.contains(world)) {
+                            self.selected_node = hit.id;
+                            self.selected_resource = None;
+                            self.status = format!("Selected {}", hit.name);
+                        } else {
+                            self.selected_resource = None;
+                        }
+                    }
+                }
+
+                draw_viewport_overlay(
+                    &painter,
+                    rect,
+                    &self.project,
+                    self.viewport_zoom,
+                    self.snap_units,
+                );
+                draw_axes_gizmo(&painter, rect);
+            });
+    }
+
+    fn draw_viewport_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let _ = ui.selectable_label(
+                true,
+                RichText::new(icons::label(icons::GRID, "Stone Room.room")).strong(),
+            );
+            if ui
+                .add(egui::Button::new(icons::text(icons::PLUS, 14.0)))
+                .on_hover_text("New scene")
+                .clicked()
+            {
+                self.status = "New scene tabs pending document support".to_string();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("Project: {}", self.project.name))
+                        .color(STUDIO_TEXT_WEAK),
+                );
+            });
+        });
+    }
+
+    fn draw_viewport_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (tool, label) in [
+                (ViewTool::Select, icons::label(icons::POINTER, "Select")),
+                (ViewTool::Move, icons::label(icons::MOVE, "Move")),
+                (ViewTool::Rotate, icons::label(icons::ROTATE_3D, "Rotate")),
+                (ViewTool::Scale, icons::label(icons::SCALE_3D, "Scale")),
+            ] {
+                ui.selectable_value(&mut self.active_tool, tool, label);
+            }
+            ui.separator();
+            ui.checkbox(
+                &mut self.snap_to_grid,
+                icons::label(icons::WAYPOINT, "Snap"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.snap_units)
+                    .speed(1.0)
+                    .range(1..=256),
+            );
+            ui.separator();
+            ui.checkbox(&mut self.show_grid, icons::label(icons::GRID, "Grid"));
+            ui.selectable_value(&mut self.view_2d, true, icons::label(icons::GRID, "2D"));
+            ui.selectable_value(&mut self.view_2d, false, icons::label(icons::BOX, "3D"));
+            ui.separator();
+            let mut zoom_percent = (self.viewport_zoom / DEFAULT_VIEWPORT_ZOOM * 100.0) as u16;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut zoom_percent)
+                        .speed(1.0)
+                        .range(25..=250)
+                        .suffix("%"),
+                )
+                .changed()
+            {
+                self.viewport_zoom = (zoom_percent as f32 / 100.0 * DEFAULT_VIEWPORT_ZOOM)
+                    .clamp(MIN_VIEWPORT_ZOOM, MAX_VIEWPORT_ZOOM);
+            }
+        });
+    }
+
+    fn add_child(&mut self, kind: NodeKind, name: &str) {
+        let parent = self.selected_node;
+        let id = self
+            .project
+            .active_scene_mut()
+            .add_node(parent, name.to_string(), kind);
+        self.selected_node = id;
+        self.selected_resource = None;
+        self.status = format!("Added {name}");
+        self.mark_dirty();
+    }
+
+    fn add_grid_world_child(&mut self) {
+        let material_options = self.project.material_options();
+        let floor = material_options
+            .iter()
+            .find(|(_, name)| name.to_ascii_lowercase().contains("floor"))
+            .or_else(|| material_options.first())
+            .map(|(id, _)| *id);
+        let wall = material_options
+            .iter()
+            .find(|(_, name)| name.to_ascii_lowercase().contains("brick"))
+            .or_else(|| material_options.first())
+            .map(|(id, _)| *id);
+        self.add_child(
+            NodeKind::GridWorld {
+                grid: WorldGrid::stone_room(4, 4, 1024, floor, wall),
+            },
+            "Grid World",
+        );
+    }
+
+    fn duplicate_selected(&mut self) {
+        let selected = self.selected_node;
+        let Some(source) = self.project.active_scene().node(selected).cloned() else {
+            return;
+        };
+        let parent = source.parent.unwrap_or(NodeId::ROOT);
+        let id = self.project.active_scene_mut().add_node(
+            parent,
+            format!("{} Copy", source.name),
+            source.kind,
+        );
+        if let Some(node) = self.project.active_scene_mut().node_mut(id) {
+            node.transform = source.transform;
+        }
+        self.selected_node = id;
+        self.selected_resource = None;
+        self.status = "Duplicated node".to_string();
+        self.mark_dirty();
+    }
+
+    fn delete_selected(&mut self) {
+        let selected = self.selected_node;
+        if self.project.active_scene_mut().remove_node(selected) {
+            self.selected_node = NodeId::ROOT;
+            self.selected_resource = None;
+            self.status = "Deleted node".to_string();
+            self.mark_dirty();
+        }
+    }
+
+    fn reset_project(&mut self) {
+        self.project = ProjectDocument::starter();
+        self.selected_node = NodeId::ROOT;
+        self.selected_resource = None;
+        self.status = "New starter project".to_string();
+        self.frame_viewport();
+        self.mark_dirty();
+    }
+
+    fn reload_project(&mut self) {
+        let Some(path) = self.project_path.clone() else {
+            self.status = "Reload unavailable: no project path".to_string();
+            return;
+        };
+        if let Err(error) = self.load_from_path(path) {
+            self.status = format!("Reload failed: {error}");
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn frame_viewport(&mut self) {
+        self.viewport_pan = Vec2::ZERO;
+        self.viewport_zoom = DEFAULT_VIEWPORT_ZOOM;
+    }
+
+    fn drag_selected_node(&mut self, screen_delta: Vec2) {
+        if self.selected_node == NodeId::ROOT || screen_delta == Vec2::ZERO {
+            return;
+        }
+
+        let world_delta = [
+            screen_delta.x / self.viewport_zoom,
+            -screen_delta.y / self.viewport_zoom,
+        ];
+        let mut moved = None;
+        if let Some(node) = self
+            .project
+            .active_scene_mut()
+            .node_mut(self.selected_node)
+            .filter(|node| !is_room_surface_node(node))
+        {
+            node.transform.translation[0] += world_delta[0];
+            node.transform.translation[2] += world_delta[1];
+            moved = Some(node.name.clone());
+        }
+
+        if let Some(name) = moved {
+            self.status = format!("Moved {name}");
+            self.mark_dirty();
+        }
+    }
+}
+
+impl Default for EditorWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn transform_editor(ui: &mut egui::Ui, label: &str, values: &mut [f32; 3], speed: f64) -> bool {
+    ui.horizontal(|ui| {
+        let mut changed = false;
+        ui.label(icons::text(transform_icon(label), 12.0).color(STUDIO_TEXT_WEAK));
+        ui.label(label);
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut values[0])
+                    .prefix("X ")
+                    .speed(speed),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut values[1])
+                    .prefix("Y ")
+                    .speed(speed),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut values[2])
+                    .prefix("Z ")
+                    .speed(speed),
+            )
+            .changed();
+        changed
+    })
+    .inner
+}
+
+fn transform_icon(label: &str) -> char {
+    match label {
+        "Position" => icons::MOVE,
+        "Rotation" => icons::ROTATE_3D,
+        "Scale" => icons::SCALE_3D,
+        _ => icons::WAYPOINT,
+    }
+}
+
+fn draw_node_kind_editor(
+    ui: &mut egui::Ui,
+    kind: &mut NodeKind,
+    material_options: &[(ResourceId, String)],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(icons::text(icons::CIRCLE_DOT, 13.0).color(STUDIO_TEXT_WEAK));
+        ui.strong("Node");
+    });
+    match kind {
+        NodeKind::Node | NodeKind::Node3D => {
+            ui.weak("Organisational transform node");
+        }
+        NodeKind::Room { width, depth } => {
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::GRID, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label("Sectors");
+                changed |= ui
+                    .add(egui::DragValue::new(width).speed(1.0).range(1..=128))
+                    .changed();
+                ui.label("x");
+                changed |= ui
+                    .add(egui::DragValue::new(depth).speed(1.0).range(1..=128))
+                    .changed();
+            });
+        }
+        NodeKind::GridWorld { grid } => {
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::GRID, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label("Grid");
+                ui.label(format!("{} x {}", grid.width, grid.depth));
+            });
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::WAYPOINT, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label("Sector Size");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut grid.sector_size)
+                            .speed(16.0)
+                            .range(64..=8192),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::BOX, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label(format!(
+                    "{} populated sectors",
+                    grid.populated_sector_count()
+                ));
+            });
+            changed |= color_editor(ui, "Ambient", &mut grid.ambient_color);
+            changed |= ui
+                .checkbox(&mut grid.fog_enabled, icons::label(icons::SCAN, "Fog"))
+                .changed();
+        }
+        NodeKind::MeshInstance { mesh, material } => {
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::BOX, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label(match mesh {
+                    Some(id) => format!("Mesh resource #{}", id.raw()),
+                    None => "No mesh resource assigned".to_string(),
+                });
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::BLEND, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label("Material");
+            });
+            if ui.selectable_label(material.is_none(), "None").clicked() && material.is_some() {
+                *material = None;
+                changed = true;
+            }
+            for (id, name) in material_options {
+                if ui.selectable_label(*material == Some(*id), name).clicked()
+                    && *material != Some(*id)
+                {
+                    *material = Some(*id);
+                    changed = true;
+                }
+            }
+        }
+        NodeKind::Light {
+            color,
+            intensity,
+            radius,
+        } => {
+            changed |= color_editor(ui, "Color", color);
+            changed |= ui
+                .add(
+                    egui::Slider::new(intensity, 0.0..=4.0)
+                        .text(icons::label(icons::SUN, "Intensity")),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(radius, 0.0..=16000.0)
+                        .text(icons::label(icons::WAYPOINT, "Radius")),
+                )
+                .changed();
+        }
+        NodeKind::SpawnPoint { player } => {
+            changed |= ui
+                .checkbox(player, icons::label(icons::MAP_PIN, "Player spawn"))
+                .changed();
+        }
+        NodeKind::Trigger { trigger_id } => {
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::SCAN, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label("Trigger ID");
+            });
+            changed |= ui.text_edit_singleline(trigger_id).changed();
+        }
+        NodeKind::AudioSource { sound, radius } => {
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::AUDIO_LINES, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label(match sound {
+                    Some(id) => format!("Audio resource #{}", id.raw()),
+                    None => "No audio resource assigned".to_string(),
+                });
+            });
+            changed |= ui
+                .add(
+                    egui::Slider::new(radius, 0.0..=16000.0)
+                        .text(icons::label(icons::WAYPOINT, "Radius")),
+                )
+                .changed();
+        }
+    }
+    changed
+}
+
+fn blend_mode_editor(ui: &mut egui::Ui, mode: &mut PsxBlendMode) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(icons::text(icons::BLEND, 12.0).color(STUDIO_TEXT_WEAK));
+        ui.label("Blend mode");
+    });
+    for candidate in [
+        PsxBlendMode::Opaque,
+        PsxBlendMode::Average,
+        PsxBlendMode::Add,
+        PsxBlendMode::Subtract,
+        PsxBlendMode::AddQuarter,
+    ] {
+        if ui
+            .selectable_label(*mode == candidate, candidate.label())
+            .clicked()
+            && *mode != candidate
+        {
+            *mode = candidate;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn color_editor(ui: &mut egui::Ui, label: &str, color: &mut [u8; 3]) -> bool {
+    ui.horizontal(|ui| {
+        let mut changed = false;
+        ui.label(icons::text(icons::PALETTE, 12.0).color(STUDIO_TEXT_WEAK));
+        ui.label(label);
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut color[0])
+                    .prefix("R ")
+                    .range(0..=255),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut color[1])
+                    .prefix("G ")
+                    .range(0..=255),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut color[2])
+                    .prefix("B ")
+                    .range(0..=255),
+            )
+            .changed();
+        changed
+    })
+    .inner
+}
+
+fn short_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn node_lucide_icon(kind: &str, root: bool) -> char {
+    if root {
+        return icons::HOUSE;
+    }
+
+    match kind {
+        "Node3D" => icons::CIRCLE_DOT,
+        "Room" | "GridWorld" => icons::GRID,
+        "MeshInstance" => icons::BOX,
+        "Light" => icons::SUN,
+        "SpawnPoint" => icons::MAP_PIN,
+        "Trigger" => icons::SCAN,
+        "AudioSource" => icons::AUDIO_LINES,
+        _ => icons::CIRCLE_DOT,
+    }
+}
+
+fn node_lucide_color(kind: &str, root: bool, selected: bool) -> Color32 {
+    if selected {
+        return Color32::WHITE;
+    }
+    if root {
+        return STUDIO_ACCENT;
+    }
+
+    match kind {
+        "Room" | "GridWorld" => Color32::from_rgb(209, 118, 71),
+        "MeshInstance" => Color32::from_rgb(156, 174, 190),
+        "Light" => Color32::from_rgb(238, 203, 116),
+        "SpawnPoint" => Color32::from_rgb(236, 188, 104),
+        "Trigger" => Color32::from_rgb(190, 128, 232),
+        "AudioSource" => Color32::from_rgb(104, 202, 188),
+        _ => Color32::from_rgb(141, 160, 180),
+    }
+}
+
+fn draw_inline_icon(ui: &mut egui::Ui, icon: char, color: Color32) {
+    ui.label(icons::text(icon, 16.0).color(color));
+}
+
+fn draw_scene_node_row(ui: &mut egui::Ui, row: &NodeRow, selected: bool) -> egui::Response {
+    let row_height = 24.0;
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height), Sense::click());
+    let painter = ui.painter_at(rect);
+    let hovered = response.hovered();
+
+    if selected {
+        painter.rect_filled(rect.shrink2(Vec2::new(0.0, 1.0)), 3.0, STUDIO_ACCENT_DIM);
+    } else if hovered {
+        painter.rect_filled(
+            rect.shrink2(Vec2::new(0.0, 1.0)),
+            3.0,
+            Color32::from_rgba_unmultiplied(42, 58, 70, 120),
+        );
+    }
+
+    let indent = row.depth as f32 * 16.0;
+    let content_left = rect.left() + 4.0 + indent;
+    if row.depth > 0 {
+        let line_x = rect.left() + 10.0 + (row.depth.saturating_sub(1) as f32 * 16.0);
+        painter.line_segment(
+            [
+                Pos2::new(line_x, rect.top()),
+                Pos2::new(line_x, rect.bottom()),
+            ],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(70, 86, 102, 92)),
+        );
+    }
+
+    let chevron_rect = Rect::from_min_size(
+        Pos2::new(content_left, rect.center().y - 5.0),
+        Vec2::splat(10.0),
+    );
+    if row.child_count > 0 {
+        painter.text(
+            chevron_rect.center(),
+            Align2::CENTER_CENTER,
+            icons::CHEVRON_DOWN.to_string(),
+            icons::font(12.0),
+            Color32::from_rgb(160, 174, 188),
+        );
+    }
+
+    let icon_rect = Rect::from_min_size(
+        Pos2::new(content_left + 14.0, rect.center().y - 8.0),
+        Vec2::splat(16.0),
+    );
+    painter.text(
+        icon_rect.center(),
+        Align2::CENTER_CENTER,
+        node_lucide_icon(row.kind, row.id == NodeId::ROOT).to_string(),
+        icons::font(15.0),
+        node_lucide_color(row.kind, row.id == NodeId::ROOT, selected),
+    );
+
+    let text_color = if selected {
+        Color32::WHITE
+    } else {
+        STUDIO_TEXT
+    };
+    let label = if row.id == NodeId::ROOT {
+        format!("Root: {}", row.kind)
+    } else {
+        row.name.clone()
+    };
+    let text_pos = Pos2::new(icon_rect.right() + 7.0, rect.center().y);
+    painter.text(
+        text_pos,
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        text_color,
+    );
+
+    if row.id != NodeId::ROOT {
+        painter.text(
+            Pos2::new(text_pos.x + 118.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            row.kind,
+            FontId::proportional(11.0),
+            if selected {
+                Color32::from_rgb(204, 229, 236)
+            } else {
+                STUDIO_TEXT_WEAK
+            },
+        );
+    }
+
+    if row.child_count > 0 && row.id != NodeId::ROOT {
+        let pill = Rect::from_min_size(
+            Pos2::new(rect.right() - 50.0, rect.center().y - 8.0),
+            Vec2::new(24.0, 16.0),
+        );
+        painter.rect_filled(pill, 8.0, Color32::from_rgba_unmultiplied(9, 14, 18, 138));
+        painter.text(
+            pill.center(),
+            Align2::CENTER_CENTER,
+            row.child_count.to_string(),
+            FontId::monospace(10.0),
+            STUDIO_TEXT_WEAK,
+        );
+    }
+
+    let eye_rect = Rect::from_min_size(
+        Pos2::new(rect.right() - 22.0, rect.center().y - 6.0),
+        Vec2::new(14.0, 12.0),
+    );
+    painter.text(
+        eye_rect.center(),
+        Align2::CENTER_CENTER,
+        icons::EYE.to_string(),
+        icons::font(12.0),
+        if selected || hovered {
+            Color32::from_rgb(184, 205, 218)
+        } else {
+            Color32::from_rgb(88, 102, 116)
+        },
+    );
+    response
+}
+
+fn node_draw_mode(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::MeshInstance { .. } => "Textured Triangles",
+        NodeKind::Room { .. } => "World Surfaces",
+        NodeKind::GridWorld { .. } => "Sector Grid",
+        NodeKind::Light { .. } => "Editor Gizmo",
+        NodeKind::SpawnPoint { .. } => "Spawn Marker",
+        NodeKind::Trigger { .. } => "Trigger Volume",
+        NodeKind::AudioSource { .. } => "Audio Marker",
+        NodeKind::Node | NodeKind::Node3D => "None",
+    }
+}
+
+fn count_nodes(project: &ProjectDocument, predicate: impl Fn(&NodeKind) -> bool) -> usize {
+    project
+        .active_scene()
+        .nodes()
+        .iter()
+        .filter(|node| predicate(&node.kind))
+        .count()
+}
+
+fn draw_scene_group(ui: &mut egui::Ui, icon: char, label: &str, count: usize) {
+    egui::CollapsingHeader::new(format!("{} ({count})", icons::label(icon, label)))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.weak("Filtered collection");
+        });
+}
+
+#[derive(Debug, Clone)]
+struct ProjectFileRow {
+    depth: usize,
+    name: String,
+    folder: bool,
+    icon: char,
+    resource: Option<ResourceId>,
+}
+
+fn project_filesystem_rows(project: &ProjectDocument) -> Vec<ProjectFileRow> {
+    let mut rows = Vec::new();
+    rows.push(ProjectFileRow {
+        depth: 0,
+        name: "res://".to_string(),
+        folder: true,
+        icon: icons::FOLDER,
+        resource: None,
+    });
+    rows.push(ProjectFileRow {
+        depth: 1,
+        name: "rooms".to_string(),
+        folder: true,
+        icon: icons::FOLDER,
+        resource: None,
+    });
+    rows.push(ProjectFileRow {
+        depth: 2,
+        name: format!("{}.room", snake_name(&project.active_scene().name)),
+        folder: false,
+        icon: icons::GRID,
+        resource: None,
+    });
+
+    push_resource_folder(project, &mut rows, "materials", ResourceFilter::Material);
+    push_resource_folder(project, &mut rows, "textures", ResourceFilter::Texture);
+    push_resource_folder(project, &mut rows, "meshes", ResourceFilter::Mesh);
+    push_resource_folder(project, &mut rows, "spawns", ResourceFilter::Other);
+    rows
+}
+
+fn push_resource_folder(
+    project: &ProjectDocument,
+    rows: &mut Vec<ProjectFileRow>,
+    folder: &str,
+    filter: ResourceFilter,
+) {
+    rows.push(ProjectFileRow {
+        depth: 1,
+        name: folder.to_string(),
+        folder: true,
+        icon: icons::FOLDER,
+        resource: None,
+    });
+    for resource in project
+        .resources
+        .iter()
+        .filter(|resource| filter.matches(&resource.data))
+    {
+        rows.push(ProjectFileRow {
+            depth: 2,
+            name: resource_file_name(resource),
+            folder: false,
+            icon: resource_lucide_icon(&resource.data),
+            resource: Some(resource.id),
+        });
+    }
+}
+
+fn draw_project_file_row(
+    ui: &mut egui::Ui,
+    row: &ProjectFileRow,
+    selected_resource: Option<ResourceId>,
+    filter: &str,
+) -> bool {
+    if !row.folder && !filter.is_empty() && !row.name.to_ascii_lowercase().contains(filter) {
+        return false;
+    }
+
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.add_space(row.depth as f32 * 14.0);
+        let label = icons::label(row.icon, &row.name);
+        if row.folder {
+            ui.label(RichText::new(label).color(STUDIO_TEXT_WEAK));
+        } else if ui
+            .selectable_label(row.resource == selected_resource, label)
+            .clicked()
+        {
+            clicked = true;
+        }
+    });
+    clicked
+}
+
+fn resource_file_name(resource: &Resource) -> String {
+    match &resource.data {
+        ResourceData::Texture { source_path, .. } => {
+            cooked_name(&resource.name, source_path, "psxtex")
+        }
+        ResourceData::Material(_) => cooked_name(&resource.name, "", "mat"),
+        ResourceData::Mesh { source_path } => cooked_name(&resource.name, source_path, "psxmesh"),
+        ResourceData::Scene { source_path } => cooked_name(&resource.name, source_path, "room"),
+        ResourceData::Script { source_path } => cooked_name(&resource.name, source_path, "script"),
+        ResourceData::Audio { source_path } => cooked_name(&resource.name, source_path, "vag"),
+    }
+}
+
+fn cooked_name(name: &str, source_path: &str, ext: &str) -> String {
+    let stem = Path::new(source_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(name);
+    format!("{}.{}", snake_name(stem), ext)
+}
+
+fn snake_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut previous_was_sep = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            previous_was_sep = false;
+        } else if !previous_was_sep {
+            out.push('_');
+            previous_was_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize); 5] {
+    let mut texture = 0;
+    let mut material = 0;
+    let mut mesh = 0;
+    let mut room = 0;
+    let mut other = 0;
+    for resource in &project.resources {
+        match &resource.data {
+            ResourceData::Texture { .. } => texture += 1,
+            ResourceData::Material(_) => material += 1,
+            ResourceData::Mesh { .. } => mesh += 1,
+            ResourceData::Scene { .. } => room += 1,
+            ResourceData::Script { .. } | ResourceData::Audio { .. } => other += 1,
+        }
+    }
+    [
+        (ResourceFilter::Texture, texture),
+        (ResourceFilter::Material, material),
+        (ResourceFilter::Mesh, mesh),
+        (ResourceFilter::Room, room),
+        (ResourceFilter::Other, other),
+    ]
+}
+
+fn draw_placeholder_panel(ui: &mut egui::Ui, title: &str, message: &str) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(28.0);
+        let icon = match title {
+            "Asset Browser" => icons::FOLDER,
+            "Output" | "Console" => icons::TERMINAL,
+            _ => icons::FILE,
+        };
+        ui.label(icons::text(icon, 24.0).color(STUDIO_TEXT_WEAK));
+        ui.strong(title);
+        ui.label(message);
+    });
+}
+
+fn resource_matches_filter(resource: &Resource, filter: ResourceFilter, search: &str) -> bool {
+    if !filter.matches(&resource.data) {
+        return false;
+    }
+    if search.is_empty() {
+        return true;
+    }
+    resource.name.to_ascii_lowercase().contains(search)
+        || resource.data.label().to_ascii_lowercase().contains(search)
+        || resource_source_path(resource)
+            .is_some_and(|path| path.to_ascii_lowercase().contains(search))
+}
+
+fn resource_source_path(resource: &Resource) -> Option<&str> {
+    match &resource.data {
+        ResourceData::Texture { source_path, .. }
+        | ResourceData::Mesh { source_path }
+        | ResourceData::Scene { source_path }
+        | ResourceData::Script { source_path }
+        | ResourceData::Audio { source_path } => Some(source_path.as_str()),
+        ResourceData::Material(_) => None,
+    }
+}
+
+fn resource_lucide_icon(data: &ResourceData) -> char {
+    match data {
+        ResourceData::Texture { .. } => icons::PALETTE,
+        ResourceData::Material(_) => icons::BLEND,
+        ResourceData::Mesh { .. } => icons::BOX,
+        ResourceData::Scene { .. } => icons::GRID,
+        ResourceData::Script { .. } => icons::FILE,
+        ResourceData::Audio { .. } => icons::AUDIO_LINES,
+    }
+}
+
+fn resource_lucide_color(data: &ResourceData, selected: bool) -> Color32 {
+    if selected {
+        return Color32::WHITE;
+    }
+
+    match data {
+        ResourceData::Texture { .. } => Color32::from_rgb(163, 182, 198),
+        ResourceData::Material(_) => Color32::from_rgb(208, 112, 162),
+        ResourceData::Mesh { .. } => Color32::from_rgb(156, 174, 190),
+        ResourceData::Scene { .. } => Color32::from_rgb(209, 118, 71),
+        ResourceData::Script { .. } => Color32::from_rgb(188, 176, 104),
+        ResourceData::Audio { .. } => Color32::from_rgb(104, 202, 188),
+    }
+}
+
+fn draw_resource_card(
+    ui: &mut egui::Ui,
+    project: &ProjectDocument,
+    resource: &Resource,
+    selected: bool,
+) -> egui::Response {
+    let size = Vec2::new(120.0, 155.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let painter = ui.painter_at(rect);
+    let fill = if selected {
+        Color32::from_rgb(21, 50, 62)
+    } else {
+        STUDIO_PANEL
+    };
+    painter.rect_filled(rect, 4.0, fill);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(
+            if selected { 2.0 } else { 1.0 },
+            if selected {
+                STUDIO_ACCENT
+            } else {
+                STUDIO_BORDER
+            },
+        ),
+        StrokeKind::Inside,
+    );
+
+    let preview = Rect::from_min_size(rect.min + Vec2::new(12.0, 12.0), Vec2::new(96.0, 76.0));
+    draw_resource_preview(&painter, preview, project, resource);
+    painter.rect_stroke(
+        preview,
+        2.0,
+        Stroke::new(1.0, Color32::from_rgb(54, 64, 76)),
+        StrokeKind::Inside,
+    );
+    let badge = Rect::from_min_size(preview.left_top() + Vec2::new(4.0, 4.0), Vec2::splat(22.0));
+    painter.rect_filled(badge, 4.0, Color32::from_rgba_unmultiplied(8, 12, 16, 192));
+    painter.text(
+        badge.center(),
+        Align2::CENTER_CENTER,
+        resource_lucide_icon(&resource.data).to_string(),
+        icons::font(14.0),
+        resource_lucide_color(&resource.data, selected),
+    );
+    painter.text(
+        rect.center_top() + Vec2::new(0.0, 98.0),
+        Align2::CENTER_TOP,
+        &resource.name,
+        FontId::monospace(12.0),
+        Color32::from_rgb(225, 231, 240),
+    );
+    painter.text(
+        rect.center_bottom() + Vec2::new(0.0, -18.0),
+        Align2::CENTER_BOTTOM,
+        resource_detail(resource),
+        FontId::monospace(10.0),
+        STUDIO_TEXT_WEAK,
+    );
+    response
+}
+
+fn draw_resource_preview(
+    painter: &egui::Painter,
+    preview: Rect,
+    project: &ProjectDocument,
+    resource: &Resource,
+) {
+    match &resource.data {
+        ResourceData::Material(material) => {
+            if let Some(texture) = material.texture.and_then(|id| project.resource(id)) {
+                draw_texture_like_preview(painter, preview, texture);
+            } else {
+                draw_texture_like_preview(painter, preview, resource);
+            }
+            let tint = Color32::from_rgba_unmultiplied(
+                material.tint[0].saturating_mul(2),
+                material.tint[1].saturating_mul(2),
+                material.tint[2].saturating_mul(2),
+                if material.blend_mode == PsxBlendMode::Opaque {
+                    55
+                } else {
+                    110
+                },
+            );
+            painter.rect_filled(preview.shrink(8.0), 2.0, tint);
+        }
+        ResourceData::Texture { .. } => {
+            draw_texture_like_preview(painter, preview, resource);
+        }
+        _ => {
+            painter.rect_filled(preview, 2.0, resource_preview_color(resource));
+        }
+    }
+    draw_palette_strip(painter, preview, palette_for_resource(resource));
+}
+
+fn draw_texture_like_preview(painter: &egui::Painter, preview: Rect, resource: &Resource) {
+    let name = resource.name.to_ascii_lowercase();
+    if name.contains("brick") {
+        draw_brick_preview(painter, preview, resource_preview_color(resource));
+    } else if name.contains("floor") || name.contains("stone") {
+        draw_stone_preview(painter, preview, resource_preview_color(resource));
+    } else if name.contains("glass") {
+        draw_checker_preview(painter, preview, resource_preview_color(resource));
+    } else {
+        draw_checker_preview(painter, preview, resource_preview_color(resource));
+    }
+}
+
+fn draw_brick_preview(painter: &egui::Painter, preview: Rect, base: Color32) {
+    painter.rect_filled(preview, 2.0, darken(base, 8));
+    let row_h = 14.0;
+    let rows = (preview.height() / row_h).ceil() as i32;
+    for row in 0..rows {
+        let top = preview.top() + row as f32 * row_h;
+        let y = top.min(preview.bottom());
+        painter.line_segment(
+            [Pos2::new(preview.left(), y), Pos2::new(preview.right(), y)],
+            Stroke::new(1.0, darken(base, 48)),
+        );
+        let offset = if row % 2 == 0 { 0.0 } else { 18.0 };
+        let mut x = preview.left() + offset;
+        while x < preview.right() {
+            painter.line_segment(
+                [
+                    Pos2::new(x, top + 2.0),
+                    Pos2::new(x, (top + row_h - 2.0).min(preview.bottom())),
+                ],
+                Stroke::new(1.0, darken(base, 45)),
+            );
+            x += 36.0;
+        }
+        let stripe = Rect::from_min_max(
+            Pos2::new(preview.left(), top + 2.0),
+            Pos2::new(preview.right(), (top + 5.0).min(preview.bottom())),
+        );
+        painter.rect_filled(
+            stripe,
+            0.0,
+            Color32::from_rgba_unmultiplied(188, 110, 60, 35),
+        );
+    }
+}
+
+fn draw_stone_preview(painter: &egui::Painter, preview: Rect, base: Color32) {
+    painter.rect_filled(preview, 2.0, darken(base, 18));
+    let cols = 3;
+    let rows = 3;
+    let cell = Vec2::new(
+        preview.width() / cols as f32,
+        preview.height() / rows as f32,
+    );
+    for y in 0..rows {
+        for x in 0..cols {
+            let min = preview.min + Vec2::new(x as f32 * cell.x, y as f32 * cell.y);
+            let rect = Rect::from_min_size(min, cell).shrink(1.0);
+            let shade = if (x + y) % 2 == 0 {
+                lighten(base, 12)
+            } else {
+                darken(base, 6)
+            };
+            painter.rect_filled(rect, 1.0, shade);
+            painter.rect_stroke(
+                rect,
+                1.0,
+                Stroke::new(1.0, darken(base, 38)),
+                StrokeKind::Inside,
+            );
+        }
+    }
+}
+
+fn draw_checker_preview(painter: &egui::Painter, preview: Rect, base: Color32) {
+    let alt = Color32::from_rgb(
+        base.r().saturating_add(28),
+        base.g().saturating_add(24),
+        base.b().saturating_add(20),
+    );
+    let cell = 16.0;
+    let cols = (preview.width() / cell).ceil() as i32;
+    let rows = (preview.height() / cell).ceil() as i32;
+    for y in 0..rows {
+        for x in 0..cols {
+            let min = preview.min + Vec2::new(x as f32 * cell, y as f32 * cell);
+            let rect = Rect::from_min_size(min, Vec2::splat(cell)).intersect(preview);
+            painter.rect_filled(rect, 0.0, if (x + y) % 2 == 0 { base } else { alt });
+        }
+    }
+}
+
+fn draw_palette_strip(painter: &egui::Painter, preview: Rect, swatches: [Color32; 5]) {
+    let width = preview.width() / swatches.len() as f32;
+    for (idx, color) in swatches.iter().enumerate() {
+        let min = Pos2::new(preview.left() + idx as f32 * width, preview.bottom() - 10.0);
+        let rect = Rect::from_min_size(min, Vec2::new(width, 10.0));
+        painter.rect_filled(rect, 0.0, *color);
+    }
+}
+
+fn palette_for_resource(resource: &Resource) -> [Color32; 5] {
+    let base = resource_preview_color(resource);
+    [
+        Color32::from_rgb(28, 30, 34),
+        darken(base, 70),
+        darken(base, 35),
+        base,
+        lighten(base, 44),
+    ]
+}
+
+fn darken(color: Color32, amount: u8) -> Color32 {
+    Color32::from_rgb(
+        color.r().saturating_sub(amount),
+        color.g().saturating_sub(amount),
+        color.b().saturating_sub(amount),
+    )
+}
+
+fn lighten(color: Color32, amount: u8) -> Color32 {
+    Color32::from_rgb(
+        color.r().saturating_add(amount),
+        color.g().saturating_add(amount),
+        color.b().saturating_add(amount),
+    )
+}
+
+fn resource_preview_color(resource: &Resource) -> Color32 {
+    let name = resource.name.to_ascii_lowercase();
+    if name.contains("brick") {
+        Color32::from_rgb(130, 70, 42)
+    } else if name.contains("floor") {
+        Color32::from_rgb(106, 112, 120)
+    } else if name.contains("glass") {
+        Color32::from_rgb(80, 150, 165)
+    } else {
+        match &resource.data {
+            ResourceData::Texture { .. } => Color32::from_rgb(92, 116, 140),
+            ResourceData::Material(_) => Color32::from_rgb(120, 92, 135),
+            ResourceData::Mesh { .. } => Color32::from_rgb(110, 120, 130),
+            ResourceData::Scene { .. } => Color32::from_rgb(92, 130, 106),
+            ResourceData::Script { .. } => Color32::from_rgb(128, 126, 80),
+            ResourceData::Audio { .. } => Color32::from_rgb(80, 128, 128),
+        }
+    }
+}
+
+fn resource_detail(resource: &Resource) -> &'static str {
+    match &resource.data {
+        ResourceData::Texture { .. } => "Texture - 4bpp",
+        ResourceData::Material(_) => "Material - 4bpp",
+        ResourceData::Mesh { .. } => "Mesh",
+        ResourceData::Scene { .. } => "Room",
+        ResourceData::Script { .. } => "Script",
+        ResourceData::Audio { .. } => "Audio",
+    }
+}
+
+fn draw_atlas_preview(ui: &mut egui::Ui, project: &ProjectDocument) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(210.0, 86.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(12, 16, 20));
+    let colors: Vec<_> = project
+        .resources
+        .iter()
+        .filter(|resource| {
+            matches!(
+                resource.data,
+                ResourceData::Texture { .. } | ResourceData::Material(_)
+            )
+        })
+        .map(resource_preview_color)
+        .collect();
+    let cell = 16.0;
+    for y in 0..5 {
+        for x in 0..13 {
+            let idx = (x + y * 3) % colors.len().max(1);
+            let min = rect.min + Vec2::new(x as f32 * cell, y as f32 * cell);
+            painter.rect_filled(
+                Rect::from_min_size(min, Vec2::splat(cell - 1.0)),
+                0.0,
+                colors
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_else(|| Color32::from_rgb(64, 72, 84)),
+            );
+        }
+    }
+    painter.rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(1.0, Color32::from_rgb(58, 70, 86)),
+        StrokeKind::Inside,
+    );
+}
+
+fn draw_viewport_overlay(
+    painter: &egui::Painter,
+    rect: Rect,
+    project: &ProjectDocument,
+    zoom: f32,
+    snap_units: u16,
+) {
+    let overlay = Rect::from_min_size(
+        rect.left_top() + Vec2::new(12.0, 12.0),
+        Vec2::new(132.0, 94.0),
+    );
+    painter.rect_filled(
+        overlay,
+        2.0,
+        Color32::from_rgba_unmultiplied(14, 20, 26, 224),
+    );
+    painter.rect_stroke(
+        overlay,
+        2.0,
+        Stroke::new(1.0, STUDIO_BORDER),
+        StrokeKind::Inside,
+    );
+    let lines = [
+        "Top Orthographic".to_string(),
+        format!("Grid: {snap_units} units"),
+        format!("{} nodes", project.active_scene().nodes().len()),
+        format!("{} resources", project.resources.len()),
+        format!("{:.0} px/unit", zoom),
+    ];
+    for (idx, line) in lines.iter().enumerate() {
+        painter.text(
+            overlay.left_top() + Vec2::new(10.0, 10.0 + idx as f32 * 15.0),
+            Align2::LEFT_TOP,
+            line,
+            FontId::monospace(11.0),
+            STUDIO_TEXT,
+        );
+    }
+}
+
+fn draw_axes_gizmo(painter: &egui::Painter, rect: Rect) {
+    let origin = Pos2::new(rect.left() + 34.0, rect.bottom() - 38.0);
+    let x_end = origin + Vec2::new(42.0, 0.0);
+    let y_end = origin + Vec2::new(0.0, -42.0);
+    let x_stroke = Stroke::new(2.0, Color32::from_rgb(220, 52, 46));
+    let y_stroke = Stroke::new(2.0, Color32::from_rgb(108, 220, 92));
+
+    painter.circle_filled(origin, 3.0, STUDIO_ACCENT);
+    painter.line_segment([origin, x_end], x_stroke);
+    painter.line_segment([origin, y_end], y_stroke);
+    painter.line_segment([x_end, x_end + Vec2::new(-7.0, -4.0)], x_stroke);
+    painter.line_segment([x_end, x_end + Vec2::new(-7.0, 4.0)], x_stroke);
+    painter.line_segment([y_end, y_end + Vec2::new(-4.0, 7.0)], y_stroke);
+    painter.line_segment([y_end, y_end + Vec2::new(4.0, 7.0)], y_stroke);
+    painter.text(
+        x_end + Vec2::new(8.0, 0.0),
+        Align2::LEFT_CENTER,
+        "X",
+        FontId::monospace(12.0),
+        Color32::from_rgb(255, 95, 88),
+    );
+    painter.text(
+        y_end + Vec2::new(0.0, -8.0),
+        Align2::CENTER_BOTTOM,
+        "Y",
+        FontId::monospace(12.0),
+        Color32::from_rgb(140, 255, 128),
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewportTransform {
+    rect: Rect,
+    pan: Vec2,
+    zoom: f32,
+}
+
+impl ViewportTransform {
+    fn new(rect: Rect, pan: Vec2, zoom: f32) -> Self {
+        Self { rect, pan, zoom }
+    }
+
+    fn world_to_screen(self, world: [f32; 2]) -> Pos2 {
+        self.rect.center() + self.pan + Vec2::new(world[0] * self.zoom, -world[1] * self.zoom)
+    }
+
+    fn screen_to_world(self, screen: Pos2) -> [f32; 2] {
+        let delta = screen - self.rect.center() - self.pan;
+        [delta.x / self.zoom, -delta.y / self.zoom]
+    }
+
+    fn world_rect_to_screen(self, center: [f32; 2], half: [f32; 2]) -> Rect {
+        let min = [center[0] - half[0], center[1] - half[1]];
+        let max = [center[0] + half[0], center[1] + half[1]];
+        let a = self.world_to_screen(min);
+        let b = self.world_to_screen(max);
+        Rect::from_min_max(
+            Pos2::new(a.x.min(b.x), a.y.min(b.y)),
+            Pos2::new(a.x.max(b.x), a.y.max(b.y)),
+        )
+    }
+
+    fn screen_radius(self, radius: f32) -> f32 {
+        radius * self.zoom
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ViewportHit {
+    id: NodeId,
+    name: String,
+    shape: HitShape,
+}
+
+impl ViewportHit {
+    fn rect(id: NodeId, name: impl Into<String>, center: [f32; 2], half: [f32; 2]) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            shape: HitShape::Rect { center, half },
+        }
+    }
+
+    fn circle(id: NodeId, name: impl Into<String>, center: [f32; 2], radius: f32) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            shape: HitShape::Circle { center, radius },
+        }
+    }
+
+    fn contains(&self, world: [f32; 2]) -> bool {
+        match self.shape {
+            HitShape::Rect { center, half } => {
+                world[0] >= center[0] - half[0]
+                    && world[0] <= center[0] + half[0]
+                    && world[1] >= center[1] - half[1]
+                    && world[1] <= center[1] + half[1]
+            }
+            HitShape::Circle { center, radius } => {
+                let dx = world[0] - center[0];
+                let dz = world[1] - center[1];
+                dx * dx + dz * dz <= radius * radius
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HitShape {
+    Rect { center: [f32; 2], half: [f32; 2] },
+    Circle { center: [f32; 2], radius: f32 },
+}
+
+fn draw_world_grid(painter: &egui::Painter, transform: ViewportTransform) {
+    let rect = transform.rect;
+    let top_left = transform.screen_to_world(rect.left_top());
+    let bottom_right = transform.screen_to_world(rect.right_bottom());
+    let min_x = top_left[0].min(bottom_right[0]).floor() as i32 - 1;
+    let max_x = top_left[0].max(bottom_right[0]).ceil() as i32 + 1;
+    let min_z = top_left[1].min(bottom_right[1]).floor() as i32 - 1;
+    let max_z = top_left[1].max(bottom_right[1]).ceil() as i32 + 1;
+
+    let minor = Stroke::new(1.0, Color32::from_rgb(20, 43, 52));
+    let major = Stroke::new(1.0, Color32::from_rgb(31, 63, 75));
+    let axis = Stroke::new(1.0, Color32::from_rgb(58, 91, 103));
+
+    for x in min_x..=max_x {
+        let stroke = if x == 0 {
+            axis
+        } else if x % 4 == 0 {
+            major
+        } else {
+            minor
+        };
+        let a = transform.world_to_screen([x as f32, min_z as f32]);
+        let b = transform.world_to_screen([x as f32, max_z as f32]);
+        painter.line_segment([a, b], stroke);
+    }
+
+    for z in min_z..=max_z {
+        let stroke = if z == 0 {
+            axis
+        } else if z % 4 == 0 {
+            major
+        } else {
+            minor
+        };
+        let a = transform.world_to_screen([min_x as f32, z as f32]);
+        let b = transform.world_to_screen([max_x as f32, z as f32]);
+        painter.line_segment([a, b], stroke);
+    }
+}
+
+fn draw_scene_viewport(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    project: &ProjectDocument,
+    selected: NodeId,
+) -> Vec<ViewportHit> {
+    let scene = project.active_scene();
+    let mut hits = Vec::new();
+
+    for node in scene.nodes() {
+        match node.kind {
+            NodeKind::GridWorld { .. } => {
+                draw_grid_world(painter, transform, project, node, selected, &mut hits);
+            }
+            NodeKind::Room { .. } => {
+                draw_room(painter, transform, project, node, selected, &mut hits);
+            }
+            _ => {}
+        }
+    }
+
+    for node in scene.nodes() {
+        match &node.kind {
+            NodeKind::MeshInstance { .. } if !is_room_surface_node(node) => {
+                draw_mesh_marker(painter, transform, project, node, selected, &mut hits);
+            }
+            NodeKind::SpawnPoint { .. } => {
+                draw_spawn_marker(painter, transform, node, selected, &mut hits);
+            }
+            NodeKind::Light {
+                color,
+                intensity,
+                radius,
+            } => {
+                draw_light_marker(
+                    painter, transform, node, selected, *color, *intensity, *radius, &mut hits,
+                );
+            }
+            NodeKind::Trigger { .. } => {
+                draw_simple_marker(
+                    painter,
+                    transform,
+                    node,
+                    selected,
+                    "T",
+                    Color32::from_rgb(180, 116, 230),
+                    &mut hits,
+                );
+            }
+            NodeKind::AudioSource { .. } => {
+                draw_simple_marker(
+                    painter,
+                    transform,
+                    node,
+                    selected,
+                    "A",
+                    Color32::from_rgb(70, 190, 165),
+                    &mut hits,
+                );
+            }
+            NodeKind::Node | NodeKind::Node3D if node.id != scene.root => {
+                draw_simple_marker(
+                    painter,
+                    transform,
+                    node,
+                    selected,
+                    "N",
+                    Color32::from_rgb(110, 124, 150),
+                    &mut hits,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    hits
+}
+
+fn draw_grid_world(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    project: &ProjectDocument,
+    node: &psxed_project::SceneNode,
+    selected: NodeId,
+    hits: &mut Vec<ViewportHit>,
+) {
+    let NodeKind::GridWorld { grid } = &node.kind else {
+        return;
+    };
+
+    let center = node_world(node);
+    let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
+    let outline = transform.world_rect_to_screen(center, half);
+    hits.push(ViewportHit::rect(node.id, node.name.clone(), center, half));
+    painter.rect_filled(outline, 0.0, darken(STUDIO_ROOM_FLOOR, 28));
+
+    for x in 0..grid.width {
+        for z in 0..grid.depth {
+            let Some(sector) = grid.sector(x, z) else {
+                continue;
+            };
+            let tile_center = [
+                center[0] - half[0] + x as f32 + 0.5,
+                center[1] - half[1] + z as f32 + 0.5,
+            ];
+            let screen_rect = transform.world_rect_to_screen(tile_center, [0.5, 0.5]);
+            if !screen_rect.intersects(transform.rect) {
+                continue;
+            }
+            let floor_material = sector.floor.as_ref().and_then(|floor| floor.material);
+            let floor_color = material_color(project, floor_material, SurfaceRole::Floor);
+            draw_floor_tile(painter, screen_rect, floor_color, x as i32, z as i32);
+            hits.push(ViewportHit::rect(
+                node.id,
+                format!("{} sector {},{}", node.name, x, z),
+                tile_center,
+                [0.5, 0.5],
+            ));
+            draw_grid_sector_walls(painter, transform, project, center, half, x, z, sector);
+        }
+    }
+
+    painter.rect_stroke(
+        outline,
+        0.0,
+        selected_stroke(selected == node.id),
+        StrokeKind::Outside,
+    );
+    painter.text(
+        transform.world_to_screen([center[0] - half[0], center[1] + half[1]])
+            + Vec2::new(8.0, -8.0),
+        Align2::LEFT_BOTTOM,
+        &node.name,
+        FontId::monospace(12.0),
+        Color32::from_rgb(230, 235, 245),
+    );
+}
+
+fn draw_grid_sector_walls(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    project: &ProjectDocument,
+    center: [f32; 2],
+    half: [f32; 2],
+    x: u16,
+    z: u16,
+    sector: &psxed_project::GridSector,
+) {
+    let wall_thickness = 0.18;
+    for direction in [
+        GridDirection::North,
+        GridDirection::East,
+        GridDirection::South,
+        GridDirection::West,
+    ] {
+        let walls = sector.walls.get(direction);
+        if walls.is_empty() {
+            continue;
+        }
+        let material = walls.first().and_then(|wall| wall.material);
+        let wall_color = material_color(project, material, SurfaceRole::Wall);
+        let min_x = center[0] - half[0] + x as f32;
+        let min_z = center[1] - half[1] + z as f32;
+        let (wall_center, wall_half) = match direction {
+            GridDirection::North => (
+                [min_x + 0.5, min_z - wall_thickness * 0.5],
+                [0.5, wall_thickness * 0.5],
+            ),
+            GridDirection::East => (
+                [min_x + 1.0 + wall_thickness * 0.5, min_z + 0.5],
+                [wall_thickness * 0.5, 0.5],
+            ),
+            GridDirection::South => (
+                [min_x + 0.5, min_z + 1.0 + wall_thickness * 0.5],
+                [0.5, wall_thickness * 0.5],
+            ),
+            GridDirection::West => (
+                [min_x - wall_thickness * 0.5, min_z + 0.5],
+                [wall_thickness * 0.5, 0.5],
+            ),
+            _ => unreachable!(),
+        };
+        let screen_rect = transform.world_rect_to_screen(wall_center, wall_half);
+        if screen_rect.intersects(transform.rect) {
+            draw_wall_band(painter, screen_rect, wall_color);
+            painter.rect_stroke(
+                screen_rect,
+                0.0,
+                Stroke::new(1.0, Color32::from_rgb(84, 58, 44)),
+                StrokeKind::Inside,
+            );
+        }
+    }
+
+    for (direction, nw_to_se) in [
+        (GridDirection::NorthWestSouthEast, true),
+        (GridDirection::NorthEastSouthWest, false),
+    ] {
+        if sector.walls.get(direction).is_empty() {
+            continue;
+        }
+        let min_x = center[0] - half[0] + x as f32;
+        let min_z = center[1] - half[1] + z as f32;
+        let a = if nw_to_se {
+            transform.world_to_screen([min_x, min_z])
+        } else {
+            transform.world_to_screen([min_x + 1.0, min_z])
+        };
+        let b = if nw_to_se {
+            transform.world_to_screen([min_x + 1.0, min_z + 1.0])
+        } else {
+            transform.world_to_screen([min_x, min_z + 1.0])
+        };
+        painter.line_segment([a, b], Stroke::new(4.0, STUDIO_ROOM_WALL));
+        painter.line_segment([a, b], Stroke::new(1.0, Color32::from_rgb(84, 58, 44)));
+    }
+}
+
+fn draw_room(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    project: &ProjectDocument,
+    room: &psxed_project::SceneNode,
+    selected: NodeId,
+    hits: &mut Vec<ViewportHit>,
+) {
+    let NodeKind::Room { width, depth } = room.kind else {
+        return;
+    };
+
+    let center = node_world(room);
+    let width = width.max(1) as i32;
+    let depth = depth.max(1) as i32;
+    let half = [width as f32 * 0.5, depth as f32 * 0.5];
+    let floor = room_child_surface(project, room.id, "floor");
+    let walls = room_child_surface(project, room.id, "wall");
+    let floor_id = floor.map(|node| node.id).unwrap_or(room.id);
+    let wall_id = walls.map(|node| node.id).unwrap_or(room.id);
+    let floor_name = floor
+        .map(|node| node.name.as_str())
+        .unwrap_or(room.name.as_str());
+    let wall_name = walls
+        .map(|node| node.name.as_str())
+        .unwrap_or(room.name.as_str());
+    let floor_material = floor.and_then(mesh_material);
+    let wall_material = walls.and_then(mesh_material);
+    let floor_color = material_color(project, floor_material, SurfaceRole::Floor);
+    let wall_color = material_color(project, wall_material, SurfaceRole::Wall);
+    let room_rect = transform.world_rect_to_screen(center, half);
+
+    hits.push(ViewportHit::rect(room.id, room.name.clone(), center, half));
+    painter.rect_filled(room_rect, 0.0, darken(floor_color, 18));
+
+    for ix in 0..width {
+        for iz in 0..depth {
+            let tile_center = [
+                center[0] - half[0] + ix as f32 + 0.5,
+                center[1] - half[1] + iz as f32 + 0.5,
+            ];
+            let screen_rect = transform.world_rect_to_screen(tile_center, [0.5, 0.5]);
+            if !screen_rect.intersects(transform.rect) {
+                continue;
+            }
+            draw_floor_tile(painter, screen_rect, floor_color, ix, iz);
+            hits.push(ViewportHit::rect(
+                floor_id,
+                floor_name.to_string(),
+                tile_center,
+                [0.5, 0.5],
+            ));
+        }
+    }
+
+    let wall_thickness = 0.18;
+    let wall_rects = [
+        (
+            [center[0], center[1] + half[1] + wall_thickness * 0.5],
+            [half[0] + wall_thickness, wall_thickness * 0.5],
+        ),
+        (
+            [center[0], center[1] - half[1] - wall_thickness * 0.5],
+            [half[0] + wall_thickness, wall_thickness * 0.5],
+        ),
+        (
+            [center[0] - half[0] - wall_thickness * 0.5, center[1]],
+            [wall_thickness * 0.5, half[1]],
+        ),
+        (
+            [center[0] + half[0] + wall_thickness * 0.5, center[1]],
+            [wall_thickness * 0.5, half[1]],
+        ),
+    ];
+
+    for (wall_center, wall_half) in wall_rects {
+        let screen_rect = transform.world_rect_to_screen(wall_center, wall_half);
+        draw_wall_band(painter, screen_rect, wall_color);
+        painter.rect_stroke(
+            screen_rect,
+            0.0,
+            Stroke::new(1.0, Color32::from_rgb(84, 58, 44)),
+            StrokeKind::Inside,
+        );
+        hits.push(ViewportHit::rect(
+            wall_id,
+            wall_name.to_string(),
+            wall_center,
+            wall_half,
+        ));
+    }
+
+    if selected == room.id || selected == floor_id {
+        let outline = transform.world_rect_to_screen(center, half);
+        painter.rect_stroke(
+            outline,
+            0.0,
+            selected_stroke(selected == room.id),
+            StrokeKind::Outside,
+        );
+    }
+
+    if selected == wall_id {
+        for (wall_center, wall_half) in wall_rects {
+            painter.rect_stroke(
+                transform.world_rect_to_screen(wall_center, wall_half),
+                0.0,
+                selected_stroke(true),
+                StrokeKind::Outside,
+            );
+        }
+    }
+
+    painter.text(
+        transform.world_to_screen([center[0] - half[0], center[1] + half[1]])
+            + Vec2::new(8.0, -8.0),
+        Align2::LEFT_BOTTOM,
+        &room.name,
+        FontId::monospace(12.0),
+        Color32::from_rgb(230, 235, 245),
+    );
+}
+
+fn draw_floor_tile(painter: &egui::Painter, rect: Rect, base: Color32, ix: i32, iz: i32) {
+    let tint = if (ix + iz) % 2 == 0 {
+        lighten(base, 8)
+    } else {
+        darken(base, 5)
+    };
+    painter.rect_filled(rect, 0.0, tint);
+    painter.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(44, 56, 65, 168)),
+        StrokeKind::Inside,
+    );
+
+    if rect.width() < 28.0 || rect.height() < 28.0 {
+        return;
+    }
+
+    let mid_x = rect.center().x
+        + if ix % 2 == 0 {
+            -rect.width() * 0.12
+        } else {
+            rect.width() * 0.10
+        };
+    let mid_y = rect.center().y
+        + if iz % 2 == 0 {
+            rect.height() * 0.08
+        } else {
+            -rect.height() * 0.10
+        };
+    let crack = Stroke::new(1.0, Color32::from_rgba_unmultiplied(70, 80, 88, 150));
+    painter.line_segment(
+        [
+            Pos2::new(mid_x, rect.top() + 5.0),
+            Pos2::new(mid_x, rect.bottom() - 5.0),
+        ],
+        crack,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(rect.left() + 5.0, mid_y),
+            Pos2::new(rect.right() - 5.0, mid_y),
+        ],
+        crack,
+    );
+}
+
+fn draw_wall_band(painter: &egui::Painter, rect: Rect, base: Color32) {
+    painter.rect_filled(rect, 0.0, darken(base, 4));
+    let highlight = Stroke::new(1.0, Color32::from_rgba_unmultiplied(166, 92, 50, 160));
+    let shadow = Stroke::new(1.0, Color32::from_rgba_unmultiplied(72, 42, 30, 180));
+
+    if rect.width() >= rect.height() {
+        let rows = (rect.height() / 7.0).max(2.0) as i32;
+        for row in 1..rows {
+            let y = rect.top() + row as f32 * rect.height() / rows as f32;
+            painter.line_segment(
+                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                if row % 2 == 0 { highlight } else { shadow },
+            );
+        }
+        let cols = (rect.width() / 42.0).max(3.0) as i32;
+        for col in 1..cols {
+            let x = rect.left() + col as f32 * rect.width() / cols as f32;
+            painter.line_segment(
+                [
+                    Pos2::new(x, rect.top() + 3.0),
+                    Pos2::new(x, rect.bottom() - 3.0),
+                ],
+                shadow,
+            );
+        }
+    } else {
+        let cols = (rect.width() / 7.0).max(2.0) as i32;
+        for col in 1..cols {
+            let x = rect.left() + col as f32 * rect.width() / cols as f32;
+            painter.line_segment(
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                if col % 2 == 0 { highlight } else { shadow },
+            );
+        }
+        let rows = (rect.height() / 42.0).max(3.0) as i32;
+        for row in 1..rows {
+            let y = rect.top() + row as f32 * rect.height() / rows as f32;
+            painter.line_segment(
+                [
+                    Pos2::new(rect.left() + 3.0, y),
+                    Pos2::new(rect.right() - 3.0, y),
+                ],
+                shadow,
+            );
+        }
+    }
+}
+
+fn draw_mesh_marker(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    project: &ProjectDocument,
+    node: &psxed_project::SceneNode,
+    selected: NodeId,
+    hits: &mut Vec<ViewportHit>,
+) {
+    let NodeKind::MeshInstance { material, .. } = node.kind else {
+        return;
+    };
+    let center = node_world(node);
+    let half = [
+        node.transform.scale[0].abs().max(0.35) * 0.5,
+        node.transform.scale[2].abs().max(0.18) * 0.5,
+    ];
+    let rect = transform.world_rect_to_screen(center, half);
+    let color = material_color(project, material, SurfaceRole::Object);
+    let translucent = material_is_translucent(project, material);
+    painter.rect_filled(rect, 0.0, color);
+    if translucent {
+        draw_glass_marker(painter, rect);
+    }
+    painter.rect_stroke(
+        rect,
+        0.0,
+        selected_stroke(selected == node.id),
+        StrokeKind::Outside,
+    );
+    painter.text(
+        rect.center_top() + Vec2::new(0.0, -6.0),
+        Align2::CENTER_BOTTOM,
+        &node.name,
+        FontId::monospace(11.0),
+        Color32::from_rgb(232, 238, 246),
+    );
+    hits.push(ViewportHit::rect(node.id, node.name.clone(), center, half));
+}
+
+fn draw_glass_marker(painter: &egui::Painter, rect: Rect) {
+    painter.rect_filled(
+        rect.shrink(1.0),
+        0.0,
+        Color32::from_rgba_unmultiplied(190, 230, 232, 34),
+    );
+    let sheen = Stroke::new(1.0, Color32::from_rgba_unmultiplied(222, 252, 255, 120));
+    let step = 18.0;
+    let mut x = rect.left() - rect.height();
+    while x < rect.right() {
+        painter.line_segment(
+            [
+                Pos2::new(x, rect.bottom()),
+                Pos2::new((x + rect.height()).min(rect.right()), rect.top()),
+            ],
+            sheen,
+        );
+        x += step;
+    }
+}
+
+fn draw_spawn_marker(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    node: &psxed_project::SceneNode,
+    selected: NodeId,
+    hits: &mut Vec<ViewportHit>,
+) {
+    draw_simple_marker(
+        painter,
+        transform,
+        node,
+        selected,
+        "P",
+        Color32::from_rgb(82, 184, 118),
+        hits,
+    );
+}
+
+fn draw_light_marker(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    node: &psxed_project::SceneNode,
+    selected: NodeId,
+    color: [u8; 3],
+    intensity: f32,
+    radius: f32,
+    hits: &mut Vec<ViewportHit>,
+) {
+    let center = node_world(node);
+    let world_radius = (radius / 4096.0).clamp(0.45, 2.5) * intensity.max(0.25);
+    let screen_center = transform.world_to_screen(center);
+    painter.circle_filled(
+        screen_center,
+        transform.screen_radius(world_radius),
+        Color32::from_rgba_unmultiplied(color[0], color[1], color[2], 28),
+    );
+    draw_simple_marker(
+        painter,
+        transform,
+        node,
+        selected,
+        "L",
+        Color32::from_rgb(color[0], color[1], color[2]),
+        hits,
+    );
+}
+
+fn draw_simple_marker(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    node: &psxed_project::SceneNode,
+    selected: NodeId,
+    label: &str,
+    fill: Color32,
+    hits: &mut Vec<ViewportHit>,
+) {
+    let center = node_world(node);
+    let screen = transform.world_to_screen(center);
+    let radius = 0.18;
+    painter.circle_filled(screen, transform.screen_radius(radius).max(8.0), fill);
+    painter.circle_stroke(
+        screen,
+        transform.screen_radius(radius).max(8.0),
+        selected_stroke(selected == node.id),
+    );
+    painter.text(
+        screen,
+        Align2::CENTER_CENTER,
+        label,
+        FontId::monospace(12.0),
+        Color32::from_rgb(8, 10, 13),
+    );
+    painter.text(
+        screen + Vec2::new(0.0, 16.0),
+        Align2::CENTER_TOP,
+        &node.name,
+        FontId::monospace(10.0),
+        Color32::from_rgb(220, 228, 238),
+    );
+    hits.push(ViewportHit::circle(
+        node.id,
+        node.name.clone(),
+        center,
+        radius.max(8.0 / transform.zoom),
+    ));
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SurfaceRole {
+    Floor,
+    Wall,
+    Object,
+}
+
+fn material_color(
+    project: &ProjectDocument,
+    material: Option<ResourceId>,
+    role: SurfaceRole,
+) -> Color32 {
+    let Some(id) = material else {
+        return match role {
+            SurfaceRole::Floor => STUDIO_ROOM_FLOOR,
+            SurfaceRole::Wall => STUDIO_ROOM_WALL,
+            SurfaceRole::Object => Color32::from_rgb(125, 155, 190),
+        };
+    };
+    let Some(resource) = project.resource(id) else {
+        return Color32::from_rgb(150, 80, 120);
+    };
+
+    let name = resource.name.to_ascii_lowercase();
+    let mut color = if name.contains("brick") {
+        Color32::from_rgb(126, 72, 43)
+    } else if name.contains("floor") || name.contains("stone") {
+        STUDIO_ROOM_FLOOR
+    } else if name.contains("glass") {
+        Color32::from_rgba_unmultiplied(122, 176, 198, 118)
+    } else {
+        match role {
+            SurfaceRole::Floor => STUDIO_ROOM_FLOOR,
+            SurfaceRole::Wall => STUDIO_ROOM_WALL,
+            SurfaceRole::Object => Color32::from_rgb(125, 155, 190),
+        }
+    };
+
+    if let ResourceData::Material(material) = &resource.data {
+        if material.blend_mode != PsxBlendMode::Opaque {
+            color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 132);
+        }
+    }
+
+    color
+}
+
+fn material_is_translucent(project: &ProjectDocument, material: Option<ResourceId>) -> bool {
+    material
+        .and_then(|id| project.resource(id))
+        .is_some_and(|resource| match &resource.data {
+            ResourceData::Material(material) => material.blend_mode != PsxBlendMode::Opaque,
+            _ => false,
+        })
+}
+
+fn selected_stroke(selected: bool) -> Stroke {
+    if selected {
+        Stroke::new(3.0, STUDIO_GOLD)
+    } else {
+        Stroke::new(1.0, Color32::from_rgb(70, 84, 108))
+    }
+}
+
+fn node_world(node: &psxed_project::SceneNode) -> [f32; 2] {
+    [node.transform.translation[0], node.transform.translation[2]]
+}
+
+fn room_child_surface<'a>(
+    project: &'a ProjectDocument,
+    room: NodeId,
+    needle: &str,
+) -> Option<&'a psxed_project::SceneNode> {
+    let scene = project.active_scene();
+    let parent = scene.node(room)?;
+    parent
+        .children
+        .iter()
+        .filter_map(|id| scene.node(*id))
+        .find(|node| node.name.to_ascii_lowercase().contains(needle))
+}
+
+fn mesh_material(node: &psxed_project::SceneNode) -> Option<ResourceId> {
+    match node.kind {
+        NodeKind::MeshInstance { material, .. } => material,
+        _ => None,
+    }
+}
+
+fn is_room_surface_node(node: &psxed_project::SceneNode) -> bool {
+    let name = node.name.to_ascii_lowercase();
+    name.contains("floor") || name.contains("wall")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_or_new_saves_and_reloads_default_project() {
+        let dir = std::env::temp_dir().join(format!(
+            "psxed-ui-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("workspace.ron");
+
+        let mut workspace = EditorWorkspace::open_or_new(&path);
+        assert!(workspace.is_dirty());
+        workspace.save().unwrap();
+        assert!(!workspace.is_dirty());
+        assert!(path.is_file());
+
+        let loaded = EditorWorkspace::open_or_new(&path);
+        assert!(!loaded.is_dirty());
+        assert_eq!(
+            loaded.project().resources.len(),
+            workspace.project().resources.len()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn viewport_transform_roundtrips_world_and_screen_points() {
+        let transform = ViewportTransform::new(
+            Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(300.0, 200.0)),
+            Vec2::new(12.0, -8.0),
+            40.0,
+        );
+
+        let world = [1.25, -0.5];
+        let screen = transform.world_to_screen(world);
+        let roundtrip = transform.screen_to_world(screen);
+
+        assert!((roundtrip[0] - world[0]).abs() < 0.001);
+        assert!((roundtrip[1] - world[1]).abs() < 0.001);
+    }
+
+    #[test]
+    fn viewport_hits_rectangles_and_circles() {
+        let rect = ViewportHit::rect(NodeId::ROOT, "Rect", [0.0, 0.0], [1.0, 0.5]);
+        assert!(rect.contains([0.25, 0.25]));
+        assert!(!rect.contains([1.25, 0.25]));
+
+        let circle = ViewportHit::circle(NodeId::ROOT, "Circle", [2.0, 2.0], 0.5);
+        assert!(circle.contains([2.25, 2.25]));
+        assert!(!circle.contains([2.6, 2.0]));
+    }
+
+    #[test]
+    fn dragging_selected_node_moves_it_in_xz_space() {
+        let mut workspace = EditorWorkspace::new();
+        let card = workspace
+            .project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find(|node| node.name == "Material Card")
+            .unwrap()
+            .id;
+
+        workspace.selected_node = card;
+        workspace.drag_selected_node(Vec2::new(96.0, -48.0));
+
+        let node = workspace.project.active_scene().node(card).unwrap();
+        assert!((node.transform.translation[0] - 1.0).abs() < 0.001);
+        assert!((node.transform.translation[2] - 0.5).abs() < 0.001);
+        assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn project_filesystem_rows_are_generated_from_resources() {
+        let project = ProjectDocument::starter();
+        let rows = project_filesystem_rows(&project);
+
+        assert!(rows.iter().any(|row| row.name == "res://"));
+        assert!(rows.iter().any(|row| row.name == "main.room"));
+        assert!(rows.iter().any(|row| row.name == "floor.psxtex"));
+        assert!(rows.iter().any(|row| row.name == "brick_wall.psxtex"));
+        assert!(rows
+            .iter()
+            .any(|row| row.name == "average_glass.mat" && row.resource.is_some()));
+    }
+
+    #[test]
+    fn resource_filter_and_search_match_expected_resources() {
+        let project = ProjectDocument::starter();
+        let floor_texture = project
+            .resources
+            .iter()
+            .find(|resource| resource.name == "floor.psxt")
+            .unwrap();
+        let glass_material = project
+            .resources
+            .iter()
+            .find(|resource| resource.name == "Average Glass")
+            .unwrap();
+
+        assert!(resource_matches_filter(
+            floor_texture,
+            ResourceFilter::Texture,
+            "floor"
+        ));
+        assert!(!resource_matches_filter(
+            floor_texture,
+            ResourceFilter::Material,
+            "floor"
+        ));
+        assert!(resource_matches_filter(
+            glass_material,
+            ResourceFilter::Material,
+            "glass"
+        ));
+    }
+}

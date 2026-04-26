@@ -55,6 +55,7 @@ pub mod render3d;
 pub mod scene;
 pub mod sfx;
 pub mod transform;
+pub mod world;
 
 pub use angle::Angle;
 pub use app::{App, Config};
@@ -63,10 +64,15 @@ pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, Primitive
 pub use render3d::{
     CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand,
     MeshRenderStats, ProjectedVertex, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
-    WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,
+    WorldVertex,
 };
 pub use scene::{Ctx, Scene};
 pub use transform::{ActorTransform, Vec3World};
+pub use world::{
+    GridCoord, GridDirection, GridFloorSample, GridHorizontalFace, GridRoom, GridSector, GridSplit,
+    GridVerticalFace, GridWalls, GridWorld, WorldMaterialId, GRID_SECTOR_SIZE,
+};
 
 /// Button-mask constants (UP, DOWN, CROSS, START, …) re-exported
 /// from `psx_pad::button` so games using `Ctx::just_pressed` /

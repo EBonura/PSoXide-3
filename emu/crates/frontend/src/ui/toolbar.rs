@@ -253,18 +253,18 @@ fn draw_debug_toggles(ui: &mut egui::Ui, state: &mut AppState) {
             bus.gpu.wireframe_enabled = !bus.gpu.wireframe_enabled;
         }
     }
-    // Resolution / scale-mode switch: full-window presentation ↔
-    // exact native 1× pixels. Active means native inspection mode.
-    let native_active = state.scale_mode == ScaleMode::Native;
-    let scale_icon = if native_active {
+    // Resolution switch: CPU-reference native rendering ↔ HW high-res
+    // rasterization fitted to the framebuffer panel.
+    let high_res_active = state.scale_mode == ScaleMode::Window;
+    let scale_icon = if high_res_active {
         icons::MINIMIZE
     } else {
         icons::MAXIMIZE
     };
-    let scale_btn = toggle_button(scale_icon, native_active);
+    let scale_btn = toggle_button(scale_icon, high_res_active);
     if ui
         .add(scale_btn)
-        .on_hover_text("Toggle full-window scale vs. native 1x pixels")
+        .on_hover_text("Toggle native PSX rendering vs. high-res renderer")
         .clicked()
     {
         state.scale_mode = match state.scale_mode {

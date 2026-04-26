@@ -283,6 +283,9 @@ impl ApplicationHandler for Shell {
                 if let Err(e) = self.state.flush_memcard_port1() {
                     eprintln!("[frontend] memcard flush on exit: {e}");
                 }
+                if let Err(e) = self.state.save_editor_project() {
+                    eprintln!("[frontend] editor save on exit: {e}");
+                }
                 // Persist current settings (BIOS path, library
                 // root, etc.) so the next launch picks up any
                 // user tweaks without needing a manual save step.
@@ -425,11 +428,28 @@ impl ApplicationHandler for Shell {
                         if let Err(e) = self.state.flush_memcard_port1() {
                             eprintln!("[frontend] memcard flush on quit: {e}");
                         }
+                        if let Err(e) = self.state.save_editor_project() {
+                            eprintln!("[frontend] editor save on quit: {e}");
+                        }
                         if let Err(e) = self.state.save_settings() {
                             eprintln!("[frontend] settings save on quit: {e}");
                         }
                         event_loop.exit();
                         return;
+                    }
+                }
+
+                // Arm GPU command capture before stepping so the HW /
+                // compute sidecars see the frame that is about to run.
+                // Re-arming clears the log, so only do this once per
+                // Bus lifetime.
+                if let Some(bus) = self.state.bus.as_mut() {
+                    if self.compute_backend.is_some() {
+                        if bus.gpu.pixel_owner.is_none() {
+                            bus.gpu.enable_pixel_tracer();
+                        }
+                    } else if !bus.gpu.cmd_log_enabled() {
+                        bus.gpu.enable_cmd_log();
                     }
                 }
 
@@ -508,6 +528,12 @@ impl ApplicationHandler for Shell {
 
                 let state = &mut self.state;
 
+                let frame_log = if let Some(bus) = state.bus.as_mut() {
+                    std::mem::take(&mut bus.gpu.cmd_log)
+                } else {
+                    Vec::new()
+                };
+
                 // Phase C: drain the CPU rasterizer's `cmd_log` and
                 // replay each GP0 packet onto the compute backend.
                 // This runs for every frame the bus advanced (or
@@ -516,19 +542,11 @@ impl ApplicationHandler for Shell {
                 if let (Some(backend), Some(bus)) =
                     (self.compute_backend.as_mut(), state.bus.as_mut())
                 {
-                    // Enable the pixel tracer once. It's idempotent:
-                    // a second call resets the cmd_log + owner buffer.
-                    // We only want it on if we're actually replaying.
-                    if bus.gpu.pixel_owner.is_none() {
-                        bus.gpu.enable_pixel_tracer();
-                    }
                     // Sync VRAM so any uploads / FMV writes / VRAM-to-
                     // VRAM copies are reflected on the compute side
                     // before we replay this frame's draw commands.
                     backend.sync_vram_from_cpu(bus.gpu.vram.words());
-                    // Drain & replay.
-                    let log = std::mem::take(&mut bus.gpu.cmd_log);
-                    for entry in &log {
+                    for entry in &frame_log {
                         backend.replay_packet(entry);
                     }
                     // pixel_owner needs resetting too — we don't use
@@ -540,48 +558,55 @@ impl ApplicationHandler for Shell {
                 }
 
                 gfx.prepare_vram(state.bus.as_ref().map(|b| &b.gpu.vram));
+                gfx.prepare_display(state.bus.as_ref().map(|b| &b.gpu));
 
-                // Drive the hardware renderer once per frame —
-                // walks `bus.gpu.cmd_log`, issues wgpu draw calls,
-                // leaves output in `gfx.hw_texture_id()`. cmd_log
-                // is always armed (see Bus initialization below);
-                // when there's no Bus yet we just clear-paint with
-                // an empty log so the central panel still shows
-                // something predictable.
+                // Match the HW renderer's internal scale to the
+                // current Native↔Window mode + framebuffer pixel budget.
+                // Cheap when stable; reallocates the VRAM-shaped
+                // target on change (which clears it — the next
+                // cmd_log replay paints a fresh frame).
                 let scale_mode = match state.scale_mode {
                     app::ScaleMode::Native => psx_gpu_render::ScaleMode::Native,
                     app::ScaleMode::Window => psx_gpu_render::ScaleMode::Window,
                 };
-                // Use the surface size as the panel's worst-case
-                // pixel budget. A future polish pass moves this to
-                // the actual central-panel rect (one-frame latency
-                // — see plan §"Panel rect availability").
-                let panel_size_px = (gfx.config.width.max(1), gfx.config.height.max(1));
+                let display_size = state
+                    .bus
+                    .as_ref()
+                    .map(|b| {
+                        let area = b.gpu.display_area();
+                        ((area.width as u32).max(320), (area.height as u32).max(240))
+                    })
+                    .unwrap_or((320, 240));
+                gfx.update_hw_scale(scale_mode, state.framebuffer_present_size_px, display_size);
+
+                // Drive the hardware renderer once per frame. The
+                // VRAM-shaped target persists across frames the way
+                // PSX VRAM does; the framebuffer panel UV-samples
+                // the active display sub-rect.
                 if let Some(bus) = state.bus.as_mut() {
-                    if !bus.gpu.cmd_log_enabled() {
-                        bus.gpu.enable_cmd_log();
-                    }
-                    let log = std::mem::take(&mut bus.gpu.cmd_log);
                     let vram_words = bus.gpu.vram.words().to_vec();
-                    gfx.render_hw_frame(&bus.gpu, scale_mode, panel_size_px, &log, &vram_words);
+                    gfx.render_hw_frame(&bus.gpu, &frame_log, &vram_words);
                 } else {
-                    // No bus → render an empty frame so the panel
-                    // is still well-defined (clears to black).
                     let empty_log: Vec<emulator_core::gpu::GpuCmdLogEntry> = Vec::new();
                     let empty_vram: Vec<u16> = vec![0; 1024 * 512];
                     let dummy_gpu = emulator_core::Gpu::new();
-                    gfx.render_hw_frame(
-                        &dummy_gpu,
-                        scale_mode,
-                        panel_size_px,
-                        &empty_log,
-                        &empty_vram,
-                    );
+                    gfx.render_hw_frame(&dummy_gpu, &empty_log, &empty_vram);
                 }
 
                 let vram_tex = gfx.vram_texture_id();
-                let display_tex = gfx.hw_texture_id();
-                gfx.render(|ctx| app::build_ui(ctx, state, vram_tex, display_tex, dt));
+                let (display_tex, framebuffer_source) = match state.scale_mode {
+                    app::ScaleMode::Native => (
+                        gfx.display_texture_id(),
+                        ui::framebuffer::FramebufferSource::CpuDisplay,
+                    ),
+                    app::ScaleMode::Window => (
+                        gfx.hw_texture_id(),
+                        ui::framebuffer::FramebufferSource::HardwareVram,
+                    ),
+                };
+                gfx.render(|ctx| {
+                    app::build_ui(ctx, state, vram_tex, display_tex, framebuffer_source, dt)
+                });
             }
             _ => {
                 if !consumed {

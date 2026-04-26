@@ -13,6 +13,7 @@ psx-gpu-compute  = { workspace = true }
 psx-gpu-render   = { workspace = true }
 psx-iso          = { workspace = true }
 psx-trace        = { workspace = true }
+psxed-ui         = { workspace = true }
 
 clap       = { workspace = true }
 winit      = { workspace = true }

@@ -21,48 +21,50 @@ use psx_gpu_compute::primitive::BlendMode;
 
 use crate::pipeline::{flags as fbits, BlendKind, HwVertex};
 
-/// Output of [`Translator::translate`] — vertices sorted into one
-/// contiguous slice per `BlendKind`. The renderer issues one draw
-/// call per non-empty batch, with the matching pipeline + blend
-/// constant.
-///
-/// `vertices[start..start+count]` is the slice for batch `i`; the
-/// `start` is `prefix_sum(counts[..i])`.
+/// Contiguous draw range sharing pipeline state and draw-area clip.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DrawRun {
+    pub kind: BlendKind,
+    pub start: u32,
+    pub count: u32,
+    /// Inclusive PSX-VRAM-space clip rectangle: left, top, right,
+    /// bottom. Fill rectangles use the full VRAM clip because GP0
+    /// fills ignore draw-area state.
+    pub clip: [u16; 4],
+}
+
+/// Output of [`Translator::translate`] — vertices remain in GP0 order
+/// and `runs` describes contiguous draw ranges that share pipeline
+/// state and draw-area clipping.
 pub struct TranslatedFrame<'a> {
     pub vertices: &'a [HwVertex],
-    pub counts: [u32; BlendKind::COUNT],
+    pub runs: &'a [DrawRun],
 }
 
 impl TranslatedFrame<'_> {
     /// Total vertex count (sum of all batches).
     pub fn total(&self) -> u32 {
-        self.counts.iter().sum()
+        self.vertices.len() as u32
     }
 }
 
 pub struct Translator {
     state: ReplayState,
-    /// One bucket per `BlendKind`. Reused across frames; cleared
-    /// at the top of each `translate` call.
-    buckets: [Vec<HwVertex>; BlendKind::COUNT],
-    /// Concatenation buffer — buckets get appended into here in
-    /// `BlendKind` order, then handed to the pipeline as one
-    /// upload.
+    /// Ordered vertex stream for the current frame. This preserves
+    /// GP0 command order, which matters for semi-transparency and
+    /// overlapping UI primitives.
     flat: Vec<HwVertex>,
+    /// Ordered draw runs over `flat`. Adjacent primitives only merge
+    /// when their blend kind and draw-area clip match.
+    runs: Vec<DrawRun>,
 }
 
 impl Translator {
     pub fn new() -> Self {
         Self {
             state: ReplayState::new(),
-            buckets: [
-                Vec::with_capacity(4 * 1024),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ],
             flat: Vec::with_capacity(4 * 1024),
+            runs: Vec::with_capacity(1024),
         }
     }
 
@@ -70,23 +72,14 @@ impl Translator {
     /// laid out as one slice per `BlendKind`. The slices borrow
     /// from `self`; copy out before the next call.
     pub fn translate(&mut self, log: &[GpuCmdLogEntry]) -> TranslatedFrame<'_> {
-        for b in &mut self.buckets {
-            b.clear();
-        }
+        self.flat.clear();
+        self.runs.clear();
         for entry in log {
             self.process(entry);
         }
-        // Concatenate in BlendKind order so the renderer can index
-        // by prefix-sum.
-        self.flat.clear();
-        let mut counts = [0u32; BlendKind::COUNT];
-        for (i, b) in self.buckets.iter().enumerate() {
-            counts[i] = b.len() as u32;
-            self.flat.extend_from_slice(b);
-        }
         TranslatedFrame {
             vertices: &self.flat,
-            counts,
+            runs: &self.runs,
         }
     }
 
@@ -108,13 +101,40 @@ impl Translator {
         }
     }
 
-    fn bucket_mut(&mut self, kind: BlendKind) -> &mut Vec<HwVertex> {
-        &mut self.buckets[kind.index()]
+    fn current_clip(&self) -> [u16; 4] {
+        let a = &self.state.draw_area;
+        [
+            a.left.clamp(0, (crate::target::VRAM_WIDTH - 1) as i32) as u16,
+            a.top.clamp(0, (crate::target::VRAM_HEIGHT - 1) as i32) as u16,
+            a.right.clamp(0, (crate::target::VRAM_WIDTH - 1) as i32) as u16,
+            a.bottom.clamp(0, (crate::target::VRAM_HEIGHT - 1) as i32) as u16,
+        ]
+    }
+
+    fn push_vertex(&mut self, kind: BlendKind, clip: [u16; 4], vertex: HwVertex) {
+        let start = self.flat.len() as u32;
+        if let Some(run) = self.runs.last_mut() {
+            if run.kind == kind && run.clip == clip && run.start + run.count == start {
+                run.count += 1;
+                self.flat.push(vertex);
+                return;
+            }
+        }
+        self.runs.push(DrawRun {
+            kind,
+            start,
+            count: 1,
+            clip,
+        });
+        self.flat.push(vertex);
     }
 
     fn process(&mut self, entry: &GpuCmdLogEntry) {
         let fifo = &entry.fifo[..];
         match entry.opcode {
+            // ---------- Fill rectangle (clear-screen primitive) ----------
+            0x02 => self.emit_fill_rect(fifo),
+
             // ---------- State setters (always applied) ----------
             0xE1 => self.handle_e1(fifo),
             0xE2 => self.handle_e2(fifo),
@@ -273,14 +293,18 @@ impl Translator {
         color: [u8; 4],
         kind: BlendKind,
     ) {
-        let bucket = self.bucket_mut(kind);
+        let clip = self.current_clip();
         for v in [v0, v1, v2] {
-            bucket.push(HwVertex {
-                pos: [v.0 as i16, v.1 as i16],
-                color,
-                uv: [0, 0],
-                flags: 0,
-            });
+            self.push_vertex(
+                kind,
+                clip,
+                HwVertex {
+                    pos: [v.0 as i16, v.1 as i16],
+                    color,
+                    uv: [0, 0],
+                    flags: 0,
+                },
+            );
         }
     }
 
@@ -377,16 +401,16 @@ impl Translator {
         prim_flags: u32,
         kind: BlendKind,
     ) {
-        let bucket = self.bucket_mut(kind);
+        let clip = self.current_clip();
         let make = |v: (i32, i32), uv: (u8, u8)| HwVertex {
             pos: [v.0 as i16, v.1 as i16],
             color,
             uv: [uv.0 as u16, uv.1 as u16],
             flags: prim_flags,
         };
-        bucket.push(make(v0, uv0));
-        bucket.push(make(v1, uv1));
-        bucket.push(make(v2, uv2));
+        self.push_vertex(kind, clip, make(v0, uv0));
+        self.push_vertex(kind, clip, make(v1, uv1));
+        self.push_vertex(kind, clip, make(v2, uv2));
     }
 
     // ----- Phase 3: shaded (Gouraud) tris + quads -----
@@ -495,16 +519,16 @@ impl Translator {
         prim_flags: u32,
         kind: BlendKind,
     ) {
-        let bucket = self.bucket_mut(kind);
+        let clip = self.current_clip();
         let make = |v: (i32, i32), c: [u8; 4]| HwVertex {
             pos: [v.0 as i16, v.1 as i16],
             color: c,
             uv: [0, 0],
             flags: prim_flags,
         };
-        bucket.push(make(v0, c0));
-        bucket.push(make(v1, c1));
-        bucket.push(make(v2, c2));
+        self.push_vertex(kind, clip, make(v0, c0));
+        self.push_vertex(kind, clip, make(v1, c1));
+        self.push_vertex(kind, clip, make(v2, c2));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -522,16 +546,16 @@ impl Translator {
         prim_flags: u32,
         kind: BlendKind,
     ) {
-        let bucket = self.bucket_mut(kind);
+        let clip = self.current_clip();
         let make = |v: (i32, i32), uv: (u8, u8), c: [u8; 4]| HwVertex {
             pos: [v.0 as i16, v.1 as i16],
             color: c,
             uv: [uv.0 as u16, uv.1 as u16],
             flags: prim_flags,
         };
-        bucket.push(make(v0, uv0, c0));
-        bucket.push(make(v1, uv1, c1));
-        bucket.push(make(v2, uv2, c2));
+        self.push_vertex(kind, clip, make(v0, uv0, c0));
+        self.push_vertex(kind, clip, make(v1, uv1, c1));
+        self.push_vertex(kind, clip, make(v2, uv2, c2));
     }
 
     // ----- Phase 3: rectangles -----
@@ -586,6 +610,55 @@ impl Translator {
         let uv0 = decode_uv(fifo[2]);
         let clut = decode_clut(fifo[2]);
         self.push_tex_rect(cmd, x, y, w, h, uv0, clut);
+    }
+
+    /// `0x02` — fill rectangle. Clears a VRAM region to a solid
+    /// colour. Bypasses `draw_offset` (XY is absolute VRAM coords)
+    /// and `draw_area` (always opaque, ignores scissor). Most demos
+    /// emit one per frame as their clear-screen primitive — without
+    /// this the HW target keeps stale pixels everywhere the game
+    /// hasn't redrawn this frame.
+    ///
+    /// Packet: `[cmd+rgb24, xy, wh]`
+    /// - xy: 10-bit x in low 16, 9-bit y in high 16 (no sign extend)
+    /// - wh: 10-bit w in low 16, 9-bit h in high 16
+    /// - color: low 24 bits of cmd word
+    fn emit_fill_rect(&mut self, fifo: &[u32]) {
+        if fifo.len() < 3 {
+            return;
+        }
+        let cmd = fifo[0];
+        let xy = fifo[1];
+        let wh = fifo[2];
+        let x = (xy & 0x3FF) as i32;
+        let y = ((xy >> 16) & 0x1FF) as i32;
+        let w = (wh & 0x3FF) as i32;
+        let h = ((wh >> 16) & 0x1FF) as i32;
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let color = mono_color_rgba8(cmd);
+        // Always opaque, regardless of state — fills aren't blended.
+        let clip = full_clip();
+        let make = |vx: i32, vy: i32| HwVertex {
+            pos: [vx as i16, vy as i16],
+            color,
+            uv: [0, 0],
+            flags: 0,
+        };
+        // Two tris covering [x..x+w] × [y..y+h]. Same winding as
+        // push_mono_rect — semi-trans / mask-bit behaviour stays
+        // pixel-equivalent in later phases.
+        let v00 = (x, y);
+        let v10 = (x + w, y);
+        let v01 = (x, y + h);
+        let v11 = (x + w, y + h);
+        for v in [v00, v10, v01] {
+            self.push_vertex(BlendKind::Opaque, clip, make(v.0, v.1));
+        }
+        for v in [v10, v11, v01] {
+            self.push_vertex(BlendKind::Opaque, clip, make(v.0, v.1));
+        }
     }
 
     fn push_mono_rect(&mut self, cmd: u32, x: i32, y: i32, w: i32, h: i32) {
@@ -647,6 +720,15 @@ fn decode_wh(word: u32) -> (i32, i32) {
     let w = (word & 0xFFFF) as i32;
     let h = ((word >> 16) & 0xFFFF) as i32;
     (w, h)
+}
+
+fn full_clip() -> [u16; 4] {
+    [
+        0,
+        0,
+        (crate::target::VRAM_WIDTH - 1) as u16,
+        (crate::target::VRAM_HEIGHT - 1) as u16,
+    ]
 }
 
 impl Default for Translator {

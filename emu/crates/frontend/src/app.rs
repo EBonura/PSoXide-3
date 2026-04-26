@@ -13,6 +13,7 @@ use psoxide_settings::library::{GameKind, Region};
 use psoxide_settings::{ConfigPaths, Library, LibraryEntry, Settings};
 use psx_iso::{Disc, Exe, SECTOR_BYTES};
 use psx_trace::InstructionRecord;
+use psxed_ui::EditorWorkspace;
 
 use crate::ui;
 use crate::ui::hud::HudState;
@@ -59,11 +60,11 @@ impl Default for PanelVisibility {
 /// window. Toggled from the debug toolbar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleMode {
-    /// Fill the available area at CRT aspect. This is the normal
-    /// “use the whole window” presentation; scaling is fractional.
+    /// Hardware-rendered high-resolution mode fitted to the
+    /// available framebuffer area at CRT aspect.
     Window,
-    /// Show exactly one host pixel per PSX framebuffer pixel.
-    /// Useful when inspecting the original output resolution.
+    /// CPU-reference native PSX render resolution, presented in the
+    /// same framebuffer area as high-res mode.
     Native,
 }
 
@@ -73,13 +74,39 @@ impl Default for ScaleMode {
     }
 }
 
+/// Active host workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Workspace {
+    /// Emulator/debugger workspace.
+    Emulator,
+    /// Mouse/keyboard editor workspace.
+    Editor,
+}
+
+impl Workspace {
+    /// True when editor panels own the central UI.
+    pub const fn is_editor(self) -> bool {
+        matches!(self, Self::Editor)
+    }
+}
+
 /// Top-level app state. Owns the emulator state directly — no Arc/Mutex,
 /// single-threaded, UI reads state in-place per frame.
 pub struct AppState {
+    /// Active host workspace.
+    pub workspace: Workspace,
+    /// Embedded editor workspace. Kept alive while hidden so editor
+    /// state survives a quick trip back to the Menu/emulator.
+    pub editor: EditorWorkspace,
     pub panels: PanelVisibility,
-    /// How the framebuffer scales — full-window presentation vs
-    /// exact 1× native pixels. Toggled via the debug toolbar.
+    /// Framebuffer mode — CPU-reference native rendering vs HW high-res
+    /// rendering fitted to the panel. Toggled via the debug toolbar.
     pub scale_mode: ScaleMode,
+    /// Physical pixel size used by the central framebuffer on the
+    /// previous UI frame. The renderer uses this as its internal
+    /// resolution budget; one-frame latency is fine because it only
+    /// changes when resizing/toggling scale mode.
+    pub framebuffer_present_size_px: (u32, u32),
     pub cpu: Cpu,
     /// Optional because we let the frontend run without a BIOS for UI
     /// development. If absent, register panels show the reset-state CPU
@@ -163,6 +190,7 @@ impl AppState {
             }),
         };
         let _ = paths.ensure_dir(paths.root());
+        let editor = EditorWorkspace::open_or_new(paths.editor_project_file());
 
         let settings = match Settings::load(&paths.settings_file()) {
             Ok(s) => s,
@@ -195,8 +223,11 @@ impl AppState {
         });
 
         let mut out = Self {
+            workspace: Workspace::Emulator,
+            editor,
             panels: PanelVisibility::default(),
             scale_mode: ScaleMode::default(),
+            framebuffer_present_size_px: (320, 240),
             cpu,
             bus,
             menu: MenuState::new(),
@@ -239,6 +270,7 @@ impl AppState {
         out.refresh_menu_library();
         out.menu
             .sync_fast_boot_label(out.settings.emulator.fast_boot_disc);
+        out.menu.sync_editor_label(out.workspace.is_editor());
         out
     }
 }
@@ -349,10 +381,12 @@ impl AppState {
         self.bus = Some(bus);
         self.cpu = cpu;
         self.running = true;
+        self.workspace = Workspace::Emulator;
         self.exec_history.clear();
         self.gpr_snapshot = None;
         self.current_game = Some(entry.clone());
         self.menu.sync_run_label(true);
+        self.menu.sync_editor_label(false);
         self.status_message = Some((
             format!("Launched: {} ({boot_mode})", entry.title),
             STATUS_MESSAGE_TTL_SECS,
@@ -557,6 +591,13 @@ impl AppState {
             .map_err(|e| format!("save settings.ron: {e}"))
     }
 
+    /// Persist the embedded editor project if it has unsaved edits.
+    pub fn save_editor_project(&mut self) -> Result<bool, String> {
+        self.editor
+            .save_if_dirty()
+            .map_err(|e| format!("save editor project: {e}"))
+    }
+
     /// Flip the disc fast-boot preference, keep the Menu label in
     /// sync, and persist immediately so the next launch uses the
     /// requested path even if the app exits abruptly.
@@ -577,6 +618,39 @@ impl AppState {
                 eprintln!("[frontend] {e}");
                 self.status_message_set(format!("{msg} (settings save failed)"));
             }
+        }
+    }
+
+    /// Enter the embedded editor workspace.
+    pub fn open_editor_workspace(&mut self) {
+        self.running = false;
+        self.workspace = Workspace::Editor;
+        self.menu.sync_run_label(false);
+        self.menu.sync_editor_label(true);
+        self.status_message_set("Editor workspace open");
+    }
+
+    /// Return from the editor workspace to the emulator view.
+    pub fn close_editor_workspace(&mut self) {
+        let save_result = self.save_editor_project();
+        self.workspace = Workspace::Emulator;
+        self.menu.sync_editor_label(false);
+        match save_result {
+            Ok(true) => self.status_message_set("Returned to emulator workspace (editor saved)"),
+            Ok(false) => self.status_message_set("Returned to emulator workspace"),
+            Err(e) => {
+                eprintln!("[frontend] {e}");
+                self.status_message_set("Returned to emulator workspace (editor save failed)");
+            }
+        }
+    }
+
+    /// Toggle the embedded editor workspace.
+    pub fn toggle_editor_workspace(&mut self) {
+        if self.workspace.is_editor() {
+            self.close_editor_workspace();
+        } else {
+            self.open_editor_workspace();
         }
     }
 
@@ -897,7 +971,8 @@ pub fn build_ui(
     state: &mut AppState,
     vram_tex: egui::TextureId,
     display_tex: egui::TextureId,
+    framebuffer_source: ui::framebuffer::FramebufferSource,
     dt: f32,
 ) {
-    ui::draw_layout(ctx, state, vram_tex, display_tex, dt);
+    ui::draw_layout(ctx, state, vram_tex, display_tex, framebuffer_source, dt);
 }

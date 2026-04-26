@@ -1,17 +1,11 @@
-// PSX hardware-renderer shader.
+// PSX hardware-renderer shader — VRAM-shaped target.
 //
-// Single shader serving every primitive type by branching on
-// `flags`. Phase 1 supported flat-color mono primitives. Phase 2
-// adds textured tris + quads with 4 bpp / 8 bpp CLUT and 15 bpp
-// direct sampling, tint modulation, and transparent-texel discard.
-//
-// PSX coordinate convention: vertex positions are post-`draw_offset`
-// PSX pixel coords (signed, fits in i16). We map
-// `(display_origin .. display_origin + display_size)` to NDC
-// (-1..+1, Y-flipped). The viewport equals the high-res render
-// target, so fractional scale "just works" — primitives rasterize
-// at viewport resolution while vertex coords stay in PSX-space
-// integers.
+// The target is a `(1024 * S) × (512 * S)` texture (S = internal
+// resolution multiplier). PSX vertex coords are in VRAM space
+// (`pos.x ∈ 0..1024`, `pos.y ∈ 0..512`); the vertex shader maps them
+// directly to NDC of that target. The wgpu viewport == target dims,
+// so the rasterizer rasterises at S× density automatically — no
+// per-S math anywhere in the shader.
 //
 // `HwVertex::flags` bit layout (must mirror `pipeline::flags`):
 //   bits  0..=3   tpage_x_units   (× 64 = pixel x)
@@ -21,17 +15,14 @@
 //   bits 13..=21  clut_y          (pixel y, 0..=511)
 //   bit      22   TEXTURED
 //   bit      23   RAW_TEXTURE     (skip tint modulate)
-//   bit      24   SEMI_TRANS      (Phase 4)
+//   bit      24   SEMI_TRANS
 
-struct Globals {
-    display_origin: vec2<f32>,
-    display_size:   vec2<f32>,
-    target_size:    vec2<f32>,
-    _pad:           vec2<f32>,
-}
+const VRAM_W: u32 = 1024u;
+const VRAM_H: u32 =  512u;
+const VRAM_W_F: f32 = 1024.0;
+const VRAM_H_F: f32 =  512.0;
 
-@group(0) @binding(0) var<uniform> g: Globals;
-@group(0) @binding(1) var vram: texture_2d<u32>;
+@group(0) @binding(0) var vram: texture_2d<u32>;
 
 struct VertexIn {
     @location(0) pos:   vec2<i32>,
@@ -43,33 +34,40 @@ struct VertexIn {
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0)       color:    vec4<f32>,
-    @location(1) @interpolate(flat) uv: vec2<u32>,
+    // UV interpolates as f32 so the rasterizer gives a fresh sample
+    // per fragment. WGSL can't interpolate integer types — passing
+    // `vec2<u32>` here was a silent no-op (defaults to flat) and the
+    // fragment got the provoking vertex's UV for every pixel.
+    @location(1)       uv:       vec2<f32>,
     @location(2) @interpolate(flat) flags: u32,
 }
 
 const FLAG_TEXTURED:    u32 = 1u << 22u;
 const FLAG_RAW_TEXTURE: u32 = 1u << 23u;
-// FLAG_SEMI_TRANS reserved for Phase 4.
-
-const VRAM_W: u32 = 1024u;
-const VRAM_H: u32 =  512u;
+// FLAG_SEMI_TRANS lives in the host-side blend-batch routing, the
+// shader doesn't sample it.
 
 @vertex
 fn vs_main(in: VertexIn) -> VertexOut {
+    // PSX-VRAM-space (0..1024, 0..512) → NDC (-1..+1, Y-flipped).
     let pos_psx = vec2<f32>(f32(in.pos.x), f32(in.pos.y));
-    let ndc_xy = ((pos_psx - g.display_origin) / g.display_size) * 2.0 - 1.0;
+    let ndc_xy = (pos_psx / vec2<f32>(VRAM_W_F, VRAM_H_F)) * 2.0 - 1.0;
     var out: VertexOut;
     out.position = vec4<f32>(ndc_xy.x, -ndc_xy.y, 0.0, 1.0);
     out.color    = in.color;
-    out.uv       = in.uv;
+    out.uv       = vec2<f32>(f32(in.uv.x), f32(in.uv.y));
     out.flags    = in.flags;
     return out;
 }
 
 // PSX U/V are 8-bit per axis (so wrap on >255). The active
-// tex-window is added in Phase 5; for now just mask to the page.
-fn page_uv(uv: vec2<u32>) -> vec2<u32> {
-    return vec2<u32>(uv.x & 0xFFu, uv.y & 0xFFu);
+// tex-window is added in a later phase; for now just mask to the
+// page. Floor before the wrap matches the PSX nearest-neighbour
+// rasterizer the compute backend already replicates pixel-for-pixel.
+fn page_uv(uv: vec2<f32>) -> vec2<u32> {
+    let ix = u32(max(uv.x, 0.0));
+    let iy = u32(max(uv.y, 0.0));
+    return vec2<u32>(ix & 0xFFu, iy & 0xFFu);
 }
 
 fn tpage_origin(flags: u32) -> vec2<u32> {
@@ -94,9 +92,10 @@ fn vram_load(x: u32, y: u32) -> u32 {
     return textureLoad(vram, vec2<i32>(i32(xx), i32(yy)), 0).r;
 }
 
-// Convert a BGR15 word to linear-ish RGB (bit-replicated to 8-bit
-// per channel, then divided by 255). Matches `Vram::to_rgba8` on
-// the CPU side — same expansion the existing display path used.
+// BGR15 → display-code 0..1 RGB. Bit-replicates 5→8 the same way
+// `Vram::to_rgba8` does on the CPU side, so colour quantisation
+// matches the existing reference. This is intentionally NOT linear:
+// PSX tint/modulate math happens in integer display-code space.
 fn bgr15_to_rgb(word: u32) -> vec3<f32> {
     let r5 = word & 0x1Fu;
     let g5 = (word >> 5u) & 0x1Fu;
@@ -107,9 +106,24 @@ fn bgr15_to_rgb(word: u32) -> vec3<f32> {
     return vec3<f32>(f32(r8), f32(g8), f32(b8)) / 255.0;
 }
 
-// Sample the active texture page at PSX UV. Returns the raw
-// 16-bit BGR15 texel (not yet alpha-tested or expanded). Texel
-// 0 is reserved for "transparent" — caller discards.
+fn srgb_channel_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+fn srgb_to_linear(rgb: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        srgb_channel_to_linear(rgb.r),
+        srgb_channel_to_linear(rgb.g),
+        srgb_channel_to_linear(rgb.b),
+    );
+}
+
+// Sample the active texture page at PSX UV. Returns the raw 16-bit
+// BGR15 texel; texel == 0 is reserved for transparency (caller
+// discards).
 fn sample_texel(flags: u32, uv8: vec2<u32>) -> u32 {
     let tp = tpage_origin(flags);
     let depth = tex_depth(flags);
@@ -130,10 +144,8 @@ fn sample_texel(flags: u32, uv8: vec2<u32>) -> u32 {
     return vram_load(tp.x + uv8.x, tp.y + uv8.y);
 }
 
-// Modulate a sampled BGR15 texel by the per-vertex tint. PSX
-// formula: each channel = clamp(channel * tint * 2, 0..=255). We
-// keep the colours in 0..1 throughout so the math is linear here.
-// `RAW_TEXTURE` (raw-texture) skips this and uses the texel as-is.
+// PSX modulate: each channel = clamp(channel * tint * 2, 0..=1).
+// `RAW_TEXTURE` skips this and returns the texel verbatim.
 fn modulate(texel_rgb: vec3<f32>, tint_rgba: vec4<f32>, raw: bool) -> vec3<f32> {
     if raw {
         return texel_rgb;
@@ -145,18 +157,14 @@ fn modulate(texel_rgb: vec3<f32>, tint_rgba: vec4<f32>, raw: bool) -> vec3<f32> 
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let textured = (in.flags & FLAG_TEXTURED) != 0u;
     if !textured {
-        return in.color;
+        return vec4<f32>(srgb_to_linear(in.color.rgb), in.color.a);
     }
     let uv8 = page_uv(in.uv);
     let texel = sample_texel(in.flags, uv8);
     if texel == 0u {
-        // PSX convention: a 0x0000 texel is fully transparent.
-        // Discarding produces the right result for both opaque
-        // primitives (no pixel written) and Phase 4 semi-trans
-        // primitives (no blend either).
         discard;
     }
     let raw = (in.flags & FLAG_RAW_TEXTURE) != 0u;
     let rgb = modulate(bgr15_to_rgb(texel), in.color, raw);
-    return vec4<f32>(rgb, 1.0);
+    return vec4<f32>(srgb_to_linear(rgb), 1.0);
 }

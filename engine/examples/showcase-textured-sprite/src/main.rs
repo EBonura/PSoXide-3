@@ -295,8 +295,9 @@ fn draw_floor(
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
     let material = TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, (0x62, 0x66, 0x6c));
-    let options =
-        WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE).with_cull_mode(CullMode::None);
+    let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE)
+        .with_cull_mode(CullMode::None)
+        .with_material_layer(material);
     let mut zi = 0;
     while zi + 1 < ROOM_EDGES.len() {
         let mut xi = 0;
@@ -343,8 +344,9 @@ fn draw_walls(
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
     let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, (0x4c, 0x44, 0x40));
-    let options =
-        WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE).with_cull_mode(CullMode::Back);
+    let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE)
+        .with_cull_mode(CullMode::Back)
+        .with_material_layer(material);
     draw_z_wall(
         camera, -ROOM_HALF, false, material, options, world, triangles,
     );
@@ -458,7 +460,8 @@ fn draw_vertical_square(
     let y1 = PANEL_BOTTOM + PANEL_SIZE;
     let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE)
         .with_cull_mode(CullMode::None)
-        .with_depth_bias(-8);
+        .with_depth_bias(-8)
+        .with_material_layer(material);
     draw_world_textured(
         camera,
         [

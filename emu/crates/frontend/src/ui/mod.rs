@@ -21,10 +21,18 @@ pub fn draw_layout(
     state: &mut AppState,
     vram_tex: egui::TextureId,
     display_tex: egui::TextureId,
+    framebuffer_source: framebuffer::FramebufferSource,
     dt: f32,
 ) {
     state.hud.update(dt, state.cpu.tick());
     state.tick_status(dt);
+
+    if state.workspace.is_editor() {
+        state.editor.draw(ctx);
+        state.menu.draw(ctx, dt);
+        draw_status_toast(ctx, state);
+        return;
+    }
 
     // Top-bar controls go first so the central panel (framebuffer)
     // clips to what's left under them. Docked side panels come next.
@@ -53,7 +61,13 @@ pub fn draw_layout(
     }
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        framebuffer::draw(ui, display_tex, state.bus.as_ref(), state.scale_mode);
+        framebuffer::draw(
+            ui,
+            display_tex,
+            framebuffer_source,
+            state.bus.as_ref(),
+            &mut state.framebuffer_present_size_px,
+        );
     });
 
     state.menu.draw(ctx, dt);
@@ -129,6 +143,11 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
                     state.status_message_set(format!("Rescan failed: {e}"));
                 }
             }
+            MenuOutcome::None
+        }
+        ToggleEditorWorkspace => {
+            state.toggle_editor_workspace();
+            state.menu.open = false;
             MenuOutcome::None
         }
         ToggleRegisters => {

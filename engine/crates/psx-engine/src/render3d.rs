@@ -333,6 +333,30 @@ impl WorldCamera {
     }
 }
 
+/// Coarse render layer for world surfaces inside one ordering table.
+///
+/// PS1 ordering tables are still depth-first. This layer only resolves
+/// exact slot/depth ties so translucent packets blend over opaque packets
+/// submitted into the same OT cell.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WorldRenderLayer {
+    /// Opaque surfaces that overwrite destination pixels.
+    Opaque,
+    /// Semi-transparent surfaces that should blend with prior pixels.
+    Transparent,
+}
+
+impl WorldRenderLayer {
+    /// Pick the world render layer implied by a texture material.
+    pub const fn for_material(material: TextureMaterial) -> Self {
+        if material.is_translucent() {
+            Self::Transparent
+        } else {
+            Self::Opaque
+        }
+    }
+}
+
 /// Shared options for projected world surfaces.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WorldSurfaceOptions {
@@ -346,6 +370,8 @@ pub struct WorldSurfaceOptions {
     pub depth_bias: i32,
     /// Triangle culling mode.
     pub cull_mode: CullMode,
+    /// Coarse tie-break layer for opaque/translucent surfaces.
+    pub render_layer: WorldRenderLayer,
 }
 
 impl WorldSurfaceOptions {
@@ -357,6 +383,7 @@ impl WorldSurfaceOptions {
             depth_policy: DepthPolicy::Average,
             depth_bias: 0,
             cull_mode: CullMode::Back,
+            render_layer: WorldRenderLayer::Opaque,
         }
     }
 
@@ -377,6 +404,18 @@ impl WorldSurfaceOptions {
         self.cull_mode = cull_mode;
         self
     }
+
+    /// Return options with a different render layer.
+    pub const fn with_render_layer(mut self, render_layer: WorldRenderLayer) -> Self {
+        self.render_layer = render_layer;
+        self
+    }
+
+    /// Return options using the render layer implied by `material`.
+    pub const fn with_material_layer(mut self, material: TextureMaterial) -> Self {
+        self.render_layer = WorldRenderLayer::for_material(material);
+        self
+    }
 }
 
 /// Scratch command for a mixed world render pass.
@@ -388,6 +427,7 @@ impl WorldSurfaceOptions {
 pub struct WorldTriCommand {
     slot: DepthSlot,
     depth: i32,
+    render_layer: WorldRenderLayer,
     packet_ptr: *mut u32,
     words: u8,
     order: usize,
@@ -398,6 +438,7 @@ impl WorldTriCommand {
     pub const EMPTY: Self = Self {
         slot: DepthSlot::new(0),
         depth: 0,
+        render_layer: WorldRenderLayer::Opaque,
         packet_ptr: core::ptr::null_mut(),
         words: 0,
         order: 0,
@@ -606,6 +647,11 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
                 .depth_band
                 .slot::<OT_DEPTH>(options.depth_range, depth),
             depth,
+            if material.is_translucent() {
+                WorldRenderLayer::Transparent
+            } else {
+                options.render_layer
+            },
             tri as *mut TriTextured as *mut u32,
             TriTextured::WORDS,
         );
@@ -867,6 +913,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
                 .depth_band
                 .slot::<OT_DEPTH>(options.depth_range, depth),
             depth,
+            options.render_layer,
             tri as *mut TriGouraud as *mut u32,
             TriGouraud::WORDS,
         );
@@ -874,10 +921,18 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         stats
     }
 
-    fn push_command(&mut self, slot: DepthSlot, depth: i32, packet_ptr: *mut u32, words: u8) {
+    fn push_command(
+        &mut self,
+        slot: DepthSlot,
+        depth: i32,
+        render_layer: WorldRenderLayer,
+        packet_ptr: *mut u32,
+        words: u8,
+    ) {
         self.commands[self.command_len] = WorldTriCommand {
             slot,
             depth,
+            render_layer,
             packet_ptr,
             words,
             order: self.next_order,
@@ -1468,12 +1523,17 @@ fn should_insert_world_after(a: WorldTriCommand, b: WorldTriCommand) -> bool {
     if a.depth != b.depth {
         return a.depth > b.depth;
     }
+    if a.render_layer != b.render_layer {
+        return a.render_layer == WorldRenderLayer::Opaque
+            && b.render_layer == WorldRenderLayer::Transparent;
+    }
     a.order < b.order
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use psx_gpu::material::BlendMode;
     use psx_gpu::ot::OrderingTable;
 
     const fn command(slot: usize, depth: i32, primitive_index: usize) -> GouraudTriCommand {
@@ -1485,9 +1545,19 @@ mod tests {
     }
 
     const fn world_command(slot: usize, depth: i32, order: usize) -> WorldTriCommand {
+        world_command_layer(slot, depth, WorldRenderLayer::Opaque, order)
+    }
+
+    const fn world_command_layer(
+        slot: usize,
+        depth: i32,
+        render_layer: WorldRenderLayer,
+        order: usize,
+    ) -> WorldTriCommand {
         WorldTriCommand {
             slot: DepthSlot::new(slot),
             depth,
+            render_layer,
             packet_ptr: core::ptr::null_mut(),
             words: 0,
             order,
@@ -1664,5 +1734,87 @@ mod tests {
         assert_eq!(commands[1], world_command(5, 300, 3));
         assert_eq!(commands[2], world_command(5, 300, 1));
         assert_eq!(commands[3], world_command(5, 600, 0));
+    }
+
+    #[test]
+    fn world_render_layer_follows_texture_material_transparency() {
+        let opaque = TextureMaterial::opaque(0, 0, (128, 128, 128));
+        let transparent = TextureMaterial::blended(0, 0, (128, 128, 128), BlendMode::Average);
+
+        assert_eq!(
+            WorldRenderLayer::for_material(opaque),
+            WorldRenderLayer::Opaque
+        );
+        assert_eq!(
+            WorldRenderLayer::for_material(transparent),
+            WorldRenderLayer::Transparent
+        );
+
+        assert_eq!(
+            WorldSurfaceOptions::new(DepthBand::whole(), DepthRange::new(0, 1000))
+                .with_material_layer(transparent)
+                .render_layer,
+            WorldRenderLayer::Transparent
+        );
+    }
+
+    #[test]
+    fn textured_submit_uses_transparent_layer_for_translucent_material() {
+        const ZERO: TriTextured = TriTextured::new(
+            [(0, 0), (0, 0), (0, 0)],
+            [(0, 0), (0, 0), (0, 0)],
+            0,
+            0,
+            (0, 0, 0),
+        );
+        let mut ot_storage = OrderingTable::<8>::new();
+        let mut ot = OtFrame::begin(&mut ot_storage);
+        let mut triangle_storage = [const { ZERO }; 1];
+        let mut triangles = PrimitiveArena::new(&mut triangle_storage);
+        let mut commands = [WorldTriCommand::EMPTY; 1];
+        let material = TextureMaterial::blended(0, 0, (128, 128, 128), BlendMode::Average);
+
+        let stats = {
+            let mut pass = WorldRenderPass::new(&mut ot, &mut commands);
+            pass.submit_textured_triangle(
+                &mut triangles,
+                [
+                    ProjectedVertex::new(0, 0, 100),
+                    ProjectedVertex::new(16, 0, 100),
+                    ProjectedVertex::new(0, 16, 100),
+                ],
+                [(0, 0), (15, 0), (0, 15)],
+                material,
+                WorldSurfaceOptions::new(DepthBand::whole(), DepthRange::new(0, 1000))
+                    .with_cull_mode(CullMode::None),
+            )
+        };
+
+        assert_eq!(stats.submitted_triangles, 1);
+        assert_eq!(commands[0].render_layer, WorldRenderLayer::Transparent);
+    }
+
+    #[test]
+    fn world_commands_put_transparent_ties_before_opaque_insertions() {
+        let mut commands = [
+            world_command_layer(5, 300, WorldRenderLayer::Opaque, 0),
+            world_command_layer(5, 300, WorldRenderLayer::Transparent, 1),
+            world_command_layer(5, 300, WorldRenderLayer::Opaque, 2),
+        ];
+
+        sort_world_for_ot_insert(&mut commands);
+
+        assert_eq!(
+            commands[0],
+            world_command_layer(5, 300, WorldRenderLayer::Transparent, 1)
+        );
+        assert_eq!(
+            commands[1],
+            world_command_layer(5, 300, WorldRenderLayer::Opaque, 2)
+        );
+        assert_eq!(
+            commands[2],
+            world_command_layer(5, 300, WorldRenderLayer::Opaque, 0)
+        );
     }
 }

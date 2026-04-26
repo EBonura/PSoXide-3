@@ -1,0 +1,11 @@
+[package]
+name = "psxed-ui"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/EBonura/PSoXide"
+description = "Reusable egui workspace panels for the PSoXide editor."
+
+[dependencies]
+egui = "0.31"
+psxed-project = { path = "../psxed-project" }

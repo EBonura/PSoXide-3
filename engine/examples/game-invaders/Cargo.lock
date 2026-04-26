@@ -22,9 +22,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "psx-asset"
+version = "0.1.0"
+dependencies = [
+ "psx-gte",
+ "psxed-format",
+]
+
+[[package]]
 name = "psx-engine"
 version = "0.1.0"
 dependencies = [
+ "psx-asset",
  "psx-gpu",
  "psx-gte",
  "psx-math",
@@ -112,3 +121,7 @@ dependencies = [
  "psx-hw",
  "psx-io",
 ]
+
+[[package]]
+name = "psxed-format"
+version = "0.1.0"

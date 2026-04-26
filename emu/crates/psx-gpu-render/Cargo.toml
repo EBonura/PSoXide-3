@@ -15,3 +15,7 @@ wgpu            = { workspace = true }
 bytemuck        = { version = "1.16", features = ["derive"] }
 egui            = { workspace = true }
 egui-wgpu       = { workspace = true }
+
+[dev-dependencies]
+psx-iso  = { workspace = true }
+pollster = { workspace = true }

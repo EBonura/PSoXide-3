@@ -2,14 +2,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::target::TARGET_FORMAT;
-
-/// PSX VRAM dimensions (in 16-bit cells). Mirrors
-/// `emulator_core::VRAM_{WIDTH,HEIGHT}` but kept local so this
-/// crate doesn't have to peer into emulator-core's public surface
-/// for a constant.
-pub const VRAM_WIDTH: u32 = 1024;
-pub const VRAM_HEIGHT: u32 = 512;
+use crate::target::{TARGET_FORMAT, VRAM_HEIGHT, VRAM_WIDTH};
 
 /// Per-vertex data. 16 bytes, `bytemuck::Pod` so we can blit a
 /// `Vec<HwVertex>` into the GPU vertex buffer with `cast_slice`.
@@ -52,9 +45,9 @@ pub struct HwVertex {
 /// bit      24   SEMI_TRANS                    routed to a non-Opaque batch
 /// ```
 pub mod flags {
-    pub const TEXTURED:    u32 = 1 << 22;
+    pub const TEXTURED: u32 = 1 << 22;
     pub const RAW_TEXTURE: u32 = 1 << 23;
-    pub const SEMI_TRANS:  u32 = 1 << 24;
+    pub const SEMI_TRANS: u32 = 1 << 24;
 
     /// Pack tpage origin (in pixels) into the flag bits.
     /// `tpage_x` must be a multiple of 64 (PSX alignment),
@@ -72,28 +65,6 @@ pub mod flags {
         let cx = (clut_x / 16) & 0x3F;
         let cy = clut_y & 0x1FF;
         (cx << 7) | (cy << 13)
-    }
-}
-
-/// Globals UBO — uploaded once per frame after the render target
-/// is sized.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Globals {
-    pub display_origin: [f32; 2],
-    pub display_size:   [f32; 2],
-    pub target_size:    [f32; 2],
-    pub _pad:           [f32; 2],
-}
-
-impl Globals {
-    pub fn zero() -> Self {
-        Self {
-            display_origin: [0.0, 0.0],
-            display_size: [320.0, 240.0],
-            target_size: [320.0, 240.0],
-            _pad: [0.0, 0.0],
-        }
     }
 }
 
@@ -144,7 +115,12 @@ fn blend_constant_for(kind: BlendKind) -> wgpu::Color {
         BlendKind::AddQuarter => 0.25,
         _ => 0.0,
     };
-    wgpu::Color { r: v, g: v, b: v, a: v }
+    wgpu::Color {
+        r: v,
+        g: v,
+        b: v,
+        a: v,
+    }
 }
 
 pub struct HwPipeline {
@@ -154,7 +130,6 @@ pub struct HwPipeline {
     pipelines: [wgpu::RenderPipeline; BlendKind::COUNT],
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
-    globals_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity_bytes: u64,
     /// VRAM texture sampled by the fragment shader for textured
@@ -178,13 +153,6 @@ impl HwPipeline {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/prim.wgsl").into()),
         });
 
-        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("psx-hw-globals"),
-            size: std::mem::size_of::<Globals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         // VRAM as a 1024×512 R16Uint texture. Filled each frame
         // by `upload_vram`. The fragment shader reads from it via
         // `textureLoad` (no filtering — every PSX texture access
@@ -205,48 +173,32 @@ impl HwPipeline {
         });
         let vram_view = vram_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("psx-hw-bgl"),
-                entries: &[
-                    // 0: Globals UBO (vertex shader only).
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("psx-hw-bgl"),
+            entries: &[
+                // 0: VRAM texture (fragment shader). Vertex shader
+                // doesn't need any uniforms — VRAM dims are
+                // hardcoded constants in the WGSL.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    // 1: VRAM texture (fragment shader).
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Uint,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("psx-hw-bg"),
             layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&vram_view),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&vram_view),
+            }],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -348,7 +300,6 @@ impl HwPipeline {
             pipelines,
             bind_group_layout,
             bind_group,
-            globals_buffer,
             vertex_buffer,
             vertex_capacity_bytes,
             vram_texture,
@@ -405,10 +356,6 @@ impl HwPipeline {
 
     pub fn vertex_buffer(&self) -> &wgpu::Buffer {
         &self.vertex_buffer
-    }
-
-    pub fn globals_buffer(&self) -> &wgpu::Buffer {
-        &self.globals_buffer
     }
 
     /// Upload the frame's vertex data. If the payload exceeds the

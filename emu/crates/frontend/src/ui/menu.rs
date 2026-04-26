@@ -53,6 +53,8 @@ pub enum MenuAction {
     /// the Games / Examples categories so users can trigger a
     /// rescan without leaving the Menu.
     RescanLibrary,
+    /// Enter or leave the host-side editor workspace.
+    ToggleEditorWorkspace,
     /// Toggle visibility of the register side panel.
     ToggleRegisters,
     /// Toggle visibility of the memory viewer panel.
@@ -150,6 +152,7 @@ impl MenuState {
         let categories = vec![
             build_games_category(&[]),
             build_examples_category(&[]),
+            build_create_category(false),
             build_system_category(running),
             build_debug_category(),
             Category {
@@ -235,6 +238,24 @@ impl MenuState {
                 .find(|item| item.action == MenuAction::ToggleFastBoot)
             {
                 item.value = Some(if enabled { "On" } else { "Off" }.into());
+            }
+        }
+    }
+
+    /// Update the Create category label for the current workspace.
+    pub fn sync_editor_label(&mut self, editor_open: bool) {
+        if let Some(create) = self.categories.iter_mut().find(|c| c.name == "Create") {
+            if let Some(item) = create
+                .items
+                .iter_mut()
+                .find(|item| item.action == MenuAction::ToggleEditorWorkspace)
+            {
+                item.label = if editor_open {
+                    "Close editor workspace".into()
+                } else {
+                    "Open editor workspace".into()
+                };
+                item.value = Some(if editor_open { "Active" } else { "Studio" }.into());
             }
         }
     }
@@ -598,6 +619,23 @@ fn build_examples_category(examples: &[LibraryItem]) -> Category {
     }
 }
 
+/// Host-side creation tools.
+fn build_create_category(editor_open: bool) -> Category {
+    Category {
+        name: "Create",
+        icon: icons::FOLDER,
+        items: vec![MenuItem {
+            label: if editor_open {
+                "Close editor workspace".into()
+            } else {
+                "Open editor workspace".into()
+            },
+            action: MenuAction::ToggleEditorWorkspace,
+            value: Some(if editor_open { "Active" } else { "Studio" }.into()),
+        }],
+    }
+}
+
 /// The System category holds emulator-wide actions: run/pause,
 /// step, reset. Renamed from "Game" — on the PSX-style Menu, the
 /// Game column holds games, System holds controls. Matches
@@ -675,14 +713,15 @@ mod tests {
     }
 
     #[test]
-    fn fresh_state_has_five_categories() {
+    fn fresh_state_has_six_categories() {
         let s = MenuState::new();
-        assert_eq!(s.categories.len(), 5);
+        assert_eq!(s.categories.len(), 6);
         assert_eq!(s.categories[0].name, "Games");
         assert_eq!(s.categories[1].name, "Examples");
-        assert_eq!(s.categories[2].name, "System");
-        assert_eq!(s.categories[3].name, "Debug");
-        assert_eq!(s.categories[4].name, "Quit");
+        assert_eq!(s.categories[2].name, "Create");
+        assert_eq!(s.categories[3].name, "System");
+        assert_eq!(s.categories[4].name, "Debug");
+        assert_eq!(s.categories[5].name, "Quit");
     }
 
     #[test]
@@ -716,7 +755,7 @@ mod tests {
     fn set_library_preserves_category_across_rebuild() {
         let mut s = MenuState::new();
         // Move to "System" category before rebuilding.
-        s.category_index = 2;
+        s.category_index = 3;
         s.set_library(&[], &[]);
         assert_eq!(s.current_category(), Some("System"));
     }
@@ -724,17 +763,17 @@ mod tests {
     #[test]
     fn sync_run_label_flips_system_run_item() {
         let mut s = MenuState::new();
-        assert_eq!(s.categories[2].items[0].label, "Run");
+        assert_eq!(s.categories[3].items[0].label, "Run");
         s.sync_run_label(true);
-        assert_eq!(s.categories[2].items[0].label, "Pause");
+        assert_eq!(s.categories[3].items[0].label, "Pause");
         s.sync_run_label(false);
-        assert_eq!(s.categories[2].items[0].label, "Run");
+        assert_eq!(s.categories[3].items[0].label, "Run");
     }
 
     #[test]
     fn sync_fast_boot_label_flips_system_value() {
         let mut s = MenuState::new();
-        let fast_boot = s.categories[2]
+        let fast_boot = s.categories[3]
             .items
             .iter()
             .find(|item| item.action == MenuAction::ToggleFastBoot)
@@ -742,7 +781,7 @@ mod tests {
         assert_eq!(fast_boot.value.as_deref(), Some("On"));
 
         s.sync_fast_boot_label(false);
-        let fast_boot = s.categories[2]
+        let fast_boot = s.categories[3]
             .items
             .iter()
             .find(|item| item.action == MenuAction::ToggleFastBoot)
@@ -750,7 +789,7 @@ mod tests {
         assert_eq!(fast_boot.value.as_deref(), Some("Off"));
 
         s.sync_fast_boot_label(true);
-        let fast_boot = s.categories[2]
+        let fast_boot = s.categories[3]
             .items
             .iter()
             .find(|item| item.action == MenuAction::ToggleFastBoot)
@@ -774,10 +813,11 @@ mod tests {
             right: true,
             ..Default::default()
         };
-        s.update(&right); // → Examples
-        s.update(&right); // → System
-        s.update(&right); // → Debug
-        s.update(&right); // → Quit
+        s.update(&right); // Examples
+        s.update(&right); // Create
+        s.update(&right); // System
+        s.update(&right); // Debug
+        s.update(&right); // Quit
         s.update(&right); // past end — should clamp
         assert_eq!(s.current_category(), Some("Quit"));
         let left = MenuInput {

@@ -10,9 +10,11 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
+#[cfg(test)]
+use crate::primitive::{BlendMode, PrimFlags};
 use crate::primitive::{
-    BlendMode, DrawArea, Fill, MonoRect, MonoTri, PrimFlags, ShadedTexTri, ShadedTri,
-    TexQuadBilinear, TexRect, TexTri, Tpage,
+    DrawArea, Fill, MonoRect, MonoTri, ShadedTexTri, ShadedTri, TexQuadBilinear, TexRect, TexTri,
+    Tpage,
 };
 use crate::scanline::{self, RowState, ScanlineConsts};
 use crate::vram::VramGpu;
@@ -156,9 +158,7 @@ impl Rasterizer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("psx-rasterizer-mono-tri-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/mono_tri.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mono_tri.wgsl").into()),
         });
 
         let mono_tri_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -190,56 +190,55 @@ impl Rasterizer {
         });
 
         // ---------- Textured-triangle pipeline ----------
-        let tex_tri_bg_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("psx-rasterizer-tex-tri-bgl"),
-                entries: &[
-                    // 0: VRAM
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let tex_tri_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("psx-rasterizer-tex-tri-bgl"),
+            entries: &[
+                // 0: VRAM
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // 1: TexTri uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // 1: TexTri uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // 2: DrawArea uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // 2: DrawArea uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // 3: Tpage uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // 3: Tpage uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let tex_tri_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("psx-rasterizer-tex-tri-pl"),
@@ -248,9 +247,7 @@ impl Rasterizer {
         });
         let tex_tri_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("psx-rasterizer-tex-tri-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/tex_tri.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/tex_tri.wgsl").into()),
         });
         let tex_tri_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("psx-rasterizer-tex-tri"),
@@ -283,9 +280,7 @@ impl Rasterizer {
         });
         let mono_rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("psx-rasterizer-mono-rect-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/mono_rect.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mono_rect.wgsl").into()),
         });
         let mono_rect_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("psx-rasterizer-mono-rect"),
@@ -312,9 +307,7 @@ impl Rasterizer {
         });
         let tex_rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("psx-rasterizer-tex-rect-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/tex_rect.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/tex_rect.wgsl").into()),
         });
         let tex_rect_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("psx-rasterizer-tex-rect"),
@@ -392,18 +385,17 @@ impl Rasterizer {
         });
         let shaded_tri_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("psx-rasterizer-shaded-tri-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/shaded_tri.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shaded_tri.wgsl").into()),
         });
-        let shaded_tri_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("psx-rasterizer-shaded-tri"),
-            layout: Some(&shaded_tri_pl),
-            module: &shaded_tri_shader,
-            entry_point: Some("rasterize"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let shaded_tri_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("psx-rasterizer-shaded-tri"),
+                layout: Some(&shaded_tri_pl),
+                module: &shaded_tri_shader,
+                entry_point: Some("rasterize"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let shaded_tri_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("psx-rasterizer-shaded-tri-uniform"),
             size: std::mem::size_of::<ShadedTri>() as u64,
@@ -419,9 +411,7 @@ impl Rasterizer {
         });
         let shaded_tex_tri_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("psx-rasterizer-shaded-tex-tri-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/shaded_tex_tri.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shaded_tex_tri.wgsl").into()),
         });
         let shaded_tex_tri_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -513,13 +503,12 @@ impl Rasterizer {
             bind_group_layouts: &[&tex_tri_scanline_bg_layout],
             push_constant_ranges: &[],
         });
-        let tex_tri_scanline_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("psx-rasterizer-tex-tri-scanline-shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/tex_tri_scanline.wgsl").into(),
-                ),
-            });
+        let tex_tri_scanline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("psx-rasterizer-tex-tri-scanline-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/tex_tri_scanline.wgsl").into(),
+            ),
+        });
         let tex_tri_scanline_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("psx-rasterizer-tex-tri-scanline"),
@@ -548,13 +537,12 @@ impl Rasterizer {
         // ---------- Shaded-tex-tri scanline pipeline (B.x) ----------
         // Same 6-binding layout as tex_tri_scanline; just a different
         // shader entry that walks RGB in addition to UV.
-        let shaded_tex_tri_scanline_pl = device.create_pipeline_layout(
-            &wgpu::PipelineLayoutDescriptor {
+        let shaded_tex_tri_scanline_pl =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("psx-rasterizer-shaded-tex-tri-scanline-pl"),
                 bind_group_layouts: &[&tex_tri_scanline_bg_layout],
                 push_constant_ranges: &[],
-            },
-        );
+            });
         let shaded_tex_tri_scanline_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("psx-rasterizer-shaded-tex-tri-scanline-shader"),
@@ -588,31 +576,26 @@ impl Rasterizer {
         // Reuses `tex_tri_bg_layout` (same 4-binding shape: VRAM,
         // prim uniform, draw area, tpage). Different shader entry +
         // dedicated prim uniform.
-        let tex_quad_bilinear_pl = device.create_pipeline_layout(
-            &wgpu::PipelineLayoutDescriptor {
-                label: Some("psx-rasterizer-tex-quad-bilinear-pl"),
-                bind_group_layouts: &[&tex_tri_bg_layout],
-                push_constant_ranges: &[],
-            },
-        );
-        let tex_quad_bilinear_shader = device.create_shader_module(
-            wgpu::ShaderModuleDescriptor {
-                label: Some("psx-rasterizer-tex-quad-bilinear-shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/tex_quad_bilinear.wgsl").into(),
-                ),
-            },
-        );
-        let tex_quad_bilinear_pipeline = device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
+        let tex_quad_bilinear_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("psx-rasterizer-tex-quad-bilinear-pl"),
+            bind_group_layouts: &[&tex_tri_bg_layout],
+            push_constant_ranges: &[],
+        });
+        let tex_quad_bilinear_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("psx-rasterizer-tex-quad-bilinear-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/tex_quad_bilinear.wgsl").into(),
+            ),
+        });
+        let tex_quad_bilinear_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("psx-rasterizer-tex-quad-bilinear"),
                 layout: Some(&tex_quad_bilinear_pl),
                 module: &tex_quad_bilinear_shader,
                 entry_point: Some("rasterize"),
                 compilation_options: Default::default(),
                 cache: None,
-            },
-        );
+            });
         let tex_quad_bilinear_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("psx-rasterizer-tex-quad-bilinear-uniform"),
             size: std::mem::size_of::<TexQuadBilinear>() as u64,
@@ -684,13 +667,12 @@ impl Rasterizer {
             push_constant_ranges: &[],
         });
 
-        let mono_tri_scanline_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("psx-rasterizer-mono-tri-scanline-shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/mono_tri_scanline.wgsl").into(),
-                ),
-            });
+        let mono_tri_scanline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("psx-rasterizer-mono-tri-scanline-shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/mono_tri_scanline.wgsl").into(),
+            ),
+        });
         let mono_tri_scanline_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("psx-rasterizer-mono-tri-scanline"),
@@ -770,9 +752,7 @@ impl Rasterizer {
             tex_tri_scanline_rows: std::cell::RefCell::new(tex_tri_scanline_rows),
             shaded_tex_tri_scanline_pipeline,
             shaded_tex_tri_scanline_consts,
-            shaded_tex_tri_scanline_rows: std::cell::RefCell::new(
-                shaded_tex_tri_scanline_rows,
-            ),
+            shaded_tex_tri_scanline_rows: std::cell::RefCell::new(shaded_tex_tri_scanline_rows),
             tex_quad_bilinear_pipeline,
             tex_quad_bilinear_uniform,
             mono_shaded_scanline_bg_layout,
@@ -896,8 +876,7 @@ impl Rasterizer {
             _ => unreachable!("unknown scanline-dispatch label: {label}"),
         };
 
-        let rows_size_bytes =
-            (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
+        let rows_size_bytes = (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
         {
             let mut rows_buf = rows_cell.borrow_mut();
             if rows_buf.size() < rows_size_bytes {
@@ -909,7 +888,8 @@ impl Rasterizer {
                 });
             }
         }
-        self.queue.write_buffer(prim_uniform, 0, bytemuck::bytes_of(tri));
+        self.queue
+            .write_buffer(prim_uniform, 0, bytemuck::bytes_of(tri));
         self.queue
             .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
         self.queue
@@ -1005,8 +985,7 @@ impl Rasterizer {
             None => return false,
         };
 
-        let rows_size_bytes =
-            (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
+        let rows_size_bytes = (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
         {
             let mut rows_buf = self.shaded_tex_tri_scanline_rows.borrow_mut();
             if rows_buf.size() < rows_size_bytes {
@@ -1019,11 +998,8 @@ impl Rasterizer {
             }
         }
 
-        self.queue.write_buffer(
-            &self.shaded_tex_tri_uniform,
-            0,
-            bytemuck::bytes_of(tri),
-        );
+        self.queue
+            .write_buffer(&self.shaded_tex_tri_uniform, 0, bytemuck::bytes_of(tri));
         self.queue
             .write_buffer(&self.draw_area_uniform, 0, bytemuck::bytes_of(area));
         self.queue
@@ -1117,18 +1093,9 @@ impl Rasterizer {
             (tri.v2[0], tri.v2[1]),
         ];
         let uv = [
-            (
-                (tri.uv0 & 0xFF) as i32,
-                ((tri.uv0 >> 8) & 0xFF) as i32,
-            ),
-            (
-                (tri.uv1 & 0xFF) as i32,
-                ((tri.uv1 >> 8) & 0xFF) as i32,
-            ),
-            (
-                (tri.uv2 & 0xFF) as i32,
-                ((tri.uv2 >> 8) & 0xFF) as i32,
-            ),
+            ((tri.uv0 & 0xFF) as i32, ((tri.uv0 >> 8) & 0xFF) as i32),
+            ((tri.uv1 & 0xFF) as i32, ((tri.uv1 >> 8) & 0xFF) as i32),
+            ((tri.uv2 & 0xFF) as i32, ((tri.uv2 >> 8) & 0xFF) as i32),
         ];
         let setup = match scanline::build_setup(v, uv, [(0, 0, 0); 3]) {
             Some(s) => s,
@@ -1136,8 +1103,7 @@ impl Rasterizer {
         };
 
         // Re-allocate per-row buffer if too small.
-        let rows_size_bytes =
-            (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
+        let rows_size_bytes = (setup.rows.len() as u64) * std::mem::size_of::<RowState>() as u64;
         {
             let mut rows_buf = self.tex_tri_scanline_rows.borrow_mut();
             if rows_buf.size() < rows_size_bytes {
@@ -1492,12 +1458,8 @@ impl Rasterizer {
                 label: Some("psx-rasterizer-vram-copy-encoder"),
             });
         for row in 0..h {
-            let s_off = ((sy + row) as u64 * super::vram::VRAM_WIDTH as u64
-                + sx as u64)
-                * 4;
-            let d_off = ((dy + row) as u64 * super::vram::VRAM_WIDTH as u64
-                + dx as u64)
-                * 4;
+            let s_off = ((sy + row) as u64 * super::vram::VRAM_WIDTH as u64 + sx as u64) * 4;
+            let d_off = ((dy + row) as u64 * super::vram::VRAM_WIDTH as u64 + dx as u64) * 4;
             // Step 1: src row → temp.
             encoder.copy_buffer_to_buffer(vram.buffer(), s_off, &temp, 0, row_bytes);
             // Step 2: temp → dst row. Same encoder ⇒ runs strictly
@@ -1621,13 +1583,7 @@ impl Rasterizer {
     /// Dispatch one textured triangle into VRAM. `tpage` selects the
     /// 256×256 source rect + colour depth; `tri` carries vertices,
     /// UVs, CLUT, tint, flags. Returns immediately after queuing.
-    pub fn dispatch_tex_tri(
-        &self,
-        vram: &VramGpu,
-        tri: &TexTri,
-        tpage: &Tpage,
-        area: &DrawArea,
-    ) {
+    pub fn dispatch_tex_tri(&self, vram: &VramGpu, tri: &TexTri, tpage: &Tpage, area: &DrawArea) {
         if tri.exceeds_hw_extent() {
             return;
         }
@@ -1977,12 +1933,7 @@ mod tests {
     /// always disagree on a few edge pixels (different fill rule);
     /// allowing a small tolerance lets us pin the inside-of-triangle
     /// blend math precisely.
-    fn diff_inside_bbox(
-        a: &[u16],
-        b: &[u16],
-        bbox_min: (i32, i32),
-        bbox_max: (i32, i32),
-    ) -> usize {
+    fn diff_inside_bbox(a: &[u16], b: &[u16], bbox_min: (i32, i32), bbox_max: (i32, i32)) -> usize {
         let mut diffs = 0;
         let x0 = (bbox_min.0 - 2).max(0) as usize;
         let y0 = (bbox_min.1 - 2).max(0) as usize;
@@ -2013,7 +1964,10 @@ mod tests {
         let prefill = 0x5678;
         let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 0, 0, prefill);
         let gpu = gpu_rasterize_mono_tri_full(
-            v0, v1, v2, color,
+            v0,
+            v1,
+            v2,
+            color,
             PrimFlags::SEMI_TRANS,
             BlendMode::Average,
             prefill,
@@ -2030,11 +1984,14 @@ mod tests {
         let v1 = (45, 5);
         let v2 = (5, 45);
         // Pick a color whose channels saturate against the prefill.
-        let color = 0x4210;        // (r=0x10, g=0x10, b=0x10)
-        let prefill = 0x4210;       // same — sum must clamp to 31 per channel
+        let color = 0x4210; // (r=0x10, g=0x10, b=0x10)
+        let prefill = 0x4210; // same — sum must clamp to 31 per channel
         let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 1, 0, prefill);
         let gpu = gpu_rasterize_mono_tri_full(
-            v0, v1, v2, color,
+            v0,
+            v1,
+            v2,
+            color,
             PrimFlags::SEMI_TRANS,
             BlendMode::Add,
             prefill,
@@ -2048,11 +2005,14 @@ mod tests {
         let v0 = (5, 5);
         let v1 = (45, 5);
         let v2 = (5, 45);
-        let color = 0x2108;         // (r=8, g=8, b=8)
-        let prefill = 0x4210;       // (r=16, g=16, b=16) → result (r=8,g=8,b=8)
+        let color = 0x2108; // (r=8, g=8, b=8)
+        let prefill = 0x4210; // (r=16, g=16, b=16) → result (r=8,g=8,b=8)
         let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 2, 0, prefill);
         let gpu = gpu_rasterize_mono_tri_full(
-            v0, v1, v2, color,
+            v0,
+            v1,
+            v2,
+            color,
             PrimFlags::SEMI_TRANS,
             BlendMode::Sub,
             prefill,
@@ -2070,7 +2030,10 @@ mod tests {
         let prefill = 0x2108;
         let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 3, 0, prefill);
         let gpu = gpu_rasterize_mono_tri_full(
-            v0, v1, v2, color,
+            v0,
+            v1,
+            v2,
+            color,
             PrimFlags::SEMI_TRANS,
             BlendMode::AddQuarter,
             prefill,
@@ -2095,7 +2058,10 @@ mod tests {
         // opaque mono, mask_e6 = 0b01 = mask_set_on_draw.
         let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x20, 0, 0b01, prefill);
         let gpu = gpu_rasterize_mono_tri_full(
-            v0, v1, v2, color,
+            v0,
+            v1,
+            v2,
+            color,
             PrimFlags::MASK_SET,
             BlendMode::Average,
             prefill,
@@ -2105,8 +2071,14 @@ mod tests {
         // Sanity: spot-check a point firmly inside the triangle has
         // bit 15 set on both backends.
         let inside_idx = 20 * 1024 + 20;
-        assert!(cpu[inside_idx] & 0x8000 != 0, "CPU inside pixel: bit 15 set");
-        assert!(gpu[inside_idx] & 0x8000 != 0, "GPU inside pixel: bit 15 set");
+        assert!(
+            cpu[inside_idx] & 0x8000 != 0,
+            "CPU inside pixel: bit 15 set"
+        );
+        assert!(
+            gpu[inside_idx] & 0x8000 != 0,
+            "GPU inside pixel: bit 15 set"
+        );
     }
 
     #[test]
@@ -2120,7 +2092,10 @@ mod tests {
         let prefill = 0x8888; // bit 15 set
         let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x20, 0, 0b10, prefill);
         let gpu = gpu_rasterize_mono_tri_full(
-            v0, v1, v2, color,
+            v0,
+            v1,
+            v2,
+            color,
             PrimFlags::MASK_CHECK,
             BlendMode::Average,
             prefill,
@@ -2172,11 +2147,7 @@ mod tests {
         let vg = VramGpu::new_headless();
         vg.upload_full(&gpu_buffer).unwrap();
         let r = Rasterizer::new(&vg);
-        let tri = MonoTri::new(
-            v0, v1, v2, color,
-            PrimFlags::MASK_CHECK,
-            BlendMode::Average,
-        );
+        let tri = MonoTri::new(v0, v1, v2, color, PrimFlags::MASK_CHECK, BlendMode::Average);
         r.dispatch_mono_tri(&vg, &tri, &DrawArea::full_vram());
         let gpu = vg.download_full().unwrap();
 
@@ -2195,8 +2166,16 @@ mod tests {
             // The new pixel may have bit 15 set/cleared depending on
             // mask-set; it shouldn't have it here. The colour part
             // must be `color`.
-            assert_eq!(cpu[i] & 0x7FFF, color & 0x7FFF, "CPU row {y} (open) overwritten");
-            assert_eq!(gpu[i] & 0x7FFF, color & 0x7FFF, "GPU row {y} (open) overwritten");
+            assert_eq!(
+                cpu[i] & 0x7FFF,
+                color & 0x7FFF,
+                "CPU row {y} (open) overwritten"
+            );
+            assert_eq!(
+                gpu[i] & 0x7FFF,
+                color & 0x7FFF,
+                "GPU row {y} (open) overwritten"
+            );
         }
     }
 
@@ -2213,16 +2192,16 @@ mod tests {
         let prefill = 0x5678;
         let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 0, 0b01, prefill);
         let gpu = gpu_rasterize_mono_tri_full(
-            v0, v1, v2, color,
+            v0,
+            v1,
+            v2,
+            color,
             PrimFlags::SEMI_TRANS | PrimFlags::MASK_SET,
             BlendMode::Average,
             prefill,
         );
         let diffs = diff_inside_bbox(&cpu, &gpu, (10, 10), (50, 50));
-        assert!(
-            diffs == 0,
-            "semi-trans + mask-set parity: {diffs} differ"
-        );
+        assert!(diffs == 0, "semi-trans + mask-set parity: {diffs} differ");
         let inside_idx = 20 * 1024 + 20;
         // Both must have bit 15 set after MASK_SET.
         assert!(cpu[inside_idx] & 0x8000 != 0);
@@ -2375,9 +2354,14 @@ mod tests {
         // GPU side.
         let r = Rasterizer::new(&vg);
         let tri = TexTri::new(
-            v[0], v[1], v[2],
-            uv[0], uv[1], uv[2],
-            0, 0,
+            v[0],
+            v[1],
+            v[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            0,
+            0,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -2472,8 +2456,7 @@ mod tests {
 
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -2484,9 +2467,14 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let tri = TexTri::new(
-            v[0], v[1], v[2],
-            uv[0], uv[1], uv[2],
-            clut_x, clut_y,
+            v[0],
+            v[1],
+            v[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            clut_x,
+            clut_y,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -2546,8 +2534,7 @@ mod tests {
 
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -2558,9 +2545,14 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let tri = TexTri::new(
-            v[0], v[1], v[2],
-            uv[0], uv[1], uv[2],
-            clut_x, clut_y,
+            v[0],
+            v[1],
+            v[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            clut_x,
+            clut_y,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -2595,8 +2587,7 @@ mod tests {
 
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -2608,9 +2599,14 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let tri = TexTri::new(
-            v[0], v[1], v[2],
-            uv[0], uv[1], uv[2],
-            0, 0,
+            v[0],
+            v[1],
+            v[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            0,
+            0,
             tint,
             PrimFlags::empty(), // no RAW_TEXTURE → modulate
             BlendMode::Average,
@@ -2621,10 +2617,7 @@ mod tests {
 
         let diffs = diff_inside_bbox(&cpu_words, &gpu_words, (20, 20), (60, 60));
         let bbox = 41 * 41;
-        assert!(
-            diffs * 4 < bbox,
-            "tex modulated coverage: {diffs} / {bbox}"
-        );
+        assert!(diffs * 4 < bbox, "tex modulated coverage: {diffs} / {bbox}");
         // Strict check: every pixel that BOTH backends wrote should
         // have R/G/B that's been halved by the 0x40 tint. So any
         // non-zero pixel must have channels ≤ 0x10 (since input
@@ -2680,8 +2673,7 @@ mod tests {
 
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -2692,9 +2684,14 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let tri = TexTri::new(
-            v[0], v[1], v[2],
-            uv[0], uv[1], uv[2],
-            0, 0,
+            v[0],
+            v[1],
+            v[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            0,
+            0,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -2723,8 +2720,14 @@ mod tests {
                 x + y < 100
             })
             .collect::<Vec<_>>();
-        let untouched = inside_pixels.iter().filter(|&&i| gpu_words[i] == prefill).count();
-        let touched = inside_pixels.iter().filter(|&&i| gpu_words[i] != prefill).count();
+        let untouched = inside_pixels
+            .iter()
+            .filter(|&&i| gpu_words[i] == prefill)
+            .count();
+        let touched = inside_pixels
+            .iter()
+            .filter(|&&i| gpu_words[i] != prefill)
+            .count();
         assert!(untouched > 0, "expected some transparent-skip pixels");
         assert!(touched > 0, "expected some opaque-write pixels");
     }
@@ -2752,8 +2755,7 @@ mod tests {
         }
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -2764,9 +2766,14 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let tri = TexTri::new(
-            v[0], v[1], v[2],
-            uv[0], uv[1], uv[2],
-            0, 0,
+            v[0],
+            v[1],
+            v[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            0,
+            0,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -2798,8 +2805,7 @@ mod tests {
         }
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -2810,9 +2816,14 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let tri = TexTri::new(
-            v[0], v[1], v[2],
-            uv[0], uv[1], uv[2],
-            0, 0,
+            v[0],
+            v[1],
+            v[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            0,
+            0,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -2821,7 +2832,10 @@ mod tests {
         r.dispatch_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
         let gpu_words = vg.download_full().unwrap();
 
-        assert_eq!(cpu_words, gpu_words, "tex tri scanline skewed strict parity");
+        assert_eq!(
+            cpu_words, gpu_words,
+            "tex tri scanline skewed strict parity"
+        );
     }
 
     #[test]
@@ -2853,8 +2867,7 @@ mod tests {
         }
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -2865,9 +2878,14 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let tri = TexTri::new(
-            v[0], v[1], v[2],
-            uv[0], uv[1], uv[2],
-            clut_x, clut_y,
+            v[0],
+            v[1],
+            v[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            clut_x,
+            clut_y,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -2876,7 +2894,10 @@ mod tests {
         r.dispatch_tex_tri_scanline(&vg, &tri, &tp, &DrawArea::full_vram());
         let gpu_words = vg.download_full().unwrap();
 
-        assert_eq!(cpu_words, gpu_words, "tex tri scanline 4bpp+CLUT strict parity");
+        assert_eq!(
+            cpu_words, gpu_words,
+            "tex tri scanline 4bpp+CLUT strict parity"
+        );
     }
 
     #[test]
@@ -2905,14 +2926,11 @@ mod tests {
 
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
-        let pack_rgb = |t: (u8, u8, u8)| {
-            (t.0 as u32) | ((t.1 as u32) << 8) | ((t.2 as u32) << 16)
-        };
+        let pack_rgb = |t: (u8, u8, u8)| (t.0 as u32) | ((t.1 as u32) << 8) | ((t.2 as u32) << 16);
         // 0x34 = textured-shaded triangle.
         cpu.gp0_push((0x34u32 << 24) | pack_rgb(c[0]));
         cpu.gp0_push(pack_xy(v[0]));
@@ -2929,10 +2947,17 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let tri = ShadedTexTri::new(
-            v[0], v[1], v[2],
-            c[0], c[1], c[2],
-            uv[0], uv[1], uv[2],
-            0, 0,
+            v[0],
+            v[1],
+            v[2],
+            c[0],
+            c[1],
+            c[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            0,
+            0,
             PrimFlags::empty(),
             BlendMode::Average,
         );
@@ -2983,8 +3008,8 @@ mod tests {
         for vy in 0..80u16 {
             for ux in 0..96u16 {
                 let val = ((vy & 0x1F) << 5) | (ux & 0x1F) | 0x0001;
-                vram[(tpage_y as usize + vy as usize) * 1024
-                    + (tpage_x as usize + ux as usize)] = val;
+                vram[(tpage_y as usize + vy as usize) * 1024 + (tpage_x as usize + ux as usize)] =
+                    val;
             }
         }
 
@@ -2992,8 +3017,7 @@ mod tests {
         // raw, opaque). Vertex order matches the cmd_log layout.
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -3019,9 +3043,16 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let quad = TexQuadBilinear::new(
-            v[0], v[1], v[2], v[3],
-            uv[0], uv[1], uv[2], uv[3],
-            0, 0,
+            v[0],
+            v[1],
+            v[2],
+            v[3],
+            uv[0],
+            uv[1],
+            uv[2],
+            uv[3],
+            0,
+            0,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -3085,8 +3116,12 @@ mod tests {
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
         let tri = ShadedTri::new(
-            v[0], v[1], v[2],
-            c[0], c[1], c[2],
+            v[0],
+            v[1],
+            v[2],
+            c[0],
+            c[1],
+            c[2],
             PrimFlags::empty(),
             BlendMode::Average,
         );
@@ -3206,13 +3241,7 @@ mod tests {
         let r = Rasterizer::new(&vg);
         r.dispatch_mono_rect(
             &vg,
-            &MonoRect::new(
-                xy,
-                wh,
-                color,
-                PrimFlags::SEMI_TRANS,
-                BlendMode::Average,
-            ),
+            &MonoRect::new(xy, wh, color, PrimFlags::SEMI_TRANS, BlendMode::Average),
             &DrawArea::full_vram(),
         );
         let gpu = vg.download_full().unwrap();
@@ -3231,13 +3260,7 @@ mod tests {
         let r = Rasterizer::new(&vg);
         r.dispatch_mono_rect(
             &vg,
-            &MonoRect::new(
-                xy,
-                wh,
-                color,
-                PrimFlags::MASK_CHECK,
-                BlendMode::Average,
-            ),
+            &MonoRect::new(xy, wh, color, PrimFlags::MASK_CHECK, BlendMode::Average),
             &DrawArea::full_vram(),
         );
         let gpu = vg.download_full().unwrap();
@@ -3283,8 +3306,7 @@ mod tests {
             | ((tint.2 as u32) << 16);
         cpu.gp0_push(cmd);
         cpu.gp0_push(((xy.1 as u32) << 16) | (xy.0 as u32 & 0xFFFF));
-        let uv_clut =
-            ((clut_word & 0xFFFF) << 16) | ((uv.0 as u32) | ((uv.1 as u32) << 8));
+        let uv_clut = ((clut_word & 0xFFFF) << 16) | ((uv.0 as u32) | ((uv.1 as u32) << 8));
         cpu.gp0_push(uv_clut);
         cpu.gp0_push((wh.1 << 16) | (wh.0 & 0xFFFF));
     }
@@ -3319,8 +3341,7 @@ mod tests {
 
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -3334,7 +3355,11 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let rect = TexRect::new(
-            xy, wh, uv, 0, 0,
+            xy,
+            wh,
+            uv,
+            0,
+            0,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -3366,8 +3391,7 @@ mod tests {
         // CPU: set the X-flip bit in GP0 0xE1 (bit 12 = 0x1000).
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -3380,7 +3404,11 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let rect = TexRect::new(
-            xy, wh, uv, 0, 0,
+            xy,
+            wh,
+            uv,
+            0,
+            0,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE | PrimFlags::FLIP_X,
             BlendMode::Average,
@@ -3410,8 +3438,7 @@ mod tests {
 
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -3425,7 +3452,12 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let rect = TexRect::new(
-            xy, wh, uv, 0, 0, tint,
+            xy,
+            wh,
+            uv,
+            0,
+            0,
+            tint,
             PrimFlags::empty(),
             BlendMode::Average,
         );
@@ -3468,8 +3500,7 @@ mod tests {
 
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
@@ -3484,7 +3515,11 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let rect = TexRect::new(
-            xy, wh, uv, clut_x, clut_y,
+            xy,
+            wh,
+            uv,
+            clut_x,
+            clut_y,
             (0x80, 0x80, 0x80),
             PrimFlags::RAW_TEXTURE,
             BlendMode::Average,
@@ -3554,15 +3589,7 @@ mod tests {
         let color = 0x1234;
         // Restrict draw area to (40..60, 40..60) — but fill IGNORES
         // this. The whole rect at (32..96, 32..96) should still write.
-        let cpu = cpu_rasterize_fill(
-            xy,
-            wh,
-            color,
-            0,
-            40 | (40 << 10),
-            60 | (60 << 10),
-            0,
-        );
+        let cpu = cpu_rasterize_fill(xy, wh, color, 0, 40 | (40 << 10), 60 | (60 << 10), 0);
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
         r.dispatch_fill(&vg, &Fill::new(xy, wh, color));
@@ -3631,8 +3658,7 @@ mod tests {
     ) -> Vec<u16> {
         let mut gpu = Gpu::new();
         for (i, &w) in seed.iter().enumerate() {
-            gpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            gpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         gpu.gp0_push(0x80_000000);
         gpu.gp0_push(((src.1 as u32) << 16) | (src.0 as u32));
@@ -3717,9 +3743,7 @@ mod tests {
         gpu.gp0_push(0xE100_0000_u32 | ((tpage_blend_bits as u32) & 0x3) << 5);
         gpu.gp0_push(0xE600_0000_u32 | (mask_e6 as u32) & 0x3);
         // GP0 0x30 packet: cmd+c0, v0, c1, v1, c2, v2 (6 words).
-        let pack_rgb = |t: (u8, u8, u8)| {
-            (t.0 as u32) | ((t.1 as u32) << 8) | ((t.2 as u32) << 16)
-        };
+        let pack_rgb = |t: (u8, u8, u8)| (t.0 as u32) | ((t.1 as u32) << 8) | ((t.2 as u32) << 16);
         gpu.gp0_push(((cmd_byte as u32) << 24) | pack_rgb(c[0]));
         gpu.gp0_push(pack_xy(v[0]));
         gpu.gp0_push(pack_rgb(c[1]));
@@ -3741,8 +3765,12 @@ mod tests {
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
         let tri = ShadedTri::new(
-            v[0], v[1], v[2],
-            c[0], c[1], c[2],
+            v[0],
+            v[1],
+            v[2],
+            c[0],
+            c[1],
+            c[2],
             PrimFlags::empty(),
             BlendMode::Average,
         );
@@ -3768,7 +3796,10 @@ mod tests {
                 }
             }
         }
-        assert!(max_chan <= 2, "shaded tri max channel delta: {max_chan} > 2");
+        assert!(
+            max_chan <= 2,
+            "shaded tri max channel delta: {max_chan} > 2"
+        );
     }
 
     #[test]
@@ -3793,8 +3824,12 @@ mod tests {
         let vg_shaded = VramGpu::new_headless();
         let r = Rasterizer::new(&vg_shaded);
         let tri = ShadedTri::new(
-            v[0], v[1], v[2],
-            rgb, rgb, rgb,
+            v[0],
+            v[1],
+            v[2],
+            rgb,
+            rgb,
+            rgb,
             PrimFlags::empty(),
             BlendMode::Average,
         );
@@ -3821,9 +3856,11 @@ mod tests {
         let v = [(20i32, 20i32), (60, 20), (20, 60)];
         let uv = [(0u8, 0u8), (32, 0), (0, 32)];
         // Different per-vertex tints so interpolation is exercised.
-        let c = [(0x80u8, 0x80u8, 0x80u8),
-                 (0xC0, 0xC0, 0xC0),
-                 (0xFFu8, 0xFFu8, 0xFFu8)];
+        let c = [
+            (0x80u8, 0x80u8, 0x80u8),
+            (0xC0, 0xC0, 0xC0),
+            (0xFFu8, 0xFFu8, 0xFFu8),
+        ];
         let tpage_x = 128u32;
         let tpage_word = make_tpage_word(tpage_x, 0, 2, 0);
 
@@ -3837,14 +3874,11 @@ mod tests {
 
         let mut cpu = Gpu::new();
         for (i, &w) in vram.iter().enumerate() {
-            cpu.vram
-                .set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
+            cpu.vram.set_pixel((i % 1024) as u16, (i / 1024) as u16, w);
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
-        let pack_rgb = |t: (u8, u8, u8)| {
-            (t.0 as u32) | ((t.1 as u32) << 8) | ((t.2 as u32) << 16)
-        };
+        let pack_rgb = |t: (u8, u8, u8)| (t.0 as u32) | ((t.1 as u32) << 8) | ((t.2 as u32) << 16);
         // 0x34 = textured-shaded triangle, modulated.
         cpu.gp0_push((0x34u32 << 24) | pack_rgb(c[0]));
         cpu.gp0_push(pack_xy(v[0]));
@@ -3861,10 +3895,17 @@ mod tests {
         vg.upload_full(&vram).unwrap();
         let r = Rasterizer::new(&vg);
         let tri = ShadedTexTri::new(
-            v[0], v[1], v[2],
-            c[0], c[1], c[2],
-            uv[0], uv[1], uv[2],
-            0, 0,
+            v[0],
+            v[1],
+            v[2],
+            c[0],
+            c[1],
+            c[2],
+            uv[0],
+            uv[1],
+            uv[2],
+            0,
+            0,
             PrimFlags::empty(),
             BlendMode::Average,
         );
@@ -3907,8 +3948,12 @@ mod tests {
         let vg = VramGpu::new_headless();
         let r = Rasterizer::new(&vg);
         let tri = ShadedTri::new(
-            v[0], v[1], v[2],
-            c[0], c[1], c[2],
+            v[0],
+            v[1],
+            v[2],
+            c[0],
+            c[1],
+            c[2],
             PrimFlags::empty(),
             BlendMode::Average,
         );

@@ -27,6 +27,7 @@ parity-oracle    = { path = "crates/parity-oracle" }
 psoxide-settings = { path = "crates/psoxide-settings" }
 psx-gpu-compute  = { path = "crates/psx-gpu-compute" }
 psx-gpu-render   = { path = "crates/psx-gpu-render" }
+psxed-ui         = { path = "../editor/crates/psxed-ui" }
 
 thiserror  = "1.0"
 serde      = { version = "1.0", features = ["derive"] }
