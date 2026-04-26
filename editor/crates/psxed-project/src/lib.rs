@@ -511,21 +511,23 @@ pub struct Resource {
 }
 
 /// Node type used by the editor scene tree.
+///
+/// Hierarchy convention for level authoring:
+/// `Scene root → World (macro) → Room (sector grid) → entity nodes`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
     /// Plain organisational node.
     Node,
     /// Spatial transform node.
     Node3D,
-    /// Room/sector authoring node.
+    /// Macro-node grouping every Room that belongs to one streamed
+    /// region. Holds shared metadata (default fog/ambient) the
+    /// editor will surface as it grows; for now it's a pure folder.
+    World,
+    /// One streamed level chunk: a sector grid plus its child
+    /// entities. Cooks to a single `.psxw` blob the runtime loads
+    /// in isolation.
     Room {
-        /// Width in sectors.
-        width: u16,
-        /// Depth in sectors.
-        depth: u16,
-    },
-    /// Engine-style sector grid world.
-    GridWorld {
         /// Authored grid-world payload.
         grid: WorldGrid,
     },
@@ -562,6 +564,21 @@ pub enum NodeKind {
         /// Playback radius.
         radius: f32,
     },
+    /// Streaming-graph edge: when the player crosses this volume, the
+    /// runtime streams the named entry point of `target_room` into
+    /// the World's residency set.
+    Portal {
+        /// Target Room node by id, or `None` when not yet wired.
+        target_room: Option<NodeId>,
+        /// Entry-portal label on the target room. The runtime matches
+        /// this against a same-named Portal in the destination so the
+        /// player spawns at the right side of the door.
+        target_entry: String,
+        /// Identifier this Portal is known by in its own Room. The
+        /// matching Portal in another Room sets `target_entry` to
+        /// this string.
+        entry_name: String,
+    },
 }
 
 impl NodeKind {
@@ -570,13 +587,14 @@ impl NodeKind {
         match self {
             Self::Node => "Node",
             Self::Node3D => "Node3D",
+            Self::World => "World",
             Self::Room { .. } => "Room",
-            Self::GridWorld { .. } => "GridWorld",
             Self::MeshInstance { .. } => "MeshInstance",
             Self::Light { .. } => "Light",
             Self::SpawnPoint { .. } => "SpawnPoint",
             Self::Trigger { .. } => "Trigger",
             Self::AudioSource { .. } => "AudioSource",
+            Self::Portal { .. } => "Portal",
         }
     }
 }
@@ -794,16 +812,17 @@ impl ProjectDocument {
 
         let scene = project.active_scene_mut();
         let root = scene.root;
-        scene.add_node(
-            root,
+        let world = scene.add_node(root, "Demo World", NodeKind::World);
+        let stone_room = scene.add_node(
+            world,
             "Stone Room",
-            NodeKind::GridWorld {
+            NodeKind::Room {
                 grid: WorldGrid::stone_room(3, 3, 1024, Some(floor_mat), Some(brick_mat)),
             },
         );
 
         let card = scene.add_node(
-            root,
+            stone_room,
             "Material Card",
             NodeKind::MeshInstance {
                 mesh: None,
@@ -815,13 +834,14 @@ impl ProjectDocument {
             node.transform.scale = [0.9, 1.0, 0.18];
         }
 
-        let spawn = scene.add_node(root, "Player Spawn", NodeKind::SpawnPoint { player: true });
+        let spawn =
+            scene.add_node(stone_room, "Player Spawn", NodeKind::SpawnPoint { player: true });
         if let Some(node) = scene.node_mut(spawn) {
             node.transform.translation = [-1.0, 0.0, -0.8];
         }
 
         let light = scene.add_node(
-            root,
+            stone_room,
             "Preview Light",
             NodeKind::Light {
                 color: [255, 236, 198],
@@ -944,10 +964,10 @@ mod tests {
             .nodes()
             .iter()
             .find_map(|node| match &node.kind {
-                NodeKind::GridWorld { grid } => Some(grid),
+                NodeKind::Room { grid } => Some(grid),
                 _ => None,
             })
-            .expect("starter should contain a grid-world node");
+            .expect("starter should contain a room node");
         assert_eq!(grid.width, 3);
         assert_eq!(grid.depth, 3);
         assert_eq!(grid.populated_sector_count(), 9);
@@ -960,7 +980,7 @@ mod tests {
         let room = scene.add_node(
             scene.root,
             "Room",
-            NodeKind::GridWorld {
+            NodeKind::Room {
                 grid: WorldGrid::empty(2, 2, 1024),
             },
         );

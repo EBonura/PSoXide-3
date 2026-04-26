@@ -12,9 +12,49 @@ use egui::{
     StrokeKind, Vec2,
 };
 use psxed_project::{
-    GridDirection, MaterialResource, NodeId, NodeKind, NodeRow, ProjectDocument, PsxBlendMode,
-    Resource, ResourceData, ResourceId, WorldGrid,
+    GridDirection, GridHorizontalFace, GridVerticalFace, MaterialResource, NodeId, NodeKind,
+    NodeRow, ProjectDocument, PsxBlendMode, Resource, ResourceData, ResourceId, WorldGrid,
 };
+
+/// Maximum undo / redo snapshots retained.
+const UNDO_CAPACITY: usize = 64;
+
+/// Snapshot-based undo. Each entry is a full `ProjectDocument` clone;
+/// for hand-authored level data this is cheap and avoids the
+/// command-pattern bookkeeping that operation-based undo demands.
+#[derive(Default)]
+struct UndoStack {
+    undo: std::collections::VecDeque<ProjectDocument>,
+    redo: std::collections::VecDeque<ProjectDocument>,
+}
+
+impl UndoStack {
+    fn record(&mut self, snapshot: ProjectDocument) {
+        if self.undo.len() == UNDO_CAPACITY {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(snapshot);
+        self.redo.clear();
+    }
+
+    fn undo(&mut self, current: ProjectDocument) -> Option<ProjectDocument> {
+        let prev = self.undo.pop_back()?;
+        if self.redo.len() == UNDO_CAPACITY {
+            self.redo.pop_front();
+        }
+        self.redo.push_back(current);
+        Some(prev)
+    }
+
+    fn redo(&mut self, current: ProjectDocument) -> Option<ProjectDocument> {
+        let next = self.redo.pop_back()?;
+        if self.undo.len() == UNDO_CAPACITY {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(current);
+        Some(next)
+    }
+}
 
 /// Embedded editor workspace state.
 pub struct EditorWorkspace {
@@ -22,6 +62,11 @@ pub struct EditorWorkspace {
     project_path: Option<PathBuf>,
     selected_node: NodeId,
     selected_resource: Option<ResourceId>,
+    /// Highlighted sector cell within the active Room. Tracked so the
+    /// inspector can show per-cell properties without inflating the
+    /// scene-tree node count with a node per sector.
+    selected_sector: Option<(u16, u16)>,
+    history: UndoStack,
     scene_filter: String,
     file_filter: String,
     resource_search: String,
@@ -40,10 +85,40 @@ pub struct EditorWorkspace {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewTool {
+    /// Click to select; arrow-key nudge moves the selected node.
     Select,
+    /// Drag a selected node in the viewport plane.
     Move,
+    /// Yaw the selected node around its origin.
     Rotate,
+    /// Resize the selected node uniformly.
     Scale,
+    /// Paint a floor onto the sector under the cursor (Room context).
+    PaintFloor,
+    /// Paint a wall on the directed edge under the cursor.
+    PaintWall,
+    /// Paint a ceiling on the sector under the cursor.
+    PaintCeiling,
+    /// Clear the painted surface under the cursor.
+    Erase,
+    /// Drop a child entity node into the sector under the cursor.
+    Place,
+}
+
+impl ViewTool {
+    /// `true` when the tool only makes sense once a Room is the
+    /// active context — viewport clicks should be suppressed
+    /// otherwise so we don't paint into thin air.
+    const fn requires_room_context(self) -> bool {
+        matches!(
+            self,
+            Self::PaintFloor
+                | Self::PaintWall
+                | Self::PaintCeiling
+                | Self::Erase
+                | Self::Place
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +332,8 @@ impl EditorWorkspace {
             project_path: None,
             selected_node: NodeId::ROOT,
             selected_resource: None,
+            selected_sector: None,
+            history: UndoStack::default(),
             scene_filter: String::new(),
             file_filter: String::new(),
             resource_search: String::new(),
@@ -351,15 +428,92 @@ impl EditorWorkspace {
         Ok(())
     }
 
+    /// Cook every Room in the active scene to a per-Room `.psxw`
+    /// blob under `<project_dir>/cooked/`.
+    ///
+    /// Returns a one-line summary on success. Fails when the project
+    /// has not yet been saved (no anchor for `<project_dir>`), or
+    /// when any room's grid cooker rejects its inputs (see
+    /// `WorldGridCookError`).
+    pub fn cook_world_to_disk(&mut self) -> Result<String, String> {
+        let project_path = self
+            .project_path
+            .clone()
+            .ok_or("Save the project first so cooked rooms have a destination")?;
+        let cooked_dir = project_path
+            .parent()
+            .map(|parent| parent.join("cooked"))
+            .ok_or("Project path has no parent directory")?;
+        std::fs::create_dir_all(&cooked_dir)
+            .map_err(|error| format!("mkdir {}: {error}", cooked_dir.display()))?;
+
+        let scene = self.project.active_scene();
+        let rooms: Vec<(NodeId, String)> = scene
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Room { .. }))
+            .map(|node| (node.id, node.name.clone()))
+            .collect();
+        if rooms.is_empty() {
+            return Err("No Room nodes in the active scene".to_string());
+        }
+
+        let mut total_bytes = 0usize;
+        let mut written = 0usize;
+        for (room_id, room_name) in &rooms {
+            let scene = self.project.active_scene();
+            let Some(node) = scene.node(*room_id) else {
+                continue;
+            };
+            let NodeKind::Room { grid } = &node.kind else {
+                continue;
+            };
+            let bytes = psxed_project::world_cook::encode_world_grid_psxw(&self.project, grid)
+                .map_err(|error| format!("cook \"{room_name}\": {error}"))?;
+            let filename = sanitise_room_filename(room_name);
+            let path = cooked_dir.join(format!("{filename}.psxw"));
+            std::fs::write(&path, &bytes)
+                .map_err(|error| format!("write {}: {error}", path.display()))?;
+            total_bytes += bytes.len();
+            written += 1;
+        }
+
+        Ok(format!(
+            "Cooked {} room{} ({} KiB) into {}",
+            written,
+            if written == 1 { "" } else { "s" },
+            total_bytes / 1024,
+            cooked_dir.display(),
+        ))
+    }
+
     /// Draw the full editor workspace.
     pub fn draw(&mut self, ctx: &egui::Context) {
         apply_studio_visuals(ctx);
+        self.handle_global_shortcuts(ctx);
         self.draw_menu_bar(ctx);
         self.draw_action_bar(ctx);
         self.draw_left_dock(ctx);
         self.draw_inspector(ctx);
         self.draw_content_browser(ctx);
         self.draw_viewport(ctx);
+    }
+
+    /// Top-level keyboard shortcut handler. Cleared via `consume_*`
+    /// so child widgets never see the same chord.
+    fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        let undo_chord = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+        let redo_chord = egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+            egui::Key::Z,
+        );
+        let consume_undo = ctx.input_mut(|input| input.consume_shortcut(&undo_chord));
+        let consume_redo = ctx.input_mut(|input| input.consume_shortcut(&redo_chord));
+        if consume_redo {
+            self.do_redo();
+        } else if consume_undo {
+            self.do_undo();
+        }
     }
 
     fn draw_menu_bar(&mut self, ctx: &egui::Context) {
@@ -409,6 +563,12 @@ impl EditorWorkspace {
                     }
                     if ui.button(icons::label(icons::PLAY, "Playtest")).clicked() {
                         self.status = "Playtest preview pending scene cook".to_string();
+                    }
+                    if ui.button(icons::label(icons::BLEND, "Cook World")).clicked() {
+                        match self.cook_world_to_disk() {
+                            Ok(report) => self.status = report,
+                            Err(error) => self.status = format!("Cook failed: {error}"),
+                        }
                     }
 
                     ui.separator();
@@ -538,9 +698,7 @@ impl EditorWorkspace {
             ui,
             icons::GRID,
             "Rooms",
-            count_nodes(&self.project, |kind| {
-                matches!(kind, NodeKind::Room { .. } | NodeKind::GridWorld { .. })
-            }),
+            count_nodes(&self.project, |kind| matches!(kind, NodeKind::Room { .. })),
         );
         draw_scene_group(
             ui,
@@ -612,46 +770,106 @@ impl EditorWorkspace {
                 }
 
                 let material_options = self.project.material_options();
+                let room_options = collect_room_options(&self.project);
                 let selected = self.selected_node;
-                let Some(node) = self.project.active_scene_mut().node_mut(selected) else {
-                    ui.weak("No node selected");
+                let active_room = self.active_room_id();
+                let selected_sector = self.selected_sector;
+
+                let mut changed = false;
+
+                // Phase 1: mutate the selected node (transform + kind props).
+                {
+                    let scene = self.project.active_scene_mut();
+                    let Some(node) = scene.node_mut(selected) else {
+                        ui.weak("No node selected");
+                        return;
+                    };
+
+                    ui.horizontal(|ui| {
+                        draw_inline_icon(
+                            ui,
+                            node_lucide_icon(node.kind.label(), node.id == NodeId::ROOT),
+                            node_lucide_color(node.kind.label(), node.id == NodeId::ROOT, true),
+                        );
+                        ui.strong(format!("{} #{}", node.kind.label(), node.id.raw()));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        changed |= ui.text_edit_singleline(&mut node.name).changed();
+                    });
+                    ui.separator();
+
+                    egui::CollapsingHeader::new(icons::label(icons::MOVE, "Transform"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            changed |= transform_editor(
+                                ui,
+                                "Position",
+                                &mut node.transform.translation,
+                                1.0,
+                            );
+                            changed |= transform_editor(
+                                ui,
+                                "Rotation",
+                                &mut node.transform.rotation_degrees,
+                                1.0,
+                            );
+                            changed |=
+                                transform_editor(ui, "Scale", &mut node.transform.scale, 0.05);
+                        });
+
+                    egui::CollapsingHeader::new(icons::label(icons::CIRCLE_DOT, "Node Properties"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            changed |= draw_node_kind_editor(
+                                ui,
+                                &mut node.kind,
+                                &material_options,
+                                &room_options,
+                            );
+                        });
+                }
+
+                // Phase 2: per-sector inspector. Owns its own borrow of the
+                // project so it can edit the active Room's grid.
+                if let Some(room_id) = active_room {
+                    if let Some((sx, sz)) = selected_sector {
+                        if draw_sector_inspector(
+                            ui,
+                            &mut self.project,
+                            room_id,
+                            sx,
+                            sz,
+                            &material_options,
+                        ) {
+                            changed = true;
+                        }
+                    } else {
+                        egui::CollapsingHeader::new(icons::label(icons::GRID, "Sector"))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.weak("Click a sector tile to inspect it.");
+                            });
+                    }
+                }
+
+                // Phase 3: read-only diagnostics that just need name / kind.
+                let scene = self.project.active_scene();
+                let Some(node) = scene.node(selected) else {
+                    if changed {
+                        self.mark_dirty();
+                    }
                     return;
                 };
 
-                let mut changed = false;
-                ui.horizontal(|ui| {
-                    draw_inline_icon(
-                        ui,
-                        node_lucide_icon(node.kind.label(), node.id == NodeId::ROOT),
-                        node_lucide_color(node.kind.label(), node.id == NodeId::ROOT, true),
-                    );
-                    ui.strong(format!("{} #{}", node.kind.label(), node.id.raw()));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    changed |= ui.text_edit_singleline(&mut node.name).changed();
-                });
-                ui.separator();
-
-                egui::CollapsingHeader::new(icons::label(icons::MOVE, "Transform"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        changed |=
-                            transform_editor(ui, "Position", &mut node.transform.translation, 1.0);
-                        changed |= transform_editor(
-                            ui,
-                            "Rotation",
-                            &mut node.transform.rotation_degrees,
-                            1.0,
-                        );
-                        changed |= transform_editor(ui, "Scale", &mut node.transform.scale, 0.05);
-                    });
-
-                egui::CollapsingHeader::new(icons::label(icons::CIRCLE_DOT, "Node Properties"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        changed |= draw_node_kind_editor(ui, &mut node.kind, &material_options);
-                    });
+                if matches!(node.kind, NodeKind::Room { .. }) {
+                    let project = &self.project;
+                    egui::CollapsingHeader::new(icons::label(icons::SCAN, "Budget"))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            draw_room_budget(ui, project, selected);
+                        });
+                }
 
                 egui::CollapsingHeader::new(icons::label(icons::BOX, "Render"))
                     .default_open(false)
@@ -687,6 +905,7 @@ impl EditorWorkspace {
                             ui.label(format!("/Root/{}", node.name));
                         });
                     });
+
                 if changed {
                     self.mark_dirty();
                 }
@@ -974,13 +1193,7 @@ impl EditorWorkspace {
                 if response.clicked_by(egui::PointerButton::Primary) {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let world = transform.screen_to_world(pos);
-                        if let Some(hit) = hits.iter().rev().find(|hit| hit.contains(world)) {
-                            self.selected_node = hit.id;
-                            self.selected_resource = None;
-                            self.status = format!("Selected {}", hit.name);
-                        } else {
-                            self.selected_resource = None;
-                        }
+                        self.handle_viewport_click(world, &hits);
                     }
                 }
 
@@ -1018,6 +1231,10 @@ impl EditorWorkspace {
     }
 
     fn draw_viewport_toolbar(&mut self, ui: &mut egui::Ui) {
+        let room_active = self.active_room_id().is_some();
+        if !room_active && self.active_tool.requires_room_context() {
+            self.active_tool = ViewTool::Select;
+        }
         ui.horizontal(|ui| {
             for (tool, label) in [
                 (ViewTool::Select, icons::label(icons::POINTER, "Select")),
@@ -1027,6 +1244,21 @@ impl EditorWorkspace {
             ] {
                 ui.selectable_value(&mut self.active_tool, tool, label);
             }
+            ui.separator();
+            ui.add_enabled_ui(room_active, |ui| {
+                for (tool, label) in [
+                    (ViewTool::PaintFloor, icons::label(icons::GRID, "Floor")),
+                    (ViewTool::PaintWall, icons::label(icons::BRICK_WALL, "Wall")),
+                    (
+                        ViewTool::PaintCeiling,
+                        icons::label(icons::LAYERS, "Ceiling"),
+                    ),
+                    (ViewTool::Erase, icons::label(icons::TRASH, "Erase")),
+                    (ViewTool::Place, icons::label(icons::PLUS, "Place")),
+                ] {
+                    ui.selectable_value(&mut self.active_tool, tool, label);
+                }
+            });
             ui.separator();
             ui.checkbox(
                 &mut self.snap_to_grid,
@@ -1058,7 +1290,200 @@ impl EditorWorkspace {
         });
     }
 
+    /// Resolve the Room node that owns the current selection, if any.
+    ///
+    /// Returns the selected node itself when it's a Room, otherwise
+    /// climbs the parent chain. Used to scope paint tools to a Room
+    /// context — placing entities or painting only makes sense once
+    /// the tool knows which `WorldGrid` it's editing.
+    fn active_room_id(&self) -> Option<NodeId> {
+        let scene = self.project.active_scene();
+        let mut current = self.selected_node;
+        loop {
+            let node = scene.node(current)?;
+            if matches!(node.kind, NodeKind::Room { .. }) {
+                return Some(current);
+            }
+            current = node.parent?;
+        }
+    }
+
+    /// Translate a viewport-space click into a sector cell on `room`.
+    ///
+    /// The Room renders its grid centred on its node transform, with
+    /// each cell exactly one viewport unit, so the inverse mapping is
+    /// trivial: subtract the room corner, floor, and bound-check.
+    fn world_to_sector(&self, room_id: NodeId, world: [f32; 2]) -> Option<(u16, u16)> {
+        let scene = self.project.active_scene();
+        let room = scene.node(room_id)?;
+        let NodeKind::Room { grid } = &room.kind else {
+            return None;
+        };
+        let center = node_world(room);
+        let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
+        let lx = (world[0] - (center[0] - half[0])).floor();
+        let lz = (world[1] - (center[1] - half[1])).floor();
+        if lx < 0.0 || lz < 0.0 {
+            return None;
+        }
+        let x = lx as u32;
+        let z = lz as u32;
+        if x >= grid.width as u32 || z >= grid.depth as u32 {
+            return None;
+        }
+        Some((x as u16, z as u16))
+    }
+
+    /// Default material id for a brushed surface, picked by name from
+    /// the project's material list. The cooker rejects unassigned
+    /// surfaces, so authors are expected to wire real materials in
+    /// resources before serious painting — this fallback at least
+    /// keeps the brush usable while iterating.
+    fn default_brush_material(&self, needle: &str) -> Option<ResourceId> {
+        let lower = needle.to_ascii_lowercase();
+        let materials = self.project.material_options();
+        materials
+            .iter()
+            .find(|(_, name)| name.to_ascii_lowercase().contains(&lower))
+            .or_else(|| materials.first())
+            .map(|(id, _)| *id)
+    }
+
+    /// Single dispatch point for primary-button clicks on the viewport.
+    fn handle_viewport_click(&mut self, world: [f32; 2], hits: &[ViewportHit]) {
+        match self.active_tool {
+            ViewTool::Select | ViewTool::Move | ViewTool::Rotate | ViewTool::Scale => {
+                if let Some(hit) = hits.iter().rev().find(|hit| hit.contains(world)) {
+                    self.selected_node = hit.id;
+                    self.selected_resource = None;
+                    self.status = format!("Selected {}", hit.name);
+                } else {
+                    self.selected_resource = None;
+                }
+                self.refresh_selected_sector(world);
+            }
+            tool => {
+                let Some(room_id) = self.active_room_id() else {
+                    return;
+                };
+                let Some((x, z)) = self.world_to_sector(room_id, world) else {
+                    self.selected_sector = None;
+                    return;
+                };
+                self.selected_sector = Some((x, z));
+                self.apply_paint(tool, room_id, x, z, world);
+            }
+        }
+    }
+
+    /// Update `selected_sector` from a click position, if there's a
+    /// Room in the current selection chain.
+    fn refresh_selected_sector(&mut self, world: [f32; 2]) {
+        self.selected_sector = self
+            .active_room_id()
+            .and_then(|room| self.world_to_sector(room, world));
+    }
+
+    /// Apply a paint/erase/place tool to one sector. Marks the project
+    /// dirty so save/cook prompts work; status bar reflects the action.
+    fn apply_paint(
+        &mut self,
+        tool: ViewTool,
+        room_id: NodeId,
+        sx: u16,
+        sz: u16,
+        world: [f32; 2],
+    ) {
+        self.push_undo();
+        let floor_mat = self.default_brush_material("floor");
+        let wall_mat = self.default_brush_material("brick").or(floor_mat);
+        let room_center;
+        let sector_center;
+        {
+            let scene = self.project.active_scene();
+            let Some(room) = scene.node(room_id) else {
+                return;
+            };
+            let NodeKind::Room { grid } = &room.kind else {
+                return;
+            };
+            room_center = node_world(room);
+            let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
+            sector_center = [
+                room_center[0] - half[0] + sx as f32 + 0.5,
+                room_center[1] - half[1] + sz as f32 + 0.5,
+            ];
+        }
+
+        if matches!(tool, ViewTool::Place) {
+            let id = self.project.active_scene_mut().add_node(
+                room_id,
+                "Spawn",
+                NodeKind::SpawnPoint { player: false },
+            );
+            if let Some(node) = self.project.active_scene_mut().node_mut(id) {
+                node.transform.translation = [
+                    world[0] - room_center[0],
+                    0.0,
+                    world[1] - room_center[1],
+                ];
+            }
+            self.selected_node = id;
+            self.status = format!("Placed entity at {sx},{sz}");
+            self.mark_dirty();
+            return;
+        }
+
+        let scene = self.project.active_scene_mut();
+        let Some(room) = scene.node_mut(room_id) else {
+            return;
+        };
+        let NodeKind::Room { grid } = &mut room.kind else {
+            return;
+        };
+        let sector_size = grid.sector_size;
+        let status = match tool {
+            ViewTool::PaintFloor => {
+                grid.set_floor(sx, sz, 0, floor_mat);
+                format!("Painted floor at {sx},{sz}")
+            }
+            ViewTool::PaintCeiling => {
+                if let Some(sector) = grid.ensure_sector(sx, sz) {
+                    sector.ceiling = Some(GridHorizontalFace::flat(sector_size, floor_mat));
+                }
+                format!("Painted ceiling at {sx},{sz}")
+            }
+            ViewTool::PaintWall => {
+                let dx = world[0] - sector_center[0];
+                let dz = world[1] - sector_center[1];
+                let dir = if dz.abs() > dx.abs() {
+                    if dz < 0.0 {
+                        GridDirection::North
+                    } else {
+                        GridDirection::South
+                    }
+                } else if dx < 0.0 {
+                    GridDirection::West
+                } else {
+                    GridDirection::East
+                };
+                grid.add_wall(sx, sz, dir, 0, sector_size, wall_mat);
+                format!("Added {dir:?} wall at {sx},{sz}")
+            }
+            ViewTool::Erase => {
+                if let Some(index) = grid.sector_index(sx, sz) {
+                    grid.sectors[index] = None;
+                }
+                format!("Erased sector {sx},{sz}")
+            }
+            _ => return,
+        };
+        self.status = status;
+        self.mark_dirty();
+    }
+
     fn add_child(&mut self, kind: NodeKind, name: &str) {
+        self.push_undo();
         let parent = self.selected_node;
         let id = self
             .project
@@ -1083,10 +1508,10 @@ impl EditorWorkspace {
             .or_else(|| material_options.first())
             .map(|(id, _)| *id);
         self.add_child(
-            NodeKind::GridWorld {
+            NodeKind::Room {
                 grid: WorldGrid::stone_room(4, 4, 1024, floor, wall),
             },
-            "Grid World",
+            "Room",
         );
     }
 
@@ -1095,6 +1520,7 @@ impl EditorWorkspace {
         let Some(source) = self.project.active_scene().node(selected).cloned() else {
             return;
         };
+        self.push_undo();
         let parent = source.parent.unwrap_or(NodeId::ROOT);
         let id = self.project.active_scene_mut().add_node(
             parent,
@@ -1112,6 +1538,10 @@ impl EditorWorkspace {
 
     fn delete_selected(&mut self) {
         let selected = self.selected_node;
+        if selected == NodeId::ROOT {
+            return;
+        }
+        self.push_undo();
         if self.project.active_scene_mut().remove_node(selected) {
             self.selected_node = NodeId::ROOT;
             self.selected_resource = None;
@@ -1143,6 +1573,44 @@ impl EditorWorkspace {
         self.dirty = true;
     }
 
+    /// Snapshot the current project before a discrete mutation.
+    /// Call once per user action — paint click, place, add/delete
+    /// node, etc — so each undo step matches one author intent.
+    fn push_undo(&mut self) {
+        self.history.record(self.project.clone());
+    }
+
+    /// Pop the most recent snapshot back into `project`.
+    fn do_undo(&mut self) {
+        if let Some(prev) = self.history.undo(self.project.clone()) {
+            self.project = prev;
+            self.selected_resource = None;
+            self.selected_sector = None;
+            if self.project.active_scene().node(self.selected_node).is_none() {
+                self.selected_node = NodeId::ROOT;
+            }
+            self.status = "Undo".to_string();
+            self.mark_dirty();
+        } else {
+            self.status = "Nothing to undo".to_string();
+        }
+    }
+
+    fn do_redo(&mut self) {
+        if let Some(next) = self.history.redo(self.project.clone()) {
+            self.project = next;
+            self.selected_resource = None;
+            self.selected_sector = None;
+            if self.project.active_scene().node(self.selected_node).is_none() {
+                self.selected_node = NodeId::ROOT;
+            }
+            self.status = "Redo".to_string();
+            self.mark_dirty();
+        } else {
+            self.status = "Nothing to redo".to_string();
+        }
+    }
+
     fn frame_viewport(&mut self) {
         self.viewport_pan = Vec2::ZERO;
         self.viewport_zoom = DEFAULT_VIEWPORT_ZOOM;
@@ -1158,12 +1626,7 @@ impl EditorWorkspace {
             -screen_delta.y / self.viewport_zoom,
         ];
         let mut moved = None;
-        if let Some(node) = self
-            .project
-            .active_scene_mut()
-            .node_mut(self.selected_node)
-            .filter(|node| !is_room_surface_node(node))
-        {
+        if let Some(node) = self.project.active_scene_mut().node_mut(self.selected_node) {
             node.transform.translation[0] += world_delta[0];
             node.transform.translation[2] += world_delta[1];
             moved = Some(node.name.clone());
@@ -1226,6 +1689,7 @@ fn draw_node_kind_editor(
     ui: &mut egui::Ui,
     kind: &mut NodeKind,
     material_options: &[(ResourceId, String)],
+    room_options: &[(NodeId, String)],
 ) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -1236,20 +1700,10 @@ fn draw_node_kind_editor(
         NodeKind::Node | NodeKind::Node3D => {
             ui.weak("Organisational transform node");
         }
-        NodeKind::Room { width, depth } => {
-            ui.horizontal(|ui| {
-                ui.label(icons::text(icons::GRID, 12.0).color(STUDIO_TEXT_WEAK));
-                ui.label("Sectors");
-                changed |= ui
-                    .add(egui::DragValue::new(width).speed(1.0).range(1..=128))
-                    .changed();
-                ui.label("x");
-                changed |= ui
-                    .add(egui::DragValue::new(depth).speed(1.0).range(1..=128))
-                    .changed();
-            });
+        NodeKind::World => {
+            ui.weak("Streamed-region group; holds Room children.");
         }
-        NodeKind::GridWorld { grid } => {
+        NodeKind::Room { grid } => {
             ui.horizontal(|ui| {
                 ui.label(icons::text(icons::GRID, 12.0).color(STUDIO_TEXT_WEAK));
                 ui.label("Grid");
@@ -1350,6 +1804,51 @@ fn draw_node_kind_editor(
                 )
                 .changed();
         }
+        NodeKind::Portal {
+            target_room,
+            target_entry,
+            entry_name,
+        } => {
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::WAYPOINT, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label("Entry name");
+                changed |= ui.text_edit_singleline(entry_name).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::HOUSE, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label("Target room");
+                let preview = target_room
+                    .and_then(|id| {
+                        room_options
+                            .iter()
+                            .find(|(rid, _)| *rid == id)
+                            .map(|(_, name)| name.as_str())
+                    })
+                    .unwrap_or("(none)");
+                egui::ComboBox::from_id_salt("portal_target_room")
+                    .selected_text(preview)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(target_room.is_none(), "(none)").clicked() {
+                            *target_room = None;
+                            changed = true;
+                        }
+                        for (id, name) in room_options {
+                            if ui
+                                .selectable_label(*target_room == Some(*id), name)
+                                .clicked()
+                            {
+                                *target_room = Some(*id);
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icons::MAP_PIN, 12.0).color(STUDIO_TEXT_WEAK));
+                ui.label("Target entry");
+                changed |= ui.text_edit_singleline(target_entry).changed();
+            });
+        }
     }
     changed
 }
@@ -1424,12 +1923,14 @@ fn node_lucide_icon(kind: &str, root: bool) -> char {
 
     match kind {
         "Node3D" => icons::CIRCLE_DOT,
-        "Room" | "GridWorld" => icons::GRID,
+        "World" => icons::HOUSE,
+        "Room" => icons::GRID,
         "MeshInstance" => icons::BOX,
         "Light" => icons::SUN,
         "SpawnPoint" => icons::MAP_PIN,
         "Trigger" => icons::SCAN,
         "AudioSource" => icons::AUDIO_LINES,
+        "Portal" => icons::WAYPOINT,
         _ => icons::CIRCLE_DOT,
     }
 }
@@ -1443,12 +1944,14 @@ fn node_lucide_color(kind: &str, root: bool, selected: bool) -> Color32 {
     }
 
     match kind {
-        "Room" | "GridWorld" => Color32::from_rgb(209, 118, 71),
+        "World" => Color32::from_rgb(232, 152, 96),
+        "Room" => Color32::from_rgb(209, 118, 71),
         "MeshInstance" => Color32::from_rgb(156, 174, 190),
         "Light" => Color32::from_rgb(238, 203, 116),
         "SpawnPoint" => Color32::from_rgb(236, 188, 104),
         "Trigger" => Color32::from_rgb(190, 128, 232),
         "AudioSource" => Color32::from_rgb(104, 202, 188),
+        "Portal" => Color32::from_rgb(255, 188, 100),
         _ => Color32::from_rgb(141, 160, 180),
     }
 }
@@ -1582,12 +2085,13 @@ fn draw_scene_node_row(ui: &mut egui::Ui, row: &NodeRow, selected: bool) -> egui
 fn node_draw_mode(kind: &NodeKind) -> &'static str {
     match kind {
         NodeKind::MeshInstance { .. } => "Textured Triangles",
-        NodeKind::Room { .. } => "World Surfaces",
-        NodeKind::GridWorld { .. } => "Sector Grid",
+        NodeKind::World => "Streaming Region",
+        NodeKind::Room { .. } => "Sector Grid",
         NodeKind::Light { .. } => "Editor Gizmo",
         NodeKind::SpawnPoint { .. } => "Spawn Marker",
         NodeKind::Trigger { .. } => "Trigger Volume",
         NodeKind::AudioSource { .. } => "Audio Marker",
+        NodeKind::Portal { .. } => "Portal Volume",
         NodeKind::Node | NodeKind::Node3D => "None",
     }
 }
@@ -2329,20 +2833,14 @@ fn draw_scene_viewport(
     let mut hits = Vec::new();
 
     for node in scene.nodes() {
-        match node.kind {
-            NodeKind::GridWorld { .. } => {
-                draw_grid_world(painter, transform, project, node, selected, &mut hits);
-            }
-            NodeKind::Room { .. } => {
-                draw_room(painter, transform, project, node, selected, &mut hits);
-            }
-            _ => {}
+        if matches!(node.kind, NodeKind::Room { .. }) {
+            draw_room(painter, transform, project, node, selected, &mut hits);
         }
     }
 
     for node in scene.nodes() {
         match &node.kind {
-            NodeKind::MeshInstance { .. } if !is_room_surface_node(node) => {
+            NodeKind::MeshInstance { .. } => {
                 draw_mesh_marker(painter, transform, project, node, selected, &mut hits);
             }
             NodeKind::SpawnPoint { .. } => {
@@ -2379,6 +2877,17 @@ fn draw_scene_viewport(
                     &mut hits,
                 );
             }
+            NodeKind::Portal { .. } => {
+                draw_simple_marker(
+                    painter,
+                    transform,
+                    node,
+                    selected,
+                    "P",
+                    Color32::from_rgb(255, 188, 100),
+                    &mut hits,
+                );
+            }
             NodeKind::Node | NodeKind::Node3D if node.id != scene.root => {
                 draw_simple_marker(
                     painter,
@@ -2397,7 +2906,7 @@ fn draw_scene_viewport(
     hits
 }
 
-fn draw_grid_world(
+fn draw_room(
     painter: &egui::Painter,
     transform: ViewportTransform,
     project: &ProjectDocument,
@@ -2405,7 +2914,7 @@ fn draw_grid_world(
     selected: NodeId,
     hits: &mut Vec<ViewportHit>,
 ) {
-    let NodeKind::GridWorld { grid } = &node.kind else {
+    let NodeKind::Room { grid } = &node.kind else {
         return;
     };
 
@@ -2537,128 +3046,6 @@ fn draw_grid_sector_walls(
     }
 }
 
-fn draw_room(
-    painter: &egui::Painter,
-    transform: ViewportTransform,
-    project: &ProjectDocument,
-    room: &psxed_project::SceneNode,
-    selected: NodeId,
-    hits: &mut Vec<ViewportHit>,
-) {
-    let NodeKind::Room { width, depth } = room.kind else {
-        return;
-    };
-
-    let center = node_world(room);
-    let width = width.max(1) as i32;
-    let depth = depth.max(1) as i32;
-    let half = [width as f32 * 0.5, depth as f32 * 0.5];
-    let floor = room_child_surface(project, room.id, "floor");
-    let walls = room_child_surface(project, room.id, "wall");
-    let floor_id = floor.map(|node| node.id).unwrap_or(room.id);
-    let wall_id = walls.map(|node| node.id).unwrap_or(room.id);
-    let floor_name = floor
-        .map(|node| node.name.as_str())
-        .unwrap_or(room.name.as_str());
-    let wall_name = walls
-        .map(|node| node.name.as_str())
-        .unwrap_or(room.name.as_str());
-    let floor_material = floor.and_then(mesh_material);
-    let wall_material = walls.and_then(mesh_material);
-    let floor_color = material_color(project, floor_material, SurfaceRole::Floor);
-    let wall_color = material_color(project, wall_material, SurfaceRole::Wall);
-    let room_rect = transform.world_rect_to_screen(center, half);
-
-    hits.push(ViewportHit::rect(room.id, room.name.clone(), center, half));
-    painter.rect_filled(room_rect, 0.0, darken(floor_color, 18));
-
-    for ix in 0..width {
-        for iz in 0..depth {
-            let tile_center = [
-                center[0] - half[0] + ix as f32 + 0.5,
-                center[1] - half[1] + iz as f32 + 0.5,
-            ];
-            let screen_rect = transform.world_rect_to_screen(tile_center, [0.5, 0.5]);
-            if !screen_rect.intersects(transform.rect) {
-                continue;
-            }
-            draw_floor_tile(painter, screen_rect, floor_color, ix, iz);
-            hits.push(ViewportHit::rect(
-                floor_id,
-                floor_name.to_string(),
-                tile_center,
-                [0.5, 0.5],
-            ));
-        }
-    }
-
-    let wall_thickness = 0.18;
-    let wall_rects = [
-        (
-            [center[0], center[1] + half[1] + wall_thickness * 0.5],
-            [half[0] + wall_thickness, wall_thickness * 0.5],
-        ),
-        (
-            [center[0], center[1] - half[1] - wall_thickness * 0.5],
-            [half[0] + wall_thickness, wall_thickness * 0.5],
-        ),
-        (
-            [center[0] - half[0] - wall_thickness * 0.5, center[1]],
-            [wall_thickness * 0.5, half[1]],
-        ),
-        (
-            [center[0] + half[0] + wall_thickness * 0.5, center[1]],
-            [wall_thickness * 0.5, half[1]],
-        ),
-    ];
-
-    for (wall_center, wall_half) in wall_rects {
-        let screen_rect = transform.world_rect_to_screen(wall_center, wall_half);
-        draw_wall_band(painter, screen_rect, wall_color);
-        painter.rect_stroke(
-            screen_rect,
-            0.0,
-            Stroke::new(1.0, Color32::from_rgb(84, 58, 44)),
-            StrokeKind::Inside,
-        );
-        hits.push(ViewportHit::rect(
-            wall_id,
-            wall_name.to_string(),
-            wall_center,
-            wall_half,
-        ));
-    }
-
-    if selected == room.id || selected == floor_id {
-        let outline = transform.world_rect_to_screen(center, half);
-        painter.rect_stroke(
-            outline,
-            0.0,
-            selected_stroke(selected == room.id),
-            StrokeKind::Outside,
-        );
-    }
-
-    if selected == wall_id {
-        for (wall_center, wall_half) in wall_rects {
-            painter.rect_stroke(
-                transform.world_rect_to_screen(wall_center, wall_half),
-                0.0,
-                selected_stroke(true),
-                StrokeKind::Outside,
-            );
-        }
-    }
-
-    painter.text(
-        transform.world_to_screen([center[0] - half[0], center[1] + half[1]])
-            + Vec2::new(8.0, -8.0),
-        Align2::LEFT_BOTTOM,
-        &room.name,
-        FontId::monospace(12.0),
-        Color32::from_rgb(230, 235, 245),
-    );
-}
 
 fn draw_floor_tile(painter: &egui::Painter, rect: Rect, base: Color32, ix: i32, iz: i32) {
     let tint = if (ix + iz) % 2 == 0 {
@@ -2970,30 +3357,250 @@ fn node_world(node: &psxed_project::SceneNode) -> [f32; 2] {
     [node.transform.translation[0], node.transform.translation[2]]
 }
 
-fn room_child_surface<'a>(
-    project: &'a ProjectDocument,
-    room: NodeId,
-    needle: &str,
-) -> Option<&'a psxed_project::SceneNode> {
-    let scene = project.active_scene();
-    let parent = scene.node(room)?;
-    parent
-        .children
-        .iter()
-        .filter_map(|id| scene.node(*id))
-        .find(|node| node.name.to_ascii_lowercase().contains(needle))
-}
-
-fn mesh_material(node: &psxed_project::SceneNode) -> Option<ResourceId> {
-    match node.kind {
-        NodeKind::MeshInstance { material, .. } => material,
-        _ => None,
+/// Lowercase + non-alphanumeric → `_`, matching the cooker's clip
+/// naming convention so room files line up with the asset cooker.
+fn sanitise_room_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "room".to_string()
+    } else {
+        trimmed
     }
 }
 
-fn is_room_surface_node(node: &psxed_project::SceneNode) -> bool {
-    let name = node.name.to_ascii_lowercase();
-    name.contains("floor") || name.contains("wall")
+/// Walk the active scene and collect every Room node as an
+/// `(id, display name)` pair, used by Portal pickers.
+fn collect_room_options(project: &ProjectDocument) -> Vec<(NodeId, String)> {
+    project
+        .active_scene()
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.kind, NodeKind::Room { .. }))
+        .map(|node| (node.id, node.name.clone()))
+        .collect()
+}
+
+/// Streaming-budget readout for one Room.
+///
+/// Cooks the room's grid in-memory and reports populated sector count,
+/// distinct material count, and the cooked `.psxw` byte total — the
+/// number that determines whether the streamer can fit the room in
+/// its residency budget.
+fn draw_room_budget(ui: &mut egui::Ui, project: &ProjectDocument, room_id: NodeId) {
+    let Some(room) = project.active_scene().node(room_id) else {
+        return;
+    };
+    let NodeKind::Room { grid } = &room.kind else {
+        return;
+    };
+
+    let total_cells = grid.width as usize * grid.depth as usize;
+    let populated = grid.populated_sector_count();
+    ui.horizontal(|ui| {
+        ui.label("Populated sectors");
+        ui.monospace(format!("{populated} / {total_cells}"));
+    });
+
+    match psxed_project::world_cook::cook_world_grid(project, grid) {
+        Ok(cooked) => {
+            ui.horizontal(|ui| {
+                ui.label("Materials");
+                ui.monospace(cooked.materials.len().to_string());
+            });
+            match cooked.to_psxw_bytes() {
+                Ok(bytes) => {
+                    let kib = bytes.len() as f32 / 1024.0;
+                    ui.horizontal(|ui| {
+                        ui.label("Cooked .psxw");
+                        ui.monospace(format!("{} B  ({kib:.2} KiB)", bytes.len()));
+                    });
+                }
+                Err(error) => {
+                    ui.colored_label(
+                        Color32::from_rgb(220, 90, 90),
+                        format!("encode failed: {error}"),
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            ui.colored_label(
+                Color32::from_rgb(220, 90, 90),
+                format!("cook failed: {error}"),
+            );
+        }
+    }
+}
+
+/// Per-cell inspector for one sector inside the active Room.
+///
+/// Renders a CollapsingHeader with floor/ceiling toggles, a single
+/// flat height per face (corner authoring lands later), a material
+/// dropdown for each face, and a row of toggles for the four
+/// cardinal walls. Returns `true` if any field changed so the
+/// workspace can mark the project dirty in one place.
+fn draw_sector_inspector(
+    ui: &mut egui::Ui,
+    project: &mut ProjectDocument,
+    room_id: NodeId,
+    sx: u16,
+    sz: u16,
+    material_options: &[(ResourceId, String)],
+) -> bool {
+    let scene = project.active_scene_mut();
+    let Some(room) = scene.node_mut(room_id) else {
+        return false;
+    };
+    let NodeKind::Room { grid } = &mut room.kind else {
+        return false;
+    };
+    if sx >= grid.width || sz >= grid.depth {
+        return false;
+    }
+    let sector_size = grid.sector_size;
+    let mut changed = false;
+
+    egui::CollapsingHeader::new(icons::label(icons::GRID, "Sector"))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Cell");
+                ui.monospace(format!("{sx}, {sz}"));
+            });
+
+            let sector = grid.ensure_sector(sx, sz);
+            let Some(sector) = sector else {
+                ui.weak("Cell out of grid bounds");
+                return;
+            };
+
+            // Floor row: enabled toggle + height + material picker.
+            ui.horizontal(|ui| {
+                let mut has_floor = sector.floor.is_some();
+                if ui.checkbox(&mut has_floor, "Floor").changed() {
+                    sector.floor = if has_floor {
+                        Some(GridHorizontalFace::flat(0, None))
+                    } else {
+                        None
+                    };
+                    changed = true;
+                }
+            });
+            if let Some(floor) = sector.floor.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("    Height");
+                    let mut height = floor.heights[0];
+                    if ui
+                        .add(egui::DragValue::new(&mut height).speed(8.0))
+                        .changed()
+                    {
+                        floor.heights = [height; 4];
+                        changed = true;
+                    }
+                });
+                changed |= material_picker(ui, "    Material", &mut floor.material, material_options);
+            }
+
+            ui.separator();
+
+            // Ceiling row.
+            ui.horizontal(|ui| {
+                let mut has_ceiling = sector.ceiling.is_some();
+                if ui.checkbox(&mut has_ceiling, "Ceiling").changed() {
+                    sector.ceiling = if has_ceiling {
+                        Some(GridHorizontalFace::flat(sector_size, None))
+                    } else {
+                        None
+                    };
+                    changed = true;
+                }
+            });
+            if let Some(ceiling) = sector.ceiling.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("    Height");
+                    let mut height = ceiling.heights[0];
+                    if ui
+                        .add(egui::DragValue::new(&mut height).speed(8.0))
+                        .changed()
+                    {
+                        ceiling.heights = [height; 4];
+                        changed = true;
+                    }
+                });
+                changed |= material_picker(
+                    ui,
+                    "    Material",
+                    &mut ceiling.material,
+                    material_options,
+                );
+            }
+
+            ui.separator();
+            ui.label(icons::label(icons::BRICK_WALL, "Walls"));
+            for (label, dir) in [
+                ("North", GridDirection::North),
+                ("East", GridDirection::East),
+                ("South", GridDirection::South),
+                ("West", GridDirection::West),
+            ] {
+                ui.horizontal(|ui| {
+                    let walls = sector.walls.get_mut(dir);
+                    let mut has_wall = !walls.is_empty();
+                    if ui.checkbox(&mut has_wall, label).changed() {
+                        if has_wall {
+                            walls.push(GridVerticalFace::flat(0, sector_size, None));
+                        } else {
+                            walls.clear();
+                        }
+                        changed = true;
+                    }
+                });
+            }
+        });
+
+    changed
+}
+
+/// Shared single-material picker used by the sector inspector.
+fn material_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    current: &mut Option<ResourceId>,
+    options: &[(ResourceId, String)],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let preview = current
+            .and_then(|id| options.iter().find(|(rid, _)| *rid == id).map(|(_, n)| n.as_str()))
+            .unwrap_or("(none)");
+        egui::ComboBox::from_id_salt(label.to_string())
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "(none)").clicked() {
+                    *current = None;
+                    changed = true;
+                }
+                for (id, name) in options {
+                    if ui
+                        .selectable_label(*current == Some(*id), name)
+                        .clicked()
+                    {
+                        *current = Some(*id);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    changed
 }
 
 #[cfg(test)]

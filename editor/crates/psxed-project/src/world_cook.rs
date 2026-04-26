@@ -725,10 +725,10 @@ mod tests {
             .nodes()
             .iter()
             .find_map(|node| match &node.kind {
-                NodeKind::GridWorld { grid } => Some(grid.clone()),
+                NodeKind::Room { grid } => Some(grid.clone()),
                 _ => None,
             })
-            .expect("starter project should contain a grid world")
+            .expect("starter project should contain a room")
     }
 
     #[test]
