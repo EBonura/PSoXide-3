@@ -1476,16 +1476,20 @@ fn isqrt_i32(value: i32) -> i32 {
 }
 
 fn sort_for_ot_insert(commands: &mut [GouraudTriCommand]) {
-    let mut i = 1;
-    while i < commands.len() {
-        let command = commands[i];
-        let mut j = i;
-        while j > 0 && should_insert_after(commands[j - 1], command) {
-            commands[j] = commands[j - 1];
-            j -= 1;
+    let mut gap = commands.len() / 2;
+    while gap > 0 {
+        let mut i = gap;
+        while i < commands.len() {
+            let command = commands[i];
+            let mut j = i;
+            while j >= gap && should_insert_after(commands[j - gap], command) {
+                commands[j] = commands[j - gap];
+                j -= gap;
+            }
+            commands[j] = command;
+            i += 1;
         }
-        commands[j] = command;
-        i += 1;
+        gap /= 2;
     }
 }
 
@@ -1503,16 +1507,20 @@ fn should_insert_after(a: GouraudTriCommand, b: GouraudTriCommand) -> bool {
 }
 
 fn sort_world_for_ot_insert(commands: &mut [WorldTriCommand]) {
-    let mut i = 1;
-    while i < commands.len() {
-        let command = commands[i];
-        let mut j = i;
-        while j > 0 && should_insert_world_after(commands[j - 1], command) {
-            commands[j] = commands[j - 1];
-            j -= 1;
+    let mut gap = commands.len() / 2;
+    while gap > 0 {
+        let mut i = gap;
+        while i < commands.len() {
+            let command = commands[i];
+            let mut j = i;
+            while j >= gap && should_insert_world_after(commands[j - gap], command) {
+                commands[j] = commands[j - gap];
+                j -= gap;
+            }
+            commands[j] = command;
+            i += 1;
         }
-        commands[j] = command;
-        i += 1;
+        gap /= 2;
     }
 }
 
