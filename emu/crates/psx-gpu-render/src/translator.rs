@@ -64,7 +64,25 @@ impl Translator {
             0x24..=0x27 => self.emit_tex_tri(fifo),
             0x2C..=0x2F => self.emit_tex_quad(fifo),
 
-            // ---------- Phase 3+ ---------- (silently skipped)
+            // ---------- Phase 3 primitives ----------
+            // Shaded (Gouraud) tris + quads.
+            0x30..=0x33 => self.emit_shaded_tri(fifo),
+            0x38..=0x3B => self.emit_shaded_quad(fifo),
+            // Shaded + textured.
+            0x34..=0x37 => self.emit_shaded_tex_tri(fifo),
+            0x3C..=0x3F => self.emit_shaded_tex_quad(fifo),
+            // Mono rectangles (variable + 1x1 / 8x8 / 16x16 fixed).
+            0x60..=0x63 => self.emit_mono_rect_variable(fifo),
+            0x68..=0x6B => self.emit_mono_rect_fixed(fifo, 1, 1),
+            0x70..=0x73 => self.emit_mono_rect_fixed(fifo, 8, 8),
+            0x78..=0x7B => self.emit_mono_rect_fixed(fifo, 16, 16),
+            // Textured rectangles (variable + fixed sizes).
+            0x64..=0x67 => self.emit_tex_rect_variable(fifo),
+            0x6C..=0x6F => self.emit_tex_rect_fixed(fifo, 1, 1),
+            0x74..=0x77 => self.emit_tex_rect_fixed(fifo, 8, 8),
+            0x7C..=0x7F => self.emit_tex_rect_fixed(fifo, 16, 16),
+
+            // ---------- Phase 4+ ---------- (silently skipped)
             // 0x02         => fill rect
             // 0x30..=0x33  => shaded tri
             // 0x34..=0x37  => shaded-tex tri
@@ -289,6 +307,259 @@ impl Translator {
         self.vertices.push(make(v1, uv1));
         self.vertices.push(make(v2, uv2));
     }
+
+    // ----- Phase 3: shaded (Gouraud) tris + quads -----
+
+    /// `0x30..=0x33` — Gouraud-shaded triangle.
+    /// Words: `[cmd+c0, v0, c1, v1, c2, v2]`.
+    /// The fragment shader interpolates `color` linearly across
+    /// the tri; we just push three different vertex colours.
+    fn emit_shaded_tri(&mut self, fifo: &[u32]) {
+        if fifo.len() < 6 {
+            return;
+        }
+        let c0 = mono_color_rgba8(fifo[0]);
+        let v0 = decode_vertex(&self.state, fifo[1]);
+        let c1 = mono_color_rgba8(fifo[2]);
+        let v1 = decode_vertex(&self.state, fifo[3]);
+        let c2 = mono_color_rgba8(fifo[4]);
+        let v2 = decode_vertex(&self.state, fifo[5]);
+        self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0);
+    }
+
+    /// `0x38..=0x3B` — Gouraud-shaded quad.
+    /// Words: `[cmd+c0, v0, c1, v1, c2, v2, c3, v3]`.
+    fn emit_shaded_quad(&mut self, fifo: &[u32]) {
+        if fifo.len() < 8 {
+            return;
+        }
+        let c0 = mono_color_rgba8(fifo[0]);
+        let v0 = decode_vertex(&self.state, fifo[1]);
+        let c1 = mono_color_rgba8(fifo[2]);
+        let v1 = decode_vertex(&self.state, fifo[3]);
+        let c2 = mono_color_rgba8(fifo[4]);
+        let v2 = decode_vertex(&self.state, fifo[5]);
+        let c3 = mono_color_rgba8(fifo[6]);
+        let v3 = decode_vertex(&self.state, fifo[7]);
+        // Same split as `draw_monochrome_quad` for diagonal-pixel
+        // ownership consistency.
+        self.push_shaded_tri(v1, c1, v3, c3, v2, c2, 0);
+        self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0);
+    }
+
+    /// `0x34..=0x37` — Gouraud + textured triangle.
+    /// Words: `[cmd+c0, v0, uv0+clut, c1, v1, uv1+tpage, c2, v2, uv2]`.
+    fn emit_shaded_tex_tri(&mut self, fifo: &[u32]) {
+        if fifo.len() < 9 {
+            return;
+        }
+        let cmd = fifo[0];
+        let c0 = mono_color_rgba8(cmd);
+        let v0 = decode_vertex(&self.state, fifo[1]);
+        let uv0 = decode_uv(fifo[2]);
+        let clut = decode_clut(fifo[2]);
+        let c1 = mono_color_rgba8(fifo[3]);
+        let v1 = decode_vertex(&self.state, fifo[4]);
+        let uv1 = decode_uv(fifo[5]);
+        apply_primitive_tpage(&mut self.state, fifo[5]);
+        let c2 = mono_color_rgba8(fifo[6]);
+        let v2 = decode_vertex(&self.state, fifo[7]);
+        let uv2 = decode_uv(fifo[8]);
+
+        let prim_flags = self.tex_prim_flags(cmd, clut);
+        self.push_tex_tri_shaded(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags);
+    }
+
+    /// `0x3C..=0x3F` — Gouraud + textured quad. Words:
+    /// `[cmd+c0, v0, uv0+clut, c1, v1, uv1+tpage, c2, v2, uv2,
+    ///   c3, v3, uv3]`.
+    fn emit_shaded_tex_quad(&mut self, fifo: &[u32]) {
+        if fifo.len() < 12 {
+            return;
+        }
+        let cmd = fifo[0];
+        let c0 = mono_color_rgba8(cmd);
+        let v0 = decode_vertex(&self.state, fifo[1]);
+        let uv0 = decode_uv(fifo[2]);
+        let clut = decode_clut(fifo[2]);
+        let c1 = mono_color_rgba8(fifo[3]);
+        let v1 = decode_vertex(&self.state, fifo[4]);
+        let uv1 = decode_uv(fifo[5]);
+        apply_primitive_tpage(&mut self.state, fifo[5]);
+        let c2 = mono_color_rgba8(fifo[6]);
+        let v2 = decode_vertex(&self.state, fifo[7]);
+        let uv2 = decode_uv(fifo[8]);
+        let c3 = mono_color_rgba8(fifo[9]);
+        let v3 = decode_vertex(&self.state, fifo[10]);
+        let uv3 = decode_uv(fifo[11]);
+
+        let prim_flags = self.tex_prim_flags(cmd, clut);
+        self.push_tex_tri_shaded(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags);
+        self.push_tex_tri_shaded(v1, uv1, c1, v3, uv3, c3, v2, uv2, c2, prim_flags);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_shaded_tri(
+        &mut self,
+        v0: (i32, i32),
+        c0: [u8; 4],
+        v1: (i32, i32),
+        c1: [u8; 4],
+        v2: (i32, i32),
+        c2: [u8; 4],
+        prim_flags: u32,
+    ) {
+        let make = |v: (i32, i32), c: [u8; 4]| HwVertex {
+            pos: [v.0 as i16, v.1 as i16],
+            color: c,
+            uv: [0, 0],
+            flags: prim_flags,
+        };
+        self.vertices.push(make(v0, c0));
+        self.vertices.push(make(v1, c1));
+        self.vertices.push(make(v2, c2));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_tex_tri_shaded(
+        &mut self,
+        v0: (i32, i32),
+        uv0: (u8, u8),
+        c0: [u8; 4],
+        v1: (i32, i32),
+        uv1: (u8, u8),
+        c1: [u8; 4],
+        v2: (i32, i32),
+        uv2: (u8, u8),
+        c2: [u8; 4],
+        prim_flags: u32,
+    ) {
+        let make = |v: (i32, i32), uv: (u8, u8), c: [u8; 4]| HwVertex {
+            pos: [v.0 as i16, v.1 as i16],
+            color: c,
+            uv: [uv.0 as u16, uv.1 as u16],
+            flags: prim_flags,
+        };
+        self.vertices.push(make(v0, uv0, c0));
+        self.vertices.push(make(v1, uv1, c1));
+        self.vertices.push(make(v2, uv2, c2));
+    }
+
+    // ----- Phase 3: rectangles -----
+
+    /// `0x60..=0x63` — variable-size mono rect.
+    /// Words: `[cmd+rgb24, xy, wh]`. Decomposes to two tris.
+    fn emit_mono_rect_variable(&mut self, fifo: &[u32]) {
+        if fifo.len() < 3 {
+            return;
+        }
+        let cmd = fifo[0];
+        let (x, y) = decode_vertex(&self.state, fifo[1]);
+        let (w, h) = decode_wh(fifo[2]);
+        self.push_mono_rect(cmd, x, y, w, h);
+    }
+
+    /// `0x68..=0x6B` (1×1), `0x70..=0x73` (8×8), `0x78..=0x7B` (16×16)
+    /// — fixed-size mono rect. Words: `[cmd+rgb24, xy]`.
+    fn emit_mono_rect_fixed(&mut self, fifo: &[u32], w: i32, h: i32) {
+        if fifo.len() < 2 {
+            return;
+        }
+        let cmd = fifo[0];
+        let (x, y) = decode_vertex(&self.state, fifo[1]);
+        self.push_mono_rect(cmd, x, y, w, h);
+    }
+
+    /// `0x64..=0x67` — variable-size textured rect.
+    /// Words: `[cmd+tint, xy, uv+clut, wh]`. Tpage is the active
+    /// state setter's; rectangles do NOT update tpage on their
+    /// own (unlike textured polys' uv1).
+    fn emit_tex_rect_variable(&mut self, fifo: &[u32]) {
+        if fifo.len() < 4 {
+            return;
+        }
+        let cmd = fifo[0];
+        let (x, y) = decode_vertex(&self.state, fifo[1]);
+        let uv0 = decode_uv(fifo[2]);
+        let clut = decode_clut(fifo[2]);
+        let (w, h) = decode_wh(fifo[3]);
+        self.push_tex_rect(cmd, x, y, w, h, uv0, clut);
+    }
+
+    /// `0x6C..=0x6F` (1×1), `0x74..=0x77` (8×8), `0x7C..=0x7F` (16×16).
+    /// Words: `[cmd+tint, xy, uv+clut]`.
+    fn emit_tex_rect_fixed(&mut self, fifo: &[u32], w: i32, h: i32) {
+        if fifo.len() < 3 {
+            return;
+        }
+        let cmd = fifo[0];
+        let (x, y) = decode_vertex(&self.state, fifo[1]);
+        let uv0 = decode_uv(fifo[2]);
+        let clut = decode_clut(fifo[2]);
+        self.push_tex_rect(cmd, x, y, w, h, uv0, clut);
+    }
+
+    fn push_mono_rect(&mut self, cmd: u32, x: i32, y: i32, w: i32, h: i32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let color = mono_color_rgba8(cmd);
+        let v00 = (x, y);
+        let v10 = (x + w, y);
+        let v01 = (x, y + h);
+        let v11 = (x + w, y + h);
+        // Two tris that cover the rect: (v00, v10, v01) + (v10, v11, v01).
+        self.push_tri(v00, v10, v01, color);
+        self.push_tri(v10, v11, v01, color);
+    }
+
+    fn push_tex_rect(
+        &mut self,
+        cmd: u32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        uv0: (u8, u8),
+        clut: (u32, u32),
+    ) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let color = tex_tint(cmd);
+        let prim_flags = self.tex_prim_flags(cmd, clut);
+        // Sprite UVs step 1 texel per pixel — top-left at uv0,
+        // top-right at uv0 + (w, 0), bottom-left at uv0 + (0, h),
+        // bottom-right at uv0 + (w, h). Real PSX uses (w-1, h-1)
+        // because UVs are inclusive; the GPU rasterizer interpolates
+        // continuously across the quad, which gives subpixel UV at
+        // high res — good for fractional scaling. The integer UV
+        // ends up identical at native scale.
+        // Wrap u8 max 255 — handled in the shader's `page_uv`.
+        let u0 = uv0.0 as i32;
+        let v0 = uv0.1 as i32;
+        let uw = w;
+        let uh = h;
+        let uv_a = (u0 as u8, v0 as u8);
+        let uv_b = ((u0 + uw) as u8, v0 as u8);
+        let uv_c = (u0 as u8, (v0 + uh) as u8);
+        let uv_d = ((u0 + uw) as u8, (v0 + uh) as u8);
+        let p_a = (x, y);
+        let p_b = (x + w, y);
+        let p_c = (x, y + h);
+        let p_d = (x + w, y + h);
+        // Two tris covering the rect.
+        self.push_tex_tri(p_a, uv_a, p_b, uv_b, p_c, uv_c, color, prim_flags);
+        self.push_tex_tri(p_b, uv_b, p_d, uv_d, p_c, uv_c, color, prim_flags);
+    }
+}
+
+/// Decode a `WH` word into `(w, h)`. Layout matches the CPU
+/// rasterizer: low 16 bits = width, high 16 bits = height.
+fn decode_wh(word: u32) -> (i32, i32) {
+    let w = (word & 0xFFFF) as i32;
+    let h = ((word >> 16) & 0xFFFF) as i32;
+    (w, h)
 }
 
 impl Default for Translator {
