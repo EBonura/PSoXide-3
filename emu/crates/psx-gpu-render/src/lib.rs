@@ -30,9 +30,9 @@ pub mod pipeline;
 pub mod target;
 pub mod translator;
 
-pub use pipeline::{HwPipeline, HwVertex};
+pub use pipeline::{BlendKind, HwPipeline, HwVertex};
 pub use target::RenderTarget;
-pub use translator::Translator;
+pub use translator::{TranslatedFrame, Translator};
 
 use emulator_core::Gpu;
 
@@ -149,11 +149,11 @@ impl HwRenderer {
         // didn't need this; Phase 2's textured primitives do.
         self.pipeline.upload_vram(&self.queue, vram_words);
 
-        // Translate cmd_log → vertex stream.
-        let vertices = self.translator.translate(cmd_log);
-        if !vertices.is_empty() {
+        // Translate cmd_log → per-blend-kind sorted vertex stream.
+        let frame = self.translator.translate(cmd_log);
+        if frame.total() > 0 {
             self.pipeline
-                .upload_vertices(&self.queue, bytemuck::cast_slice(&vertices));
+                .upload_vertices(&self.queue, bytemuck::cast_slice(frame.vertices));
         }
 
         let mut encoder = self
@@ -176,11 +176,31 @@ impl HwRenderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(self.pipeline.pipeline());
             pass.set_bind_group(0, self.pipeline.bind_group(), &[]);
-            if !vertices.is_empty() {
-                pass.set_vertex_buffer(0, self.pipeline.vertex_buffer().slice(..));
-                pass.draw(0..(vertices.len() as u32), 0..1);
+            pass.set_vertex_buffer(0, self.pipeline.vertex_buffer().slice(..));
+
+            // One draw per non-empty blend batch. Average and
+            // AddQuarter use the blend constant — bind the right
+            // value before their pipelines run. The other modes
+            // ignore the constant so binding it is a no-op.
+            let mut start: u32 = 0;
+            for i in 0..pipeline::BlendKind::COUNT {
+                let count = frame.counts[i];
+                if count == 0 {
+                    start += count;
+                    continue;
+                }
+                let kind = match i {
+                    0 => pipeline::BlendKind::Opaque,
+                    1 => pipeline::BlendKind::Average,
+                    2 => pipeline::BlendKind::Add,
+                    3 => pipeline::BlendKind::Sub,
+                    _ => pipeline::BlendKind::AddQuarter,
+                };
+                pass.set_pipeline(self.pipeline.pipeline(kind));
+                pass.set_blend_constant(self.pipeline.blend_constant(kind));
+                pass.draw(start..(start + count), 0..1);
+                start += count;
             }
         }
         self.queue.submit(Some(encoder.finish()));

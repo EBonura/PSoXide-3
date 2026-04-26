@@ -49,7 +49,7 @@ pub struct HwVertex {
 /// bits 13..=21  clut_y         (0..511)
 /// bit      22   TEXTURED                      else flat color
 /// bit      23   RAW_TEXTURE                   skip tint modulate
-/// bit      24   SEMI_TRANS                    Phase 4
+/// bit      24   SEMI_TRANS                    routed to a non-Opaque batch
 /// ```
 pub mod flags {
     pub const TEXTURED:    u32 = 1 << 22;
@@ -104,8 +104,54 @@ impl Globals {
 /// then the high-water-mark sticks).
 const INITIAL_VERTEX_CAPACITY: u64 = 16 * 1024;
 
+/// Per-primitive PSX blend mode. Maps 1:1 to one of the 5 render
+/// pipelines `HwPipeline` builds — the translator sorts vertices
+/// into contiguous batches by `BlendKind`, the renderer issues
+/// one draw per batch with the matching pipeline + blend constant.
+///
+/// Numeric discriminants are stable so they can index into the
+/// pipeline / blend-constant arrays directly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlendKind {
+    /// `cmd-bit-25` clear → standard opaque draw, `BlendState::REPLACE`.
+    Opaque = 0,
+    /// PSX semi-trans mode 0: `(B + F) / 2`. Implemented as
+    /// `Constant * F + Constant * B` with blend_constant = 0.5.
+    Average = 1,
+    /// PSX semi-trans mode 1: `B + F`. `One * F + One * B`.
+    Add = 2,
+    /// PSX semi-trans mode 2: `B - F`. `One * B - One * F` (reverse subtract).
+    Sub = 3,
+    /// PSX semi-trans mode 3: `B + F/4`. `Constant * F + One * B` with
+    /// blend_constant = 0.25.
+    AddQuarter = 4,
+}
+
+impl BlendKind {
+    pub const COUNT: usize = 5;
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Blend-constant value to bind before a batch's draw call.
+/// Only Average / AddQuarter use it; the others ignore it.
+fn blend_constant_for(kind: BlendKind) -> wgpu::Color {
+    let v = match kind {
+        BlendKind::Average => 0.5,
+        BlendKind::AddQuarter => 0.25,
+        _ => 0.0,
+    };
+    wgpu::Color { r: v, g: v, b: v, a: v }
+}
+
 pub struct HwPipeline {
-    pipeline: wgpu::RenderPipeline,
+    /// One render pipeline per [`BlendKind`]. Same shader, same
+    /// vertex layout — only `BlendState` differs. Indexed by
+    /// `BlendKind::index()`.
+    pipelines: [wgpu::RenderPipeline; BlendKind::COUNT],
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     globals_buffer: wgpu::Buffer,
@@ -240,43 +286,55 @@ impl HwPipeline {
             ],
         };
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("psx-hw-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[vertex_layout],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                // PSX has no winding constraint — quads / rects come
-                // in with mixed windings depending on game UV layout.
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: TARGET_FORMAT,
-                    // Phase 1: opaque only (REPLACE). Phase 4 adds
-                    // PSX semi-transparency variants.
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview: None,
-            cache: None,
-        });
+        // Build five render-pipeline variants, one per BlendKind.
+        // Same shader + same vertex layout; only the color
+        // attachment's `BlendState` differs. Translator picks the
+        // right pipeline per primitive at draw time.
+        let make_pipeline = |label: &str, blend: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[vertex_layout.clone()],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    // PSX has no winding constraint — quads / rects
+                    // come in with mixed windings depending on game
+                    // UV layout.
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: TARGET_FORMAT,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipelines = [
+            make_pipeline("psx-hw-pipeline-opaque", wgpu::BlendState::REPLACE),
+            make_pipeline("psx-hw-pipeline-average", blend_state_average()),
+            make_pipeline("psx-hw-pipeline-add", blend_state_add()),
+            make_pipeline("psx-hw-pipeline-sub", blend_state_sub()),
+            make_pipeline("psx-hw-pipeline-add-quarter", blend_state_add_quarter()),
+        ];
 
         let vertex_capacity_bytes =
             INITIAL_VERTEX_CAPACITY * std::mem::size_of::<HwVertex>() as u64;
@@ -287,7 +345,7 @@ impl HwPipeline {
         });
 
         Self {
-            pipeline,
+            pipelines,
             bind_group_layout,
             bind_group,
             globals_buffer,
@@ -329,8 +387,16 @@ impl HwPipeline {
         );
     }
 
-    pub fn pipeline(&self) -> &wgpu::RenderPipeline {
-        &self.pipeline
+    pub fn pipeline(&self, kind: BlendKind) -> &wgpu::RenderPipeline {
+        &self.pipelines[kind.index()]
+    }
+
+    /// Blend constant the given kind expects bound before its
+    /// draw call (`set_blend_constant`). Opaque / Add / Sub
+    /// don't use it; we still bind a defined value for
+    /// determinism.
+    pub fn blend_constant(&self, kind: BlendKind) -> wgpu::Color {
+        blend_constant_for(kind)
     }
 
     pub fn bind_group(&self) -> &wgpu::BindGroup {
@@ -378,4 +444,55 @@ impl HwPipeline {
 #[allow(dead_code)]
 fn _bgl_used(p: &HwPipeline) -> &wgpu::BindGroupLayout {
     &p.bind_group_layout
+}
+
+// ---- PSX semi-trans blend states ----
+//
+// All four reuse the same factors for color and alpha (alpha
+// channel of the output is unused by egui's display path; we
+// just keep it consistent). The blend constant is bound per draw
+// call via `RenderPass::set_blend_constant`. PSX doesn't need
+// per-component constants — same value on R/G/B/A is fine.
+
+/// PSX mode 0 — `(B + F) / 2`. With blend_constant = 0.5,
+/// `Constant * F + Constant * B = 0.5*F + 0.5*B`.
+fn blend_state_average() -> wgpu::BlendState {
+    let c = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Constant,
+        dst_factor: wgpu::BlendFactor::Constant,
+        operation: wgpu::BlendOperation::Add,
+    };
+    wgpu::BlendState { color: c, alpha: c }
+}
+
+/// PSX mode 1 — `B + F`. Plain additive: `One*F + One*B`.
+fn blend_state_add() -> wgpu::BlendState {
+    let c = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    };
+    wgpu::BlendState { color: c, alpha: c }
+}
+
+/// PSX mode 2 — `B - F`. Reverse-subtract gives
+/// `One*B - One*F = B - F`.
+fn blend_state_sub() -> wgpu::BlendState {
+    let c = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::ReverseSubtract,
+    };
+    wgpu::BlendState { color: c, alpha: c }
+}
+
+/// PSX mode 3 — `B + F/4`. `Constant=0.25`,
+/// `Constant*F + One*B = 0.25*F + B`.
+fn blend_state_add_quarter() -> wgpu::BlendState {
+    let c = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Constant,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    };
+    wgpu::BlendState { color: c, alpha: c }
 }

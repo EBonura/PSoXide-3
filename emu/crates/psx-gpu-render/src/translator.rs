@@ -17,32 +17,99 @@ use psx_gpu_compute::decode::{
     apply_primitive_tpage, decode_clut, decode_tint, decode_uv, decode_vertex, is_raw_texture,
     is_semi_trans, rgb24_to_bgr15, ReplayState,
 };
+use psx_gpu_compute::primitive::BlendMode;
 
-use crate::pipeline::{flags as fbits, HwVertex};
+use crate::pipeline::{flags as fbits, BlendKind, HwVertex};
+
+/// Output of [`Translator::translate`] — vertices sorted into one
+/// contiguous slice per `BlendKind`. The renderer issues one draw
+/// call per non-empty batch, with the matching pipeline + blend
+/// constant.
+///
+/// `vertices[start..start+count]` is the slice for batch `i`; the
+/// `start` is `prefix_sum(counts[..i])`.
+pub struct TranslatedFrame<'a> {
+    pub vertices: &'a [HwVertex],
+    pub counts: [u32; BlendKind::COUNT],
+}
+
+impl TranslatedFrame<'_> {
+    /// Total vertex count (sum of all batches).
+    pub fn total(&self) -> u32 {
+        self.counts.iter().sum()
+    }
+}
 
 pub struct Translator {
     state: ReplayState,
-    /// Reused per call so we don't allocate every frame.
-    vertices: Vec<HwVertex>,
+    /// One bucket per `BlendKind`. Reused across frames; cleared
+    /// at the top of each `translate` call.
+    buckets: [Vec<HwVertex>; BlendKind::COUNT],
+    /// Concatenation buffer — buckets get appended into here in
+    /// `BlendKind` order, then handed to the pipeline as one
+    /// upload.
+    flat: Vec<HwVertex>,
 }
 
 impl Translator {
     pub fn new() -> Self {
         Self {
             state: ReplayState::new(),
-            vertices: Vec::with_capacity(4 * 1024),
+            buckets: [
+                Vec::with_capacity(4 * 1024),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ],
+            flat: Vec::with_capacity(4 * 1024),
         }
     }
 
-    /// Walk `cmd_log`, return the vertex stream for this frame.
-    /// The returned slice borrows from `self`; copy out before the
-    /// next call.
-    pub fn translate(&mut self, log: &[GpuCmdLogEntry]) -> &[HwVertex] {
-        self.vertices.clear();
+    /// Walk `cmd_log`, return the vertex stream for this frame
+    /// laid out as one slice per `BlendKind`. The slices borrow
+    /// from `self`; copy out before the next call.
+    pub fn translate(&mut self, log: &[GpuCmdLogEntry]) -> TranslatedFrame<'_> {
+        for b in &mut self.buckets {
+            b.clear();
+        }
         for entry in log {
             self.process(entry);
         }
-        &self.vertices
+        // Concatenate in BlendKind order so the renderer can index
+        // by prefix-sum.
+        self.flat.clear();
+        let mut counts = [0u32; BlendKind::COUNT];
+        for (i, b) in self.buckets.iter().enumerate() {
+            counts[i] = b.len() as u32;
+            self.flat.extend_from_slice(b);
+        }
+        TranslatedFrame {
+            vertices: &self.flat,
+            counts,
+        }
+    }
+
+    /// Active blend kind for the *next* primitive about to be
+    /// emitted. Mono / shaded primitives always read it via this
+    /// helper; textured primitives that set `is_semi_trans` also
+    /// route here. `cmd-bit-25` clear → opaque (state's tex blend
+    /// mode is irrelevant); set → translate the active tpage's
+    /// blend mode into our `BlendKind`.
+    fn blend_kind(&self, cmd: u32) -> BlendKind {
+        if !is_semi_trans(cmd) {
+            return BlendKind::Opaque;
+        }
+        match self.state.tex_blend_mode {
+            BlendMode::Average => BlendKind::Average,
+            BlendMode::Add => BlendKind::Add,
+            BlendMode::Sub => BlendKind::Sub,
+            BlendMode::AddQuarter => BlendKind::AddQuarter,
+        }
+    }
+
+    fn bucket_mut(&mut self, kind: BlendKind) -> &mut Vec<HwVertex> {
+        &mut self.buckets[kind.index()]
     }
 
     fn process(&mut self, entry: &GpuCmdLogEntry) {
@@ -172,10 +239,11 @@ impl Translator {
         }
         let cmd = fifo[0];
         let color = mono_color_rgba8(cmd);
+        let kind = self.blend_kind(cmd);
         let v0 = decode_vertex(&self.state, fifo[1]);
         let v1 = decode_vertex(&self.state, fifo[2]);
         let v2 = decode_vertex(&self.state, fifo[3]);
-        self.push_tri(v0, v1, v2, color);
+        self.push_tri(v0, v1, v2, color, kind);
     }
 
     fn emit_mono_quad(&mut self, fifo: &[u32]) {
@@ -184,6 +252,7 @@ impl Translator {
         }
         let cmd = fifo[0];
         let color = mono_color_rgba8(cmd);
+        let kind = self.blend_kind(cmd);
         let v0 = decode_vertex(&self.state, fifo[1]);
         let v1 = decode_vertex(&self.state, fifo[2]);
         let v2 = decode_vertex(&self.state, fifo[3]);
@@ -191,15 +260,22 @@ impl Translator {
         // Match the CPU rasterizer's split order
         // (`Gpu::draw_monochrome_quad`): lower/right half first, then
         // upper/left, so pixels on the shared diagonal are owned by
-        // (v0, v1, v2). Doesn't matter visually with opaque flat
-        // color but keeps Phase 4 semi-trans behaviour identical.
-        self.push_tri(v1, v3, v2, color);
-        self.push_tri(v0, v1, v2, color);
+        // (v0, v1, v2).
+        self.push_tri(v1, v3, v2, color, kind);
+        self.push_tri(v0, v1, v2, color, kind);
     }
 
-    fn push_tri(&mut self, v0: (i32, i32), v1: (i32, i32), v2: (i32, i32), color: [u8; 4]) {
+    fn push_tri(
+        &mut self,
+        v0: (i32, i32),
+        v1: (i32, i32),
+        v2: (i32, i32),
+        color: [u8; 4],
+        kind: BlendKind,
+    ) {
+        let bucket = self.bucket_mut(kind);
         for v in [v0, v1, v2] {
-            self.vertices.push(HwVertex {
+            bucket.push(HwVertex {
                 pos: [v.0 as i16, v.1 as i16],
                 color,
                 uv: [0, 0],
@@ -231,7 +307,8 @@ impl Translator {
 
         let prim_flags = self.tex_prim_flags(cmd, clut);
         let color = tex_tint(cmd);
-        self.push_tex_tri(v0, uv0, v1, uv1, v2, uv2, color, prim_flags);
+        let kind = self.blend_kind(cmd);
+        self.push_tex_tri(v0, uv0, v1, uv1, v2, uv2, color, prim_flags, kind);
     }
 
     /// `0x2C..=0x2F` — textured quad. Packet:
@@ -258,9 +335,10 @@ impl Translator {
 
         let prim_flags = self.tex_prim_flags(cmd, clut);
         let color = tex_tint(cmd);
+        let kind = self.blend_kind(cmd);
 
-        self.push_tex_tri(v0, uv0, v1, uv1, v2, uv2, color, prim_flags);
-        self.push_tex_tri(v1, uv1, v3, uv3, v2, uv2, color, prim_flags);
+        self.push_tex_tri(v0, uv0, v1, uv1, v2, uv2, color, prim_flags, kind);
+        self.push_tex_tri(v1, uv1, v3, uv3, v2, uv2, color, prim_flags, kind);
     }
 
     /// Pack the per-primitive state setter bits + vertex flags
@@ -286,6 +364,7 @@ impl Translator {
         flags
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_tex_tri(
         &mut self,
         v0: (i32, i32),
@@ -296,16 +375,18 @@ impl Translator {
         uv2: (u8, u8),
         color: [u8; 4],
         prim_flags: u32,
+        kind: BlendKind,
     ) {
+        let bucket = self.bucket_mut(kind);
         let make = |v: (i32, i32), uv: (u8, u8)| HwVertex {
             pos: [v.0 as i16, v.1 as i16],
             color,
             uv: [uv.0 as u16, uv.1 as u16],
             flags: prim_flags,
         };
-        self.vertices.push(make(v0, uv0));
-        self.vertices.push(make(v1, uv1));
-        self.vertices.push(make(v2, uv2));
+        bucket.push(make(v0, uv0));
+        bucket.push(make(v1, uv1));
+        bucket.push(make(v2, uv2));
     }
 
     // ----- Phase 3: shaded (Gouraud) tris + quads -----
@@ -318,13 +399,15 @@ impl Translator {
         if fifo.len() < 6 {
             return;
         }
-        let c0 = mono_color_rgba8(fifo[0]);
+        let cmd = fifo[0];
+        let kind = self.blend_kind(cmd);
+        let c0 = mono_color_rgba8(cmd);
         let v0 = decode_vertex(&self.state, fifo[1]);
         let c1 = mono_color_rgba8(fifo[2]);
         let v1 = decode_vertex(&self.state, fifo[3]);
         let c2 = mono_color_rgba8(fifo[4]);
         let v2 = decode_vertex(&self.state, fifo[5]);
-        self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0);
+        self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0, kind);
     }
 
     /// `0x38..=0x3B` — Gouraud-shaded quad.
@@ -333,7 +416,9 @@ impl Translator {
         if fifo.len() < 8 {
             return;
         }
-        let c0 = mono_color_rgba8(fifo[0]);
+        let cmd = fifo[0];
+        let kind = self.blend_kind(cmd);
+        let c0 = mono_color_rgba8(cmd);
         let v0 = decode_vertex(&self.state, fifo[1]);
         let c1 = mono_color_rgba8(fifo[2]);
         let v1 = decode_vertex(&self.state, fifo[3]);
@@ -341,10 +426,8 @@ impl Translator {
         let v2 = decode_vertex(&self.state, fifo[5]);
         let c3 = mono_color_rgba8(fifo[6]);
         let v3 = decode_vertex(&self.state, fifo[7]);
-        // Same split as `draw_monochrome_quad` for diagonal-pixel
-        // ownership consistency.
-        self.push_shaded_tri(v1, c1, v3, c3, v2, c2, 0);
-        self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0);
+        self.push_shaded_tri(v1, c1, v3, c3, v2, c2, 0, kind);
+        self.push_shaded_tri(v0, c0, v1, c1, v2, c2, 0, kind);
     }
 
     /// `0x34..=0x37` — Gouraud + textured triangle.
@@ -367,7 +450,8 @@ impl Translator {
         let uv2 = decode_uv(fifo[8]);
 
         let prim_flags = self.tex_prim_flags(cmd, clut);
-        self.push_tex_tri_shaded(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags);
+        let kind = self.blend_kind(cmd);
+        self.push_tex_tri_shaded(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags, kind);
     }
 
     /// `0x3C..=0x3F` — Gouraud + textured quad. Words:
@@ -394,8 +478,9 @@ impl Translator {
         let uv3 = decode_uv(fifo[11]);
 
         let prim_flags = self.tex_prim_flags(cmd, clut);
-        self.push_tex_tri_shaded(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags);
-        self.push_tex_tri_shaded(v1, uv1, c1, v3, uv3, c3, v2, uv2, c2, prim_flags);
+        let kind = self.blend_kind(cmd);
+        self.push_tex_tri_shaded(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, prim_flags, kind);
+        self.push_tex_tri_shaded(v1, uv1, c1, v3, uv3, c3, v2, uv2, c2, prim_flags, kind);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -408,16 +493,18 @@ impl Translator {
         v2: (i32, i32),
         c2: [u8; 4],
         prim_flags: u32,
+        kind: BlendKind,
     ) {
+        let bucket = self.bucket_mut(kind);
         let make = |v: (i32, i32), c: [u8; 4]| HwVertex {
             pos: [v.0 as i16, v.1 as i16],
             color: c,
             uv: [0, 0],
             flags: prim_flags,
         };
-        self.vertices.push(make(v0, c0));
-        self.vertices.push(make(v1, c1));
-        self.vertices.push(make(v2, c2));
+        bucket.push(make(v0, c0));
+        bucket.push(make(v1, c1));
+        bucket.push(make(v2, c2));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -433,16 +520,18 @@ impl Translator {
         uv2: (u8, u8),
         c2: [u8; 4],
         prim_flags: u32,
+        kind: BlendKind,
     ) {
+        let bucket = self.bucket_mut(kind);
         let make = |v: (i32, i32), uv: (u8, u8), c: [u8; 4]| HwVertex {
             pos: [v.0 as i16, v.1 as i16],
             color: c,
             uv: [uv.0 as u16, uv.1 as u16],
             flags: prim_flags,
         };
-        self.vertices.push(make(v0, uv0, c0));
-        self.vertices.push(make(v1, uv1, c1));
-        self.vertices.push(make(v2, uv2, c2));
+        bucket.push(make(v0, uv0, c0));
+        bucket.push(make(v1, uv1, c1));
+        bucket.push(make(v2, uv2, c2));
     }
 
     // ----- Phase 3: rectangles -----
@@ -504,13 +593,13 @@ impl Translator {
             return;
         }
         let color = mono_color_rgba8(cmd);
+        let kind = self.blend_kind(cmd);
         let v00 = (x, y);
         let v10 = (x + w, y);
         let v01 = (x, y + h);
         let v11 = (x + w, y + h);
-        // Two tris that cover the rect: (v00, v10, v01) + (v10, v11, v01).
-        self.push_tri(v00, v10, v01, color);
-        self.push_tri(v10, v11, v01, color);
+        self.push_tri(v00, v10, v01, color, kind);
+        self.push_tri(v10, v11, v01, color, kind);
     }
 
     fn push_tex_rect(
@@ -528,14 +617,13 @@ impl Translator {
         }
         let color = tex_tint(cmd);
         let prim_flags = self.tex_prim_flags(cmd, clut);
+        let kind = self.blend_kind(cmd);
         // Sprite UVs step 1 texel per pixel — top-left at uv0,
-        // top-right at uv0 + (w, 0), bottom-left at uv0 + (0, h),
-        // bottom-right at uv0 + (w, h). Real PSX uses (w-1, h-1)
-        // because UVs are inclusive; the GPU rasterizer interpolates
-        // continuously across the quad, which gives subpixel UV at
-        // high res — good for fractional scaling. The integer UV
-        // ends up identical at native scale.
-        // Wrap u8 max 255 — handled in the shader's `page_uv`.
+        // bottom-right at uv0 + (w, h). The GPU rasterizer
+        // interpolates UV continuously across the quad, giving
+        // subpixel UV at fractional internal scale — texture
+        // detail tracks output resolution. Wrap to 0..=255 happens
+        // in the shader's `page_uv`.
         let u0 = uv0.0 as i32;
         let v0 = uv0.1 as i32;
         let uw = w;
@@ -548,9 +636,8 @@ impl Translator {
         let p_b = (x + w, y);
         let p_c = (x, y + h);
         let p_d = (x + w, y + h);
-        // Two tris covering the rect.
-        self.push_tex_tri(p_a, uv_a, p_b, uv_b, p_c, uv_c, color, prim_flags);
-        self.push_tex_tri(p_b, uv_b, p_d, uv_d, p_c, uv_c, color, prim_flags);
+        self.push_tex_tri(p_a, uv_a, p_b, uv_b, p_c, uv_c, color, prim_flags, kind);
+        self.push_tex_tri(p_b, uv_b, p_d, uv_d, p_c, uv_c, color, prim_flags, kind);
     }
 }
 
