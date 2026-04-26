@@ -135,13 +135,34 @@ pub fn draw_sync() {
     while !gpustat().contains(GpuStat::READY_DMA_RECV) {}
 }
 
-/// Wait for the next vertical blank by polling Timer 1 in HBlank-source
-/// mode. The timer auto-resets at VBlank start, so we wait for it to
-/// reach the VBlank scanline region, then wait for the reset.
-pub fn vsync() {
+/// Configure Timer 1 as an HBlank-counting scanline counter.
+///
+/// The counter is used by [`vsync`] and engine-level presentation
+/// clocks. Calling it repeatedly is harmless.
+#[inline]
+pub fn configure_vsync_timer() {
     // Mode: bit0=sync enable, bits1-2=01 (reset at VBlank), bit8=1
     // (clock source = HBlank).
     timers::set_mode(timers::Timer::Timer1, 0x0103);
+}
+
+/// Timer-1 scanline counter used by the VBlank wait helpers.
+#[inline]
+pub fn scanline_counter() -> u16 {
+    configure_vsync_timer();
+    timers::counter(timers::Timer::Timer1)
+}
+
+/// Whether Timer 1 currently reports the VBlank scanline region.
+#[inline]
+pub fn in_vblank() -> bool {
+    scanline_counter() >= 242
+}
+
+/// Wait for the next vertical blank by polling Timer 1 in HBlank-source
+/// mode.
+pub fn vsync() {
+    configure_vsync_timer();
     while timers::counter(timers::Timer::Timer1) < 242 {}
 }
 

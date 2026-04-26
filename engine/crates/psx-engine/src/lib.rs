@@ -7,7 +7,7 @@
 //! - a [`Scene`] trait and an [`App::run`] entry point so games
 //!   don't each reinvent the main loop;
 //! - a [`Ctx`] carrying per-frame state (pad, frame counter,
-//!   framebuffer) to the scene;
+//!   engine time, framebuffer) to the scene;
 //! - a canonical [`Angle`] unit so we stop hitting the recurring
 //!   "256-per-revolution vs 4096-per-revolution" angle-mismatch bug
 //!   that cost an afternoon on showcase-fog's light orbit;
@@ -54,6 +54,7 @@ pub mod render;
 pub mod render3d;
 pub mod scene;
 pub mod sfx;
+pub mod time;
 pub mod transform;
 pub mod world;
 
@@ -63,11 +64,13 @@ pub use frames::{Frames, Ticks};
 pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
 pub use render3d::{
     CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand,
-    LocalToWorldScale, MeshRenderStats, ProjectedVertex, TexturedViewVertex, ViewVertex,
-    WorldCamera, WorldProjection, WorldRenderLayer, WorldRenderPass, WorldRenderStats,
-    WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex, ProjectedVertex,
+    TexturedModelRenderStats, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
+    WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,
+    WorldVertex,
 };
 pub use scene::{Ctx, Scene};
+pub use time::EngineTime;
 pub use transform::{ActorTransform, Vec3World};
 pub use world::{
     GridCoord, GridDirection, GridFloorSample, GridHorizontalFace, GridRoom, GridSector, GridSplit,

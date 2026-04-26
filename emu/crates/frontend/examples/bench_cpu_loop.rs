@@ -191,10 +191,10 @@ fn main() {
         // what `Graphics::prepare_vram` does pre-upload.
         if !args.skip_vram_rgba {
             let t = Instant::now();
-            let vram_rgba =
-                bus.gpu
-                    .vram
-                    .to_rgba8(0, 0, VRAM_WIDTH as u16, VRAM_HEIGHT as u16);
+            let vram_rgba = bus
+                .gpu
+                .vram
+                .to_rgba8(0, 0, VRAM_WIDTH as u16, VRAM_HEIGHT as u16);
             t_vram_rgba += t.elapsed();
             std::hint::black_box(&vram_rgba);
         }

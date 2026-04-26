@@ -5,10 +5,13 @@
 //! without wgpu types leaking into it.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use emulator_core::{Gpu, Vram, VRAM_HEIGHT, VRAM_WIDTH};
 use psx_gpu_render::HwRenderer;
 use winit::window::Window;
+
+use crate::ui::profiler::EguiRenderProfile;
 
 /// Largest logical display window the PSX exposes. The 24bpp fallback
 /// texture is allocated once at this size and each frame uploads the
@@ -151,6 +154,11 @@ impl Graphics {
         self.hw_renderer.texture_id()
     }
 
+    /// Current internal scale used by the hardware-renderer target.
+    pub fn hw_internal_scale(&self) -> u32 {
+        self.hw_renderer.internal_scale()
+    }
+
     /// Drive the hardware renderer for one frame. Walks `cmd_log`,
     /// issues wgpu draw calls for the supported primitive types,
     /// and leaves the result in the renderer's VRAM-shaped target.
@@ -284,33 +292,51 @@ impl Graphics {
     /// Paint one frame. `build_ui` runs inside the egui context and builds
     /// all panels/overlays for this frame. Split out so `App` controls UI
     /// content without `Graphics` knowing what panels exist.
-    pub fn render(&mut self, build_ui: impl FnMut(&egui::Context)) {
-        let raw_input = self.egui_winit.take_egui_input(&self.window);
-        let full_output = self.egui_ctx.run(raw_input, build_ui);
+    pub fn render(&mut self, build_ui: impl FnMut(&egui::Context)) -> EguiRenderProfile {
+        let total_start = Instant::now();
+        let mut profile = EguiRenderProfile::default();
 
+        let t = Instant::now();
+        let raw_input = self.egui_winit.take_egui_input(&self.window);
+        profile.input_ms = elapsed_ms(t);
+
+        let t = Instant::now();
+        let full_output = self.egui_ctx.run(raw_input, build_ui);
+        profile.ui_ms = elapsed_ms(t);
+
+        let t = Instant::now();
         self.egui_winit
             .handle_platform_output(&self.window, full_output.platform_output);
+        profile.platform_output_ms = elapsed_ms(t);
 
+        let t = Instant::now();
         let paint_jobs = self
             .egui_ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
+        profile.tessellate_ms = elapsed_ms(t);
 
         let screen_desc = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: full_output.pixels_per_point,
         };
 
+        let t = Instant::now();
         let output = match self.surface.get_current_texture() {
             Ok(out) => out,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                profile.surface_ms = elapsed_ms(t);
+                profile.total_ms = elapsed_ms(total_start);
+                return profile;
             }
             Err(e) => {
                 eprintln!("surface error: {e:?}");
-                return;
+                profile.surface_ms = elapsed_ms(t);
+                profile.total_ms = elapsed_ms(total_start);
+                return profile;
             }
         };
+        profile.surface_ms = elapsed_ms(t);
 
         let view = output
             .texture
@@ -322,10 +348,14 @@ impl Graphics {
                 label: Some("psoxide3-frame"),
             });
 
+        let t = Instant::now();
         for (id, delta) in &full_output.textures_delta.set {
             self.egui_renderer
                 .update_texture(&self.device, &self.queue, *id, delta);
         }
+        profile.texture_update_ms = elapsed_ms(t);
+
+        let t = Instant::now();
         self.egui_renderer.update_buffers(
             &self.device,
             &self.queue,
@@ -333,7 +363,9 @@ impl Graphics {
             &paint_jobs,
             &screen_desc,
         );
+        profile.buffer_update_ms = elapsed_ms(t);
 
+        let t = Instant::now();
         {
             let mut rpass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -360,15 +392,24 @@ impl Graphics {
             self.egui_renderer
                 .render(&mut rpass, &paint_jobs, &screen_desc);
         }
+        profile.paint_ms = elapsed_ms(t);
 
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
 
+        let t = Instant::now();
         self.queue.submit(Some(encoder.finish()));
         self.window.pre_present_notify();
         output.present();
+        profile.submit_present_ms = elapsed_ms(t);
+        profile.total_ms = elapsed_ms(total_start);
+        profile
     }
+}
+
+fn elapsed_ms(start: Instant) -> f32 {
+    start.elapsed().as_secs_f32() * 1000.0
 }
 
 fn create_rgba_texture(device: &wgpu::Device, label: &'static str) -> wgpu::Texture {

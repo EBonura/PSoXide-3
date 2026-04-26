@@ -11,11 +11,11 @@
 
 extern crate psx_rt;
 
-use psx_asset::{Animation, JointPose, Model, ModelVertex, Texture};
+use psx_asset::{Animation, Model, Texture};
 use psx_engine::{
-    button, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange, LocalToWorldScale,
-    OtFrame, PrimitiveArena, Scene, WorldCamera, WorldProjection, WorldRenderPass,
-    WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    button, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange, OtFrame,
+    PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex, Scene, WorldCamera, WorldProjection,
+    WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
@@ -49,12 +49,13 @@ const CAMERA_RADIUS_START: i32 = 2048;
 const CAMERA_RADIUS_MIN: i32 = 1152;
 const CAMERA_RADIUS_MAX: i32 = 4096;
 const CAMERA_RADIUS_STEP: i32 = 64;
-const CAMERA_AUTO_STEP: u16 = 4;
-const CAMERA_PAD_STEP: u16 = 12;
+const CAMERA_AUTO_STEP_PER_VBLANK: u16 = 4;
+const CAMERA_PAD_STEP_PER_VBLANK: u16 = 12;
 const WORLD_DEPTH_RANGE: DepthRange =
     DepthRange::new(NEAR_Z, CAMERA_RADIUS_MAX + MODEL_WORLD_HEIGHT * 2);
 
 const TRI_CAP: usize = 1536;
+const MODEL_VERTEX_CAP: usize = 1024;
 
 static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
 static mut TEXTURED_TRIS: [TriTextured; TRI_CAP] = [const {
@@ -67,6 +68,8 @@ static mut TEXTURED_TRIS: [TriTextured; TRI_CAP] = [const {
     )
 }; TRI_CAP];
 static mut WORLD_COMMANDS: [WorldTriCommand; TRI_CAP] = [WorldTriCommand::EMPTY; TRI_CAP];
+static mut MODEL_VERTICES: [ProjectedTexturedVertex; MODEL_VERTEX_CAP] =
+    [ProjectedTexturedVertex::new(ProjectedVertex::new(0, 0, 0), 0, 0); MODEL_VERTEX_CAP];
 
 struct ModelShowcase {
     model: Option<Model<'static>>,
@@ -83,18 +86,27 @@ impl Scene for ModelShowcase {
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
-        self.camera_yaw = self.camera_yaw.wrapping_add(CAMERA_AUTO_STEP);
+        let dt = ctx.time.delta_vblanks();
+        self.camera_yaw = self
+            .camera_yaw
+            .wrapping_add(scale_u16(CAMERA_AUTO_STEP_PER_VBLANK, dt));
         if ctx.is_held(button::LEFT) {
-            self.camera_yaw = self.camera_yaw.wrapping_sub(CAMERA_PAD_STEP);
+            self.camera_yaw = self
+                .camera_yaw
+                .wrapping_sub(scale_u16(CAMERA_PAD_STEP_PER_VBLANK, dt));
         }
         if ctx.is_held(button::RIGHT) {
-            self.camera_yaw = self.camera_yaw.wrapping_add(CAMERA_PAD_STEP);
+            self.camera_yaw = self
+                .camera_yaw
+                .wrapping_add(scale_u16(CAMERA_PAD_STEP_PER_VBLANK, dt));
         }
         if ctx.is_held(button::UP) {
-            self.camera_radius = (self.camera_radius - CAMERA_RADIUS_STEP).max(CAMERA_RADIUS_MIN);
+            self.camera_radius =
+                (self.camera_radius - scale_i32(CAMERA_RADIUS_STEP, dt)).max(CAMERA_RADIUS_MIN);
         }
         if ctx.is_held(button::DOWN) {
-            self.camera_radius = (self.camera_radius + CAMERA_RADIUS_STEP).min(CAMERA_RADIUS_MAX);
+            self.camera_radius =
+                (self.camera_radius + scale_i32(CAMERA_RADIUS_STEP, dt)).min(CAMERA_RADIUS_MAX);
         }
     }
 
@@ -119,18 +131,15 @@ impl Scene for ModelShowcase {
             self.camera_yaw,
         );
 
-        let frame = animation_frame(
-            ctx.frame,
-            animation.frame_count(),
-            animation.sample_rate_hz(),
-        );
+        let frame_q12 =
+            animation.phase_at_tick_q12(ctx.time.elapsed_vblanks(), ctx.time.video_hz());
         let mut ot = unsafe { OtFrame::begin(&mut OT) };
         let mut triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_TRIS) };
         let mut world = unsafe { WorldRenderPass::new(&mut ot, &mut WORLD_COMMANDS) };
         draw_animated_model(
             model,
             animation,
-            frame,
+            frame_q12,
             camera,
             material,
             &mut world,
@@ -160,6 +169,14 @@ impl ModelShowcase {
             camera_radius: CAMERA_RADIUS_START,
         }
     }
+}
+
+fn scale_u16(value: u16, scale: u16) -> u16 {
+    value.saturating_mul(scale)
+}
+
+fn scale_i32(value: i32, scale: u16) -> i32 {
+    value.saturating_mul(scale as i32)
 }
 
 fn upload_model_texture() {
@@ -196,18 +213,10 @@ fn upload_opaque_clut(rect: VramRect, bytes: &[u8]) {
     upload_bytes(rect, &marked[..bytes.len()]);
 }
 
-fn animation_frame(frame: u32, frame_count: u16, sample_rate_hz: u16) -> u16 {
-    if frame_count == 0 {
-        return 0;
-    }
-    let divisor = (60 / sample_rate_hz.max(1) as u32).max(1);
-    ((frame / divisor) % frame_count as u32) as u16
-}
-
 fn draw_animated_model(
     model: Model<'_>,
     animation: Animation<'_>,
-    frame: u16,
+    frame_q12: u32,
     camera: WorldCamera,
     material: TextureMaterial,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
@@ -217,101 +226,18 @@ fn draw_animated_model(
         .with_depth_policy(DepthPolicy::Average)
         .with_cull_mode(CullMode::Back)
         .with_material_layer(material);
-    let local_to_world = LocalToWorldScale::from_q12(model.local_to_world_q12());
-
-    let mut part_index = 0;
-    while part_index < model.part_count() {
-        let Some(part) = model.part(part_index) else {
-            break;
-        };
-        let Some(pose) = animation.pose(frame, part.joint_index()) else {
-            part_index += 1;
-            continue;
-        };
-        let first_face = part.first_face();
-        let last_face = first_face.saturating_add(part.face_count());
-        let mut face_index = first_face;
-        while face_index < last_face {
-            let Some((ia, ib, ic)) = model.face(face_index) else {
-                break;
-            };
-            let Some(a) = model.vertex(ia) else {
-                face_index += 1;
-                continue;
-            };
-            let Some(b) = model.vertex(ib) else {
-                face_index += 1;
-                continue;
-            };
-            let Some(c) = model.vertex(ic) else {
-                face_index += 1;
-                continue;
-            };
-
-            let stats = world.submit_textured_world_triangle(
-                triangles,
-                camera,
-                [
-                    animated_world_vertex(a, pose, local_to_world),
-                    animated_world_vertex(b, pose, local_to_world),
-                    animated_world_vertex(c, pose, local_to_world),
-                ],
-                [a.uv, b.uv, c.uv],
-                material,
-                options,
-            );
-            if stats.primitive_overflow || stats.command_overflow {
-                return;
-            }
-
-            face_index += 1;
-        }
-        part_index += 1;
+    let stats = world.submit_textured_model(
+        triangles,
+        model,
+        animation,
+        frame_q12,
+        camera,
+        WorldVertex::new(0, MODEL_Y_OFFSET, 0),
+        unsafe { &mut MODEL_VERTICES },
+        material,
+        options,
+    );
+    if stats.primitive_overflow || stats.command_overflow || stats.vertex_overflow {
+        return;
     }
-}
-
-fn animated_world_vertex(
-    vertex: ModelVertex,
-    pose: JointPose,
-    local_to_world: LocalToWorldScale,
-) -> WorldVertex {
-    let x = vertex.position.x as i32;
-    let y = vertex.position.y as i32;
-    let z = vertex.position.z as i32;
-    let px = transform_q12(
-        pose.matrix[0][0],
-        pose.matrix[1][0],
-        pose.matrix[2][0],
-        pose.translation.x,
-        x,
-        y,
-        z,
-    );
-    let py = transform_q12(
-        pose.matrix[0][1],
-        pose.matrix[1][1],
-        pose.matrix[2][1],
-        pose.translation.y,
-        x,
-        y,
-        z,
-    );
-    let pz = transform_q12(
-        pose.matrix[0][2],
-        pose.matrix[1][2],
-        pose.matrix[2][2],
-        pose.translation.z,
-        x,
-        y,
-        z,
-    );
-    WorldVertex::new(
-        local_to_world.apply(px),
-        local_to_world.apply(py) + MODEL_Y_OFFSET,
-        local_to_world.apply(pz),
-    )
-}
-
-fn transform_q12(m0: i16, m1: i16, m2: i16, t: i32, x: i32, y: i32, z: i32) -> i32 {
-    ((m0 as i32 * x) >> 12) + ((m1 as i32 * y) >> 12) + ((m2 as i32 * z) >> 12) + t
 }

@@ -755,11 +755,7 @@ mod tests {
             0,
             "ACK must wait for the ACK phase"
         );
-        assert_eq!(
-            stat & stat_bit::IRQ,
-            0,
-            "IRQ bit must stay low until ACK"
-        );
+        assert_eq!(stat & stat_bit::IRQ, 0, "IRQ bit must stay low until ACK");
         assert!(
             !sio.take_pending_irq(),
             "bus IRQ should not fire before ACK"
@@ -767,11 +763,7 @@ mod tests {
 
         sio.tick(DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_ne!(
-            stat & stat_bit::ACK_INPUT,
-            0,
-            "ACK input should be visible"
-        );
+        assert_ne!(stat & stat_bit::ACK_INPUT, 0, "ACK input should be visible");
         assert_ne!(stat & stat_bit::IRQ, 0, "STAT IRQ bit should latch");
         assert!(sio.take_pending_irq(), "bus should see one IRQ edge");
         assert!(!sio.take_pending_irq(), "IRQ edge should be single-shot");
@@ -793,11 +785,7 @@ mod tests {
         sio.tick(DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);
 
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_ne!(
-            stat & stat_bit::ACK_INPUT,
-            0,
-            "ACK input should be visible"
-        );
+        assert_ne!(stat & stat_bit::ACK_INPUT, 0, "ACK input should be visible");
         assert_eq!(
             stat & stat_bit::IRQ,
             0,

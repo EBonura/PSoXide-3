@@ -179,7 +179,8 @@ fn main() {
     // Translate (display-space x,y) → (vram x,y) using the configured
     // display area. tracer stamps VRAM coords.
     let da = bus.gpu.display_area();
-    let to_vram = |dx: u16, dy: u16| -> (u16, u16) { (da.x.wrapping_add(dx), da.y.wrapping_add(dy)) };
+    let to_vram =
+        |dx: u16, dy: u16| -> (u16, u16) { (da.x.wrapping_add(dx), da.y.wrapping_add(dy)) };
 
     eprintln!(
         "[probe] display area: x={} y={} w={} h={}",
@@ -446,7 +447,5 @@ fn describe_tpage(tpage: u16) {
         _ => "RES",
     };
     let tex_dis = (tpage >> 11) & 1;
-    eprintln!(
-        "      tpage_x={tx} tpage_y={ty} {bpp_str} blend={blend} tex_disable={tex_dis}"
-    );
+    eprintln!("      tpage_x={tx} tpage_y={ty} {bpp_str} blend={blend} tex_disable={tex_dis}");
 }

@@ -941,9 +941,9 @@ impl Bus {
     /// observing timer state; the scheduler drain calls it once
     /// per branch-test boundary so IRQs fire on time.
     fn service_timers(&mut self) {
-        let fired = self
-            .timers
-            .advance_to(self.cycles, self.hsync_cycles, self.gpu.dot_clock_divisor());
+        let fired =
+            self.timers
+                .advance_to(self.cycles, self.hsync_cycles, self.gpu.dot_clock_divisor());
         if fired & 1 != 0 {
             self.irq.raise(IrqSource::Timer0);
         }

@@ -723,6 +723,26 @@ impl<'a> Animation<'a> {
         self.sample_rate_hz
     }
 
+    /// Q12 sampled-frame phase advance for one playback tick.
+    ///
+    /// `playback_hz` is the caller's update cadence. For example,
+    /// a 15 Hz cooked clip played by a 30 Hz update loop advances by
+    /// half a sampled frame per tick (`0x0800`).
+    #[inline]
+    pub fn phase_step_q12(&self, playback_hz: u16) -> u32 {
+        ((self.sample_rate_hz as u32) << 12) / playback_hz.max(1) as u32
+    }
+
+    /// Convert a fixed-rate playback tick to a Q12 sampled-frame phase.
+    ///
+    /// This is a convenience for frame-locked demos. More advanced
+    /// scenes can accumulate [`Animation::phase_step_q12`] themselves
+    /// when playback speed, pausing, or elapsed-time correction matters.
+    #[inline]
+    pub fn phase_at_tick_q12(&self, playback_tick: u32, playback_hz: u16) -> u32 {
+        playback_tick.wrapping_mul(self.phase_step_q12(playback_hz))
+    }
+
     /// Joint pose at `frame_index`, `joint_index`.
     pub fn pose(&self, frame_index: u16, joint_index: u16) -> Option<JointPose> {
         if frame_index >= self.frame_count || joint_index >= self.joint_count {
@@ -751,6 +771,36 @@ impl<'a> Animation<'a> {
             translation,
         })
     }
+
+    /// Interpolated looping joint pose at a Q12 fixed-point frame phase.
+    ///
+    /// `frame_q12` uses sampled animation frames as the integer unit
+    /// and 12 fractional bits. For example, `1 << 12` samples frame
+    /// 1 exactly, while `1 << 11` samples halfway between frames 0
+    /// and 1. The cooker writes endpoint-inclusive clips, so looping
+    /// playback treats the final stored frame as the duplicate of
+    /// frame 0 and blends `frame_count - 2` back to frame 0.
+    pub fn pose_looped_q12(&self, frame_q12: u32, joint_index: u16) -> Option<JointPose> {
+        if self.frame_count == 0 {
+            return None;
+        }
+
+        let cycle_frames = self.frame_count.saturating_sub(1).max(1);
+        let base_frame = ((frame_q12 >> 12) % cycle_frames as u32) as u16;
+        let next_frame = if cycle_frames <= 1 || base_frame + 1 >= cycle_frames {
+            0
+        } else {
+            base_frame + 1
+        };
+        let alpha_q12 = (frame_q12 & 0x0fff) as u16;
+        if alpha_q12 == 0 || base_frame == next_frame {
+            return self.pose(base_frame, joint_index);
+        }
+
+        let a = self.pose(base_frame, joint_index)?;
+        let b = self.pose(next_frame, joint_index)?;
+        Some(lerp_pose_q12(a, b, alpha_q12))
+    }
 }
 
 /// Decoded joint pose matrix.
@@ -760,6 +810,54 @@ pub struct JointPose {
     pub matrix: [[i16; 3]; 3],
     /// Q3.12 translation vector.
     pub translation: Vec3I32,
+}
+
+fn lerp_pose_q12(a: JointPose, b: JointPose, alpha_q12: u16) -> JointPose {
+    let mut matrix = [[0i16; 3]; 3];
+    let mut col = 0;
+    while col < 3 {
+        let mut row = 0;
+        while row < 3 {
+            matrix[col][row] = lerp_i16_q12(a.matrix[col][row], b.matrix[col][row], alpha_q12);
+            row += 1;
+        }
+        col += 1;
+    }
+
+    JointPose {
+        matrix,
+        translation: Vec3I32::new(
+            lerp_i32_q12(a.translation.x, b.translation.x, alpha_q12),
+            lerp_i32_q12(a.translation.y, b.translation.y, alpha_q12),
+            lerp_i32_q12(a.translation.z, b.translation.z, alpha_q12),
+        ),
+    }
+}
+
+fn lerp_i16_q12(a: i16, b: i16, alpha_q12: u16) -> i16 {
+    let value = a as i32 + (((b as i32 - a as i32) * alpha_q12 as i32) >> 12);
+    clamp_i32_to_i16(value)
+}
+
+fn lerp_i32_q12(a: i32, b: i32, alpha_q12: u16) -> i32 {
+    let delta = b.saturating_sub(a);
+    a.saturating_add(scale_i32_q12(delta, alpha_q12 as i32))
+}
+
+fn scale_i32_q12(value: i32, scale_q12: i32) -> i32 {
+    let whole = value >> 12;
+    let frac = value - (whole << 12);
+    whole.saturating_mul(scale_q12) + ((frac * scale_q12) >> 12)
+}
+
+fn clamp_i32_to_i16(value: i32) -> i16 {
+    if value < i16::MIN as i32 {
+        i16::MIN
+    } else if value > i16::MAX as i32 {
+        i16::MAX
+    } else {
+        value as i16
+    }
 }
 
 /// A parsed 2D texture backed by slices into the caller's cooked
@@ -1541,9 +1639,49 @@ mod tests {
         assert_eq!(animation.joint_count(), 1);
         assert_eq!(animation.frame_count(), 2);
         assert_eq!(animation.sample_rate_hz(), 15);
+        assert_eq!(animation.phase_step_q12(30), 0x0800);
+        assert_eq!(animation.phase_at_tick_q12(2, 30), 0x1000);
         let pose = animation.pose(1, 0).unwrap();
         assert_eq!(pose.matrix[0][0], 4096);
         assert_eq!(pose.translation, Vec3I32::new(100, 200, 300));
+    }
+
+    #[test]
+    fn animation_looped_pose_interpolates_q12_phase() {
+        use psxed_format::animation;
+
+        let payload_len = animation::AnimationHeader::SIZE + 3 * animation::POSE_RECORD_SIZE;
+        let mut buf = std::vec::Vec::new();
+        buf.extend_from_slice(&animation::MAGIC);
+        buf.extend_from_slice(&animation::VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // joints
+        buf.extend_from_slice(&3u16.to_le_bytes()); // frames: first, middle, duplicate first
+        buf.extend_from_slice(&15u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+
+        for (m00, tx, ty, tz) in [
+            (4096i16, 0i32, 0i32, 0i32),
+            (2048i16, 100i32, -100i32, 50i32),
+            (4096i16, 0i32, 0i32, 0i32),
+        ] {
+            for value in [m00, 0, 0, 0, 4096, 0, 0, 0, 4096] {
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in [tx, ty, tz] {
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+
+        let animation = Animation::from_bytes(&buf).expect("parse animation");
+        let halfway = animation.pose_looped_q12(0x0800, 0).unwrap();
+        assert_eq!(halfway.matrix[0][0], 3072);
+        assert_eq!(halfway.translation, Vec3I32::new(50, -50, 25));
+
+        let wrapped = animation.pose_looped_q12(0x1800, 0).unwrap();
+        assert_eq!(wrapped.matrix[0][0], 3072);
+        assert_eq!(wrapped.translation, Vec3I32::new(50, -50, 25));
     }
 
     #[test]

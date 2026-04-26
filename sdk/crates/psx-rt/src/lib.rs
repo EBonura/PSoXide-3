@@ -25,6 +25,7 @@
 #![cfg_attr(target_arch = "mips", feature(asm_experimental_arch))]
 
 pub mod bios;
+pub mod interrupts;
 pub mod tty;
 
 #[cfg(feature = "alloc")]

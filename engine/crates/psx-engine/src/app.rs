@@ -10,10 +10,11 @@
 //!   loop:
 //!     ctx.pad_prev ← ctx.pad           (one-frame input history)
 //!     ctx.pad      ← poll_port1()
+//!     ctx.time     ← elapsed display-time snapshot
 //!     scene.update(&mut ctx)
 //!     ctx.fb.clear(config.clear_color)
 //!     scene.render(&mut ctx)
-//!     draw_sync + vsync + fb.swap
+//!     display-clock wait + draw_sync + fb.swap
 //!     ctx.frame += 1
 //! ```
 //!
@@ -33,9 +34,10 @@
 
 use psx_gpu::framebuf::FrameBuffer;
 use psx_gpu::{self as gpu, Resolution, VideoMode};
-use psx_pad::{ButtonState, poll_port1};
+use psx_pad::{poll_port1, ButtonState};
 
 use crate::scene::{Ctx, Scene};
+use crate::time::{EngineClock, EngineTime};
 
 /// Configuration passed to [`App::run`]. Sensible defaults via
 /// [`Config::default`] so simple games can just write
@@ -59,6 +61,17 @@ pub struct Config {
     pub clear_color: (u8, u8, u8),
 }
 
+impl Config {
+    /// Display cadence in whole frames per second.
+    #[inline]
+    pub const fn video_hz(self) -> u16 {
+        match self.video_mode {
+            VideoMode::Ntsc => 60,
+            VideoMode::Pal => 50,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -80,7 +93,8 @@ impl App {
     /// Run `scene` under `config`. Never returns.
     ///
     /// Calls [`Scene::init`] once, then loops forever:
-    /// poll-pad → update → clear → render → draw-sync → vsync → swap.
+    /// poll-pad → update → clear → render → display-clock wait →
+    /// draw-sync → swap.
     ///
     /// Typical call site in `main`:
     ///
@@ -93,6 +107,7 @@ impl App {
     /// ```
     pub fn run<S: Scene>(config: Config, scene: &mut S) -> ! {
         gpu::init(config.video_mode, config.resolution);
+        let mut clock = EngineClock::new(config.video_hz());
         let fb = FrameBuffer::new(config.screen_w, config.screen_h);
         gpu::set_draw_area(
             0,
@@ -104,6 +119,7 @@ impl App {
 
         let mut ctx = Ctx {
             frame: 0,
+            time: EngineTime::start(config.video_hz()),
             pad: ButtonState::NONE,
             pad_prev: ButtonState::NONE,
             fb,
@@ -112,6 +128,7 @@ impl App {
         scene.init(&mut ctx);
 
         loop {
+            ctx.time = clock.begin_frame(ctx.frame);
             ctx.pad_prev = ctx.pad;
             ctx.pad = poll_port1();
 
@@ -125,8 +142,8 @@ impl App {
 
             scene.render(&mut ctx);
 
+            clock.wait_present();
             gpu::draw_sync();
-            gpu::vsync();
             ctx.fb.swap();
             ctx.frame = ctx.frame.wrapping_add(1);
         }

@@ -12,14 +12,15 @@
 //! frame's opaque mesh triangles share one depth policy and one
 //! deterministic OT insertion order.
 
-use psx_asset::Mesh;
+use psx_asset::{Animation, JointPose, Mesh, Model};
 use psx_gpu::{
     material::TextureMaterial,
     prim::{TriGouraud, TriTextured},
 };
 use psx_gte::{
     lighting::{project_lit, ProjectedLit},
-    math::Vec3I16,
+    math::{Mat3I16, Vec3I16, Vec3I32},
+    scene,
 };
 use psx_math::{cos_q12, sin_q12};
 
@@ -30,6 +31,8 @@ const PSX_VERTEX_MAX: i16 = 1023;
 const PSX_TRI_MAX_DX: i32 = 1023;
 const PSX_TRI_MAX_DY: i32 = 511;
 const MAX_TEXTURED_HW_SPLIT_DEPTH: u8 = 5;
+const WORLD_COMMAND_NONE: u16 = u16::MAX;
+const GOURAUD_COMMAND_NONE: u16 = u16::MAX;
 
 /// Scalar depth policy used to bucket a triangle into the ordering table.
 ///
@@ -201,20 +204,25 @@ impl TexturedViewVertex {
     }
 }
 
+/// Projected textured vertex used as scratch by GTE-backed textured model paths.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct ProjectedTexturedVertex {
-    projected: ProjectedVertex,
-    u: i32,
-    v: i32,
+pub struct ProjectedTexturedVertex {
+    /// Screen-space position and depth.
+    pub projected: ProjectedVertex,
+    /// Texture U coordinate.
+    pub u: i32,
+    /// Texture V coordinate.
+    pub v: i32,
 }
 
 impl ProjectedTexturedVertex {
-    const fn new(projected: ProjectedVertex, u: i32, v: i32) -> Self {
+    /// Build a projected textured vertex.
+    pub const fn new(projected: ProjectedVertex, u: i32, v: i32) -> Self {
         Self { projected, u, v }
     }
 }
 
-/// Perspective projection settings for CPU-transformed world surfaces.
+/// Perspective projection settings for world-space render passes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WorldProjection {
     /// Screen centre X.
@@ -228,7 +236,7 @@ pub struct WorldProjection {
 }
 
 impl WorldProjection {
-    /// Build projection settings for CPU-transformed world surfaces.
+    /// Build projection settings for world-space render passes.
     pub const fn new(screen_x: i16, screen_y: i16, focal_length: i32, near_z: i32) -> Self {
         Self {
             screen_x,
@@ -260,7 +268,7 @@ impl From<ProjectedLit> for ProjectedVertex {
     }
 }
 
-/// CPU-side perspective camera for authored world surfaces.
+/// Perspective camera for authored world surfaces and GTE model passes.
 ///
 /// The camera stores a simple orbit-style basis: yaw rotates around
 /// the world's Y axis, then pitch tilts the view around the camera's
@@ -469,6 +477,7 @@ pub struct WorldTriCommand {
     packet_ptr: *mut u32,
     words: u8,
     order: usize,
+    next: u16,
 }
 
 impl WorldTriCommand {
@@ -480,6 +489,7 @@ impl WorldTriCommand {
         packet_ptr: core::ptr::null_mut(),
         words: 0,
         order: 0,
+        next: WORLD_COMMAND_NONE,
     };
 }
 
@@ -505,6 +515,32 @@ pub struct WorldRenderStats {
     pub command_overflow: bool,
 }
 
+/// Per-submit counters and overflow flags for textured model rendering.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TexturedModelRenderStats {
+    /// Vertices projected into the caller-provided scratch buffer.
+    pub projected_vertices: u16,
+    /// Triangles accepted into the pass after culling.
+    pub submitted_triangles: u16,
+    /// Triangles rejected by back-face culling.
+    pub culled_triangles: u16,
+    /// Oversized projected triangles split to satisfy PS1 hardware
+    /// extent limits.
+    pub split_triangles: u16,
+    /// Triangles skipped because a face referenced vertices outside
+    /// the part's projected vertex range.
+    pub skipped_triangles: u16,
+    /// Triangles dropped before packet emission because they were
+    /// behind the near plane or could not be made hardware-legal.
+    pub dropped_triangles: u16,
+    /// True if the vertex scratch buffer was too small for any part.
+    pub vertex_overflow: bool,
+    /// True if the primitive packet arena filled up.
+    pub primitive_overflow: bool,
+    /// True if the command scratch buffer filled up.
+    pub command_overflow: bool,
+}
+
 /// Mixed world render pass.
 ///
 /// Authoring code can submit surfaces as quads or triangles; the pass
@@ -514,6 +550,7 @@ pub struct WorldRenderStats {
 pub struct WorldRenderPass<'a, 'ot, const OT_DEPTH: usize> {
     ot: &'a mut OtFrame<'ot, OT_DEPTH>,
     commands: &'a mut [WorldTriCommand],
+    slot_heads: [u16; OT_DEPTH],
     command_len: usize,
     next_order: usize,
 }
@@ -524,6 +561,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         Self {
             ot,
             commands,
+            slot_heads: [WORLD_COMMAND_NONE; OT_DEPTH],
             command_len: 0,
             next_order: 0,
         }
@@ -552,6 +590,33 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         merge_world_stats(
             &mut stats,
             self.submit_textured_triangle_split(triangles, textured, material, options, 0),
+        );
+        stats
+    }
+
+    /// Submit a textured triangle whose vertices are already projected.
+    ///
+    /// This is the common packet path for pre-projected surfaces and
+    /// GTE-projected model/world batches. Projection is intentionally
+    /// kept outside so the expensive part can happen once per shared
+    /// vertex rather than once per face.
+    pub fn submit_projected_textured_triangle(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTextured>,
+        verts: [ProjectedTexturedVertex; 3],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+    ) -> WorldRenderStats {
+        let mut stats = WorldRenderStats::default();
+        let projected = [verts[0].projected, verts[1].projected, verts[2].projected];
+        if options.cull_mode == CullMode::Back && projected_back_facing(projected) {
+            stats.culled_triangles = 1;
+            return stats;
+        }
+
+        merge_world_stats(
+            &mut stats,
+            self.submit_textured_triangle_split(triangles, verts, material, options, 0),
         );
         stats
     }
@@ -864,6 +929,160 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         )
     }
 
+    /// Submit an animated rigid-skeletal textured model through the GTE.
+    ///
+    /// The engine loads one GTE transform per model part, projects that
+    /// part's vertices once into `projected_vertices`, and then builds
+    /// textured triangle packets from those projected vertices. Vertex
+    /// projection uses GTE `RTPT` batches where possible. This is the
+    /// native textured model path; callers should size the scratch
+    /// buffer for the largest part vertex count, not the whole model.
+    /// `frame_q12` is a looping sampled-frame phase with 12
+    /// fractional bits, so decimated animation clips can still play
+    /// smoothly between stored poses.
+    pub fn submit_textured_model(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTextured>,
+        model: Model<'_>,
+        animation: Animation<'_>,
+        frame_q12: u32,
+        camera: WorldCamera,
+        origin: WorldVertex,
+        projected_vertices: &mut [ProjectedTexturedVertex],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+    ) -> TexturedModelRenderStats {
+        let mut stats = TexturedModelRenderStats::default();
+        let local_to_world = LocalToWorldScale::from_q12(model.local_to_world_q12());
+        load_world_projection_gte(camera.projection);
+
+        let mut part_index = 0;
+        while part_index < model.part_count() {
+            let Some(part) = model.part(part_index) else {
+                break;
+            };
+            let Some(pose) = animation.pose_looped_q12(frame_q12, part.joint_index()) else {
+                part_index += 1;
+                continue;
+            };
+
+            let part_vertex_count = part.vertex_count() as usize;
+            let project_count = part_vertex_count
+                .min(projected_vertices.len())
+                .min(u16::MAX as usize);
+            if project_count < part_vertex_count {
+                stats.vertex_overflow = true;
+            }
+            stats.projected_vertices = stats
+                .projected_vertices
+                .saturating_add(project_count as u16);
+
+            load_textured_model_part_gte(camera, pose, local_to_world, origin);
+            let first_vertex = part.first_vertex();
+            let mut local_index = 0;
+            while local_index + 2 < project_count {
+                let global_a = first_vertex.saturating_add(local_index as u16);
+                let global_b = first_vertex.saturating_add((local_index + 1) as u16);
+                let global_c = first_vertex.saturating_add((local_index + 2) as u16);
+                let Some(a) = model.vertex(global_a) else {
+                    break;
+                };
+                let Some(b) = model.vertex(global_b) else {
+                    break;
+                };
+                let Some(c) = model.vertex(global_c) else {
+                    break;
+                };
+                let projected = scene::project_triangle(a.position, b.position, c.position);
+                projected_vertices[local_index] = ProjectedTexturedVertex::new(
+                    ProjectedVertex::new(projected[0].sx, projected[0].sy, projected[0].sz as i32),
+                    a.uv.0 as i32,
+                    a.uv.1 as i32,
+                );
+                projected_vertices[local_index + 1] = ProjectedTexturedVertex::new(
+                    ProjectedVertex::new(projected[1].sx, projected[1].sy, projected[1].sz as i32),
+                    b.uv.0 as i32,
+                    b.uv.1 as i32,
+                );
+                projected_vertices[local_index + 2] = ProjectedTexturedVertex::new(
+                    ProjectedVertex::new(projected[2].sx, projected[2].sy, projected[2].sz as i32),
+                    c.uv.0 as i32,
+                    c.uv.1 as i32,
+                );
+                local_index += 3;
+            }
+            while local_index < project_count {
+                let global_index = first_vertex.saturating_add(local_index as u16);
+                let Some(vertex) = model.vertex(global_index) else {
+                    break;
+                };
+                let projected = scene::project_vertex(vertex.position);
+                projected_vertices[local_index] = ProjectedTexturedVertex::new(
+                    ProjectedVertex::new(projected.sx, projected.sy, projected.sz as i32),
+                    vertex.uv.0 as i32,
+                    vertex.uv.1 as i32,
+                );
+                local_index += 1;
+            }
+
+            let first_face = part.first_face();
+            let last_face = first_face.saturating_add(part.face_count());
+            let mut face_index = first_face;
+            while face_index < last_face {
+                let Some((ia, ib, ic)) = model.face(face_index) else {
+                    break;
+                };
+                let Some(a) =
+                    textured_part_vertex(projected_vertices, first_vertex, project_count, ia)
+                else {
+                    stats.skipped_triangles = stats.skipped_triangles.saturating_add(1);
+                    face_index += 1;
+                    continue;
+                };
+                let Some(b) =
+                    textured_part_vertex(projected_vertices, first_vertex, project_count, ib)
+                else {
+                    stats.skipped_triangles = stats.skipped_triangles.saturating_add(1);
+                    face_index += 1;
+                    continue;
+                };
+                let Some(c) =
+                    textured_part_vertex(projected_vertices, first_vertex, project_count, ic)
+                else {
+                    stats.skipped_triangles = stats.skipped_triangles.saturating_add(1);
+                    face_index += 1;
+                    continue;
+                };
+
+                if a.projected.sz < camera.projection.near_z
+                    || b.projected.sz < camera.projection.near_z
+                    || c.projected.sz < camera.projection.near_z
+                {
+                    stats.dropped_triangles = stats.dropped_triangles.saturating_add(1);
+                    face_index += 1;
+                    continue;
+                }
+
+                let tri_stats = self.submit_projected_textured_triangle(
+                    triangles,
+                    [a, b, c],
+                    material,
+                    options,
+                );
+                merge_textured_model_stats(&mut stats, tri_stats);
+                if stats.primitive_overflow || stats.command_overflow {
+                    return stats;
+                }
+
+                face_index += 1;
+            }
+
+            part_index += 1;
+        }
+
+        stats
+    }
+
     fn submit_clipped_textured_triangle(
         &mut self,
         triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -967,34 +1186,76 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         packet_ptr: *mut u32,
         words: u8,
     ) {
-        self.commands[self.command_len] = WorldTriCommand {
+        let command_index = self.command_len;
+        self.commands[command_index] = WorldTriCommand {
             slot,
             depth,
             render_layer,
             packet_ptr,
             words,
             order: self.next_order,
+            next: WORLD_COMMAND_NONE,
         };
         self.command_len += 1;
         self.next_order = self.next_order.saturating_add(1);
+        self.insert_command_in_slot(command_index);
+    }
+
+    fn insert_command_in_slot(&mut self, command_index: usize) {
+        if OT_DEPTH == 0 || command_index >= WORLD_COMMAND_NONE as usize {
+            return;
+        }
+
+        let slot = self.commands[command_index].slot.index().min(OT_DEPTH - 1);
+        let command_link = command_index as u16;
+        let head = self.slot_heads[slot];
+        if head == WORLD_COMMAND_NONE
+            || should_insert_world_before(
+                self.commands[command_index],
+                self.commands[head as usize],
+            )
+        {
+            self.commands[command_index].next = head;
+            self.slot_heads[slot] = command_link;
+            return;
+        }
+
+        let mut prev = head as usize;
+        loop {
+            let next = self.commands[prev].next;
+            if next == WORLD_COMMAND_NONE
+                || should_insert_world_before(
+                    self.commands[command_index],
+                    self.commands[next as usize],
+                )
+            {
+                self.commands[command_index].next = next;
+                self.commands[prev].next = command_link;
+                return;
+            }
+            prev = next as usize;
+        }
     }
 
     /// Sort and insert all submitted triangles into the ordering table.
     pub fn flush(self) {
-        sort_world_for_ot_insert(&mut self.commands[..self.command_len]);
-        let mut i = 0;
-        while i < self.command_len {
-            let command = self.commands[i];
-            if !command.packet_ptr.is_null() {
-                // SAFETY: Commands are created only from primitive
-                // arenas borrowed by submit methods. Those packets live
-                // until after this pass flushes and the frame submits.
-                unsafe {
-                    self.ot
-                        .add_raw_slot(command.slot, command.packet_ptr, command.words)
-                };
+        let mut slot = 0;
+        while slot < OT_DEPTH {
+            let mut command_index = self.slot_heads[slot];
+            while command_index != WORLD_COMMAND_NONE {
+                let command = self.commands[command_index as usize];
+                if !command.packet_ptr.is_null() {
+                    // SAFETY: Commands are created only from primitive
+                    // arenas borrowed by submit methods. Those packets live
+                    // until after this pass flushes and the frame submits.
+                    unsafe {
+                        self.ot
+                            .add_raw_slot(command.slot, command.packet_ptr, command.words)
+                    };
+                }
+                command_index = command.next;
             }
-            i += 1;
+            slot += 1;
         }
     }
 }
@@ -1010,6 +1271,7 @@ pub struct GouraudTriCommand {
     slot: DepthSlot,
     depth: i32,
     primitive_index: usize,
+    next: u16,
 }
 
 impl GouraudTriCommand {
@@ -1018,6 +1280,7 @@ impl GouraudTriCommand {
         slot: DepthSlot::new(0),
         depth: 0,
         primitive_index: 0,
+        next: GOURAUD_COMMAND_NONE,
     };
 }
 
@@ -1124,6 +1387,7 @@ pub struct GouraudRenderPass<'a, 'ot, 'arena, const OT_DEPTH: usize> {
     ot: &'a mut OtFrame<'ot, OT_DEPTH>,
     triangles: &'a mut PrimitiveArena<'arena, TriGouraud>,
     commands: &'a mut [GouraudTriCommand],
+    slot_heads: [u16; OT_DEPTH],
     command_len: usize,
 }
 
@@ -1138,6 +1402,7 @@ impl<'a, 'ot, 'arena, const OT_DEPTH: usize> GouraudRenderPass<'a, 'ot, 'arena, 
             ot,
             triangles,
             commands,
+            slot_heads: [GOURAUD_COMMAND_NONE; OT_DEPTH],
             command_len: 0,
         }
     }
@@ -1258,14 +1523,17 @@ impl<'a, 'ot, 'arena, const OT_DEPTH: usize> GouraudRenderPass<'a, 'ot, 'arena, 
                 .depth_policy
                 .depth(verts)
                 .saturating_add(options.depth_bias);
-            self.commands[self.command_len] = GouraudTriCommand {
+            let command_index = self.command_len;
+            self.commands[command_index] = GouraudTriCommand {
                 slot: options
                     .depth_band
                     .slot::<OT_DEPTH>(options.depth_range, depth),
                 depth,
                 primitive_index,
+                next: GOURAUD_COMMAND_NONE,
             };
             self.command_len += 1;
+            self.insert_command_in_slot(command_index);
             stats.submitted_triangles = stats.submitted_triangles.saturating_add(1);
             face_idx += 1;
         }
@@ -1273,16 +1541,55 @@ impl<'a, 'ot, 'arena, const OT_DEPTH: usize> GouraudRenderPass<'a, 'ot, 'arena, 
         stats
     }
 
+    fn insert_command_in_slot(&mut self, command_index: usize) {
+        if OT_DEPTH == 0 || command_index >= GOURAUD_COMMAND_NONE as usize {
+            return;
+        }
+
+        let slot = self.commands[command_index].slot.index().min(OT_DEPTH - 1);
+        let command_link = command_index as u16;
+        let head = self.slot_heads[slot];
+        if head == GOURAUD_COMMAND_NONE
+            || should_insert_gouraud_before(
+                self.commands[command_index],
+                self.commands[head as usize],
+            )
+        {
+            self.commands[command_index].next = head;
+            self.slot_heads[slot] = command_link;
+            return;
+        }
+
+        let mut prev = head as usize;
+        loop {
+            let next = self.commands[prev].next;
+            if next == GOURAUD_COMMAND_NONE
+                || should_insert_gouraud_before(
+                    self.commands[command_index],
+                    self.commands[next as usize],
+                )
+            {
+                self.commands[command_index].next = next;
+                self.commands[prev].next = command_link;
+                return;
+            }
+            prev = next as usize;
+        }
+    }
+
     /// Sort and insert all submitted triangles into the ordering table.
     pub fn flush(self) {
-        sort_for_ot_insert(&mut self.commands[..self.command_len]);
-        let mut i = 0;
-        while i < self.command_len {
-            let command = self.commands[i];
-            if let Some(tri) = self.triangles.get_mut(command.primitive_index) {
-                self.ot.add_packet_slot(command.slot, tri);
+        let mut slot = 0;
+        while slot < OT_DEPTH {
+            let mut command_index = self.slot_heads[slot];
+            while command_index != GOURAUD_COMMAND_NONE {
+                let command = self.commands[command_index as usize];
+                if let Some(tri) = self.triangles.get_mut(command.primitive_index) {
+                    self.ot.add_packet_slot(command.slot, tri);
+                }
+                command_index = command.next;
             }
-            i += 1;
+            slot += 1;
         }
     }
 }
@@ -1297,6 +1604,146 @@ fn vertex_material(mesh: &Mesh<'_>, vert: u16, fallback: (u8, u8, u8)) -> (u8, u
         face_idx += 1;
     }
     fallback
+}
+
+fn textured_part_vertex(
+    projected_vertices: &[ProjectedTexturedVertex],
+    first_vertex: u16,
+    project_count: usize,
+    vertex_index: u16,
+) -> Option<ProjectedTexturedVertex> {
+    if vertex_index < first_vertex {
+        return None;
+    }
+    let local_index = vertex_index - first_vertex;
+    if local_index as usize >= project_count {
+        return None;
+    }
+    projected_vertices.get(local_index as usize).copied()
+}
+
+fn load_world_projection_gte(projection: WorldProjection) {
+    scene::set_screen_offset(
+        (projection.screen_x as i32) << 16,
+        (projection.screen_y as i32) << 16,
+    );
+    scene::set_projection_plane(clamp_u16_i32(projection.focal_length));
+}
+
+fn load_textured_model_part_gte(
+    camera: WorldCamera,
+    pose: JointPose,
+    local_to_world: LocalToWorldScale,
+    origin: WorldVertex,
+) {
+    let (rotation, translation) =
+        textured_model_part_gte_transform(camera, pose, local_to_world, origin);
+    scene::load_rotation(&rotation);
+    scene::load_translation(translation);
+}
+
+fn textured_model_part_gte_transform(
+    camera: WorldCamera,
+    pose: JointPose,
+    local_to_world: LocalToWorldScale,
+    origin: WorldVertex,
+) -> (Mat3I16, Vec3I32) {
+    let view = camera_gte_view_matrix(camera);
+    let model = scaled_pose_matrix(pose, local_to_world);
+    let rotation = mat3_mul_q12(&view, &model);
+
+    let world_translation = WorldVertex::new(
+        origin
+            .x
+            .saturating_add(local_to_world.apply(pose.translation.x)),
+        origin
+            .y
+            .saturating_add(local_to_world.apply(pose.translation.y)),
+        origin
+            .z
+            .saturating_add(local_to_world.apply(pose.translation.z)),
+    );
+    let delta = WorldVertex::new(
+        world_translation.x.saturating_sub(camera.position.x),
+        world_translation.y.saturating_sub(camera.position.y),
+        world_translation.z.saturating_sub(camera.position.z),
+    );
+    let translation = Vec3I32::new(
+        dot_world_q12(view.m[0], delta),
+        dot_world_q12(view.m[1], delta),
+        dot_world_q12(view.m[2], delta),
+    );
+
+    (rotation, translation)
+}
+
+fn camera_gte_view_matrix(camera: WorldCamera) -> Mat3I16 {
+    let sy_sp = q12_mul_i32(camera.sin_yaw, camera.sin_pitch);
+    let cy_sp = q12_mul_i32(camera.cos_yaw, camera.sin_pitch);
+    let sy_cp = q12_mul_i32(camera.sin_yaw, camera.cos_pitch);
+    let cy_cp = q12_mul_i32(camera.cos_yaw, camera.cos_pitch);
+
+    Mat3I16 {
+        m: [
+            [clamp_i16(camera.cos_yaw), 0, clamp_i16(-camera.sin_yaw)],
+            [
+                clamp_i16(-sy_sp),
+                clamp_i16(-camera.cos_pitch),
+                clamp_i16(-cy_sp),
+            ],
+            [
+                clamp_i16(-sy_cp),
+                clamp_i16(camera.sin_pitch),
+                clamp_i16(-cy_cp),
+            ],
+        ],
+    }
+}
+
+fn scaled_pose_matrix(pose: JointPose, local_to_world: LocalToWorldScale) -> Mat3I16 {
+    let scale = local_to_world.q12() as i32;
+    let mut out = [[0i16; 3]; 3];
+    let mut row = 0;
+    while row < 3 {
+        let mut col = 0;
+        while col < 3 {
+            out[row][col] = clamp_i16(q12_mul_i32(pose.matrix[col][row] as i32, scale));
+            col += 1;
+        }
+        row += 1;
+    }
+    Mat3I16 { m: out }
+}
+
+fn mat3_mul_q12(a: &Mat3I16, b: &Mat3I16) -> Mat3I16 {
+    let mut out = [[0i16; 3]; 3];
+    let mut row = 0;
+    while row < 3 {
+        let mut col = 0;
+        while col < 3 {
+            let mut sum = 0i32;
+            let mut k = 0;
+            while k < 3 {
+                sum = sum.saturating_add((a.m[row][k] as i32) * (b.m[k][col] as i32));
+                k += 1;
+            }
+            out[row][col] = clamp_i16(sum >> 12);
+            col += 1;
+        }
+        row += 1;
+    }
+    Mat3I16 { m: out }
+}
+
+fn dot_world_q12(row: [i16; 3], v: WorldVertex) -> i32 {
+    let x = (row[0] as i32).saturating_mul(v.x);
+    let y = (row[1] as i32).saturating_mul(v.y);
+    let z = (row[2] as i32).saturating_mul(v.z);
+    x.saturating_add(y).saturating_add(z) >> 12
+}
+
+fn q12_mul_i32(a: i32, b: i32) -> i32 {
+    a.saturating_mul(b) >> 12
 }
 
 fn back_facing(verts: [ProjectedLit; 3]) -> bool {
@@ -1462,6 +1909,19 @@ fn merge_world_stats(stats: &mut WorldRenderStats, next: WorldRenderStats) {
     stats.command_overflow |= next.command_overflow;
 }
 
+fn merge_textured_model_stats(stats: &mut TexturedModelRenderStats, next: WorldRenderStats) {
+    stats.submitted_triangles = stats
+        .submitted_triangles
+        .saturating_add(next.submitted_triangles);
+    stats.culled_triangles = stats.culled_triangles.saturating_add(next.culled_triangles);
+    stats.split_triangles = stats.split_triangles.saturating_add(next.split_triangles);
+    stats.dropped_triangles = stats
+        .dropped_triangles
+        .saturating_add(next.dropped_triangles);
+    stats.primitive_overflow |= next.primitive_overflow;
+    stats.command_overflow |= next.command_overflow;
+}
+
 fn clamp_i16(value: i32) -> i16 {
     if value < i16::MIN as i32 {
         i16::MIN
@@ -1492,6 +1952,16 @@ fn clamp_u8(value: i32) -> u8 {
     }
 }
 
+fn clamp_u16_i32(value: i32) -> u16 {
+    if value < 0 {
+        0
+    } else if value > u16::MAX as i32 {
+        u16::MAX
+    } else {
+        value as u16
+    }
+}
+
 fn isqrt_i32(value: i32) -> i32 {
     if value <= 0 {
         return 0;
@@ -1515,6 +1985,7 @@ fn isqrt_i32(value: i32) -> i32 {
     root
 }
 
+#[cfg(test)]
 fn sort_for_ot_insert(commands: &mut [GouraudTriCommand]) {
     let mut gap = commands.len() / 2;
     while gap > 0 {
@@ -1533,6 +2004,7 @@ fn sort_for_ot_insert(commands: &mut [GouraudTriCommand]) {
     }
 }
 
+#[cfg(test)]
 fn should_insert_after(a: GouraudTriCommand, b: GouraudTriCommand) -> bool {
     if a.slot.index() != b.slot.index() {
         return a.slot.index() > b.slot.index();
@@ -1546,6 +2018,14 @@ fn should_insert_after(a: GouraudTriCommand, b: GouraudTriCommand) -> bool {
     a.primitive_index < b.primitive_index
 }
 
+fn should_insert_gouraud_before(a: GouraudTriCommand, b: GouraudTriCommand) -> bool {
+    if a.depth != b.depth {
+        return a.depth < b.depth;
+    }
+    a.primitive_index > b.primitive_index
+}
+
+#[cfg(test)]
 fn sort_world_for_ot_insert(commands: &mut [WorldTriCommand]) {
     let mut gap = commands.len() / 2;
     while gap > 0 {
@@ -1564,6 +2044,7 @@ fn sort_world_for_ot_insert(commands: &mut [WorldTriCommand]) {
     }
 }
 
+#[cfg(test)]
 fn should_insert_world_after(a: WorldTriCommand, b: WorldTriCommand) -> bool {
     if a.slot.index() != b.slot.index() {
         return a.slot.index() > b.slot.index();
@@ -1578,6 +2059,17 @@ fn should_insert_world_after(a: WorldTriCommand, b: WorldTriCommand) -> bool {
     a.order < b.order
 }
 
+fn should_insert_world_before(a: WorldTriCommand, b: WorldTriCommand) -> bool {
+    if a.depth != b.depth {
+        return a.depth < b.depth;
+    }
+    if a.render_layer != b.render_layer {
+        return a.render_layer == WorldRenderLayer::Transparent
+            && b.render_layer == WorldRenderLayer::Opaque;
+    }
+    a.order > b.order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1589,6 +2081,7 @@ mod tests {
             slot: DepthSlot::new(slot),
             depth,
             primitive_index,
+            next: GOURAUD_COMMAND_NONE,
         }
     }
 
@@ -1609,6 +2102,7 @@ mod tests {
             packet_ptr: core::ptr::null_mut(),
             words: 0,
             order,
+            next: WORLD_COMMAND_NONE,
         }
     }
 
@@ -1771,6 +2265,42 @@ mod tests {
     }
 
     #[test]
+    fn textured_model_gte_transform_matches_world_camera_projection() {
+        let projection = WorldProjection::new(160, 118, 320, 48);
+        let target = WorldVertex::new(0, 512, 0);
+        let camera = WorldCamera::orbit_yaw(projection, target, 1120, 2048, 220);
+        let pose = JointPose {
+            matrix: [[0x1000, 0, 0], [0, 0x1000, 0], [0, 0, 0x1000]],
+            translation: Vec3I32::new(20, -16, 32),
+        };
+        let origin = WorldVertex::new(0, 512, 0);
+        let local = Vec3I16::new(64, 128, -32);
+
+        let cpu_world = WorldVertex::new(
+            origin.x + pose.translation.x + local.x as i32,
+            origin.y + pose.translation.y + local.y as i32,
+            origin.z + pose.translation.z + local.z as i32,
+        );
+        let cpu_view = camera.view_vertex(cpu_world);
+        let cpu_projected = camera.project_world(cpu_world).expect("in front");
+
+        let (rotation, translation) =
+            textured_model_part_gte_transform(camera, pose, LocalToWorldScale::IDENTITY, origin);
+        let gte_x = translation.x + dot_q12_row_i16(rotation.m[0], local);
+        let gte_y = translation.y + dot_q12_row_i16(rotation.m[1], local);
+        let gte_z = translation.z + dot_q12_row_i16(rotation.m[2], local);
+
+        assert_close_i32(gte_x, cpu_view.x, 4);
+        assert_close_i32(gte_y, -cpu_view.y, 4);
+        assert_close_i32(gte_z, cpu_view.z, 4);
+
+        let gte_sx = projection.screen_x as i32 + (gte_x * projection.focal_length) / gte_z;
+        let gte_sy = projection.screen_y as i32 + (gte_y * projection.focal_length) / gte_z;
+        assert_close_i32(gte_sx, cpu_projected.sx as i32, 1);
+        assert_close_i32(gte_sy, cpu_projected.sy as i32, 1);
+    }
+
+    #[test]
     fn world_projection_accepts_vertices_on_near_plane() {
         let projection = WorldProjection::new(160, 120, 200, 40);
 
@@ -1875,6 +2405,21 @@ mod tests {
         assert_eq!(
             commands[2],
             world_command_layer(5, 300, WorldRenderLayer::Opaque, 0)
+        );
+    }
+
+    fn dot_q12_row_i16(row: [i16; 3], v: Vec3I16) -> i32 {
+        ((row[0] as i32) * (v.x as i32)
+            + (row[1] as i32) * (v.y as i32)
+            + (row[2] as i32) * (v.z as i32))
+            >> 12
+    }
+
+    fn assert_close_i32(actual: i32, expected: i32, tolerance: i32) {
+        let delta = actual.saturating_sub(expected).abs();
+        assert!(
+            delta <= tolerance,
+            "actual {actual}, expected {expected}, delta {delta}, tolerance {tolerance}"
         );
     }
 }

@@ -147,9 +147,8 @@ fn main() {
             let vram_path = out_dir.join(format!("vram_{:012}.ppm", i));
             dump_full_vram(&bus, &vram_path).expect("vram");
             let now = std::time::Instant::now();
-            let mips = (i - last_log_step) as f64
-                / now.duration_since(last_log_time).as_secs_f64()
-                / 1e6;
+            let mips =
+                (i - last_log_step) as f64 / now.duration_since(last_log_time).as_secs_f64() / 1e6;
             eprintln!(
                 "[probe] step {i:>12}  vblank={:>5}  pad=0x{current_mask:04x}  dumped {} ({:.1} MIPS)",
                 bus.irq().raise_counts()[0],

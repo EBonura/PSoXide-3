@@ -15,5 +15,8 @@ psx-pad  = { workspace = true }
 psx-spu  = { workspace = true }
 psx-vram = { workspace = true }
 
+[target.'cfg(target_arch = "mips")'.dependencies]
+psx-rt = { workspace = true }
+
 [lints.rust]
 missing_docs = "warn"

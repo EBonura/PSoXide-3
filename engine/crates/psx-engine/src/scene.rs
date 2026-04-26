@@ -4,8 +4,8 @@
 //! [`Scene::init`] once at boot, then [`Scene::update`] + [`Scene::render`]
 //! in a loop, passing a [`Ctx`] that carries the live-per-frame
 //! things the scene needs: the current pad state (with edge-detection
-//! helpers), the frame counter, and a [`FrameBuffer`] ready to draw
-//! into.
+//! helpers), the render-frame counter, engine time, and a
+//! [`FrameBuffer`] ready to draw into.
 //!
 //! The split into `update` + `render` is cosmetic — both get the
 //! same `Ctx`. Keeping them separate reads better and makes it easy
@@ -13,7 +13,9 @@
 //! update, replay without re-rendering, etc).
 
 use psx_gpu::framebuf::FrameBuffer;
-use psx_pad::{ButtonState, button};
+use psx_pad::{button, ButtonState};
+
+use crate::time::EngineTime;
 
 /// Per-frame context passed to [`Scene::update`] and
 /// [`Scene::render`]. The engine owns and updates this between
@@ -27,6 +29,11 @@ pub struct Ctx {
     /// raw `u32` so the common `frame % N` / `frame & N` cases
     /// compose without unwrap ceremony.
     pub frame: u32,
+    /// PS1 display-time snapshot for this app iteration. Unlike
+    /// `frame`, this advances by elapsed VBlanks, so heavy render
+    /// paths can keep animation/simulation time independent of
+    /// rendered FPS.
+    pub time: EngineTime,
     /// Port-1 pad state this frame.
     pub pad: ButtonState,
     /// Port-1 pad state last frame — used by [`Ctx::just_pressed`]

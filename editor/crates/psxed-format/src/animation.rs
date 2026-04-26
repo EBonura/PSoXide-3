@@ -1,9 +1,10 @@
 //! On-disk layout for cooked rigid-skeletal animations (`.psxanim`).
 //!
 //! The animation format stores already-sampled fixed-point joint pose
-//! matrices. Runtime code can index a frame, fetch the joint record for
-//! each model part, and submit transformed triangles without evaluating
-//! glTF channels, quaternions, or keyframe interpolation on the PS1.
+//! matrices. Runtime code can index or cheaply interpolate between
+//! sampled frames, fetch the joint record for each model part, and
+//! submit transformed triangles without evaluating glTF channels or
+//! quaternions on the PS1.
 //!
 //! # File layout
 //!
