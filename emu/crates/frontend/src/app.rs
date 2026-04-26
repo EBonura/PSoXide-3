@@ -42,6 +42,8 @@ pub struct PanelVisibility {
     pub memory: bool,
     /// VRAM thumbnail at the bottom of the screen.
     pub vram: bool,
+    /// Floating frame-profiler window.
+    pub profiler: bool,
 }
 
 impl Default for PanelVisibility {
@@ -52,6 +54,7 @@ impl Default for PanelVisibility {
             registers: false,
             memory: false,
             vram: false,
+            profiler: false,
         }
     }
 }
@@ -114,6 +117,8 @@ pub struct AppState {
     pub bus: Option<Bus>,
     pub menu: MenuState,
     pub hud: HudState,
+    /// Rolling frame-time breakdown, visible from the profiler toolbar button.
+    pub profiler: ui::profiler::FrameProfiler,
     pub memory_view: MemoryView,
     /// When true, the shell advances emulation on each redraw. Toggled
     /// via the Menu's Run/Pause item.
@@ -231,6 +236,7 @@ impl AppState {
             bus,
             menu: MenuState::new(),
             hud: HudState::default(),
+            profiler: ui::profiler::FrameProfiler::default(),
             memory_view: MemoryView::default(),
             running: false,
             run_steps_per_frame: 1_000_000,
@@ -770,22 +776,33 @@ pub fn push_history(history: &mut VecDeque<InstructionRecord>, record: Instructi
     history.push_back(record);
 }
 
-/// Retire enough instructions to cover one NTSC frame's worth of PSX
+/// Guest-side work performed while advancing one video frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StepFrameReport {
+    /// Cycle budget for the target video frame.
+    pub target_cycles: u64,
+    /// Bus cycles actually advanced.
+    pub cycles: u64,
+    /// CPU instructions retired.
+    pub instructions: u64,
+    /// VBlank IRQ raises observed while stepping.
+    pub vblanks: u64,
+    /// True when the safety instruction cap stopped the frame early.
+    pub hit_step_cap: bool,
+}
+
+/// Retire enough instructions to cover one PSX video frame's worth of
 /// master-clock cycles. Any execution error auto-pauses, reopens the
 /// Menu, and surfaces the stopped state via the register panel. Hitting
 /// a breakpoint does the same. Split out here (rather than living in
 /// the shell loop) so both the shell's per-frame run path and the
 /// toolbar's "advance one frame" button can invoke the same logic.
-pub fn step_one_frame(state: &mut AppState) {
-    const PSX_MASTER_CLOCK_HZ: u64 = 33_868_800;
-    const NTSC_FRAMES_PER_SECOND: u64 = 60;
-    const CYCLES_PER_FRAME: u64 = PSX_MASTER_CLOCK_HZ / NTSC_FRAMES_PER_SECOND;
-
+pub fn step_one_frame(state: &mut AppState) -> StepFrameReport {
     let max_steps = state.run_steps_per_frame.max(1);
     let Some(bus) = state.bus.as_mut() else {
         state.running = false;
         state.menu.sync_run_label(false);
-        return;
+        return StepFrameReport::default();
     };
 
     // Only fill `exec_history` when the registers panel is open —
@@ -793,7 +810,12 @@ pub fn step_one_frame(state: &mut AppState) {
     // overhead. The panel is closed by default on first run, so
     // most users get the fast `step()` path automatically.
     let trace = state.panels.registers;
-    let target_cycles = bus.cycles().saturating_add(CYCLES_PER_FRAME);
+    let cycles_before = bus.cycles();
+    let tick_before = state.cpu.tick();
+    let vblank_before = bus.irq().raise_counts()[0];
+    let frame_budget = bus.vblank_period().max(1);
+    let target_cycles = cycles_before.saturating_add(frame_budget);
+    let mut steps_run = 0;
     for _ in 0..max_steps {
         if bus.cycles() >= target_cycles {
             break;
@@ -807,6 +829,7 @@ pub fn step_one_frame(state: &mut AppState) {
             state.menu.open = true;
             break;
         }
+        steps_run += 1;
 
         let result = if trace {
             match state.cpu.step_traced(bus) {
@@ -825,6 +848,16 @@ pub fn step_one_frame(state: &mut AppState) {
             state.menu.open = true;
             break;
         }
+    }
+
+    let cycles_after = bus.cycles();
+    let vblank_after = bus.irq().raise_counts()[0];
+    StepFrameReport {
+        target_cycles: frame_budget,
+        cycles: cycles_after.saturating_sub(cycles_before),
+        instructions: state.cpu.tick().saturating_sub(tick_before),
+        vblanks: vblank_after.saturating_sub(vblank_before),
+        hit_step_cap: steps_run >= max_steps && cycles_after < target_cycles && state.running,
     }
 }
 

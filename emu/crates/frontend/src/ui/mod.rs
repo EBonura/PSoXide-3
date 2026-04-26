@@ -8,6 +8,7 @@
 pub mod framebuffer;
 pub mod hud;
 pub mod memory;
+pub mod profiler;
 pub mod registers;
 pub mod toolbar;
 pub mod vram;
@@ -29,6 +30,9 @@ pub fn draw_layout(
 
     if state.workspace.is_editor() {
         state.editor.draw(ctx);
+        if state.panels.profiler {
+            profiler::draw(ctx, &mut state.profiler);
+        }
         state.menu.draw(ctx, dt);
         draw_status_toast(ctx, state);
         return;
@@ -58,6 +62,9 @@ pub fn draw_layout(
     }
     if state.panels.vram {
         vram::draw(ctx, vram_tex);
+    }
+    if state.panels.profiler {
+        profiler::draw(ctx, &mut state.profiler);
     }
 
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -160,6 +167,10 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
         }
         ToggleVram => {
             state.panels.vram = !state.panels.vram;
+            MenuOutcome::None
+        }
+        ToggleProfiler => {
+            state.panels.profiler = !state.panels.profiler;
             MenuOutcome::None
         }
         Quit => MenuOutcome::Quit,

@@ -61,6 +61,8 @@ pub enum MenuAction {
     ToggleMemory,
     /// Toggle visibility of the VRAM bottom panel.
     ToggleVram,
+    /// Toggle visibility of the frame-profiler window.
+    ToggleProfiler,
     /// Quit the application.
     Quit,
 }
@@ -689,6 +691,11 @@ fn build_debug_category() -> Category {
             MenuItem {
                 label: "Toggle VRAM panel".into(),
                 action: MenuAction::ToggleVram,
+                value: None,
+            },
+            MenuItem {
+                label: "Toggle profiler".into(),
+                action: MenuAction::ToggleProfiler,
                 value: None,
             },
             MenuItem {

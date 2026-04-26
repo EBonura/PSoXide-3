@@ -32,6 +32,7 @@ src/
     ├── mod.rs        # draw_layout — composes panels in layer order
     ├── registers.rs  # CPU + COP0 + history + breakpoints side panel
     ├── memory.rs     # hex+ASCII viewer, quick-jump, BP toggle
+    ├── profiler.rs   # rolling frame-time breakdown + stderr summaries
     ├── vram.rs       # 1024×512 VRAM as an egui::Image
     ├── hud.rs        # FPS / frame-time / tick overlay
     └── menu.rs        # Menu menu, Painter-drawn on Middle layer
@@ -43,8 +44,9 @@ src/
 2. **Register side panel** (left, `egui::SidePanel::left`).
 3. **Memory side panel** (right, `egui::SidePanel::right`, hidden by default).
 4. **VRAM bottom panel** (`egui::TopBottomPanel::bottom`).
-5. **Menu overlay** on `egui::Order::Middle` — dims background, slides animated category icons.
-6. **HUD bar** on `egui::Order::Foreground` — always on top, above Menu.
+5. **Profiler window** (`egui::Window`, hidden by default).
+6. **Menu overlay** on `egui::Order::Middle` — dims background, slides animated category icons.
+7. **HUD bar** on `egui::Order::Foreground` — always on top, above Menu.
 
 Each panel is its own module, so adding a new one is about 150 lines and touching `ui/mod.rs`' layout-orchestration function.
 
@@ -59,8 +61,11 @@ winit event
         2. MenuState::update(input) → Option<MenuAction>
         3. ui::apply_menu_action (run/step/reset/toggle panels)
         4. run loop: bus + cpu → exec_history ring, breakpoint check
-        5. Graphics::prepare_vram(state.bus?.gpu.vram)
-        6. Graphics::render(|ctx| ui::draw_layout(...))
+        5. GPU command-log drain + optional compute replay
+        6. Graphics::prepare_vram(state.bus?.gpu.vram)
+        7. HW renderer scale/update + frame replay
+        8. Graphics::render(|ctx| ui::draw_layout(...))
+        9. FrameProfiler::record(sample)
 ```
 
 Key pattern: `run_frame` destructures `state` so `state.bus`, `state.cpu`, and `state.exec_history` are three disjoint field borrows Rust accepts simultaneously. A `&mut self` method on `AppState` would block that.
@@ -70,6 +75,23 @@ Key pattern: `run_frame` destructures `state` so `state.bus`, `state.cpu`, and `
 `Graphics` owns a persistent `wgpu::Texture` (1024×512, `Rgba8UnormSrgb`, `TEXTURE_BINDING | COPY_DST`) registered with the egui-wgpu renderer as a native texture once at startup. Every frame, `prepare_vram` decodes the 16bpp VRAM into an RGBA8 scratch buffer (full-range `(v<<3)|(v>>2)` expansion, not the naive `v<<3` that loses 8% of white brightness) and `queue.write_texture`s it onto the persistent target.
 
 The VRAM panel then renders the single `egui::Image` referencing this texture — all three panels (game view, VRAM view, and future framebuffer clip) will eventually share the same upload by differing only in their `uv` rect.
+
+## Frame profiler
+
+The toolbar's monitor button opens a floating profiler window. It records a
+rolling sample per redraw: input/Menu, guest emulation, SPU/audio, command-log
+drain, compute replay, VRAM upload, hardware-render scale/clone/replay, and
+egui/wgpu presentation. The same sample includes emulated frame count, CPU
+ticks, bus cycles, emulated VBlank cadence, draw-producing VBlank cadence,
+step-cap misses, GTE command load, GP0 command counts, draw/image command
+splits, FIFO words, and current hardware-renderer scale.
+
+For terminal-accessible measurements, launch with `PSOXIDE_PROFILE=1` to print
+a rolling one-line average roughly once per second. Use
+`PSOXIDE_PROFILE=trace` to print every frame. In those lines, host timings
+remain in milliseconds, while `emu_hz`, `draw_hz`, `cyc_f`, `budget_f`,
+`instr_f`, `gte_f`, and `gtecy_f` describe the emulated PS1 workload and
+cadence.
 
 ## Menu mechanics
 

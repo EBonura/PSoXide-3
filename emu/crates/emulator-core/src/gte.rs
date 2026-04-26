@@ -168,6 +168,59 @@ pub struct Gte {
     zsf4: i16,
     /// FLAG — error/saturation bits. Bit 31 is the OR of [`flag::ERROR_MASK`].
     flag: u32,
+    /// Diagnostic command counter. This deliberately does not drive
+    /// timing yet; it lets frontends report GTE pressure separately
+    /// from the current CPU/bus cycle model.
+    profile_ops: u64,
+    /// Sum of documented GTE command latencies for recognised ops.
+    /// Real hardware can hide some of this behind independent CPU
+    /// work, so consumers should treat it as internal GTE load rather
+    /// than extra bus cycles.
+    profile_estimated_cycles: u64,
+    /// Per-opcode diagnostic counts, indexed by the low 6 command bits.
+    profile_opcode_counts: [u64; 64],
+}
+
+/// Monotonic diagnostic counters for GTE command pressure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GteProfileSnapshot {
+    /// Recognised GTE function commands executed since reset.
+    pub ops: u64,
+    /// Sum of estimated internal GTE cycles since reset.
+    pub estimated_cycles: u64,
+    /// Per-opcode command counts, indexed by the low 6 command bits.
+    pub opcode_counts: [u64; 64],
+}
+
+/// Documented command latencies from the public PSX GTE tables. The
+/// profiler reports these as internal GTE load only; the emulator's
+/// bus cycle counter remains the source of truth for elapsed guest time.
+fn gte_command_cycles(opcode: u8) -> Option<u8> {
+    match opcode {
+        0x01 => Some(15), // RTPS
+        0x06 => Some(8),  // NCLIP
+        0x0C => Some(6),  // OP
+        0x10 => Some(8),  // DPCS
+        0x11 => Some(8),  // INTPL
+        0x12 => Some(8),  // MVMVA
+        0x13 => Some(19), // NCDS
+        0x14 => Some(13), // CDP
+        0x16 => Some(44), // NCDT
+        0x1B => Some(17), // NCCS
+        0x1C => Some(11), // CC
+        0x1E => Some(14), // NCS
+        0x20 => Some(30), // NCT
+        0x28 => Some(5),  // SQR
+        0x29 => Some(8),  // DCPL
+        0x2A => Some(17), // DPCT
+        0x2D => Some(5),  // AVSZ3
+        0x2E => Some(6),  // AVSZ4
+        0x30 => Some(23), // RTPT
+        0x3D => Some(5),  // GPF
+        0x3E => Some(5),  // GPL
+        0x3F => Some(39), // NCCT
+        _ => None,
+    }
 }
 
 impl Gte {
@@ -204,6 +257,18 @@ impl Gte {
             zsf3: 0,
             zsf4: 0,
             flag: 0,
+            profile_ops: 0,
+            profile_estimated_cycles: 0,
+            profile_opcode_counts: [0; 64],
+        }
+    }
+
+    /// Current monotonic GTE diagnostic counters.
+    pub fn profile_snapshot(&self) -> GteProfileSnapshot {
+        GteProfileSnapshot {
+            ops: self.profile_ops,
+            estimated_cycles: self.profile_estimated_cycles,
+            opcode_counts: self.profile_opcode_counts,
         }
     }
 
@@ -460,6 +525,13 @@ impl Gte {
     pub fn execute(&mut self, instr: u32) {
         let cmd = Cmd::decode(instr);
         let opcode = (instr & 0x3F) as u8;
+        if let Some(cycles) = gte_command_cycles(opcode) {
+            self.profile_ops = self.profile_ops.saturating_add(1);
+            self.profile_estimated_cycles =
+                self.profile_estimated_cycles.saturating_add(cycles as u64);
+            self.profile_opcode_counts[opcode as usize] =
+                self.profile_opcode_counts[opcode as usize].saturating_add(1);
+        }
         self.flag = 0;
         match opcode {
             0x01 => self.op_rtps(cmd, 0, true),
@@ -1499,6 +1571,22 @@ mod tests {
         let mut g = Gte::new();
         g.execute(0x00); // not a valid GTE op
         assert_eq!(g.read_control(31), 0);
+    }
+
+    #[test]
+    fn profile_counts_recognised_commands_only() {
+        let mut g = Gte::new();
+
+        g.execute(0x01); // RTPS
+        g.execute(0x30); // RTPT
+        g.execute(0x00); // undefined nop
+
+        let profile = g.profile_snapshot();
+        assert_eq!(profile.ops, 2);
+        assert_eq!(profile.estimated_cycles, 15 + 23);
+        assert_eq!(profile.opcode_counts[0x01], 1);
+        assert_eq!(profile.opcode_counts[0x30], 1);
+        assert_eq!(profile.opcode_counts[0x00], 0);
     }
 
     // ------------------------------------------------------------------

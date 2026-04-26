@@ -3,9 +3,8 @@
 //! Two halves on a single strip:
 //!
 //! - **Left**: live emulator status. Colored dot + RUNNING/PAUSED
-//!   label, followed by FPS / MIPS / frame-time — the same values
-//!   the bottom HUD used to show, now consolidated so the
-//!   framebuffer isn't bracketed by two metric bars.
+//!   label, followed by PS1 emulation cadence, draw cadence, host
+//!   redraw rate, MIPS, frame-time, and audio backlog.
 //! - **Right**: icon buttons. Play/pause (context-sensitive),
 //!   reset, advance-one-frame. Clicking fires the same state
 //!   transition as the equivalent Menu menu item.
@@ -14,7 +13,7 @@
 //!
 //! ```text
 //!  ┌────────────────────────────────────────────────────────────────┐
-//!  │ ● RUNNING    60.0 FPS   58 MIPS   16.7 ms            ▶  ⟲  ⇥ │
+//!  │ ● RUNNING    EMU 60.0   DRAW 30.0   HOST 120.0       ▶  ⟲  ⇥ │
 //!  └────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -39,7 +38,7 @@ const TOOLBAR_MARGIN_X: f32 = 8.0;
 /// Gap between the metrics lane and the controls lane.
 const TOOLBAR_CLUSTER_GAP: f32 = 8.0;
 /// Right-side lane: transport, volume slider, BIOS toggle, debug toggles.
-const CONTROLS_WIDTH: f32 = 560.0;
+const CONTROLS_WIDTH: f32 = 600.0;
 /// Keep enough room for the status dot + RUNNING/PAUSED label.
 const METRICS_MIN_WIDTH: f32 = 116.0;
 /// Slider width used in the toolbar.
@@ -226,6 +225,12 @@ fn draw_debug_toggles(ui: &mut egui::Ui, state: &mut AppState) {
     );
     debug_toggle(
         ui,
+        icons::MONITOR,
+        "Toggle frame profiler",
+        &mut state.panels.profiler,
+    );
+    debug_toggle(
+        ui,
         icons::TERMINAL,
         "Toggle memory viewer",
         &mut state.panels.memory,
@@ -306,15 +311,30 @@ fn draw_metrics(ui: &mut egui::Ui, state: &AppState, available_width: f32) {
     ui.add_space(4.0);
     ui.add(toolbar_label(status_label, METRIC_TEXT));
 
-    let fps = state.hud.fps();
+    let host_fps = state.hud.fps();
     let ms = state.hud.average_dt() * 1000.0;
     let mips = state.hud.ips() / 1_000_000.0;
     let audio = state.hud.audio_queue_len();
+    let profile_avg = state.profiler.average();
+    let emu_hz = profile_avg
+        .map(|sample| sample.emulated_vblank_hz())
+        .unwrap_or(0.0);
+    let draw_hz = profile_avg
+        .map(|sample| sample.psx_draw_hz())
+        .unwrap_or(0.0);
 
-    maybe_metric(ui, available_width, 170.0, "FPS", format!("{fps:4.1}"));
-    maybe_metric(ui, available_width, 260.0, "MIPS", format!("{mips:4.1}"));
-    maybe_metric(ui, available_width, 360.0, "dt", format!("{ms:4.1} ms"));
-    maybe_metric(ui, available_width, 460.0, "AUDIO", format!("{audio}"));
+    maybe_metric(ui, available_width, 170.0, "EMU", format!("{emu_hz:4.1}"));
+    maybe_metric(ui, available_width, 260.0, "DRAW", format!("{draw_hz:4.1}"));
+    maybe_metric(
+        ui,
+        available_width,
+        360.0,
+        "HOST",
+        format!("{host_fps:4.1}"),
+    );
+    maybe_metric(ui, available_width, 460.0, "MIPS", format!("{mips:4.1}"));
+    maybe_metric(ui, available_width, 560.0, "dt", format!("{ms:4.1} ms"));
+    maybe_metric(ui, available_width, 660.0, "AUDIO", format!("{audio}"));
 }
 
 /// One "LABEL value" pair, formatted so the label is dim and the

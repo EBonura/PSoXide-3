@@ -110,9 +110,18 @@ The top-of-window toolbar shows live metrics (FPS / MIPS / frame time / audio-qu
 - **CPU** — registers + exec history + breakpoints
 - **TERMINAL** — memory viewer with hex + disassembly
 - **LAYERS** — full VRAM overview
+- **MONITOR** — frame profiler with host timings, PS1 cycle-budget load, GTE counters, GPU command counts, and 60/30 fps budget lines
 - **GRID** — wireframe mode (triangles render as edges only)
 
 Each button tints green when its target is active.
+
+For log-based profiling, launch the frontend with `PSOXIDE_PROFILE=1` for
+one-line rolling summaries, or `PSOXIDE_PROFILE=trace` for every frame.
+The toolbar/profiler separate host wall-clock timing from guest PS1 work:
+`EMU`/`emu_hz` is emulated VBlank cadence, `DRAW`/`draw_hz` is the cadence of
+VBlanks that actually produced draw packets, and `HOST`/`host_fps` is desktop
+redraw cadence. `cyc_f`/`budget_f` show cycles per emulated frame, and
+`gte_f`/`gtecy_f` show GTE command load.
 
 ### Canary milestone ladder
 

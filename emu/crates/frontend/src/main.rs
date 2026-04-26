@@ -32,6 +32,7 @@ use winit::window::{Window, WindowId};
 use crate::app::AppState;
 use crate::cli::Cli;
 use crate::gfx::Graphics;
+use crate::ui::profiler::FrameProfileSample;
 use crate::ui::{menu::MenuInput, MenuOutcome};
 
 use emulator_core::{button, spu::SAMPLE_CYCLES};
@@ -54,6 +55,10 @@ const TARGET_FRAME_DT: f32 = 1.0 / 60.0;
 /// cap the burst so a debugger stop or window drag doesn't spend
 /// seconds chewing through delayed emu frames.
 const MAX_CATCHUP_FRAMES: u32 = 4;
+
+fn elapsed_ms(start: Instant) -> f32 {
+    start.elapsed().as_secs_f32() * 1000.0
+}
 
 fn main() {
     // Argument parsing first — if a subcommand is present, we
@@ -350,10 +355,20 @@ impl ApplicationHandler for Shell {
                 gfx.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                let profile_start = Instant::now();
                 let now = Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
+                let cpu_tick_before = self.state.cpu.tick();
+                let gte_profile_before = self.state.cpu.cop2().profile_snapshot();
+                let bus_cycles_before =
+                    self.state.bus.as_ref().map(|bus| bus.cycles()).unwrap_or(0);
+                let mut profile = FrameProfileSample {
+                    host_dt_ms: dt * 1000.0,
+                    ..FrameProfileSample::default()
+                };
 
+                let input_start = Instant::now();
                 let mut input = std::mem::take(&mut self.pending_input);
 
                 // Poll the gamepad router BEFORE doing anything
@@ -438,6 +453,7 @@ impl ApplicationHandler for Shell {
                         return;
                     }
                 }
+                profile.input_ms = elapsed_ms(input_start);
 
                 // Arm GPU command capture before stepping so the HW /
                 // compute sidecars see the frame that is about to run.
@@ -453,7 +469,7 @@ impl ApplicationHandler for Shell {
                     }
                 }
 
-                // Run loop: retire one NTSC frame's worth of PSX cycles
+                // Run loop: retire one video frame's worth of PSX cycles
                 // if we're in run mode. Any execution error auto-pauses
                 // and surfaces via the register panel. History captures
                 // only the tail via `push_history`'s ring-buffer semantics.
@@ -483,7 +499,31 @@ impl ApplicationHandler for Shell {
                     for _ in 0..frames_to_run {
                         let cycles_before =
                             self.state.bus.as_ref().map(|bus| bus.cycles()).unwrap_or(0);
-                        app::step_one_frame(&mut self.state);
+                        let draw_log_start = self
+                            .state
+                            .bus
+                            .as_ref()
+                            .map(|bus| bus.gpu.cmd_log.len())
+                            .unwrap_or(0);
+                        let emu_start = Instant::now();
+                        let step_report = app::step_one_frame(&mut self.state);
+                        profile.emu_ms += elapsed_ms(emu_start);
+                        profile.frames_run += 1.0;
+                        profile.psx_budget_cycles += step_report.target_cycles as f32;
+                        profile.psx_vblanks += step_report.vblanks as f32;
+                        if step_report.vblanks > 0
+                            && self
+                                .state
+                                .bus
+                                .as_ref()
+                                .map(|bus| gpu_log_has_draw(&bus.gpu.cmd_log[draw_log_start..]))
+                                .unwrap_or(false)
+                        {
+                            profile.psx_draw_vblanks += 1.0;
+                        }
+                        if step_report.hit_step_cap {
+                            profile.psx_step_cap_misses += 1.0;
+                        }
 
                         // Pump the SPU by however much emulated time the
                         // CPU just advanced, not by "one host redraw".
@@ -491,6 +531,7 @@ impl ApplicationHandler for Shell {
                         // clock even on 120 Hz / 144 Hz hosts or slow
                         // frames, matching the SPU's 768-cycles/sample
                         // timing model.
+                        let audio_start = Instant::now();
                         let effective_audio_volume = self.state.effective_audio_volume();
                         if let Some(bus) = self.state.bus.as_mut() {
                             let cycles_after = bus.cycles();
@@ -516,6 +557,7 @@ impl ApplicationHandler for Shell {
                                 let _ = bus.spu.drain_audio();
                             }
                         }
+                        profile.audio_ms += elapsed_ms(audio_start);
                     }
                     self.emu_frame_accum -= (frames_to_run as f32) * TARGET_FRAME_DT;
                 } else {
@@ -525,20 +567,43 @@ impl ApplicationHandler for Shell {
                     // resume doesn't inherit cycles from an older run.
                     self.audio_cycle_accum = 0;
                 }
+                profile.cpu_ticks = self.state.cpu.tick().saturating_sub(cpu_tick_before) as f32;
+                profile.bus_cycles = self
+                    .state
+                    .bus
+                    .as_ref()
+                    .map(|bus| bus.cycles().saturating_sub(bus_cycles_before))
+                    .unwrap_or(0) as f32;
+                let gte_profile_after = self.state.cpu.cop2().profile_snapshot();
+                profile.gte_ops =
+                    gte_profile_after.ops.saturating_sub(gte_profile_before.ops) as f32;
+                profile.gte_estimated_cycles = gte_profile_after
+                    .estimated_cycles
+                    .saturating_sub(gte_profile_before.estimated_cycles)
+                    as f32;
 
                 let state = &mut self.state;
 
+                let cmd_log_start = Instant::now();
                 let frame_log = if let Some(bus) = state.bus.as_mut() {
                     std::mem::take(&mut bus.gpu.cmd_log)
                 } else {
                     Vec::new()
                 };
+                profile.cmd_log_ms = elapsed_ms(cmd_log_start);
+                let (gpu_cmds, gpu_words, gpu_draw_cmds, gpu_image_cmds) =
+                    gpu_log_counters(&frame_log);
+                profile.gpu_cmds = gpu_cmds as f32;
+                profile.gpu_words = gpu_words as f32;
+                profile.gpu_draw_cmds = gpu_draw_cmds as f32;
+                profile.gpu_image_cmds = gpu_image_cmds as f32;
 
                 // Phase C: drain the CPU rasterizer's `cmd_log` and
                 // replay each GP0 packet onto the compute backend.
                 // This runs for every frame the bus advanced (or
                 // not, when paused — in which case `cmd_log` will
                 // be empty and the loop is a no-op).
+                let compute_start = Instant::now();
                 if let (Some(backend), Some(bus)) =
                     (self.compute_backend.as_mut(), state.bus.as_mut())
                 {
@@ -556,9 +621,15 @@ impl ApplicationHandler for Shell {
                         owner.fill(u32::MAX);
                     }
                 }
+                profile.compute_ms = elapsed_ms(compute_start);
 
+                let vram_upload_start = Instant::now();
                 gfx.prepare_vram(state.bus.as_ref().map(|b| &b.gpu.vram));
+                profile.vram_upload_ms = elapsed_ms(vram_upload_start);
+
+                let display_upload_start = Instant::now();
                 gfx.prepare_24bpp_display(state.bus.as_ref().map(|b| &b.gpu));
+                profile.display_upload_ms = elapsed_ms(display_upload_start);
 
                 // Match the HW renderer's internal scale to the
                 // current Native↔Window mode + framebuffer pixel budget.
@@ -577,20 +648,29 @@ impl ApplicationHandler for Shell {
                         ((area.width as u32).max(320), (area.height as u32).max(240))
                     })
                     .unwrap_or((320, 240));
+                let hw_scale_start = Instant::now();
                 gfx.update_hw_scale(scale_mode, state.framebuffer_present_size_px, display_size);
+                profile.hw_scale_ms = elapsed_ms(hw_scale_start);
+                profile.hw_scale = gfx.hw_internal_scale() as f32;
 
                 // Drive the hardware renderer once per frame. The
                 // VRAM-shaped target persists across frames the way
                 // PSX VRAM does; the framebuffer panel UV-samples
                 // the active display sub-rect.
                 if let Some(bus) = state.bus.as_mut() {
+                    let clone_start = Instant::now();
                     let vram_words = bus.gpu.vram.words().to_vec();
+                    profile.hw_vram_clone_ms = elapsed_ms(clone_start);
+                    let hw_render_start = Instant::now();
                     gfx.render_hw_frame(&bus.gpu, &frame_log, &vram_words);
+                    profile.hw_render_ms = elapsed_ms(hw_render_start);
                 } else {
                     let empty_log: Vec<emulator_core::gpu::GpuCmdLogEntry> = Vec::new();
                     let empty_vram: Vec<u16> = vec![0; 1024 * 512];
                     let dummy_gpu = emulator_core::Gpu::new();
+                    let hw_render_start = Instant::now();
                     gfx.render_hw_frame(&dummy_gpu, &empty_log, &empty_vram);
+                    profile.hw_render_ms = elapsed_ms(hw_render_start);
                 }
 
                 let vram_tex = gfx.vram_texture_id();
@@ -610,9 +690,13 @@ impl ApplicationHandler for Shell {
                         ui::framebuffer::FramebufferSource::HardwareVram,
                     )
                 };
-                gfx.render(|ctx| {
+                profile.egui = gfx.render(|ctx| {
                     app::build_ui(ctx, state, vram_tex, display_tex, framebuffer_source, dt)
                 });
+                profile.total_ms = elapsed_ms(profile_start);
+                if let Some(line) = state.profiler.record(profile) {
+                    eprintln!("{line}");
+                }
             }
             _ => {
                 if !consumed {
@@ -646,6 +730,25 @@ fn merge_key(mut input: MenuInput, key: &Key) -> MenuInput {
         _ => {}
     }
     input
+}
+
+fn gpu_log_counters(log: &[emulator_core::gpu::GpuCmdLogEntry]) -> (usize, usize, usize, usize) {
+    let mut words = 0usize;
+    let mut draw_cmds = 0usize;
+    let mut image_cmds = 0usize;
+    for entry in log {
+        words = words.saturating_add(entry.fifo.len());
+        match entry.opcode {
+            0x20..=0x7F => draw_cmds += 1,
+            0x80..=0xBF => image_cmds += 1,
+            _ => {}
+        }
+    }
+    (log.len(), words, draw_cmds, image_cmds)
+}
+
+fn gpu_log_has_draw(log: &[emulator_core::gpu::GpuCmdLogEntry]) -> bool {
+    log.iter().any(|entry| matches!(entry.opcode, 0x20..=0x7F))
 }
 
 #[cfg(test)]
