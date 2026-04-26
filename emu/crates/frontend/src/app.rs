@@ -56,15 +56,14 @@ impl Default for PanelVisibility {
     }
 }
 
-/// How the framebuffer panel scales the PSX display into the host
-/// window. Toggled from the debug toolbar.
+/// Hardware-renderer internal scale mode. Both modes use the same
+/// renderer; Native forces scale 1, Window chooses a larger scale
+/// from the framebuffer panel size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleMode {
-    /// Hardware-rendered high-resolution mode fitted to the
-    /// available framebuffer area at CRT aspect.
+    /// Internal scale chosen from the available framebuffer area.
     Window,
-    /// CPU-reference native PSX render resolution, presented in the
-    /// same framebuffer area as high-res mode.
+    /// Internal scale 1, presented in the same framebuffer area.
     Native,
 }
 
@@ -99,8 +98,8 @@ pub struct AppState {
     /// state survives a quick trip back to the Menu/emulator.
     pub editor: EditorWorkspace,
     pub panels: PanelVisibility,
-    /// Framebuffer mode — CPU-reference native rendering vs HW high-res
-    /// rendering fitted to the panel. Toggled via the debug toolbar.
+    /// Framebuffer mode — shared HW renderer at native scale vs
+    /// window-fitted high resolution. Toggled via the debug toolbar.
     pub scale_mode: ScaleMode,
     /// Physical pixel size used by the central framebuffer on the
     /// previous UI frame. The renderer uses this as its internal
@@ -971,8 +970,7 @@ pub fn build_ui(
     state: &mut AppState,
     vram_tex: egui::TextureId,
     display_tex: egui::TextureId,
-    framebuffer_source: ui::framebuffer::FramebufferSource,
     dt: f32,
 ) {
-    ui::draw_layout(ctx, state, vram_tex, display_tex, framebuffer_source, dt);
+    ui::draw_layout(ctx, state, vram_tex, display_tex, dt);
 }

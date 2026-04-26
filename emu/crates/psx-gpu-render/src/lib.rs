@@ -41,6 +41,7 @@ pub use pipeline::{BlendKind, HwPipeline, HwVertex};
 pub use target::{RenderTarget, MAX_SCALE, VRAM_HEIGHT, VRAM_WIDTH};
 pub use translator::{DrawRun, TranslatedFrame, Translator};
 
+use emulator_core::gpu::GpuCmdLogEntry;
 use emulator_core::Gpu;
 
 /// Top-level HW renderer. Owns the wgpu pipeline + the VRAM-shaped
@@ -156,22 +157,36 @@ impl HwRenderer {
     /// VRAM-style persistence holds across frames. `vram_words` is
     /// the CPU rasterizer's VRAM (post-frame) which the fragment
     /// shader reads for textured primitives.
-    pub fn render_frame(
-        &mut self,
-        gpu: &Gpu,
-        cmd_log: &[emulator_core::gpu::GpuCmdLogEntry],
-        vram_words: &[u16],
-    ) {
+    pub fn render_frame(&mut self, gpu: &Gpu, cmd_log: &[GpuCmdLogEntry], vram_words: &[u16]) {
         self.pipeline.upload_vram(&self.queue, vram_words);
 
-        let frame = self
-            .translator
-            .translate_with_wireframe(cmd_log, gpu.wireframe_enabled);
-        if frame.total() > 0 {
-            self.pipeline
-                .upload_vertices(&self.queue, bytemuck::cast_slice(frame.vertices));
+        let mut segment_start = 0;
+        for (i, entry) in cmd_log.iter().enumerate() {
+            if is_vram_image_op(entry) {
+                self.render_draw_segment(&cmd_log[segment_start..i], gpu.wireframe_enabled);
+                self.mirror_vram_image_op(entry, vram_words);
+                segment_start = i + 1;
+            }
+        }
+        self.render_draw_segment(&cmd_log[segment_start..], gpu.wireframe_enabled);
+    }
+
+    fn render_draw_segment(&mut self, cmd_log: &[GpuCmdLogEntry], wireframe: bool) {
+        if cmd_log.is_empty() {
+            return;
         }
 
+        let frame = self.translator.translate_with_wireframe(cmd_log, wireframe);
+        if frame.total() > 0 {
+            let vertices = frame.vertices.to_vec();
+            let runs = frame.runs.to_vec();
+            self.pipeline
+                .upload_vertices(&self.queue, bytemuck::cast_slice(&vertices));
+            self.draw_runs(&runs);
+        }
+    }
+
+    fn draw_runs(&mut self, runs: &[DrawRun]) {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -198,7 +213,7 @@ impl HwRenderer {
 
             let scale = self.target.scale();
             let (target_w, target_h) = self.target.size();
-            for run in frame.runs {
+            for run in runs {
                 if run.count == 0 || run.clip[0] > run.clip[2] || run.clip[1] > run.clip[3] {
                     continue;
                 }
@@ -216,6 +231,243 @@ impl HwRenderer {
             }
         }
         self.queue.submit(Some(encoder.finish()));
+    }
+
+    fn mirror_vram_image_op(&self, entry: &GpuCmdLogEntry, vram_words: &[u16]) {
+        match entry.opcode {
+            0x80..=0x9F => self.mirror_vram_copy(entry),
+            0xA0..=0xBF => self.mirror_vram_upload(entry, vram_words),
+            _ => {}
+        }
+    }
+
+    fn mirror_vram_copy(&self, entry: &GpuCmdLogEntry) {
+        if entry.fifo.len() < 4 {
+            return;
+        }
+        let src = entry.fifo[1];
+        let dst = entry.fifo[2];
+        let wh = entry.fifo[3];
+        let sx = src & (VRAM_WIDTH - 1);
+        let sy = (src >> 16) & (VRAM_HEIGHT - 1);
+        let dx = dst & (VRAM_WIDTH - 1);
+        let dy = (dst >> 16) & (VRAM_HEIGHT - 1);
+        let raw_w = wh & 0xFFFF;
+        let raw_h = (wh >> 16) & 0xFFFF;
+        let w = if raw_w == 0 { VRAM_WIDTH } else { raw_w };
+        let h = if raw_h == 0 { VRAM_HEIGHT } else { raw_h };
+        if w == 0 || h == 0 {
+            return;
+        }
+
+        let scale = self.target.scale();
+        let out_w = w * scale;
+        let temp = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("psx-hw-vram-copy-temp"),
+            size: wgpu::Extent3d {
+                width: out_w,
+                height: scale,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::target::TARGET_FORMAT,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("psx-hw-vram-copy-encoder"),
+            });
+
+        // Match the CPU rasterizer's row-buffer copy semantics:
+        // read one complete wrapped source row, then write that row
+        // to the wrapped destination. This keeps overlapping copies
+        // and edge-wrapping image ops in command order.
+        for row in 0..h {
+            let src_y = (sy + row) & (VRAM_HEIGHT - 1);
+            let dst_y = (dy + row) & (VRAM_HEIGHT - 1);
+
+            let mut copied = 0;
+            while copied < w {
+                let src_x = (sx + copied) & (VRAM_WIDTH - 1);
+                let chunk_w = (w - copied).min(VRAM_WIDTH - src_x);
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: self.target.texture(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: src_x * scale,
+                            y: src_y * scale,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &temp,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: copied * scale,
+                            y: 0,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: chunk_w * scale,
+                        height: scale,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                copied += chunk_w;
+            }
+
+            copied = 0;
+            while copied < w {
+                let dst_x = (dx + copied) & (VRAM_WIDTH - 1);
+                let chunk_w = (w - copied).min(VRAM_WIDTH - dst_x);
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &temp,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: copied * scale,
+                            y: 0,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: self.target.texture(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: dst_x * scale,
+                            y: dst_y * scale,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: chunk_w * scale,
+                        height: scale,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                copied += chunk_w;
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    fn mirror_vram_upload(&self, entry: &GpuCmdLogEntry, vram_words: &[u16]) {
+        if entry.fifo.len() < 3 {
+            return;
+        }
+        let xy = entry.fifo[1];
+        let wh = entry.fifo[2];
+        let x = xy & 0x3FF;
+        let y = (xy >> 16) & 0x1FF;
+        let raw_w = wh & 0x3FF;
+        let raw_h = (wh >> 16) & 0x1FF;
+        let w = if raw_w == 0 { VRAM_WIDTH } else { raw_w };
+        let h = if raw_h == 0 { VRAM_HEIGHT } else { raw_h };
+        let payload = entry.fifo.get(3..).unwrap_or(&[]);
+        if payload.is_empty() {
+            self.write_scaled_vram_rect_wrapped(x, y, w, h, |col, row| {
+                let xx = (x + col) & (VRAM_WIDTH - 1);
+                let yy = (y + row) & (VRAM_HEIGHT - 1);
+                vram_words[(yy * VRAM_WIDTH + xx) as usize]
+            });
+            return;
+        }
+
+        self.write_scaled_vram_rect_wrapped(x, y, w, h, |col, row| {
+            let pixel_index = row * w + col;
+            let Some(&word) = payload.get((pixel_index / 2) as usize) else {
+                return 0;
+            };
+            if pixel_index & 1 == 0 {
+                word as u16
+            } else {
+                (word >> 16) as u16
+            }
+        });
+    }
+
+    fn write_scaled_vram_rect_wrapped(
+        &self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        pixel_at: impl Fn(u32, u32) -> u16,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+
+        let scale = self.target.scale();
+        let mut row = 0;
+        while row < h {
+            let dst_y = (y + row) & (VRAM_HEIGHT - 1);
+            let chunk_h = (h - row).min(VRAM_HEIGHT - dst_y);
+            let mut col = 0;
+            while col < w {
+                let dst_x = (x + col) & (VRAM_WIDTH - 1);
+                let chunk_w = (w - col).min(VRAM_WIDTH - dst_x);
+
+                let out_w = chunk_w * scale;
+                let out_h = chunk_h * scale;
+                let row_bytes = out_w * 4;
+                let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+                let padded_row_bytes = row_bytes.div_ceil(align) * align;
+                let mut rgba = vec![0u8; (padded_row_bytes * out_h) as usize];
+
+                for src_y in 0..chunk_h {
+                    for src_x in 0..chunk_w {
+                        let color = bgr15_to_rgba8(pixel_at(col + src_x, row + src_y));
+                        for sy in 0..scale {
+                            let out_y = src_y * scale + sy;
+                            let row_start = (out_y * padded_row_bytes) as usize;
+                            for sx in 0..scale {
+                                let out_x = src_x * scale + sx;
+                                let off = row_start + (out_x * 4) as usize;
+                                rgba[off..off + 4].copy_from_slice(&color);
+                            }
+                        }
+                    }
+                }
+
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: self.target.texture(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: dst_x * scale,
+                            y: dst_y * scale,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row_bytes),
+                        rows_per_image: Some(out_h),
+                    },
+                    wgpu::Extent3d {
+                        width: out_w,
+                        height: out_h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+
+                col += chunk_w;
+            }
+            row += chunk_h;
+        }
     }
 
     /// Synchronously read back the entire VRAM-shaped target as
@@ -292,4 +544,20 @@ impl HwRenderer {
         buffer.unmap();
         (w, h, out)
     }
+}
+
+fn is_vram_image_op(entry: &GpuCmdLogEntry) -> bool {
+    matches!(entry.opcode, 0x80..=0x9F | 0xA0..=0xBF)
+}
+
+fn bgr15_to_rgba8(pixel: u16) -> [u8; 4] {
+    let r5 = (pixel & 0x1F) as u8;
+    let g5 = ((pixel >> 5) & 0x1F) as u8;
+    let b5 = ((pixel >> 10) & 0x1F) as u8;
+    [
+        (r5 << 3) | (r5 >> 2),
+        (g5 << 3) | (g5 >> 2),
+        (b5 << 3) | (b5 >> 2),
+        0xFF,
+    ]
 }

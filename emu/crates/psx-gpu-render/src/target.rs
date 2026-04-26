@@ -138,7 +138,8 @@ fn create_target(device: &wgpu::Device, scale: u32) -> (wgpu::Texture, wgpu::Tex
         format: TARGET_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

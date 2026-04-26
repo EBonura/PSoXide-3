@@ -558,7 +558,6 @@ impl ApplicationHandler for Shell {
                 }
 
                 gfx.prepare_vram(state.bus.as_ref().map(|b| &b.gpu.vram));
-                gfx.prepare_display(state.bus.as_ref().map(|b| &b.gpu));
 
                 // Match the HW renderer's internal scale to the
                 // current Native↔Window mode + framebuffer pixel budget.
@@ -594,19 +593,8 @@ impl ApplicationHandler for Shell {
                 }
 
                 let vram_tex = gfx.vram_texture_id();
-                let (display_tex, framebuffer_source) = match state.scale_mode {
-                    app::ScaleMode::Native => (
-                        gfx.display_texture_id(),
-                        ui::framebuffer::FramebufferSource::CpuDisplay,
-                    ),
-                    app::ScaleMode::Window => (
-                        gfx.hw_texture_id(),
-                        ui::framebuffer::FramebufferSource::HardwareVram,
-                    ),
-                };
-                gfx.render(|ctx| {
-                    app::build_ui(ctx, state, vram_tex, display_tex, framebuffer_source, dt)
-                });
+                let display_tex = gfx.hw_texture_id();
+                gfx.render(|ctx| app::build_ui(ctx, state, vram_tex, display_tex, dt));
             }
             _ => {
                 if !consumed {

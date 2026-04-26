@@ -261,8 +261,10 @@ pub struct GpuCmdLogEntry {
     pub index: u32,
     /// Opcode byte — top 8 bits of the first FIFO word.
     pub opcode: u8,
-    /// Full FIFO contents at dispatch time. Short slices (3..=12 words)
-    /// so cloning per command is cheap.
+    /// Full FIFO contents at dispatch time. Draw packets are short
+    /// slices (3..=12 words). CPU→VRAM uploads append their payload
+    /// words after the 3-word setup so downstream renderers can mirror
+    /// direct image transfers such as FMV frames.
     pub fifo: Vec<u32>,
 }
 
@@ -282,6 +284,10 @@ struct VramTransfer {
     col: u16,
     /// Words still expected (= ceil(w*h / 2)).
     remaining: u32,
+    /// Command-log entry for the 0xA0 setup packet. While the upload
+    /// payload streams in, append the words there so render backends
+    /// can replay direct VRAM image writes.
+    cmd_log_index: Option<usize>,
 }
 
 impl Gpu {
@@ -692,6 +698,7 @@ impl Gpu {
             row: 0,
             col: 0,
             remaining,
+            cmd_log_index: None,
         });
     }
 
@@ -2478,6 +2485,11 @@ impl Gpu {
             row: 0,
             col: 0,
             remaining,
+            cmd_log_index: if self.cmd_log_enabled {
+                self.cmd_log.len().checked_sub(1)
+            } else {
+                None
+            },
         });
     }
 
@@ -2485,6 +2497,11 @@ impl Gpu {
     /// transfer. When `remaining` hits zero, the transfer closes and
     /// the next GP0 write is interpreted as a new command.
     fn ingest_vram_upload_word(&mut self, word: u32) {
+        if let Some(log_index) = self.vram_upload.as_ref().and_then(|t| t.cmd_log_index) {
+            if let Some(entry) = self.cmd_log.get_mut(log_index) {
+                entry.fifo.push(word);
+            }
+        }
         let done = {
             let Some(t) = self.vram_upload.as_mut() else {
                 return;
@@ -3869,6 +3886,34 @@ mod tests {
         for op in 0x58..=0x5B {
             assert_eq!(gp0_packet_size(op), 4);
         }
+    }
+
+    #[test]
+    fn cmd_log_captures_cpu_vram_upload_payload() {
+        let mut gpu = Gpu::new();
+        gpu.enable_cmd_log();
+
+        gpu.gp0_push(0xA0_00_00_00);
+        gpu.gp0_push(0x0000_0000); // x=0, y=0
+        gpu.gp0_push(0x0001_0003); // w=3, h=1 -> 2 payload words
+        gpu.gp0_push(0x2222_1111);
+        gpu.gp0_push(0x4444_3333);
+
+        assert_eq!(gpu.cmd_log.len(), 1);
+        assert_eq!(gpu.cmd_log[0].opcode, 0xA0);
+        assert_eq!(
+            gpu.cmd_log[0].fifo,
+            vec![
+                0xA0_00_00_00,
+                0x0000_0000,
+                0x0001_0003,
+                0x2222_1111,
+                0x4444_3333
+            ]
+        );
+        assert_eq!(gpu.vram.get_pixel(0, 0), 0x1111);
+        assert_eq!(gpu.vram.get_pixel(1, 0), 0x2222);
+        assert_eq!(gpu.vram.get_pixel(2, 0), 0x3333);
     }
 
     #[test]

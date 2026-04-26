@@ -253,8 +253,8 @@ fn draw_debug_toggles(ui: &mut egui::Ui, state: &mut AppState) {
             bus.gpu.wireframe_enabled = !bus.gpu.wireframe_enabled;
         }
     }
-    // Resolution switch: CPU-reference native rendering ↔ HW high-res
-    // rasterization fitted to the framebuffer panel.
+    // Resolution switch: shared HW renderer at native scale ↔
+    // high-res rasterization fitted to the framebuffer panel.
     let high_res_active = state.scale_mode == ScaleMode::Window;
     let scale_icon = if high_res_active {
         icons::MINIMIZE
@@ -264,7 +264,7 @@ fn draw_debug_toggles(ui: &mut egui::Ui, state: &mut AppState) {
     let scale_btn = toggle_button(scale_icon, high_res_active);
     if ui
         .add(scale_btn)
-        .on_hover_text("Toggle native PSX rendering vs. high-res renderer")
+        .on_hover_text("Toggle native scale vs. high-res scale")
         .clicked()
     {
         state.scale_mode = match state.scale_mode {
