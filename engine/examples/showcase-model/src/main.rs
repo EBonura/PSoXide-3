@@ -1,10 +1,13 @@
-//! `showcase-model` — animated-model demo with clip cycling.
+//! `showcase-model` — animated-model demo with model + clip cycling.
 //!
-//! Loads one cooked `.psxmdl`, one 8bpp CLUT texture, and **all**
-//! cooked `.psxanim` clips for the model. The camera orbits the
-//! model and Square/Circle steps backward/forward through the
-//! clip set. Animation phase is anchored to the engine's PS1-time
-//! clock, so each clip restarts cleanly when you switch.
+//! Loads two cooked models that share the same Meshy biped rig, plus
+//! every cooked `.psxanim` clip for each. The camera spherically
+//! orbits the active model; D-pad rotates, Triangle/Cross dolly, and
+//! Square/Circle step through the active model's clip set. Select
+//! swaps between the two characters — texture is re-uploaded into
+//! the same VRAM slot, animation phase resets so the new clip starts
+//! cleanly. An overlay draws the active model name, the current clip
+//! name, and a one-line control reminder.
 
 #![no_std]
 #![no_main]
@@ -18,20 +21,28 @@ use psx_engine::{
     OtFrame, PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex, Scene, WorldCamera,
     WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
+use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
-
-static MODEL_BLOB: &[u8] =
-    include_bytes!("../../../../assets/models/obsidian_wraith/obsidian_wraith.psxmdl");
-static TEXTURE_BLOB: &[u8] =
-    include_bytes!("../../../../assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt");
 
 struct ClipEntry {
     label: &'static str,
     blob: &'static [u8],
 }
 
-const CLIPS: &[ClipEntry] = &[
+struct ModelEntry {
+    label: &'static str,
+    model: &'static [u8],
+    texture: &'static [u8],
+    clips: &'static [ClipEntry],
+}
+
+/// Both models share the Meshy biped rig (24 joints, identical
+/// hierarchy and bind pose), so a single cooked clip set animates
+/// either character. We cook the eight clips off the obsidian glb
+/// because that's the drop with the full move list — the hooded
+/// wretch glb only ships running and walking.
+const SHARED_CLIPS: &[ClipEntry] = &[
     ClipEntry {
         label: "idle",
         blob: include_bytes!(
@@ -82,6 +93,27 @@ const CLIPS: &[ClipEntry] = &[
     },
 ];
 
+const MODELS: &[ModelEntry] = &[
+    ModelEntry {
+        label: "Obsidian Wraith",
+        model: include_bytes!("../../../../assets/models/obsidian_wraith/obsidian_wraith.psxmdl"),
+        texture: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt"
+        ),
+        clips: SHARED_CLIPS,
+    },
+    ModelEntry {
+        label: "Hooded Wretch",
+        model: include_bytes!("../../../../assets/models/hooded_wretch/hooded_wretch.psxmdl"),
+        texture: include_bytes!(
+            "../../../../assets/models/hooded_wretch/hooded_wretch_128x128_8bpp.psxt"
+        ),
+        clips: SHARED_CLIPS,
+    },
+];
+
+const MAX_CLIPS: usize = 8;
+
 const SCREEN_CX: i32 = 160;
 const SCREEN_CY: i32 = 118;
 const PROJ_FOCAL: i32 = 320;
@@ -92,8 +124,15 @@ const PROJECTION: WorldProjection =
 const OT_DEPTH: usize = 128;
 const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 2);
 
+/// Model texture lives in a dedicated 8bpp page well clear of the
+/// font atlas at x=320. Re-upload happens on every model swap.
 const TEX_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit8);
 const TEX_CLUT: Clut = Clut::new(0, 482);
+
+/// 4bpp 8x8 BIOS-style font atlas. Sits at x=320 (multiple of 64),
+/// clear of both display buffers and the model's 8bpp page at 640.
+const FONT_TPAGE: Tpage = Tpage::new(320, 0, TexDepth::Bit4);
+const FONT_CLUT: Clut = Clut::new(320, 256);
 
 const MODEL_WORLD_HEIGHT: i32 = 1024;
 const MODEL_Y_OFFSET: i32 = MODEL_WORLD_HEIGHT / 2;
@@ -130,30 +169,35 @@ static mut JOINT_VIEW_TRANSFORMS: [JointViewTransform; JOINT_CAP] =
     [const { JointViewTransform::ZERO }; JOINT_CAP];
 
 struct ModelShowcase {
-    model: Option<Model<'static>>,
-    clips: [Option<Animation<'static>>; CLIPS.len()],
+    current_model: usize,
     current_clip: usize,
+    model: Option<Model<'static>>,
+    animations: [Option<Animation<'static>>; MAX_CLIPS],
     clip_origin_vblanks: u32,
     camera_yaw: u16,
     camera_pitch: u16,
     camera_radius: i32,
+    font: Option<FontAtlas>,
 }
 
 impl Scene for ModelShowcase {
     fn init(&mut self, _ctx: &mut Ctx) {
-        self.model = Some(Model::from_bytes(MODEL_BLOB).expect("obsidian_wraith.psxmdl"));
-        for (i, entry) in CLIPS.iter().enumerate() {
-            self.clips[i] = Some(Animation::from_bytes(entry.blob).expect(entry.label));
-        }
-        upload_model_texture();
+        self.font = Some(FontAtlas::upload(&BASIC, FONT_TPAGE, FONT_CLUT));
+        self.activate_model(0, 0);
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
+        if ctx.just_pressed(button::SELECT) {
+            let next = (self.current_model + 1) % MODELS.len();
+            self.activate_model(next, ctx.time.elapsed_vblanks());
+        }
+
+        let entry = &MODELS[self.current_model];
         if ctx.just_pressed(button::CIRCLE) || ctx.just_pressed(button::R1) {
             self.advance_clip(ctx, 1);
         }
         if ctx.just_pressed(button::SQUARE) || ctx.just_pressed(button::L1) {
-            self.advance_clip(ctx, CLIPS.len() - 1);
+            self.advance_clip(ctx, entry.clips.len().saturating_sub(1));
         }
 
         let dt = ctx.time.delta_vblanks();
@@ -188,45 +232,48 @@ impl Scene for ModelShowcase {
     }
 
     fn render(&mut self, ctx: &mut Ctx) {
-        let Some(model) = self.model else {
-            return;
-        };
-        let Some(animation) = self.clips[self.current_clip] else {
-            return;
-        };
-        let material = TextureMaterial::opaque(
-            TEX_CLUT.uv_clut_word(),
-            TEX_TPAGE.uv_tpage_word(0),
-            (0x80, 0x80, 0x80),
-        )
-        .with_raw_texture(true);
-        let camera = WorldCamera::orbit(
-            PROJECTION,
-            CAMERA_TARGET,
-            self.camera_radius,
-            self.camera_yaw,
-            self.camera_pitch,
-        );
+        let entry = &MODELS[self.current_model];
+        if let (Some(model), Some(animation)) =
+            (self.model, self.animations[self.current_clip])
+        {
+            let material = TextureMaterial::opaque(
+                TEX_CLUT.uv_clut_word(),
+                TEX_TPAGE.uv_tpage_word(0),
+                (0x80, 0x80, 0x80),
+            )
+            .with_raw_texture(true);
+            let camera = WorldCamera::orbit(
+                PROJECTION,
+                CAMERA_TARGET,
+                self.camera_radius,
+                self.camera_yaw,
+                self.camera_pitch,
+            );
 
-        let clip_tick = ctx
-            .time
-            .elapsed_vblanks()
-            .wrapping_sub(self.clip_origin_vblanks);
-        let frame_q12 = animation.phase_at_tick_q12(clip_tick, ctx.time.video_hz());
-        let mut ot = unsafe { OtFrame::begin(&mut OT) };
-        let mut triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_TRIS) };
-        let mut world = unsafe { WorldRenderPass::new(&mut ot, &mut WORLD_COMMANDS) };
-        draw_animated_model(
-            model,
-            animation,
-            frame_q12,
-            camera,
-            material,
-            &mut world,
-            &mut triangles,
-        );
-        world.flush();
-        ot.submit();
+            let clip_tick = ctx
+                .time
+                .elapsed_vblanks()
+                .wrapping_sub(self.clip_origin_vblanks);
+            let frame_q12 = animation.phase_at_tick_q12(clip_tick, ctx.time.video_hz());
+            let mut ot = unsafe { OtFrame::begin(&mut OT) };
+            let mut triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_TRIS) };
+            let mut world = unsafe { WorldRenderPass::new(&mut ot, &mut WORLD_COMMANDS) };
+            draw_animated_model(
+                model,
+                animation,
+                frame_q12,
+                camera,
+                material,
+                &mut world,
+                &mut triangles,
+            );
+            world.flush();
+            ot.submit();
+        }
+
+        if let Some(font) = self.font.as_ref() {
+            draw_overlay(font, entry, self.current_clip);
+        }
     }
 }
 
@@ -243,18 +290,43 @@ fn main() -> ! {
 impl ModelShowcase {
     const fn new() -> Self {
         Self {
-            model: None,
-            clips: [const { None }; CLIPS.len()],
+            current_model: 0,
             current_clip: 0,
+            model: None,
+            animations: [const { None }; MAX_CLIPS],
             clip_origin_vblanks: 0,
             camera_yaw: 0,
             camera_pitch: CAMERA_PITCH_START,
             camera_radius: CAMERA_RADIUS_START,
+            font: None,
+        }
+    }
+
+    /// Swap to the model at `index`. Re-parses model, re-uploads
+    /// texture into the shared VRAM slot, re-parses every clip, and
+    /// resets clip phase to `now_vblanks` so the new clip starts at
+    /// frame 0.
+    fn activate_model(&mut self, index: usize, now_vblanks: u32) {
+        self.current_model = index;
+        self.current_clip = 0;
+        self.clip_origin_vblanks = now_vblanks;
+        let entry = &MODELS[index];
+        self.model = Some(Model::from_bytes(entry.model).expect(entry.label));
+        upload_model_texture(entry.texture);
+        for slot in self.animations.iter_mut() {
+            *slot = None;
+        }
+        for (i, clip) in entry.clips.iter().enumerate() {
+            if i >= MAX_CLIPS {
+                break;
+            }
+            self.animations[i] = Some(Animation::from_bytes(clip.blob).expect(clip.label));
         }
     }
 
     fn advance_clip(&mut self, ctx: &Ctx, step: usize) {
-        self.current_clip = (self.current_clip + step) % CLIPS.len();
+        let count = MODELS[self.current_model].clips.len().max(1);
+        self.current_clip = (self.current_clip + step) % count;
         self.clip_origin_vblanks = ctx.time.elapsed_vblanks();
     }
 }
@@ -267,8 +339,8 @@ fn scale_i32(value: i32, scale: u16) -> i32 {
     value.saturating_mul(scale as i32)
 }
 
-fn upload_model_texture() {
-    let texture = Texture::from_bytes(TEXTURE_BLOB).expect("obsidian_wraith texture");
+fn upload_model_texture(blob: &[u8]) {
+    let texture = Texture::from_bytes(blob).expect("model texture");
     upload_bytes(
         VramRect::new(
             TEX_TPAGE.x(),
@@ -329,4 +401,21 @@ fn draw_animated_model(
     if stats.primitive_overflow || stats.command_overflow || stats.vertex_overflow {
         return;
     }
+}
+
+/// One-frame text overlay: model name + clip name at the top, control
+/// reminder at the bottom. Drawn after the 3D scene so it sits over
+/// the model without participating in the OT.
+fn draw_overlay(font: &FontAtlas, entry: &ModelEntry, current_clip: usize) {
+    font.draw_text(8, 8, entry.label, (235, 235, 245));
+
+    let clip_label = entry
+        .clips
+        .get(current_clip)
+        .map(|c| c.label)
+        .unwrap_or("-");
+    font.draw_text(8, 20, clip_label, (160, 220, 160));
+
+    font.draw_text(8, 216, "DPAD orbit  TRI/X zoom", (180, 180, 200));
+    font.draw_text(8, 226, "SQ/O clip  SEL model", (180, 180, 200));
 }
