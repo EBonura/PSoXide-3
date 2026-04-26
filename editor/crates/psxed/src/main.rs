@@ -384,13 +384,14 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
     std::fs::write(&model_path, &package.model)
         .map_err(|e| format!("write {}: {e}", model_path.display()))?;
 
-    let animation_path = if let Some(animation) = &package.animation {
-        let path = out_dir.join(format!("{name}_idle.psxanim"));
-        std::fs::write(&path, animation).map_err(|e| format!("write {}: {e}", path.display()))?;
-        Some(path)
-    } else {
-        None
-    };
+    let mut clip_paths: Vec<(std::path::PathBuf, &psxed_gltf::CookedClip)> =
+        Vec::with_capacity(package.clips.len());
+    for clip in &package.clips {
+        let path = out_dir.join(format!("{name}_{}.psxanim", clip.sanitized_name));
+        std::fs::write(&path, &clip.bytes)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        clip_paths.push((path, clip));
+    }
 
     let texture_path = if let Some(texture) = &package.texture {
         let path = out_dir.join(format!(
@@ -417,14 +418,25 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
         "[psxed glb-model] precision local_height={} local_to_world_q12={} target_world_height={}",
         package.report.local_height, package.report.local_to_world_q12, world_height
     );
-    if let Some(path) = animation_path {
+    if clip_paths.is_empty() {
+        eprintln!("[psxed glb-model] no animations in source");
+    } else {
         eprintln!(
-            "[psxed glb-model] animation {} ({} frames @ {}Hz, {} bytes)",
-            path.display(),
-            package.report.animation_frames,
+            "[psxed glb-model] {} clips @ {}Hz, {} bytes total",
+            clip_paths.len(),
             animation_fps,
             package.report.animation_bytes
         );
+        for (path, clip) in &clip_paths {
+            let label = clip.source_name.as_deref().unwrap_or(&clip.sanitized_name);
+            eprintln!(
+                "[psxed glb-model]   {} ({} frames, {} bytes) <- {}",
+                path.display(),
+                clip.frames,
+                clip.bytes.len(),
+                label
+            );
+        }
     }
     if let Some(path) = texture_path {
         eprintln!(

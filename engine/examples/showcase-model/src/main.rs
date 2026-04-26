@@ -1,9 +1,10 @@
-//! `showcase-model` — first native animated-model demo.
+//! `showcase-model` — animated-model demo with clip cycling.
 //!
-//! This is deliberately tiny: one cooked `.psxmdl`, one sampled
-//! `.psxanim`, one 8bpp CLUT texture, and a camera orbiting the model.
-//! The point is to validate the new native import path end-to-end
-//! before building a richer character viewer/editor workflow on top.
+//! Loads one cooked `.psxmdl`, one 8bpp CLUT texture, and **all**
+//! cooked `.psxanim` clips for the model. The camera orbits the
+//! model and Square/Circle steps backward/forward through the
+//! clip set. Animation phase is anchored to the engine's PS1-time
+//! clock, so each clip restarts cleanly when you switch.
 
 #![no_std]
 #![no_main]
@@ -13,19 +14,73 @@ extern crate psx_rt;
 
 use psx_asset::{Animation, Model, Texture};
 use psx_engine::{
-    button, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange, OtFrame,
-    PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex, Scene, WorldCamera, WorldProjection,
-    WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    button, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange, JointViewTransform,
+    OtFrame, PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex, Scene, WorldCamera,
+    WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
 static MODEL_BLOB: &[u8] =
-    include_bytes!("../../../../assets/models/iron_wraith/iron_wraith.psxmdl");
-static ANIM_BLOB: &[u8] =
-    include_bytes!("../../../../assets/models/iron_wraith/iron_wraith_idle.psxanim");
+    include_bytes!("../../../../assets/models/obsidian_wraith/obsidian_wraith.psxmdl");
 static TEXTURE_BLOB: &[u8] =
-    include_bytes!("../../../../assets/models/iron_wraith/iron_wraith_128x128_8bpp.psxt");
+    include_bytes!("../../../../assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt");
+
+struct ClipEntry {
+    label: &'static str,
+    blob: &'static [u8],
+}
+
+const CLIPS: &[ClipEntry] = &[
+    ClipEntry {
+        label: "idle",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_idle.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "walking",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_walking.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "running",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_running.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "unsteady_walk",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_unsteady_walk.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "walk_backward",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_walk_backward_inplace.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "double_combo_attack",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_double_combo_attack.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "hit_reaction",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_hit_reaction.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "dead",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_dead.psxanim"
+        ),
+    },
+];
 
 const SCREEN_CX: i32 = 160;
 const SCREEN_CY: i32 = 118;
@@ -44,18 +99,19 @@ const MODEL_WORLD_HEIGHT: i32 = 1024;
 const MODEL_Y_OFFSET: i32 = MODEL_WORLD_HEIGHT / 2;
 const MODEL_TARGET_Y: i32 = MODEL_WORLD_HEIGHT / 2;
 const CAMERA_TARGET: WorldVertex = WorldVertex::new(0, MODEL_TARGET_Y, 0);
-const CAMERA_Y: i32 = 1120;
 const CAMERA_RADIUS_START: i32 = 2048;
 const CAMERA_RADIUS_MIN: i32 = 1152;
 const CAMERA_RADIUS_MAX: i32 = 4096;
-const CAMERA_RADIUS_STEP: i32 = 64;
-const CAMERA_AUTO_STEP_PER_VBLANK: u16 = 4;
-const CAMERA_PAD_STEP_PER_VBLANK: u16 = 12;
+const CAMERA_RADIUS_STEP: i32 = 128;
+const CAMERA_YAW_STEP_PER_VBLANK: u16 = 32;
+const CAMERA_PITCH_STEP_PER_VBLANK: u16 = 24;
+const CAMERA_PITCH_START: u16 = 350;
 const WORLD_DEPTH_RANGE: DepthRange =
     DepthRange::new(NEAR_Z, CAMERA_RADIUS_MAX + MODEL_WORLD_HEIGHT * 2);
 
 const TRI_CAP: usize = 1536;
 const MODEL_VERTEX_CAP: usize = 1024;
+const JOINT_CAP: usize = 32;
 
 static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
 static mut TEXTURED_TRIS: [TriTextured; TRI_CAP] = [const {
@@ -70,41 +126,62 @@ static mut TEXTURED_TRIS: [TriTextured; TRI_CAP] = [const {
 static mut WORLD_COMMANDS: [WorldTriCommand; TRI_CAP] = [WorldTriCommand::EMPTY; TRI_CAP];
 static mut MODEL_VERTICES: [ProjectedTexturedVertex; MODEL_VERTEX_CAP] =
     [ProjectedTexturedVertex::new(ProjectedVertex::new(0, 0, 0), 0, 0); MODEL_VERTEX_CAP];
+static mut JOINT_VIEW_TRANSFORMS: [JointViewTransform; JOINT_CAP] =
+    [const { JointViewTransform::ZERO }; JOINT_CAP];
 
 struct ModelShowcase {
     model: Option<Model<'static>>,
-    animation: Option<Animation<'static>>,
+    clips: [Option<Animation<'static>>; CLIPS.len()],
+    current_clip: usize,
+    clip_origin_vblanks: u32,
     camera_yaw: u16,
+    camera_pitch: u16,
     camera_radius: i32,
 }
 
 impl Scene for ModelShowcase {
     fn init(&mut self, _ctx: &mut Ctx) {
-        self.model = Some(Model::from_bytes(MODEL_BLOB).expect("iron_wraith.psxmdl"));
-        self.animation = Some(Animation::from_bytes(ANIM_BLOB).expect("iron_wraith_idle.psxanim"));
+        self.model = Some(Model::from_bytes(MODEL_BLOB).expect("obsidian_wraith.psxmdl"));
+        for (i, entry) in CLIPS.iter().enumerate() {
+            self.clips[i] = Some(Animation::from_bytes(entry.blob).expect(entry.label));
+        }
         upload_model_texture();
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
+        if ctx.just_pressed(button::CIRCLE) || ctx.just_pressed(button::R1) {
+            self.advance_clip(ctx, 1);
+        }
+        if ctx.just_pressed(button::SQUARE) || ctx.just_pressed(button::L1) {
+            self.advance_clip(ctx, CLIPS.len() - 1);
+        }
+
         let dt = ctx.time.delta_vblanks();
-        self.camera_yaw = self
-            .camera_yaw
-            .wrapping_add(scale_u16(CAMERA_AUTO_STEP_PER_VBLANK, dt));
         if ctx.is_held(button::LEFT) {
             self.camera_yaw = self
                 .camera_yaw
-                .wrapping_sub(scale_u16(CAMERA_PAD_STEP_PER_VBLANK, dt));
+                .wrapping_sub(scale_u16(CAMERA_YAW_STEP_PER_VBLANK, dt));
         }
         if ctx.is_held(button::RIGHT) {
             self.camera_yaw = self
                 .camera_yaw
-                .wrapping_add(scale_u16(CAMERA_PAD_STEP_PER_VBLANK, dt));
+                .wrapping_add(scale_u16(CAMERA_YAW_STEP_PER_VBLANK, dt));
         }
         if ctx.is_held(button::UP) {
+            self.camera_pitch = self
+                .camera_pitch
+                .wrapping_add(scale_u16(CAMERA_PITCH_STEP_PER_VBLANK, dt));
+        }
+        if ctx.is_held(button::DOWN) {
+            self.camera_pitch = self
+                .camera_pitch
+                .wrapping_sub(scale_u16(CAMERA_PITCH_STEP_PER_VBLANK, dt));
+        }
+        if ctx.is_held(button::TRIANGLE) {
             self.camera_radius =
                 (self.camera_radius - scale_i32(CAMERA_RADIUS_STEP, dt)).max(CAMERA_RADIUS_MIN);
         }
-        if ctx.is_held(button::DOWN) {
+        if ctx.is_held(button::CROSS) {
             self.camera_radius =
                 (self.camera_radius + scale_i32(CAMERA_RADIUS_STEP, dt)).min(CAMERA_RADIUS_MAX);
         }
@@ -114,7 +191,7 @@ impl Scene for ModelShowcase {
         let Some(model) = self.model else {
             return;
         };
-        let Some(animation) = self.animation else {
+        let Some(animation) = self.clips[self.current_clip] else {
             return;
         };
         let material = TextureMaterial::opaque(
@@ -123,16 +200,19 @@ impl Scene for ModelShowcase {
             (0x80, 0x80, 0x80),
         )
         .with_raw_texture(true);
-        let camera = WorldCamera::orbit_yaw(
+        let camera = WorldCamera::orbit(
             PROJECTION,
             CAMERA_TARGET,
-            CAMERA_Y,
             self.camera_radius,
             self.camera_yaw,
+            self.camera_pitch,
         );
 
-        let frame_q12 =
-            animation.phase_at_tick_q12(ctx.time.elapsed_vblanks(), ctx.time.video_hz());
+        let clip_tick = ctx
+            .time
+            .elapsed_vblanks()
+            .wrapping_sub(self.clip_origin_vblanks);
+        let frame_q12 = animation.phase_at_tick_q12(clip_tick, ctx.time.video_hz());
         let mut ot = unsafe { OtFrame::begin(&mut OT) };
         let mut triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_TRIS) };
         let mut world = unsafe { WorldRenderPass::new(&mut ot, &mut WORLD_COMMANDS) };
@@ -164,10 +244,18 @@ impl ModelShowcase {
     const fn new() -> Self {
         Self {
             model: None,
-            animation: None,
+            clips: [const { None }; CLIPS.len()],
+            current_clip: 0,
+            clip_origin_vblanks: 0,
             camera_yaw: 0,
+            camera_pitch: CAMERA_PITCH_START,
             camera_radius: CAMERA_RADIUS_START,
         }
+    }
+
+    fn advance_clip(&mut self, ctx: &Ctx, step: usize) {
+        self.current_clip = (self.current_clip + step) % CLIPS.len();
+        self.clip_origin_vblanks = ctx.time.elapsed_vblanks();
     }
 }
 
@@ -180,7 +268,7 @@ fn scale_i32(value: i32, scale: u16) -> i32 {
 }
 
 fn upload_model_texture() {
-    let texture = Texture::from_bytes(TEXTURE_BLOB).expect("iron_wraith texture");
+    let texture = Texture::from_bytes(TEXTURE_BLOB).expect("obsidian_wraith texture");
     upload_bytes(
         VramRect::new(
             TEX_TPAGE.x(),
@@ -234,6 +322,7 @@ fn draw_animated_model(
         camera,
         WorldVertex::new(0, MODEL_Y_OFFSET, 0),
         unsafe { &mut MODEL_VERTICES },
+        unsafe { &mut JOINT_VIEW_TRANSFORMS },
         material,
         options,
     );

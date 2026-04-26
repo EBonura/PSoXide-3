@@ -222,6 +222,27 @@ impl ProjectedTexturedVertex {
     }
 }
 
+/// Per-joint world-to-view transform for one render frame.
+///
+/// `submit_textured_model` fills one entry per skin joint up-front so
+/// blend-skin vertices can read both their primary and secondary
+/// joint matrices without re-deriving them mid-frame.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct JointViewTransform {
+    /// Combined view × model rotation, Q12.
+    pub rotation: Mat3I16,
+    /// View-space translation, Q0.
+    pub translation: Vec3I32,
+}
+
+impl JointViewTransform {
+    /// All-zero transform suitable for `static mut` scratch storage.
+    pub const ZERO: Self = Self {
+        rotation: Mat3I16::ZERO,
+        translation: Vec3I32::ZERO,
+    };
+}
+
 /// Perspective projection settings for world-space render passes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WorldProjection {
@@ -340,6 +361,39 @@ impl WorldCamera {
             cos_yaw,
             sin_pitch: (target_dy * 4096) / pitch_len,
             cos_pitch: (radius * 4096) / pitch_len,
+        }
+    }
+
+    /// Build a camera on a full spherical orbit around `target`.
+    ///
+    /// `yaw_q12` and `pitch_q12` use 4096 units per full turn. The
+    /// camera sits at constant `radius` from `target` and looks at it
+    /// directly: positive `pitch_q12` raises the camera above the
+    /// target so the view tilts down. Pitch wraps freely, so the orbit
+    /// can pass through the poles and view the model upside-down.
+    pub fn orbit(
+        projection: WorldProjection,
+        target: WorldVertex,
+        radius: i32,
+        yaw_q12: u16,
+        pitch_q12: u16,
+    ) -> Self {
+        let sin_yaw = sin_q12(yaw_q12);
+        let cos_yaw = cos_q12(yaw_q12);
+        let sin_pitch = sin_q12(pitch_q12);
+        let cos_pitch = cos_q12(pitch_q12);
+        let horiz = (radius * cos_pitch) >> 12;
+        Self {
+            projection,
+            position: WorldVertex::new(
+                target.x + ((horiz * sin_yaw) >> 12),
+                target.y - ((radius * sin_pitch) >> 12),
+                target.z + ((horiz * cos_yaw) >> 12),
+            ),
+            sin_yaw,
+            cos_yaw,
+            sin_pitch,
+            cos_pitch,
         }
     }
 
@@ -949,6 +1003,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         camera: WorldCamera,
         origin: WorldVertex,
         projected_vertices: &mut [ProjectedTexturedVertex],
+        joint_view_transforms: &mut [JointViewTransform],
         material: TextureMaterial,
         options: WorldSurfaceOptions,
     ) -> TexturedModelRenderStats {
@@ -956,15 +1011,32 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         let local_to_world = LocalToWorldScale::from_q12(model.local_to_world_q12());
         load_world_projection_gte(camera.projection);
 
+        let joint_count = (model.joint_count() as usize).min(joint_view_transforms.len());
+        for joint in 0..joint_count {
+            joint_view_transforms[joint] = match animation.pose_looped_q12(frame_q12, joint as u16) {
+                Some(pose) => {
+                    let (rotation, translation) =
+                        textured_model_part_gte_transform(camera, pose, local_to_world, origin);
+                    JointViewTransform {
+                        rotation,
+                        translation,
+                    }
+                }
+                None => JointViewTransform::default(),
+            };
+        }
+
         let mut part_index = 0;
         while part_index < model.part_count() {
             let Some(part) = model.part(part_index) else {
                 break;
             };
-            let Some(pose) = animation.pose_looped_q12(frame_q12, part.joint_index()) else {
+            let primary_joint = part.joint_index() as usize;
+            if primary_joint >= joint_count {
                 part_index += 1;
                 continue;
-            };
+            }
+            let primary = joint_view_transforms[primary_joint];
 
             let part_vertex_count = part.vertex_count() as usize;
             let project_count = part_vertex_count
@@ -977,48 +1049,33 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
                 .projected_vertices
                 .saturating_add(project_count as u16);
 
-            load_textured_model_part_gte(camera, pose, local_to_world, origin);
+            scene::load_rotation(&primary.rotation);
+            scene::load_translation(primary.translation);
+
             let first_vertex = part.first_vertex();
             let mut local_index = 0;
-            while local_index + 2 < project_count {
-                let global_a = first_vertex.saturating_add(local_index as u16);
-                let global_b = first_vertex.saturating_add((local_index + 1) as u16);
-                let global_c = first_vertex.saturating_add((local_index + 2) as u16);
-                let Some(a) = model.vertex(global_a) else {
-                    break;
-                };
-                let Some(b) = model.vertex(global_b) else {
-                    break;
-                };
-                let Some(c) = model.vertex(global_c) else {
-                    break;
-                };
-                let projected = scene::project_triangle(a.position, b.position, c.position);
-                projected_vertices[local_index] = ProjectedTexturedVertex::new(
-                    ProjectedVertex::new(projected[0].sx, projected[0].sy, projected[0].sz as i32),
-                    a.uv.0 as i32,
-                    a.uv.1 as i32,
-                );
-                projected_vertices[local_index + 1] = ProjectedTexturedVertex::new(
-                    ProjectedVertex::new(projected[1].sx, projected[1].sy, projected[1].sz as i32),
-                    b.uv.0 as i32,
-                    b.uv.1 as i32,
-                );
-                projected_vertices[local_index + 2] = ProjectedTexturedVertex::new(
-                    ProjectedVertex::new(projected[2].sx, projected[2].sy, projected[2].sz as i32),
-                    c.uv.0 as i32,
-                    c.uv.1 as i32,
-                );
-                local_index += 3;
-            }
             while local_index < project_count {
                 let global_index = first_vertex.saturating_add(local_index as u16);
                 let Some(vertex) = model.vertex(global_index) else {
                     break;
                 };
-                let projected = scene::project_vertex(vertex.position);
+                let projected = if !vertex.is_blend()
+                    || (vertex.joint1 as usize) >= joint_count
+                {
+                    let proj = scene::project_vertex(vertex.position);
+                    ProjectedVertex::new(proj.sx, proj.sy, proj.sz as i32)
+                } else {
+                    let secondary = joint_view_transforms[vertex.joint1 as usize];
+                    let view_a = cpu_view_transform(&primary, vertex.position);
+                    let view_b = cpu_view_transform(&secondary, vertex.position);
+                    let view_blend = lerp_view_vertex(view_a, view_b, vertex.blend);
+                    match cpu_project_gte_view(view_blend, camera.projection) {
+                        Some(proj) => proj,
+                        None => ProjectedVertex::new(0, 0, camera.projection.near_z - 1),
+                    }
+                };
                 projected_vertices[local_index] = ProjectedTexturedVertex::new(
-                    ProjectedVertex::new(projected.sx, projected.sy, projected.sz as i32),
+                    projected,
                     vertex.uv.0 as i32,
                     vertex.uv.1 as i32,
                 );
@@ -1630,18 +1687,6 @@ fn load_world_projection_gte(projection: WorldProjection) {
     scene::set_projection_plane(clamp_u16_i32(projection.focal_length));
 }
 
-fn load_textured_model_part_gte(
-    camera: WorldCamera,
-    pose: JointPose,
-    local_to_world: LocalToWorldScale,
-    origin: WorldVertex,
-) {
-    let (rotation, translation) =
-        textured_model_part_gte_transform(camera, pose, local_to_world, origin);
-    scene::load_rotation(&rotation);
-    scene::load_translation(translation);
-}
-
 fn textured_model_part_gte_transform(
     camera: WorldCamera,
     pose: JointPose,
@@ -1740,6 +1785,65 @@ fn dot_world_q12(row: [i16; 3], v: WorldVertex) -> i32 {
     let y = (row[1] as i32).saturating_mul(v.y);
     let z = (row[2] as i32).saturating_mul(v.z);
     x.saturating_add(y).saturating_add(z) >> 12
+}
+
+/// Software-side equivalent of one GTE RTPS transform stage.
+///
+/// Used by the blend-skin slow path: a vertex with weight on a second
+/// joint cannot stay on the GTE because the rotation/translation
+/// registers are loaded for the part's primary joint. We compute its
+/// view-space position twice on the CPU, lerp, and project on the CPU
+/// using `WorldProjection::project_view`.
+#[inline]
+fn cpu_view_transform(transform: &JointViewTransform, position: Vec3I16) -> ViewVertex {
+    let vx = position.x as i32;
+    let vy = position.y as i32;
+    let vz = position.z as i32;
+    let m = &transform.rotation.m;
+    let x = ((m[0][0] as i32) * vx + (m[0][1] as i32) * vy + (m[0][2] as i32) * vz) >> 12;
+    let y = ((m[1][0] as i32) * vx + (m[1][1] as i32) * vy + (m[1][2] as i32) * vz) >> 12;
+    let z = ((m[2][0] as i32) * vx + (m[2][1] as i32) * vy + (m[2][2] as i32) * vz) >> 12;
+    ViewVertex::new(
+        x.saturating_add(transform.translation.x),
+        y.saturating_add(transform.translation.y),
+        z.saturating_add(transform.translation.z),
+    )
+}
+
+/// CPU projection that matches the GTE RTPS convention used by the
+/// rest of the model render path.
+///
+/// `WorldProjection::project_view` is for *unflipped* camera-space
+/// vertices and applies its own `screen_y -= y*H/z` flip. The
+/// view-space output of [`cpu_view_transform`] is already pre-flipped
+/// in Y by the GTE-style camera matrix in
+/// [`camera_gte_view_matrix`], so we project with `screen_y += y*H/z`
+/// to avoid the double-flip that put blend verts on the wrong half
+/// of the screen.
+#[inline]
+fn cpu_project_gte_view(view: ViewVertex, projection: WorldProjection) -> Option<ProjectedVertex> {
+    if view.z <= 0 || view.z < projection.near_z {
+        return None;
+    }
+    let sx = (projection.screen_x as i32) + (view.x * projection.focal_length) / view.z;
+    let sy = (projection.screen_y as i32) + (view.y * projection.focal_length) / view.z;
+    Some(ProjectedVertex::new(clamp_i16(sx), clamp_i16(sy), view.z))
+}
+
+/// 256-step linear blend between two view-space positions.
+///
+/// `t` is the cooked blend byte: `0` returns `a` exactly, `255` returns
+/// (255 a + 1 b) / 256 — close enough to `b` for skin-deform purposes
+/// and avoids the expensive divide-by-255 a true unit lerp would cost.
+#[inline]
+fn lerp_view_vertex(a: ViewVertex, b: ViewVertex, t: u8) -> ViewVertex {
+    let t = t as i32;
+    let inv = 256 - t;
+    ViewVertex::new(
+        ((a.x.saturating_mul(inv)).saturating_add(b.x.saturating_mul(t))) >> 8,
+        ((a.y.saturating_mul(inv)).saturating_add(b.y.saturating_mul(t))) >> 8,
+        ((a.z.saturating_mul(inv)).saturating_add(b.z.saturating_mul(t))) >> 8,
+    )
 }
 
 fn q12_mul_i32(a: i32, b: i32) -> i32 {

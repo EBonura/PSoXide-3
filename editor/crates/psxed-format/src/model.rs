@@ -36,32 +36,44 @@
 //!     joint_index, first_vertex, vertex_count, first_face, face_count,
 //!     material_index, _reserved
 //!
-//!   Vertex table: vertex_count × 14 bytes
+//!   Vertex table: vertex_count × 16 bytes
 //!     position: i16x3 model-local units
 //!     normal:   i16x3 Q3.12
 //!     uv:       u8x2
+//!     joint1:   u8 secondary skin bone (`NO_JOINT8` when unused)
+//!     blend:    u8 weight on `joint1`, 0..=255 (0 = single-bone)
 //!
 //!   Face table: face_count × 6 bytes
 //!     a, b, c: u16 LE each, indexing the global vertex table
 //! ```
 //!
-//! The initial animation path is intentionally "rigid skinning":
-//! triangles are assigned to the joint that contributes the greatest
-//! summed weight to their three vertices. Vertices remain in model
-//! space; a `.psxanim` pose matrix maps each part into the sampled
-//! animated pose. Model-local coordinates are deliberately allowed
-//! to use a much denser scale than world/grid coordinates; the
-//! header's `local_to_world_q12` is the content pipeline's suggested
-//! conversion for previews and simple runtime draw paths.
+//! Skinning is a hybrid model. Each part still owns one rigid bone
+//! (its `joint_index`), and most triangles transform rigidly through
+//! that bone — fast GTE path. A vertex near a joint seam can name a
+//! second bone in `joint1` along with a `blend` weight: the runtime
+//! transforms that vertex by both bones and lerps the view-space
+//! results, which keeps elbow and shoulder creases continuous instead
+//! of opening into chunky gaps. `blend == 0` opts a vertex out of the
+//! slow path entirely. Model-local coordinates are deliberately
+//! allowed to use a much denser scale than world/grid coordinates;
+//! the header's `local_to_world_q12` is the content pipeline's
+//! suggested conversion for previews and simple runtime draw paths.
 
 /// ASCII magic identifying the `.psxmdl` model format.
 pub const MAGIC: [u8; 4] = *b"PSMD";
 
 /// Current model format revision.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Sentinel parent/joint value used when a record has no joint.
 pub const NO_JOINT: u16 = u16::MAX;
+
+/// 8-bit sentinel for the per-vertex secondary joint slot.
+///
+/// Stored in the `joint1` byte of a vertex record when the cooker
+/// chose not to assign a secondary blend bone. Readers that see this
+/// value should treat the vertex as single-bone regardless of `blend`.
+pub const NO_JOINT8: u8 = u8::MAX;
 
 /// Fallback model-local to world-space scale. `0x1000` is identity.
 pub const DEFAULT_LOCAL_TO_WORLD_Q12: u16 = 0x1000;
@@ -74,6 +86,12 @@ pub mod flags {
     pub const HAS_UVS: u16 = 1 << 1;
     /// Part records are associated with joint pose matrices.
     pub const RIGID_SKINNED: u16 = 1 << 2;
+    /// Vertex records may carry a secondary joint and blend weight.
+    ///
+    /// Set when the cooker emitted any vertex with `blend > 0`. Pure
+    /// rigid models clear this bit so the runtime can stay on the
+    /// single-bone fast path without inspecting per-vertex blend.
+    pub const BLEND_SKIN: u16 = 1 << 3;
 }
 
 /// Byte layout of the model payload header.
@@ -229,7 +247,7 @@ impl PartRecord {
 }
 
 /// Size of one vertex record in bytes.
-pub const VERTEX_RECORD_SIZE: usize = 14;
+pub const VERTEX_RECORD_SIZE: usize = 16;
 
 /// Size of one face record in bytes.
 pub const FACE_RECORD_SIZE: usize = 6;

@@ -468,16 +468,33 @@ impl Default for RigidModelConfig {
 pub struct RigidModelPackage {
     /// Cooked `.psxmdl` bytes.
     pub model: Vec<u8>,
-    /// Cooked `.psxanim` bytes for the first clip, if present.
-    pub animation: Option<Vec<u8>>,
+    /// Cooked `.psxanim` bytes per source animation clip.
+    ///
+    /// Empty when the source has no animations. One entry per glTF
+    /// animation, in source order, each with a filesystem-safe name
+    /// derived from `gltf::Animation::name`.
+    pub clips: Vec<CookedClip>,
     /// Cooked `.psxt` base-colour texture, if present.
     pub texture: Option<Vec<u8>>,
     /// Counts and byte sizes useful for build logs and tests.
     pub report: RigidModelReport,
 }
 
+/// One cooked animation clip ready to write to disk.
+#[derive(Debug, Clone)]
+pub struct CookedClip {
+    /// Original glTF clip name, if the source provided one.
+    pub source_name: Option<String>,
+    /// Filesystem-safe name suitable as a filename suffix.
+    pub sanitized_name: String,
+    /// Cooked `.psxanim` bytes for this clip.
+    pub bytes: Vec<u8>,
+    /// Number of sampled frames in the cooked clip.
+    pub frames: usize,
+}
+
 /// Summary of a native model import.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RigidModelReport {
     /// Number of source vertices before rigid part duplication.
     pub source_vertices: usize,
@@ -489,15 +506,15 @@ pub struct RigidModelReport {
     pub parts: usize,
     /// Number of skin joints.
     pub joints: usize,
-    /// Number of sampled animation frames.
-    pub animation_frames: usize,
+    /// Per-clip frame count, one entry per cooked clip.
+    pub clip_frames: Vec<(String, usize)>,
     /// Cooked animated model height in model-local units.
     pub local_height: usize,
     /// Suggested model-local to world-space scale, Q12.
     pub local_to_world_q12: u16,
     /// Cooked model byte length.
     pub model_bytes: usize,
-    /// Cooked animation byte length, or zero when no clip exists.
+    /// Total cooked animation byte length across all clips.
     pub animation_bytes: usize,
     /// Cooked texture byte length, or zero when no texture exists.
     pub texture_bytes: usize,
@@ -586,7 +603,7 @@ fn convert_rigid_model_document(
         cfg.texture_height,
         local_to_world_q12,
     )?;
-    let animation = cook_first_animation(
+    let clips = cook_all_animations(
         document,
         buffers,
         &parents,
@@ -597,23 +614,28 @@ fn convert_rigid_model_document(
         cfg.animation_fps,
     )?;
 
+    let animation_bytes = clips.iter().map(|c| c.bytes.len()).sum();
+    let clip_frames = clips
+        .iter()
+        .map(|c| (c.sanitized_name.clone(), c.frames))
+        .collect();
     let report = RigidModelReport {
         source_vertices: source.vertices.len(),
         cooked_vertices,
         faces: source.faces.len(),
         parts,
         joints: joints.len(),
-        animation_frames: animation_frame_count(animation.as_deref()),
+        clip_frames,
         local_height: local_height.max(0) as usize,
         local_to_world_q12,
         model_bytes: model.len(),
-        animation_bytes: animation.as_ref().map_or(0, Vec::len),
+        animation_bytes,
         texture_bytes: texture.as_ref().map_or(0, Vec::len),
     };
 
     Ok(RigidModelPackage {
         model,
-        animation,
+        clips,
         texture,
         report,
     })
@@ -639,6 +661,11 @@ struct SourceVertex {
     uv: [f32; 2],
     joints: [u16; 4],
     weights: [f32; 4],
+    /// Bone this vertex follows under rigid skinning. Picked as the
+    /// joint with the highest weight in `weights`. Pre-computed so the
+    /// face-grouping pass and the seam-duplication step both see the
+    /// same per-vertex choice.
+    dominant_joint: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -761,46 +788,53 @@ fn collect_precision_bounds(
         inverse_bind_matrices,
     );
 
-    let Some(animation) = document.animations().next() else {
-        return bounds.finish();
-    };
-    let channels = read_animation_channels(&animation, buffers)?;
-    if channels.is_empty() {
-        return bounds.finish();
+    for animation in document.animations() {
+        let channels = read_animation_channels(&animation, buffers)?;
+        if channels.is_empty() {
+            continue;
+        }
+
+        let Some((min_time, max_time)) = channel_time_range(&channels) else {
+            continue;
+        };
+
+        let duration = max_time - min_time;
+        let frame_count = (duration * fps as f32).round() as usize + 1;
+        ensure_u16("animation frames", frame_count)?;
+        for frame in 0..frame_count {
+            let time = (min_time + frame as f32 / fps as f32).min(max_time);
+            let mut frame_trs = base_trs.to_vec();
+            for channel in &channels {
+                channel.apply(time, &mut frame_trs);
+            }
+            include_pose_bounds(
+                &mut bounds,
+                &frame_trs,
+                source,
+                parents,
+                joints,
+                inverse_bind_matrices,
+            );
+        }
     }
 
+    bounds.finish()
+}
+
+fn channel_time_range(channels: &[AnimationChannel]) -> Option<(f32, f32)> {
     let mut min_time = f32::INFINITY;
     let mut max_time = f32::NEG_INFINITY;
-    for channel in &channels {
+    for channel in channels {
         for time in &channel.times {
             min_time = min_time.min(*time);
             max_time = max_time.max(*time);
         }
     }
-    if !min_time.is_finite() || !max_time.is_finite() || max_time < min_time {
-        return bounds.finish();
+    if min_time.is_finite() && max_time.is_finite() && max_time >= min_time {
+        Some((min_time, max_time))
+    } else {
+        None
     }
-
-    let duration = max_time - min_time;
-    let frame_count = (duration * fps as f32).round() as usize + 1;
-    ensure_u16("animation frames", frame_count)?;
-    for frame in 0..frame_count {
-        let time = (min_time + frame as f32 / fps as f32).min(max_time);
-        let mut frame_trs = base_trs.to_vec();
-        for channel in &channels {
-            channel.apply(time, &mut frame_trs);
-        }
-        include_pose_bounds(
-            &mut bounds,
-            &frame_trs,
-            source,
-            parents,
-            joints,
-            inverse_bind_matrices,
-        );
-    }
-
-    bounds.finish()
 }
 
 fn include_pose_bounds(
@@ -919,6 +953,7 @@ fn read_skinned_mesh(
 
         let base = source.vertices.len();
         source.vertices.extend((0..vertex_count).map(|index| {
+            let cleaned_joints = joint_indices_or_zero(joints[index], weights[index]);
             SourceVertex {
                 position: positions[index],
                 normal: normals
@@ -926,8 +961,9 @@ fn read_skinned_mesh(
                     .map(|normals| normals[index])
                     .unwrap_or([0.0, 1.0, 0.0]),
                 uv: uvs[index],
-                joints: joint_indices_or_zero(joints[index], weights[index]),
+                joints: cleaned_joints,
                 weights: weights[index],
+                dominant_joint: dominant_vertex_joint(cleaned_joints, weights[index]),
             }
         }));
 
@@ -994,9 +1030,47 @@ fn joint_indices_or_zero(joints: [u16; 4], weights: [f32; 4]) -> [u16; 4] {
     out
 }
 
+fn dominant_vertex_joint(joints: [u16; 4], weights: [f32; 4]) -> u16 {
+    let mut best = 0u16;
+    let mut best_weight = f32::NEG_INFINITY;
+    for influence in 0..4 {
+        let weight = weights[influence];
+        if weight > best_weight {
+            best_weight = weight;
+            best = joints[influence];
+        }
+    }
+    best
+}
+
+/// Group faces by per-vertex bone choice. Each vertex has already
+/// picked its dominant bone in `read_skinned_mesh`. A face is bound
+/// to whichever bone owns the **majority** of its three corners.
+///
+/// On a 2-1 split the majority vertex pair wins, leaving the third
+/// corner as the only "pulled" vertex bound to a foreign bone — much
+/// less visible than the previous face-level binding, which could
+/// pull all three corners together. On a 3-way disagreement we fall
+/// back to summed-weight scoring so the choice still reflects the
+/// face's overall bias.
 fn assign_face_joints(source: &mut SkinnedSourceMesh, joint_count: usize) {
     let mut scores = vec![0.0f32; joint_count];
     for face in &mut source.faces {
+        let bones = [
+            source.vertices[face.indices[0]].dominant_joint,
+            source.vertices[face.indices[1]].dominant_joint,
+            source.vertices[face.indices[2]].dominant_joint,
+        ];
+
+        if bones[0] == bones[1] || bones[0] == bones[2] {
+            face.joint = bones[0];
+            continue;
+        }
+        if bones[1] == bones[2] {
+            face.joint = bones[1];
+            continue;
+        }
+
         scores.fill(0.0);
         for vertex_index in face.indices {
             let vertex = source.vertices[vertex_index];
@@ -1125,6 +1199,7 @@ fn cook_model_blob(
     let mut part_records = Vec::new();
     let mut cooked_vertices: Vec<[u8; psxed_format::model::VERTEX_RECORD_SIZE]> = Vec::new();
     let mut cooked_faces: Vec<[u16; 3]> = Vec::new();
+    let mut blend_skin = false;
 
     for (joint_index, faces) in grouped_faces {
         let first_vertex = cooked_vertices.len();
@@ -1140,12 +1215,17 @@ fn cook_model_blob(
                 } else {
                     let vertex = source.vertices[source_index];
                     let index = ensure_u16("vertices", cooked_vertices.len())?;
-                    cooked_vertices.push(encode_model_vertex(
+                    let record = encode_model_vertex(
                         vertex,
+                        joint_index,
                         bounds,
                         texture_width,
                         texture_height,
-                    ));
+                    );
+                    if record[15] != 0 {
+                        blend_skin = true;
+                    }
+                    cooked_vertices.push(record);
                     local_map.insert(source_index, index);
                     index
                 };
@@ -1177,13 +1257,17 @@ fn cook_model_blob(
         + cooked_vertices.len() * psxed_format::model::VERTEX_RECORD_SIZE
         + cooked_faces.len() * psxed_format::model::FACE_RECORD_SIZE;
     let mut out = Vec::with_capacity(psxed_format::AssetHeader::SIZE + payload_len);
+    let mut model_flags = psxed_format::model::flags::HAS_NORMALS
+        | psxed_format::model::flags::HAS_UVS
+        | psxed_format::model::flags::RIGID_SKINNED;
+    if blend_skin {
+        model_flags |= psxed_format::model::flags::BLEND_SKIN;
+    }
     append_asset_header(
         &mut out,
         psxed_format::model::MAGIC,
         psxed_format::model::VERSION,
-        psxed_format::model::flags::HAS_NORMALS
-            | psxed_format::model::flags::HAS_UVS
-            | psxed_format::model::flags::RIGID_SKINNED,
+        model_flags,
         payload_len,
     )?;
     append_u16(&mut out, ensure_u16("joints", joint_records.len())?);
@@ -1227,6 +1311,7 @@ fn cook_model_blob(
 
 fn encode_model_vertex(
     vertex: SourceVertex,
+    primary_joint: u16,
     bounds: &ModelBounds,
     texture_width: u16,
     texture_height: u16,
@@ -1235,6 +1320,7 @@ fn encode_model_vertex(
     let normal = normalize3(vertex.normal);
     let u = uv_to_u8(vertex.uv[0], texture_width);
     let v = uv_to_u8(vertex.uv[1], texture_height);
+    let (joint1_byte, blend_byte) = blend_slot_for_vertex(vertex, primary_joint);
     let mut out = [0u8; psxed_format::model::VERTEX_RECORD_SIZE];
     write_i16(&mut out, 0, q12_i16(position[0]));
     write_i16(&mut out, 2, q12_i16(position[1]));
@@ -1244,7 +1330,87 @@ fn encode_model_vertex(
     write_i16(&mut out, 10, q12_i16(normal[2]));
     out[12] = u;
     out[13] = v;
+    out[14] = joint1_byte;
+    out[15] = blend_byte;
     out
+}
+
+/// Threshold below which a secondary bone's relative weight is dropped.
+///
+/// `weight1 / (weight0 + weight1)` smaller than this contributes a
+/// blend so subtle the runtime CPU path costs more than the visual
+/// difference — better to stay on the single-bone GTE fast path.
+const BLEND_DROP_THRESHOLD: f32 = 0.04;
+
+/// Pick the secondary bone + blend byte for a vertex, given the part
+/// it ended up in.
+///
+/// `joint0` is implicit at runtime (it is the part's bone), so we only
+/// store `joint1` and a relative weight in 0..=255. The secondary bone
+/// is the strongest of:
+///
+/// * the vertex's own dominant bone, when the part's bone differs (a
+///   "pulled" vertex on the wrong side of a seam — pulling it back
+///   toward its natural bone removes the gap);
+/// * otherwise the next-highest-weight bone after `primary_joint`.
+fn blend_slot_for_vertex(vertex: SourceVertex, primary_joint: u16) -> (u8, u8) {
+    let mut weight0 = 0.0f32;
+    let mut weight1 = 0.0f32;
+    let mut joint1: Option<u16> = None;
+
+    if vertex.dominant_joint != primary_joint && vertex.weights[0] > 0.0 {
+        joint1 = Some(vertex.dominant_joint);
+    }
+
+    for i in 0..4 {
+        let w = vertex.weights[i].max(0.0);
+        if w == 0.0 {
+            continue;
+        }
+        let j = vertex.joints[i];
+        if j == primary_joint {
+            weight0 += w;
+        } else if Some(j) == joint1 {
+            weight1 += w;
+        } else if joint1.is_none() {
+            joint1 = Some(j);
+            weight1 = w;
+        } else if w > weight1 && Some(j) != joint1 {
+            // Replace joint1 only if we have not committed it to the
+            // pulled-vertex case above. The first branch already set
+            // `joint1` to the natural bone in that case.
+            if vertex.dominant_joint == primary_joint {
+                joint1 = Some(j);
+                weight1 = w;
+            }
+        }
+    }
+
+    let Some(j1) = joint1 else {
+        return (psxed_format::model::NO_JOINT8, 0);
+    };
+    let total = weight0 + weight1;
+    if total <= 0.0 {
+        return (psxed_format::model::NO_JOINT8, 0);
+    }
+    let blend = weight1 / total;
+    if blend < BLEND_DROP_THRESHOLD {
+        return (psxed_format::model::NO_JOINT8, 0);
+    }
+
+    let blend_byte = (blend * 255.0).round().clamp(0.0, 255.0) as u8;
+    if blend_byte == 0 {
+        return (psxed_format::model::NO_JOINT8, 0);
+    }
+    let joint1_byte = if j1 < 255 {
+        j1 as u8
+    } else {
+        psxed_format::model::NO_JOINT8
+    };
+    if joint1_byte == psxed_format::model::NO_JOINT8 {
+        return (psxed_format::model::NO_JOINT8, 0);
+    }
+    (joint1_byte, blend_byte)
 }
 
 fn cook_base_color_texture(
@@ -1300,7 +1466,7 @@ fn first_material_base_color(mesh: &gltf::Mesh<'_>) -> [u8; 4] {
     [255, 255, 255, 255]
 }
 
-fn cook_first_animation(
+fn cook_all_animations(
     document: &gltf::Document,
     buffers: &[gltf::buffer::Data],
     parents: &[Option<usize>],
@@ -1309,27 +1475,53 @@ fn cook_first_animation(
     inverse_bind_matrices: &[[[f32; 4]; 4]],
     bounds: &ModelBounds,
     fps: u16,
-) -> Result<Option<Vec<u8>>, Error> {
-    let Some(animation) = document.animations().next() else {
-        return Ok(None);
-    };
-    let channels = read_animation_channels(&animation, buffers)?;
-    if channels.is_empty() {
-        return Ok(None);
-    }
-
-    let mut min_time = f32::INFINITY;
-    let mut max_time = f32::NEG_INFINITY;
-    for channel in &channels {
-        for time in &channel.times {
-            min_time = min_time.min(*time);
-            max_time = max_time.max(*time);
+) -> Result<Vec<CookedClip>, Error> {
+    let mut clips = Vec::new();
+    for (index, animation) in document.animations().enumerate() {
+        let channels = read_animation_channels(&animation, buffers)?;
+        if channels.is_empty() {
+            continue;
         }
+        let Some((min_time, max_time)) = channel_time_range(&channels) else {
+            continue;
+        };
+        let Some(bytes) = cook_animation_bytes(
+            &channels,
+            parents,
+            base_trs,
+            joints,
+            inverse_bind_matrices,
+            bounds,
+            min_time,
+            max_time,
+            fps,
+        )?
+        else {
+            continue;
+        };
+        let frames = animation_frame_count_from_bytes(&bytes);
+        let raw_name = animation.name().map(|s| s.to_string());
+        clips.push(CookedClip {
+            source_name: raw_name.clone(),
+            sanitized_name: sanitize_clip_name(raw_name.as_deref(), index),
+            bytes,
+            frames,
+        });
     }
-    if !min_time.is_finite() || !max_time.is_finite() || max_time < min_time {
-        return Ok(None);
-    }
+    Ok(clips)
+}
 
+fn cook_animation_bytes(
+    channels: &[AnimationChannel],
+    parents: &[Option<usize>],
+    base_trs: &[Trs],
+    joints: &[usize],
+    inverse_bind_matrices: &[[[f32; 4]; 4]],
+    bounds: &ModelBounds,
+    min_time: f32,
+    max_time: f32,
+    fps: u16,
+) -> Result<Option<Vec<u8>>, Error> {
     let duration = max_time - min_time;
     let frame_count = (duration * fps as f32).round() as usize + 1;
     ensure_u16("animation frames", frame_count)?;
@@ -1352,7 +1544,7 @@ fn cook_first_animation(
     for frame in 0..frame_count {
         let time = (min_time + frame as f32 / fps as f32).min(max_time);
         let mut frame_trs = base_trs.to_vec();
-        for channel in &channels {
+        for channel in channels {
             channel.apply(time, &mut frame_trs);
         }
         let locals: Vec<[[f32; 4]; 4]> = frame_trs.iter().map(|trs| trs.matrix()).collect();
@@ -1364,6 +1556,24 @@ fn cook_first_animation(
     }
 
     Ok(Some(out))
+}
+
+fn sanitize_clip_name(source: Option<&str>, fallback_index: usize) -> String {
+    let raw = source.unwrap_or("");
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        format!("clip{fallback_index}")
+    } else {
+        trimmed
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1537,10 +1747,7 @@ fn append_pose_record(out: &mut Vec<u8>, skin_matrix: &[[f32; 4]; 4], bounds: &M
     append_i32(out, q12_i32(translation[2]));
 }
 
-fn animation_frame_count(animation: Option<&[u8]>) -> usize {
-    let Some(bytes) = animation else {
-        return 0;
-    };
+fn animation_frame_count_from_bytes(bytes: &[u8]) -> usize {
     if bytes.len()
         < psxed_format::AssetHeader::SIZE + psxed_format::animation::AnimationHeader::SIZE
     {
@@ -1799,6 +2006,7 @@ mod tests {
             uv: [0.0, 0.0],
             joints: [0; 4],
             weights: [1.0, 0.0, 0.0, 0.0],
+            dominant_joint: 0,
         }
     }
 }

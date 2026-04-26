@@ -64,10 +64,10 @@ pub use frames::{Frames, Ticks};
 pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
 pub use render3d::{
     CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand,
-    LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex, ProjectedVertex,
-    TexturedModelRenderStats, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
-    WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,
-    WorldVertex,
+    JointViewTransform, LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex,
+    ProjectedVertex, TexturedModelRenderStats, TexturedViewVertex, ViewVertex, WorldCamera,
+    WorldProjection, WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions,
+    WorldTriCommand, WorldVertex,
 };
 pub use scene::{Ctx, Scene};
 pub use time::EngineTime;

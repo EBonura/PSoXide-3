@@ -514,6 +514,8 @@ impl<'a> Model<'a> {
             position: Vec3I16::new(read_i16(bytes, 0), read_i16(bytes, 2), read_i16(bytes, 4)),
             normal: Vec3I16::new(read_i16(bytes, 6), read_i16(bytes, 8), read_i16(bytes, 10)),
             uv: (bytes[12], bytes[13]),
+            joint1: bytes[14],
+            blend: bytes[15],
         })
     }
 
@@ -625,6 +627,11 @@ impl ModelPart {
     }
 }
 
+/// Sentinel value for [`ModelVertex::joint1`] meaning "no secondary
+/// blend bone". Re-exported from `psxed_format::model` so runtime
+/// code does not need to depend on the editor crate.
+pub const NO_JOINT8: u8 = psxed_format::model::NO_JOINT8;
+
 /// Decoded textured model vertex.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ModelVertex {
@@ -636,6 +643,20 @@ pub struct ModelVertex {
     pub normal: Vec3I16,
     /// 8-bit texture coordinates.
     pub uv: (u8, u8),
+    /// Secondary blend joint, or [`NO_JOINT8`] when this vertex is
+    /// single-bone.
+    pub joint1: u8,
+    /// Weight of `joint1` for view-space blending (0..=255). Zero
+    /// signals the renderer to stay on the single-bone GTE fast path.
+    pub blend: u8,
+}
+
+impl ModelVertex {
+    /// `true` when this vertex needs the two-bone blend render path.
+    #[inline]
+    pub fn is_blend(&self) -> bool {
+        self.blend != 0 && self.joint1 != NO_JOINT8
+    }
 }
 
 /// A parsed rigid-skeletal animation backed by slices into the
