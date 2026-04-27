@@ -827,6 +827,19 @@ fn wall_inward_normal(dir: GridDirection) -> (i32, i32) {
     }
 }
 
+/// Round-away-from-zero, clamped so any non-zero perpendicular is
+/// at least ±1 pixel. Keeps thin diagonal lines from collapsing to
+/// degenerate zero-width strips after `as i16` truncation.
+fn round_perp(value: f32) -> i16 {
+    if value > 0.0 {
+        (value + 0.5).max(1.0) as i16
+    } else if value < 0.0 {
+        (value - 0.5).min(-1.0) as i16
+    } else {
+        0
+    }
+}
+
 /// Emit two triangles forming a `thickness_px`-pixel-wide line
 /// between two screen-projected vertices. The OT slot is pinned at
 /// 0 so the line draws on top of everything.
@@ -846,28 +859,20 @@ fn push_screen_line(
         return;
     }
     let half = (style.thickness_px as f32) * 0.5;
-    let nx = -dy / len * half;
-    let ny = dx / len * half;
-    let a_lo = synth(
-        a.sx.saturating_add(-nx as i16),
-        a.sy.saturating_add(-ny as i16),
-        a.sz,
-    );
-    let a_hi = synth(
-        a.sx.saturating_add(nx as i16),
-        a.sy.saturating_add(ny as i16),
-        a.sz,
-    );
-    let b_lo = synth(
-        b.sx.saturating_add(-nx as i16),
-        b.sy.saturating_add(-ny as i16),
-        b.sz,
-    );
-    let b_hi = synth(
-        b.sx.saturating_add(nx as i16),
-        b.sy.saturating_add(ny as i16),
-        b.sz,
-    );
+    // Round-away-from-zero on both components so a diagonal screen
+    // edge with a sub-pixel perpendicular doesn't collapse the line
+    // to zero width — `0.707 as i16` truncates to 0, so a 2 px
+    // hover line on any tilted edge would otherwise disappear. We
+    // also clamp the magnitude to ≥ 1 px on the dominant axis so
+    // very thin slopes still render visibly.
+    let nx_f = -dy / len * half;
+    let ny_f = dx / len * half;
+    let nx = round_perp(nx_f);
+    let ny = round_perp(ny_f);
+    let a_lo = synth(a.sx.saturating_add(-nx), a.sy.saturating_add(-ny), a.sz);
+    let a_hi = synth(a.sx.saturating_add(nx), a.sy.saturating_add(ny), a.sz);
+    let b_lo = synth(b.sx.saturating_add(-nx), b.sy.saturating_add(-ny), b.sz);
+    let b_hi = synth(b.sx.saturating_add(nx), b.sy.saturating_add(ny), b.sz);
     push_tri_at_slot(scratch, [a_lo, a_hi, b_lo], style.rgb, 0);
     push_tri_at_slot(scratch, [b_lo, a_hi, b_hi], style.rgb, 0);
 }
