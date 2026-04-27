@@ -15,6 +15,7 @@ use egui::{
 use psxed_project::{
     GridDirection, GridHorizontalFace, GridVerticalFace, MaterialResource, NodeId, NodeKind,
     NodeRow, ProjectDocument, PsxBlendMode, Resource, ResourceData, ResourceId, WorldGrid,
+    WorldGridBudget, MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
 };
 
 /// Maximum undo / redo snapshots retained.
@@ -2331,6 +2332,14 @@ impl EditorWorkspace {
                 // Phase 2: per-sector inspector. Owns its own borrow of the
                 // project so it can edit the active Room's grid.
                 if let Some(room_id) = active_room {
+                    // Room budget panel — same data the cooker
+                    // uses, surfaced here so authors notice when
+                    // they're approaching the PSX cap before cook
+                    // time refuses the room.
+                    let budget = self.room_grid_view(room_id).map(|grid| grid.budget());
+                    if let Some(budget) = budget {
+                        draw_room_budget(ui, budget);
+                    }
                     if let Some((sx, sz)) = selected_sector {
                         if draw_sector_inspector(
                             ui,
@@ -2361,12 +2370,10 @@ impl EditorWorkspace {
                 };
 
                 if matches!(node.kind, NodeKind::Room { .. }) {
-                    let project = &self.project;
-                    egui::CollapsingHeader::new(icons::label(icons::SCAN, "Budget"))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            draw_room_budget(ui, project, selected);
-                        });
+                    if let NodeKind::Room { grid } = &node.kind {
+                        let budget = grid.budget();
+                        draw_room_budget(ui, budget);
+                    }
                 }
 
                 egui::CollapsingHeader::new(icons::label(icons::BOX, "Render"))
@@ -5769,62 +5776,83 @@ fn collect_room_options(project: &ProjectDocument) -> Vec<(NodeId, String)> {
         .collect()
 }
 
-/// Streaming-budget readout for one Room.
-///
-/// Cooks the room's grid in-memory and reports populated sector count,
-/// distinct material count, and the cooked `.psxw` byte total — the
-/// number that determines whether the streamer can fit the room in
-/// its residency budget.
-fn draw_room_budget(ui: &mut egui::Ui, project: &ProjectDocument, room_id: NodeId) {
-    let Some(room) = project.active_scene().node(room_id) else {
-        return;
-    };
-    let NodeKind::Room { grid } = &room.kind else {
-        return;
-    };
-
-    let total_cells = grid.width as usize * grid.depth as usize;
-    let populated = grid.populated_sector_count();
-    ui.horizontal(|ui| {
-        ui.label("Populated sectors");
-        ui.monospace(format!("{populated} / {total_cells}"));
-    });
-
-    match psxed_project::world_cook::cook_world_grid(project, grid) {
-        Ok(cooked) => {
-            ui.horizontal(|ui| {
-                ui.label("Materials");
-                ui.monospace(cooked.materials.len().to_string());
-            });
-            match cooked.to_psxw_bytes() {
-                Ok(bytes) => {
-                    let kib = bytes.len() as f32 / 1024.0;
-                    ui.horizontal(|ui| {
-                        ui.label("Cooked .psxw");
-                        ui.monospace(format!("{} B  ({kib:.2} KiB)", bytes.len()));
-                    });
-                }
-                Err(error) => {
-                    ui.colored_label(
-                        Color32::from_rgb(220, 90, 90),
-                        format!("encode failed: {error}"),
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            ui.colored_label(
-                Color32::from_rgb(220, 90, 90),
-                format!("cook failed: {error}"),
-            );
-        }
-    }
-}
-
 /// Per-cell inspector for one sector inside the active Room.
 ///
 /// Renders a CollapsingHeader with floor/ceiling toggles, a single
 /// flat height per face (corner authoring lands later), a material
+/// Render the room-budget summary block. Counts on the left,
+/// hard caps on the right; rows tinted red once they cross.
+/// Surfaces both `.psxw` v1 and v2-estimate sizes so authors
+/// can see what the format change is buying.
+fn draw_room_budget(ui: &mut egui::Ui, budget: WorldGridBudget) {
+    let over = budget.over_budget();
+    let header = if over {
+        icons::label(icons::TRASH, "Budget — over limit")
+    } else {
+        icons::label(icons::SCAN, "Budget")
+    };
+    egui::CollapsingHeader::new(header)
+        .default_open(over)
+        .show(ui, |ui| {
+            let row = |ui: &mut egui::Ui, key: &str, val: String, hot: bool| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(key).color(STUDIO_TEXT_WEAK));
+                    let txt = RichText::new(val).monospace();
+                    ui.label(if hot {
+                        txt.color(Color32::from_rgb(0xE0, 0x60, 0x60))
+                    } else {
+                        txt
+                    });
+                });
+            };
+            row(
+                ui,
+                "Cells",
+                format!(
+                    "{} populated / {} total",
+                    budget.populated_cells, budget.total_cells
+                ),
+                budget.total_cells > (MAX_ROOM_WIDTH as usize) * (MAX_ROOM_DEPTH as usize),
+            );
+            row(
+                ui,
+                "Floors",
+                format!("{}", budget.floors),
+                false,
+            );
+            row(
+                ui,
+                "Ceilings",
+                format!("{}", budget.ceilings),
+                false,
+            );
+            row(
+                ui,
+                "Walls",
+                format!("{}", budget.walls),
+                false,
+            );
+            row(
+                ui,
+                "Triangles",
+                format!("{} / {}", budget.triangles, MAX_ROOM_TRIANGLES),
+                budget.triangles > MAX_ROOM_TRIANGLES,
+            );
+            row(
+                ui,
+                ".psxw v1",
+                format!("{} / {}", human_bytes(budget.psxw_v1_bytes as u32), human_bytes(MAX_ROOM_BYTES as u32)),
+                budget.psxw_v1_bytes > MAX_ROOM_BYTES,
+            );
+            row(
+                ui,
+                ".psxw v2 est.",
+                format!("{}", human_bytes(budget.psxw_v2_estimated_bytes as u32)),
+                budget.psxw_v2_estimated_bytes > MAX_ROOM_BYTES,
+            );
+        });
+}
+
 /// dropdown for each face, and a row of toggles for the four
 /// cardinal walls. Returns `true` if any field changed so the
 /// workspace can mark the project dirty in one place.

@@ -262,7 +262,18 @@ pub struct GridFloorSample {
     pub height: i32,
 }
 
-/// One cooked grid room.
+/// One cooked grid room — **authoring / test helper**, not the
+/// resident PSX runtime format.
+///
+/// The room body holds `&[Option<GridSector<'a>>]` where each
+/// `GridSector<'a>` further holds six borrowed slices. Convenient
+/// for tests that build a world in static const data and for
+/// engine-side code that wants direct access; **but six-pointer
+/// pre-decoded sectors are not what we want resident in PSX
+/// memory at scale**. The PSX target shape is `psx_asset::World<'a>`
+/// — flat byte tables decoded by-value on demand. Don't grow new
+/// runtime systems on top of `GridRoom`; build them on
+/// `psx_asset::World`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridRoom<'a> {
     /// World-space room origin.
@@ -398,6 +409,11 @@ fn mul_sector(delta: i32, amount: i32) -> i32 {
 }
 
 /// Complete cooked grid-world.
+///
+/// Same authoring / test caveat as [`GridRoom`]: this is the
+/// engine-side helper, not the PSX-resident shape. PSX-resident
+/// world data is `psx_asset::World<'a>` (one room) plus a thin
+/// runtime wrapper — see [`RuntimeRoom`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridWorld<'a> {
     /// Rooms in the world.
@@ -416,6 +432,91 @@ impl<'a> GridWorld<'a> {
     /// Room by index.
     pub fn room(self, index: usize) -> Option<GridRoom<'a>> {
         self.rooms.get(index).copied()
+    }
+}
+
+/// PSX-resident wrapper over a parsed `.psxw` blob.
+///
+/// Compared with [`GridRoom`], this type holds **only** the
+/// zero-copy `psx_asset::World<'a>` view — no pre-decoded sector
+/// array, no `Option<GridSector>` slice, no per-sector borrows.
+/// Sectors and walls decode by value on demand:
+///
+/// ```ignore
+/// let blob: &[u8] = include_bytes!("level1.psxw");
+/// let room = RuntimeRoom::from_bytes(blob)?;
+/// for x in 0..room.width() {
+///     for z in 0..room.depth() {
+///         if let Some(sector) = room.sector(x, z) {
+///             // …decode walls by value:
+///             for i in 0..sector.wall_count() {
+///                 if let Some(wall) = room.sector_wall(sector, i) {
+///                     // …
+///                 }
+///             }
+///         }
+///     }
+/// }
+/// ```
+///
+/// New runtime systems (collision, rendering, AI floor sampling)
+/// should grow on this type rather than `GridRoom` — `GridRoom`
+/// stays for tests and authoring helpers only.
+#[derive(Copy, Clone, Debug)]
+pub struct RuntimeRoom<'a> {
+    inner: psx_asset::World<'a>,
+}
+
+impl<'a> RuntimeRoom<'a> {
+    /// Parse a cooked `.psxw` blob into a runtime view.
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, psx_asset::ParseError> {
+        Ok(Self {
+            inner: psx_asset::World::from_bytes(bytes)?,
+        })
+    }
+
+    /// Wrap an already-parsed `World`. Used when the parse and
+    /// the engine-side wrap happen in different layers.
+    pub const fn from_world(world: psx_asset::World<'a>) -> Self {
+        Self { inner: world }
+    }
+
+    /// Underlying byte-level view. Borrow it when you need the
+    /// raw slice access (validation, debug dump, …).
+    pub const fn world(&self) -> &psx_asset::World<'a> {
+        &self.inner
+    }
+
+    /// Width in grid sectors.
+    pub fn width(&self) -> u16 {
+        self.inner.width()
+    }
+
+    /// Depth in grid sectors.
+    pub fn depth(&self) -> u16 {
+        self.inner.depth()
+    }
+
+    /// Engine units per sector.
+    pub fn sector_size(&self) -> i32 {
+        self.inner.sector_size()
+    }
+
+    /// Sector by `(x, z)` cell index, or `None` for empty cells
+    /// or out-of-range coords.
+    pub fn sector(&self, x: u16, z: u16) -> Option<psx_asset::WorldSector> {
+        self.inner.sector(x, z)
+    }
+
+    /// Wall record by sector-local wall index. Skip the array-
+    /// decode dance the caller would otherwise do over
+    /// `sector.first_wall + i`.
+    pub fn sector_wall(
+        &self,
+        sector: psx_asset::WorldSector,
+        local_index: u16,
+    ) -> Option<psx_asset::WorldWall> {
+        self.inner.sector_wall(sector, local_index)
     }
 }
 

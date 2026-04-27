@@ -397,6 +397,48 @@ impl GridSector {
     }
 }
 
+/// Hard caps on a single room's authoring shape. The cooker
+/// rejects past these, and the editor inspector warns as the
+/// budget approaches them — both to keep the cooked `.psxw`
+/// inside reasonable PSX-side memory and to surface coordinate
+/// safety early (32-sector room × 1024 sector_size = 32 768,
+/// right at the i16 cliff; the renderer uses anchor-relative
+/// coords now but still respects the cap as belt-and-braces).
+pub const MAX_ROOM_WIDTH: u16 = 32;
+pub const MAX_ROOM_DEPTH: u16 = 32;
+pub const MAX_WALL_STACK: usize = 4;
+pub const MAX_ROOM_TRIANGLES: usize = 2048;
+pub const MAX_ROOM_BYTES: usize = 64 * 1024;
+
+/// Snapshot of a [`WorldGrid`]'s authoring footprint + cooked-
+/// byte estimate. Cheap to compute (single sector pass); the
+/// editor recomputes it whenever the inspector for a Room
+/// repaints.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorldGridBudget {
+    pub total_cells: usize,
+    pub populated_cells: usize,
+    pub floors: usize,
+    pub ceilings: usize,
+    pub walls: usize,
+    pub triangles: usize,
+    /// `.psxw` v1 wire size with 44-byte sectors / 24-byte walls.
+    pub psxw_v1_bytes: usize,
+    /// `.psxw` v2 estimate — 28-byte sectors / 12-byte walls.
+    /// Surfaced even before v2 ships so authors can see the
+    /// savings the format change is targeting.
+    pub psxw_v2_estimated_bytes: usize,
+}
+
+impl WorldGridBudget {
+    /// `true` if any of the cap constants is exceeded.
+    pub fn over_budget(&self) -> bool {
+        self.triangles > MAX_ROOM_TRIANGLES
+            || self.psxw_v1_bytes > MAX_ROOM_BYTES
+            || self.psxw_v2_estimated_bytes > MAX_ROOM_BYTES
+    }
+}
+
 /// Engine-style grid world authored by a scene node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldGrid {
@@ -525,6 +567,48 @@ impl WorldGrid {
     /// Number of populated sectors.
     pub fn populated_sector_count(&self) -> usize {
         self.sectors.iter().flatten().count()
+    }
+
+    /// Snapshot of this grid's authoring footprint + cooked-byte
+    /// estimate. Used by the editor inspector to surface room
+    /// budgets so authors notice when they're approaching PSX
+    /// limits before cook time.
+    pub fn budget(&self) -> WorldGridBudget {
+        let mut b = WorldGridBudget {
+            total_cells: (self.width as usize) * (self.depth as usize),
+            ..Default::default()
+        };
+        for sector in self.sectors.iter().flatten() {
+            b.populated_cells += 1;
+            if sector.floor.is_some() {
+                b.floors += 1;
+                b.triangles += 2;
+            }
+            if sector.ceiling.is_some() {
+                b.ceilings += 1;
+                b.triangles += 2;
+            }
+            for direction in [
+                GridDirection::North,
+                GridDirection::East,
+                GridDirection::South,
+                GridDirection::West,
+                GridDirection::NorthWestSouthEast,
+                GridDirection::NorthEastSouthWest,
+            ] {
+                let count = sector.walls.get(direction).len();
+                b.walls += count;
+                b.triangles += count * 2;
+            }
+        }
+        // v1 wire layout (matches `psxed_format::world` records):
+        //   AssetHeader = 12, WorldHeader = 20, Sector = 44, Wall = 24.
+        b.psxw_v1_bytes = 12 + 20 + b.populated_cells * 44 + b.walls * 24;
+        // v2 target (designed in P6): Sector = 28, Wall = 12. We
+        // surface this even before v2 lands so authors see the
+        // savings the format change is buying.
+        b.psxw_v2_estimated_bytes = 12 + 20 + b.populated_cells * 28 + b.walls * 12;
+        b
     }
 
     /// World-space X coordinate of the left edge of column `sx`
