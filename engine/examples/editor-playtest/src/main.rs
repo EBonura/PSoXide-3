@@ -32,6 +32,7 @@ use psx_engine::{
     WorldTriCommand, WorldVertex,
 };
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
+use psx_gte::transform::{cos_1_3_12, sin_1_3_12};
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
 mod generated {
@@ -77,6 +78,18 @@ const CAMERA_RADIUS_STEP: i32 = 64;
 const CAMERA_START_YAW: u16 = 220;
 const CAMERA_YAW_STEP: u16 = 12;
 
+// Tank-controls follow camera. Half-turn in PSX angle units —
+// the follow camera sits opposite the player's facing so the
+// player faces away from the camera, which is what tank
+// controls want.
+const HALF_TURN_Q12: u16 = 2048;
+const FOLLOW_RADIUS: i32 = 1400;
+const FOLLOW_HEIGHT: i32 = 700;
+/// Player linear speed (engine units per frame at 60 Hz).
+const PLAYER_SPEED: i32 = 32;
+/// Player turn rate (PSX angle units per frame).
+const PLAYER_YAW_STEP: u16 = 32;
+
 const OT_DEPTH: usize = 64;
 const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 1);
 const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, FAR_Z);
@@ -105,19 +118,33 @@ struct Playtest {
     /// `Some` when the cooked bytes were valid. The placeholder
     /// manifest leaves this `None` and renders a clear screen.
     room: Option<RuntimeRoom<'static>>,
-    /// Camera target — the spawn position from the manifest.
-    target: WorldVertex,
-    camera_yaw: u16,
-    camera_radius: i32,
+    /// Player position in room-local engine units. Initialised
+    /// from `PLAYER_SPAWN`.
+    player_x: i32,
+    player_y: i32,
+    player_z: i32,
+    player_yaw: u16,
+    /// `true` toggles a free-orbit camera around the spawn for
+    /// debug inspection. Default = follow.
+    free_orbit: bool,
+    orbit_yaw: u16,
+    orbit_radius: i32,
+    /// Spawn position retained for orbit-mode targeting.
+    spawn: WorldVertex,
 }
 
 impl Playtest {
     const fn new() -> Self {
         Self {
             room: None,
-            target: WorldVertex::ZERO,
-            camera_yaw: CAMERA_START_YAW,
-            camera_radius: CAMERA_START_RADIUS,
+            player_x: 0,
+            player_y: 0,
+            player_z: 0,
+            player_yaw: 0,
+            free_orbit: false,
+            orbit_yaw: CAMERA_START_YAW,
+            orbit_radius: CAMERA_START_RADIUS,
+            spawn: WorldVertex::ZERO,
         }
     }
 }
@@ -133,35 +160,88 @@ impl Scene for Playtest {
             if let Ok(world) = AssetWorld::from_bytes(room_record.world_bytes) {
                 self.room = Some(RuntimeRoom::from_world(world));
             }
-            // Spawn → camera target. PLAYER_SPAWN is in the same
-            // engine-unit room-local space the renderer uses.
-            self.target = WorldVertex::new(PLAYER_SPAWN.x, PLAYER_SPAWN.y, PLAYER_SPAWN.z);
         }
+        // Spawn → player + retained orbit target. PLAYER_SPAWN is
+        // in the same engine-unit room-local space the renderer
+        // uses, so no further transformation is needed.
+        self.player_x = PLAYER_SPAWN.x;
+        self.player_y = PLAYER_SPAWN.y;
+        self.player_z = PLAYER_SPAWN.z;
+        self.player_yaw = PLAYER_SPAWN.yaw as u16;
+        self.spawn = WorldVertex::new(PLAYER_SPAWN.x, PLAYER_SPAWN.y, PLAYER_SPAWN.z);
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
-        if ctx.is_held(button::RIGHT) {
-            self.camera_yaw = self.camera_yaw.wrapping_add(CAMERA_YAW_STEP);
+        if ctx.just_pressed(button::SELECT) {
+            self.free_orbit = !self.free_orbit;
         }
-        if ctx.is_held(button::LEFT) {
-            self.camera_yaw = self.camera_yaw.wrapping_sub(CAMERA_YAW_STEP);
-        }
-        if ctx.is_held(button::UP) {
-            self.camera_radius = (self.camera_radius - CAMERA_RADIUS_STEP).max(CAMERA_RADIUS_MIN);
-        }
-        if ctx.is_held(button::DOWN) {
-            self.camera_radius = (self.camera_radius + CAMERA_RADIUS_STEP).min(CAMERA_RADIUS_MAX);
+        if self.free_orbit {
+            // Orbit mode: D-pad yaws the camera + zooms.
+            if ctx.is_held(button::RIGHT) {
+                self.orbit_yaw = self.orbit_yaw.wrapping_add(CAMERA_YAW_STEP);
+            }
+            if ctx.is_held(button::LEFT) {
+                self.orbit_yaw = self.orbit_yaw.wrapping_sub(CAMERA_YAW_STEP);
+            }
+            if ctx.is_held(button::UP) {
+                self.orbit_radius =
+                    (self.orbit_radius - CAMERA_RADIUS_STEP).max(CAMERA_RADIUS_MIN);
+            }
+            if ctx.is_held(button::DOWN) {
+                self.orbit_radius =
+                    (self.orbit_radius + CAMERA_RADIUS_STEP).min(CAMERA_RADIUS_MAX);
+            }
+        } else {
+            // Tank-controls mode: D-pad LEFT / RIGHT yaws the
+            // player; UP / DOWN walks forward / back. Camera
+            // follows from behind. No collision yet.
+            if ctx.is_held(button::RIGHT) {
+                self.player_yaw = self.player_yaw.wrapping_add(PLAYER_YAW_STEP);
+            }
+            if ctx.is_held(button::LEFT) {
+                self.player_yaw = self.player_yaw.wrapping_sub(PLAYER_YAW_STEP);
+            }
+            // PSX trig: angle 0 → +Z, angle 1024 (90°) → +X. The
+            // player's forward direction is (sin(yaw), cos(yaw))
+            // as a Q1.3.12 unit vector.
+            let sin_y = sin_1_3_12(self.player_yaw) as i32;
+            let cos_y = cos_1_3_12(self.player_yaw) as i32;
+            if ctx.is_held(button::UP) {
+                self.player_x += (sin_y * PLAYER_SPEED) >> 12;
+                self.player_z += (cos_y * PLAYER_SPEED) >> 12;
+            }
+            if ctx.is_held(button::DOWN) {
+                self.player_x -= (sin_y * PLAYER_SPEED) >> 12;
+                self.player_z -= (cos_y * PLAYER_SPEED) >> 12;
+            }
         }
     }
 
     fn render(&mut self, _ctx: &mut Ctx) {
-        let camera = WorldCamera::orbit_yaw(
-            PROJECTION,
-            self.target,
-            CAMERA_Y_OFFSET,
-            self.camera_radius,
-            self.camera_yaw,
-        );
+        let camera = if self.free_orbit {
+            WorldCamera::orbit_yaw(
+                PROJECTION,
+                self.spawn,
+                CAMERA_Y_OFFSET,
+                self.orbit_radius,
+                self.orbit_yaw,
+            )
+        } else {
+            // Camera target = player; orbit yaw = player_yaw + π
+            // so the camera sits behind the player along the
+            // forward axis. `orbit_yaw` places the camera at
+            // `target + (sin*r, _, cos*r)` and looks back at
+            // `target`, so the +π flip puts it on the opposite
+            // side of player from the forward direction.
+            let target = WorldVertex::new(self.player_x, self.player_y, self.player_z);
+            WorldCamera::orbit_yaw(
+                PROJECTION,
+                target,
+                self.player_y + FOLLOW_HEIGHT,
+                FOLLOW_RADIUS,
+                self.player_yaw.wrapping_add(HALF_TURN_Q12),
+            )
+        };
 
         let mut ot = unsafe { OtFrame::begin(&mut OT) };
         let mut triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_TRIS) };

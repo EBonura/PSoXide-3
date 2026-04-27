@@ -18,6 +18,7 @@ lto           = true
 psx-asset  = { path = "../../../sdk/crates/psx-asset" }
 psx-engine = { path = "../../crates/psx-engine" }
 psx-gpu    = { path = "../../../sdk/crates/psx-gpu" }
+psx-gte    = { path = "../../../sdk/crates/psx-gte" }
 psx-math   = { path = "../../../sdk/crates/psx-math" }
 psx-rt     = { path = "../../../sdk/crates/psx-rt" }
 psx-vram   = { path = "../../../sdk/crates/psx-vram" }

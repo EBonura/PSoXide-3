@@ -136,6 +136,11 @@ pub struct EditorWorkspace {
     resource_search: String,
     resource_filter: ResourceFilter,
     active_tool: ViewTool,
+    /// Kind of node the Place tool drops on a click. Surfaces in
+    /// the toolbar as a small picker visible only when
+    /// `active_tool == Place`. Player Spawn enforces uniqueness
+    /// at place-time; the others are additive markers.
+    place_kind: PlaceKind,
     /// Material the next Floor / Wall / Ceiling paint will use, when
     /// set. `None` means "fall back to the name-based heuristic
     /// (`floor → first 'floor' material, brick → first 'brick' …`)" —
@@ -281,7 +286,36 @@ enum ViewTool {
     /// Clear the painted surface under the cursor.
     Erase,
     /// Drop a child entity node into the sector under the cursor.
+    /// The kind of node placed is controlled by `place_kind`.
     Place,
+}
+
+/// Variants of the `Place` tool. Maps directly onto the
+/// `NodeKind` produced by a Place click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaceKind {
+    /// `SpawnPoint { player: true }` — the editor enforces
+    /// uniqueness by demoting existing player spawns to
+    /// generic spawns at place time.
+    PlayerSpawn,
+    /// `SpawnPoint { player: false }`. Multiple OK.
+    SpawnMarker,
+    /// `MeshInstance` with no resource yet — useful as a
+    /// physical entity placeholder during authoring.
+    EntityMarker,
+    /// `Light` with default color / intensity / radius.
+    LightMarker,
+}
+
+impl PlaceKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PlayerSpawn => "Player Spawn",
+            Self::SpawnMarker => "Spawn",
+            Self::EntityMarker => "Entity",
+            Self::LightMarker => "Light",
+        }
+    }
 }
 
 impl ViewTool {
@@ -510,6 +544,7 @@ impl EditorWorkspace {
             resource_search: String::new(),
             resource_filter: ResourceFilter::All,
             active_tool: ViewTool::Select,
+            place_kind: PlaceKind::PlayerSpawn,
             brush_material: None,
             snap_to_grid: true,
             snap_units: 16,
@@ -1351,16 +1386,51 @@ impl EditorWorkspace {
                 .room_grid_view(room_id)
                 .map(|grid| grid.room_local_to_editor(hit_world))
                 .unwrap_or([0.0, 0.0]);
-            let id = self.project.active_scene_mut().add_node(
-                room_id,
-                "Spawn",
-                NodeKind::SpawnPoint { player: false },
-            );
+            let kind = self.place_kind;
+            // Player Spawn is exclusive — demote any existing
+            // player spawns so the cooker sees exactly one.
+            if matches!(kind, PlaceKind::PlayerSpawn) {
+                let scene = self.project.active_scene_mut();
+                let stale: Vec<NodeId> = scene
+                    .nodes()
+                    .iter()
+                    .filter(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true }))
+                    .map(|n| n.id)
+                    .collect();
+                for id in stale {
+                    if let Some(node) = scene.node_mut(id) {
+                        node.kind = NodeKind::SpawnPoint { player: false };
+                    }
+                }
+            }
+            let (default_name, node_kind) = match kind {
+                PlaceKind::PlayerSpawn => ("Player Spawn", NodeKind::SpawnPoint { player: true }),
+                PlaceKind::SpawnMarker => ("Spawn", NodeKind::SpawnPoint { player: false }),
+                PlaceKind::EntityMarker => (
+                    "Entity",
+                    NodeKind::MeshInstance {
+                        mesh: None,
+                        material: None,
+                    },
+                ),
+                PlaceKind::LightMarker => (
+                    "Light",
+                    NodeKind::Light {
+                        color: [255, 240, 200],
+                        intensity: 1.0,
+                        radius: 1.0,
+                    },
+                ),
+            };
+            let id = self
+                .project
+                .active_scene_mut()
+                .add_node(room_id, default_name, node_kind);
             if let Some(node) = self.project.active_scene_mut().node_mut(id) {
                 node.transform.translation = [editor[0], 0.0, editor[1]];
             }
             self.selected_node = id;
-            self.status = format!("Placed entity at {sx},{sz}");
+            self.status = format!("Placed {} at {sx},{sz}", kind.label());
             self.mark_dirty();
             return;
         }
@@ -3026,7 +3096,11 @@ impl EditorWorkspace {
                     }
                 });
                 ui.separator();
-                self.draw_brush_material_picker(ui);
+                if matches!(self.active_tool, ViewTool::Place) {
+                    self.draw_place_kind_picker(ui);
+                } else {
+                    self.draw_brush_material_picker(ui);
+                }
             });
             ui.horizontal(|ui| {
                 ui.checkbox(
@@ -3068,6 +3142,21 @@ impl EditorWorkspace {
     /// the per-tool name heuristic (`floor → "floor" material,
     /// brick → "brick" material`); picking a specific entry pins
     /// every Floor / Wall / Ceiling stroke to that material.
+    /// Toolbar selector for the Place tool's node kind. Shown
+    /// only while `active_tool == Place` — otherwise the brush
+    /// material picker takes the same slot.
+    fn draw_place_kind_picker(&mut self, ui: &mut egui::Ui) {
+        ui.label(icons::label(icons::PLUS, "Place"));
+        for kind in [
+            PlaceKind::PlayerSpawn,
+            PlaceKind::SpawnMarker,
+            PlaceKind::EntityMarker,
+            PlaceKind::LightMarker,
+        ] {
+            ui.selectable_value(&mut self.place_kind, kind, kind.label());
+        }
+    }
+
     fn draw_brush_material_picker(&mut self, ui: &mut egui::Ui) {
         let materials = self.project.material_options();
         let label = match self.brush_material {

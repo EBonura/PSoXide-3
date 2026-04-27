@@ -11,5 +11,9 @@ psxed-format = { path = "../psxed-format" }
 ron = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 
+[[bin]]
+name = "cook-playtest"
+path = "src/bin/cook_playtest.rs"
+
 [dev-dependencies]
 psx-asset = { path = "../../../sdk/crates/psx-asset" }
