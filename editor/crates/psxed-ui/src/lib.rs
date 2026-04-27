@@ -1141,13 +1141,31 @@ impl EditorWorkspace {
         let Some(room_id) = self.active_room_id() else {
             return;
         };
+        let paint_tool = matches!(
+            self.active_tool,
+            ViewTool::PaintFloor
+                | ViewTool::PaintWall
+                | ViewTool::PaintCeiling
+                | ViewTool::Erase
+                | ViewTool::Place
+        );
         let (cell, hit_world) = match face_hit {
             Some((face, hit)) => ((face.sx, face.sz), hit),
             None => {
                 let Some(world) = ground_hit else {
                     return;
                 };
-                let Some((sx, sz)) = self.world_to_sector(room_id, world) else {
+                // Click outside the existing grid? Auto-grow on
+                // paint/place clicks so the user can extend a room
+                // by stamping a floor in empty space — Sims-style.
+                // Move just bails (it never made sense for it to
+                // grow the room).
+                let cell = if paint_tool {
+                    self.ensure_cell_in_grid(room_id, world)
+                } else {
+                    self.world_to_sector(room_id, world)
+                };
+                let Some((sx, sz)) = cell else {
                     return;
                 };
                 let sector_size = self.room_sector_size(room_id).unwrap_or(1024) as f32;
@@ -1177,6 +1195,62 @@ impl EditorWorkspace {
                 hit_world,
             ),
         }
+    }
+
+    /// Resolve the cell `world` lands in, growing the room's grid
+    /// in `+X` / `+Z` if the click falls beyond the current
+    /// footprint. Negative-side clicks (`-X` / `-Z`) need anchor
+    /// shifting we don't do yet — they surface a hint instead.
+    /// Returns `None` for negative-side or for grows that would
+    /// blow past the safety cap.
+    fn ensure_cell_in_grid(
+        &mut self,
+        room_id: NodeId,
+        world: [f32; 2],
+    ) -> Option<(u16, u16)> {
+        const AUTO_GROW_LIMIT: u16 = 64;
+        if let Some(cell) = self.world_to_sector(room_id, world) {
+            return Some(cell);
+        }
+        let scene = self.project.active_scene();
+        let room = scene.node(room_id)?;
+        let NodeKind::Room { grid } = &room.kind else {
+            return None;
+        };
+        let center = node_world(room);
+        let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
+        let lx = (world[0] - (center[0] - half[0])).floor();
+        let lz = (world[1] - (center[1] - half[1])).floor();
+        if lx < 0.0 || lz < 0.0 {
+            self.status =
+                "Cannot grow room toward -X / -Z — adjust the room's transform manually"
+                    .to_string();
+            return None;
+        }
+        let need_w = (lx as u32 + 1).min(AUTO_GROW_LIMIT as u32) as u16;
+        let need_d = (lz as u32 + 1).min(AUTO_GROW_LIMIT as u32) as u16;
+        if (lx as u32 + 1) > AUTO_GROW_LIMIT as u32
+            || (lz as u32 + 1) > AUTO_GROW_LIMIT as u32
+        {
+            self.status =
+                format!("Auto-grow capped at {AUTO_GROW_LIMIT} — resize the grid manually");
+            return None;
+        }
+        let new_w = grid.width.max(need_w);
+        let new_d = grid.depth.max(need_d);
+        if new_w == grid.width && new_d == grid.depth {
+            return None;
+        }
+        self.push_undo();
+        let scene = self.project.active_scene_mut();
+        let node = scene.node_mut(room_id)?;
+        let NodeKind::Room { grid } = &mut node.kind else {
+            return None;
+        };
+        grid.resize(new_w, new_d);
+        self.status = format!("Grew grid to {new_w}×{new_d}");
+        self.mark_dirty();
+        Some((lx as u16, lz as u16))
     }
 
     /// World-space sector size of the named Room, or `None` if the
