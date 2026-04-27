@@ -33,10 +33,12 @@
 //! - `emulator-core` — owns `Gpu` (CPU rasterizer + VRAM + cmd_log)
 //!   and `Bus`.
 
+pub mod from_ot;
 pub mod pipeline;
 pub mod target;
 pub mod translator;
 
+pub use from_ot::build_cmd_log;
 pub use pipeline::{BlendKind, HwPipeline, HwVertex};
 pub use target::{RenderTarget, MAX_SCALE, VRAM_HEIGHT, VRAM_WIDTH};
 pub use translator::{DrawRun, TranslatedFrame, Translator};

@@ -198,3 +198,57 @@ pub fn average_z_triangle() -> u16 {
 pub fn read_flag() -> u32 {
     cfc2!(31)
 }
+
+#[cfg(all(test, not(target_arch = "mips")))]
+mod host_smoke {
+    //! Smoke tests for the host-side software-GTE shim.
+    //!
+    //! On hardware these helpers compile to inline COP2 instructions,
+    //! so testing them via Rust integration would require running on
+    //! a PS1. On host they route through the per-thread Gte from
+    //! `psx-gte-core`, which we *can* poke at directly to confirm the
+    //! routing produces matching output.
+    use super::*;
+    use crate::host;
+
+    fn install_identity() {
+        load_rotation(&Mat3I16::IDENTITY);
+        load_translation(Vec3I32::ZERO);
+        set_screen_offset(160 << 16, 120 << 16);
+        set_projection_plane(200);
+    }
+
+    #[test]
+    fn rtps_through_host_shim_projects_an_in_front_vertex() {
+        host::reset();
+        install_identity();
+        // V0 = (0, 0, 1024) — straight ahead, depth 1024. With H=200
+        // the GTE divides 200/sz3 (≈0x4000/sz3 internally), giving an
+        // X/Y near the screen offset for a vertex at the origin.
+        let projected = project_vertex(Vec3I16::new(0, 0, 1024));
+        assert_eq!(projected.sx, 160);
+        assert_eq!(projected.sy, 120);
+        assert!(projected.sz > 0, "near-plane vertex must yield non-zero depth");
+    }
+
+    #[test]
+    fn rtpt_through_host_shim_matches_three_separate_rtps_calls() {
+        host::reset();
+        install_identity();
+        let a = Vec3I16::new(-256, 0, 1024);
+        let b = Vec3I16::new(256, 0, 1024);
+        let c = Vec3I16::new(0, 256, 1024);
+
+        let batch = project_triangle(a, b, c);
+
+        host::reset();
+        install_identity();
+        let p_a = project_vertex(a);
+        let p_b = project_vertex(b);
+        let p_c = project_vertex(c);
+
+        assert_eq!(batch[0], p_a);
+        assert_eq!(batch[1], p_b);
+        assert_eq!(batch[2], p_c);
+    }
+}

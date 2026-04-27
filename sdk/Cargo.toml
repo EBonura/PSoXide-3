@@ -5,6 +5,7 @@ members = [
     "crates/psx-rt",
     "crates/psx-gpu",
     "crates/psx-gte",
+    "crates/psx-gte-core",
     "crates/psx-pad",
     "crates/psx-sdk",
     "crates/psx-vram",
@@ -32,6 +33,7 @@ psx-io  = { path = "crates/psx-io" }
 psx-rt  = { path = "crates/psx-rt" }
 psx-gpu = { path = "crates/psx-gpu" }
 psx-gte = { path = "crates/psx-gte" }
+psx-gte-core = { path = "crates/psx-gte-core" }
 psx-pad = { path = "crates/psx-pad" }
 psx-sdk = { path = "crates/psx-sdk" }
 psx-vram = { path = "crates/psx-vram" }

@@ -1,0 +1,10 @@
+[package]
+name         = "psx-gte-core"
+version      = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description  = "Pure-Rust GTE state machine and fixed-point math types. Shared by the PS1 SDK (`psx-gte`) and the emulator (`emulator-core`); both consume the same simulation so editor previews match what the hardware will draw."
+
+[lints.rust]
+missing_docs = "warn"

@@ -17,9 +17,11 @@ repository = "https://github.com/EBonura/PSoXide"
 
 [workspace.dependencies]
 # Shared-crate path deps. Three levels up: emu/crates/emulator-core/ → repo root → crates/.
-psx-hw    = { path = "../crates/psx-hw" }
-psx-iso   = { path = "../crates/psx-iso" }
-psx-trace = { path = "../crates/psx-trace" }
+psx-hw       = { path = "../crates/psx-hw" }
+psx-iso      = { path = "../crates/psx-iso" }
+psx-trace    = { path = "../crates/psx-trace" }
+psx-gpu      = { path = "../sdk/crates/psx-gpu" }
+psx-gte-core = { path = "../sdk/crates/psx-gte-core" }
 
 # Host-workspace-internal deps (one crate depends on another here).
 emulator-core    = { path = "crates/emulator-core" }

@@ -14,7 +14,6 @@ pub mod cpu;
 pub mod dma;
 pub mod fastboot;
 pub mod gpu;
-pub mod gte;
 pub mod hle_bios;
 pub mod irq;
 pub mod mdec;
@@ -35,7 +34,7 @@ pub use fastboot::{
     DISC_FAST_BOOT_WARMUP_STEPS,
 };
 pub use gpu::{DisplayArea, Gpu};
-pub use gte::Gte;
+pub use psx_gte_core::{Gte, GteProfileSnapshot};
 pub use irq::{Irq, IrqSource};
 pub use mmio_trace::{MmioKind, MmioTrace};
 pub use pad::{button, ButtonState, DigitalPad, PortDevice};

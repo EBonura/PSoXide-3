@@ -93,7 +93,7 @@ macro_rules! mfc2 {
         }
         #[cfg(not(target_arch = "mips"))]
         {
-            value = 0;
+            value = $crate::host::read_data($reg);
         }
         value
     }};
@@ -112,6 +112,10 @@ macro_rules! mtc2 {
                 in("$8") _value,
                 options(nostack, nomem, preserves_flags)
             );
+        }
+        #[cfg(not(target_arch = "mips"))]
+        {
+            $crate::host::write_data($reg, _value);
         }
     }};
 }
@@ -136,7 +140,7 @@ macro_rules! cfc2 {
         }
         #[cfg(not(target_arch = "mips"))]
         {
-            value = 0;
+            value = $crate::host::read_control($reg);
         }
         value
     }};
@@ -155,6 +159,10 @@ macro_rules! ctc2 {
                 in("$8") _value,
                 options(nostack, nomem, preserves_flags)
             );
+        }
+        #[cfg(not(target_arch = "mips"))]
+        {
+            $crate::host::write_control($reg, _value);
         }
     }};
 }

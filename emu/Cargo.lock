@@ -839,6 +839,7 @@ version = "0.1.0"
 dependencies = [
  "parity-oracle",
  "psoxide-settings",
+ "psx-gte-core",
  "psx-hw",
  "psx-iso",
  "psx-trace",
@@ -2417,6 +2418,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "psx-gpu"
+version = "0.1.0"
+dependencies = [
+ "psx-hw",
+ "psx-io",
+]
+
+[[package]]
 name = "psx-gpu-compute"
 version = "0.1.0"
 dependencies = [
@@ -2439,16 +2448,28 @@ dependencies = [
  "egui-wgpu",
  "emulator-core",
  "pollster",
+ "psx-gpu",
  "psx-gpu-compute",
  "psx-iso",
  "wgpu",
 ]
 
 [[package]]
+name = "psx-gte-core"
+version = "0.1.0"
+
+[[package]]
 name = "psx-hw"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
+]
+
+[[package]]
+name = "psx-io"
+version = "0.1.0"
+dependencies = [
+ "psx-hw",
 ]
 
 [[package]]

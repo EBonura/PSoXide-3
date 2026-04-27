@@ -10,7 +10,7 @@ use psx_trace::InstructionRecord;
 use thiserror::Error;
 
 use crate::bus::Bus;
-use crate::gte::Gte;
+use psx_gte_core::Gte;
 
 /// Errors raised during instruction execution.
 #[derive(Error, Debug, PartialEq, Eq)]

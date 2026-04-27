@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 emulator-core   = { workspace = true }
+psx-gpu         = { workspace = true }
 psx-gpu-compute = { workspace = true }
 wgpu            = { workspace = true }
 bytemuck        = { version = "1.16", features = ["derive"] }

@@ -1607,6 +1607,10 @@ mod tests {
             buf.extend_from_slice(&0i16.to_le_bytes());
             buf.push(u);
             buf.push(v);
+            // joint1 sentinel + blend=0 → single-bone vertex, matching
+            // the v2 layout `psxed_format::model` documents.
+            buf.push(psxed_format::model::NO_JOINT8);
+            buf.push(0);
         }
         for index in [0u16, 1, 2] {
             buf.extend_from_slice(&index.to_le_bytes());

@@ -24,8 +24,11 @@
 // host target where only the panic handler + heap are live.
 #![cfg_attr(target_arch = "mips", feature(asm_experimental_arch))]
 
+#[cfg(target_arch = "mips")]
 pub mod bios;
+#[cfg(target_arch = "mips")]
 pub mod interrupts;
+#[cfg(target_arch = "mips")]
 pub mod tty;
 
 #[cfg(feature = "alloc")]
@@ -41,6 +44,7 @@ extern "C" {
     static __heap_end: u8;
 }
 
+#[cfg(target_arch = "mips")]
 extern "Rust" {
     fn main();
 }
@@ -52,6 +56,7 @@ extern "Rust" {
 /// have set up a valid stack pointer before branching here — the
 /// PSX-EXE header's `initial_sp_base` + `initial_sp_offset` fields
 /// guarantee this.
+#[cfg(target_arch = "mips")]
 #[no_mangle]
 #[link_section = ".text._start"]
 pub unsafe extern "C" fn _start() -> ! {
@@ -85,6 +90,12 @@ pub fn halt() -> ! {
 
 /// Panic handler. Tries to write the message to TTY so PCSX-Redux
 /// (and our emulator's future console hook) shows it, then halts.
+///
+/// Only registered when targeting PS1 hardware. Host builds of the
+/// SDK use `std`'s panic handler — this avoids the lang-item conflict
+/// that would otherwise fire when something on host transitively
+/// depends on both `psx-rt` and `std`.
+#[cfg(target_arch = "mips")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     tty::print("PANIC: ");

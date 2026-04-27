@@ -8,10 +8,11 @@ repository.workspace = true
 description = "PSoXide emulator core: CPU, bus, and peripherals. No UI, no window — pure state machine."
 
 [dependencies]
-psx-hw    = { workspace = true }
-psx-iso   = { workspace = true }
-psx-trace = { workspace = true }
-thiserror = { workspace = true }
+psx-hw       = { workspace = true }
+psx-iso      = { workspace = true }
+psx-trace    = { workspace = true }
+psx-gte-core = { workspace = true }
+thiserror    = { workspace = true }
 
 [dev-dependencies]
 parity-oracle = { workspace = true }

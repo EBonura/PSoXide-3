@@ -4,7 +4,10 @@ version      = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description  = "PS1 GTE (COP2) inline-asm wrappers + fixed-point math types."
+description  = "PS1 GTE (COP2) wrappers. MIPS build emits inline-asm coprocessor instructions; host build routes the same API through `psx-gte-core`'s software simulation so editor and emulator share one implementation."
+
+[dependencies]
+psx-gte-core = { workspace = true }
 
 [lints.rust]
 missing_docs = "warn"

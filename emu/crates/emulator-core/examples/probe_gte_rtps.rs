@@ -17,7 +17,7 @@
 //! something else (like 0, 0 or a saturated garbage value), we have
 //! an emulator-side concern to surface.
 
-use emulator_core::gte::Gte;
+use emulator_core::Gte;
 
 fn pack_i16(lo: i16, hi: i16) -> u32 {
     ((hi as u16 as u32) << 16) | (lo as u16 as u32)
