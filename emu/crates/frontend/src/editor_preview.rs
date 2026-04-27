@@ -52,17 +52,27 @@ const SCREEN_CY: i32 = SCREEN_H / 2;
 /// Projection-plane distance (focal length). Bigger = narrower FOV.
 const PROJ_H: i32 = 320;
 
-/// Per-frame scratch — primitives + OT live in a static so the chain
-/// pointers `OrderingTable::insert` writes into each packet remain
-/// valid for the duration of `build_phase1_cmd_log`.
+/// Per-frame scratch — primitives **and** OT must live in the same
+/// memory region. `OrderingTable` stores 24-bit chain pointers (the
+/// PS1 DMA encoding); `iter_packets` reconstructs full addresses by
+/// OR-ing the OT slot's high 40 bits over the 24-bit chain entries.
+/// That only works if every chained primitive sits in the same 16 MB
+/// window as the OT itself — heap-allocated `Vec<TriFlat>` lives in
+/// a totally separate region on host and segfaults on dereference.
+/// Keeping the array inline alongside the OT in the static fixes
+/// that and matches PS1's flat 2 MB main RAM layout.
 struct PreviewScratch {
     ot: OrderingTable<OT_DEPTH>,
-    tris: Vec<TriFlat>,
+    tris: [TriFlat; TRI_CAP],
+    used: usize,
 }
+
+const EMPTY_TRI: TriFlat = TriFlat::new([(0, 0), (0, 0), (0, 0)], 0, 0, 0);
 
 static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
     ot: OrderingTable::new(),
-    tris: Vec::new(),
+    tris: [EMPTY_TRI; TRI_CAP],
+    used: 0,
 });
 
 /// Build a fresh `cmd_log` rendering the project's first Room from
@@ -80,10 +90,7 @@ pub fn build_phase1_cmd_log(
     };
 
     let mut scratch = SCRATCH.lock().expect("editor preview scratch mutex");
-    scratch.tris.clear();
-    if scratch.tris.capacity() < TRI_CAP {
-        scratch.tris.reserve(TRI_CAP);
-    }
+    scratch.used = 0;
     scratch.ot.clear();
 
     setup_gte_for_camera(camera, target);
@@ -213,7 +220,7 @@ fn walk_floors(grid: &WorldGrid, _target: [i32; 3], scratch: &mut PreviewScratch
             push_tri(scratch, [p_nw, p_sw, p_ne], (r, g, b));
             push_tri(scratch, [p_ne, p_sw, p_se], (r, g, b));
 
-            if scratch.tris.len() >= TRI_CAP {
+            if scratch.used >= TRI_CAP {
                 return;
             }
         }
@@ -243,15 +250,19 @@ fn floor_color_for(x: u16, z: u16) -> (u8, u8, u8) {
     }
 }
 
-/// Compose a [`TriFlat`] from three projected vertices, insert it
-/// into the OT at `avg_z / depth_step`, and stash the packet in the
-/// per-frame scratch vec.
+/// Compose a [`TriFlat`] from three projected vertices, store it in
+/// the next slot of the static `tris` array, and link it into the
+/// OT keyed on average screen-space depth.
 fn push_tri(
     scratch: &mut PreviewScratch,
     p: [psx_gte::scene::Projected; 3],
     rgb: (u8, u8, u8),
 ) {
-    let tri = TriFlat::new(
+    if scratch.used >= TRI_CAP {
+        return;
+    }
+    let idx = scratch.used;
+    scratch.tris[idx] = TriFlat::new(
         [
             (p[0].sx, p[0].sy),
             (p[1].sx, p[1].sy),
@@ -261,8 +272,7 @@ fn push_tri(
         rgb.1,
         rgb.2,
     );
-    scratch.tris.push(tri);
-    let idx = scratch.tris.len() - 1;
+    scratch.used = idx + 1;
     let avg_sz = (p[0].sz as u32 + p[1].sz as u32 + p[2].sz as u32) / 3;
     // Map sz (Q0, range up to ~32K for our scenes) into the OT
     // depth band. Smaller sz = closer = drawn last, so map to a
