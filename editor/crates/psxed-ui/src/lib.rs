@@ -760,6 +760,37 @@ impl EditorWorkspace {
         ))
     }
 
+    /// Cook the active project into the playtest example's
+    /// `generated/` directory. Validates the scene tree, cooks
+    /// every populated Room into `rooms/room_NNN.psxw`, and
+    /// writes a fresh `level_manifest.rs`. Returns a status
+    /// string suitable for `self.status`. The "& Play" half is
+    /// up to the caller — the editor doesn't spawn child
+    /// processes from this path; instead the status string
+    /// hands back the exact command to run.
+    pub fn cook_playtest_to_disk(&self) -> Result<String, String> {
+        let dir = psxed_project::playtest::default_generated_dir();
+        let report = psxed_project::playtest::cook_to_dir(&self.project, &dir)
+            .map_err(|e| format!("write playtest output: {e}"))?;
+        if !report.is_ok() {
+            return Err(format!(
+                "playtest validation failed: {}",
+                report.errors.join("; ")
+            ));
+        }
+        let warning_suffix = if report.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} warning{})", report.warnings.len(),
+                if report.warnings.len() == 1 { "" } else { "s" })
+        };
+        Ok(format!(
+            "Playtest cooked → {}{}.  Run: make run-editor-playtest",
+            dir.display(),
+            warning_suffix,
+        ))
+    }
+
     /// Draw the full editor workspace.
     ///
     /// `viewport_3d_tex` is the host's `egui::TextureId` for the
@@ -2134,6 +2165,19 @@ impl EditorWorkspace {
                         match self.cook_world_to_disk() {
                             Ok(report) => self.status = report,
                             Err(error) => self.status = format!("Cook failed: {error}"),
+                        }
+                    }
+                    if ui
+                        .button(icons::label(icons::PLAY, "Cook & Play"))
+                        .on_hover_text(
+                            "Cook the active scene into editor-playtest's generated dir. \
+                             Run `make run-editor-playtest` afterwards to launch.",
+                        )
+                        .clicked()
+                    {
+                        match self.cook_playtest_to_disk() {
+                            Ok(report) => self.status = report,
+                            Err(error) => self.status = format!("Cook & Play failed: {error}"),
                         }
                     }
 

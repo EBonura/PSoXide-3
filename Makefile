@@ -24,7 +24,9 @@
         showcase-lights run-showcase-lights \
         showcase-fog run-showcase-fog \
         showcase-particles run-showcase-particles \
-        hello-engine run-hello-engine
+        hello-engine run-hello-engine \
+        showcase-room run-showcase-room \
+        cook-playtest editor-playtest run-editor-playtest
 
 help:
 	@echo "PSoXide targets:"
@@ -189,6 +191,21 @@ showcase-fog: assets
 showcase-particles:
 	cd engine/examples/showcase-particles && cargo build --release
 
+showcase-room:
+	cd engine/examples/showcase-room && cargo build --release
+
+# Cook the editor's active project into the editor-playtest
+# example's `generated/` directory. Re-run after any scene-tree
+# change. Falls through to running cargo on psxed-project so
+# the host workspace's Cargo.lock stays in sync.
+cook-playtest:
+	cd editor && cargo run --release -p psxed-project --bin cook-playtest
+
+# Build the editor-playtest example. Depends on cook-playtest
+# so a fresh checkout produces a valid binary on the first run.
+editor-playtest: cook-playtest
+	cd engine/examples/editor-playtest && cargo build --release
+
 # --- Content pipeline (host-side editor tooling) ------------------------
 
 PSXED := editor/target/release/psxed
@@ -296,3 +313,14 @@ run-showcase-particles: showcase-particles
 
 run-hello-engine: hello-engine
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/hello-engine.exe cargo run -p frontend --release
+
+run-showcase-room: showcase-room
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-room.exe cargo run -p frontend --release
+
+# Editor-driven playtest loop: cooks the active project into
+# the example's generated/ dir, builds the PSX EXE, and side-
+# loads it through the desktop frontend. Pairs with the
+# editor's "Cook & Play" button which performs the cook half
+# and asks the user to run this target afterwards.
+run-editor-playtest: editor-playtest
+	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/editor-playtest.exe cargo run -p frontend --release

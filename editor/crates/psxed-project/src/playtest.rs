@@ -674,6 +674,35 @@ mod tests {
     }
 
     #[test]
+    fn cook_to_dir_writes_manifest_and_room_blob() {
+        let project = ProjectDocument::starter();
+        let dir = std::env::temp_dir().join(format!(
+            "psxed-playtest-cook-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let report = cook_to_dir(&project, &dir).expect("cook_to_dir IO");
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+
+        // level_manifest.rs exists, references room_000.psxw.
+        let manifest = std::fs::read_to_string(dir.join(MANIFEST_FILENAME))
+            .expect("manifest written");
+        assert!(manifest.contains("rooms/room_000.psxw"));
+
+        // The referenced room blob actually landed on disk.
+        let blob_path = dir.join(ROOMS_DIRNAME).join("room_000.psxw");
+        let blob = std::fs::read(&blob_path).expect("room blob written");
+        // PSXW magic — sanity that it parses, not just a stub.
+        assert_eq!(&blob[0..4], b"PSXW");
+
+        // Cleanup tempdir.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn empty_package_renders_a_valid_skeleton() {
         let package = PlaytestPackage::default();
         let src = render_manifest_source(&package);
