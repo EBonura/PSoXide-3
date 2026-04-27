@@ -215,19 +215,44 @@ fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) {
         ],
     };
 
-    // GTE translation: view × (-camera_pos). Computed manually as i32
-    // dot products since we need the full 32-bit range.
-    let cam_world = [cam_x, cam_y, cam_z];
+    // Vertex emit will subtract `target` from each world coord
+    // (see `world_to_view`), so anything inside ±i16 of the
+    // camera target is safe to GTE-project. Compose the GTE
+    // translation around that anchor: view·(anchor - cam_world)
+    // = view·(-cam_local) where cam_local lives entirely within
+    // the (small) orbit-radius range. This is the fix for the
+    // 64×1024 = 65 536 > i16::MAX overflow the prior code's
+    // saturating clamp would silently corrupt.
+    let cam_local = [cam_x - target[0], cam_y - target[1], cam_z - target[2]];
     let tr = Vec3I32::new(
-        -dot_view_world(view.m[0], cam_world),
-        -dot_view_world(view.m[1], cam_world),
-        -dot_view_world(view.m[2], cam_world),
+        -dot_view_world(view.m[0], cam_local),
+        -dot_view_world(view.m[1], cam_local),
+        -dot_view_world(view.m[2], cam_local),
     );
 
+    set_view_anchor(target);
     gte_scene::load_rotation(&view);
     gte_scene::load_translation(tr);
     gte_scene::set_screen_offset((SCREEN_CX as i32) << 16, (SCREEN_CY as i32) << 16);
     gte_scene::set_projection_plane(PROJ_H as u16);
+}
+
+/// Shared anchor that `world_to_view` subtracts from each vertex
+/// before squashing to `i16`. Set per-frame by
+/// `setup_gte_for_camera` to the camera target so the emitted
+/// vertices stay anchor-relative — the GTE absorbs the offset via
+/// its translation register. Without this, a single 32-sector
+/// room (32 × 1024 = 32 768) sits exactly on the i16 cliff.
+static VIEW_ANCHOR: std::sync::Mutex<[i32; 3]> = std::sync::Mutex::new([0, 0, 0]);
+
+fn set_view_anchor(anchor: [i32; 3]) {
+    if let Ok(mut a) = VIEW_ANCHOR.lock() {
+        *a = anchor;
+    }
+}
+
+fn view_anchor() -> [i32; 3] {
+    VIEW_ANCHOR.lock().map(|a| *a).unwrap_or([0, 0, 0])
 }
 
 /// `view_row · world_pos` with the >>12 the GTE does internally for
@@ -579,14 +604,28 @@ fn material_color(
 }
 
 /// Squash a world-space i32 corner into the i16 the GTE V0 register
-/// expects. Cooked PS1 levels live within ±i16 by design (sectors
-/// are 1024 units, even a 64-sector room fits).
+/// expects. Subtracts the per-frame view anchor (= camera target)
+/// first so the emitted coord is anchor-relative. With sector_size
+/// 1024, this gives ±32 sectors of headroom from the camera target
+/// before clamp truncation kicks in — comfortably the editor's
+/// budget cap.
+///
+/// Debug builds assert; release silently saturates rather than
+/// crashing the editor mid-paint.
 fn world_to_view(world: [i32; 3]) -> Vec3I16 {
-    Vec3I16::new(
-        clamp_i16(world[0]),
-        clamp_i16(world[1]),
-        clamp_i16(world[2]),
-    )
+    let a = view_anchor();
+    let lx = world[0] - a[0];
+    let ly = world[1] - a[1];
+    let lz = world[2] - a[2];
+    debug_assert!(
+        (i16::MIN as i32..=i16::MAX as i32).contains(&lx)
+            && (i16::MIN as i32..=i16::MAX as i32).contains(&ly)
+            && (i16::MIN as i32..=i16::MAX as i32).contains(&lz),
+        "vertex {:?} (anchor-relative {:?}) overflows i16 — room too big or camera anchor wrong",
+        world,
+        [lx, ly, lz]
+    );
+    Vec3I16::new(clamp_i16(lx), clamp_i16(ly), clamp_i16(lz))
 }
 
 /// Render the paint-target ghost outline. Cell ghosts trace the

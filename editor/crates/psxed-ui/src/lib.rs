@@ -115,12 +115,13 @@ pub struct EditorWorkspace {
     /// them as ghosts at the world position the auto-grow would
     /// place them.
     paint_target_preview: Option<PaintTargetPreview>,
-    /// Last cell `apply_paint` has run on during the current drag.
-    /// Used to dedupe per-frame paint events so click-drag with
-    /// Wall / Place doesn't stack duplicate walls / spawn N entities
-    /// in the same cell. Reset to `None` whenever a new primary
-    /// click starts.
-    last_paint_cell: Option<(NodeId, u16, u16)>,
+    /// Last paint stamp committed during the current drag. Edge-
+    /// aware so dragging across different edges of the same cell
+    /// stamps each one (PaintWall sweeping a cell can hit N then
+    /// E without the dedupe blocking the second click), but
+    /// dwelling on the same edge doesn't re-stack walls. Reset
+    /// to `None` whenever a new primary click starts.
+    last_paint_stamp: Option<PaintStamp>,
     /// `Some((id, buffer))` while a scene-tree row is in rename mode.
     /// Buffer holds the in-flight string the user is typing; commit /
     /// cancel finalises against the actual node name.
@@ -190,6 +191,21 @@ struct PsxtStats {
     pixel_bytes: u32,
     clut_bytes: u32,
     file_bytes: u32,
+}
+
+/// Per-stamp paint dedupe key. Two paint events with equal stamps
+/// are considered redundant during a single drag — typically the
+/// second is dropped. Edge / stack components let PaintWall stamp
+/// multiple edges of the same cell without dwelling on one
+/// re-firing the same wall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaintStamp {
+    room: NodeId,
+    sx: u16,
+    sz: u16,
+    tool: ViewTool,
+    edge: Option<GridDirection>,
+    stack: Option<u8>,
 }
 
 /// What the next paint click would target. Carries world-cell
@@ -484,7 +500,7 @@ impl EditorWorkspace {
             hovered_face: None,
             selected_face: None,
             paint_target_preview: None,
-            last_paint_cell: None,
+            last_paint_stamp: None,
             renaming: None,
             pending_rename_focus: false,
             history: UndoStack::default(),
@@ -902,7 +918,7 @@ impl EditorWorkspace {
         if response.drag_started_by(egui::PointerButton::Primary)
             || response.clicked_by(egui::PointerButton::Primary)
         {
-            self.last_paint_cell = None;
+            self.last_paint_stamp = None;
         }
         let primary_active = response.clicked_by(egui::PointerButton::Primary)
             || response.dragged_by(egui::PointerButton::Primary);
@@ -1136,10 +1152,11 @@ impl EditorWorkspace {
             }
         };
         let (sx, sz) = cell;
-        if self.last_paint_cell == Some((room_id, sx, sz)) {
+        let stamp = self.paint_stamp_for(room_id, sx, sz, face_hit, hit_world);
+        if self.last_paint_stamp == Some(stamp) {
             return;
         }
-        self.last_paint_cell = Some((room_id, sx, sz));
+        self.last_paint_stamp = Some(stamp);
         self.selected_sector = Some((sx, sz));
         match self.active_tool {
             ViewTool::Move => self.snap_selected_to_cell(room_id, sx, sz),
@@ -1151,6 +1168,54 @@ impl EditorWorkspace {
                 face_hit.map(|(f, _)| f),
                 hit_world,
             ),
+        }
+    }
+
+    /// Build the dedupe key for the next paint dispatch. PaintWall
+    /// records the targeted edge + stack so dragging across edges
+    /// of the same cell stamps each one (different stamps), but
+    /// dwelling on the same edge during drag dedupes (same stamp).
+    /// Other tools key on cell + tool only — drag-restamping a
+    /// floor with the same material is a no-op anyway.
+    fn paint_stamp_for(
+        &self,
+        room_id: NodeId,
+        sx: u16,
+        sz: u16,
+        face_hit: Option<(FaceRef, [f32; 3])>,
+        hit_world: [f32; 3],
+    ) -> PaintStamp {
+        let (edge, stack) = if matches!(self.active_tool, ViewTool::PaintWall) {
+            match face_hit {
+                Some((
+                    FaceRef {
+                        kind: FaceKind::Wall { dir, stack },
+                        ..
+                    },
+                    _,
+                )) => (Some(dir), Some(stack)),
+                _ => {
+                    let center = self
+                        .room_grid_view(room_id)
+                        .map(|grid| grid.cell_center_world(sx, sz))
+                        .unwrap_or([0.0, 0.0]);
+                    let dir = edge_from_world_offset(
+                        hit_world[0] - center[0],
+                        hit_world[2] - center[1],
+                    );
+                    (Some(dir), None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        PaintStamp {
+            room: room_id,
+            sx,
+            sz,
+            tool: self.active_tool,
+            edge,
+            stack,
         }
     }
 
@@ -1333,22 +1398,37 @@ impl EditorWorkspace {
                 format!("Painted ceiling at {sx},{sz}")
             }
             ViewTool::PaintWall => {
-                // Prefer the wall the ray actually hit; otherwise
-                // infer the edge from where on the cell's footprint
-                // the click landed (raw-world dx/dz, so the sign
-                // matches the renderer's `WallEdge` convention).
-                let dir = match picked_face {
-                    Some(FaceRef {
-                        kind: FaceKind::Wall { dir, .. },
-                        ..
-                    }) => dir,
-                    _ => edge_from_world_offset(
+                // When the ray hit an existing wall: REPLACE its
+                // material instead of stacking another wall on top
+                // of it (the previous behaviour silently appended,
+                // which the user spotted as the click-and-nothing-
+                // happens-but-walls-pile-up bug). When the ray hit
+                // a floor / ceiling / nothing: infer the edge from
+                // the click position relative to the cell centre
+                // and append a new wall on that edge.
+                if let Some(FaceRef {
+                    kind: FaceKind::Wall { dir, stack },
+                    ..
+                }) = picked_face
+                {
+                    if let Some(sector) = grid.sector_mut(sx, sz) {
+                        if let Some(wall) = sector.walls.get_mut(dir).get_mut(stack as usize) {
+                            wall.material = wall_mat;
+                            format!("Repainted {} wall #{stack} at {sx},{sz}", direction_label(dir))
+                        } else {
+                            format!("Wall #{stack} on {} edge of {sx},{sz} is gone", direction_label(dir))
+                        }
+                    } else {
+                        format!("Cell {sx},{sz} no longer has a sector")
+                    }
+                } else {
+                    let dir = edge_from_world_offset(
                         hit_world[0] - cell_center[0],
                         hit_world[2] - cell_center[1],
-                    ),
-                };
-                grid.add_wall(sx, sz, dir, 0, sector_size_i, wall_mat);
-                format!("Added {} wall at {sx},{sz}", direction_label(dir))
+                    );
+                    grid.add_wall(sx, sz, dir, 0, sector_size_i, wall_mat);
+                    format!("Added {} wall at {sx},{sz}", direction_label(dir))
+                }
             }
             ViewTool::Erase => {
                 // Per-face Erase: a wall ray-pick drops just that

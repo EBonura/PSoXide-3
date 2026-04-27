@@ -108,6 +108,19 @@ pub enum WorldGridCookError {
         /// Authored wall heights.
         heights: [i32; 4],
     },
+    /// Diagonal walls (`NorthWestSouthEast` / `NorthEastSouthWest`)
+    /// aren't supported by the v1 cooker / runtime. The data model
+    /// has the slots so authoring can land later, but render +
+    /// picking + collision aren't consistent yet — better to fail
+    /// loud than ship half-working diagonals.
+    UnsupportedDiagonalWall {
+        /// Sector X coordinate.
+        x: u16,
+        /// Sector Z coordinate.
+        z: u16,
+        /// Diagonal direction.
+        direction: GridDirection,
+    },
 }
 
 impl std::fmt::Display for WorldGridCookError {
@@ -161,6 +174,10 @@ impl std::fmt::Display for WorldGridCookError {
             } => write!(
                 f,
                 "sector {x},{z} {direction:?} wall has invalid heights {heights:?}"
+            ),
+            Self::UnsupportedDiagonalWall { x, z, direction } => write!(
+                f,
+                "sector {x},{z} has a {direction:?} diagonal wall — diagonals aren't supported by the v1 cooker / runtime yet"
             ),
         }
     }
@@ -445,13 +462,28 @@ fn cook_walls(
     material_slots: &mut HashMap<ResourceId, u16>,
 ) -> Result<CookedGridWalls, WorldGridCookError> {
     let mut cooked = CookedGridWalls::default();
+    // Diagonal walls fail loud: the data model has the slots
+    // (so authoring + serialization works), but render / pick /
+    // collision aren't consistent yet — better to refuse to
+    // cook than ship half-supported geometry.
+    for direction in [
+        GridDirection::NorthWestSouthEast,
+        GridDirection::NorthEastSouthWest,
+    ] {
+        if !walls.get(direction).is_empty() {
+            return Err(WorldGridCookError::UnsupportedDiagonalWall { x, z, direction });
+        }
+    }
+    // Cardinal walls only. The cooker keeps each cell's locally-
+    // authored walls — the wall-ownership normalization
+    // (deduping the east wall of (x,z) against the west wall of
+    // (x+1,z)) lives in `normalize_shared_walls` so the runtime
+    // never gets two coplanar walls on the same physical edge.
     for direction in [
         GridDirection::North,
         GridDirection::East,
         GridDirection::South,
         GridDirection::West,
-        GridDirection::NorthWestSouthEast,
-        GridDirection::NorthEastSouthWest,
     ] {
         for wall in walls.get(direction) {
             validate_wall_heights(wall, x, z, direction)?;

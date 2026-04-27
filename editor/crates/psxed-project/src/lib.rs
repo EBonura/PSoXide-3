@@ -303,6 +303,20 @@ impl GridVerticalFace {
 }
 
 /// Wall lists for one grid sector.
+///
+/// **Ownership rule**: a physical wall between cells `(x, z)` and
+/// `(x+1, z)` is the **East** wall of `(x, z)` AND the **West**
+/// wall of `(x+1, z)` simultaneously. The editor's PaintWall tool
+/// stamps only one side (whichever the user clicked); the cooker
+/// is responsible for normalizing any duplicate-opposing-coplanar
+/// walls — when both sides exist, the **lower-index cell wins**
+/// (i.e., `East(x,z)` survives, `West(x+1,z)` is dropped if
+/// they're identical). North/South share `North(x, z)` ↔
+/// `South(x, z+1)` with the same low-index-wins rule.
+///
+/// Diagonal walls are authoring-only for now: cooker rejects them
+/// (`UnsupportedDiagonalWall`) until render / pick / collision
+/// agree on their geometry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridWalls {
     /// Walls on the north edge.
