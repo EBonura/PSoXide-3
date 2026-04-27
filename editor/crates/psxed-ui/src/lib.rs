@@ -2609,95 +2609,106 @@ impl EditorWorkspace {
         if !room_active && self.active_tool.requires_room_context() {
             self.active_tool = ViewTool::Select;
         }
-        ui.horizontal(|ui| {
-            for (tool, label, hint) in [
-                (
-                    ViewTool::Select,
-                    icons::label(icons::POINTER, "Select"),
-                    "Click an entity in the viewport to select it.",
-                ),
-                (
-                    ViewTool::Move,
-                    icons::label(icons::MOVE, "Move"),
-                    "Drag the selected entity onto another cell.",
-                ),
-                (
-                    ViewTool::Rotate,
-                    icons::label(icons::ROTATE_3D, "Rotate"),
-                    "Rotate (2D viewport only for now).",
-                ),
-                (
-                    ViewTool::Scale,
-                    icons::label(icons::SCALE_3D, "Scale"),
-                    "Scale (2D viewport only for now).",
-                ),
-            ] {
-                ui.selectable_value(&mut self.active_tool, tool, label)
-                    .on_hover_text(hint);
-            }
-            ui.separator();
-            ui.add_enabled_ui(room_active, |ui| {
+        // Two rows: row 1 is "what to do" (tools + the brush
+        // material a paint tool will use); row 2 is "how to view"
+        // (snap / grid / 2D-vs-3D / zoom). Splitting keeps the
+        // toolbar from overflowing on narrow windows and groups
+        // controls by intent so each row scans as one decision.
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
                 for (tool, label, hint) in [
                     (
-                        ViewTool::PaintFloor,
-                        icons::label(icons::GRID, "Floor"),
-                        "Paint a floor on each cell you click or drag over.",
+                        ViewTool::Select,
+                        icons::label(icons::POINTER, "Select"),
+                        "Click a face (floor / wall / ceiling) in the viewport.",
                     ),
                     (
-                        ViewTool::PaintWall,
-                        icons::label(icons::BRICK_WALL, "Wall"),
-                        "Paint a wall on the edge nearest the click.",
+                        ViewTool::Move,
+                        icons::label(icons::MOVE, "Move"),
+                        "Drag the selected entity onto another cell.",
                     ),
                     (
-                        ViewTool::PaintCeiling,
-                        icons::label(icons::LAYERS, "Ceiling"),
-                        "Paint a ceiling on each cell.",
+                        ViewTool::Rotate,
+                        icons::label(icons::ROTATE_3D, "Rotate"),
+                        "Rotate (2D viewport only for now).",
                     ),
                     (
-                        ViewTool::Erase,
-                        icons::label(icons::TRASH, "Erase"),
-                        "Clear floor/walls/ceiling from the cell.",
-                    ),
-                    (
-                        ViewTool::Place,
-                        icons::label(icons::PLUS, "Place"),
-                        "Drop a SpawnPoint at the clicked cell.",
+                        ViewTool::Scale,
+                        icons::label(icons::SCALE_3D, "Scale"),
+                        "Scale (2D viewport only for now).",
                     ),
                 ] {
                     ui.selectable_value(&mut self.active_tool, tool, label)
                         .on_hover_text(hint);
                 }
+                ui.separator();
+                ui.add_enabled_ui(room_active, |ui| {
+                    for (tool, label, hint) in [
+                        (
+                            ViewTool::PaintFloor,
+                            icons::label(icons::GRID, "Floor"),
+                            "Paint a floor on each cell you click or drag over.",
+                        ),
+                        (
+                            ViewTool::PaintWall,
+                            icons::label(icons::BRICK_WALL, "Wall"),
+                            "Paint a wall on the edge nearest the click.",
+                        ),
+                        (
+                            ViewTool::PaintCeiling,
+                            icons::label(icons::LAYERS, "Ceiling"),
+                            "Paint a ceiling on each cell.",
+                        ),
+                        (
+                            ViewTool::Erase,
+                            icons::label(icons::TRASH, "Erase"),
+                            "Clear floor/walls/ceiling from the cell.",
+                        ),
+                        (
+                            ViewTool::Place,
+                            icons::label(icons::PLUS, "Place"),
+                            "Drop a SpawnPoint at the clicked cell.",
+                        ),
+                    ] {
+                        ui.selectable_value(&mut self.active_tool, tool, label)
+                            .on_hover_text(hint);
+                    }
+                });
+                ui.separator();
+                self.draw_brush_material_picker(ui);
             });
-            ui.separator();
-            self.draw_brush_material_picker(ui);
-            ui.separator();
-            ui.checkbox(
-                &mut self.snap_to_grid,
-                icons::label(icons::WAYPOINT, "Snap"),
-            );
-            ui.add(
-                egui::DragValue::new(&mut self.snap_units)
-                    .speed(1.0)
-                    .range(1..=256),
-            );
-            ui.separator();
-            ui.checkbox(&mut self.show_grid, icons::label(icons::GRID, "Grid"));
-            ui.selectable_value(&mut self.view_2d, true, icons::label(icons::GRID, "2D"));
-            ui.selectable_value(&mut self.view_2d, false, icons::label(icons::BOX, "3D"));
-            ui.separator();
-            let mut zoom_percent = (self.viewport_zoom / DEFAULT_VIEWPORT_ZOOM * 100.0) as u16;
-            if ui
-                .add(
-                    egui::DragValue::new(&mut zoom_percent)
+            ui.horizontal(|ui| {
+                ui.checkbox(
+                    &mut self.snap_to_grid,
+                    icons::label(icons::WAYPOINT, "Snap"),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.snap_units)
                         .speed(1.0)
-                        .range(25..=250)
-                        .suffix("%"),
-                )
-                .changed()
-            {
-                self.viewport_zoom = (zoom_percent as f32 / 100.0 * DEFAULT_VIEWPORT_ZOOM)
-                    .clamp(MIN_VIEWPORT_ZOOM, MAX_VIEWPORT_ZOOM);
-            }
+                        .range(1..=256),
+                );
+                ui.separator();
+                ui.checkbox(&mut self.show_grid, icons::label(icons::GRID, "Grid"));
+                ui.separator();
+                ui.selectable_value(&mut self.view_2d, true, icons::label(icons::GRID, "2D"));
+                ui.selectable_value(&mut self.view_2d, false, icons::label(icons::BOX, "3D"));
+                ui.separator();
+                ui.label(RichText::new("Zoom").color(STUDIO_TEXT_WEAK));
+                let mut zoom_percent =
+                    (self.viewport_zoom / DEFAULT_VIEWPORT_ZOOM * 100.0) as u16;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut zoom_percent)
+                            .speed(1.0)
+                            .range(25..=250)
+                            .suffix("%"),
+                    )
+                    .changed()
+                {
+                    self.viewport_zoom = (zoom_percent as f32 / 100.0 * DEFAULT_VIEWPORT_ZOOM)
+                        .clamp(MIN_VIEWPORT_ZOOM, MAX_VIEWPORT_ZOOM);
+                }
+            });
         });
     }
 
@@ -2732,20 +2743,29 @@ impl EditorWorkspace {
 
     /// Resolve the Room node that owns the current selection, if any.
     ///
-    /// Returns the selected node itself when it's a Room, otherwise
-    /// climbs the parent chain. Used to scope paint tools to a Room
-    /// context — placing entities or painting only makes sense once
-    /// the tool knows which `WorldGrid` it's editing.
+    /// Order: selected face's room → climb the selected node's
+    /// parent chain → fall back to the active scene's first Room.
+    /// The fallback keeps paint tools enabled even when the
+    /// selection sits outside the scene tree (e.g. a face the user
+    /// just picked, which clears `selected_node` to ROOT).
     fn active_room_id(&self) -> Option<NodeId> {
+        if let Some(face) = self.selected_face {
+            return Some(face.room);
+        }
         let scene = self.project.active_scene();
         let mut current = self.selected_node;
-        loop {
-            let node = scene.node(current)?;
+        while let Some(node) = scene.node(current) {
             if matches!(node.kind, NodeKind::Room { .. }) {
                 return Some(current);
             }
-            current = node.parent?;
+            let Some(parent) = node.parent else { break };
+            current = parent;
         }
+        scene
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Room { .. }))
+            .map(|node| node.id)
     }
 
     /// Translate a viewport-space click into a sector cell on `room`.
