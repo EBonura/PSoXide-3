@@ -634,8 +634,14 @@ impl SceneNode {
 pub struct NodeRow {
     /// Node id.
     pub id: NodeId,
+    /// Parent node id, or `None` for the scene root.
+    pub parent: Option<NodeId>,
     /// Tree depth from root.
     pub depth: usize,
+    /// Index of this node inside its parent's `children` list. Used
+    /// by the editor's drag-drop machinery so a "drop above this row"
+    /// gesture maps cleanly to `move_node(.., parent, sibling_index)`.
+    pub sibling_index: usize,
     /// Display name.
     pub name: String,
     /// Node kind label.
@@ -716,6 +722,62 @@ impl Scene {
         true
     }
 
+    /// `true` when `ancestor` appears anywhere on the parent chain of
+    /// `id`. Includes `id` itself in the check, so callers using this
+    /// for cycle detection don't need a separate equality test.
+    pub fn is_descendant_of(&self, id: NodeId, ancestor: NodeId) -> bool {
+        if id == ancestor {
+            return true;
+        }
+        let mut current = self.node(id).and_then(|n| n.parent);
+        while let Some(p) = current {
+            if p == ancestor {
+                return true;
+            }
+            current = self.node(p).and_then(|n| n.parent);
+        }
+        false
+    }
+
+    /// Move `id` under `new_parent` at `position` in its child list.
+    ///
+    /// Refuses (returns `false`) when:
+    /// * `id` is the scene root,
+    /// * `id` or `new_parent` is missing,
+    /// * `new_parent` is `id` or any of its descendants — that would
+    ///   form a cycle.
+    ///
+    /// `position` clamps to the destination's current child count.
+    /// Reordering inside the same parent works because `id` is removed
+    /// from the child list before `position` is clamped, so dropping
+    /// at "the same slot" is a no-op without UI corner cases.
+    pub fn move_node(&mut self, id: NodeId, new_parent: NodeId, position: usize) -> bool {
+        if id == self.root {
+            return false;
+        }
+        if self.node(id).is_none() || self.node(new_parent).is_none() {
+            return false;
+        }
+        if self.is_descendant_of(new_parent, id) {
+            return false;
+        }
+
+        let old_parent = self.node(id).and_then(|n| n.parent);
+        if let Some(old) = old_parent {
+            if let Some(parent) = self.node_mut(old) {
+                parent.children.retain(|c| *c != id);
+            }
+        }
+        if let Some(parent) = self.node_mut(new_parent) {
+            let pos = position.min(parent.children.len());
+            parent.children.insert(pos, id);
+        }
+        if let Some(node) = self.node_mut(id) {
+            node.parent = Some(new_parent);
+        }
+        true
+    }
+
     fn collect_descendants(&self, id: NodeId, out: &mut Vec<NodeId>) {
         if let Some(node) = self.node(id) {
             for child in &node.children {
@@ -738,7 +800,13 @@ impl Scene {
         };
         rows.push(NodeRow {
             id,
+            parent: node.parent,
             depth,
+            sibling_index: node
+                .parent
+                .and_then(|parent_id| self.node(parent_id))
+                .and_then(|parent| parent.children.iter().position(|child| *child == id))
+                .unwrap_or(0),
             name: node.name.clone(),
             kind: node.kind.label(),
             child_count: node.children.len(),
@@ -1004,6 +1072,41 @@ mod tests {
         assert!(scene
             .node(scene.root)
             .is_some_and(|root| root.children.is_empty()));
+    }
+
+    #[test]
+    fn move_node_reparents_and_reorders() {
+        let mut scene = Scene::new("Test");
+        let a = scene.add_node(scene.root, "A", NodeKind::Node3D);
+        let b = scene.add_node(scene.root, "B", NodeKind::Node3D);
+        let c = scene.add_node(a, "C", NodeKind::Node3D);
+
+        // Reparent c from a to b at position 0.
+        assert!(scene.move_node(c, b, 0));
+        assert_eq!(scene.node(c).unwrap().parent, Some(b));
+        assert!(scene.node(a).unwrap().children.is_empty());
+        assert_eq!(scene.node(b).unwrap().children, vec![c]);
+
+        // Reorder b before a at the root.
+        assert!(scene.move_node(b, scene.root, 0));
+        assert_eq!(
+            scene.node(scene.root).unwrap().children,
+            vec![b, a]
+        );
+    }
+
+    #[test]
+    fn move_node_rejects_cycles_and_root() {
+        let mut scene = Scene::new("Test");
+        let a = scene.add_node(scene.root, "A", NodeKind::Node3D);
+        let b = scene.add_node(a, "B", NodeKind::Node3D);
+
+        // Cannot reparent a node under itself.
+        assert!(!scene.move_node(a, a, 0));
+        // Cannot reparent an ancestor under its descendant.
+        assert!(!scene.move_node(a, b, 0));
+        // Cannot move the root.
+        assert!(!scene.move_node(scene.root, a, 0));
     }
 
     #[test]

@@ -19,6 +19,31 @@ use psxed_project::{
 /// Maximum undo / redo snapshots retained.
 const UNDO_CAPACITY: usize = 64;
 
+/// Discrete action a scene-tree row can produce in one frame.
+///
+/// The panel iterates rows borrowing `&self.project` immutably; rows
+/// describe what they want to happen via this enum, and the panel
+/// drains the queue after iteration so all the mutating helpers
+/// (`push_undo`, `add_node`, `move_node`, …) can take `&mut self`
+/// without fighting the iteration borrow.
+enum TreeAction {
+    Select(NodeId),
+    BeginRename(NodeId),
+    CommitRename(NodeId, String),
+    CancelRename,
+    Delete(NodeId),
+    Duplicate(NodeId),
+    AddChild { parent: NodeId, kind: NodeKind, name: &'static str },
+    /// Move `source` so it becomes a child of `target_parent` at
+    /// `position` in that parent's child list. Caller has already
+    /// proven the move is non-cyclic; `Scene::move_node` re-checks.
+    Reparent {
+        source: NodeId,
+        target_parent: NodeId,
+        position: usize,
+    },
+}
+
 /// Snapshot-based undo. Each entry is a full `ProjectDocument` clone;
 /// for hand-authored level data this is cheap and avoids the
 /// command-pattern bookkeeping that operation-based undo demands.
@@ -66,6 +91,13 @@ pub struct EditorWorkspace {
     /// inspector can show per-cell properties without inflating the
     /// scene-tree node count with a node per sector.
     selected_sector: Option<(u16, u16)>,
+    /// `Some((id, buffer))` while a scene-tree row is in rename mode.
+    /// Buffer holds the in-flight string the user is typing; commit /
+    /// cancel finalises against the actual node name.
+    renaming: Option<(NodeId, String)>,
+    /// One-shot flag set when entering rename mode so the next frame
+    /// requests focus + selects the text inside the rename TextEdit.
+    pending_rename_focus: bool,
     history: UndoStack,
     scene_filter: String,
     file_filter: String,
@@ -333,6 +365,8 @@ impl EditorWorkspace {
             selected_node: NodeId::ROOT,
             selected_resource: None,
             selected_sector: None,
+            renaming: None,
+            pending_rename_focus: false,
             history: UndoStack::default(),
             scene_filter: String::new(),
             file_filter: String::new(),
@@ -514,6 +548,107 @@ impl EditorWorkspace {
         } else if consume_undo {
             self.do_undo();
         }
+
+        // F2 / Delete only fire when no widget owns focus — so they
+        // don't fight TextEdit content while the user is typing.
+        let focus_taken = ctx.memory(|m| m.focused().is_some());
+        if !focus_taken {
+            let f2 = ctx.input_mut(|i| i.key_pressed(egui::Key::F2));
+            if f2 && self.selected_node != NodeId::ROOT {
+                self.apply_tree_action(TreeAction::BeginRename(self.selected_node));
+            }
+            let del = ctx.input_mut(|i| {
+                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+            });
+            if del && self.selected_node != NodeId::ROOT && self.renaming.is_none() {
+                self.apply_tree_action(TreeAction::Delete(self.selected_node));
+            }
+        }
+    }
+
+    /// Apply one scene-tree action collected from a row.
+    fn apply_tree_action(&mut self, action: TreeAction) {
+        match action {
+            TreeAction::Select(id) => {
+                self.selected_node = id;
+                self.selected_resource = None;
+                self.renaming = None;
+            }
+            TreeAction::BeginRename(id) => {
+                if let Some(node) = self.project.active_scene().node(id) {
+                    self.renaming = Some((id, node.name.clone()));
+                    self.pending_rename_focus = true;
+                    self.selected_node = id;
+                }
+            }
+            TreeAction::CommitRename(id, name) => {
+                let trimmed = name.trim();
+                let final_name = if trimmed.is_empty() {
+                    self.project
+                        .active_scene()
+                        .node(id)
+                        .map(|node| node.name.clone())
+                        .unwrap_or_default()
+                } else {
+                    trimmed.to_string()
+                };
+                let original = self
+                    .project
+                    .active_scene()
+                    .node(id)
+                    .map(|node| node.name.clone());
+                if original.as_deref() != Some(final_name.as_str()) {
+                    self.push_undo();
+                    if let Some(node) = self.project.active_scene_mut().node_mut(id) {
+                        node.name = final_name.clone();
+                    }
+                    self.status = format!("Renamed {final_name}");
+                    self.mark_dirty();
+                }
+                self.renaming = None;
+            }
+            TreeAction::CancelRename => {
+                self.renaming = None;
+            }
+            TreeAction::Delete(id) => {
+                self.selected_node = id;
+                self.delete_selected();
+                self.renaming = None;
+            }
+            TreeAction::Duplicate(id) => {
+                self.selected_node = id;
+                self.duplicate_selected();
+                self.renaming = None;
+            }
+            TreeAction::AddChild { parent, kind, name } => {
+                self.selected_node = parent;
+                self.add_child(kind, name);
+            }
+            TreeAction::Reparent {
+                source,
+                target_parent,
+                position,
+            } => {
+                if source == target_parent {
+                    return;
+                }
+                if self
+                    .project
+                    .active_scene()
+                    .is_descendant_of(target_parent, source)
+                {
+                    self.status = "Cannot reparent: would create a cycle".to_string();
+                    return;
+                }
+                self.push_undo();
+                let scene = self.project.active_scene_mut();
+                if scene.move_node(source, target_parent, position) {
+                    self.selected_node = source;
+                    self.status = "Moved node".to_string();
+                    self.mark_dirty();
+                }
+            }
+        }
     }
 
     fn draw_menu_bar(&mut self, ctx: &egui::Context) {
@@ -659,23 +794,35 @@ impl EditorWorkspace {
 
         let rows = self.project.active_scene().hierarchy_rows();
         let filter = self.scene_filter.to_ascii_lowercase();
+        let mut actions: Vec<TreeAction> = Vec::new();
+        let selected_node = self.selected_node;
+        let renaming = &mut self.renaming;
+        let pending_focus = &mut self.pending_rename_focus;
         egui::ScrollArea::vertical()
             .id_salt("psxed_scene_tree")
             .max_height(285.0)
             .show(ui, |ui| {
-                for row in rows {
+                for row in &rows {
                     if !filter.is_empty()
                         && !row.name.to_ascii_lowercase().contains(&filter)
                         && !row.kind.to_ascii_lowercase().contains(&filter)
                     {
                         continue;
                     }
-                    if draw_scene_node_row(ui, &row, self.selected_node == row.id).clicked() {
-                        self.selected_node = row.id;
-                        self.selected_resource = None;
-                    }
+                    draw_scene_node_row(
+                        ui,
+                        row,
+                        selected_node == row.id,
+                        renaming,
+                        pending_focus,
+                        &mut actions,
+                    );
                 }
             });
+
+        for action in actions {
+            self.apply_tree_action(action);
+        }
 
         ui.horizontal(|ui| {
             if ui.button(icons::label(icons::COPY, "Duplicate")).clicked() {
@@ -1960,10 +2107,47 @@ fn draw_inline_icon(ui: &mut egui::Ui, icon: char, color: Color32) {
     ui.label(icons::text(icon, 16.0).color(color));
 }
 
-fn draw_scene_node_row(ui: &mut egui::Ui, row: &NodeRow, selected: bool) -> egui::Response {
+fn draw_scene_node_row(
+    ui: &mut egui::Ui,
+    row: &NodeRow,
+    selected: bool,
+    renaming: &mut Option<(NodeId, String)>,
+    pending_focus: &mut bool,
+    actions: &mut Vec<TreeAction>,
+) {
     let row_height = 24.0;
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height), Sense::click());
+    let dnd_active = egui::DragAndDrop::has_any_payload(ui.ctx());
+
+    // Insertion bar above the row: dropping here reorders before the
+    // current row inside its parent's child list. Hidden when no drag
+    // is in flight so we don't steal mouse hovers.
+    if dnd_active && row.id != NodeId::ROOT {
+        let (insert_rect, insert_response) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), 4.0),
+            Sense::hover(),
+        );
+        if let Some(payload) = insert_response.dnd_release_payload::<NodeId>() {
+            actions.push(TreeAction::Reparent {
+                source: *payload,
+                target_parent: row.parent.unwrap_or(NodeId::ROOT),
+                position: row.sibling_index,
+            });
+        }
+        if insert_response.contains_pointer() {
+            ui.painter().line_segment(
+                [
+                    Pos2::new(insert_rect.left() + 4.0, insert_rect.center().y),
+                    Pos2::new(insert_rect.right() - 4.0, insert_rect.center().y),
+                ],
+                Stroke::new(2.0, STUDIO_ACCENT),
+            );
+        }
+    }
+
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), row_height),
+        Sense::click_and_drag(),
+    );
     let painter = ui.painter_at(rect);
     let hovered = response.hovered();
 
@@ -2021,21 +2205,52 @@ fn draw_scene_node_row(ui: &mut egui::Ui, row: &NodeRow, selected: bool) -> egui
     } else {
         STUDIO_TEXT
     };
+    let in_rename = matches!(renaming, Some((id, _)) if *id == row.id);
     let label = if row.id == NodeId::ROOT {
         format!("Root: {}", row.kind)
     } else {
         row.name.clone()
     };
-    let text_pos = Pos2::new(icon_rect.right() + 7.0, rect.center().y);
-    painter.text(
-        text_pos,
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(13.0),
-        text_color,
-    );
+    let text_left = icon_rect.right() + 7.0;
+    let text_pos = Pos2::new(text_left, rect.center().y);
 
-    if row.id != NodeId::ROOT {
+    if in_rename {
+        let edit_rect = Rect::from_min_size(
+            Pos2::new(text_left, rect.center().y - 10.0),
+            Vec2::new(rect.right() - text_left - 56.0, 20.0),
+        );
+        if let Some((_, buffer)) = renaming.as_mut() {
+            let edit_response = ui.put(
+                edit_rect,
+                egui::TextEdit::singleline(buffer)
+                    .desired_width(edit_rect.width())
+                    .margin(egui::Vec2::new(2.0, 1.0)),
+            );
+            if *pending_focus {
+                edit_response.request_focus();
+                *pending_focus = false;
+            }
+            let lost_focus = edit_response.lost_focus();
+            let pressed_enter =
+                lost_focus && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let pressed_esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if pressed_esc {
+                actions.push(TreeAction::CancelRename);
+            } else if pressed_enter || lost_focus {
+                actions.push(TreeAction::CommitRename(row.id, buffer.clone()));
+            }
+        }
+    } else {
+        painter.text(
+            text_pos,
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(13.0),
+            text_color,
+        );
+    }
+
+    if !in_rename && row.id != NodeId::ROOT {
         painter.text(
             Pos2::new(text_pos.x + 118.0, rect.center().y),
             Align2::LEFT_CENTER,
@@ -2079,7 +2294,154 @@ fn draw_scene_node_row(ui: &mut egui::Ui, row: &NodeRow, selected: bool) -> egui
             Color32::from_rgb(88, 102, 116)
         },
     );
-    response
+
+    if in_rename {
+        return;
+    }
+
+    // Drag source: only descendants of root can be dragged.
+    if row.id != NodeId::ROOT && response.dragged() {
+        response.dnd_set_drag_payload::<NodeId>(row.id);
+        let label_text = label_for_drag(row);
+        let pointer_pos = ui
+            .ctx()
+            .input(|i| i.pointer.interact_pos())
+            .unwrap_or_else(|| rect.center());
+        ui.painter().text(
+            pointer_pos + Vec2::new(12.0, 0.0),
+            Align2::LEFT_CENTER,
+            label_text,
+            FontId::proportional(12.0),
+            STUDIO_ACCENT,
+        );
+    }
+
+    // Drop on row body → reparent as last child. Highlight while
+    // hovered so the user knows where the drop will land.
+    if let Some(payload) = response.dnd_hover_payload::<NodeId>() {
+        if *payload != row.id {
+            ui.painter().rect_stroke(
+                rect.shrink2(Vec2::new(2.0, 1.0)),
+                3.0,
+                Stroke::new(1.5, STUDIO_ACCENT),
+                StrokeKind::Inside,
+            );
+        }
+    }
+    if let Some(payload) = response.dnd_release_payload::<NodeId>() {
+        actions.push(TreeAction::Reparent {
+            source: *payload,
+            target_parent: row.id,
+            position: row.child_count,
+        });
+    }
+
+    if response.clicked() {
+        actions.push(TreeAction::Select(row.id));
+    }
+    if response.double_clicked() && row.id != NodeId::ROOT {
+        actions.push(TreeAction::BeginRename(row.id));
+    }
+
+    if row.id != NodeId::ROOT {
+        response.context_menu(|ui| {
+            ui.menu_button(icons::label(icons::PLUS, "Add Child"), |ui| {
+                for (label, kind) in default_addable_kinds() {
+                    if ui.button(label).clicked() {
+                        actions.push(TreeAction::AddChild {
+                            parent: row.id,
+                            kind,
+                            name: label,
+                        });
+                        ui.close_menu();
+                    }
+                }
+            });
+            if ui.button(icons::label(icons::PALETTE, "Rename")).clicked() {
+                actions.push(TreeAction::BeginRename(row.id));
+                ui.close_menu();
+            }
+            if ui.button(icons::label(icons::COPY, "Duplicate")).clicked() {
+                actions.push(TreeAction::Duplicate(row.id));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button(icons::label(icons::TRASH, "Delete")).clicked() {
+                actions.push(TreeAction::Delete(row.id));
+                ui.close_menu();
+            }
+        });
+    } else {
+        // Even root accepts "Add Child" for top-level Worlds.
+        response.context_menu(|ui| {
+            ui.menu_button(icons::label(icons::PLUS, "Add Child"), |ui| {
+                for (label, kind) in default_addable_kinds() {
+                    if ui.button(label).clicked() {
+                        actions.push(TreeAction::AddChild {
+                            parent: row.id,
+                            kind,
+                            name: label,
+                        });
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
+    }
+}
+
+/// Friendly label for the drag-tooltip preview.
+fn label_for_drag(row: &NodeRow) -> String {
+    if row.name.is_empty() {
+        row.kind.to_string()
+    } else {
+        row.name.clone()
+    }
+}
+
+/// Default `(menu label, kind template)` pairs for "Add Child" menus.
+/// Each menu entry uses the label as the new node's display name.
+fn default_addable_kinds() -> [(&'static str, NodeKind); 8] {
+    [
+        ("World", NodeKind::World),
+        (
+            "Room",
+            NodeKind::Room {
+                grid: WorldGrid::empty(4, 4, 1024),
+            },
+        ),
+        ("Node3D", NodeKind::Node3D),
+        (
+            "MeshInstance",
+            NodeKind::MeshInstance {
+                mesh: None,
+                material: None,
+            },
+        ),
+        (
+            "Light",
+            NodeKind::Light {
+                color: [255, 240, 200],
+                intensity: 1.0,
+                radius: 4096.0,
+            },
+        ),
+        ("SpawnPoint", NodeKind::SpawnPoint { player: false }),
+        (
+            "Trigger",
+            NodeKind::Trigger {
+                trigger_id: String::new(),
+            },
+        ),
+        (
+            "Portal",
+            NodeKind::Portal {
+                target_room: None,
+                target_entry: String::new(),
+                entry_name: String::new(),
+            },
+        ),
+    ]
 }
 
 fn node_draw_mode(kind: &NodeKind) -> &'static str {
