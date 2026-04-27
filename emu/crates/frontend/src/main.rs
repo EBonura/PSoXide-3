@@ -686,6 +686,7 @@ impl ApplicationHandler for Shell {
                 let editor_root = state.editor.project_root();
                 let editor_hover_face = state.editor.hovered_face();
                 let editor_selected_face = state.editor.selected_face();
+                let editor_wall_preview = state.editor.wall_paint_preview();
                 gfx.render_editor_preview(
                     state.editor.project(),
                     editor_root,
@@ -695,6 +696,7 @@ impl ApplicationHandler for Shell {
                     editor_hover_edge,
                     editor_hover_face,
                     editor_selected_face,
+                    editor_wall_preview,
                 );
 
                 let vram_tex = gfx.vram_texture_id();

@@ -202,6 +202,7 @@ impl Graphics {
         hovered_edge: Option<(u16, u16, u8)>,
         hovered_face: Option<psxed_ui::FaceRef>,
         selected_face: Option<psxed_ui::FaceRef>,
+        wall_paint_preview: Option<psxed_ui::FaceRef>,
     ) {
         self.editor_textures.refresh(project, project_root);
         let cmd_log = crate::editor_preview::build_phase1_cmd_log(
@@ -212,6 +213,7 @@ impl Graphics {
             hovered_edge,
             hovered_face,
             selected_face,
+            wall_paint_preview,
             &self.editor_textures,
         );
         self.editor_hw_renderer.render_frame(

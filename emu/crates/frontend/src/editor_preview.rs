@@ -116,6 +116,7 @@ pub fn build_phase1_cmd_log(
     hovered_edge: Option<(u16, u16, u8)>,
     hovered_face: Option<psxed_ui::FaceRef>,
     selected_face: Option<psxed_ui::FaceRef>,
+    wall_paint_preview: Option<psxed_ui::FaceRef>,
     textures: &EditorTextures,
 ) -> Vec<GpuCmdLogEntry> {
     let Some((grid, target)) = first_room_grid(project) else {
@@ -153,6 +154,12 @@ pub fn build_phase1_cmd_log(
         if Some(face) != selected_face {
             push_face_outline(grid, face, FACE_OUTLINE_HOVER, &mut scratch);
         }
+    }
+    // PaintWall preview: green ghost outline of where the next
+    // click would place the wall. Drawn after select / hover so
+    // it wins the depth-sort tie when stacking with them.
+    if let Some(face) = wall_paint_preview {
+        push_face_outline(grid, face, FACE_OUTLINE_WALL_PAINT, &mut scratch);
     }
 
     // SAFETY: `scratch.tris` lives until end of this function (the
@@ -703,6 +710,13 @@ const FACE_OUTLINE_SELECTED: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0x60, 0xC8, 0xFF),
     thickness_px: 4,
 };
+/// PaintWall hover preview — green for "this would be added /
+/// replaced". 3 px so it reads through the `FACE_OUTLINE_HOVER`
+/// yellow when both fire on the same face.
+const FACE_OUTLINE_WALL_PAINT: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0x60, 0xFF, 0x90),
+    thickness_px: 3,
+};
 
 #[derive(Copy, Clone)]
 struct FaceOutlineStyle {
@@ -725,9 +739,7 @@ fn push_face_outline(
     if face.sx >= grid.width || face.sz >= grid.depth {
         return;
     }
-    let Some(sector) = grid.sector(face.sx, face.sz) else {
-        return;
-    };
+    let sector = grid.sector(face.sx, face.sz);
     let s = grid.sector_size;
     let x0 = (face.sx as i32) * s;
     let x1 = ((face.sx as i32) + 1) * s;
@@ -739,7 +751,7 @@ fn push_face_outline(
     // amount along the local up axis.
     const LIFT: i32 = 4;
     let corners = match face.kind {
-        psxed_ui::FaceKind::Floor => sector.floor.as_ref().map(|f| {
+        psxed_ui::FaceKind::Floor => sector.and_then(|s| s.floor.as_ref()).map(|f| {
             let h = f.heights;
             [
                 [x0, h[0] + LIFT, z1],
@@ -748,7 +760,7 @@ fn push_face_outline(
                 [x0, h[3] + LIFT, z0],
             ]
         }),
-        psxed_ui::FaceKind::Ceiling => sector.ceiling.as_ref().map(|c| {
+        psxed_ui::FaceKind::Ceiling => sector.and_then(|s| s.ceiling.as_ref()).map(|c| {
             let h = c.heights;
             [
                 [x0, h[0] - LIFT, z1],
@@ -758,21 +770,25 @@ fn push_face_outline(
             ]
         }),
         psxed_ui::FaceKind::Wall { dir, stack } => {
-            let walls = sector.walls.get(dir);
-            walls.get(stack as usize).map(|wall| {
-                let (bl_xy, br_xy) = wall_xy_for(dir, x0, x1, z0, z1);
-                let h = wall.heights;
-                // Inset the outline 4 units along the normal of
-                // the wall plane so it doesn't z-fight the wall
-                // surface when viewed from inside the room.
-                let (nx, nz) = wall_inward_normal(dir);
-                [
-                    [bl_xy.0 + LIFT * nx, h[0], bl_xy.1 + LIFT * nz],
-                    [br_xy.0 + LIFT * nx, h[1], br_xy.1 + LIFT * nz],
-                    [br_xy.0 + LIFT * nx, h[2], br_xy.1 + LIFT * nz],
-                    [bl_xy.0 + LIFT * nx, h[3], bl_xy.1 + LIFT * nz],
-                ]
-            })
+            // Default ghost heights span the full sector when the
+            // wall doesn't exist yet — used by the PaintWall
+            // hover preview to outline where a brand-new wall
+            // would land.
+            let h = sector
+                .and_then(|s| s.walls.get(dir).get(stack as usize))
+                .map(|wall| wall.heights)
+                .unwrap_or([0, 0, s, s]);
+            let (bl_xy, br_xy) = wall_xy_for(dir, x0, x1, z0, z1);
+            // Inset along the wall's inward normal so the outline
+            // sits inside the room rather than z-fighting the
+            // wall surface when viewed from inside.
+            let (nx, nz) = wall_inward_normal(dir);
+            Some([
+                [bl_xy.0 + LIFT * nx, h[0], bl_xy.1 + LIFT * nz],
+                [br_xy.0 + LIFT * nx, h[1], br_xy.1 + LIFT * nz],
+                [br_xy.0 + LIFT * nx, h[2], br_xy.1 + LIFT * nz],
+                [bl_xy.0 + LIFT * nx, h[3], bl_xy.1 + LIFT * nz],
+            ])
         }
     };
     let Some(corners) = corners else { return };

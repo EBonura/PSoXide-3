@@ -119,6 +119,13 @@ pub struct EditorWorkspace {
     /// `hovered_face`; the inspector panel reads it to surface
     /// per-face properties (material, heights, …).
     selected_face: Option<FaceRef>,
+    /// PaintWall hover preview: the wall the next click would
+    /// place / replace. Re-uses `FaceRef` with `FaceKind::Wall` —
+    /// when the cursor is over an existing wall this is that wall;
+    /// otherwise it's a "ghost" reference whose heights the
+    /// renderer fills in from `sector_size` defaults. Cleared when
+    /// the active tool isn't PaintWall or the pointer leaves.
+    wall_paint_preview: Option<FaceRef>,
     /// Last cell `apply_paint` has run on during the current drag.
     /// Used to dedupe per-frame paint events so click-drag with
     /// Wall / Place doesn't stack duplicate walls / spawn N entities
@@ -468,6 +475,7 @@ impl EditorWorkspace {
             hovered_3d_edge: None,
             hovered_face: None,
             selected_face: None,
+            wall_paint_preview: None,
             last_paint_cell: None,
             renaming: None,
             pending_rename_focus: false,
@@ -883,9 +891,20 @@ impl EditorWorkspace {
         // dispatch onto the actual face the user clicked rather
         // than the floor-plane projection (which lies under wall
         // surfaces and gets the wrong cell for back-row clicks).
-        self.hovered_face = response
+        let face_hit = response
             .hover_pos()
-            .and_then(|pointer| self.pick_face_at(rect, pointer));
+            .and_then(|pointer| self.pick_face_with_hit(rect, pointer));
+        self.hovered_face = face_hit.map(|(face, _)| face);
+        // PaintWall preview: build the same FaceRef the next click
+        // would target so the renderer can outline it. Mirrors
+        // `run_paint_action`'s edge resolution exactly so what you
+        // see is what you'll paint.
+        self.wall_paint_preview =
+            if matches!(self.active_tool, ViewTool::PaintWall) {
+                hover_room.and_then(|room| self.preview_paint_wall(room, face_hit, hover_world))
+            } else {
+                None
+            };
 
         // Primary click / drag: ray-pick the cell under the cursor
         // and dispatch to the active tool. Click starts a fresh
@@ -983,6 +1002,15 @@ impl EditorWorkspace {
         self.selected_face
     }
 
+    /// Wall the next PaintWall click would target. Frontend draws
+    /// a translucent outline so the user previews the placement
+    /// before committing. May reference a wall that doesn't exist
+    /// yet — the renderer falls back to default heights for the
+    /// ghost case.
+    pub fn wall_paint_preview(&self) -> Option<FaceRef> {
+        self.wall_paint_preview
+    }
+
     /// Pick the cell + nearest cardinal edge at `world` within `room`.
     /// Mirrors the click-time logic in `apply_paint(PaintWall)` so
     /// the hover preview and the actual placement target agree.
@@ -1018,6 +1046,75 @@ impl EditorWorkspace {
     /// ray-on-Y=0 hit lands beyond the room. Also surfaces the
     /// face's material in the resources panel so the user sees
     /// which material is on the picked surface.
+    /// Resolve the `FaceRef` the PaintWall click would target.
+    /// When the cursor's directly over a wall the preview tracks
+    /// that wall (paint replaces it); otherwise it builds a "ghost"
+    /// `FaceRef` for the cell + edge the click would create.
+    /// Mirrors `run_paint_action`'s logic exactly so the preview
+    /// outline never drifts from the actual paint result.
+    fn preview_paint_wall(
+        &self,
+        room_id: NodeId,
+        face_hit: Option<(FaceRef, [f32; 3])>,
+        ground_hit: Option<[f32; 2]>,
+    ) -> Option<FaceRef> {
+        if let Some((
+            face @ FaceRef {
+                kind: FaceKind::Wall { .. },
+                ..
+            },
+            _,
+        )) = face_hit
+        {
+            return Some(face);
+        }
+        // Floor / ceiling / no-pick: infer the cell + edge.
+        let (sx, sz, hit_world) = match face_hit {
+            Some((face, hit)) => (face.sx, face.sz, hit),
+            None => {
+                let world = ground_hit?;
+                let (sx, sz) = self.world_to_sector(room_id, world)?;
+                let sector_size = self.room_sector_size(room_id).unwrap_or(1024) as f32;
+                let half = self.room_half_extents(room_id).unwrap_or([0.0, 0.0]);
+                let hit = [
+                    (world[0] + half[0]) * sector_size,
+                    0.0,
+                    (world[1] + half[1]) * sector_size,
+                ];
+                (sx, sz, hit)
+            }
+        };
+        let sector_size = self.room_sector_size(room_id).unwrap_or(1024) as f32;
+        let cell_center = [
+            (sx as f32 + 0.5) * sector_size,
+            (sz as f32 + 0.5) * sector_size,
+        ];
+        let dir = edge_from_world_offset(
+            hit_world[0] - cell_center[0],
+            hit_world[2] - cell_center[1],
+        );
+        // Stack index points past the existing wall stack — that's
+        // where `add_wall` would append. The renderer treats
+        // out-of-bounds stack indices as "no wall data → ghost
+        // outline at default heights".
+        let stack = self
+            .project
+            .active_scene()
+            .node(room_id)
+            .and_then(|node| match &node.kind {
+                NodeKind::Room { grid } => grid.sector(sx, sz),
+                _ => None,
+            })
+            .map(|sector| sector.walls.get(dir).len() as u8)
+            .unwrap_or(0);
+        Some(FaceRef {
+            room: room_id,
+            sx,
+            sz,
+            kind: FaceKind::Wall { dir, stack },
+        })
+    }
+
     fn commit_face_selection(&mut self) {
         if let Some(face) = self.hovered_face {
             self.selected_face = Some(face);
@@ -1393,14 +1490,10 @@ impl EditorWorkspace {
     /// triangle layout `editor_preview` emits so what the user sees
     /// matches what gets picked. `None` when the pointer is off the
     /// panel or no face is along the ray.
-    fn pick_face_at(&self, rect: egui::Rect, pointer: egui::Pos2) -> Option<FaceRef> {
-        self.pick_face_with_hit(rect, pointer).map(|(face, _)| face)
-    }
-
-    /// Same ray-test as [`Self::pick_face_at`], but also returns the
-    /// world-space hit point. Paint dispatch needs the hit position
-    /// to infer which edge of a floor cell the user clicked when
-    /// the wall paint tool is active.
+    /// Closest floor / wall / ceiling the camera ray intersects,
+    /// along with the world-space hit point. Paint dispatch reads
+    /// the hit point to infer which edge of a floor cell the user
+    /// clicked when the wall paint tool is active.
     fn pick_face_with_hit(
         &self,
         rect: egui::Rect,
