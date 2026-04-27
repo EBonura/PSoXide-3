@@ -1,0 +1,23 @@
+[package]
+name    = "editor-playtest"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "editor-playtest"
+path = "src/main.rs"
+
+[profile.release]
+panic         = "abort"
+codegen-units = 1
+lto           = true
+
+[dependencies]
+psx-asset  = { path = "../../../sdk/crates/psx-asset" }
+psx-engine = { path = "../../crates/psx-engine" }
+psx-gpu    = { path = "../../../sdk/crates/psx-gpu" }
+psx-math   = { path = "../../../sdk/crates/psx-math" }
+psx-rt     = { path = "../../../sdk/crates/psx-rt" }
+psx-vram   = { path = "../../../sdk/crates/psx-vram" }

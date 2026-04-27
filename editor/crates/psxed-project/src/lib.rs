@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use ron::ser::PrettyConfig;
 use serde::{Deserialize, Serialize};
 
+pub mod playtest;
 pub mod world_cook;
 
 /// Embedded copy of the default project's RON, baked at compile
@@ -635,6 +636,71 @@ impl WorldGrid {
         ]
     }
 
+    /// Geometric centre of the room in world-cell units. After a
+    /// negative-side grow this is `(origin + half)` rather than
+    /// just `half`, so callers stay correct without each
+    /// re-deriving the offset.
+    ///
+    /// This is the **canonical** editor centre — every coordinate
+    /// helper that bridges editor-viewport units (sector-units,
+    /// room-centre-relative) and world-cell / world-space units
+    /// goes through this single source of truth.
+    pub fn grid_center_cells(&self) -> [f32; 2] {
+        [
+            self.origin[0] as f32 + self.width as f32 * 0.5,
+            self.origin[1] as f32 + self.depth as f32 * 0.5,
+        ]
+    }
+
+    /// Convert editor-viewport coordinates (sector-units,
+    /// room-centre-relative) to world-cell units. The viewport's
+    /// `(0, 0)` is the room centre; world-cell `(0, 0)` is the
+    /// runtime cell at the room's first array slot pre-grow.
+    pub fn editor_to_world_cells(&self, editor: [f32; 2]) -> [f32; 2] {
+        let center = self.grid_center_cells();
+        [editor[0] + center[0], editor[1] + center[1]]
+    }
+
+    /// Inverse of [`Self::editor_to_world_cells`]. World coords
+    /// (post-`/sector_size`) returned from a 3D ground-plane hit
+    /// land back in the editor's sector-unit space ready to feed
+    /// `world_cell_to_array` or stash on a node transform.
+    pub fn world_cells_to_editor(&self, world_cells: [f32; 2]) -> [f32; 2] {
+        let center = self.grid_center_cells();
+        [world_cells[0] - center[0], world_cells[1] - center[1]]
+    }
+
+    /// Editor-viewport position → array `(sx, sz)`. Combines
+    /// `editor_to_world_cells` + `floor` + `world_cell_to_array`
+    /// in one step so callers don't repeat the conversion at
+    /// each call site.
+    pub fn editor_cells_to_array(&self, editor: [f32; 2]) -> Option<(u16, u16)> {
+        let world = self.editor_to_world_cells(editor);
+        let wcx = world[0].floor() as i32;
+        let wcz = world[1].floor() as i32;
+        self.world_cell_to_array(wcx, wcz)
+    }
+
+    /// Editor-viewport position → world-space `(x, 0, z)` in
+    /// engine units (room-local, origin-aware). Used by the
+    /// editor's 3D preview path which renders cells at
+    /// `cell_world_x/z` so authored content keeps its visual
+    /// position after a negative-side grow.
+    pub fn editor_to_room_local(&self, editor: [f32; 2]) -> [f32; 3] {
+        let world_cells = self.editor_to_world_cells(editor);
+        let s = self.sector_size as f32;
+        [world_cells[0] * s, 0.0, world_cells[1] * s]
+    }
+
+    /// Inverse of [`Self::editor_to_room_local`] — world-space
+    /// `(x, _, z)` → editor-viewport `(x, z)` (sector-units,
+    /// room-centre-relative). The `y` component is dropped:
+    /// cell positioning is purely XZ.
+    pub fn room_local_to_editor(&self, room_local: [f32; 3]) -> [f32; 2] {
+        let s = self.sector_size as f32;
+        self.world_cells_to_editor([room_local[0] / s, room_local[2] / s])
+    }
+
     /// Convert a world position to the world-cell coordinate
     /// (which can be negative). The world-cell is the same coord
     /// system the renderer uses; subtract `origin` to get the
@@ -1238,6 +1304,78 @@ impl Default for ProjectDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_to_room_local_round_trip_origin_zero() {
+        let grid = WorldGrid::stone_room(3, 3, 1024, None, None);
+        for editor in [[0.0_f32, 0.0], [1.5, -0.25], [-1.4, 1.49]] {
+            let world = grid.editor_to_room_local(editor);
+            let back = grid.room_local_to_editor(world);
+            assert!((back[0] - editor[0]).abs() < 1e-3, "x: {editor:?} → {back:?}");
+            assert!((back[1] - editor[1]).abs() < 1e-3, "z: {editor:?} → {back:?}");
+        }
+    }
+
+    #[test]
+    fn editor_to_room_local_round_trip_negative_origin() {
+        let mut grid = WorldGrid::stone_room(3, 3, 1024, None, None);
+        // Force a -2/-3 origin via the public grow path so the
+        // test shape matches what auto-grow actually produces.
+        grid.extend_to_include(-2, -3);
+        assert_eq!(grid.origin, [-2, -3]);
+
+        for editor in [[0.0_f32, 0.0], [2.0, -1.25], [-3.5, 1.0]] {
+            let world = grid.editor_to_room_local(editor);
+            let back = grid.room_local_to_editor(world);
+            assert!((back[0] - editor[0]).abs() < 1e-3, "x: {editor:?} → {back:?}");
+            assert!((back[1] - editor[1]).abs() < 1e-3, "z: {editor:?} → {back:?}");
+        }
+    }
+
+    #[test]
+    fn editor_cells_to_array_resolves_to_correct_cell() {
+        // Plain 3×3, origin [0, 0]: editor (0, 0) is room centre,
+        // which falls inside cell (1, 1).
+        let grid = WorldGrid::stone_room(3, 3, 1024, None, None);
+        assert_eq!(grid.editor_cells_to_array([0.0, 0.0]), Some((1, 1)));
+        assert_eq!(grid.editor_cells_to_array([-1.4, -1.4]), Some((0, 0)));
+        assert_eq!(grid.editor_cells_to_array([1.4, 1.4]), Some((2, 2)));
+        // Past the room edge: out of range.
+        assert_eq!(grid.editor_cells_to_array([-2.0, 0.0]), None);
+    }
+
+    #[test]
+    fn editor_cells_to_array_after_negative_grow_is_origin_aware() {
+        // Negative-side grow: origin shifts but the previously-
+        // existing cells must remain reachable from the same
+        // editor coordinates. After `extend_to_include(-1, 0)` on a
+        // 3×3 starter the room becomes width=4, depth=3, origin=[-1,0].
+        // Old cell at world-cell (0, 0) is now at array (1, 0).
+        let mut grid = WorldGrid::stone_room(3, 3, 1024, None, None);
+        grid.extend_to_include(-1, 0);
+        assert_eq!(grid.origin, [-1, 0]);
+        assert_eq!(grid.width, 4);
+        // grid_center_cells = [-1 + 2, 0 + 1.5] = [1.0, 1.5]; cell
+        // (1, 0) has world-cell centre [0.5, 0.5], so editor centre
+        // is [0.5 - 1.0, 0.5 - 1.5] = [-0.5, -1.0].
+        assert_eq!(grid.editor_cells_to_array([-0.5, -1.0]), Some((1, 0)));
+        // Newly-included cell at array (0, 0) — world-cell (-1, 0),
+        // editor centre [-0.5 - 1.0, -1.0] = [-1.5, -1.0].
+        assert_eq!(grid.editor_cells_to_array([-1.5, -1.0]), Some((0, 0)));
+    }
+
+    #[test]
+    fn cell_center_world_in_editor_units_matches_helper() {
+        let mut grid = WorldGrid::stone_room(4, 5, 1024, None, None);
+        grid.extend_to_include(-2, -1);
+        let s = grid.sector_size as f32;
+        for (sx, sz) in [(0u16, 0u16), (1, 2), (3, 4)] {
+            let world_centre = grid.cell_center_world(sx, sz);
+            let editor = grid.world_cells_to_editor([world_centre[0] / s, world_centre[1] / s]);
+            // Same cell via editor_cells_to_array should round-trip.
+            assert_eq!(grid.editor_cells_to_array(editor), Some((sx, sz)));
+        }
+    }
 
     #[test]
     fn budget_empty_grid_reports_no_geometry() {

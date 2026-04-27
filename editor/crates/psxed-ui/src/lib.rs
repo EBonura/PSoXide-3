@@ -1240,13 +1240,13 @@ impl EditorWorkspace {
         let NodeKind::Room { grid } = &room.kind else {
             return None;
         };
-        let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
-        // Translate editor click → world-cell coord. Editor coord
-        // is grid-centre-relative; cells span [-half, +half) in
-        // editor space, and the world-cell index of editor 0 is
-        // `origin + half`.
-        let wcx = (world[0] + half[0]).floor() as i32 + grid.origin[0];
-        let wcz = (world[1] + half[1]).floor() as i32 + grid.origin[1];
+        // `world` here is already in editor-cell units (sector-units,
+        // room-centre-relative — the 2D viewport's native space).
+        // Route through the canonical helper so this stays exactly
+        // inverse to `world_to_sector`'s lookup.
+        let editor_to_world = grid.editor_to_world_cells(world);
+        let wcx = editor_to_world[0].floor() as i32;
+        let wcz = editor_to_world[1].floor() as i32;
         // Cap the request before mutating so a wild click can't
         // explode the sector vec. The cap covers the post-grow
         // dimensions in either direction.
@@ -1289,16 +1289,13 @@ impl EditorWorkspace {
     }
 
     /// Convert an editor (sector-units, room-centre-relative) hit
-    /// position to a raw world `[x, 0, z]` triple. Inverse of the
-    /// grid-centre subtraction `pick_3d_world` performs.
+    /// position to a raw world `[x, 0, z]` triple. Thin shim over
+    /// `WorldGrid::editor_to_room_local` so `pick_3d_world` and this
+    /// stay exact inverses by construction.
     fn editor_world_to_world3(&self, room_id: NodeId, editor: [f32; 2]) -> [f32; 3] {
-        let Some(grid) = self.room_grid_view(room_id) else {
-            return [0.0, 0.0, 0.0];
-        };
-        let s = grid.sector_size as f32;
-        let center_x = (grid.origin[0] as f32 + grid.width as f32 * 0.5) * s;
-        let center_z = (grid.origin[1] as f32 + grid.depth as f32 * 0.5) * s;
-        [editor[0] * s + center_x, 0.0, editor[1] * s + center_z]
+        self.room_grid_view(room_id)
+            .map(|grid| grid.editor_to_room_local(editor))
+            .unwrap_or([0.0, 0.0, 0.0])
     }
 
     /// Borrow the named Room's grid for the duration of `&self`,
@@ -1347,29 +1344,20 @@ impl EditorWorkspace {
 
         if matches!(tool, ViewTool::Place) {
             self.push_undo();
-            // World → editor (room-centre-relative, sector units).
-            // Origin contributes via the grid centre, same as in
-            // `pick_3d_world` and `editor_world_to_world3`.
-            let (half, origin) = self
+            // World → editor (room-centre-relative, sector units)
+            // via `WorldGrid::room_local_to_editor`. Single helper,
+            // origin-aware, exact inverse of `editor_to_room_local`.
+            let editor = self
                 .room_grid_view(room_id)
-                .map(|grid| {
-                    (
-                        [grid.width as f32 * 0.5, grid.depth as f32 * 0.5],
-                        [grid.origin[0] as f32, grid.origin[1] as f32],
-                    )
-                })
-                .unwrap_or(([0.0, 0.0], [0.0, 0.0]));
+                .map(|grid| grid.room_local_to_editor(hit_world))
+                .unwrap_or([0.0, 0.0]);
             let id = self.project.active_scene_mut().add_node(
                 room_id,
                 "Spawn",
                 NodeKind::SpawnPoint { player: false },
             );
             if let Some(node) = self.project.active_scene_mut().node_mut(id) {
-                node.transform.translation = [
-                    hit_world[0] / sector_size - half[0] - origin[0],
-                    0.0,
-                    hit_world[2] / sector_size - half[1] - origin[1],
-                ];
+                node.transform.translation = [editor[0], 0.0, editor[1]];
             }
             self.selected_node = id;
             self.status = format!("Placed entity at {sx},{sz}");
@@ -1525,14 +1513,13 @@ impl EditorWorkspace {
     /// Snap the selected entity's translation to the centre of cell
     /// `(sx, sz)` inside `room_id`. Editor convention: 1 transform
     /// unit = 1 sector, with the room at its own translation; cell
-    /// centres land at integer + 0.5 minus half the grid extents so
-    /// the room renders symmetric around its anchor.
+    /// centres land in editor sector-unit space via the canonical
+    /// `WorldGrid::cell_center_world` (origin-aware) post-divide.
     fn snap_selected_to_cell(&mut self, room_id: NodeId, sx: u16, sz: u16) {
         if self.selected_node == NodeId::ROOT {
             return;
         }
-        // Read the room's grid dims first (immutable borrow).
-        let (half_w, half_d) = {
+        let editor = {
             let scene = self.project.active_scene();
             let Some(room) = scene.node(room_id) else {
                 return;
@@ -1540,10 +1527,14 @@ impl EditorWorkspace {
             let NodeKind::Room { grid } = &room.kind else {
                 return;
             };
-            (grid.width as f32 * 0.5, grid.depth as f32 * 0.5)
+            // World-space centre of the cell, divided into editor
+            // sector-units, then re-expressed room-centre-relative.
+            let world_centre = grid.cell_center_world(sx, sz);
+            let s = grid.sector_size as f32;
+            grid.world_cells_to_editor([world_centre[0] / s, world_centre[1] / s])
         };
-        let new_x = (sx as f32) + 0.5 - half_w;
-        let new_z = (sz as f32) + 0.5 - half_d;
+        let new_x = editor[0];
+        let new_z = editor[1];
         let mut moved = None;
         if let Some(node) = self.project.active_scene_mut().node_mut(self.selected_node) {
             // Don't move Rooms / Worlds via cell-snap — only entities.
@@ -1589,14 +1580,11 @@ impl EditorWorkspace {
         let sin_p = psx_gte::transform::sin_1_3_12(pitch) as f32 / 4096.0;
         let cos_y = psx_gte::transform::cos_1_3_12(yaw) as f32 / 4096.0;
         let sin_y = psx_gte::transform::sin_1_3_12(yaw) as f32 / 4096.0;
-        // Geometric centre in world coords — must include `origin`
-        // so the camera target stays on the actual middle of the
-        // grid after a -X / -Z grow shifts the data.
-        let target_world = [
-            (grid.origin[0] as f32 + grid.width as f32 * 0.5) * grid.sector_size as f32,
-            0.0,
-            (grid.origin[1] as f32 + grid.depth as f32 * 0.5) * grid.sector_size as f32,
-        ];
+        // Geometric centre in world coords. Editor `(0, 0)` is the
+        // room centre by definition, so `editor_to_room_local`
+        // delivers the right point — origin-aware via the canonical
+        // helper, no ad-hoc multiplication at this call site.
+        let target_world = grid.editor_to_room_local([0.0, 0.0]);
         let cam_pos = [
             target_world[0] + radius * cos_p * sin_y,
             target_world[1] - radius * sin_p,
@@ -1782,14 +1770,11 @@ impl EditorWorkspace {
         let cos_y = psx_gte::transform::cos_1_3_12(yaw) as f32 / 4096.0;
         let sin_y = psx_gte::transform::sin_1_3_12(yaw) as f32 / 4096.0;
 
-        // Geometric centre in world coords — must include `origin`
-        // so the camera target stays on the actual middle of the
-        // grid after a -X / -Z grow shifts the data.
-        let target_world = [
-            (grid.origin[0] as f32 + grid.width as f32 * 0.5) * grid.sector_size as f32,
-            0.0,
-            (grid.origin[1] as f32 + grid.depth as f32 * 0.5) * grid.sector_size as f32,
-        ];
+        // Geometric centre in world coords. Editor `(0, 0)` is the
+        // room centre by definition, so `editor_to_room_local`
+        // delivers the right point — origin-aware via the canonical
+        // helper, no ad-hoc multiplication at this call site.
+        let target_world = grid.editor_to_room_local([0.0, 0.0]);
         let cam_pos = [
             target_world[0] + radius * cos_p * sin_y,
             target_world[1] - radius * sin_p,
@@ -1840,16 +1825,12 @@ impl EditorWorkspace {
         }
         let hit_world = [cam_pos[0] + dir[0] * t, cam_pos[2] + dir[2] * t];
 
-        // The 2D click handler thinks in editor "viewport units"
-        // where 1 = 1 sector and the origin is the room's *centre*
-        // (the room sits at its `transform.translation`; cells lay
-        // out symmetrically around it). The 3D geometry is drawn
-        // corner-rooted in actual world units, so we both divide by
-        // sector_size and subtract the half-extents to translate.
-        let unit = grid.sector_size as f32;
-        let half_w = grid.width as f32 * 0.5;
-        let half_d = grid.depth as f32 * 0.5;
-        Some([hit_world[0] / unit - half_w, hit_world[1] / unit - half_d])
+        // 3D ground hit → editor sector-units, room-centre-relative.
+        // `WorldGrid::room_local_to_editor` is the canonical inverse of
+        // `editor_to_room_local` and accounts for `origin`, so picking
+        // stays correct after a negative-side grow.
+        let editor = grid.room_local_to_editor([hit_world[0], 0.0, hit_world[1]]);
+        Some(editor)
     }
 
     /// Top-level keyboard shortcut handler. Cleared via `consume_*`
@@ -3138,11 +3119,13 @@ impl EditorWorkspace {
             .map(|node| node.id)
     }
 
-    /// Translate a viewport-space click into a sector cell on `room`.
-    ///
-    /// The Room renders its grid centred on its node transform, with
-    /// each cell exactly one viewport unit, so the inverse mapping is
-    /// trivial: subtract the room corner, floor, and bound-check.
+    /// Translate a 2D-viewport-space click into a sector cell on
+    /// `room`. The viewport draws cells around `node_world(room)`
+    /// with 1 unit = 1 sector, so the click is first re-expressed
+    /// as editor coords (room-centre-relative) and then routed
+    /// through `WorldGrid::editor_cells_to_array`. `origin` enters
+    /// the conversion via the canonical helper, keeping 2D and 3D
+    /// picks consistent after a negative-side grow.
     fn world_to_sector(&self, room_id: NodeId, world: [f32; 2]) -> Option<(u16, u16)> {
         let scene = self.project.active_scene();
         let room = scene.node(room_id)?;
@@ -3150,18 +3133,8 @@ impl EditorWorkspace {
             return None;
         };
         let center = node_world(room);
-        let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
-        let lx = (world[0] - (center[0] - half[0])).floor();
-        let lz = (world[1] - (center[1] - half[1])).floor();
-        if lx < 0.0 || lz < 0.0 {
-            return None;
-        }
-        let x = lx as u32;
-        let z = lz as u32;
-        if x >= grid.width as u32 || z >= grid.depth as u32 {
-            return None;
-        }
-        Some((x as u16, z as u16))
+        let editor = [world[0] - center[0], world[1] - center[1]];
+        grid.editor_cells_to_array(editor)
     }
 
     /// Default material id for a brushed surface, picked by name from
