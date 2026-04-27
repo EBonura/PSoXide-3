@@ -763,6 +763,10 @@ impl EditorWorkspace {
             return;
         }
         self.last_paint_cell = Some((room_id, sx, sz));
+        // Surfacing the clicked cell in the inspector is useful for
+        // every tool, not just paint — Select / Move users want to
+        // see what cell they're on too.
+        self.selected_sector = Some((sx, sz));
 
         match self.active_tool {
             ViewTool::Move => self.snap_selected_to_cell(room_id, sx, sz),
@@ -772,11 +776,11 @@ impl EditorWorkspace {
             ViewTool::Select => self.pick_entity_at(room_id, world),
             // Rotate / Scale aren't Sims-shaped — skip in 3D.
             ViewTool::Rotate | ViewTool::Scale => {}
-            // Paint / Place tools reuse the 2D pipeline by feeding
-            // back through `handle_viewport_click`. The 2D dispatch
-            // already does the right thing per tool.
-            _ => {
-                self.handle_viewport_click(world, &[]);
+            // Paint / Place / Erase: call `apply_paint` directly so
+            // the 3D path doesn't re-pick through the 2D click
+            // handler's hit-test machinery.
+            tool => {
+                self.apply_paint(tool, room_id, sx, sz, world);
             }
         }
     }
