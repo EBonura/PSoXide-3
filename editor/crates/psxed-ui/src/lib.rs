@@ -95,6 +95,12 @@ pub struct EditorWorkspace {
     /// frame the panel is hovered; rendered as a translucent overlay
     /// so the user sees exactly what cell paint / place tools will hit.
     hovered_3d_sector: Option<(u16, u16)>,
+    /// Last cell `apply_paint` has run on during the current drag.
+    /// Used to dedupe per-frame paint events so click-drag with
+    /// Wall / Place doesn't stack duplicate walls / spawn N entities
+    /// in the same cell. Reset to `None` whenever a new primary
+    /// click starts.
+    last_paint_cell: Option<(NodeId, u16, u16)>,
     /// `Some((id, buffer))` while a scene-tree row is in rename mode.
     /// Buffer holds the in-flight string the user is typing; commit /
     /// cancel finalises against the actual node name.
@@ -391,6 +397,7 @@ impl EditorWorkspace {
             selected_resource: None,
             selected_sector: None,
             hovered_3d_sector: None,
+            last_paint_cell: None,
             renaming: None,
             pending_rename_focus: false,
             history: UndoStack::default(),
@@ -641,15 +648,21 @@ impl EditorWorkspace {
         };
 
         // Primary click / drag: ray-pick the cell under the cursor
-        // and dispatch to the active tool the same way the 2D
-        // viewport does. Drag fires every frame the pointer moves,
-        // so painting / moving stays continuous.
+        // and dispatch to the active tool. Click starts a fresh
+        // drag; drag fires every frame the pointer moves; per-cell
+        // dedupe keeps walls / placements from stacking when the
+        // pointer dwells inside the same cell across frames.
+        if response.drag_started_by(egui::PointerButton::Primary)
+            || response.clicked_by(egui::PointerButton::Primary)
+        {
+            self.last_paint_cell = None;
+        }
         let primary_active = response.clicked_by(egui::PointerButton::Primary)
             || response.dragged_by(egui::PointerButton::Primary);
         if primary_active {
             if let Some(pos) = response.interact_pointer_pos() {
                 if let Some(world) = self.pick_3d_world(rect, pos) {
-                    self.handle_viewport_click(world, &[]);
+                    self.dispatch_3d_tool(world);
                 }
             }
         }
@@ -697,6 +710,136 @@ impl EditorWorkspace {
     /// affordance.
     pub fn hovered_3d_sector(&self) -> Option<(u16, u16)> {
         self.hovered_3d_sector
+    }
+
+    /// 3D-viewport tool dispatch: routes a picked world position to
+    /// the right per-tool handler, deduping per cell so click-drag
+    /// stays idempotent within a cell.
+    fn dispatch_3d_tool(&mut self, world: [f32; 2]) {
+        let Some(room_id) = self.active_room_id().or_else(|| {
+            self.project
+                .active_scene()
+                .nodes()
+                .iter()
+                .find(|n| matches!(n.kind, NodeKind::Room { .. }))
+                .map(|n| n.id)
+        }) else {
+            return;
+        };
+        let Some((sx, sz)) = self.world_to_sector(room_id, world) else {
+            return;
+        };
+        if self.last_paint_cell == Some((room_id, sx, sz)) {
+            return;
+        }
+        self.last_paint_cell = Some((room_id, sx, sz));
+
+        match self.active_tool {
+            ViewTool::Move => self.snap_selected_to_cell(room_id, sx, sz),
+            // Select picks the placeable child node nearest to the
+            // pointer's projected ground-plane hit; falls back to
+            // selecting the Room itself if no entity is close.
+            ViewTool::Select => self.pick_entity_at(room_id, world),
+            // Rotate / Scale aren't Sims-shaped — skip in 3D.
+            ViewTool::Rotate | ViewTool::Scale => {}
+            // Paint / Place tools reuse the 2D pipeline by feeding
+            // back through `handle_viewport_click`. The 2D dispatch
+            // already does the right thing per tool.
+            _ => {
+                self.handle_viewport_click(world, &[]);
+            }
+        }
+    }
+
+    /// Hit-test placeable child nodes against the picked ground
+    /// position; selects the closest within half a sector. Falls
+    /// back to selecting the Room when no entity is close enough.
+    fn pick_entity_at(&mut self, room_id: NodeId, world: [f32; 2]) {
+        let scene = self.project.active_scene();
+        let mut best: Option<(NodeId, String, f32)> = None;
+        for node in scene.nodes() {
+            // Skip the things that can't be 3D-picked: the Room
+            // itself, its World parent, the scene root, plain
+            // organisational nodes.
+            if !matches!(
+                node.kind,
+                NodeKind::SpawnPoint { .. }
+                    | NodeKind::MeshInstance { .. }
+                    | NodeKind::Light { .. }
+                    | NodeKind::Trigger { .. }
+                    | NodeKind::Portal { .. }
+                    | NodeKind::AudioSource { .. }
+            ) {
+                continue;
+            }
+            let entity_x = node.transform.translation[0];
+            let entity_z = node.transform.translation[2];
+            // World coords here are in editor "1 unit = 1 sector"
+            // space; the room's geometry origin is at (-half_w,
+            // -half_d). Entity transforms are stored relative to
+            // that anchor too, so the difference is direct.
+            let dx = entity_x - world[0];
+            let dz = entity_z - world[1];
+            let dist = (dx * dx + dz * dz).sqrt();
+            if dist > 0.5 {
+                continue;
+            }
+            if let Some((_, _, best_dist)) = best {
+                if dist >= best_dist {
+                    continue;
+                }
+            }
+            best = Some((node.id, node.name.clone(), dist));
+        }
+        match best {
+            Some((id, name, _)) => {
+                self.selected_node = id;
+                self.selected_resource = None;
+                self.status = format!("Selected {name}");
+            }
+            None => {
+                self.selected_node = room_id;
+                self.selected_resource = None;
+            }
+        }
+    }
+
+    /// Snap the selected entity's translation to the centre of cell
+    /// `(sx, sz)` inside `room_id`. Editor convention: 1 transform
+    /// unit = 1 sector, with the room at its own translation; cell
+    /// centres land at integer + 0.5 minus half the grid extents so
+    /// the room renders symmetric around its anchor.
+    fn snap_selected_to_cell(&mut self, room_id: NodeId, sx: u16, sz: u16) {
+        if self.selected_node == NodeId::ROOT {
+            return;
+        }
+        // Read the room's grid dims first (immutable borrow).
+        let (half_w, half_d) = {
+            let scene = self.project.active_scene();
+            let Some(room) = scene.node(room_id) else {
+                return;
+            };
+            let NodeKind::Room { grid } = &room.kind else {
+                return;
+            };
+            (grid.width as f32 * 0.5, grid.depth as f32 * 0.5)
+        };
+        let new_x = (sx as f32) + 0.5 - half_w;
+        let new_z = (sz as f32) + 0.5 - half_d;
+        let mut moved = None;
+        if let Some(node) = self.project.active_scene_mut().node_mut(self.selected_node) {
+            // Don't move Rooms / Worlds via cell-snap — only entities.
+            if matches!(node.kind, NodeKind::Room { .. } | NodeKind::World) {
+                return;
+            }
+            node.transform.translation[0] = new_x;
+            node.transform.translation[2] = new_z;
+            moved = Some(node.name.clone());
+        }
+        if let Some(name) = moved {
+            self.status = format!("Moved {name} to {sx},{sz}");
+            self.mark_dirty();
+        }
     }
 
     /// Project a pointer position inside the 3D viewport panel onto
@@ -785,10 +928,15 @@ impl EditorWorkspace {
         let hit_world = [cam_pos[0] + dir[0] * t, cam_pos[2] + dir[2] * t];
 
         // The 2D click handler thinks in editor "viewport units"
-        // where 1 = 1 sector. Apply the same convention so
-        // `world_to_sector` / `apply_paint` work without changes.
+        // where 1 = 1 sector and the origin is the room's *centre*
+        // (the room sits at its `transform.translation`; cells lay
+        // out symmetrically around it). The 3D geometry is drawn
+        // corner-rooted in actual world units, so we both divide by
+        // sector_size and subtract the half-extents to translate.
         let unit = grid.sector_size as f32;
-        Some([hit_world[0] / unit, hit_world[1] / unit])
+        let half_w = grid.width as f32 * 0.5;
+        let half_d = grid.depth as f32 * 0.5;
+        Some([hit_world[0] / unit - half_w, hit_world[1] / unit - half_d])
     }
 
     /// Top-level keyboard shortcut handler. Cleared via `consume_*`
