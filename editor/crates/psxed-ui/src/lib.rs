@@ -877,17 +877,15 @@ impl EditorWorkspace {
             } else {
                 None
             };
-        // Select runs a fuller ray-test against every face in the
-        // active Room — floors, walls, ceilings — so the user sees
-        // a light outline on whatever they're about to click. Other
-        // tools clear `hovered_face` so the outline doesn't linger.
-        self.hovered_face = if matches!(self.active_tool, ViewTool::Select) {
-            response
-                .hover_pos()
-                .and_then(|pointer| self.pick_face_at(rect, pointer))
-        } else {
-            None
-        };
+        // Face hover ray-tests every floor / wall / ceiling in the
+        // active Room and reports the closest hit. Used by Select
+        // for the outline UI, AND by paint tools to anchor their
+        // dispatch onto the actual face the user clicked rather
+        // than the floor-plane projection (which lies under wall
+        // surfaces and gets the wrong cell for back-row clicks).
+        self.hovered_face = response
+            .hover_pos()
+            .and_then(|pointer| self.pick_face_at(rect, pointer));
 
         // Primary click / drag: ray-pick the cell under the cursor
         // and dispatch to the active tool. Click starts a fresh
@@ -902,17 +900,19 @@ impl EditorWorkspace {
         let primary_active = response.clicked_by(egui::PointerButton::Primary)
             || response.dragged_by(egui::PointerButton::Primary);
         if primary_active {
-            // Select reads the face the hover-tracker already
-            // ray-picked this frame, so clicks land even when the
-            // ground-plane projection (which paint tools rely on)
-            // would fall outside the room footprint — back-row
-            // walls are the obvious case.
+            // Select and paint tools both read the hover ray-test
+            // result so the click lands on the actual face under
+            // the cursor, not the floor-plane projection (which is
+            // wrong for back-row walls and gets the cell-edge
+            // direction backwards because of editor / world Z
+            // convention drift). Falls back to ground-plane only
+            // for the empty-cell paint case where there's no face.
             if matches!(self.active_tool, ViewTool::Select) {
                 self.commit_face_selection();
             } else if let Some(pos) = response.interact_pointer_pos() {
-                if let Some(world) = self.pick_3d_world(rect, pos) {
-                    self.dispatch_3d_tool(world);
-                }
+                let face_hit = self.pick_face_with_hit(rect, pos);
+                let ground = self.pick_3d_world(rect, pos);
+                self.dispatch_paint_3d(face_hit, ground);
             }
         }
 
@@ -1011,48 +1011,6 @@ impl EditorWorkspace {
         Some((sx, sz, dir))
     }
 
-    /// 3D-viewport tool dispatch: routes a picked world position to
-    /// the right per-tool handler, deduping per cell so click-drag
-    /// stays idempotent within a cell.
-    fn dispatch_3d_tool(&mut self, world: [f32; 2]) {
-        let Some(room_id) = self.active_room_id().or_else(|| {
-            self.project
-                .active_scene()
-                .nodes()
-                .iter()
-                .find(|n| matches!(n.kind, NodeKind::Room { .. }))
-                .map(|n| n.id)
-        }) else {
-            return;
-        };
-        let Some((sx, sz)) = self.world_to_sector(room_id, world) else {
-            return;
-        };
-        if self.last_paint_cell == Some((room_id, sx, sz)) {
-            return;
-        }
-        self.last_paint_cell = Some((room_id, sx, sz));
-        // Surfacing the clicked cell in the inspector is useful for
-        // every tool, not just paint — Select / Move users want to
-        // see what cell they're on too.
-        self.selected_sector = Some((sx, sz));
-
-        match self.active_tool {
-            ViewTool::Move => self.snap_selected_to_cell(room_id, sx, sz),
-            // Select is handled separately on click — see
-            // `commit_face_selection`. It bypasses the floor-plane
-            // sector requirement since back-row walls' ground-plane
-            // projection lands outside the room footprint.
-            ViewTool::Select => {}
-            // Paint / Place / Erase: call `apply_paint` directly so
-            // the 3D path doesn't re-pick through the 2D click
-            // handler's hit-test machinery.
-            tool => {
-                self.apply_paint(tool, room_id, sx, sz, world);
-            }
-        }
-    }
-
     /// Commit the most recent hover-tracked face to `selected_face`.
     /// Called from the click handler when the Select tool is active,
     /// independent of `dispatch_3d_tool`'s ground-plane sector
@@ -1071,6 +1029,199 @@ impl EditorWorkspace {
             self.selected_resource = None;
             self.status = "Cleared face selection".to_string();
         }
+    }
+
+    /// 3D paint / move click handler. `face_hit` is the ray-test
+    /// result (`pick_face_with_hit`) — preferred because it
+    /// reflects the actual face under the cursor. `ground_hit` is
+    /// the floor-plane fallback for empty cells where no face
+    /// exists to hover.
+    fn dispatch_paint_3d(
+        &mut self,
+        face_hit: Option<(FaceRef, [f32; 3])>,
+        ground_hit: Option<[f32; 2]>,
+    ) {
+        let Some(room_id) = self.active_room_id() else {
+            return;
+        };
+        let (cell, hit_world) = match face_hit {
+            Some((face, hit)) => ((face.sx, face.sz), hit),
+            None => {
+                let Some(world) = ground_hit else {
+                    return;
+                };
+                let Some((sx, sz)) = self.world_to_sector(room_id, world) else {
+                    return;
+                };
+                let sector_size = self.room_sector_size(room_id).unwrap_or(1024) as f32;
+                let half = self.room_half_extents(room_id).unwrap_or([0.0, 0.0]);
+                let raw_hit = [
+                    (world[0] + half[0]) * sector_size,
+                    0.0,
+                    (world[1] + half[1]) * sector_size,
+                ];
+                ((sx, sz), raw_hit)
+            }
+        };
+        let (sx, sz) = cell;
+        if self.last_paint_cell == Some((room_id, sx, sz)) {
+            return;
+        }
+        self.last_paint_cell = Some((room_id, sx, sz));
+        self.selected_sector = Some((sx, sz));
+        match self.active_tool {
+            ViewTool::Move => self.snap_selected_to_cell(room_id, sx, sz),
+            tool => self.run_paint_action(
+                tool,
+                room_id,
+                sx,
+                sz,
+                face_hit.map(|(f, _)| f),
+                hit_world,
+            ),
+        }
+    }
+
+    /// World-space sector size of the named Room, or `None` if the
+    /// node isn't a Room.
+    fn room_sector_size(&self, room_id: NodeId) -> Option<i32> {
+        let node = self.project.active_scene().node(room_id)?;
+        match &node.kind {
+            NodeKind::Room { grid } => Some(grid.sector_size),
+            _ => None,
+        }
+    }
+
+    /// Half (width, depth) of the named Room in sector units.
+    fn room_half_extents(&self, room_id: NodeId) -> Option<[f32; 2]> {
+        let node = self.project.active_scene().node(room_id)?;
+        match &node.kind {
+            NodeKind::Room { grid } => {
+                Some([grid.width as f32 * 0.5, grid.depth as f32 * 0.5])
+            }
+            _ => None,
+        }
+    }
+
+    /// Apply one paint / erase / place action to `(sx, sz)` in
+    /// `room_id`. `picked_face` is set when a face was directly
+    /// ray-picked (lets us remove a specific wall stack instead of
+    /// the whole sector for Erase). `hit_world` is the world-space
+    /// click position for tools that need the in-cell offset
+    /// (PaintWall picks the edge from `(dx, dz)` against the cell
+    /// centre).
+    fn run_paint_action(
+        &mut self,
+        tool: ViewTool,
+        room_id: NodeId,
+        sx: u16,
+        sz: u16,
+        picked_face: Option<FaceRef>,
+        hit_world: [f32; 3],
+    ) {
+        let floor_mat = self
+            .brush_material
+            .or_else(|| self.default_brush_material("floor"));
+        let wall_mat = self
+            .brush_material
+            .or_else(|| self.default_brush_material("brick"))
+            .or(floor_mat);
+        let sector_size_i = self.room_sector_size(room_id).unwrap_or(1024);
+        let sector_size = sector_size_i as f32;
+        let cell_center = [
+            (sx as f32 + 0.5) * sector_size,
+            (sz as f32 + 0.5) * sector_size,
+        ];
+
+        if matches!(tool, ViewTool::Place) {
+            self.push_undo();
+            let half = self.room_half_extents(room_id).unwrap_or([0.0, 0.0]);
+            let id = self.project.active_scene_mut().add_node(
+                room_id,
+                "Spawn",
+                NodeKind::SpawnPoint { player: false },
+            );
+            if let Some(node) = self.project.active_scene_mut().node_mut(id) {
+                node.transform.translation = [
+                    hit_world[0] / sector_size - half[0],
+                    0.0,
+                    hit_world[2] / sector_size - half[1],
+                ];
+            }
+            self.selected_node = id;
+            self.status = format!("Placed entity at {sx},{sz}");
+            self.mark_dirty();
+            return;
+        }
+
+        // Snapshot for undo BEFORE mutating. Each non-Place tool
+        // shares the same snapshot point.
+        self.push_undo();
+        let scene = self.project.active_scene_mut();
+        let Some(room) = scene.node_mut(room_id) else {
+            return;
+        };
+        let NodeKind::Room { grid } = &mut room.kind else {
+            return;
+        };
+        let status = match tool {
+            ViewTool::PaintFloor => {
+                grid.set_floor(sx, sz, 0, floor_mat);
+                format!("Painted floor at {sx},{sz}")
+            }
+            ViewTool::PaintCeiling => {
+                if let Some(sector) = grid.ensure_sector(sx, sz) {
+                    sector.ceiling = Some(GridHorizontalFace::flat(sector_size_i, floor_mat));
+                }
+                format!("Painted ceiling at {sx},{sz}")
+            }
+            ViewTool::PaintWall => {
+                // Prefer the wall the ray actually hit; otherwise
+                // infer the edge from where on the cell's footprint
+                // the click landed (raw-world dx/dz, so the sign
+                // matches the renderer's `WallEdge` convention).
+                let dir = match picked_face {
+                    Some(FaceRef {
+                        kind: FaceKind::Wall { dir, .. },
+                        ..
+                    }) => dir,
+                    _ => edge_from_world_offset(
+                        hit_world[0] - cell_center[0],
+                        hit_world[2] - cell_center[1],
+                    ),
+                };
+                grid.add_wall(sx, sz, dir, 0, sector_size_i, wall_mat);
+                format!("Added {} wall at {sx},{sz}", direction_label(dir))
+            }
+            ViewTool::Erase => {
+                // Per-face Erase: a wall ray-pick drops just that
+                // wall stack entry; floor/ceiling/no-pick clears
+                // the whole sector (mirrors the 2D paint pass).
+                match picked_face {
+                    Some(FaceRef {
+                        kind: FaceKind::Wall { dir, stack },
+                        ..
+                    }) => {
+                        if let Some(sector) = grid.sector_mut(sx, sz) {
+                            let walls = sector.walls.get_mut(dir);
+                            if (stack as usize) < walls.len() {
+                                walls.remove(stack as usize);
+                            }
+                        }
+                        format!("Removed wall at {sx},{sz}")
+                    }
+                    _ => {
+                        if let Some(index) = grid.sector_index(sx, sz) {
+                            grid.sectors[index] = None;
+                        }
+                        format!("Erased sector {sx},{sz}")
+                    }
+                }
+            }
+            _ => return,
+        };
+        self.dirty = true;
+        self.status = status;
     }
 
     /// Material id currently applied to `face`, or `None` if the
@@ -1243,6 +1394,18 @@ impl EditorWorkspace {
     /// matches what gets picked. `None` when the pointer is off the
     /// panel or no face is along the ray.
     fn pick_face_at(&self, rect: egui::Rect, pointer: egui::Pos2) -> Option<FaceRef> {
+        self.pick_face_with_hit(rect, pointer).map(|(face, _)| face)
+    }
+
+    /// Same ray-test as [`Self::pick_face_at`], but also returns the
+    /// world-space hit point. Paint dispatch needs the hit position
+    /// to infer which edge of a floor cell the user clicked when
+    /// the wall paint tool is active.
+    fn pick_face_with_hit(
+        &self,
+        rect: egui::Rect,
+        pointer: egui::Pos2,
+    ) -> Option<(FaceRef, [f32; 3])> {
         let (origin, dir) = self.camera_ray_for_pointer(rect, pointer)?;
         let scene = self.project.active_scene();
         let room = scene
@@ -1346,7 +1509,14 @@ impl EditorWorkspace {
             }
         }
 
-        best.map(|(face, _)| face)
+        best.map(|(face, t)| {
+            let hit = [
+                origin[0] + dir[0] * t,
+                origin[1] + dir[1] * t,
+                origin[2] + dir[2] * t,
+            ];
+            (face, hit)
+        })
     }
 
     /// Project a pointer position inside the 3D viewport panel onto
@@ -5228,15 +5398,42 @@ fn describe_face(face: FaceRef) -> String {
         FaceKind::Floor => format!("Floor at {},{}", face.sx, face.sz),
         FaceKind::Ceiling => format!("Ceiling at {},{}", face.sx, face.sz),
         FaceKind::Wall { dir, stack } => {
-            let dir_label = match dir {
-                GridDirection::North => "North",
-                GridDirection::East => "East",
-                GridDirection::South => "South",
-                GridDirection::West => "West",
-                _ => "Diag",
-            };
-            format!("{dir_label} wall #{stack} at {},{}", face.sx, face.sz)
+            format!(
+                "{} wall #{stack} at {},{}",
+                direction_label(dir),
+                face.sx,
+                face.sz
+            )
         }
+    }
+}
+
+fn direction_label(dir: GridDirection) -> &'static str {
+    match dir {
+        GridDirection::North => "North",
+        GridDirection::East => "East",
+        GridDirection::South => "South",
+        GridDirection::West => "West",
+        _ => "Diag",
+    }
+}
+
+/// Pick the cardinal `GridDirection` for a wall edge given the
+/// click offset from the cell's world-space centre. Mirrors the
+/// renderer's `WallEdge` mapping in `editor_preview`:
+/// `North = +Z`, `East = +X`, `South = -Z`, `West = -X`. The
+/// dominant axis decides; ties favour the X axis.
+fn edge_from_world_offset(dx: f32, dz: f32) -> GridDirection {
+    if dz.abs() > dx.abs() {
+        if dz >= 0.0 {
+            GridDirection::North
+        } else {
+            GridDirection::South
+        }
+    } else if dx >= 0.0 {
+        GridDirection::East
+    } else {
+        GridDirection::West
     }
 }
 

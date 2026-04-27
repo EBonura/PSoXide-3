@@ -458,6 +458,13 @@ impl WorldGrid {
             .and_then(|index| self.sectors.get(index)?.as_ref())
     }
 
+    /// Mutable sector. `None` when out-of-bounds OR the cell hasn't
+    /// been authored yet (use `ensure_sector` to create-on-access).
+    pub fn sector_mut(&mut self, x: u16, z: u16) -> Option<&mut GridSector> {
+        self.sector_index(x, z)
+            .and_then(move |index| self.sectors.get_mut(index)?.as_mut())
+    }
+
     /// Mutable sector, creating it if needed.
     pub fn ensure_sector(&mut self, x: u16, z: u16) -> Option<&mut GridSector> {
         let index = self.sector_index(x, z)?;
