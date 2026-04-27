@@ -1004,6 +1004,7 @@ dependencies = [
  "gilrs",
  "pollster",
  "psoxide-settings",
+ "psx-asset",
  "psx-engine",
  "psx-gpu",
  "psx-gpu-compute",

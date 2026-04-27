@@ -478,16 +478,21 @@ impl WorldGrid {
 /// Resource payloads available to editor scenes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourceData {
-    /// Source texture plus intended cooked dimensions/depth.
+    /// Cooked PSXT artifact reference.
+    ///
+    /// The editor and the runtime both consume the same `.psxt` blob
+    /// — the runtime via `include_bytes!` at compile time, the editor
+    /// via `std::fs::read` at refresh time and `psx_asset::Texture::from_bytes`
+    /// to extract pixel + CLUT bytes. PNG → PSXT cooking lives in the
+    /// `psxed-tex` CLI; the editor's runtime path doesn't touch PNGs.
     Texture {
-        /// Project-relative source path.
-        source_path: String,
-        /// Cooked width in texels.
-        width: u16,
-        /// Cooked height in texels.
-        height: u16,
-        /// Indexed texture depth, typically 4 or 8.
-        indexed_depth: u8,
+        /// Path to the cooked `.psxt` artifact. Resolved at refresh
+        /// time first as-is (absolute paths), then relative to the
+        /// project file's directory, then relative to the workspace
+        /// cwd. The starter project ships paths relative to the repo
+        /// root so `cargo run -p frontend` from `/repos/psoxide` finds
+        /// the canonical `assets/textures/*.psxt`.
+        psxt_path: String,
     },
     /// Editor material.
     Material(MaterialResource),
@@ -869,41 +874,35 @@ impl ProjectDocument {
     }
 
     /// Create a useful starter project for the embedded editor workspace.
+    ///
+    /// Ships the same two textures the `showcase-textured-sprite`
+    /// runtime demo uses — brick + cobblestone — and one material
+    /// per texture. Both Texture resources reference the canonical
+    /// `assets/textures/*.psxt` paths so the editor's preview
+    /// loads the exact bytes the runtime would embed at compile
+    /// time. No invented placeholders.
     pub fn starter() -> Self {
         let mut project = Self::new("Untitled PS1 Project");
 
         let floor_tex = project.add_resource(
             "floor.psxt",
             ResourceData::Texture {
-                source_path: "textures/floor.png".to_string(),
-                width: 64,
-                height: 64,
-                indexed_depth: 4,
+                psxt_path: "assets/textures/floor.psxt".to_string(),
             },
         );
         let brick_tex = project.add_resource(
             "brick-wall.psxt",
             ResourceData::Texture {
-                source_path: "textures/brick-wall.png".to_string(),
-                width: 64,
-                height: 64,
-                indexed_depth: 4,
+                psxt_path: "assets/textures/brick-wall.psxt".to_string(),
             },
         );
         let floor_mat = project.add_resource(
-            "Floor Material",
+            "Floor",
             ResourceData::Material(MaterialResource::opaque(Some(floor_tex))),
         );
         let brick_mat = project.add_resource(
-            "Brick Material",
+            "Brick",
             ResourceData::Material(MaterialResource::opaque(Some(brick_tex))),
-        );
-        let glass_mat = project.add_resource(
-            "Average Glass",
-            ResourceData::Material(MaterialResource::translucent(
-                Some(floor_tex),
-                PsxBlendMode::Average,
-            )),
         );
 
         let scene = project.active_scene_mut();
@@ -916,19 +915,6 @@ impl ProjectDocument {
                 grid: WorldGrid::stone_room(3, 3, 1024, Some(floor_mat), Some(brick_mat)),
             },
         );
-
-        let card = scene.add_node(
-            stone_room,
-            "Material Card",
-            NodeKind::MeshInstance {
-                mesh: None,
-                material: Some(glass_mat),
-            },
-        );
-        if let Some(node) = scene.node_mut(card) {
-            node.transform.translation = [0.0, 0.0, 0.0];
-            node.transform.scale = [0.9, 1.0, 0.18];
-        }
 
         let spawn =
             scene.add_node(stone_room, "Player Spawn", NodeKind::SpawnPoint { player: true });
@@ -1049,12 +1035,13 @@ mod tests {
         let project = ProjectDocument::starter();
 
         assert_eq!(project.scenes.len(), 1);
-        assert!(project.resources.len() >= 5);
+        // 2 textures + 2 materials = 4.
+        assert!(project.resources.len() >= 4);
         assert!(project
             .active_scene()
             .hierarchy_rows()
             .iter()
-            .any(|row| row.name == "Material Card"));
+            .any(|row| row.name == "Stone Room"));
         let grid = project
             .active_scene()
             .nodes()
@@ -1142,7 +1129,7 @@ mod tests {
         let project = ProjectDocument::starter();
         let ron = project.to_ron_string().unwrap();
 
-        assert!(ron.contains("Material Card"));
+        assert!(ron.contains("Stone Room"));
         assert_eq!(ProjectDocument::from_ron_str(&ron).unwrap(), project);
     }
 

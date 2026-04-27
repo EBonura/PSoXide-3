@@ -26,8 +26,8 @@ use psx_gpu::{
 };
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
-static BRICK_BLOB: &[u8] = include_bytes!("../../showcase-fog/assets/brick-wall.psxt");
-static FLOOR_BLOB: &[u8] = include_bytes!("../../showcase-fog/assets/floor.psxt");
+static BRICK_BLOB: &[u8] = include_bytes!("../../../../assets/textures/brick-wall.psxt");
+static FLOOR_BLOB: &[u8] = include_bytes!("../../../../assets/textures/floor.psxt");
 
 const SHARED_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
 const BRICK_CLUT: Clut = Clut::new(0, 480);

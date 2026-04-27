@@ -38,10 +38,10 @@ use psx_vram::{Clut, TexDepth, Tpage, VramRect, upload_bytes};
 
 /// Wall (brick) — cooked by `make assets` from
 /// `vendor/brick-wall.jpg`.
-static BRICK_BLOB: &[u8] = include_bytes!("../assets/brick-wall.psxt");
+static BRICK_BLOB: &[u8] = include_bytes!("../../../../assets/textures/brick-wall.psxt");
 
 /// Floor (cobblestone / batako) — cooked from `vendor/floor.jpg`.
-static FLOOR_BLOB: &[u8] = include_bytes!("../assets/floor.psxt");
+static FLOOR_BLOB: &[u8] = include_bytes!("../../../../assets/textures/floor.psxt");
 
 /// Shared tpage — both 64-texel-wide 4bpp textures fit in one
 /// 256-wide tpage with room to spare. The `apply_as_draw_mode`

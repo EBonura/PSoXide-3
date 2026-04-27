@@ -23,9 +23,11 @@
 //! ```
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
+use psx_asset::Texture;
 use psx_gpu_render::{VRAM_HEIGHT, VRAM_WIDTH};
-use psxed_project::{ProjectDocument, ResourceData, ResourceId};
+use psxed_project::{MaterialResource, ProjectDocument, Resource, ResourceData, ResourceId};
 
 /// Cached tpage/CLUT for one Material resource.
 #[derive(Debug, Clone, Copy)]
@@ -41,11 +43,25 @@ pub struct MaterialSlot {
     pub height: u8,
 }
 
+/// Cache row keeping the slot together with the source signature so
+/// we know when to invalidate. Re-uploading on every change leaks
+/// the previous tpage / CLUT band; that's fine for editor lifetime
+/// (we have ~10 tpages × 32 CLUT slots of slack), but we do skip the
+/// re-upload entirely when the signature hasn't moved.
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    slot: MaterialSlot,
+    /// Path of the `.psxt` resource that produced this slot. Empty
+    /// string when the material has no texture or the file couldn't
+    /// be read — then the slot holds a procedural fallback pattern.
+    signature: String,
+}
+
 /// Owns the editor renderer's VRAM mirror plus the per-material
 /// texture cache.
 pub struct EditorTextures {
     vram: Box<[u16]>,
-    cache: HashMap<ResourceId, MaterialSlot>,
+    cache: HashMap<ResourceId, CacheEntry>,
     /// Index into the tpage row, starts at 5 (after the framebuffer
     /// at tpages 0..4) and bumps by 1 per uploaded texture.
     next_tpage: u8,
@@ -76,46 +92,160 @@ impl EditorTextures {
     /// been uploaded (the editor preview should fall back to flat
     /// shading in that case).
     pub fn slot(&self, id: ResourceId) -> Option<MaterialSlot> {
-        self.cache.get(&id).copied()
+        self.cache.get(&id).map(|e| e.slot)
     }
 
-    /// Walk every Material resource and ensure it has a procedural
-    /// texture in VRAM. Cheap when nothing's changed — the cache
-    /// short-circuits per-resource. Call once per frame; anything
-    /// not yet seen gets generated and uploaded right then.
-    pub fn refresh(&mut self, project: &ProjectDocument) {
+    /// Walk every Material resource and ensure its texture is in VRAM.
+    ///
+    /// Resolution order per material:
+    ///
+    /// 1. Follow `material.texture` to a `ResourceData::Texture`.
+    /// 2. Resolve `psxt_path` (absolute as-is, otherwise against
+    ///    `project_root`).
+    /// 3. `fs::read` and parse via [`psx_asset::Texture::from_bytes`].
+    /// 4. On any failure, fall back to a name-keyed procedural
+    ///    pattern (brick / stone / wood / metal / glass / default
+    ///    checker) so the preview is never blank.
+    ///
+    /// Cached signature is `psxt_path` so editing the path
+    /// re-uploads on the next refresh; unchanged paths short-circuit.
+    pub fn refresh(&mut self, project: &ProjectDocument, project_root: &Path) {
         for resource in &project.resources {
-            if !matches!(resource.data, ResourceData::Material(_)) {
+            let ResourceData::Material(material) = &resource.data else {
+                continue;
+            };
+            let signature = texture_path(project, material).unwrap_or_default();
+            if self.cache.get(&resource.id).is_some_and(|entry| entry.signature == signature) {
                 continue;
             }
-            if self.cache.contains_key(&resource.id) {
-                continue;
-            }
-            // Out of CLUT row, or out of tpages — silently stop.
-            // Future work: pack textures inside one tpage so the
-            // 11 free tpages aren't a hard ceiling.
             if self.next_tpage > 15 || self.next_clut_x + 16 > VRAM_WIDTH as u16 {
+                // Out of slots. Don't insert a stale cache entry.
                 continue;
             }
-            let pattern = pattern_for_name(&resource.name);
-            let tpage_x = (self.next_tpage as u16) * 64;
-            let tpage_y = 0;
-            let clut_x = self.next_clut_x;
-            let clut_y = 480;
-            self.upload_4bpp(tpage_x, tpage_y, &pattern.pixels);
-            self.upload_clut(clut_x, clut_y, &pattern.palette);
+            let slot = self
+                .upload_real_psxt(&signature, project_root)
+                .unwrap_or_else(|| self.upload_procedural(&resource.name));
             self.cache.insert(
                 resource.id,
-                MaterialSlot {
-                    tpage_word: pack_tpage_word(self.next_tpage as u16, 0),
-                    clut_word: pack_clut_word(clut_x, clut_y),
-                    width: pattern.width,
-                    height: pattern.height,
+                CacheEntry {
+                    slot,
+                    signature,
                 },
             );
-            self.next_tpage += 1;
-            self.next_clut_x += 16;
         }
+    }
+
+    /// Read `path` and upload the parsed PSXT into the next free
+    /// tpage / CLUT slot. Returns `None` if the path is empty, the
+    /// file can't be read, the blob fails to parse, or the depth
+    /// is unsupported by the editor preview path (only 4bpp + 8bpp
+    /// indexed for now — the runtime supports 15bpp but editor's
+    /// procedural fallback covers any holes).
+    fn upload_real_psxt(&mut self, path: &str, project_root: &Path) -> Option<MaterialSlot> {
+        if path.is_empty() {
+            return None;
+        }
+        let abs = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            project_root.join(path)
+        };
+        let bytes = std::fs::read(&abs).ok()?;
+        let texture = Texture::from_bytes(&bytes).ok()?;
+        // PSX UVs are 8-bit so anything >256 wouldn't be addressable
+        // from a single primitive anyway; reject taller-than-256
+        // textures rather than silently producing wrong UVs.
+        let width = u8::try_from(texture.width()).ok()?;
+        let height = u8::try_from(texture.height()).ok()?;
+        let tpage_index = self.next_tpage as u16;
+        let tpage_x = tpage_index * 64;
+        let tpage_y = 0;
+        let clut_x = self.next_clut_x;
+        let clut_y = 480;
+
+        // Pixel halfwords: copy raw little-endian bytes from
+        // `pixel_bytes` into VRAM. The runtime path's
+        // `psx_vram::upload_bytes` does the same — we mirror it on
+        // host because the editor's `HwRenderer` reads VRAM as
+        // halfwords through `R16Uint`.
+        let halfwords_per_row = texture.halfwords_per_row() as usize;
+        let height_px = texture.height() as usize;
+        let pixel_bytes = texture.pixel_bytes();
+        if pixel_bytes.len() < halfwords_per_row * height_px * 2 {
+            return None;
+        }
+        for row in 0..height_px {
+            for hw in 0..halfwords_per_row {
+                let off = (row * halfwords_per_row + hw) * 2;
+                let word = u16::from_le_bytes([pixel_bytes[off], pixel_bytes[off + 1]]);
+                let vram_idx = (tpage_y as usize + row) * VRAM_WIDTH as usize
+                    + tpage_x as usize
+                    + hw;
+                self.vram[vram_idx] = word;
+            }
+        }
+
+        // CLUT halfwords: 16 entries for 4bpp. The editor allocates
+        // one 4bpp-sized CLUT band per material; 8bpp + 15bpp
+        // follow-up since they need a wider band. Detect via the
+        // declared CLUT entry count rather than the depth enum so
+        // the only psx-asset surface this file touches is `Texture`.
+        let clut_bytes = texture.clut_bytes();
+        if texture.clut_entries() != 16 {
+            return None;
+        }
+        if !clut_bytes.is_empty() {
+            for i in 0..16 {
+                let off = i * 2;
+                if off + 1 >= clut_bytes.len() {
+                    break;
+                }
+                let raw = u16::from_le_bytes([clut_bytes[off], clut_bytes[off + 1]]);
+                // STP-bit hack the showcase applies: opaque texels
+                // get bit15 set so PSX semi-transparent draws can
+                // still discriminate against fully transparent
+                // black. Mirroring keeps editor + runtime visuals
+                // identical.
+                let marked = if raw == 0 { 0 } else { raw | 0x8000 };
+                let vram_idx =
+                    (clut_y as usize) * VRAM_WIDTH as usize + clut_x as usize + i;
+                self.vram[vram_idx] = marked;
+            }
+        }
+
+        let slot = MaterialSlot {
+            tpage_word: pack_tpage_word(tpage_index, 0),
+            clut_word: pack_clut_word(clut_x, clut_y),
+            width,
+            height,
+        };
+        self.next_tpage += 1;
+        self.next_clut_x += 16;
+        Some(slot)
+    }
+
+    /// Stamp a name-keyed procedural pattern (brick / stone / wood /
+    /// metal / glass / default checker) into the next free slot.
+    /// Always returns a valid slot — assumes the caller already
+    /// confirmed there's room.
+    fn upload_procedural(&mut self, material_name: &str) -> MaterialSlot {
+        let pattern = pattern_for_name(material_name);
+        let tpage_index = self.next_tpage as u16;
+        let tpage_x = tpage_index * 64;
+        let tpage_y = 0;
+        let clut_x = self.next_clut_x;
+        let clut_y = 480;
+        self.upload_4bpp(tpage_x, tpage_y, &pattern.pixels);
+        self.upload_clut(clut_x, clut_y, &pattern.palette);
+        let slot = MaterialSlot {
+            tpage_word: pack_tpage_word(tpage_index, 0),
+            clut_word: pack_clut_word(clut_x, clut_y),
+            width: pattern.width,
+            height: pattern.height,
+        };
+        self.next_tpage += 1;
+        self.next_clut_x += 16;
+        slot
     }
 
     /// Pack a 4bpp 64×64 pattern into VRAM at `(x, y)` (halfword
@@ -146,6 +276,18 @@ impl EditorTextures {
             let vram_idx = (clut_y as usize) * VRAM_WIDTH as usize + clut_x as usize + i;
             self.vram[vram_idx] = entry;
         }
+    }
+}
+
+/// Resolve a Material's texture link to the underlying `.psxt`
+/// path string, or `None` if the link is missing or the linked
+/// resource isn't a Texture.
+fn texture_path(project: &ProjectDocument, material: &MaterialResource) -> Option<String> {
+    let tex_id = material.texture?;
+    let resource: &Resource = project.resource(tex_id)?;
+    match &resource.data {
+        ResourceData::Texture { psxt_path } => Some(psxt_path.clone()),
+        _ => None,
     }
 }
 

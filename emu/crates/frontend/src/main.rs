@@ -683,8 +683,10 @@ impl ApplicationHandler for Shell {
                 let editor_selected = state.editor.selected_node_id();
                 let editor_hover = state.editor.hovered_3d_sector();
                 let editor_hover_edge = state.editor.hovered_3d_edge();
+                let editor_root = state.editor.project_root();
                 gfx.render_editor_preview(
                     state.editor.project(),
+                    &editor_root,
                     editor_camera,
                     editor_selected,
                     editor_hover,

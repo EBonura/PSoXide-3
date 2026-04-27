@@ -119,7 +119,6 @@ pub struct EditorWorkspace {
     scene_filter: String,
     file_filter: String,
     resource_search: String,
-    bottom_tab: BottomTab,
     resource_filter: ResourceFilter,
     active_tool: ViewTool,
     /// Material the next Floor / Wall / Ceiling paint will use, when
@@ -194,41 +193,6 @@ impl ViewTool {
                 | Self::Erase
                 | Self::Place
         )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BottomTab {
-    Resources,
-    AssetBrowser,
-    Output,
-    Console,
-}
-
-impl BottomTab {
-    const ALL: [Self; 4] = [
-        Self::Resources,
-        Self::AssetBrowser,
-        Self::Output,
-        Self::Console,
-    ];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Resources => "Resources",
-            Self::AssetBrowser => "Asset Browser",
-            Self::Output => "Output",
-            Self::Console => "Console",
-        }
-    }
-
-    const fn icon(self) -> char {
-        match self {
-            Self::Resources => icons::LAYERS,
-            Self::AssetBrowser => icons::FOLDER,
-            Self::Output => icons::TERMINAL,
-            Self::Console => icons::TERMINAL,
-        }
     }
 }
 
@@ -428,7 +392,6 @@ impl EditorWorkspace {
             scene_filter: String::new(),
             file_filter: String::new(),
             resource_search: String::new(),
-            bottom_tab: BottomTab::Resources,
             resource_filter: ResourceFilter::All,
             active_tool: ViewTool::Select,
             brush_material: None,
@@ -475,6 +438,18 @@ impl EditorWorkspace {
     /// Current project document.
     pub fn project(&self) -> &ProjectDocument {
         &self.project
+    }
+
+    /// Directory project-relative paths resolve against. Returns the
+    /// project file's parent directory when one is configured, falling
+    /// back to the current working directory otherwise — which is
+    /// what the in-tree starter relies on so `cargo run -p frontend`
+    /// from the repo root finds `assets/textures/*.psxt`.
+    pub fn project_root(&self) -> PathBuf {
+        self.project_path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 
     /// True when the project has unsaved edits.
@@ -1645,37 +1620,19 @@ impl EditorWorkspace {
         ui.separator();
 
         match &mut resource.data {
-            ResourceData::Texture {
-                source_path,
-                width,
-                height,
-                indexed_depth,
-            } => {
-                egui::CollapsingHeader::new(icons::label(icons::FILE, "Import"))
+            ResourceData::Texture { psxt_path } => {
+                egui::CollapsingHeader::new(icons::label(icons::FILE, "PSXT"))
                     .default_open(true)
                     .show(ui, |ui| {
-                        ui.label("Source");
-                        changed |= ui.text_edit_singleline(source_path).changed();
-                    });
-                egui::CollapsingHeader::new(icons::label(icons::PALETTE, "PS1 Texture"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Size");
-                            changed |= ui
-                                .add(egui::DragValue::new(width).speed(1.0).range(1..=256))
-                                .changed();
-                            ui.label("x");
-                            changed |= ui
-                                .add(egui::DragValue::new(height).speed(1.0).range(1..=256))
-                                .changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Indexed depth");
-                            changed |= ui
-                                .add(egui::DragValue::new(indexed_depth).speed(1.0).range(4..=8))
-                                .changed();
-                        });
+                        ui.label("Path");
+                        changed |= ui.text_edit_singleline(psxt_path).changed();
+                        ui.label(
+                            RichText::new(
+                                "Cooked .psxt blob; same artifact the runtime embeds.",
+                            )
+                            .color(STUDIO_TEXT_WEAK)
+                            .small(),
+                        );
                     });
             }
             ResourceData::Material(material) => {
@@ -1719,15 +1676,13 @@ impl EditorWorkspace {
             .frame(dock_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for tab in BottomTab::ALL {
-                        ui.selectable_value(
-                            &mut self.bottom_tab,
-                            tab,
-                            icons::label(tab.icon(), tab.label()),
-                        );
-                    }
+                    ui.label(icons::label(icons::LAYERS, "Resources"));
                     ui.separator();
-                    if ui.button(icons::label(icons::BLEND, "Material")).clicked() {
+                    if ui
+                        .button(icons::label(icons::PLUS, "Material"))
+                        .on_hover_text("Add a new Material resource.")
+                        .clicked()
+                    {
                         let id = self.project.add_resource(
                             "New Material",
                             ResourceData::Material(MaterialResource::opaque(None)),
@@ -1736,14 +1691,17 @@ impl EditorWorkspace {
                         self.status = "Added material".to_string();
                         self.mark_dirty();
                     }
-                    if ui.button(icons::label(icons::PALETTE, "Texture")).clicked() {
+                    if ui
+                        .button(icons::label(icons::PLUS, "Texture"))
+                        .on_hover_text(
+                            "Add a Texture resource pointing at a cooked .psxt blob.",
+                        )
+                        .clicked()
+                    {
                         let id = self.project.add_resource(
                             "New Texture",
                             ResourceData::Texture {
-                                source_path: "textures/new.png".to_string(),
-                                width: 64,
-                                height: 64,
-                                indexed_depth: 4,
+                                psxt_path: String::new(),
                             },
                         );
                         self.selected_resource = Some(id);
@@ -1752,25 +1710,7 @@ impl EditorWorkspace {
                     }
                 });
                 ui.separator();
-
-                match self.bottom_tab {
-                    BottomTab::Resources => self.draw_resources_tab(ui),
-                    BottomTab::AssetBrowser => draw_placeholder_panel(
-                        ui,
-                        "Asset Browser",
-                        "Import folders and cook queues will live here.",
-                    ),
-                    BottomTab::Output => draw_placeholder_panel(
-                        ui,
-                        "Output",
-                        "Scene cook and playtest logs will stream here.",
-                    ),
-                    BottomTab::Console => draw_placeholder_panel(
-                        ui,
-                        "Console",
-                        "Runtime/editor diagnostics will land here.",
-                    ),
-                }
+                self.draw_resources_tab(ui);
             });
     }
 
@@ -3236,8 +3176,8 @@ fn draw_project_file_row(
 
 fn resource_file_name(resource: &Resource) -> String {
     match &resource.data {
-        ResourceData::Texture { source_path, .. } => {
-            cooked_name(&resource.name, source_path, "psxtex")
+        ResourceData::Texture { psxt_path } => {
+            cooked_name(&resource.name, psxt_path, "psxt")
         }
         ResourceData::Material(_) => cooked_name(&resource.name, "", "mat"),
         ResourceData::Mesh { source_path } => cooked_name(&resource.name, source_path, "psxmesh"),
@@ -3295,20 +3235,6 @@ fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize)
     ]
 }
 
-fn draw_placeholder_panel(ui: &mut egui::Ui, title: &str, message: &str) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(28.0);
-        let icon = match title {
-            "Asset Browser" => icons::FOLDER,
-            "Output" | "Console" => icons::TERMINAL,
-            _ => icons::FILE,
-        };
-        ui.label(icons::text(icon, 24.0).color(STUDIO_TEXT_WEAK));
-        ui.strong(title);
-        ui.label(message);
-    });
-}
-
 fn resource_matches_filter(resource: &Resource, filter: ResourceFilter, search: &str) -> bool {
     if !filter.matches(&resource.data) {
         return false;
@@ -3324,8 +3250,8 @@ fn resource_matches_filter(resource: &Resource, filter: ResourceFilter, search: 
 
 fn resource_source_path(resource: &Resource) -> Option<&str> {
     match &resource.data {
-        ResourceData::Texture { source_path, .. }
-        | ResourceData::Mesh { source_path }
+        ResourceData::Texture { psxt_path } => Some(psxt_path.as_str()),
+        ResourceData::Mesh { source_path }
         | ResourceData::Scene { source_path }
         | ResourceData::Script { source_path }
         | ResourceData::Audio { source_path } => Some(source_path.as_str()),
@@ -4817,21 +4743,28 @@ mod tests {
     #[test]
     fn dragging_selected_node_moves_it_in_xz_space() {
         let mut workspace = EditorWorkspace::new();
-        let card = workspace
+        let spawn = workspace
             .project
             .active_scene()
             .nodes()
             .iter()
-            .find(|node| node.name == "Material Card")
+            .find(|node| node.name == "Player Spawn")
             .unwrap()
             .id;
+        let start = workspace
+            .project
+            .active_scene()
+            .node(spawn)
+            .unwrap()
+            .transform
+            .translation;
 
-        workspace.selected_node = card;
+        workspace.selected_node = spawn;
         workspace.drag_selected_node(Vec2::new(96.0, -48.0));
 
-        let node = workspace.project.active_scene().node(card).unwrap();
-        assert!((node.transform.translation[0] - 1.0).abs() < 0.001);
-        assert!((node.transform.translation[2] - 0.5).abs() < 0.001);
+        let node = workspace.project.active_scene().node(spawn).unwrap();
+        assert!((node.transform.translation[0] - (start[0] + 1.0)).abs() < 0.001);
+        assert!((node.transform.translation[2] - (start[2] + 0.5)).abs() < 0.001);
         assert!(workspace.is_dirty());
     }
 
@@ -4842,11 +4775,11 @@ mod tests {
 
         assert!(rows.iter().any(|row| row.name == "res://"));
         assert!(rows.iter().any(|row| row.name == "main.room"));
-        assert!(rows.iter().any(|row| row.name == "floor.psxtex"));
-        assert!(rows.iter().any(|row| row.name == "brick_wall.psxtex"));
+        assert!(rows.iter().any(|row| row.name == "floor.psxt"));
+        assert!(rows.iter().any(|row| row.name == "brick_wall.psxt"));
         assert!(rows
             .iter()
-            .any(|row| row.name == "average_glass.mat" && row.resource.is_some()));
+            .any(|row| row.name == "brick.mat" && row.resource.is_some()));
     }
 
     #[test]
@@ -4857,10 +4790,10 @@ mod tests {
             .iter()
             .find(|resource| resource.name == "floor.psxt")
             .unwrap();
-        let glass_material = project
+        let brick_material = project
             .resources
             .iter()
-            .find(|resource| resource.name == "Average Glass")
+            .find(|resource| resource.name == "Brick")
             .unwrap();
 
         assert!(resource_matches_filter(
@@ -4874,9 +4807,9 @@ mod tests {
             "floor"
         ));
         assert!(resource_matches_filter(
-            glass_material,
+            brick_material,
             ResourceFilter::Material,
-            "glass"
+            "brick"
         ));
     }
 }

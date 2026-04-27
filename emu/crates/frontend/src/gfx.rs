@@ -195,15 +195,18 @@ impl Graphics {
     pub fn render_editor_preview(
         &mut self,
         project: &psxed_project::ProjectDocument,
+        project_root: &std::path::Path,
         camera: psxed_ui::ViewportCameraState,
         selected: psxed_project::NodeId,
         hovered_cell: Option<(u16, u16)>,
         hovered_edge: Option<(u16, u16, u8)>,
     ) {
-        // Materials added to the project since last frame get
-        // procedural textures stamped into VRAM here. Cheap when the
-        // resource list is unchanged.
-        self.editor_textures.refresh(project);
+        // Materials whose linked Texture resource has a real
+        // `.psxt` blob get the actual cooked bytes here; everything
+        // else falls back to a name-keyed procedural pattern.
+        // Cheap when the resource list + paths are unchanged — the
+        // signature cache short-circuits per-material.
+        self.editor_textures.refresh(project, project_root);
         let cmd_log = crate::editor_preview::build_phase1_cmd_log(
             project,
             camera,

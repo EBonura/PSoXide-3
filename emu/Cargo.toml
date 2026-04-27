@@ -20,6 +20,7 @@ repository = "https://github.com/EBonura/PSoXide"
 psx-hw       = { path = "../crates/psx-hw" }
 psx-iso      = { path = "../crates/psx-iso" }
 psx-trace    = { path = "../crates/psx-trace" }
+psx-asset    = { path = "../sdk/crates/psx-asset" }
 psx-gpu      = { path = "../sdk/crates/psx-gpu" }
 psx-gte      = { path = "../sdk/crates/psx-gte" }
 psx-gte-core = { path = "../sdk/crates/psx-gte-core" }

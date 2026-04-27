@@ -197,9 +197,9 @@ const BASE_RIG: LightRig = LightRig::new(
 const TEX_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
 
 /// Brick wall — ceilings + left/right walls.
-static BRICK_BLOB: &[u8] = include_bytes!("../assets/brick-wall.psxt");
+static BRICK_BLOB: &[u8] = include_bytes!("../../../../assets/textures/brick-wall.psxt");
 /// Cobblestone floor.
-static FLOOR_BLOB: &[u8] = include_bytes!("../assets/floor.psxt");
+static FLOOR_BLOB: &[u8] = include_bytes!("../../../../assets/textures/floor.psxt");
 
 /// CLUT slots. X multiples of 16; Y=480/481 keeps them out of the
 /// font CLUT's row (256) and the framebuffer's rows (0..479).
