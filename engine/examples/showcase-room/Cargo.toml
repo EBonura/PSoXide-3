@@ -1,0 +1,32 @@
+[package]
+name    = "showcase-room"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "showcase-room"
+path = "src/main.rs"
+
+[profile.release]
+panic         = "abort"
+codegen-units = 1
+lto           = true
+
+[dependencies]
+psx-asset  = { path = "../../../sdk/crates/psx-asset" }
+psx-engine = { path = "../../crates/psx-engine" }
+psx-font   = { path = "../../../sdk/crates/psx-font" }
+psx-gpu    = { path = "../../../sdk/crates/psx-gpu" }
+psx-math   = { path = "../../../sdk/crates/psx-math" }
+psx-rt     = { path = "../../../sdk/crates/psx-rt" }
+psx-vram   = { path = "../../../sdk/crates/psx-vram" }
+
+# Host-only build.rs deps. These cook the starter project's grid
+# into a `.psxw` blob at build time and validate the slot-ordering
+# invariant that the runtime side bakes in. Neither crate ends up
+# in the PSX binary.
+[build-dependencies]
+psxed-format  = { path = "../../../editor/crates/psxed-format" }
+psxed-project = { path = "../../../editor/crates/psxed-project" }

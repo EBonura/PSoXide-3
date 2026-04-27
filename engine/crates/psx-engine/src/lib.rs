@@ -57,6 +57,7 @@ pub mod sfx;
 pub mod time;
 pub mod transform;
 pub mod world;
+pub mod world_render;
 
 pub use angle::Angle;
 pub use app::{App, Config};
@@ -74,8 +75,10 @@ pub use time::EngineTime;
 pub use transform::{ActorTransform, Vec3World};
 pub use world::{
     GridCoord, GridDirection, GridFloorSample, GridHorizontalFace, GridRoom, GridSector, GridSplit,
-    GridVerticalFace, GridWalls, GridWorld, WorldMaterialId, GRID_SECTOR_SIZE,
+    GridVerticalFace, GridWalls, GridWorld, RoomCollision, RoomRender, RuntimeRoom,
+    SectorCollision, SectorRender, WallCollision, WallRender, WorldMaterialId, GRID_SECTOR_SIZE,
 };
+pub use world_render::draw_room;
 
 /// Button-mask constants (UP, DOWN, CROSS, START, …) re-exported
 /// from `psx_pad::button` so games using `Ctx::just_pressed` /

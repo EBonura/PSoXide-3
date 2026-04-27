@@ -922,6 +922,35 @@ mod tests {
     }
 
     #[test]
+    fn starter_cook_pins_floor_to_slot_zero_and_brick_to_slot_one() {
+        // The runtime side of `engine/examples/showcase-room`
+        // bakes in slot 0 = floor texture, slot 1 = brick-wall
+        // texture. The cooker assigns slots in first-use order
+        // while iterating sectors `[x * depth + z]`. If a future
+        // reshape flips that order, both this test and the
+        // example's build.rs assertion fail loud.
+        let project = ProjectDocument::starter();
+        let grid = starter_grid(&project);
+        let cooked = cook_world_grid(&project, &grid).unwrap();
+
+        assert_eq!(cooked.materials.len(), 2);
+
+        let psxt_path_for_slot = |slot: usize| -> String {
+            let texture_id = cooked.materials[slot]
+                .texture
+                .expect("starter material has a texture");
+            let texture = project.resource(texture_id).expect("texture in resources");
+            match &texture.data {
+                ResourceData::Texture { psxt_path } => psxt_path.clone(),
+                _ => panic!("slot {slot} resource isn't a texture"),
+            }
+        };
+
+        assert!(psxt_path_for_slot(0).ends_with("floor.psxt"));
+        assert!(psxt_path_for_slot(1).ends_with("brick-wall.psxt"));
+    }
+
+    #[test]
     fn rejects_diagonal_walls() {
         // Author a NW-SE diagonal wall and confirm the cooker
         // refuses it. Render / pick / collision aren't consistent
