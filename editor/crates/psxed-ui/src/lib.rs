@@ -95,6 +95,13 @@ pub struct EditorWorkspace {
     /// frame the panel is hovered; rendered as a translucent overlay
     /// so the user sees exactly what cell paint / place tools will hit.
     hovered_3d_sector: Option<(u16, u16)>,
+    /// Wall-edge currently under the pointer when the PaintWall tool
+    /// is active — `(sx, sz, dir_index)` where `dir_index` is the
+    /// `GridDirection` enum discriminant (0=N, 1=E, 2=S, 3=W). The
+    /// frontend overlays a thin strip on this edge so the user sees
+    /// which boundary the next click will target. Cleared whenever
+    /// the active tool isn't PaintWall or the pointer leaves.
+    hovered_3d_edge: Option<(u16, u16, u8)>,
     /// Last cell `apply_paint` has run on during the current drag.
     /// Used to dedupe per-frame paint events so click-drag with
     /// Wall / Place doesn't stack duplicate walls / spawn N entities
@@ -115,6 +122,12 @@ pub struct EditorWorkspace {
     bottom_tab: BottomTab,
     resource_filter: ResourceFilter,
     active_tool: ViewTool,
+    /// Material the next Floor / Wall / Ceiling paint will use, when
+    /// set. `None` means "fall back to the name-based heuristic
+    /// (`floor → first 'floor' material, brick → first 'brick' …`)" —
+    /// which is also what fresh projects start with so painting works
+    /// before any material is hand-picked.
+    brush_material: Option<ResourceId>,
     snap_to_grid: bool,
     snap_units: u16,
     show_grid: bool,
@@ -407,6 +420,7 @@ impl EditorWorkspace {
             selected_resource: None,
             selected_sector: None,
             hovered_3d_sector: None,
+            hovered_3d_edge: None,
             last_paint_cell: None,
             renaming: None,
             pending_rename_focus: false,
@@ -417,6 +431,7 @@ impl EditorWorkspace {
             bottom_tab: BottomTab::Resources,
             resource_filter: ResourceFilter::All,
             active_tool: ViewTool::Select,
+            brush_material: None,
             snap_to_grid: true,
             snap_units: 16,
             show_grid: true,
@@ -531,7 +546,33 @@ impl EditorWorkspace {
             .map(|node| node.id)
         {
             self.selected_node = room_id;
+            self.frame_3d_on_room(room_id);
         }
+    }
+
+    /// Position the orbit camera so `room_id`'s grid fills the
+    /// viewport at startup. Pulls back to ~1.6× the room diagonal
+    /// in world units, which lands a 3/4 view that shows all four
+    /// walls plus the floor without the corners clipping.
+    fn frame_3d_on_room(&mut self, room_id: NodeId) {
+        let scene = self.project.active_scene();
+        let Some(room) = scene.node(room_id) else {
+            return;
+        };
+        let NodeKind::Room { grid } = &room.kind else {
+            return;
+        };
+        let max_side = grid.width.max(grid.depth) as f32;
+        let world_extent = max_side * grid.sector_size as f32;
+        // 1.6× max-side fits diagonally with a little headroom; the
+        // FOV is fixed (focal=320, screen=320×240 → ~53° H-FOV).
+        let radius = (world_extent * 1.6).clamp(512.0, 262_144.0);
+        self.viewport_3d_radius = radius as i32;
+        // Default 3/4 view: yaw 8/64 turn (45° off the +Z axis),
+        // pitch 4/64 (~22° looking down). Mirrors the showcase
+        // demos' first-frame angle.
+        self.viewport_3d_yaw = 256;
+        self.viewport_3d_pitch = 256;
     }
 
     /// Cook every Room in the active scene to a per-Room `.psxw`
@@ -659,23 +700,30 @@ impl EditorWorkspace {
         // Hover tracking: every frame the pointer is over the panel,
         // ray-pick which cell it's on so the renderer can stamp a
         // translucent overlay there. Cleared when the pointer leaves.
-        self.hovered_3d_sector = if let Some(pointer) = response.hover_pos() {
-            self.pick_3d_world(rect, pointer)
-                .and_then(|world| {
-                    self.active_room_id()
-                        .or_else(|| {
-                            self.project
-                                .active_scene()
-                                .nodes()
-                                .iter()
-                                .find(|n| matches!(n.kind, NodeKind::Room { .. }))
-                                .map(|n| n.id)
-                        })
-                        .and_then(|room| self.world_to_sector(room, world))
+        // For PaintWall, ALSO track which edge of the cell the pointer
+        // is closest to so the renderer can preview the targeted wall
+        // edge before the click.
+        let hover_world = response
+            .hover_pos()
+            .and_then(|pointer| self.pick_3d_world(rect, pointer));
+        let hover_room = self.active_room_id().or_else(|| {
+            self.project
+                .active_scene()
+                .nodes()
+                .iter()
+                .find(|n| matches!(n.kind, NodeKind::Room { .. }))
+                .map(|n| n.id)
+        });
+        self.hovered_3d_sector = hover_world
+            .and_then(|world| hover_room.and_then(|room| self.world_to_sector(room, world)));
+        self.hovered_3d_edge =
+            if matches!(self.active_tool, ViewTool::PaintWall) {
+                hover_world.and_then(|world| {
+                    hover_room.and_then(|room| self.hovered_wall_edge(room, world))
                 })
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // Primary click / drag: ray-pick the cell under the cursor
         // and dispatch to the active tool. Click starts a fresh
@@ -740,6 +788,42 @@ impl EditorWorkspace {
     /// affordance.
     pub fn hovered_3d_sector(&self) -> Option<(u16, u16)> {
         self.hovered_3d_sector
+    }
+
+    /// Wall-edge under the 3D pointer last frame, or `None` when the
+    /// PaintWall tool isn't active or the pointer's off-panel.
+    /// `(sx, sz, dir_index)` where `dir_index` matches the
+    /// `GridDirection` discriminant `(0=N, 1=E, 2=S, 3=W)`.
+    pub fn hovered_3d_edge(&self) -> Option<(u16, u16, u8)> {
+        self.hovered_3d_edge
+    }
+
+    /// Pick the cell + nearest cardinal edge at `world` within `room`.
+    /// Mirrors the click-time logic in `apply_paint(PaintWall)` so
+    /// the hover preview and the actual placement target agree.
+    fn hovered_wall_edge(&self, room: NodeId, world: [f32; 2]) -> Option<(u16, u16, u8)> {
+        let (sx, sz) = self.world_to_sector(room, world)?;
+        let scene = self.project.active_scene();
+        let node = scene.node(room)?;
+        let NodeKind::Room { grid } = &node.kind else {
+            return None;
+        };
+        let room_center = node_world(node);
+        let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
+        let cell_center = [
+            room_center[0] - half[0] + sx as f32 + 0.5,
+            room_center[1] - half[1] + sz as f32 + 0.5,
+        ];
+        let dx = world[0] - cell_center[0];
+        let dz = world[1] - cell_center[1];
+        let dir: u8 = if dz.abs() > dx.abs() {
+            if dz < 0.0 { 0 /* North */ } else { 2 /* South */ }
+        } else if dx < 0.0 {
+            3 /* West */
+        } else {
+            1 /* East */
+        };
+        Some((sx, sz, dir))
     }
 
     /// 3D-viewport tool dispatch: routes a picked world position to
@@ -1003,7 +1087,44 @@ impl EditorWorkspace {
             if del && self.selected_node != NodeId::ROOT && self.renaming.is_none() {
                 self.apply_tree_action(TreeAction::Delete(self.selected_node));
             }
+            let rot = ctx.input_mut(|i| i.key_pressed(egui::Key::R));
+            if rot && self.renaming.is_none() {
+                self.rotate_selected_yaw_90();
+            }
         }
+    }
+
+    /// Snap the selected node's Y-rotation up by 90°. No-op on
+    /// macro / structural nodes (Root, World, Room, plain
+    /// transform-only nodes) since they have no in-world heading.
+    /// The `MeshInstance` card and entity markers (spawn / light /
+    /// trigger / audio / portal) are all rotatable.
+    fn rotate_selected_yaw_90(&mut self) {
+        let id = self.selected_node;
+        if id == NodeId::ROOT {
+            return;
+        }
+        let scene = self.project.active_scene();
+        let Some(node) = scene.node(id) else { return };
+        let rotatable = matches!(
+            node.kind,
+            NodeKind::MeshInstance { .. }
+                | NodeKind::SpawnPoint { .. }
+                | NodeKind::Light { .. }
+                | NodeKind::Trigger { .. }
+                | NodeKind::AudioSource { .. }
+                | NodeKind::Portal { .. }
+        );
+        if !rotatable {
+            return;
+        }
+        self.push_undo();
+        if let Some(node) = self.project.active_scene_mut().node_mut(id) {
+            let next = (node.transform.rotation_degrees[1] + 90.0) % 360.0;
+            node.transform.rotation_degrees[1] = next;
+            self.status = format!("Rotated {} to {}°", node.name, next as i32);
+        }
+        self.mark_dirty();
     }
 
     /// Apply one scene-tree action collected from a row.
@@ -1013,6 +1134,9 @@ impl EditorWorkspace {
                 self.selected_node = id;
                 self.selected_resource = None;
                 self.renaming = None;
+                // No-op when `id` isn't a Room — keeps the camera
+                // put while the user clicks through entity nodes.
+                self.frame_3d_on_room(id);
             }
             TreeAction::BeginRename(id) => {
                 if let Some(node) = self.project.active_scene().node(id) {
@@ -1887,6 +2011,8 @@ impl EditorWorkspace {
                 }
             });
             ui.separator();
+            self.draw_brush_material_picker(ui);
+            ui.separator();
             ui.checkbox(
                 &mut self.snap_to_grid,
                 icons::label(icons::WAYPOINT, "Snap"),
@@ -1915,6 +2041,35 @@ impl EditorWorkspace {
                     .clamp(MIN_VIEWPORT_ZOOM, MAX_VIEWPORT_ZOOM);
             }
         });
+    }
+
+    /// Toolbar combobox for the active brush material. Selecting
+    /// "Auto" leaves `brush_material = None` so paint falls back to
+    /// the per-tool name heuristic (`floor → "floor" material,
+    /// brick → "brick" material`); picking a specific entry pins
+    /// every Floor / Wall / Ceiling stroke to that material.
+    fn draw_brush_material_picker(&mut self, ui: &mut egui::Ui) {
+        let materials = self.project.material_options();
+        let label = match self.brush_material {
+            Some(id) => materials
+                .iter()
+                .find(|(mid, _)| *mid == id)
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| "(missing)".to_string()),
+            None => "Auto".to_string(),
+        };
+        ui.label(icons::label(icons::PALETTE, "Brush"));
+        egui::ComboBox::from_id_salt("brush-material-picker")
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.brush_material, None, "Auto")
+                    .on_hover_text(
+                        "Pick by tool: Floor uses the first 'floor' material, Wall the first 'brick'.",
+                    );
+                for (id, name) in &materials {
+                    ui.selectable_value(&mut self.brush_material, Some(*id), name);
+                }
+            });
     }
 
     /// Resolve the Room node that owns the current selection, if any.
@@ -2022,8 +2177,16 @@ impl EditorWorkspace {
         world: [f32; 2],
     ) {
         self.push_undo();
-        let floor_mat = self.default_brush_material("floor");
-        let wall_mat = self.default_brush_material("brick").or(floor_mat);
+        // Toolbar picker overrides the name-based default. The picker
+        // lives in the workspace state so the choice survives across
+        // tool switches and across cells in a single drag-paint.
+        let floor_mat = self
+            .brush_material
+            .or_else(|| self.default_brush_material("floor"));
+        let wall_mat = self
+            .brush_material
+            .or_else(|| self.default_brush_material("brick"))
+            .or(floor_mat);
         let room_center;
         let sector_center;
         {
@@ -4376,17 +4539,7 @@ fn draw_sector_inspector(
                 }
             });
             if let Some(floor) = sector.floor.as_mut() {
-                ui.horizontal(|ui| {
-                    ui.label("    Height");
-                    let mut height = floor.heights[0];
-                    if ui
-                        .add(egui::DragValue::new(&mut height).speed(8.0))
-                        .changed()
-                    {
-                        floor.heights = [height; 4];
-                        changed = true;
-                    }
-                });
+                changed |= height_row("    Height", &mut floor.heights, ui);
                 changed |= material_picker(ui, "    Material", &mut floor.material, material_options);
             }
 
@@ -4405,17 +4558,7 @@ fn draw_sector_inspector(
                 }
             });
             if let Some(ceiling) = sector.ceiling.as_mut() {
-                ui.horizontal(|ui| {
-                    ui.label("    Height");
-                    let mut height = ceiling.heights[0];
-                    if ui
-                        .add(egui::DragValue::new(&mut height).speed(8.0))
-                        .changed()
-                    {
-                        ceiling.heights = [height; 4];
-                        changed = true;
-                    }
-                });
+                changed |= height_row("    Height", &mut ceiling.heights, ui);
                 changed |= material_picker(
                     ui,
                     "    Material",
@@ -4432,20 +4575,148 @@ fn draw_sector_inspector(
                 ("South", GridDirection::South),
                 ("West", GridDirection::West),
             ] {
-                ui.horizontal(|ui| {
-                    let walls = sector.walls.get_mut(dir);
-                    let mut has_wall = !walls.is_empty();
-                    if ui.checkbox(&mut has_wall, label).changed() {
-                        if has_wall {
-                            walls.push(GridVerticalFace::flat(0, sector_size, None));
-                        } else {
-                            walls.clear();
-                        }
-                        changed = true;
-                    }
-                });
+                changed |= wall_stack_row(label, sector.walls.get_mut(dir), sector_size, material_options, ui);
             }
         });
+
+    changed
+}
+
+/// Stack-of-walls editor for a single sector edge (N/E/S/W).
+///
+/// PSX rooms commonly stack walls to model windows / arches: one
+/// wall from `0..window_bottom`, another from `window_top..ceiling`.
+/// The data model already allows N walls per edge — this UI surfaces
+/// it. Each wall row carries its own `[bottom, top]` and material;
+/// `+` adds a new wall on top of the previous one (or `0..ceil` for
+/// the first), `×` removes that row.
+fn wall_stack_row(
+    edge_label: &str,
+    walls: &mut Vec<GridVerticalFace>,
+    sector_size: i32,
+    material_options: &[(ResourceId, String)],
+    ui: &mut egui::Ui,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(edge_label);
+        if ui.small_button("+").on_hover_text("Add wall stack").clicked() {
+            // New wall sits above the highest existing wall, or
+            // spans the full sector when this edge is empty.
+            let bottom = walls
+                .iter()
+                .map(|w| w.heights[2].max(w.heights[3]))
+                .max()
+                .unwrap_or(0);
+            let top = (bottom + sector_size).max(bottom + 1);
+            walls.push(GridVerticalFace::flat(bottom, top, None));
+            changed = true;
+        }
+    });
+    let mut remove_at: Option<usize> = None;
+    for (i, wall) in walls.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(format!("    #{i}"));
+            ui.label("bot");
+            // bottom height = heights[0] = heights[1]; top = heights[2] = heights[3].
+            let mut bot = wall.heights[0];
+            let mut top = wall.heights[2];
+            if ui.add(egui::DragValue::new(&mut bot).speed(8.0)).changed() {
+                wall.heights[0] = bot;
+                wall.heights[1] = bot;
+                changed = true;
+            }
+            ui.label("top");
+            if ui.add(egui::DragValue::new(&mut top).speed(8.0)).changed() {
+                wall.heights[2] = top;
+                wall.heights[3] = top;
+                changed = true;
+            }
+            if ui.small_button("×").on_hover_text("Remove wall").clicked() {
+                remove_at = Some(i);
+            }
+        });
+        let pick_label = format!("    #{i} mat");
+        changed |= material_picker(ui, &pick_label, &mut wall.material, material_options);
+    }
+    if let Some(i) = remove_at {
+        walls.remove(i);
+        changed = true;
+    }
+    changed
+}
+
+/// Editable row for a `[NW, NE, SE, SW]` corner-height array.
+///
+/// Renders one DragValue when the four corners agree (the common
+/// "flat floor" case) and switches to a 2×2 grid of independent
+/// DragValues — laid out NW-NE / SW-SE so the on-screen position
+/// matches the world-space corner — once the heights diverge or
+/// the user clicks the "Slope" toggle. Returns `true` whenever any
+/// corner changed so the caller can mark the project dirty.
+fn height_row(label: &str, heights: &mut [i32; 4], ui: &mut egui::Ui) -> bool {
+    let mut changed = false;
+    let mut sloped = !(heights[0] == heights[1]
+        && heights[1] == heights[2]
+        && heights[2] == heights[3]);
+
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if ui
+            .toggle_value(&mut sloped, "Slope")
+            .on_hover_text("Edit each corner height independently.")
+            .changed()
+        {
+            if !sloped {
+                // Collapse back to the NW value so the floor is flat
+                // again — predictable, matches how `flat()` builds.
+                heights[1] = heights[0];
+                heights[2] = heights[0];
+                heights[3] = heights[0];
+                changed = true;
+            }
+        }
+    });
+
+    if sloped {
+        // 2×2 grid: NW NE on top row (z+), SW SE on bottom (z−).
+        // The order in `heights` is [NW, NE, SE, SW] — index map:
+        //   top row: [0]=NW, [1]=NE
+        //   bottom:  [3]=SW, [2]=SE
+        egui::Grid::new(format!("{label}-corners"))
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                for &idx in &[0usize, 1] {
+                    if ui
+                        .add(egui::DragValue::new(&mut heights[idx]).speed(8.0))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                }
+                ui.end_row();
+                for &idx in &[3usize, 2] {
+                    if ui
+                        .add(egui::DragValue::new(&mut heights[idx]).speed(8.0))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                }
+                ui.end_row();
+            });
+    } else {
+        ui.horizontal(|ui| {
+            // Indent so the field aligns with the per-corner grid above.
+            ui.label("    ");
+            let mut h = heights[0];
+            if ui.add(egui::DragValue::new(&mut h).speed(8.0)).changed() {
+                *heights = [h; 4];
+                changed = true;
+            }
+        });
+    }
 
     changed
 }

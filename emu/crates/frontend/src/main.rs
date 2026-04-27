@@ -682,11 +682,13 @@ impl ApplicationHandler for Shell {
                 let editor_camera = state.editor.viewport_3d_camera();
                 let editor_selected = state.editor.selected_node_id();
                 let editor_hover = state.editor.hovered_3d_sector();
+                let editor_hover_edge = state.editor.hovered_3d_edge();
                 gfx.render_editor_preview(
                     state.editor.project(),
                     editor_camera,
                     editor_selected,
                     editor_hover,
+                    editor_hover_edge,
                 );
 
                 let vram_tex = gfx.vram_texture_id();

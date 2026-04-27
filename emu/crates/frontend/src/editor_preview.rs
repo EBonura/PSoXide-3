@@ -113,6 +113,7 @@ pub fn build_phase1_cmd_log(
     camera: ViewportCameraState,
     selected: psxed_project::NodeId,
     hovered_cell: Option<(u16, u16)>,
+    hovered_edge: Option<(u16, u16, u8)>,
     textures: &EditorTextures,
 ) -> Vec<GpuCmdLogEntry> {
     let Some((grid, target)) = first_room_grid(project) else {
@@ -128,7 +129,12 @@ pub fn build_phase1_cmd_log(
     setup_gte_for_camera(camera, target);
     walk_room(project, grid, textures, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
-    if let Some((sx, sz)) = hovered_cell {
+    // Wall-edge preview wins over cell preview: when the user has
+    // PaintWall selected we want them to see the targeted edge, not
+    // the whole cell underneath.
+    if let Some((sx, sz, dir)) = hovered_edge {
+        push_hover_edge_overlay(grid, sx, sz, dir, &mut scratch);
+    } else if let Some((sx, sz)) = hovered_cell {
         push_hover_overlay(grid, sx, sz, &mut scratch);
     }
 
@@ -289,13 +295,16 @@ fn walk_room(
     }
 }
 
-/// Per-face render description: either a texture sample with neutral
-/// PSX tint, or a flat RGB. Resolved up-front so each face's tri
-/// emit doesn't re-walk the resource table.
+/// Per-face render description: either a texture sample with a
+/// per-material tint, or a flat RGB. Resolved up-front so each
+/// face's tri emit doesn't re-walk the resource table.
 #[derive(Copy, Clone)]
 enum FaceShade {
     Flat(u8, u8, u8),
-    Textured(MaterialSlot),
+    Textured {
+        slot: MaterialSlot,
+        tint: (u8, u8, u8),
+    },
 }
 
 fn face_shade(
@@ -304,13 +313,13 @@ fn face_shade(
     fallback: (u8, u8, u8),
     textures: &EditorTextures,
 ) -> FaceShade {
+    let tint = material_color(project, material, fallback);
     if let Some(id) = material {
         if let Some(slot) = textures.slot(id) {
-            return FaceShade::Textured(slot);
+            return FaceShade::Textured { slot, tint };
         }
     }
-    let (r, g, b) = material_color(project, material, fallback);
-    FaceShade::Flat(r, g, b)
+    FaceShade::Flat(tint.0, tint.1, tint.2)
 }
 
 /// Project the four corners of a sector-aligned horizontal face and
@@ -331,7 +340,7 @@ fn push_horizontal_face(
     let (uv_nw, uv_ne, uv_se, uv_sw);
     let max_u;
     let max_v;
-    if let FaceShade::Textured(slot) = shade {
+    if let FaceShade::Textured { slot, .. } = shade {
         max_u = slot.width.saturating_sub(1);
         max_v = slot.height.saturating_sub(1);
         uv_nw = (0u8, 0u8);
@@ -393,7 +402,7 @@ fn push_wall_face(
     let p_br = gte_scene::project_vertex(world_to_view([br_xy.0, heights[1], br_xy.1]));
     let p_tr = gte_scene::project_vertex(world_to_view([tr_xy.0, heights[2], tr_xy.1]));
     let p_tl = gte_scene::project_vertex(world_to_view([tl_xy.0, heights[3], tl_xy.1]));
-    let (uv_bl, uv_br, uv_tr, uv_tl) = if let FaceShade::Textured(slot) = shade {
+    let (uv_bl, uv_br, uv_tr, uv_tl) = if let FaceShade::Textured { slot, .. } = shade {
         let u_max = slot.width.saturating_sub(1);
         let v_max = slot.height.saturating_sub(1);
         ((0, v_max), (u_max, v_max), (u_max, 0), (0, 0))
@@ -594,6 +603,75 @@ fn push_hover_overlay(grid: &WorldGrid, sx: u16, sz: u16, scratch: &mut PreviewS
     push_tri_at_slot(scratch, [p_ne, p_sw, p_se], color, 0);
 }
 
+/// Project a thin vertical strip on the given cell edge — a quad
+/// running the full sector_size length × ~12% sector_size width,
+/// rising one floor's-worth above the ground. Tells the user which
+/// boundary the next PaintWall click will turn into a wall.
+///
+/// `dir` is the `GridDirection` discriminant (`0=N, 1=E, 2=S, 3=W`).
+/// Lives at the same OT slot as the cell hover so it draws on top.
+fn push_hover_edge_overlay(
+    grid: &WorldGrid,
+    sx: u16,
+    sz: u16,
+    dir: u8,
+    scratch: &mut PreviewScratch,
+) {
+    if sx >= grid.width || sz >= grid.depth {
+        return;
+    }
+    let s = grid.sector_size;
+    let x0 = (sx as i32) * s;
+    let x1 = ((sx as i32) + 1) * s;
+    let z0 = (sz as i32) * s;
+    let z1 = ((sz as i32) + 1) * s;
+    // Strip width (orthogonal to the edge). 12% of sector_size keeps
+    // it visible without obscuring much of the floor underneath.
+    let w = (s / 8).max(8);
+    // Lift slightly off the floor — same trick as push_hover_overlay.
+    let y = 4;
+    // Build the two world-space corners on the floor and lift them
+    // up by the sector_size to form a vertical band the camera can't
+    // miss. North = z = z1; South = z = z0; East = x = x1; West = x = x0.
+    let (a_lo, b_lo, a_hi, b_hi) = match dir {
+        0 => (
+            // North edge — band hugs z = z1, extends inward.
+            [x0, y, z1],
+            [x1, y, z1],
+            [x0, y + s, z1 - w],
+            [x1, y + s, z1 - w],
+        ),
+        2 => (
+            // South.
+            [x0, y, z0],
+            [x1, y, z0],
+            [x0, y + s, z0 + w],
+            [x1, y + s, z0 + w],
+        ),
+        1 => (
+            // East.
+            [x1, y, z0],
+            [x1, y, z1],
+            [x1 - w, y + s, z0],
+            [x1 - w, y + s, z1],
+        ),
+        _ => (
+            // West.
+            [x0, y, z0],
+            [x0, y, z1],
+            [x0 + w, y + s, z0],
+            [x0 + w, y + s, z1],
+        ),
+    };
+    let p_a_lo = gte_scene::project_vertex(world_to_view(a_lo));
+    let p_b_lo = gte_scene::project_vertex(world_to_view(b_lo));
+    let p_a_hi = gte_scene::project_vertex(world_to_view(a_hi));
+    let p_b_hi = gte_scene::project_vertex(world_to_view(b_hi));
+    let color = (0xFF, 0x60, 0x60);
+    push_tri_at_slot(scratch, [p_a_lo, p_a_hi, p_b_lo], color, 0);
+    push_tri_at_slot(scratch, [p_b_lo, p_a_hi, p_b_hi], color, 0);
+}
+
 /// Lower-level [`push_tri`] that pins the OT slot rather than
 /// computing it from screen-space depth. Used for fixed-layer
 /// overlays (hover highlight, gizmos, …).
@@ -659,17 +737,25 @@ fn emit_face_tri(
 ) {
     match shade {
         FaceShade::Flat(r, g, b) => push_tri(scratch, p, (r, g, b)),
-        FaceShade::Textured(slot) => push_tex_tri(scratch, p, uvs, slot),
+        FaceShade::Textured { slot, tint } => push_tex_tri(scratch, p, uvs, slot, tint),
     }
 }
 
 /// Compose a [`TriTextured`] sampling `slot`'s tpage / CLUT, stash
 /// it in the static `tex_tris` arena, and chain it into the OT.
+///
+/// `tint` modulates the texel: PSX hardware computes
+/// `output = texel * tint / 0x80`, so `(0x80, 0x80, 0x80)` is a
+/// pass-through and `(0xFF, 0x60, 0x40)` saturates a grey texel
+/// toward terracotta. The editor uses the material-name keyword
+/// colour as the tint so a procedural-grey brick texture still
+/// reads as red until real cooked textures land.
 fn push_tex_tri(
     scratch: &mut PreviewScratch,
     p: [psx_gte::scene::Projected; 3],
     uvs: [(u8, u8); 3],
     slot: MaterialSlot,
+    tint: (u8, u8, u8),
 ) {
     if scratch.tex_used >= TRI_CAP {
         return;
@@ -684,10 +770,7 @@ fn push_tex_tri(
         uvs,
         slot.clut_word,
         slot.tpage_word,
-        // Neutral PSX tint — the texture sample passes through
-        // unmodulated. Once we add per-light shading we'll vary
-        // this per-vertex via TriTexturedGouraud.
-        (0x80, 0x80, 0x80),
+        tint,
     );
     let avg_sz = (p[0].sz as u32 + p[1].sz as u32 + p[2].sz as u32) / 3;
     let slot_idx = ((avg_sz as usize) >> 6).clamp(1, OT_DEPTH - 2);

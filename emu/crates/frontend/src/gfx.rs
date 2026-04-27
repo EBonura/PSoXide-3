@@ -198,6 +198,7 @@ impl Graphics {
         camera: psxed_ui::ViewportCameraState,
         selected: psxed_project::NodeId,
         hovered_cell: Option<(u16, u16)>,
+        hovered_edge: Option<(u16, u16, u8)>,
     ) {
         // Materials added to the project since last frame get
         // procedural textures stamped into VRAM here. Cheap when the
@@ -208,6 +209,7 @@ impl Graphics {
             camera,
             selected,
             hovered_cell,
+            hovered_edge,
             &self.editor_textures,
         );
         self.editor_hw_renderer.render_frame(
