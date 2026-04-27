@@ -52,6 +52,17 @@ pub struct Graphics {
     /// presentation falls back to [`Gpu::display_rgba8`] until the HW
     /// presenter has a packed-RGB decode shader.
     hw_renderer: HwRenderer,
+    /// Editor-side `HwRenderer` instance. Independent VRAM target,
+    /// rendered from the editor's authored scene rather than the
+    /// running game; the editor's egui panel paints its texture as
+    /// an Image so the preview is bit-faithful to what the PS1 would
+    /// draw given the same input data.
+    editor_hw_renderer: HwRenderer,
+    /// Stub `Gpu` consumed by [`HwRenderer::render_frame`]. The
+    /// renderer only reads `wireframe_enabled` from it; the editor
+    /// preview always renders solid, so we hand it a freshly-zeroed
+    /// instance.
+    editor_gpu_stub: Gpu,
 }
 
 impl Graphics {
@@ -120,6 +131,12 @@ impl Graphics {
         );
 
         let hw_renderer = HwRenderer::new(device.clone(), queue.clone(), &mut egui_renderer);
+        let mut editor_hw_renderer =
+            HwRenderer::new(device.clone(), queue.clone(), &mut egui_renderer);
+        // Higher internal scale for the editor preview — the game's
+        // renderer follows user/scale-mode preference, but the editor
+        // viewport is always overlay-friendly host resolution.
+        editor_hw_renderer.set_internal_scale(2, Some(&mut egui_renderer));
 
         Self {
             window,
@@ -135,6 +152,8 @@ impl Graphics {
             display_texture,
             display_texture_id,
             hw_renderer,
+            editor_hw_renderer,
+            editor_gpu_stub: Gpu::new(),
         }
     }
 
@@ -152,6 +171,29 @@ impl Graphics {
     /// Egui handle for the hardware-renderer target.
     pub fn hw_texture_id(&self) -> egui::TextureId {
         self.hw_renderer.texture_id()
+    }
+
+    /// Egui handle for the editor's preview HW target. Stable across
+    /// frames; the editor's 3D viewport panel paints it as an Image.
+    pub fn editor_hw_texture_id(&self) -> egui::TextureId {
+        self.editor_hw_renderer.texture_id()
+    }
+
+    /// Render one frame of the editor preview through the second
+    /// `HwRenderer` instance.
+    ///
+    /// Phase 0 spike: hands a hardcoded three-triangle scene to the
+    /// renderer so we can verify the cross-workspace plumbing —
+    /// `psx-gpu` prims → OT → `build_cmd_log` → `HwRenderer` — works
+    /// end-to-end on host. Subsequent phases will replace the
+    /// hardcoded scene with the real authored data from the editor's
+    /// active Room.
+    pub fn render_editor_preview(&mut self) {
+        let cmd_log = crate::editor_preview::build_phase0_cmd_log();
+        // Empty VRAM is fine: the test scene uses no textures.
+        let empty_vram = [0u16; 1];
+        self.editor_hw_renderer
+            .render_frame(&self.editor_gpu_stub, &cmd_log, &empty_vram);
     }
 
     /// Current internal scale used by the hardware-renderer target.

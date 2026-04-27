@@ -522,7 +522,14 @@ impl EditorWorkspace {
     }
 
     /// Draw the full editor workspace.
-    pub fn draw(&mut self, ctx: &egui::Context) {
+    ///
+    /// `viewport_3d_tex` is the host's `egui::TextureId` for the
+    /// editor's dedicated `HwRenderer` target — the frontend renders
+    /// authored scene data into it once per frame and we paint it as
+    /// an Image inside the 3D Viewport panel. The texture stays bit-
+    /// faithful to what the PS1 would draw because it's produced by
+    /// the same `psx-gpu-render` HwRenderer the emulator uses.
+    pub fn draw(&mut self, ctx: &egui::Context, viewport_3d_tex: egui::TextureId) {
         apply_studio_visuals(ctx);
         self.handle_global_shortcuts(ctx);
         self.draw_menu_bar(ctx);
@@ -530,7 +537,51 @@ impl EditorWorkspace {
         self.draw_left_dock(ctx);
         self.draw_inspector(ctx);
         self.draw_content_browser(ctx);
+        self.draw_viewport_3d(ctx, viewport_3d_tex);
         self.draw_viewport(ctx);
+    }
+
+    /// 3D viewport panel — paints the HwRenderer texture as an Image.
+    /// Anchored to the top of the central area so the existing 2D
+    /// viewport stays where it is below.
+    fn draw_viewport_3d(&mut self, ctx: &egui::Context, viewport_3d_tex: egui::TextureId) {
+        egui::TopBottomPanel::top("psxed_viewport_3d")
+            .resizable(true)
+            .default_height(280.0)
+            .min_height(160.0)
+            .frame(dock_frame())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(icons::text(icons::BOX, 15.0).color(STUDIO_ACCENT));
+                    ui.label(RichText::new("3D Viewport").strong().color(STUDIO_TEXT));
+                    ui.separator();
+                    ui.weak("Phase 0 spike — bit-faithful PS1 renderer");
+                });
+                ui.separator();
+                let avail = ui.available_size();
+                // Match the PSX 320×240 logical aspect; UV-sample only
+                // that sub-rect of the 1024×512 VRAM texture.
+                let target_aspect = 320.0_f32 / 240.0;
+                let (w, h) = if avail.x / avail.y > target_aspect {
+                    (avail.y * target_aspect, avail.y)
+                } else {
+                    (avail.x, avail.x / target_aspect)
+                };
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::Vec2::new(w, h),
+                    egui::Sense::hover(),
+                );
+                // Top-left 320×240 region of VRAM = the editor render
+                // target's display sub-rect at internal scale 2 →
+                // texture is 2048×1024, sub-rect at 0..640 / 0..480.
+                let uv = egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(640.0 / 2048.0, 480.0 / 1024.0),
+                );
+                egui::Image::new((viewport_3d_tex, rect.size()))
+                    .uv(uv)
+                    .paint_at(ui, rect);
+            });
     }
 
     /// Top-level keyboard shortcut handler. Cleared via `consume_*`

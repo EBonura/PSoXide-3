@@ -22,6 +22,7 @@ pub fn draw_layout(
     state: &mut AppState,
     vram_tex: egui::TextureId,
     display_tex: egui::TextureId,
+    editor_viewport_tex: egui::TextureId,
     framebuffer_source: framebuffer::FramebufferSource,
     dt: f32,
 ) {
@@ -29,7 +30,7 @@ pub fn draw_layout(
     state.tick_status(dt);
 
     if state.workspace.is_editor() {
-        state.editor.draw(ctx);
+        state.editor.draw(ctx, editor_viewport_tex);
         if state.panels.profiler {
             profiler::draw(ctx, &mut state.profiler);
         }

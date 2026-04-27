@@ -1003,8 +1003,17 @@ pub fn build_ui(
     state: &mut AppState,
     vram_tex: egui::TextureId,
     display_tex: egui::TextureId,
+    editor_viewport_tex: egui::TextureId,
     framebuffer_source: ui::framebuffer::FramebufferSource,
     dt: f32,
 ) {
-    ui::draw_layout(ctx, state, vram_tex, display_tex, framebuffer_source, dt);
+    ui::draw_layout(
+        ctx,
+        state,
+        vram_tex,
+        display_tex,
+        editor_viewport_tex,
+        framebuffer_source,
+        dt,
+    );
 }

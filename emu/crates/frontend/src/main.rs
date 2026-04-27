@@ -13,6 +13,7 @@ mod app;
 mod audio;
 mod cli;
 mod disasm;
+mod editor_preview;
 mod gfx;
 mod icons;
 mod input;
@@ -673,6 +674,13 @@ impl ApplicationHandler for Shell {
                     profile.hw_render_ms = elapsed_ms(hw_render_start);
                 }
 
+                // Editor 3D preview: drive the editor-owned HwRenderer
+                // once per frame, regardless of editor visibility. The
+                // scene is tiny (Phase 0 = three triangles) and keeping
+                // the texture warm avoids a one-frame flash of stale
+                // contents the moment the editor panel opens.
+                gfx.render_editor_preview();
+
                 let vram_tex = gfx.vram_texture_id();
                 let use_24bpp_display = state
                     .bus
@@ -690,8 +698,17 @@ impl ApplicationHandler for Shell {
                         ui::framebuffer::FramebufferSource::HardwareVram,
                     )
                 };
+                let editor_viewport_tex = gfx.editor_hw_texture_id();
                 profile.egui = gfx.render(|ctx| {
-                    app::build_ui(ctx, state, vram_tex, display_tex, framebuffer_source, dt)
+                    app::build_ui(
+                        ctx,
+                        state,
+                        vram_tex,
+                        display_tex,
+                        editor_viewport_tex,
+                        framebuffer_source,
+                        dt,
+                    )
                 });
                 profile.total_ms = elapsed_ms(profile_start);
                 if let Some(line) = state.profiler.record(profile) {

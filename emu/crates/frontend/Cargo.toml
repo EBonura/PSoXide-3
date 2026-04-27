@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 emulator-core    = { workspace = true }
 psoxide-settings = { workspace = true }
+psx-gpu          = { workspace = true }
 psx-gpu-compute  = { workspace = true }
 psx-gpu-render   = { workspace = true }
 psx-iso          = { workspace = true }
