@@ -131,13 +131,16 @@ pub fn build_phase1_cmd_log(
     setup_gte_for_camera(camera, target);
     walk_room(project, grid, textures, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
-    // Wall-edge preview wins over cell preview: when the user has
-    // PaintWall selected we want them to see the targeted edge, not
-    // the whole cell underneath.
-    if let Some((sx, sz, dir)) = hovered_edge {
-        push_hover_edge_overlay(grid, sx, sz, dir, &mut scratch);
-    } else if let Some((sx, sz)) = hovered_cell {
-        push_hover_overlay(grid, sx, sz, &mut scratch);
+    // Hover-quad and edge-strip belong to paint targeting; under
+    // Select the face outline does the user-affordance work, so
+    // suppress them when a face is being highlighted to avoid
+    // doubling up with a fluorescent fill.
+    if hovered_face.is_none() {
+        if let Some((sx, sz, dir)) = hovered_edge {
+            push_hover_edge_overlay(grid, sx, sz, dir, &mut scratch);
+        } else if let Some((sx, sz)) = hovered_cell {
+            push_hover_overlay(grid, sx, sz, &mut scratch);
+        }
     }
     // Face outlines for the Select tool. Selected drawn first so
     // its bolder lines sit *under* a possibly-co-located hover —
@@ -688,14 +691,17 @@ fn push_hover_edge_overlay(
 
 /// Hover and Selected outline styling. RGB plus screen-space line
 /// thickness in pixels; selected reads bolder so the user can spot
-/// it across a busy room.
+/// it across a busy room. Thicknesses are at least 2 px because
+/// `push_screen_line` carries the line as two screen-space tris
+/// whose half-width gets truncated to integer pixels — anything
+/// less collapses to a degenerate zero-width strip.
 const FACE_OUTLINE_HOVER: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0xFF, 0xE0, 0x60),
-    thickness_px: 1,
+    thickness_px: 2,
 };
 const FACE_OUTLINE_SELECTED: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0x60, 0xC8, 0xFF),
-    thickness_px: 2,
+    thickness_px: 4,
 };
 
 #[derive(Copy, Clone)]

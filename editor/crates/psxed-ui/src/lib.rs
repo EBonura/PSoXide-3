@@ -1128,10 +1128,15 @@ impl EditorWorkspace {
 
         let nx = (pointer.x - rect.center().x) / (rect.width() * 0.5);
         let ny = (pointer.y - rect.center().y) / (rect.height() * 0.5);
-        let aspect = rect.width() / rect.height();
-        let target_aspect = 320.0 / 240.0;
-        let half_fov_x = 0.5 * (aspect / target_aspect).max(0.001);
-        let half_fov_y = 0.5;
+        // PSX projection plane H = 320, framebuffer = 320×240. The
+        // ray's right/up offsets are tan(half-FOV) at panel-edge:
+        // 160/320 = 0.5 horizontally, 120/320 = 0.375 vertically.
+        // Hardcoding 0.5 for both (the previous shape) over-shoots
+        // the vertical ray angle by exactly the 4:3 aspect ratio,
+        // which is why floor picking worked but walls — whose Y
+        // range is narrow — never got hit.
+        let half_fov_x: f32 = 0.5;
+        let half_fov_y: f32 = 0.5 * 240.0 / 320.0;
         let dir = normalize3([
             forward[0] + right[0] * (nx * half_fov_x) + up[0] * (-ny * half_fov_y),
             forward[1] + right[1] * (nx * half_fov_x) + up[1] * (-ny * half_fov_y),
@@ -1310,15 +1315,11 @@ impl EditorWorkspace {
         // = 0.5; we bake that into the multiplier below.
         let nx = (pointer.x - rect.center().x) / (rect.width() * 0.5);
         let ny = (pointer.y - rect.center().y) / (rect.height() * 0.5);
-        let aspect = rect.width() / rect.height();
-        // PSX framebuffer aspect is 320/240 = 4:3; if the panel rect
-        // is wider/narrower than that, the painted texture is
-        // letterboxed. We still want the click to track what the
-        // user sees, so scale the X half-FOV by the actual aspect
-        // relative to 4:3.
-        let target_aspect = 320.0 / 240.0;
-        let half_fov_x = 0.5 * (aspect / target_aspect).max(0.001);
-        let half_fov_y = 0.5;
+        // Same FOV constants `camera_ray_for_pointer` uses; see the
+        // comment there. Hardcoded for the PSX framebuffer's
+        // 320×240 over PROJ_H=320.
+        let half_fov_x: f32 = 0.5;
+        let half_fov_y: f32 = 0.5 * 240.0 / 320.0;
         let dir = normalize3([
             forward[0] + right[0] * (nx * half_fov_x) + up[0] * (-ny * half_fov_y),
             forward[1] + right[1] * (nx * half_fov_x) + up[1] * (-ny * half_fov_y),
