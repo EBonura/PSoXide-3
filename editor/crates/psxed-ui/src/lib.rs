@@ -91,6 +91,10 @@ pub struct EditorWorkspace {
     /// inspector can show per-cell properties without inflating the
     /// scene-tree node count with a node per sector.
     selected_sector: Option<(u16, u16)>,
+    /// Cell currently under the 3D viewport's pointer. Updated each
+    /// frame the panel is hovered; rendered as a translucent overlay
+    /// so the user sees exactly what cell paint / place tools will hit.
+    hovered_3d_sector: Option<(u16, u16)>,
     /// `Some((id, buffer))` while a scene-tree row is in rename mode.
     /// Buffer holds the in-flight string the user is typing; commit /
     /// cancel finalises against the actual node name.
@@ -386,6 +390,7 @@ impl EditorWorkspace {
             selected_node: NodeId::ROOT,
             selected_resource: None,
             selected_sector: None,
+            hovered_3d_sector: None,
             renaming: None,
             pending_rename_focus: false,
             history: UndoStack::default(),
@@ -398,7 +403,10 @@ impl EditorWorkspace {
             snap_to_grid: true,
             snap_units: 16,
             show_grid: true,
-            view_2d: true,
+            // Default to the 3D preview so the bit-faithful HwRenderer
+            // is the first thing the user sees on opening the editor.
+            // The 2D top-down view stays one toolbar click away.
+            view_2d: false,
             viewport_pan: Vec2::ZERO,
             viewport_zoom: DEFAULT_VIEWPORT_ZOOM,
             // Default orbit: ~22° pitch above the target, looking
@@ -553,9 +561,10 @@ impl EditorWorkspace {
     /// `viewport_3d_tex` is the host's `egui::TextureId` for the
     /// editor's dedicated `HwRenderer` target — the frontend renders
     /// authored scene data into it once per frame and we paint it as
-    /// an Image inside the 3D Viewport panel. The texture stays bit-
-    /// faithful to what the PS1 would draw because it's produced by
-    /// the same `psx-gpu-render` HwRenderer the emulator uses.
+    /// an Image when the user toggles the central viewport into 3D
+    /// mode. The texture stays bit-faithful to what the PS1 would
+    /// draw because it's produced by the same `psx-gpu-render`
+    /// `HwRenderer` the emulator uses.
     pub fn draw(&mut self, ctx: &egui::Context, viewport_3d_tex: egui::TextureId) {
         apply_studio_visuals(ctx);
         self.handle_global_shortcuts(ctx);
@@ -564,74 +573,106 @@ impl EditorWorkspace {
         self.draw_left_dock(ctx);
         self.draw_inspector(ctx);
         self.draw_content_browser(ctx);
-        self.draw_viewport_3d(ctx, viewport_3d_tex);
-        self.draw_viewport(ctx);
+        self.draw_viewport(ctx, viewport_3d_tex);
     }
 
-    /// 3D viewport panel — paints the HwRenderer texture as an Image
-    /// and converts pointer drag / scroll into orbit-camera updates.
-    fn draw_viewport_3d(&mut self, ctx: &egui::Context, viewport_3d_tex: egui::TextureId) {
-        egui::TopBottomPanel::top("psxed_viewport_3d")
-            .resizable(true)
-            .default_height(280.0)
-            .min_height(160.0)
-            .frame(dock_frame())
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(icons::text(icons::BOX, 15.0).color(STUDIO_ACCENT));
-                    ui.label(RichText::new("3D Viewport").strong().color(STUDIO_TEXT));
-                    ui.separator();
-                    ui.weak(format!(
-                        "yaw {} pitch {} r {}",
-                        self.viewport_3d_yaw, self.viewport_3d_pitch, self.viewport_3d_radius
-                    ));
-                });
-                ui.separator();
-                let avail = ui.available_size();
-                let target_aspect = 320.0_f32 / 240.0;
-                let (w, h) = if avail.x / avail.y > target_aspect {
-                    (avail.y * target_aspect, avail.y)
-                } else {
-                    (avail.x, avail.x / target_aspect)
-                };
-                let (rect, response) = ui.allocate_exact_size(
-                    egui::Vec2::new(w, h),
-                    egui::Sense::click_and_drag(),
-                );
+    /// 3D viewport body — paints the HwRenderer texture into the
+    /// central area's working space and turns pointer input into
+    /// orbit-camera updates. Called from `draw_viewport` when the
+    /// user has toggled the 2D / 3D switch on the toolbar to 3D.
+    fn draw_viewport_3d_body(&mut self, ui: &mut egui::Ui, viewport_3d_tex: egui::TextureId) {
+        ui.horizontal(|ui| {
+            ui.label(icons::text(icons::BOX, 14.0).color(STUDIO_ACCENT));
+            ui.label(RichText::new("3D Preview").strong().color(STUDIO_TEXT));
+            ui.separator();
+            ui.weak(format!(
+                "yaw {} pitch {} r {}",
+                self.viewport_3d_yaw, self.viewport_3d_pitch, self.viewport_3d_radius
+            ));
+        });
+        ui.separator();
+        let avail = ui.available_size();
+        let target_aspect = 320.0_f32 / 240.0;
+        let (w, h) = if avail.x / avail.y > target_aspect {
+            (avail.y * target_aspect, avail.y)
+        } else {
+            (avail.x, avail.x / target_aspect)
+        };
+        let (rect, response) = ui.allocate_exact_size(
+            egui::Vec2::new(w, h),
+            egui::Sense::click_and_drag(),
+        );
 
-                // Drag = orbit. ~3° per pixel — sticky enough to
-                // recover from a tiny mouse jitter, fast enough that
-                // flicking the trackpad swings the view.
-                if response.dragged_by(egui::PointerButton::Primary) {
-                    let delta = response.drag_delta();
-                    self.viewport_3d_yaw = self
-                        .viewport_3d_yaw
-                        .wrapping_add((delta.x * 6.0) as i16 as u16);
-                    self.viewport_3d_pitch = self
-                        .viewport_3d_pitch
-                        .wrapping_add((delta.y * 6.0) as i16 as u16);
-                }
-                // Scroll = dolly. Each wheel notch ≈ 12% of the
-                // current radius, clamped so the camera can't pass
-                // through the target or escape the world.
-                if response.hovered() {
-                    let scroll = ui.input(|i| i.raw_scroll_delta.y);
-                    if scroll.abs() > f32::EPSILON {
-                        let factor = if scroll > 0.0 { 0.92 } else { 1.08 };
-                        self.viewport_3d_radius = ((self.viewport_3d_radius as f32) * factor)
-                            .clamp(512.0, 32_768.0)
-                            as i32;
-                    }
-                }
+        // Sims-style: primary button always belongs to the active
+        // tool — click-and-drag floors / walls / entities into the
+        // world. Camera orbit lives on middle / secondary so the
+        // user can reframe mid-edit without giving up the tool.
+        if response.dragged_by(egui::PointerButton::Middle)
+            || response.dragged_by(egui::PointerButton::Secondary)
+        {
+            let delta = response.drag_delta();
+            self.viewport_3d_yaw = self
+                .viewport_3d_yaw
+                .wrapping_add((delta.x * 1.5) as i16 as u16);
+            self.viewport_3d_pitch = self
+                .viewport_3d_pitch
+                .wrapping_add((delta.y * 1.5) as i16 as u16);
+        }
 
-                let uv = egui::Rect::from_min_max(
-                    egui::pos2(0.0, 0.0),
-                    egui::pos2(640.0 / 2048.0, 480.0 / 1024.0),
-                );
-                egui::Image::new((viewport_3d_tex, rect.size()))
-                    .uv(uv)
-                    .paint_at(ui, rect);
-            });
+        // Hover tracking: every frame the pointer is over the panel,
+        // ray-pick which cell it's on so the renderer can stamp a
+        // translucent overlay there. Cleared when the pointer leaves.
+        self.hovered_3d_sector = if let Some(pointer) = response.hover_pos() {
+            self.pick_3d_world(rect, pointer)
+                .and_then(|world| {
+                    self.active_room_id()
+                        .or_else(|| {
+                            self.project
+                                .active_scene()
+                                .nodes()
+                                .iter()
+                                .find(|n| matches!(n.kind, NodeKind::Room { .. }))
+                                .map(|n| n.id)
+                        })
+                        .and_then(|room| self.world_to_sector(room, world))
+                })
+        } else {
+            None
+        };
+
+        // Primary click / drag: ray-pick the cell under the cursor
+        // and dispatch to the active tool the same way the 2D
+        // viewport does. Drag fires every frame the pointer moves,
+        // so painting / moving stays continuous.
+        let primary_active = response.clicked_by(egui::PointerButton::Primary)
+            || response.dragged_by(egui::PointerButton::Primary);
+        if primary_active {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(world) = self.pick_3d_world(rect, pos) {
+                    self.handle_viewport_click(world, &[]);
+                }
+            }
+        }
+
+        // Scroll = dolly. ±8% of current radius per wheel notch,
+        // clamped so the camera can't pass through the target or
+        // escape the world entirely.
+        if response.hovered() {
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll.abs() > f32::EPSILON {
+                let factor = if scroll > 0.0 { 0.92 } else { 1.08 };
+                self.viewport_3d_radius =
+                    ((self.viewport_3d_radius as f32) * factor).clamp(512.0, 32_768.0) as i32;
+            }
+        }
+
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(640.0 / 2048.0, 480.0 / 1024.0),
+        );
+        egui::Image::new((viewport_3d_tex, rect.size()))
+            .uv(uv)
+            .paint_at(ui, rect);
     }
 
     /// Snapshot of the orbit camera the frontend needs to drive the
@@ -642,6 +683,112 @@ impl EditorWorkspace {
             pitch_q12: self.viewport_3d_pitch,
             radius: self.viewport_3d_radius,
         }
+    }
+
+    /// Currently-selected scene node. The frontend reads this so the
+    /// 3D preview can highlight the selected entity.
+    pub fn selected_node_id(&self) -> NodeId {
+        self.selected_node
+    }
+
+    /// Cell under the 3D pointer last frame, or `None` when the
+    /// pointer is off-panel. Frontend overlays a translucent quad on
+    /// it so paint tools have a Sims-style "you'll hit this cell"
+    /// affordance.
+    pub fn hovered_3d_sector(&self) -> Option<(u16, u16)> {
+        self.hovered_3d_sector
+    }
+
+    /// Project a pointer position inside the 3D viewport panel onto
+    /// the active Room's ground plane and return the editor's
+    /// "1 unit = 1 sector" world coordinates the 2D click handler
+    /// already speaks. Lets every paint tool (Floor / Wall / Ceiling
+    /// / Erase / Place) work identically in 3D and 2D.
+    fn pick_3d_world(&self, rect: egui::Rect, pointer: egui::Pos2) -> Option<[f32; 2]> {
+        let scene = self.project.active_scene();
+        let room = scene
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Room { .. }))?;
+        let NodeKind::Room { grid } = &room.kind else {
+            return None;
+        };
+
+        // Camera basis from the orbit state. Mirrors the math in
+        // `editor_preview::setup_gte_for_camera` so picking and
+        // rendering agree on every axis convention.
+        let yaw = self.viewport_3d_yaw;
+        let pitch = self.viewport_3d_pitch;
+        let radius = self.viewport_3d_radius as f32;
+        let cos_p = psx_gte::transform::cos_1_3_12(pitch) as f32 / 4096.0;
+        let sin_p = psx_gte::transform::sin_1_3_12(pitch) as f32 / 4096.0;
+        let cos_y = psx_gte::transform::cos_1_3_12(yaw) as f32 / 4096.0;
+        let sin_y = psx_gte::transform::sin_1_3_12(yaw) as f32 / 4096.0;
+
+        let target_world = [
+            (grid.width as f32 * grid.sector_size as f32) * 0.5,
+            0.0,
+            (grid.depth as f32 * grid.sector_size as f32) * 0.5,
+        ];
+        let cam_pos = [
+            target_world[0] + radius * cos_p * sin_y,
+            target_world[1] - radius * sin_p,
+            target_world[2] + radius * cos_p * cos_y,
+        ];
+
+        // World-space camera basis: forward = target - camera, with
+        // +Y up. `right` is forward × up, `up` recomputed from those
+        // two so the basis is orthonormal in floating point.
+        let forward = normalize3([
+            target_world[0] - cam_pos[0],
+            target_world[1] - cam_pos[1],
+            target_world[2] - cam_pos[2],
+        ]);
+        let right = normalize3(cross3(forward, [0.0, 1.0, 0.0]));
+        let up = cross3(right, forward);
+
+        // Map the pointer to PSX 320×240 NDC, clamped to the panel
+        // rect since clicks beyond it shouldn't pick.
+        if !rect.contains(pointer) {
+            return None;
+        }
+        // Pixel offset from panel centre, normalised so ±1 covers
+        // the half-FOV. Focal=320, half-screen=160 → tan(half_fov)
+        // = 0.5; we bake that into the multiplier below.
+        let nx = (pointer.x - rect.center().x) / (rect.width() * 0.5);
+        let ny = (pointer.y - rect.center().y) / (rect.height() * 0.5);
+        let aspect = rect.width() / rect.height();
+        // PSX framebuffer aspect is 320/240 = 4:3; if the panel rect
+        // is wider/narrower than that, the painted texture is
+        // letterboxed. We still want the click to track what the
+        // user sees, so scale the X half-FOV by the actual aspect
+        // relative to 4:3.
+        let target_aspect = 320.0 / 240.0;
+        let half_fov_x = 0.5 * (aspect / target_aspect).max(0.001);
+        let half_fov_y = 0.5;
+        let dir = normalize3([
+            forward[0] + right[0] * (nx * half_fov_x) + up[0] * (-ny * half_fov_y),
+            forward[1] + right[1] * (nx * half_fov_x) + up[1] * (-ny * half_fov_y),
+            forward[2] + right[2] * (nx * half_fov_x) + up[2] * (-ny * half_fov_y),
+        ]);
+
+        // Ray-plane intersection at world Y=0. The orbit cam never
+        // sits exactly on Y=0, but we still guard against a near-
+        // zero divisor for numerical safety.
+        if dir[1].abs() < 1e-5 {
+            return None;
+        }
+        let t = -cam_pos[1] / dir[1];
+        if t < 0.0 {
+            return None;
+        }
+        let hit_world = [cam_pos[0] + dir[0] * t, cam_pos[2] + dir[2] * t];
+
+        // The 2D click handler thinks in editor "viewport units"
+        // where 1 = 1 sector. Apply the same convention so
+        // `world_to_sector` / `apply_paint` work without changes.
+        let unit = grid.sector_size as f32;
+        Some([hit_world[0] / unit, hit_world[1] / unit])
     }
 
     /// Top-level keyboard shortcut handler. Cleared via `consume_*`
@@ -1397,7 +1544,7 @@ impl EditorWorkspace {
         });
     }
 
-    fn draw_viewport(&mut self, ctx: &egui::Context) {
+    fn draw_viewport(&mut self, ctx: &egui::Context, viewport_3d_tex: egui::TextureId) {
         egui::CentralPanel::default()
             .frame(viewport_frame())
             .show(ctx, |ui| {
@@ -1405,6 +1552,11 @@ impl EditorWorkspace {
                 ui.separator();
                 self.draw_viewport_toolbar(ui);
                 ui.separator();
+
+                if !self.view_2d {
+                    self.draw_viewport_3d_body(ui, viewport_3d_tex);
+                    return;
+                }
 
                 let size = ui.available_size();
                 let size = Vec2::new(size.x.max(320.0), size.y.max(240.0));
@@ -3828,6 +3980,23 @@ fn selected_stroke(selected: bool) -> Stroke {
 
 fn node_world(node: &psxed_project::SceneNode) -> [f32; 2] {
     [node.transform.translation[0], node.transform.translation[2]]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    if len_sq <= f32::EPSILON {
+        return [0.0, 0.0, 1.0];
+    }
+    let inv = len_sq.sqrt().recip();
+    [v[0] * inv, v[1] * inv, v[2] * inv]
 }
 
 /// Lowercase + non-alphanumeric → `_`, matching the cooker's clip

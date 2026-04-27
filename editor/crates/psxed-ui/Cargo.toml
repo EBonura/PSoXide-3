@@ -8,4 +8,5 @@ description = "Reusable egui workspace panels for the PSoXide editor."
 
 [dependencies]
 egui = "0.31"
+psx-gte = { path = "../../../sdk/crates/psx-gte" }
 psxed-project = { path = "../psxed-project" }

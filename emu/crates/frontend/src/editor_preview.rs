@@ -29,7 +29,9 @@ use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::TriFlat;
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
-use psxed_project::{NodeKind, ProjectDocument, WorldGrid};
+use psxed_project::{
+    GridDirection, NodeKind, ProjectDocument, ResourceData, ResourceId, WorldGrid,
+};
 use psxed_ui::ViewportCameraState;
 
 /// Maximum sectors we'll attempt to render in one preview pass.
@@ -65,6 +67,13 @@ struct PreviewScratch {
     ot: OrderingTable<OT_DEPTH>,
     tris: [TriFlat; TRI_CAP],
     used: usize,
+    /// GP0(02h) fill-rectangle packet: 1 tag word + 3 data words
+    /// (`opcode|color`, `pack_xy(x, y)`, `pack_xy(w, h)`). Must live
+    /// in the same static as the OT for the same reason `tris` does
+    /// — `iter_packets` reconstructs full pointers from the OT's
+    /// 24-bit chain encoding plus the OT struct's high address bits,
+    /// so chained packets must share that 16 MB region.
+    clear_packet: [u32; 4],
 }
 
 const EMPTY_TRI: TriFlat = TriFlat::new([(0, 0), (0, 0), (0, 0)], 0, 0, 0);
@@ -73,6 +82,7 @@ static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
     ot: OrderingTable::new(),
     tris: [EMPTY_TRI; TRI_CAP],
     used: 0,
+    clear_packet: [0; 4],
 });
 
 /// Build a fresh `cmd_log` rendering the project's first Room from
@@ -84,6 +94,8 @@ static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
 pub fn build_phase1_cmd_log(
     project: &ProjectDocument,
     camera: ViewportCameraState,
+    selected: psxed_project::NodeId,
+    hovered_cell: Option<(u16, u16)>,
 ) -> Vec<GpuCmdLogEntry> {
     let Some((grid, target)) = first_room_grid(project) else {
         return Vec::new();
@@ -93,9 +105,13 @@ pub fn build_phase1_cmd_log(
     scratch.used = 0;
     scratch.ot.clear();
 
+    push_clear(&mut scratch);
     setup_gte_for_camera(camera, target);
-
-    walk_floors(grid, target, &mut scratch);
+    walk_room(project, grid, &mut scratch);
+    walk_entities(project, grid, selected, &mut scratch);
+    if let Some((sx, sz)) = hovered_cell {
+        push_hover_overlay(grid, sx, sz, &mut scratch);
+    }
 
     // SAFETY: `scratch.tris` lives until end of this function (the
     // mutex guard keeps it alive); the OT chain pointers reference
@@ -186,15 +202,13 @@ fn clamp_i16(value: i32) -> i16 {
     value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-/// Walk every populated sector and emit two flat triangles per floor.
-fn walk_floors(grid: &WorldGrid, _target: [i32; 3], scratch: &mut PreviewScratch) {
+/// Walk every populated sector and emit flat-shaded triangles for
+/// floors, ceilings, and the walls on each cardinal edge.
+fn walk_room(project: &ProjectDocument, grid: &WorldGrid, scratch: &mut PreviewScratch) {
     let s = grid.sector_size;
     for x in 0..grid.width {
         for z in 0..grid.depth {
             let Some(sector) = grid.sector(x, z) else {
-                continue;
-            };
-            let Some(floor) = sector.floor.as_ref() else {
                 continue;
             };
             // Corner heights: [NW, NE, SE, SW] in `GridHorizontalFace`.
@@ -203,27 +217,255 @@ fn walk_floors(grid: &WorldGrid, _target: [i32; 3], scratch: &mut PreviewScratch
             let x1 = ((x as i32) + 1) * s;
             let z0 = (z as i32) * s;
             let z1 = ((z as i32) + 1) * s;
-            let nw = world_to_view([x0, floor.heights[0], z1]);
-            let ne = world_to_view([x1, floor.heights[1], z1]);
-            let se = world_to_view([x1, floor.heights[2], z0]);
-            let sw = world_to_view([x0, floor.heights[3], z0]);
-            // Each `project_vertex` returns sx/sy/sz directly out of
-            // the GTE; we need depth for the OT key and screen coords
-            // for the prim packet.
-            let p_nw = gte_scene::project_vertex(nw);
-            let p_ne = gte_scene::project_vertex(ne);
-            let p_se = gte_scene::project_vertex(se);
-            let p_sw = gte_scene::project_vertex(sw);
 
-            // Two-triangle floor split along the NW-SE diagonal.
-            let (r, g, b) = floor_color_for(x, z);
-            push_tri(scratch, [p_nw, p_sw, p_ne], (r, g, b));
-            push_tri(scratch, [p_ne, p_sw, p_se], (r, g, b));
+            if let Some(floor) = sector.floor.as_ref() {
+                push_horizontal_face(
+                    scratch,
+                    [x0, x1, z0, z1],
+                    floor.heights,
+                    material_color(project, floor.material, FALLBACK_FLOOR),
+                    /* flip_winding */ false,
+                );
+            }
+            if let Some(ceiling) = sector.ceiling.as_ref() {
+                push_horizontal_face(
+                    scratch,
+                    [x0, x1, z0, z1],
+                    ceiling.heights,
+                    material_color(project, ceiling.material, FALLBACK_CEILING),
+                    // Ceiling normal points down; flipping the winding
+                    // keeps backface-cullers happy and pins the inside
+                    // surface as the visible side once we add culling.
+                    /* flip_winding */ true,
+                );
+            }
+            for &(direction, edge) in &[
+                (GridDirection::North, WallEdge::North),
+                (GridDirection::East, WallEdge::East),
+                (GridDirection::South, WallEdge::South),
+                (GridDirection::West, WallEdge::West),
+            ] {
+                for face in sector.walls.get(direction) {
+                    push_wall_face(scratch, [x0, x1, z0, z1], edge, face.heights, {
+                        material_color(project, face.material, FALLBACK_WALL)
+                    });
+                }
+            }
 
             if scratch.used >= TRI_CAP {
                 return;
             }
         }
+    }
+}
+
+/// Project the four corners of a sector-aligned horizontal face and
+/// emit two triangles for it. `heights` is `[NW, NE, SE, SW]`.
+/// `flip_winding=true` reverses the vertex order for ceilings.
+fn push_horizontal_face(
+    scratch: &mut PreviewScratch,
+    bounds: [i32; 4],
+    heights: [i32; 4],
+    color: (u8, u8, u8),
+    flip_winding: bool,
+) {
+    let [x0, x1, z0, z1] = bounds;
+    let p_nw = gte_scene::project_vertex(world_to_view([x0, heights[0], z1]));
+    let p_ne = gte_scene::project_vertex(world_to_view([x1, heights[1], z1]));
+    let p_se = gte_scene::project_vertex(world_to_view([x1, heights[2], z0]));
+    let p_sw = gte_scene::project_vertex(world_to_view([x0, heights[3], z0]));
+    if flip_winding {
+        push_tri(scratch, [p_nw, p_ne, p_sw], color);
+        push_tri(scratch, [p_ne, p_se, p_sw], color);
+    } else {
+        push_tri(scratch, [p_nw, p_sw, p_ne], color);
+        push_tri(scratch, [p_ne, p_sw, p_se], color);
+    }
+}
+
+/// Which edge of the sector this wall sits on. The renderer needs
+/// the four corner positions in a consistent order so heights[bl,
+/// br, tr, tl] line up with the right world-space corners.
+#[derive(Copy, Clone)]
+enum WallEdge {
+    North,
+    East,
+    South,
+    West,
+}
+
+/// Build the four world-space corners of a wall face on `edge` and
+/// emit two triangles for it. `heights` is the `GridVerticalFace`
+/// `[bottom_left, bottom_right, top_right, top_left]` quad.
+fn push_wall_face(
+    scratch: &mut PreviewScratch,
+    bounds: [i32; 4],
+    edge: WallEdge,
+    heights: [i32; 4],
+    color: (u8, u8, u8),
+) {
+    let [x0, x1, z0, z1] = bounds;
+    // For each cardinal edge, "left" and "right" are picked so an
+    // observer standing inside the sector sees the wall the right
+    // way up.
+    let (bl_xy, br_xy, tr_xy, tl_xy) = match edge {
+        WallEdge::North => ((x0, z1), (x1, z1), (x1, z1), (x0, z1)),
+        WallEdge::East => ((x1, z1), (x1, z0), (x1, z0), (x1, z1)),
+        WallEdge::South => ((x1, z0), (x0, z0), (x0, z0), (x1, z0)),
+        WallEdge::West => ((x0, z0), (x0, z1), (x0, z1), (x0, z0)),
+    };
+    let p_bl = gte_scene::project_vertex(world_to_view([bl_xy.0, heights[0], bl_xy.1]));
+    let p_br = gte_scene::project_vertex(world_to_view([br_xy.0, heights[1], br_xy.1]));
+    let p_tr = gte_scene::project_vertex(world_to_view([tr_xy.0, heights[2], tr_xy.1]));
+    let p_tl = gte_scene::project_vertex(world_to_view([tl_xy.0, heights[3], tl_xy.1]));
+    push_tri(scratch, [p_bl, p_br, p_tr], color);
+    push_tri(scratch, [p_bl, p_tr, p_tl], color);
+}
+
+/// Walk every placeable child node and stamp a small screen-space
+/// marker so the user can see where they sit inside the room.
+///
+/// The room geometry uses the GTE-projected world coords; markers
+/// project the same way so they read as "here is this thing in the
+/// world", but the corners are drawn at fixed pixel offsets around
+/// the projected centre — a billboarded square that doesn't shrink
+/// with distance, the way Godot's editor sprites work.
+fn walk_entities(
+    project: &ProjectDocument,
+    grid: &WorldGrid,
+    selected: psxed_project::NodeId,
+    scratch: &mut PreviewScratch,
+) {
+    let s = grid.sector_size;
+    let scene = project.active_scene();
+    for node in scene.nodes() {
+        let Some(kind_color) = entity_marker_color(&node.kind) else {
+            continue;
+        };
+        // Editor convention: child node transforms are in "sectors
+        // relative to the room origin." 2D viewport draws them at
+        // exactly translation; 3D viewport must scale by sector_size
+        // to match the room geometry below it.
+        let pos = node.transform.translation;
+        let entity_world = [
+            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
+            (pos[1] * s as f32) as i32,
+            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
+        ];
+        let projected = gte_scene::project_vertex(world_to_view(entity_world));
+        if projected.sz == 0 {
+            continue;
+        }
+
+        let is_selected = node.id == selected;
+        let half = if is_selected { 9 } else { 6 };
+        let (mut r, mut g, mut b) = kind_color;
+        if is_selected {
+            // Brighten selected markers so they stand out on top of
+            // any colour scheme.
+            r = r.saturating_add(0x40);
+            g = g.saturating_add(0x40);
+            b = b.saturating_add(0x40);
+        }
+
+        let cx = projected.sx;
+        let cy = projected.sy;
+        let p_tl = synth(cx - half, cy - half, projected.sz);
+        let p_tr = synth(cx + half, cy - half, projected.sz);
+        let p_br = synth(cx + half, cy + half, projected.sz);
+        let p_bl = synth(cx - half, cy + half, projected.sz);
+        push_tri(scratch, [p_tl, p_bl, p_tr], (r, g, b));
+        push_tri(scratch, [p_tr, p_bl, p_br], (r, g, b));
+
+        if is_selected {
+            // Outline ring for selected entity: four thin tris
+            // forming an offset square one pixel beyond the marker.
+            let ring = half + 2;
+            let outline = (0xFF, 0xFF, 0xFF);
+            let r_tl = synth(cx - ring, cy - ring, projected.sz);
+            let r_tr = synth(cx + ring, cy - ring, projected.sz);
+            let r_br = synth(cx + ring, cy + ring, projected.sz);
+            let r_bl = synth(cx - ring, cy + ring, projected.sz);
+            push_tri(scratch, [r_tl, p_tl, r_tr], outline);
+            push_tri(scratch, [r_tr, p_tl, p_tr], outline);
+            push_tri(scratch, [r_tr, p_tr, r_br], outline);
+            push_tri(scratch, [r_br, p_tr, p_br], outline);
+            push_tri(scratch, [r_br, p_br, r_bl], outline);
+            push_tri(scratch, [r_bl, p_br, p_bl], outline);
+            push_tri(scratch, [r_bl, p_bl, r_tl], outline);
+            push_tri(scratch, [r_tl, p_bl, p_tl], outline);
+        }
+    }
+}
+
+fn synth(sx: i16, sy: i16, sz: u16) -> psx_gte::scene::Projected {
+    psx_gte::scene::Projected { sx, sy, sz }
+}
+
+/// Marker colour per node kind, or `None` for nodes that aren't
+/// placeable in 3D space (the World macro, the Room itself, plain
+/// transform-only nodes).
+fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
+    match kind {
+        NodeKind::SpawnPoint { player: true } => Some((0x60, 0xE0, 0x80)),
+        NodeKind::SpawnPoint { player: false } => Some((0x60, 0xB8, 0xF0)),
+        NodeKind::MeshInstance { .. } => Some((0xC0, 0xC8, 0xD0)),
+        NodeKind::Light { .. } => Some((0xFF, 0xD8, 0x70)),
+        NodeKind::Trigger { .. } => Some((0xC8, 0x80, 0xE0)),
+        NodeKind::Portal { .. } => Some((0xFF, 0xB0, 0x60)),
+        NodeKind::AudioSource { .. } => Some((0x70, 0xD8, 0xC0)),
+        NodeKind::Room { .. } | NodeKind::World | NodeKind::Node | NodeKind::Node3D => None,
+    }
+}
+
+const FALLBACK_FLOOR: (u8, u8, u8) = (0xB0, 0xA0, 0x88);
+const FALLBACK_WALL: (u8, u8, u8) = (0x88, 0x70, 0x58);
+const FALLBACK_CEILING: (u8, u8, u8) = (0x60, 0x60, 0x70);
+
+/// Pick the GP0 RGB triple to paint a face with.
+///
+/// Authored `MaterialResource::tint` defaults to PSX-neutral
+/// `(0x80, 0x80, 0x80)` because that's the right value when sampling
+/// a textured polygon (output = texel × tint / 128). For the editor's
+/// pre-textured flat-shaded preview that means every face renders the
+/// same dull grey — useless for distinguishing materials. Mirror the
+/// 2D viewport's approach: derive a colour from the material's name
+/// so a project's "Floor Material" / "Brick Material" / "Glass" all
+/// land at distinct, recognisable hues until real texturing arrives.
+fn material_color(
+    project: &ProjectDocument,
+    material: Option<ResourceId>,
+    fallback: (u8, u8, u8),
+) -> (u8, u8, u8) {
+    let Some(id) = material else {
+        return fallback;
+    };
+    let Some(resource) = project.resource(id) else {
+        return fallback;
+    };
+    let name = resource.name.to_ascii_lowercase();
+    if name.contains("brick") {
+        (0xC8, 0x70, 0x40)
+    } else if name.contains("floor") || name.contains("stone") {
+        (0xB6, 0xAC, 0x96)
+    } else if name.contains("glass") {
+        (0x70, 0xA8, 0xC0)
+    } else if name.contains("wood") {
+        (0x90, 0x60, 0x40)
+    } else if name.contains("metal") {
+        (0x90, 0x96, 0x9A)
+    } else if let ResourceData::Material(mat) = &resource.data {
+        // Author actually tinted the material away from neutral — use
+        // the tint directly. The mid-grey default falls through to
+        // the role-specific fallback below.
+        if mat.tint != [0x80, 0x80, 0x80] {
+            let [r, g, b] = mat.tint;
+            (r, g, b)
+        } else {
+            fallback
+        }
+    } else {
+        fallback
     }
 }
 
@@ -238,15 +480,90 @@ fn world_to_view(world: [i32; 3]) -> Vec3I16 {
     )
 }
 
-/// Lay each tile out in a checkerboard so the grid is visible even
-/// before per-sector materials are surfaced. Sector materials feed in
-/// during a later phase; for Phase 1 we just want to *see* the
-/// authored shape clearly.
-fn floor_color_for(x: u16, z: u16) -> (u8, u8, u8) {
-    if (x + z) % 2 == 0 {
-        (0xC0, 0xB0, 0x90)
-    } else {
-        (0x90, 0x80, 0x70)
+/// Project the hovered cell's four corners and emit a translucent
+/// quad over it so the user sees exactly which cell paint / place
+/// tools will hit.
+///
+/// Inserted at OT slot 0 — the chain walker visits it last, so the
+/// overlay paints on top of every floor / wall / ceiling regardless
+/// of their depth keys.
+fn push_hover_overlay(grid: &WorldGrid, sx: u16, sz: u16, scratch: &mut PreviewScratch) {
+    if sx >= grid.width || sz >= grid.depth {
+        return;
+    }
+    let s = grid.sector_size;
+    let x0 = (sx as i32) * s;
+    let x1 = ((sx as i32) + 1) * s;
+    let z0 = (sz as i32) * s;
+    let z1 = ((sz as i32) + 1) * s;
+    // Lift the overlay a hair off the floor so it doesn't z-fight
+    // with floor faces at exactly y=0. PSX OT-depth resolution is
+    // ~2 units per slot at typical orbit distances, so 4 is safe.
+    let y = 4;
+    let p_nw = gte_scene::project_vertex(world_to_view([x0, y, z1]));
+    let p_ne = gte_scene::project_vertex(world_to_view([x1, y, z1]));
+    let p_se = gte_scene::project_vertex(world_to_view([x1, y, z0]));
+    let p_sw = gte_scene::project_vertex(world_to_view([x0, y, z0]));
+    let color = (0xFF, 0xE0, 0x60);
+
+    // Inline two-triangle emit at slot 0 — bypasses `push_tri`'s
+    // sz-based slot mapping.
+    push_tri_at_slot(scratch, [p_nw, p_sw, p_ne], color, 0);
+    push_tri_at_slot(scratch, [p_ne, p_sw, p_se], color, 0);
+}
+
+/// Lower-level [`push_tri`] that pins the OT slot rather than
+/// computing it from screen-space depth. Used for fixed-layer
+/// overlays (hover highlight, gizmos, …).
+fn push_tri_at_slot(
+    scratch: &mut PreviewScratch,
+    p: [psx_gte::scene::Projected; 3],
+    rgb: (u8, u8, u8),
+    slot: usize,
+) {
+    if scratch.used >= TRI_CAP {
+        return;
+    }
+    let idx = scratch.used;
+    scratch.tris[idx] = TriFlat::new(
+        [
+            (p[0].sx, p[0].sy),
+            (p[1].sx, p[1].sy),
+            (p[2].sx, p[2].sy),
+        ],
+        rgb.0,
+        rgb.1,
+        rgb.2,
+    );
+    scratch.used = idx + 1;
+    let packet_ptr: *mut TriFlat = &mut scratch.tris[idx];
+    unsafe {
+        scratch
+            .ot
+            .insert(slot.min(OT_DEPTH - 1), packet_ptr.cast::<u32>(), TriFlat::WORDS);
+    }
+}
+
+/// Stamp a GP0(02h) fill-rectangle into `scratch.clear_packet` and
+/// link it into the back-most OT slot so it runs first when DMA
+/// walks the chain — which is the same pattern PS1 software uses to
+/// "clear" the framebuffer at the start of every frame, since the
+/// HwRenderer (faithfully) preserves VRAM across frames the way real
+/// hardware does.
+fn push_clear(scratch: &mut PreviewScratch) {
+    // PSX VRAM coords; the editor's HwRenderer renders the same
+    // 320×240 sub-rect that the runtime frame-buffer would land in.
+    let color_word = 0x0200_0000_u32; // opcode 0x02, RGB = 0 (black)
+    let xy_word = 0u32; // top-left at (0, 0)
+    let wh_word = ((240u32) << 16) | 320u32; // pack_xy(320, 240)
+    // word[0] is rewritten by `OrderingTable::insert` with the
+    // chain tag — leave it at 0 here.
+    scratch.clear_packet[1] = color_word;
+    scratch.clear_packet[2] = xy_word;
+    scratch.clear_packet[3] = wh_word;
+    let ptr: *mut u32 = scratch.clear_packet.as_mut_ptr();
+    unsafe {
+        scratch.ot.insert(OT_DEPTH - 1, ptr, 3);
     }
 }
 
@@ -276,8 +593,11 @@ fn push_tri(
     let avg_sz = (p[0].sz as u32 + p[1].sz as u32 + p[2].sz as u32) / 3;
     // Map sz (Q0, range up to ~32K for our scenes) into the OT
     // depth band. Smaller sz = closer = drawn last, so map to a
-    // lower OT slot index.
-    let slot = ((avg_sz as usize) >> 6).min(OT_DEPTH - 1);
+    // lower OT slot index. We reserve slot OT_DEPTH-1 for the
+    // per-frame fill-rect clear and slot 0 for the hover overlay
+    // (drawn last so it tops everything), so geometry rides the
+    // 1..OT_DEPTH-1 band exclusively.
+    let slot = ((avg_sz as usize) >> 6).clamp(1, OT_DEPTH - 2);
     let packet_ptr: *mut TriFlat = &mut scratch.tris[idx];
     unsafe {
         scratch

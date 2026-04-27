@@ -2571,6 +2571,7 @@ name = "psxed-ui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "psx-gte",
  "psxed-project",
 ]
 

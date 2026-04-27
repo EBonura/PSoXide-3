@@ -191,8 +191,11 @@ impl Graphics {
         &mut self,
         project: &psxed_project::ProjectDocument,
         camera: psxed_ui::ViewportCameraState,
+        selected: psxed_project::NodeId,
+        hovered_cell: Option<(u16, u16)>,
     ) {
-        let cmd_log = crate::editor_preview::build_phase1_cmd_log(project, camera);
+        let cmd_log =
+            crate::editor_preview::build_phase1_cmd_log(project, camera, selected, hovered_cell);
         // Empty VRAM is fine: floor rendering is flat-shaded — no
         // textured primitives sample VRAM. Texture support arrives
         // in a later phase along with the editor's static VRAM

@@ -679,7 +679,14 @@ impl ApplicationHandler for Shell {
                 // the texture is always current the moment the editor
                 // panel opens. Cheap when the project has no Rooms.
                 let editor_camera = state.editor.viewport_3d_camera();
-                gfx.render_editor_preview(state.editor.project(), editor_camera);
+                let editor_selected = state.editor.selected_node_id();
+                let editor_hover = state.editor.hovered_3d_sector();
+                gfx.render_editor_preview(
+                    state.editor.project(),
+                    editor_camera,
+                    editor_selected,
+                    editor_hover,
+                );
 
                 let vram_tex = gfx.vram_texture_id();
                 let use_24bpp_display = state
