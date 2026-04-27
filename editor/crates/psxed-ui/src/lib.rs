@@ -238,10 +238,6 @@ enum ViewTool {
     Select,
     /// Drag a selected node in the viewport plane.
     Move,
-    /// Yaw the selected node around its origin.
-    Rotate,
-    /// Resize the selected node uniformly.
-    Scale,
     /// Paint a floor onto the sector under the cursor (Room context).
     PaintFloor,
     /// Paint a wall on the directed edge under the cursor.
@@ -1048,8 +1044,6 @@ impl EditorWorkspace {
             // sector requirement since back-row walls' ground-plane
             // projection lands outside the room footprint.
             ViewTool::Select => {}
-            // Rotate / Scale aren't Sims-shaped — skip in 3D.
-            ViewTool::Rotate | ViewTool::Scale => {}
             // Paint / Place / Erase: call `apply_paint` directly so
             // the 3D path doesn't re-pick through the 2D click
             // handler's hit-test machinery.
@@ -1612,9 +1606,27 @@ impl EditorWorkspace {
             .frame(top_bar_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for menu in ["File", "Edit", "View", "Project", "Build", "Help"] {
-                        ui.menu_button(menu, |_ui| {});
-                    }
+                    ui.menu_button("File", |ui| {
+                        if ui.button("New Project…").clicked() {
+                            self.open_new_project_dialog();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Save").clicked() {
+                            if let Err(error) = self.save() {
+                                self.status = format!("Save failed: {error}");
+                            }
+                            ui.close_menu();
+                        }
+                        if ui.button("Reload").clicked() {
+                            self.reload();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Quit").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("PSoXide Studio").strong());
                         ui.separator();
@@ -1657,9 +1669,6 @@ impl EditorWorkspace {
                     if ui.button(icons::label(icons::FOCUS, "Frame")).clicked() {
                         self.frame_viewport();
                     }
-                    if ui.button(icons::label(icons::PLAY, "Playtest")).clicked() {
-                        self.status = "Playtest preview pending scene cook".to_string();
-                    }
                     if ui.button(icons::label(icons::BLEND, "Cook World")).clicked() {
                         match self.cook_world_to_disk() {
                             Ok(report) => self.status = report,
@@ -1674,43 +1683,6 @@ impl EditorWorkspace {
                         self.project.name.clone()
                     };
                     ui.label(project_label);
-                    ui.separator();
-
-                    if ui
-                        .button(icons::label(icons::CIRCLE_DOT, "Add Node"))
-                        .clicked()
-                    {
-                        self.add_child(NodeKind::Node3D, "Node3D");
-                    }
-                    if ui.button(icons::label(icons::GRID, "Add Room")).clicked() {
-                        self.add_grid_world_child();
-                    }
-                    if ui.button(icons::label(icons::BOX, "Add Mesh")).clicked() {
-                        let material = self.project.material_options().first().map(|(id, _)| *id);
-                        self.add_child(
-                            NodeKind::MeshInstance {
-                                mesh: None,
-                                material,
-                            },
-                            "MeshInstance",
-                        );
-                    }
-                    if ui.button(icons::label(icons::SUN, "Add Light")).clicked() {
-                        self.add_child(
-                            NodeKind::Light {
-                                color: [255, 240, 210],
-                                intensity: 1.0,
-                                radius: 4096.0,
-                            },
-                            "Light",
-                        );
-                    }
-                    if ui
-                        .button(icons::label(icons::MAP_PIN, "Add Spawn"))
-                        .clicked()
-                    {
-                        self.add_child(NodeKind::SpawnPoint { player: true }, "Player Spawn");
-                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(&self.status).color(STUDIO_TEXT_WEAK));
@@ -2495,16 +2467,6 @@ impl EditorWorkspace {
                     }
                 }
             });
-
-            ui.add_space(4.0);
-
-            section_frame().show(ui, |ui| {
-                ui.set_width(230.0);
-                panel_heading(ui, icons::PALETTE, "Texture Atlas (PS1)");
-                draw_atlas_preview(ui, &self.project);
-                ui.label(RichText::new("Atlas: default.atlas (256x256)").color(STUDIO_TEXT_WEAK));
-                ui.label(RichText::new("Mode: 4bpp Indexed").color(STUDIO_TEXT_WEAK));
-            });
         });
     }
 
@@ -2583,18 +2545,20 @@ impl EditorWorkspace {
     }
 
     fn draw_viewport_tabs(&mut self, ui: &mut egui::Ui) {
+        // Single-tab placeholder: shows whatever Room is the
+        // current edit context. Multi-room tab switching can land
+        // alongside File→Open Project; for now just reflect reality
+        // instead of the previous hardcoded "Stone Room.room".
+        let room_label = self
+            .active_room_id()
+            .and_then(|id| self.project.active_scene().node(id))
+            .map(|node| node.name.as_str())
+            .unwrap_or("(no room)");
         ui.horizontal(|ui| {
             let _ = ui.selectable_label(
                 true,
-                RichText::new(icons::label(icons::GRID, "Stone Room.room")).strong(),
+                RichText::new(icons::label(icons::GRID, &format!("{room_label}.room"))).strong(),
             );
-            if ui
-                .add(egui::Button::new(icons::text(icons::PLUS, 14.0)))
-                .on_hover_text("New scene")
-                .clicked()
-            {
-                self.status = "New scene tabs pending document support".to_string();
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     RichText::new(format!("Project: {}", self.project.name))
@@ -2626,16 +2590,6 @@ impl EditorWorkspace {
                         ViewTool::Move,
                         icons::label(icons::MOVE, "Move"),
                         "Drag the selected entity onto another cell.",
-                    ),
-                    (
-                        ViewTool::Rotate,
-                        icons::label(icons::ROTATE_3D, "Rotate"),
-                        "Rotate (2D viewport only for now).",
-                    ),
-                    (
-                        ViewTool::Scale,
-                        icons::label(icons::SCALE_3D, "Scale"),
-                        "Scale (2D viewport only for now).",
                     ),
                 ] {
                     ui.selectable_value(&mut self.active_tool, tool, label)
@@ -2812,7 +2766,7 @@ impl EditorWorkspace {
     /// Single dispatch point for primary-button clicks on the viewport.
     fn handle_viewport_click(&mut self, world: [f32; 2], hits: &[ViewportHit]) {
         match self.active_tool {
-            ViewTool::Select | ViewTool::Move | ViewTool::Rotate | ViewTool::Scale => {
+            ViewTool::Select | ViewTool::Move => {
                 if let Some(hit) = hits.iter().rev().find(|hit| hit.contains(world)) {
                     self.selected_node = hit.id;
                     self.selected_resource = None;
@@ -2961,26 +2915,6 @@ impl EditorWorkspace {
         self.selected_resource = None;
         self.status = format!("Added {name}");
         self.mark_dirty();
-    }
-
-    fn add_grid_world_child(&mut self) {
-        let material_options = self.project.material_options();
-        let floor = material_options
-            .iter()
-            .find(|(_, name)| name.to_ascii_lowercase().contains("floor"))
-            .or_else(|| material_options.first())
-            .map(|(id, _)| *id);
-        let wall = material_options
-            .iter()
-            .find(|(_, name)| name.to_ascii_lowercase().contains("brick"))
-            .or_else(|| material_options.first())
-            .map(|(id, _)| *id);
-        self.add_child(
-            NodeKind::Room {
-                grid: WorldGrid::stone_room(4, 4, 1024, floor, wall),
-            },
-            "Room",
-        );
     }
 
     fn duplicate_selected(&mut self) {
@@ -4530,44 +4464,6 @@ fn resource_detail(resource: &Resource) -> &'static str {
         ResourceData::Script { .. } => "Script",
         ResourceData::Audio { .. } => "Audio",
     }
-}
-
-fn draw_atlas_preview(ui: &mut egui::Ui, project: &ProjectDocument) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(210.0, 86.0), Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, Color32::from_rgb(12, 16, 20));
-    let colors: Vec<_> = project
-        .resources
-        .iter()
-        .filter(|resource| {
-            matches!(
-                resource.data,
-                ResourceData::Texture { .. } | ResourceData::Material(_)
-            )
-        })
-        .map(resource_preview_color)
-        .collect();
-    let cell = 16.0;
-    for y in 0..5 {
-        for x in 0..13 {
-            let idx = (x + y * 3) % colors.len().max(1);
-            let min = rect.min + Vec2::new(x as f32 * cell, y as f32 * cell);
-            painter.rect_filled(
-                Rect::from_min_size(min, Vec2::splat(cell - 1.0)),
-                0.0,
-                colors
-                    .get(idx)
-                    .copied()
-                    .unwrap_or_else(|| Color32::from_rgb(64, 72, 84)),
-            );
-        }
-    }
-    painter.rect_stroke(
-        rect,
-        2.0,
-        Stroke::new(1.0, Color32::from_rgb(58, 70, 86)),
-        StrokeKind::Inside,
-    );
 }
 
 fn draw_viewport_overlay(
