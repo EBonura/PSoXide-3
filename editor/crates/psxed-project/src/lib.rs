@@ -1240,6 +1240,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn budget_empty_grid_reports_no_geometry() {
+        let grid = WorldGrid::empty(3, 3, 1024);
+        let b = grid.budget();
+        assert_eq!(b.total_cells, 9);
+        assert_eq!(b.populated_cells, 0);
+        assert_eq!(b.floors, 0);
+        assert_eq!(b.ceilings, 0);
+        assert_eq!(b.walls, 0);
+        assert_eq!(b.triangles, 0);
+        // Just the AssetHeader (12) + WorldHeader (20).
+        assert_eq!(b.psxw_v1_bytes, 32);
+        assert_eq!(b.psxw_v2_estimated_bytes, 32);
+        assert!(!b.over_budget());
+    }
+
+    #[test]
+    fn budget_starter_room_matches_authored_geometry() {
+        let grid = WorldGrid::stone_room(3, 3, 1024, None, None);
+        let b = grid.budget();
+        assert_eq!(b.populated_cells, 9);
+        assert_eq!(b.floors, 9);
+        assert_eq!(b.ceilings, 0);
+        // Perimeter only: 4 sides * 3 cells = 12 walls.
+        assert_eq!(b.walls, 12);
+        // 2 tris per face: 9 floors + 12 walls = 21 faces.
+        assert_eq!(b.triangles, 42);
+        // v2 should be strictly smaller than v1 once any geometry
+        // exists — the size delta is the whole point of the v2
+        // record reshape.
+        assert!(b.psxw_v2_estimated_bytes < b.psxw_v1_bytes);
+        assert!(!b.over_budget());
+    }
+
+    #[test]
+    fn budget_max_dimension_grid_within_caps() {
+        // Floors-only at MAX_ROOM_WIDTH × MAX_ROOM_DEPTH = 32 × 32.
+        // Stresses the byte-cap path without going over MAX_ROOM_TRIANGLES.
+        let mut grid = WorldGrid::empty(MAX_ROOM_WIDTH, MAX_ROOM_DEPTH, 1024);
+        for x in 0..MAX_ROOM_WIDTH {
+            for z in 0..MAX_ROOM_DEPTH {
+                grid.set_floor(x, z, 0, None);
+            }
+        }
+        let b = grid.budget();
+        assert_eq!(b.populated_cells, 1024);
+        assert_eq!(b.floors, 1024);
+        assert_eq!(b.triangles, 2048);
+        assert!(b.triangles <= MAX_ROOM_TRIANGLES);
+        // v1: 32 + 1024 * 44 = 45088 — over the 64KiB cap on the
+        // wall-stack-heavy worst case but fine on floors-only.
+        // v2: 32 + 1024 * 28 = 28704 — well under cap.
+        assert!(b.psxw_v2_estimated_bytes <= MAX_ROOM_BYTES);
+        assert!(!b.over_budget());
+    }
+
+    #[test]
     fn extend_to_include_grows_positively_without_shift() {
         let mut grid = WorldGrid::stone_room(3, 3, 1024, None, None);
         let baseline_floor_world = grid.cell_world_x(0); // 0

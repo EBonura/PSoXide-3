@@ -389,6 +389,23 @@ fn cook_sector(
         return Ok(None);
     }
 
+    // The cooker writes one record per face today, but the
+    // fields in that record fall into two concerns the runtime
+    // already separates via `psx_engine::RoomRender` /
+    // `psx_engine::RoomCollision`:
+    //
+    //   render    — heights, splits, material slot
+    //   collision — heights, splits, walkable / solid bits
+    //
+    // Heights and splits feed both views. Materials are render-
+    // only (no collision branches on tpage). `walkable` /
+    // `solid` are collision-only (no draw call branches on
+    // walkability). When v2 lands and the byte format splits
+    // render and collision into distinct tables, this function
+    // peels into `cook_sector_render` + `cook_sector_collision`
+    // — the call structure is already grouped that way below.
+
+    // -------- render-relevant cook --------
     let floor = sector
         .floor
         .as_ref()
@@ -420,6 +437,13 @@ fn cook_sector(
         })
         .transpose()?;
     let walls = cook_walls(project, &sector.walls, x, z, materials, material_slots)?;
+
+    // -------- collision-relevant cook --------
+    // `walkable` / `solid` are forwarded through the cooked
+    // structs by `cook_horizontal_face` / `cook_walls` already
+    // — listed here only so the future v2 split has an obvious
+    // landing spot for any extra collision-only data
+    // (sector logic offset, traversal portal slots, …).
 
     Ok(Some(CookedGridSector {
         floor,
@@ -870,6 +894,59 @@ mod tests {
 
         assert_eq!(cooked.sectors, vec![None]);
         assert!(cooked.materials.is_empty());
+    }
+
+    #[test]
+    fn cooked_starter_round_trips_through_psx_asset() {
+        // End-to-end: cook the starter grid, parse the .psxw bytes
+        // through `psx_asset::World`, and verify the runtime view
+        // decodes the same dimensions / sector / wall counts the
+        // cooker reported. Regresses the v1 byte layout against
+        // both producer and consumer in one assertion.
+        let project = ProjectDocument::starter();
+        let grid = starter_grid(&project);
+        let cooked = cook_world_grid(&project, &grid).unwrap();
+        let bytes = encode_world_grid_psxw(&project, &grid).unwrap();
+
+        let world = psx_asset::World::from_bytes(&bytes).expect("psxw parses");
+        assert_eq!(world.width(), cooked.width);
+        assert_eq!(world.depth(), cooked.depth);
+        assert_eq!(world.sector_size(), cooked.sector_size);
+        assert_eq!(world.material_count() as usize, cooked.materials.len());
+
+        // Sector (0,0) — the starter has a floor + perimeter walls
+        // here, so this exercises both decoded paths.
+        let sector = world.sector(0, 0).expect("starter (0,0) populated");
+        assert!(sector.has_floor());
+        assert!(sector.wall_count() > 0);
+    }
+
+    #[test]
+    fn rejects_diagonal_walls() {
+        // Author a NW-SE diagonal wall and confirm the cooker
+        // refuses it. Render / pick / collision aren't consistent
+        // for diagonals yet; failing loud at cook time beats
+        // shipping half-supported geometry.
+        let project = ProjectDocument::starter();
+        let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
+        // No floor — the diagonal-wall check has to fire before
+        // any material validation in the rest of the sector.
+        grid.add_wall(
+            0,
+            0,
+            GridDirection::NorthWestSouthEast,
+            0,
+            world::SECTOR_SIZE,
+            None,
+        );
+
+        match cook_world_grid(&project, &grid) {
+            Err(WorldGridCookError::UnsupportedDiagonalWall { x, z, direction }) => {
+                assert_eq!((x, z), (0, 0));
+                assert_eq!(direction, GridDirection::NorthWestSouthEast);
+            }
+            other => panic!("expected UnsupportedDiagonalWall, got {other:?}"),
+        }
     }
 
     #[test]

@@ -415,6 +415,7 @@ dependencies = [
 name = "psxed-project"
 version = "0.1.0"
 dependencies = [
+ "psx-asset",
  "psxed-format",
  "ron",
  "serde",

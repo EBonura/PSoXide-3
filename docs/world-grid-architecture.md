@@ -1,6 +1,6 @@
 # World Grid Architecture
 
-The world grid has three layers. Keeping them separate is the main guardrail
+The world grid has four layers. Keeping them separate is the main guardrail
 that lets the editor stay pleasant while the PS1 runtime stays small.
 
 ## Layers
@@ -8,7 +8,7 @@ that lets the editor stay pleasant while the PS1 runtime stays small.
 ```text
 Editor authoring model
   psxed-project::WorldGrid
-  serde, Vec, ResourceId, mutable node payloads
+  serde, Vec, ResourceId, mutable node payloads, origin offset
 
 Cooked host manifest
   psxed-project::CookedWorldGrid
@@ -19,13 +19,105 @@ Cooked binary asset
   AssetHeader + WorldHeader + SectorRecord[] + WallRecord[]
 
 Runtime engine model
-  psx_engine::GridWorld<'a>
-  borrowed slices, no allocator, u16 material slots, ROM-backed data
+  psx_engine::RuntimeRoom<'a>            (PSX-resident wrapper over psx_asset::World)
+    .render() -> RoomRender<'a, '_>      (renderer-only API surface)
+    .collision() -> RoomCollision<'a, '_> (collision-only API surface)
+
+  psx_engine::GridRoom<'a>               (authoring / test helper, NOT PSX-resident)
 ```
 
 The engine must not depend on editor nodes, RON, paths, or resource names. The
 editor must not be forced to store borrowed runtime slices. The cooker is the
 contract boundary.
+
+`GridRoom` / `GridWorld` (the older "engine model" type) are now flagged
+**authoring / test helpers** in their doc comments. New runtime systems —
+collision, rendering, AI floor sampling — should grow on top of `RuntimeRoom`,
+which holds zero owned state and decodes sectors / walls by value on demand.
+
+## Authoring vs Runtime
+
+The editor's job is to make geometry pleasant to author. Authoring needs a
+mutable, type-rich model (`Vec<Wall>`, optional materials, scene-level node
+hierarchy, …). The runtime's job is to draw + simulate that geometry on a
+33 MHz CPU with 2 MB of RAM. Runtime needs the inverse: zero-copy, byte-table
+addressing, no allocator, and a record layout that the GTE / GP0 can fan out
+without per-vertex chasing.
+
+Two concrete consequences:
+
+* **No `Vec`, no `String`, no `HashMap` reachable from `RuntimeRoom`**. The
+  type is `Copy`. Adding any owned field would break the
+  `_assert_copy::<RuntimeRoom>` const-assertion in `psx-engine::world`.
+
+* **Authoring model is allowed to be wider than the runtime model.** The
+  cooker is where authoring richness collapses into the runtime's compact
+  shape. If the editor lets you assign a material that doesn't exist, that's
+  caught at cook time, not at parse time.
+
+## Render vs Collision Split
+
+Same room data, two consumers, two read paths:
+
+* `RoomRender` — heights and splits for vertex emission, materials for tpage /
+  CLUT lookup, world-level lighting state.
+* `RoomCollision` — heights and splits for floor / ceiling sampling, walkable /
+  solid bits for stop-or-pass decisions.
+
+Materials are render-only. Walkable / solid bits are collision-only. The two
+views are zero-cost `Copy` newtypes over `RuntimeRoom`; they exist to enforce
+discipline at the API level (a draw pass cannot accidentally branch on
+walkability; a collision query cannot reach a tpage word).
+
+The cooker today writes one record per sector / wall, with both render and
+collision concerns interleaved. When the v2 byte format lands, those two
+concerns split into separate tables — the cooker pipeline is already organized
+by render-emit / collision-emit phases so that future split is a small change.
+
+## Tomb Raider Analogy
+
+Bonnie-32's room model deliberately echoes the original Tomb Raider runtime,
+because the constraints are similar: 1 MB working set, sector-based level
+geometry, integer math throughout. The mapping:
+
+| TR concept                          | PSoXide equivalent                          |
+| ----------------------------------- | ------------------------------------------- |
+| `tr_room`                           | `RuntimeRoom<'a>` / one `.psxw` blob        |
+| `tr_room_data` (vertex/face arrays) | not yet emitted — render path WIP           |
+| `tr_room_sector` (4 B floor / ceiling height + flags) | `SectorRecordV2` (28 B) |
+| FloorData stream (triggers / slopes) | `SectorLogicStream` (designed, not wired)  |
+| `tr_room_portal` (visibility)       | `RoomPortalRecord`                          |
+| `room_below` / `room_above` / wall portal | `SectorPortalRecord`                  |
+| Object texture table                | `MaterialRecordV2` (embedded in v2 .psxw)   |
+
+Two TR lessons we deliberately keep:
+
+* **Sectors are a strong addressing mode**, not just a layout convenience. Once
+  you commit to "1024 world units per sector, world-grid coords are sector
+  coords times sector size," collision lookup becomes `O(1)` and floor / wall
+  data becomes table-indexed instead of pointer-chased. Keep the world coords
+  → sector coords division single-instruction; resist temptation to break the
+  grid.
+
+* **Heights are room-local, not world-absolute.** TR stores room-relative
+  i16 heights so a level can address ±32 KU vertically with 2 bytes per height
+  set. PSoXide v2 follows the same trick: `i16` heights room-local, the
+  renderer adds the room origin during vertex emission. The
+  `editor_preview::VIEW_ANCHOR` exists for the same reason on the editor side
+  — keeping vertex data within i16 range from the camera target.
+
+Two TR lessons we deliberately ignore:
+
+* **No `tr_face4` / `tr_face3` lists** today. TR's render path iterates an
+  explicit face list per room because sector geometry alone doesn't capture
+  decoration (statues, columns, water surface). PSoXide currently emits all
+  faces from sector data; once decorative geometry lands, a face table is the
+  obvious shape — but the `RuntimeRoom` API will absorb it as
+  `RoomRender::faces()` rather than another concern on `SectorRender`.
+
+* **No item / entity table inside `.psxw`**. TR mixes statics into the room
+  blob; we keep entities in scene nodes outside the cooked world. Cleaner
+  authoring, slightly more bookkeeping at level-load.
 
 ## Contract
 
@@ -43,28 +135,73 @@ contract boundary.
   first-use order while scanning sectors.
 - Split and direction numeric ids live in `psxed-format::world`; the final
   `.psxw` writer uses those ids.
+- **Diagonal walls (`NorthWestSouthEast` / `NorthEastSouthWest`) are rejected
+  at cook time**. The data model has the slots so authoring + serialization
+  works, but render / pick / collision aren't consistent for diagonals yet.
+- **Wall ownership rule**: the physical wall between `(x, z)` and `(x+1, z)`
+  is `East(x, z)` *and* `West(x+1, z)`. The editor's PaintWall stamps one
+  side; the cooker is responsible for normalizing duplicate opposing coplanar
+  walls (low-index-cell wins). Same for North / South.
+
+## Room Budget
+
+Authoring is bounded by the runtime's tolerance:
+
+| Cap                | Value     |
+| ------------------ | --------- |
+| `MAX_ROOM_WIDTH`   | 32 sectors|
+| `MAX_ROOM_DEPTH`   | 32 sectors|
+| `MAX_WALL_STACK`   | 4 walls per edge |
+| `MAX_ROOM_TRIANGLES` | 2048    |
+| `MAX_ROOM_BYTES`   | 64 KiB    |
+
+`WorldGrid::budget()` rolls up populated cells, faces, walls, triangles, plus
+v1 wire size and a v2-format estimate. The editor inspector shows the rollup
+and tints any over-cap metric red.
 
 ## Binary Shape
 
-`.psxw` starts with the standard `AssetHeader` using magic `PSXW`. The payload
-is:
+### v1 (current shipping)
+
+`.psxw` starts with the standard `AssetHeader` using magic `PSXW`. The
+payload is:
 
 ```text
-WorldHeader
-SectorRecord[width * depth]
-WallRecord[wall_count]
+WorldHeader        (20 B)
+SectorRecord[]     (44 B each, width * depth records)
+WallRecord[]       (24 B each, wall_count records)
 ```
 
-Sector records stay in flat `[x * depth + z]` order. Each sector points at a
-contiguous run in the wall table through `first_wall` and `wall_count`.
+Heights are `[i32; 4]` per face. Materials resolve via an external bank slot.
+No sector logic. No portals.
 
-## Naming
+### v2 (designed, not yet emitted)
 
-`WorldGrid` is the editor authoring payload. `GridWorld` is the runtime engine
-view. That distinction is intentional: authoring owns mutation and resources;
-runtime owns static query and render data.
+```text
+WorldHeaderV2          (20 B)
+MaterialRecordV2[]     (12 B each, embedded — no external bank)
+SectorRecordV2[]       (28 B each, room-local i16 heights)
+WallRecordV2[]         (12 B each, room-local i16 heights)
+SectorLogicStream      (variable, FloorData-style sparse byte stream)
+RoomPortalRecord[]     (visibility portals between rooms)
+SectorPortalRecord[]   (8 B each, traversal: wall / pit / sky)
+```
 
-## Next Step
+Records are defined alongside v1 in `psxed-format::world`; each has a
+`const _: () = assert!(SIZE == N)` so layout drift fails the build. The
+`WorldGridBudget` already exposes a v2 estimate so authors see the savings
+the format change is buying.
 
-The next layer should adapt parsed `.psxw` data into the engine's higher-level
-world query/render APIs, starting with floor and wall collision helpers.
+## i16 Vertex Safety
+
+`SECTOR_SIZE * MAX_ROOM_WIDTH = 32 * 1024 = 32 768` — that's the i16 cliff.
+A 32×32 room sits exactly on it; bigger rooms silently truncate.
+
+Editor preview: vertices are emitted relative to a per-frame `VIEW_ANCHOR`
+(the camera target). The GTE translation absorbs the offset via `cam_local`.
+Debug builds assert the relative coord fits i16; release saturates loudly via
+the same clamp. With sector_size 1024 this gives ±32 sectors of headroom from
+the camera target — comfortably the editor cap.
+
+Runtime: same trick, room-local i16 heights, room origin added during vertex
+emission. Keeps i16 vertex space valid for any room up to the budget cap.

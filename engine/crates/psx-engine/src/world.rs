@@ -518,7 +518,301 @@ impl<'a> RuntimeRoom<'a> {
     ) -> Option<psx_asset::WorldWall> {
         self.inner.sector_wall(sector, local_index)
     }
+
+    /// Render-side facade, see [`RoomRender`].
+    pub const fn render(&self) -> RoomRender<'a, '_> {
+        RoomRender { room: self }
+    }
+
+    /// Collision-side facade, see [`RoomCollision`].
+    pub const fn collision(&self) -> RoomCollision<'a, '_> {
+        RoomCollision { room: self }
+    }
 }
+
+// ============================================================
+// Render-vs-collision facades
+// ============================================================
+//
+// Tomb Raider runs render and collision off the same on-disk
+// room data, but with two distinct read paths: the renderer
+// walks tr_face4 / tr_face3 lists with materials and lighting;
+// collision walks tr_room_sector heights and traversal portals
+// with no concept of texture pages. The two systems literally
+// cannot fetch each other's fields at the API level.
+//
+// `RoomRender` / `RoomCollision` give us the same discipline
+// over a single `RuntimeRoom`. Both views are zero-cost
+// `Copy` borrows; the v1 byte format keeps render + collision
+// fields in one record so today's cooker writes both streams
+// in one pass — but a caller that says
+// `room.render().sector(...)` cannot accidentally branch on
+// `floor_walkable`, and a caller that says
+// `room.collision().sector(...)` cannot accidentally read a
+// material slot.
+
+/// Render-side view over a [`RuntimeRoom`].
+///
+/// Exposes only the fields a draw pass cares about: heights and
+/// splits for vertex emission, materials for tpage / clut lookup,
+/// world-level lighting state. Collision-only state
+/// (`walkable`, `solid`, traversal portals) is intentionally
+/// **not** reachable through this view.
+#[derive(Copy, Clone, Debug)]
+pub struct RoomRender<'a, 'b> {
+    room: &'b RuntimeRoom<'a>,
+}
+
+impl<'a, 'b> RoomRender<'a, 'b> {
+    /// Width in grid sectors.
+    pub fn width(self) -> u16 {
+        self.room.width()
+    }
+
+    /// Depth in grid sectors.
+    pub fn depth(self) -> u16 {
+        self.room.depth()
+    }
+
+    /// Engine units per sector.
+    pub fn sector_size(self) -> i32 {
+        self.room.sector_size()
+    }
+
+    /// Room ambient RGB color.
+    pub fn ambient_color(self) -> [u8; 3] {
+        self.room.world().ambient_color()
+    }
+
+    /// Whether fog / depth cue is enabled for this world.
+    pub fn fog_enabled(self) -> bool {
+        self.room.world().fog_enabled()
+    }
+
+    /// Sector at `(x, z)` for render purposes, or `None` for
+    /// empty cells.
+    pub fn sector(self, x: u16, z: u16) -> Option<SectorRender> {
+        self.room.sector(x, z).map(SectorRender)
+    }
+
+    /// Wall record by sector-local index, render view.
+    pub fn sector_wall(self, sector: SectorRender, local_index: u16) -> Option<WallRender> {
+        self.room.sector_wall(sector.0, local_index).map(WallRender)
+    }
+}
+
+/// Collision-side view over a [`RuntimeRoom`].
+///
+/// Exposes only the fields a movement / floor-sample query
+/// cares about: heights for surface sampling, splits for
+/// triangulation of the height grid, walkable / solid bits for
+/// stop-or-pass decisions. Render-only state (materials,
+/// lighting, fog) is intentionally **not** reachable through
+/// this view.
+#[derive(Copy, Clone, Debug)]
+pub struct RoomCollision<'a, 'b> {
+    room: &'b RuntimeRoom<'a>,
+}
+
+impl<'a, 'b> RoomCollision<'a, 'b> {
+    /// Width in grid sectors.
+    pub fn width(self) -> u16 {
+        self.room.width()
+    }
+
+    /// Depth in grid sectors.
+    pub fn depth(self) -> u16 {
+        self.room.depth()
+    }
+
+    /// Engine units per sector.
+    pub fn sector_size(self) -> i32 {
+        self.room.sector_size()
+    }
+
+    /// Sector at `(x, z)` for collision purposes, or `None` for
+    /// empty cells.
+    pub fn sector(self, x: u16, z: u16) -> Option<SectorCollision> {
+        self.room.sector(x, z).map(SectorCollision)
+    }
+
+    /// Wall record by sector-local index, collision view.
+    pub fn sector_wall(
+        self,
+        sector: SectorCollision,
+        local_index: u16,
+    ) -> Option<WallCollision> {
+        self.room
+            .sector_wall(sector.0, local_index)
+            .map(WallCollision)
+    }
+}
+
+/// Render-side projection of one decoded sector.
+#[derive(Copy, Clone, Debug)]
+pub struct SectorRender(psx_asset::WorldSector);
+
+impl SectorRender {
+    /// `true` if this sector emits a floor face.
+    pub fn has_floor(self) -> bool {
+        self.0.has_floor()
+    }
+
+    /// `true` if this sector emits a ceiling face.
+    pub fn has_ceiling(self) -> bool {
+        self.0.has_ceiling()
+    }
+
+    /// Floor diagonal split id.
+    pub fn floor_split(self) -> u8 {
+        self.0.floor_split()
+    }
+
+    /// Ceiling diagonal split id.
+    pub fn ceiling_split(self) -> u8 {
+        self.0.ceiling_split()
+    }
+
+    /// Floor material slot, if any.
+    pub fn floor_material(self) -> Option<u16> {
+        self.0.floor_material()
+    }
+
+    /// Ceiling material slot, if any.
+    pub fn ceiling_material(self) -> Option<u16> {
+        self.0.ceiling_material()
+    }
+
+    /// Floor corner heights `[NW, NE, SE, SW]` for vertex emission.
+    pub fn floor_heights(self) -> [i32; 4] {
+        self.0.floor_heights()
+    }
+
+    /// Ceiling corner heights `[NW, NE, SE, SW]` for vertex emission.
+    pub fn ceiling_heights(self) -> [i32; 4] {
+        self.0.ceiling_heights()
+    }
+
+    /// First global wall index for this sector.
+    pub fn first_wall(self) -> u16 {
+        self.0.first_wall()
+    }
+
+    /// Number of walls belonging to this sector.
+    pub fn wall_count(self) -> u16 {
+        self.0.wall_count()
+    }
+}
+
+/// Collision-side projection of one decoded sector.
+#[derive(Copy, Clone, Debug)]
+pub struct SectorCollision(psx_asset::WorldSector);
+
+impl SectorCollision {
+    /// `true` if this sector has a floor surface to sample.
+    pub fn has_floor(self) -> bool {
+        self.0.has_floor()
+    }
+
+    /// `true` if this sector has a ceiling surface for clearance.
+    pub fn has_ceiling(self) -> bool {
+        self.0.has_ceiling()
+    }
+
+    /// `true` if the floor face is walkable.
+    pub fn floor_walkable(self) -> bool {
+        self.0.floor_walkable()
+    }
+
+    /// Floor diagonal split id (decides the triangulation used
+    /// to interpolate height samples).
+    pub fn floor_split(self) -> u8 {
+        self.0.floor_split()
+    }
+
+    /// Ceiling diagonal split id.
+    pub fn ceiling_split(self) -> u8 {
+        self.0.ceiling_split()
+    }
+
+    /// Floor corner heights `[NW, NE, SE, SW]`.
+    pub fn floor_heights(self) -> [i32; 4] {
+        self.0.floor_heights()
+    }
+
+    /// Ceiling corner heights `[NW, NE, SE, SW]`.
+    pub fn ceiling_heights(self) -> [i32; 4] {
+        self.0.ceiling_heights()
+    }
+
+    /// First global wall index for this sector.
+    pub fn first_wall(self) -> u16 {
+        self.0.first_wall()
+    }
+
+    /// Number of walls belonging to this sector.
+    pub fn wall_count(self) -> u16 {
+        self.0.wall_count()
+    }
+}
+
+/// Render-side projection of one decoded wall.
+#[derive(Copy, Clone, Debug)]
+pub struct WallRender(psx_asset::WorldWall);
+
+impl WallRender {
+    /// Direction id.
+    pub fn direction(self) -> u8 {
+        self.0.direction()
+    }
+
+    /// Material slot.
+    pub fn material(self) -> u16 {
+        self.0.material()
+    }
+
+    /// Wall heights `[bottom-left, bottom-right, top-right, top-left]`.
+    pub fn heights(self) -> [i32; 4] {
+        self.0.heights()
+    }
+}
+
+/// Collision-side projection of one decoded wall.
+#[derive(Copy, Clone, Debug)]
+pub struct WallCollision(psx_asset::WorldWall);
+
+impl WallCollision {
+    /// Direction id.
+    pub fn direction(self) -> u8 {
+        self.0.direction()
+    }
+
+    /// `true` when this wall blocks character movement.
+    pub fn solid(self) -> bool {
+        self.0.solid()
+    }
+
+    /// Wall heights `[bottom-left, bottom-right, top-right, top-left]`
+    /// for slab-vs-character clearance checks.
+    pub fn heights(self) -> [i32; 4] {
+        self.0.heights()
+    }
+}
+
+// Compile-time guarantee that `RuntimeRoom` and its render /
+// collision facades stay zero-allocation `Copy` types. Any
+// future change that adds an owned field (Vec, String, …) will
+// break the build here, which is the whole point.
+const _: () = {
+    const fn _assert_copy<T: Copy>() {}
+    _assert_copy::<RuntimeRoom<'static>>();
+    _assert_copy::<RoomRender<'static, 'static>>();
+    _assert_copy::<RoomCollision<'static, 'static>>();
+    _assert_copy::<SectorRender>();
+    _assert_copy::<SectorCollision>();
+    _assert_copy::<WallRender>();
+    _assert_copy::<WallCollision>();
+};
 
 #[cfg(test)]
 extern crate std;
