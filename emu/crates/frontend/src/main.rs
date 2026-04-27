@@ -684,6 +684,8 @@ impl ApplicationHandler for Shell {
                 let editor_hover = state.editor.hovered_3d_sector();
                 let editor_hover_edge = state.editor.hovered_3d_edge();
                 let editor_root = state.editor.project_root();
+                let editor_hover_face = state.editor.hovered_face();
+                let editor_selected_face = state.editor.selected_face();
                 gfx.render_editor_preview(
                     state.editor.project(),
                     editor_root,
@@ -691,6 +693,8 @@ impl ApplicationHandler for Shell {
                     editor_selected,
                     editor_hover,
                     editor_hover_edge,
+                    editor_hover_face,
+                    editor_selected_face,
                 );
 
                 let vram_tex = gfx.vram_texture_id();

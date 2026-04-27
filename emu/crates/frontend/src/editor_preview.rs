@@ -114,6 +114,8 @@ pub fn build_phase1_cmd_log(
     selected: psxed_project::NodeId,
     hovered_cell: Option<(u16, u16)>,
     hovered_edge: Option<(u16, u16, u8)>,
+    hovered_face: Option<psxed_ui::FaceRef>,
+    selected_face: Option<psxed_ui::FaceRef>,
     textures: &EditorTextures,
 ) -> Vec<GpuCmdLogEntry> {
     let Some((grid, target)) = first_room_grid(project) else {
@@ -136,6 +138,18 @@ pub fn build_phase1_cmd_log(
         push_hover_edge_overlay(grid, sx, sz, dir, &mut scratch);
     } else if let Some((sx, sz)) = hovered_cell {
         push_hover_overlay(grid, sx, sz, &mut scratch);
+    }
+    // Face outlines for the Select tool. Selected drawn first so
+    // its bolder lines sit *under* a possibly-co-located hover —
+    // that way switching focus from selected → hover via mouse-move
+    // doesn't make the bold outline strobe.
+    if let Some(face) = selected_face {
+        push_face_outline(grid, face, FACE_OUTLINE_SELECTED, &mut scratch);
+    }
+    if let Some(face) = hovered_face {
+        if Some(face) != selected_face {
+            push_face_outline(grid, face, FACE_OUTLINE_HOVER, &mut scratch);
+        }
     }
 
     // SAFETY: `scratch.tris` lives until end of this function (the
@@ -670,6 +684,186 @@ fn push_hover_edge_overlay(
     let color = (0xFF, 0x60, 0x60);
     push_tri_at_slot(scratch, [p_a_lo, p_a_hi, p_b_lo], color, 0);
     push_tri_at_slot(scratch, [p_b_lo, p_a_hi, p_b_hi], color, 0);
+}
+
+/// Hover and Selected outline styling. RGB plus screen-space line
+/// thickness in pixels; selected reads bolder so the user can spot
+/// it across a busy room.
+const FACE_OUTLINE_HOVER: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0xFF, 0xE0, 0x60),
+    thickness_px: 1,
+};
+const FACE_OUTLINE_SELECTED: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0x60, 0xC8, 0xFF),
+    thickness_px: 2,
+};
+
+#[derive(Copy, Clone)]
+struct FaceOutlineStyle {
+    rgb: (u8, u8, u8),
+    thickness_px: i16,
+}
+
+/// Stamp four short, screen-space-thick line segments along the
+/// edges of a picked face. Drawing in screen space (after GTE
+/// projection) keeps the outline a constant pixel weight regardless
+/// of perspective, which matches Godot / Unity's "selection halo"
+/// look. Lines pinned to OT slot 0 so they paint on top of every
+/// floor / wall / ceiling.
+fn push_face_outline(
+    grid: &WorldGrid,
+    face: psxed_ui::FaceRef,
+    style: FaceOutlineStyle,
+    scratch: &mut PreviewScratch,
+) {
+    if face.sx >= grid.width || face.sz >= grid.depth {
+        return;
+    }
+    let Some(sector) = grid.sector(face.sx, face.sz) else {
+        return;
+    };
+    let s = grid.sector_size;
+    let x0 = (face.sx as i32) * s;
+    let x1 = ((face.sx as i32) + 1) * s;
+    let z0 = (face.sz as i32) * s;
+    let z1 = ((face.sz as i32) + 1) * s;
+    // Lift a hair off the surface so the outline doesn't z-fight
+    // the face it's marking. Sloped floors keep their relative
+    // outline position because we lift each corner by the same
+    // amount along the local up axis.
+    const LIFT: i32 = 4;
+    let corners = match face.kind {
+        psxed_ui::FaceKind::Floor => sector.floor.as_ref().map(|f| {
+            let h = f.heights;
+            [
+                [x0, h[0] + LIFT, z1],
+                [x1, h[1] + LIFT, z1],
+                [x1, h[2] + LIFT, z0],
+                [x0, h[3] + LIFT, z0],
+            ]
+        }),
+        psxed_ui::FaceKind::Ceiling => sector.ceiling.as_ref().map(|c| {
+            let h = c.heights;
+            [
+                [x0, h[0] - LIFT, z1],
+                [x1, h[1] - LIFT, z1],
+                [x1, h[2] - LIFT, z0],
+                [x0, h[3] - LIFT, z0],
+            ]
+        }),
+        psxed_ui::FaceKind::Wall { dir, stack } => {
+            let walls = sector.walls.get(dir);
+            walls.get(stack as usize).map(|wall| {
+                let (bl_xy, br_xy) = wall_xy_for(dir, x0, x1, z0, z1);
+                let h = wall.heights;
+                // Inset the outline 4 units along the normal of
+                // the wall plane so it doesn't z-fight the wall
+                // surface when viewed from inside the room.
+                let (nx, nz) = wall_inward_normal(dir);
+                [
+                    [bl_xy.0 + LIFT * nx, h[0], bl_xy.1 + LIFT * nz],
+                    [br_xy.0 + LIFT * nx, h[1], br_xy.1 + LIFT * nz],
+                    [br_xy.0 + LIFT * nx, h[2], br_xy.1 + LIFT * nz],
+                    [bl_xy.0 + LIFT * nx, h[3], bl_xy.1 + LIFT * nz],
+                ]
+            })
+        }
+    };
+    let Some(corners) = corners else { return };
+    let projected: [psx_gte::scene::Projected; 4] = [
+        gte_scene::project_vertex(world_to_view(corners[0])),
+        gte_scene::project_vertex(world_to_view(corners[1])),
+        gte_scene::project_vertex(world_to_view(corners[2])),
+        gte_scene::project_vertex(world_to_view(corners[3])),
+    ];
+    // Skip outlines whose corners didn't project — `project_vertex`
+    // returns `sz == 0` for behind-camera or near-plane-clipped
+    // points, which would produce nonsense screen lines.
+    if projected.iter().any(|p| p.sz == 0) {
+        return;
+    }
+    for i in 0..4 {
+        let a = projected[i];
+        let b = projected[(i + 1) % 4];
+        push_screen_line(scratch, a, b, style);
+    }
+}
+
+/// World-space (x, z) endpoints of a wall on the given cardinal
+/// edge — mirrors `push_wall_face` so picking, paint preview, and
+/// outline rendering all agree.
+fn wall_xy_for(
+    dir: GridDirection,
+    x0: i32,
+    x1: i32,
+    z0: i32,
+    z1: i32,
+) -> ((i32, i32), (i32, i32)) {
+    match dir {
+        GridDirection::North => ((x0, z1), (x1, z1)),
+        GridDirection::East => ((x1, z1), (x1, z0)),
+        GridDirection::South => ((x1, z0), (x0, z0)),
+        GridDirection::West => ((x0, z0), (x0, z1)),
+        _ => ((x0, z0), (x0, z0)),
+    }
+}
+
+/// Inward-facing normal (sign of x, sign of z) for the wall on
+/// `dir`. Used to inset the outline so it sits *inside* the room,
+/// not behind the wall plane.
+fn wall_inward_normal(dir: GridDirection) -> (i32, i32) {
+    match dir {
+        GridDirection::North => (0, -1),
+        GridDirection::East => (-1, 0),
+        GridDirection::South => (0, 1),
+        GridDirection::West => (1, 0),
+        _ => (0, 0),
+    }
+}
+
+/// Emit two triangles forming a `thickness_px`-pixel-wide line
+/// between two screen-projected vertices. The OT slot is pinned at
+/// 0 so the line draws on top of everything.
+fn push_screen_line(
+    scratch: &mut PreviewScratch,
+    a: psx_gte::scene::Projected,
+    b: psx_gte::scene::Projected,
+    style: FaceOutlineStyle,
+) {
+    // Perpendicular to (b - a) in screen space, normalised to
+    // `thickness_px / 2`. Width 0 (parallel a/b) collapses the line
+    // to a single screen point, which we just skip.
+    let dx = (b.sx as f32) - (a.sx as f32);
+    let dy = (b.sy as f32) - (a.sy as f32);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.5 {
+        return;
+    }
+    let half = (style.thickness_px as f32) * 0.5;
+    let nx = -dy / len * half;
+    let ny = dx / len * half;
+    let a_lo = synth(
+        a.sx.saturating_add(-nx as i16),
+        a.sy.saturating_add(-ny as i16),
+        a.sz,
+    );
+    let a_hi = synth(
+        a.sx.saturating_add(nx as i16),
+        a.sy.saturating_add(ny as i16),
+        a.sz,
+    );
+    let b_lo = synth(
+        b.sx.saturating_add(-nx as i16),
+        b.sy.saturating_add(-ny as i16),
+        b.sz,
+    );
+    let b_hi = synth(
+        b.sx.saturating_add(nx as i16),
+        b.sy.saturating_add(ny as i16),
+        b.sz,
+    );
+    push_tri_at_slot(scratch, [a_lo, a_hi, b_lo], style.rgb, 0);
+    push_tri_at_slot(scratch, [b_lo, a_hi, b_hi], style.rgb, 0);
 }
 
 /// Lower-level [`push_tri`] that pins the OT slot rather than

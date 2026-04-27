@@ -106,6 +106,19 @@ pub struct EditorWorkspace {
     /// which boundary the next click will target. Cleared whenever
     /// the active tool isn't PaintWall or the pointer leaves.
     hovered_3d_edge: Option<(u16, u16, u8)>,
+    /// Face under the pointer while the Select tool is active —
+    /// floors, walls, ceilings of the active Room. Updated every
+    /// frame the panel is hovered and the tool is Select; cleared
+    /// when the pointer leaves or another tool takes over. The
+    /// renderer outlines this face lightly so the user sees what
+    /// the next click will pick.
+    hovered_face: Option<FaceRef>,
+    /// Face the user clicked with the Select tool last. Persists
+    /// across frames until the user clicks a different face or
+    /// switches tools. The renderer outlines it more boldly than
+    /// `hovered_face`; the inspector panel reads it to surface
+    /// per-face properties (material, heights, …).
+    selected_face: Option<FaceRef>,
     /// Last cell `apply_paint` has run on during the current drag.
     /// Used to dedupe per-frame paint events so click-drag with
     /// Wall / Place doesn't stack duplicate walls / spawn N entities
@@ -181,6 +194,28 @@ struct PsxtStats {
     pixel_bytes: u32,
     clut_bytes: u32,
     file_bytes: u32,
+}
+
+/// One pickable surface on the active Room's grid. Floors and
+/// ceilings are addressed by sector; walls add a cardinal direction
+/// plus a stack index (a single edge can hold multiple stacked walls
+/// — windows / arches — and each is independently selectable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaceKind {
+    Floor,
+    Ceiling,
+    Wall { dir: GridDirection, stack: u8 },
+}
+
+/// A face inside the active Room, fully qualified by Room id +
+/// sector + face kind. Used by the Select tool's hover / selected
+/// state and the per-face inspector that follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FaceRef {
+    pub room: NodeId,
+    pub sx: u16,
+    pub sz: u16,
+    pub kind: FaceKind,
 }
 
 /// Snapshot of the editor's 3D viewport camera, handed to the
@@ -435,6 +470,8 @@ impl EditorWorkspace {
             selected_sector: None,
             hovered_3d_sector: None,
             hovered_3d_edge: None,
+            hovered_face: None,
+            selected_face: None,
             last_paint_cell: None,
             renaming: None,
             pending_rename_focus: false,
@@ -821,6 +858,17 @@ impl EditorWorkspace {
             } else {
                 None
             };
+        // Select runs a fuller ray-test against every face in the
+        // active Room — floors, walls, ceilings — so the user sees
+        // a light outline on whatever they're about to click. Other
+        // tools clear `hovered_face` so the outline doesn't linger.
+        self.hovered_face = if matches!(self.active_tool, ViewTool::Select) {
+            response
+                .hover_pos()
+                .and_then(|pointer| self.pick_face_at(rect, pointer))
+        } else {
+            None
+        };
 
         // Primary click / drag: ray-pick the cell under the cursor
         // and dispatch to the active tool. Click starts a fresh
@@ -895,6 +943,20 @@ impl EditorWorkspace {
         self.hovered_3d_edge
     }
 
+    /// Face under the 3D pointer when the Select tool is active —
+    /// floors / walls / ceilings of the active Room. Frontend reads
+    /// this every frame to draw a light hover outline.
+    pub fn hovered_face(&self) -> Option<FaceRef> {
+        self.hovered_face
+    }
+
+    /// Face the user picked with the Select tool. Frontend draws a
+    /// bold outline; the inspector reads it to surface per-face
+    /// editable fields (material, heights, …).
+    pub fn selected_face(&self) -> Option<FaceRef> {
+        self.selected_face
+    }
+
     /// Pick the cell + nearest cardinal edge at `world` within `room`.
     /// Mirrors the click-time logic in `apply_paint(PaintWall)` so
     /// the hover preview and the actual placement target agree.
@@ -951,10 +1013,23 @@ impl EditorWorkspace {
 
         match self.active_tool {
             ViewTool::Move => self.snap_selected_to_cell(room_id, sx, sz),
-            // Select picks the placeable child node nearest to the
-            // pointer's projected ground-plane hit; falls back to
-            // selecting the Room itself if no entity is close.
-            ViewTool::Select => self.pick_entity_at(room_id, world),
+            // Select promotes the hovered face (floor / wall /
+            // ceiling) into the persisted selection. The hover
+            // tracker has already done the ray-test; reading it
+            // here keeps click and hover in lockstep so the user
+            // never picks something different from what was
+            // outlined under the cursor.
+            ViewTool::Select => {
+                if let Some(face) = self.hovered_face {
+                    self.selected_face = Some(face);
+                    self.selected_node = NodeId::ROOT;
+                    self.selected_resource = None;
+                    self.status = format!("Selected {}", describe_face(face));
+                } else {
+                    self.selected_face = None;
+                    self.status = "Cleared face selection".to_string();
+                }
+            }
             // Rotate / Scale aren't Sims-shaped — skip in 3D.
             ViewTool::Rotate | ViewTool::Scale => {}
             // Paint / Place / Erase: call `apply_paint` directly so
@@ -962,59 +1037,6 @@ impl EditorWorkspace {
             // handler's hit-test machinery.
             tool => {
                 self.apply_paint(tool, room_id, sx, sz, world);
-            }
-        }
-    }
-
-    /// Hit-test placeable child nodes against the picked ground
-    /// position; selects the closest within half a sector. Falls
-    /// back to selecting the Room when no entity is close enough.
-    fn pick_entity_at(&mut self, room_id: NodeId, world: [f32; 2]) {
-        let scene = self.project.active_scene();
-        let mut best: Option<(NodeId, String, f32)> = None;
-        for node in scene.nodes() {
-            // Skip the things that can't be 3D-picked: the Room
-            // itself, its World parent, the scene root, plain
-            // organisational nodes.
-            if !matches!(
-                node.kind,
-                NodeKind::SpawnPoint { .. }
-                    | NodeKind::MeshInstance { .. }
-                    | NodeKind::Light { .. }
-                    | NodeKind::Trigger { .. }
-                    | NodeKind::Portal { .. }
-                    | NodeKind::AudioSource { .. }
-            ) {
-                continue;
-            }
-            let entity_x = node.transform.translation[0];
-            let entity_z = node.transform.translation[2];
-            // World coords here are in editor "1 unit = 1 sector"
-            // space; the room's geometry origin is at (-half_w,
-            // -half_d). Entity transforms are stored relative to
-            // that anchor too, so the difference is direct.
-            let dx = entity_x - world[0];
-            let dz = entity_z - world[1];
-            let dist = (dx * dx + dz * dz).sqrt();
-            if dist > 0.5 {
-                continue;
-            }
-            if let Some((_, _, best_dist)) = best {
-                if dist >= best_dist {
-                    continue;
-                }
-            }
-            best = Some((node.id, node.name.clone(), dist));
-        }
-        match best {
-            Some((id, name, _)) => {
-                self.selected_node = id;
-                self.selected_resource = None;
-                self.status = format!("Selected {name}");
-            }
-            None => {
-                self.selected_node = room_id;
-                self.selected_resource = None;
             }
         }
     }
@@ -1055,6 +1077,179 @@ impl EditorWorkspace {
             self.status = format!("Moved {name} to {sx},{sz}");
             self.mark_dirty();
         }
+    }
+
+    /// Build the camera ray in world units for the given pointer
+    /// position, or `None` if the pointer's outside the viewport.
+    /// Shared by `pick_3d_world` (ray vs. ground plane) and
+    /// `pick_face_at` (ray vs. every face triangle in the active
+    /// room) so both agree on every axis convention.
+    fn camera_ray_for_pointer(
+        &self,
+        rect: egui::Rect,
+        pointer: egui::Pos2,
+    ) -> Option<([f32; 3], [f32; 3])> {
+        if !rect.contains(pointer) {
+            return None;
+        }
+        let scene = self.project.active_scene();
+        let room = scene
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Room { .. }))?;
+        let NodeKind::Room { grid } = &room.kind else {
+            return None;
+        };
+
+        let yaw = self.viewport_3d_yaw;
+        let pitch = self.viewport_3d_pitch;
+        let radius = self.viewport_3d_radius as f32;
+        let cos_p = psx_gte::transform::cos_1_3_12(pitch) as f32 / 4096.0;
+        let sin_p = psx_gte::transform::sin_1_3_12(pitch) as f32 / 4096.0;
+        let cos_y = psx_gte::transform::cos_1_3_12(yaw) as f32 / 4096.0;
+        let sin_y = psx_gte::transform::sin_1_3_12(yaw) as f32 / 4096.0;
+        let target_world = [
+            (grid.width as f32 * grid.sector_size as f32) * 0.5,
+            0.0,
+            (grid.depth as f32 * grid.sector_size as f32) * 0.5,
+        ];
+        let cam_pos = [
+            target_world[0] + radius * cos_p * sin_y,
+            target_world[1] - radius * sin_p,
+            target_world[2] + radius * cos_p * cos_y,
+        ];
+        let forward = normalize3([
+            target_world[0] - cam_pos[0],
+            target_world[1] - cam_pos[1],
+            target_world[2] - cam_pos[2],
+        ]);
+        let right = normalize3(cross3(forward, [0.0, 1.0, 0.0]));
+        let up = cross3(right, forward);
+
+        let nx = (pointer.x - rect.center().x) / (rect.width() * 0.5);
+        let ny = (pointer.y - rect.center().y) / (rect.height() * 0.5);
+        let aspect = rect.width() / rect.height();
+        let target_aspect = 320.0 / 240.0;
+        let half_fov_x = 0.5 * (aspect / target_aspect).max(0.001);
+        let half_fov_y = 0.5;
+        let dir = normalize3([
+            forward[0] + right[0] * (nx * half_fov_x) + up[0] * (-ny * half_fov_y),
+            forward[1] + right[1] * (nx * half_fov_x) + up[1] * (-ny * half_fov_y),
+            forward[2] + right[2] * (nx * half_fov_x) + up[2] * (-ny * half_fov_y),
+        ]);
+        Some((cam_pos, dir))
+    }
+
+    /// Walk every floor / ceiling / wall in the active Room and
+    /// return the closest face the camera ray hits. Mirrors the
+    /// triangle layout `editor_preview` emits so what the user sees
+    /// matches what gets picked. `None` when the pointer is off the
+    /// panel or no face is along the ray.
+    fn pick_face_at(&self, rect: egui::Rect, pointer: egui::Pos2) -> Option<FaceRef> {
+        let (origin, dir) = self.camera_ray_for_pointer(rect, pointer)?;
+        let scene = self.project.active_scene();
+        let room = scene
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Room { .. }))?;
+        let NodeKind::Room { grid } = &room.kind else {
+            return None;
+        };
+        let room_id = room.id;
+        let s = grid.sector_size as f32;
+
+        let mut best: Option<(FaceRef, f32)> = None;
+        let mut consider = |face: FaceRef, t: f32| {
+            if !t.is_finite() || t <= 0.0 {
+                return;
+            }
+            if best.map_or(true, |(_, bt)| t < bt) {
+                best = Some((face, t));
+            }
+        };
+
+        for sx in 0..grid.width {
+            for sz in 0..grid.depth {
+                let Some(sector) = grid.sector(sx, sz) else {
+                    continue;
+                };
+                let x0 = sx as f32 * s;
+                let x1 = (sx + 1) as f32 * s;
+                let z0 = sz as f32 * s;
+                let z1 = (sz + 1) as f32 * s;
+
+                if let Some(floor) = &sector.floor {
+                    let h = floor.heights;
+                    let nw = [x0, h[0] as f32, z1];
+                    let ne = [x1, h[1] as f32, z1];
+                    let se = [x1, h[2] as f32, z0];
+                    let sw = [x0, h[3] as f32, z0];
+                    let face = FaceRef {
+                        room: room_id,
+                        sx,
+                        sz,
+                        kind: FaceKind::Floor,
+                    };
+                    if let Some(t) = ray_triangle(origin, dir, nw, sw, ne) {
+                        consider(face, t);
+                    }
+                    if let Some(t) = ray_triangle(origin, dir, ne, sw, se) {
+                        consider(face, t);
+                    }
+                }
+                if let Some(ceiling) = &sector.ceiling {
+                    let h = ceiling.heights;
+                    let nw = [x0, h[0] as f32, z1];
+                    let ne = [x1, h[1] as f32, z1];
+                    let se = [x1, h[2] as f32, z0];
+                    let sw = [x0, h[3] as f32, z0];
+                    let face = FaceRef {
+                        room: room_id,
+                        sx,
+                        sz,
+                        kind: FaceKind::Ceiling,
+                    };
+                    if let Some(t) = ray_triangle(origin, dir, nw, ne, sw) {
+                        consider(face, t);
+                    }
+                    if let Some(t) = ray_triangle(origin, dir, ne, se, sw) {
+                        consider(face, t);
+                    }
+                }
+                for dir_card in [
+                    GridDirection::North,
+                    GridDirection::East,
+                    GridDirection::South,
+                    GridDirection::West,
+                ] {
+                    for (stack_idx, wall) in sector.walls.get(dir_card).iter().enumerate() {
+                        let (bl_xy, br_xy) = wall_xy_endpoints(dir_card, x0, x1, z0, z1);
+                        let h = wall.heights;
+                        let bl = [bl_xy.0, h[0] as f32, bl_xy.1];
+                        let br = [br_xy.0, h[1] as f32, br_xy.1];
+                        let tr = [br_xy.0, h[2] as f32, br_xy.1];
+                        let tl = [bl_xy.0, h[3] as f32, bl_xy.1];
+                        let face = FaceRef {
+                            room: room_id,
+                            sx,
+                            sz,
+                            kind: FaceKind::Wall {
+                                dir: dir_card,
+                                stack: stack_idx as u8,
+                            },
+                        };
+                        if let Some(t) = ray_triangle(origin, dir, bl, br, tr) {
+                            consider(face, t);
+                        }
+                        if let Some(t) = ray_triangle(origin, dir, bl, tr, tl) {
+                            consider(face, t);
+                        }
+                    }
+                }
+            }
+        }
+
+        best.map(|(face, _)| face)
     }
 
     /// Project a pointer position inside the 3D viewport panel onto
@@ -1578,6 +1773,15 @@ impl EditorWorkspace {
                 panel_heading(ui, icons::SCAN, "Inspector");
                 ui.separator();
 
+                // Selection priority: face (Select tool product) →
+                // resource (clicked in the bottom panel) → node
+                // (scene tree row). Faces win because they're the
+                // active edit target during paint workflows.
+                if let Some(face) = self.selected_face {
+                    self.draw_face_inspector(ui, face);
+                    return;
+                }
+
                 if let Some(resource_id) = self.selected_resource {
                     self.draw_resource_inspector(ui, resource_id);
                     return;
@@ -1724,6 +1928,155 @@ impl EditorWorkspace {
                     self.mark_dirty();
                 }
             });
+    }
+
+    /// Inspector panel for the face currently selected by the
+    /// Select tool. Surfaces material picker, height fields, and a
+    /// preview thumbnail of the linked texture so the user can
+    /// retarget materials without opening the resources panel.
+    fn draw_face_inspector(&mut self, ui: &mut egui::Ui, face: FaceRef) {
+        let material_options = self.project.material_options();
+        // Snapshot the face's current material id BEFORE we borrow
+        // the scene mutably, so the preview lookup below can run
+        // without fighting the inspector's `&mut` on resource.data.
+        let current_material = self
+            .project
+            .active_scene()
+            .node(face.room)
+            .and_then(|node| match &node.kind {
+                NodeKind::Room { grid } => Some(grid),
+                _ => None,
+            })
+            .and_then(|grid| grid.sector(face.sx, face.sz))
+            .and_then(|sector| match face.kind {
+                FaceKind::Floor => sector.floor.as_ref().and_then(|f| f.material),
+                FaceKind::Ceiling => sector.ceiling.as_ref().and_then(|c| c.material),
+                FaceKind::Wall { dir, stack } => sector
+                    .walls
+                    .get(dir)
+                    .get(stack as usize)
+                    .and_then(|w| w.material),
+            });
+        let preview_thumb = current_material
+            .and_then(|id| self.project.resource(id))
+            .and_then(|resource| self.texture_thumb_entry(resource))
+            .map(|entry| (entry.handle.id(), entry.stats));
+
+        ui.horizontal(|ui| {
+            draw_inline_icon(ui, icons::GRID, STUDIO_ACCENT);
+            ui.strong(describe_face(face));
+        });
+        ui.separator();
+        draw_psxt_preview_block(ui, preview_thumb);
+
+        let scene = self.project.active_scene_mut();
+        let Some(room) = scene.node_mut(face.room) else {
+            ui.weak("Selected face's Room is gone");
+            return;
+        };
+        let NodeKind::Room { grid } = &mut room.kind else {
+            ui.weak("Selected face's Room kind changed");
+            return;
+        };
+        if face.sx >= grid.width || face.sz >= grid.depth {
+            ui.weak("Cell out of grid bounds");
+            return;
+        }
+        let sector_size = grid.sector_size;
+        let Some(sector) = grid.ensure_sector(face.sx, face.sz) else {
+            ui.weak("Cell not authored");
+            return;
+        };
+
+        let mut changed = false;
+        match face.kind {
+            FaceKind::Floor => {
+                let Some(face_data) = sector.floor.as_mut() else {
+                    ui.weak("Floor was removed");
+                    return;
+                };
+                egui::CollapsingHeader::new(icons::label(icons::BLEND, "Material"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= material_picker(
+                            ui,
+                            "    Material",
+                            &mut face_data.material,
+                            &material_options,
+                        );
+                    });
+                egui::CollapsingHeader::new(icons::label(icons::MOVE, "Heights"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= height_row("Height", &mut face_data.heights, ui);
+                    });
+            }
+            FaceKind::Ceiling => {
+                let Some(face_data) = sector.ceiling.as_mut() else {
+                    ui.weak("Ceiling was removed");
+                    return;
+                };
+                egui::CollapsingHeader::new(icons::label(icons::BLEND, "Material"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= material_picker(
+                            ui,
+                            "    Material",
+                            &mut face_data.material,
+                            &material_options,
+                        );
+                    });
+                egui::CollapsingHeader::new(icons::label(icons::MOVE, "Heights"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= height_row("Height", &mut face_data.heights, ui);
+                    });
+            }
+            FaceKind::Wall { dir, stack } => {
+                let walls = sector.walls.get_mut(dir);
+                let Some(wall) = walls.get_mut(stack as usize) else {
+                    ui.weak("Wall stack entry was removed");
+                    return;
+                };
+                egui::CollapsingHeader::new(icons::label(icons::BLEND, "Material"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= material_picker(
+                            ui,
+                            "    Material",
+                            &mut wall.material,
+                            &material_options,
+                        );
+                    });
+                egui::CollapsingHeader::new(icons::label(icons::MOVE, "Span"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("    Bottom");
+                            let mut bot = wall.heights[0];
+                            if ui.add(egui::DragValue::new(&mut bot).speed(8.0)).changed() {
+                                wall.heights[0] = bot;
+                                wall.heights[1] = bot;
+                                changed = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("    Top");
+                            let mut top = wall.heights[2];
+                            if ui.add(egui::DragValue::new(&mut top).speed(8.0)).changed() {
+                                wall.heights[2] = top;
+                                wall.heights[3] = top;
+                                changed = true;
+                            }
+                        });
+                    });
+                let _ = sector_size;
+            }
+        }
+
+        if changed {
+            self.mark_dirty();
+        }
     }
 
     fn draw_resource_inspector(&mut self, ui: &mut egui::Ui, id: ResourceId) {
@@ -4824,6 +5177,97 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
     }
     let inv = len_sq.sqrt().recip();
     [v[0] * inv, v[1] * inv, v[2] * inv]
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// One-line human description of a `FaceRef` for status messages
+/// and the inspector header. Walls include their cardinal direction
+/// + stack index since a single edge can carry several stacked
+/// walls (windows / arches).
+fn describe_face(face: FaceRef) -> String {
+    match face.kind {
+        FaceKind::Floor => format!("Floor at {},{}", face.sx, face.sz),
+        FaceKind::Ceiling => format!("Ceiling at {},{}", face.sx, face.sz),
+        FaceKind::Wall { dir, stack } => {
+            let dir_label = match dir {
+                GridDirection::North => "North",
+                GridDirection::East => "East",
+                GridDirection::South => "South",
+                GridDirection::West => "West",
+                _ => "Diag",
+            };
+            format!("{dir_label} wall #{stack} at {},{}", face.sx, face.sz)
+        }
+    }
+}
+
+/// World-space (x, z) endpoints of a wall on the given cardinal
+/// edge of a sector, packed as `(bottom-left, bottom-right)`. The
+/// pairing matches `editor_preview::push_wall_face` so picking and
+/// rendering agree on which corner is which.
+fn wall_xy_endpoints(
+    dir: GridDirection,
+    x0: f32,
+    x1: f32,
+    z0: f32,
+    z1: f32,
+) -> ((f32, f32), (f32, f32)) {
+    match dir {
+        GridDirection::North => ((x0, z1), (x1, z1)),
+        GridDirection::East => ((x1, z1), (x1, z0)),
+        GridDirection::South => ((x1, z0), (x0, z0)),
+        GridDirection::West => ((x0, z0), (x0, z1)),
+        // Diagonals aren't authored from the toolbar yet — picking
+        // them is a follow-up. Pick a degenerate edge so the
+        // ray-test never hits.
+        _ => ((x0, z0), (x0, z0)),
+    }
+}
+
+/// Möller–Trumbore ray-triangle intersection. Returns the ray
+/// parameter `t` of the front-side hit, or `None` for misses /
+/// back-face hits / degenerate triangles. Front-side only because
+/// the editor draws every face once per OT slot — picking the back
+/// of a wall would land on the *opposite* room's geometry, which
+/// reads as a bug to the user.
+fn ray_triangle(
+    orig: [f32; 3],
+    dir: [f32; 3],
+    v0: [f32; 3],
+    v1: [f32; 3],
+    v2: [f32; 3],
+) -> Option<f32> {
+    let edge1 = sub3(v1, v0);
+    let edge2 = sub3(v2, v0);
+    let h = cross3(dir, edge2);
+    let a = dot3(edge1, h);
+    if a.abs() < 1e-6 {
+        return None;
+    }
+    let f = 1.0 / a;
+    let s = sub3(orig, v0);
+    let u = f * dot3(s, h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = cross3(s, edge1);
+    let v = f * dot3(dir, q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = f * dot3(edge2, q);
+    if t > 1e-3 {
+        Some(t)
+    } else {
+        None
+    }
 }
 
 /// Lowercase + non-alphanumeric → `_`, matching the cooker's clip
