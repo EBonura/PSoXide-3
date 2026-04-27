@@ -16,6 +16,7 @@ license    = "GPL-2.0-or-later"
 repository = "https://github.com/EBonura/PSoXide"
 
 [workspace.dependencies]
+psx-asset    = { path = "../sdk/crates/psx-asset" }
 psxed-format = { path = "crates/psxed-format" }
 psxed-gltf   = { path = "crates/psxed-gltf" }
 psxed-obj    = { path = "crates/psxed-obj" }
