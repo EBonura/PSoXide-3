@@ -822,13 +822,18 @@ impl EditorWorkspace {
         if response.dragged_by(egui::PointerButton::Middle)
             || response.dragged_by(egui::PointerButton::Secondary)
         {
+            // 0.5 px → 1 q12-step keeps the orbit responsive without
+            // making a small wrist flick spin the camera multiple
+            // turns. Earlier 1.5x felt over-eager; this lands around
+            // ~3° per 100 pixels of drag.
+            const ORBIT_DRAG_STEP: f32 = 0.5;
             let delta = response.drag_delta();
             self.viewport_3d_yaw = self
                 .viewport_3d_yaw
-                .wrapping_add((delta.x * 1.5) as i16 as u16);
+                .wrapping_add((delta.x * ORBIT_DRAG_STEP) as i16 as u16);
             self.viewport_3d_pitch = self
                 .viewport_3d_pitch
-                .wrapping_add((delta.y * 1.5) as i16 as u16);
+                .wrapping_add((delta.y * ORBIT_DRAG_STEP) as i16 as u16);
         }
 
         // Hover tracking: every frame the pointer is over the panel,
@@ -848,8 +853,26 @@ impl EditorWorkspace {
                 .find(|n| matches!(n.kind, NodeKind::Room { .. }))
                 .map(|n| n.id)
         });
-        self.hovered_3d_sector = hover_world
-            .and_then(|world| hover_room.and_then(|room| self.world_to_sector(room, world)));
+        // Cell-hover quad is a paint-tool affordance — Move /
+        // Rotate / Scale / Select have their own visual idiom (face
+        // outline for Select, no overlay for the rest), so we only
+        // update `hovered_3d_sector` when a paint tool is active.
+        // Otherwise the yellow fill keeps drawing on top of the
+        // viewport even when the user is just orbiting.
+        let paint_tool = matches!(
+            self.active_tool,
+            ViewTool::PaintFloor
+                | ViewTool::PaintWall
+                | ViewTool::PaintCeiling
+                | ViewTool::Erase
+                | ViewTool::Place
+        );
+        self.hovered_3d_sector = if paint_tool {
+            hover_world
+                .and_then(|world| hover_room.and_then(|room| self.world_to_sector(room, world)))
+        } else {
+            None
+        };
         self.hovered_3d_edge =
             if matches!(self.active_tool, ViewTool::PaintWall) {
                 hover_world.and_then(|world| {
@@ -883,7 +906,14 @@ impl EditorWorkspace {
         let primary_active = response.clicked_by(egui::PointerButton::Primary)
             || response.dragged_by(egui::PointerButton::Primary);
         if primary_active {
-            if let Some(pos) = response.interact_pointer_pos() {
+            // Select reads the face the hover-tracker already
+            // ray-picked this frame, so clicks land even when the
+            // ground-plane projection (which paint tools rely on)
+            // would fall outside the room footprint — back-row
+            // walls are the obvious case.
+            if matches!(self.active_tool, ViewTool::Select) {
+                self.commit_face_selection();
+            } else if let Some(pos) = response.interact_pointer_pos() {
                 if let Some(world) = self.pick_3d_world(rect, pos) {
                     self.dispatch_3d_tool(world);
                 }
@@ -1013,23 +1043,11 @@ impl EditorWorkspace {
 
         match self.active_tool {
             ViewTool::Move => self.snap_selected_to_cell(room_id, sx, sz),
-            // Select promotes the hovered face (floor / wall /
-            // ceiling) into the persisted selection. The hover
-            // tracker has already done the ray-test; reading it
-            // here keeps click and hover in lockstep so the user
-            // never picks something different from what was
-            // outlined under the cursor.
-            ViewTool::Select => {
-                if let Some(face) = self.hovered_face {
-                    self.selected_face = Some(face);
-                    self.selected_node = NodeId::ROOT;
-                    self.selected_resource = None;
-                    self.status = format!("Selected {}", describe_face(face));
-                } else {
-                    self.selected_face = None;
-                    self.status = "Cleared face selection".to_string();
-                }
-            }
+            // Select is handled separately on click — see
+            // `commit_face_selection`. It bypasses the floor-plane
+            // sector requirement since back-row walls' ground-plane
+            // projection lands outside the room footprint.
+            ViewTool::Select => {}
             // Rotate / Scale aren't Sims-shaped — skip in 3D.
             ViewTool::Rotate | ViewTool::Scale => {}
             // Paint / Place / Erase: call `apply_paint` directly so
@@ -1039,6 +1057,86 @@ impl EditorWorkspace {
                 self.apply_paint(tool, room_id, sx, sz, world);
             }
         }
+    }
+
+    /// Commit the most recent hover-tracked face to `selected_face`.
+    /// Called from the click handler when the Select tool is active,
+    /// independent of `dispatch_3d_tool`'s ground-plane sector
+    /// requirement so wall / ceiling clicks register even when the
+    /// ray-on-Y=0 hit lands beyond the room. Also surfaces the
+    /// face's material in the resources panel so the user sees
+    /// which material is on the picked surface.
+    fn commit_face_selection(&mut self) {
+        if let Some(face) = self.hovered_face {
+            self.selected_face = Some(face);
+            self.selected_node = NodeId::ROOT;
+            self.selected_resource = self.face_material(face);
+            self.status = format!("Selected {}", describe_face(face));
+        } else {
+            self.selected_face = None;
+            self.selected_resource = None;
+            self.status = "Cleared face selection".to_string();
+        }
+    }
+
+    /// Material id currently applied to `face`, or `None` if the
+    /// face is unassigned / its referent went away.
+    fn face_material(&self, face: FaceRef) -> Option<ResourceId> {
+        let scene = self.project.active_scene();
+        let node = scene.node(face.room)?;
+        let NodeKind::Room { grid } = &node.kind else {
+            return None;
+        };
+        let sector = grid.sector(face.sx, face.sz)?;
+        match face.kind {
+            FaceKind::Floor => sector.floor.as_ref().and_then(|f| f.material),
+            FaceKind::Ceiling => sector.ceiling.as_ref().and_then(|c| c.material),
+            FaceKind::Wall { dir, stack } => sector
+                .walls
+                .get(dir)
+                .get(stack as usize)
+                .and_then(|w| w.material),
+        }
+    }
+
+    /// Reassign `face`'s material in-place. Marks the project
+    /// dirty if the field actually moved. Used by the
+    /// resource-card click flow when a face is selected, so
+    /// picking a different material in the bottom panel
+    /// retargets the selected surface (Sims-style).
+    fn assign_face_material(&mut self, face: FaceRef, material: Option<ResourceId>) -> bool {
+        if self.face_material(face) == material {
+            return false;
+        }
+        self.push_undo();
+        let scene = self.project.active_scene_mut();
+        let Some(node) = scene.node_mut(face.room) else {
+            return false;
+        };
+        let NodeKind::Room { grid } = &mut node.kind else {
+            return false;
+        };
+        let Some(sector) = grid.ensure_sector(face.sx, face.sz) else {
+            return false;
+        };
+        let updated = match face.kind {
+            FaceKind::Floor => sector.floor.as_mut().map(|f| f.material = material).is_some(),
+            FaceKind::Ceiling => sector
+                .ceiling
+                .as_mut()
+                .map(|c| c.material = material)
+                .is_some(),
+            FaceKind::Wall { dir, stack } => sector
+                .walls
+                .get_mut(dir)
+                .get_mut(stack as usize)
+                .map(|w| w.material = material)
+                .is_some(),
+        };
+        if updated {
+            self.mark_dirty();
+        }
+        updated
     }
 
     /// Snap the selected entity's translation to the centre of cell
@@ -2376,8 +2474,25 @@ impl EditorWorkspace {
                         });
                     });
                 if let Some(id) = clicked {
-                    self.selected_resource = Some(id);
-                    self.selected_node = NodeId::ROOT;
+                    // Sims-style: with a face selected, clicking a
+                    // Material card retargets the face's material
+                    // rather than swapping the inspector. Texture
+                    // / non-Material clicks still navigate normally.
+                    let is_material = matches!(
+                        self.project.resource(id).map(|r| &r.data),
+                        Some(ResourceData::Material(_))
+                    );
+                    if let (true, Some(face)) = (is_material, self.selected_face) {
+                        if self.assign_face_material(face, Some(id)) {
+                            self.status =
+                                format!("Assigned material to {}", describe_face(face));
+                        }
+                        self.selected_resource = Some(id);
+                    } else {
+                        self.selected_resource = Some(id);
+                        self.selected_node = NodeId::ROOT;
+                        self.selected_face = None;
+                    }
                 }
             });
 
