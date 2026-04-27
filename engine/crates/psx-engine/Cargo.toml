@@ -7,16 +7,19 @@ repository.workspace = true
 description = "PSoXide engine layer. Scene/App framework + canonical unit types (Angle, Frames) sitting on top of the SDK. Host-independent; MIPS-target only."
 
 [dependencies]
-psx-asset = { workspace = true }
-psx-gpu  = { workspace = true }
-psx-gte  = { workspace = true }
-psx-math = { workspace = true }
-psx-pad  = { workspace = true }
-psx-spu  = { workspace = true }
-psx-vram = { workspace = true }
+# Explicit paths rather than `workspace = true` so this crate
+# resolves cleanly when consumed from outside its native workspace
+# (the editor frontend pulls it in for the 3D-viewport host renderer).
+psx-asset = { path = "../../../sdk/crates/psx-asset" }
+psx-gpu   = { path = "../../../sdk/crates/psx-gpu" }
+psx-gte   = { path = "../../../sdk/crates/psx-gte" }
+psx-math  = { path = "../../../sdk/crates/psx-math" }
+psx-pad   = { path = "../../../sdk/crates/psx-pad" }
+psx-spu   = { path = "../../../sdk/crates/psx-spu" }
+psx-vram  = { path = "../../../sdk/crates/psx-vram" }
 
 [target.'cfg(target_arch = "mips")'.dependencies]
-psx-rt = { workspace = true }
+psx-rt = { path = "../../../sdk/crates/psx-rt" }
 
 [lints.rust]
 missing_docs = "warn"

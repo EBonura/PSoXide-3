@@ -675,11 +675,11 @@ impl ApplicationHandler for Shell {
                 }
 
                 // Editor 3D preview: drive the editor-owned HwRenderer
-                // once per frame, regardless of editor visibility. The
-                // scene is tiny (Phase 0 = three triangles) and keeping
-                // the texture warm avoids a one-frame flash of stale
-                // contents the moment the editor panel opens.
-                gfx.render_editor_preview();
+                // once per frame, regardless of editor visibility, so
+                // the texture is always current the moment the editor
+                // panel opens. Cheap when the project has no Rooms.
+                let editor_camera = state.editor.viewport_3d_camera();
+                gfx.render_editor_preview(state.editor.project(), editor_camera);
 
                 let vram_tex = gfx.vram_texture_id();
                 let use_24bpp_display = state

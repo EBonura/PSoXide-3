@@ -111,8 +111,29 @@ pub struct EditorWorkspace {
     view_2d: bool,
     viewport_pan: Vec2,
     viewport_zoom: f32,
+    /// Orbit camera for the 3D viewport. Yaw + pitch in 4096-per-turn
+    /// Q12 units (matching `psx_engine::WorldCamera::orbit`); radius
+    /// in world units. Drag on the 3D panel rotates yaw/pitch; scroll
+    /// changes radius.
+    viewport_3d_yaw: u16,
+    viewport_3d_pitch: u16,
+    viewport_3d_radius: i32,
     dirty: bool,
     status: String,
+}
+
+/// Snapshot of the editor's 3D viewport camera, handed to the
+/// frontend each frame so it can drive the editor-owned `HwRenderer`
+/// from the same orbit state the editor's drag input updates.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewportCameraState {
+    /// Yaw, 4096 per full revolution.
+    pub yaw_q12: u16,
+    /// Pitch, 4096 per full revolution; positive raises the camera
+    /// above the target so the view tilts down.
+    pub pitch_q12: u16,
+    /// Distance from the camera to the orbit target, world units.
+    pub radius: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +401,12 @@ impl EditorWorkspace {
             view_2d: true,
             viewport_pan: Vec2::ZERO,
             viewport_zoom: DEFAULT_VIEWPORT_ZOOM,
+            // Default orbit: ~22° pitch above the target, looking
+            // toward +Z, radius wide enough to frame a 4×4 stone room
+            // at the cooker's standard 1024-unit sector size.
+            viewport_3d_yaw: 256,
+            viewport_3d_pitch: 256,
+            viewport_3d_radius: 6144,
             dirty: false,
             status: "Editor ready".to_string(),
         }
@@ -541,9 +568,8 @@ impl EditorWorkspace {
         self.draw_viewport(ctx);
     }
 
-    /// 3D viewport panel — paints the HwRenderer texture as an Image.
-    /// Anchored to the top of the central area so the existing 2D
-    /// viewport stays where it is below.
+    /// 3D viewport panel — paints the HwRenderer texture as an Image
+    /// and converts pointer drag / scroll into orbit-camera updates.
     fn draw_viewport_3d(&mut self, ctx: &egui::Context, viewport_3d_tex: egui::TextureId) {
         egui::TopBottomPanel::top("psxed_viewport_3d")
             .resizable(true)
@@ -555,25 +581,49 @@ impl EditorWorkspace {
                     ui.label(icons::text(icons::BOX, 15.0).color(STUDIO_ACCENT));
                     ui.label(RichText::new("3D Viewport").strong().color(STUDIO_TEXT));
                     ui.separator();
-                    ui.weak("Phase 0 spike — bit-faithful PS1 renderer");
+                    ui.weak(format!(
+                        "yaw {} pitch {} r {}",
+                        self.viewport_3d_yaw, self.viewport_3d_pitch, self.viewport_3d_radius
+                    ));
                 });
                 ui.separator();
                 let avail = ui.available_size();
-                // Match the PSX 320×240 logical aspect; UV-sample only
-                // that sub-rect of the 1024×512 VRAM texture.
                 let target_aspect = 320.0_f32 / 240.0;
                 let (w, h) = if avail.x / avail.y > target_aspect {
                     (avail.y * target_aspect, avail.y)
                 } else {
                     (avail.x, avail.x / target_aspect)
                 };
-                let (rect, _) = ui.allocate_exact_size(
+                let (rect, response) = ui.allocate_exact_size(
                     egui::Vec2::new(w, h),
-                    egui::Sense::hover(),
+                    egui::Sense::click_and_drag(),
                 );
-                // Top-left 320×240 region of VRAM = the editor render
-                // target's display sub-rect at internal scale 2 →
-                // texture is 2048×1024, sub-rect at 0..640 / 0..480.
+
+                // Drag = orbit. ~3° per pixel — sticky enough to
+                // recover from a tiny mouse jitter, fast enough that
+                // flicking the trackpad swings the view.
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    let delta = response.drag_delta();
+                    self.viewport_3d_yaw = self
+                        .viewport_3d_yaw
+                        .wrapping_add((delta.x * 6.0) as i16 as u16);
+                    self.viewport_3d_pitch = self
+                        .viewport_3d_pitch
+                        .wrapping_add((delta.y * 6.0) as i16 as u16);
+                }
+                // Scroll = dolly. Each wheel notch ≈ 12% of the
+                // current radius, clamped so the camera can't pass
+                // through the target or escape the world.
+                if response.hovered() {
+                    let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                    if scroll.abs() > f32::EPSILON {
+                        let factor = if scroll > 0.0 { 0.92 } else { 1.08 };
+                        self.viewport_3d_radius = ((self.viewport_3d_radius as f32) * factor)
+                            .clamp(512.0, 32_768.0)
+                            as i32;
+                    }
+                }
+
                 let uv = egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
                     egui::pos2(640.0 / 2048.0, 480.0 / 1024.0),
@@ -582,6 +632,16 @@ impl EditorWorkspace {
                     .uv(uv)
                     .paint_at(ui, rect);
             });
+    }
+
+    /// Snapshot of the orbit camera the frontend needs to drive the
+    /// editor's HwRenderer this frame.
+    pub fn viewport_3d_camera(&self) -> ViewportCameraState {
+        ViewportCameraState {
+            yaw_q12: self.viewport_3d_yaw,
+            pitch_q12: self.viewport_3d_pitch,
+            radius: self.viewport_3d_radius,
+        }
     }
 
     /// Top-level keyboard shortcut handler. Cleared via `consume_*`

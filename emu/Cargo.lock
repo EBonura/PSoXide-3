@@ -1004,11 +1004,14 @@ dependencies = [
  "gilrs",
  "pollster",
  "psoxide-settings",
+ "psx-engine",
  "psx-gpu",
  "psx-gpu-compute",
  "psx-gpu-render",
+ "psx-gte",
  "psx-iso",
  "psx-trace",
+ "psxed-project",
  "psxed-ui",
  "wgpu",
  "winit",
@@ -2419,6 +2422,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "psx-asset"
+version = "0.1.0"
+dependencies = [
+ "psx-gte",
+ "psxed-format",
+]
+
+[[package]]
+name = "psx-engine"
+version = "0.1.0"
+dependencies = [
+ "psx-asset",
+ "psx-gpu",
+ "psx-gte",
+ "psx-math",
+ "psx-pad",
+ "psx-rt",
+ "psx-spu",
+ "psx-vram",
+]
+
+[[package]]
 name = "psx-gpu"
 version = "0.1.0"
 dependencies = [
@@ -2456,6 +2481,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "psx-gte"
+version = "0.1.0"
+dependencies = [
+ "psx-gte-core",
+]
+
+[[package]]
 name = "psx-gte-core"
 version = "0.1.0"
 
@@ -2478,11 +2510,47 @@ name = "psx-iso"
 version = "0.1.0"
 
 [[package]]
+name = "psx-math"
+version = "0.1.0"
+
+[[package]]
+name = "psx-pad"
+version = "0.1.0"
+dependencies = [
+ "psx-hw",
+ "psx-io",
+]
+
+[[package]]
+name = "psx-rt"
+version = "0.1.0"
+dependencies = [
+ "psx-hw",
+ "psx-io",
+]
+
+[[package]]
+name = "psx-spu"
+version = "0.1.0"
+dependencies = [
+ "psx-hw",
+ "psx-io",
+]
+
+[[package]]
 name = "psx-trace"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "psx-vram"
+version = "0.1.0"
+dependencies = [
+ "psx-hw",
+ "psx-io",
 ]
 
 [[package]]

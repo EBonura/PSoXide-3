@@ -182,15 +182,21 @@ impl Graphics {
     /// Render one frame of the editor preview through the second
     /// `HwRenderer` instance.
     ///
-    /// Phase 0 spike: hands a hardcoded three-triangle scene to the
-    /// renderer so we can verify the cross-workspace plumbing —
-    /// `psx-gpu` prims → OT → `build_cmd_log` → `HwRenderer` — works
-    /// end-to-end on host. Subsequent phases will replace the
-    /// hardcoded scene with the real authored data from the editor's
-    /// active Room.
-    pub fn render_editor_preview(&mut self) {
-        let cmd_log = crate::editor_preview::build_phase0_cmd_log();
-        // Empty VRAM is fine: the test scene uses no textures.
+    /// Phase 1: walks the editor project's first Room, projects each
+    /// floor through the host GTE shim, and feeds the resulting
+    /// `TriFlat` packets to the renderer. The path is intentionally
+    /// the same one PS1 runtime code follows — only the final DMA
+    /// step is replaced by `build_cmd_log` + `render_frame`.
+    pub fn render_editor_preview(
+        &mut self,
+        project: &psxed_project::ProjectDocument,
+        camera: psxed_ui::ViewportCameraState,
+    ) {
+        let cmd_log = crate::editor_preview::build_phase1_cmd_log(project, camera);
+        // Empty VRAM is fine: floor rendering is flat-shaded — no
+        // textured primitives sample VRAM. Texture support arrives
+        // in a later phase along with the editor's static VRAM
+        // upload path.
         let empty_vram = [0u16; 1];
         self.editor_hw_renderer
             .render_frame(&self.editor_gpu_stub, &cmd_log, &empty_vram);

@@ -21,7 +21,10 @@ psx-hw       = { path = "../crates/psx-hw" }
 psx-iso      = { path = "../crates/psx-iso" }
 psx-trace    = { path = "../crates/psx-trace" }
 psx-gpu      = { path = "../sdk/crates/psx-gpu" }
+psx-gte      = { path = "../sdk/crates/psx-gte" }
 psx-gte-core = { path = "../sdk/crates/psx-gte-core" }
+psx-engine    = { path = "../engine/crates/psx-engine" }
+psxed-project = { path = "../editor/crates/psxed-project" }
 
 # Host-workspace-internal deps (one crate depends on another here).
 emulator-core    = { path = "crates/emulator-core" }
