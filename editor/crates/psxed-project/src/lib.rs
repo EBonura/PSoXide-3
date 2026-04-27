@@ -394,6 +394,14 @@ pub struct WorldGrid {
     pub sector_size: i32,
     /// Flat `[x * depth + z]` sector storage. `None` means no sector.
     pub sectors: Vec<Option<GridSector>>,
+    /// World offset (in cell units) of cell index `(0, 0)`. Lets the
+    /// editor extend the room into negative `X` / `Z` without
+    /// renumbering existing cells: a `-X` grow shifts sectors by
+    /// `+1` in X, decrements `origin.x` by `1`, and the renderer's
+    /// world coord = `(origin + index) * sector_size`. Default
+    /// `[0, 0]` for backward compat with already-saved projects.
+    #[serde(default)]
+    pub origin: [i32; 2],
     /// Room ambient color used as editor/cooker metadata.
     pub ambient_color: [u8; 3],
     /// Whether PS1 depth cue/fog should be cooked for this grid.
@@ -409,6 +417,7 @@ impl WorldGrid {
             depth,
             sector_size,
             sectors: vec![None; len],
+            origin: [0, 0],
             ambient_color: [32, 32, 32],
             fog_enabled: true,
         }
@@ -502,6 +511,101 @@ impl WorldGrid {
     /// Number of populated sectors.
     pub fn populated_sector_count(&self) -> usize {
         self.sectors.iter().flatten().count()
+    }
+
+    /// World-space X coordinate of the left edge of column `sx`
+    /// (array index, not world-cell index). Accounts for `origin`
+    /// so the renderer and picking always agree on cell positions.
+    pub fn cell_world_x(&self, sx: u16) -> i32 {
+        (self.origin[0] + sx as i32) * self.sector_size
+    }
+
+    /// World-space Z coordinate of the front edge of row `sz`.
+    pub fn cell_world_z(&self, sz: u16) -> i32 {
+        (self.origin[1] + sz as i32) * self.sector_size
+    }
+
+    /// World-space `(x, z)` centre of cell `(sx, sz)` in floating
+    /// point — handy for picking, edge inference, and entity
+    /// snapping. Mirrors the renderer's cell positioning so all
+    /// three pipelines agree on where each cell physically sits.
+    pub fn cell_center_world(&self, sx: u16, sz: u16) -> [f32; 2] {
+        let s = self.sector_size as f32;
+        [
+            (self.origin[0] as f32 + sx as f32 + 0.5) * s,
+            (self.origin[1] as f32 + sz as f32 + 0.5) * s,
+        ]
+    }
+
+    /// Convert a world position to the world-cell coordinate
+    /// (which can be negative). The world-cell is the same coord
+    /// system the renderer uses; subtract `origin` to get the
+    /// array index.
+    pub fn world_x_to_cell(&self, world_x: f32) -> i32 {
+        (world_x / self.sector_size as f32).floor() as i32
+    }
+
+    pub fn world_z_to_cell(&self, world_z: f32) -> i32 {
+        (world_z / self.sector_size as f32).floor() as i32
+    }
+
+    /// Translate a world-cell coordinate to its array index, or
+    /// `None` if the cell isn't currently allocated.
+    pub fn world_cell_to_array(&self, wcx: i32, wcz: i32) -> Option<(u16, u16)> {
+        let ax = wcx.checked_sub(self.origin[0])?;
+        let az = wcz.checked_sub(self.origin[1])?;
+        if ax < 0 || az < 0 {
+            return None;
+        }
+        let ax = ax as u32;
+        let az = az as u32;
+        if ax >= self.width as u32 || az >= self.depth as u32 {
+            return None;
+        }
+        Some((ax as u16, az as u16))
+    }
+
+    /// Ensure the world-cell `(wcx, wcz)` is addressable. Grows
+    /// the grid in `+X` / `+Z` and / or shifts existing sectors
+    /// (with `origin` decrementing in lockstep) when growth is
+    /// needed in `-X` / `-Z`. Existing cells keep the same world
+    /// position throughout. Returns the resolved array index.
+    pub fn extend_to_include(&mut self, wcx: i32, wcz: i32) -> (u16, u16) {
+        let rel_x = wcx - self.origin[0];
+        let rel_z = wcz - self.origin[1];
+        let shift_x = (-rel_x).max(0) as u16;
+        let shift_z = (-rel_z).max(0) as u16;
+        // The new array width must hold both the shifted existing
+        // data ([shift, shift + old_width)) AND the new cell (at
+        // shift + max(rel, 0)). Same logic for depth.
+        let new_cell_x = (rel_x.max(0) as u16) + shift_x;
+        let new_cell_z = (rel_z.max(0) as u16) + shift_z;
+        let new_w = (shift_x + self.width).max(new_cell_x + 1);
+        let new_d = (shift_z + self.depth).max(new_cell_z + 1);
+        if shift_x == 0 && shift_z == 0 && new_w == self.width && new_d == self.depth {
+            return (rel_x as u16, rel_z as u16);
+        }
+        // Rebuild the sector array, shifting existing data by
+        // (shift_x, shift_z) so its world position is preserved.
+        let new_len = new_w as usize * new_d as usize;
+        let mut new_sectors: Vec<Option<GridSector>> = vec![None; new_len];
+        for x in 0..self.width {
+            for z in 0..self.depth {
+                let old_idx = x as usize * self.depth as usize + z as usize;
+                let new_x = x as usize + shift_x as usize;
+                let new_z = z as usize + shift_z as usize;
+                if new_x < new_w as usize && new_z < new_d as usize {
+                    let new_idx = new_x * new_d as usize + new_z;
+                    new_sectors[new_idx] = self.sectors[old_idx].take();
+                }
+            }
+        }
+        self.width = new_w;
+        self.depth = new_d;
+        self.origin[0] -= shift_x as i32;
+        self.origin[1] -= shift_z as i32;
+        self.sectors = new_sectors;
+        ((rel_x + shift_x as i32) as u16, (rel_z + shift_z as i32) as u16)
     }
 
     /// Reshape the grid to `new_width × new_depth`.
@@ -1036,6 +1140,35 @@ impl Default for ProjectDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extend_to_include_grows_positively_without_shift() {
+        let mut grid = WorldGrid::stone_room(3, 3, 1024, None, None);
+        let baseline_floor_world = grid.cell_world_x(0); // 0
+        let cell = grid.extend_to_include(5, 1);
+        assert_eq!(cell, (5, 1));
+        assert_eq!(grid.width, 6);
+        assert_eq!(grid.depth, 3);
+        assert_eq!(grid.origin, [0, 0]);
+        // Old (0, 0) data still at array (0, 0), still at world 0.
+        assert_eq!(grid.cell_world_x(0), baseline_floor_world);
+        assert!(grid.sector(0, 0).is_some());
+    }
+
+    #[test]
+    fn extend_to_include_grows_negatively_preserving_world_position() {
+        let mut grid = WorldGrid::stone_room(3, 3, 1024, None, None);
+        let cell = grid.extend_to_include(-2, 0);
+        assert_eq!(cell, (0, 0));
+        // Two new columns prepended in -X.
+        assert_eq!(grid.width, 5);
+        assert_eq!(grid.origin[0], -2);
+        // Old (0, 0) data is now at array (2, 0), still at world 0.
+        assert_eq!(grid.cell_world_x(2), 0);
+        assert!(grid.sector(2, 0).is_some());
+        // The newly-included cell at array (0, 0) is empty.
+        assert!(grid.sector(0, 0).is_none());
+    }
 
     #[test]
     fn embedded_default_project_ron_deserializes() {

@@ -112,11 +112,9 @@ pub fn build_phase1_cmd_log(
     project: &ProjectDocument,
     camera: ViewportCameraState,
     selected: psxed_project::NodeId,
-    hovered_cell: Option<(u16, u16)>,
-    hovered_edge: Option<(u16, u16, u8)>,
     hovered_face: Option<psxed_ui::FaceRef>,
     selected_face: Option<psxed_ui::FaceRef>,
-    wall_paint_preview: Option<psxed_ui::FaceRef>,
+    paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     textures: &EditorTextures,
 ) -> Vec<GpuCmdLogEntry> {
     let Some((grid, target)) = first_room_grid(project) else {
@@ -132,20 +130,9 @@ pub fn build_phase1_cmd_log(
     setup_gte_for_camera(camera, target);
     walk_room(project, grid, textures, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
-    // Hover-quad and edge-strip belong to paint targeting; under
-    // Select the face outline does the user-affordance work, so
-    // suppress them when a face is being highlighted to avoid
-    // doubling up with a fluorescent fill.
-    if hovered_face.is_none() {
-        if let Some((sx, sz, dir)) = hovered_edge {
-            push_hover_edge_overlay(grid, sx, sz, dir, &mut scratch);
-        } else if let Some((sx, sz)) = hovered_cell {
-            push_hover_overlay(grid, sx, sz, &mut scratch);
-        }
-    }
-    // Face outlines for the Select tool. Selected drawn first so
-    // its bolder lines sit *under* a possibly-co-located hover —
-    // that way switching focus from selected → hover via mouse-move
+    // Select-tool face outlines. Selected drawn first so its
+    // bolder lines sit *under* a possibly-co-located hover — that
+    // way switching focus from selected → hover via mouse-move
     // doesn't make the bold outline strobe.
     if let Some(face) = selected_face {
         push_face_outline(grid, face, FACE_OUTLINE_SELECTED, &mut scratch);
@@ -155,11 +142,12 @@ pub fn build_phase1_cmd_log(
             push_face_outline(grid, face, FACE_OUTLINE_HOVER, &mut scratch);
         }
     }
-    // PaintWall preview: green ghost outline of where the next
-    // click would place the wall. Drawn after select / hover so
-    // it wins the depth-sort tie when stacking with them.
-    if let Some(face) = wall_paint_preview {
-        push_face_outline(grid, face, FACE_OUTLINE_WALL_PAINT, &mut scratch);
+    // Paint preview: ghost outline of the cell or wall the next
+    // click would create / replace. Works for cells outside the
+    // current grid by reading world-cell coords directly rather
+    // than via array indices.
+    if let Some(preview) = paint_target_preview {
+        push_paint_preview(grid, preview, &mut scratch);
     }
 
     // SAFETY: `scratch.tris` lives until end of this function (the
@@ -180,8 +168,12 @@ fn first_room_grid(project: &ProjectDocument) -> Option<(&WorldGrid, [i32; 3])> 
     let NodeKind::Room { grid } = &room.kind else {
         return None;
     };
-    let center_x = (grid.width as i32 * grid.sector_size) / 2;
-    let center_z = (grid.depth as i32 * grid.sector_size) / 2;
+    // Geometric centre in world coords accounts for `origin` so the
+    // camera reframes naturally as the grid grows in any direction.
+    let center_x =
+        grid.origin[0] * grid.sector_size + (grid.width as i32 * grid.sector_size) / 2;
+    let center_z =
+        grid.origin[1] * grid.sector_size + (grid.depth as i32 * grid.sector_size) / 2;
     Some((grid, [center_x, 0, center_z]))
 }
 
@@ -269,10 +261,12 @@ fn walk_room(
             };
             // Corner heights: [NW, NE, SE, SW] in `GridHorizontalFace`.
             // World coords with +X east, +Z south, +Y up.
-            let x0 = (x as i32) * s;
-            let x1 = ((x as i32) + 1) * s;
-            let z0 = (z as i32) * s;
-            let z1 = ((z as i32) + 1) * s;
+            // `cell_world_x/z` add `grid.origin` so cells stay at the
+            // same world position when the room grows in -X / -Z.
+            let x0 = grid.cell_world_x(x);
+            let x1 = x0 + s;
+            let z0 = grid.cell_world_z(z);
+            let z1 = z0 + s;
 
             if let Some(floor) = sector.floor.as_ref() {
                 push_horizontal_face(
@@ -595,105 +589,128 @@ fn world_to_view(world: [i32; 3]) -> Vec3I16 {
     )
 }
 
-/// Project the hovered cell's four corners and emit a translucent
-/// quad over it so the user sees exactly which cell paint / place
-/// tools will hit.
-///
-/// Inserted at OT slot 0 — the chain walker visits it last, so the
-/// overlay paints on top of every floor / wall / ceiling regardless
-/// of their depth keys.
-fn push_hover_overlay(grid: &WorldGrid, sx: u16, sz: u16, scratch: &mut PreviewScratch) {
-    if sx >= grid.width || sz >= grid.depth {
-        return;
-    }
-    let s = grid.sector_size;
-    let x0 = (sx as i32) * s;
-    let x1 = ((sx as i32) + 1) * s;
-    let z0 = (sz as i32) * s;
-    let z1 = ((sz as i32) + 1) * s;
-    // Lift the overlay a hair off the floor so it doesn't z-fight
-    // with floor faces at exactly y=0. PSX OT-depth resolution is
-    // ~2 units per slot at typical orbit distances, so 4 is safe.
-    let y = 4;
-    let p_nw = gte_scene::project_vertex(world_to_view([x0, y, z1]));
-    let p_ne = gte_scene::project_vertex(world_to_view([x1, y, z1]));
-    let p_se = gte_scene::project_vertex(world_to_view([x1, y, z0]));
-    let p_sw = gte_scene::project_vertex(world_to_view([x0, y, z0]));
-    let color = (0xFF, 0xE0, 0x60);
-
-    // Inline two-triangle emit at slot 0 — bypasses `push_tri`'s
-    // sz-based slot mapping.
-    push_tri_at_slot(scratch, [p_nw, p_sw, p_ne], color, 0);
-    push_tri_at_slot(scratch, [p_ne, p_sw, p_se], color, 0);
-}
-
-/// Project a thin vertical strip on the given cell edge — a quad
-/// running the full sector_size length × ~12% sector_size width,
-/// rising one floor's-worth above the ground. Tells the user which
-/// boundary the next PaintWall click will turn into a wall.
-///
-/// `dir` is the `GridDirection` discriminant (`0=N, 1=E, 2=S, 3=W`).
-/// Lives at the same OT slot as the cell hover so it draws on top.
-fn push_hover_edge_overlay(
+/// Render the paint-target ghost outline. Cell ghosts trace the
+/// floor footprint of the would-be cell; wall ghosts use
+/// `push_face_outline` with a synthetic `FaceRef` whose world cell
+/// might lie outside the current grid — `push_face_outline`'s
+/// missing-data fallback supplies default heights for the ghost
+/// case. World-cell coords let both work for cells the grid
+/// hasn't allocated yet; the outline appears exactly where the
+/// auto-grow would create the cell on click.
+fn push_paint_preview(
     grid: &WorldGrid,
-    sx: u16,
-    sz: u16,
-    dir: u8,
+    preview: psxed_ui::PaintTargetPreview,
     scratch: &mut PreviewScratch,
 ) {
-    if sx >= grid.width || sz >= grid.depth {
+    match preview {
+        psxed_ui::PaintTargetPreview::Cell {
+            world_cell_x,
+            world_cell_z,
+        } => push_cell_ghost_outline(grid, world_cell_x, world_cell_z, scratch),
+        psxed_ui::PaintTargetPreview::Wall {
+            world_cell_x,
+            world_cell_z,
+            dir,
+            stack,
+        } => {
+            // Translate world cell → array (when in bounds) so
+            // existing wall data is read for the outline; for
+            // off-grid ghosts we pass a synthetic array index that
+            // can't collide with any real wall and let
+            // `push_face_outline` fall back to default heights.
+            let (sx, sz) = grid
+                .world_cell_to_array(world_cell_x, world_cell_z)
+                .unwrap_or((u16::MAX, u16::MAX));
+            // Fake a FaceRef. `room` field is unused by
+            // push_face_outline; safe to fill with anything.
+            let face = psxed_ui::FaceRef {
+                room: psxed_project::NodeId::ROOT,
+                sx,
+                sz,
+                kind: psxed_ui::FaceKind::Wall { dir, stack },
+            };
+            // For off-grid wall ghosts we have to project the
+            // outline ourselves — `push_face_outline` short-
+            // circuits when sx/sz are out of grid bounds.
+            if sx == u16::MAX || sz == u16::MAX {
+                push_ghost_wall_outline(grid, world_cell_x, world_cell_z, dir, scratch);
+            } else {
+                push_face_outline(grid, face, FACE_OUTLINE_WALL_PAINT, scratch);
+            }
+        }
+    }
+}
+
+/// Outline a cell at world-cell `(wcx, wcz)`. Draws four screen-
+/// space lines along the cell's edges, lifted slightly above
+/// `y = 0` so the strokes don't z-fight any existing floor at the
+/// same world position.
+fn push_cell_ghost_outline(
+    grid: &WorldGrid,
+    wcx: i32,
+    wcz: i32,
+    scratch: &mut PreviewScratch,
+) {
+    let s = grid.sector_size;
+    let x0 = wcx * s;
+    let x1 = x0 + s;
+    let z0 = wcz * s;
+    let z1 = z0 + s;
+    let y = 4;
+    let nw = gte_scene::project_vertex(world_to_view([x0, y, z1]));
+    let ne = gte_scene::project_vertex(world_to_view([x1, y, z1]));
+    let se = gte_scene::project_vertex(world_to_view([x1, y, z0]));
+    let sw = gte_scene::project_vertex(world_to_view([x0, y, z0]));
+    if [nw, ne, se, sw].iter().any(|p| p.sz == 0) {
         return;
     }
+    for (a, b) in [(nw, ne), (ne, se), (se, sw), (sw, nw)] {
+        push_screen_line(scratch, a, b, FACE_OUTLINE_HOVER);
+    }
+}
+
+/// Outline a wall at world-cell `(wcx, wcz)` on edge `dir` with
+/// default heights `[0, 0, sector_size, sector_size]`. Used when
+/// `push_face_outline`'s array-bound check rejects an off-grid
+/// ghost so the user still sees where the wall will land.
+fn push_ghost_wall_outline(
+    grid: &WorldGrid,
+    wcx: i32,
+    wcz: i32,
+    dir: GridDirection,
+    scratch: &mut PreviewScratch,
+) {
     let s = grid.sector_size;
-    let x0 = (sx as i32) * s;
-    let x1 = ((sx as i32) + 1) * s;
-    let z0 = (sz as i32) * s;
-    let z1 = ((sz as i32) + 1) * s;
-    // Strip width (orthogonal to the edge). 12% of sector_size keeps
-    // it visible without obscuring much of the floor underneath.
-    let w = (s / 8).max(8);
-    // Lift slightly off the floor — same trick as push_hover_overlay.
-    let y = 4;
-    // Build the two world-space corners on the floor and lift them
-    // up by the sector_size to form a vertical band the camera can't
-    // miss. North = z = z1; South = z = z0; East = x = x1; West = x = x0.
-    let (a_lo, b_lo, a_hi, b_hi) = match dir {
-        0 => (
-            // North edge — band hugs z = z1, extends inward.
-            [x0, y, z1],
-            [x1, y, z1],
-            [x0, y + s, z1 - w],
-            [x1, y + s, z1 - w],
-        ),
-        2 => (
-            // South.
-            [x0, y, z0],
-            [x1, y, z0],
-            [x0, y + s, z0 + w],
-            [x1, y + s, z0 + w],
-        ),
-        1 => (
-            // East.
-            [x1, y, z0],
-            [x1, y, z1],
-            [x1 - w, y + s, z0],
-            [x1 - w, y + s, z1],
-        ),
-        _ => (
-            // West.
-            [x0, y, z0],
-            [x0, y, z1],
-            [x0 + w, y + s, z0],
-            [x0 + w, y + s, z1],
-        ),
-    };
-    let p_a_lo = gte_scene::project_vertex(world_to_view(a_lo));
-    let p_b_lo = gte_scene::project_vertex(world_to_view(b_lo));
-    let p_a_hi = gte_scene::project_vertex(world_to_view(a_hi));
-    let p_b_hi = gte_scene::project_vertex(world_to_view(b_hi));
-    let color = (0xFF, 0x60, 0x60);
-    push_tri_at_slot(scratch, [p_a_lo, p_a_hi, p_b_lo], color, 0);
-    push_tri_at_slot(scratch, [p_b_lo, p_a_hi, p_b_hi], color, 0);
+    let x0 = wcx * s;
+    let x1 = x0 + s;
+    let z0 = wcz * s;
+    let z1 = z0 + s;
+    let (bl_xy, br_xy) = wall_xy_for(dir, x0, x1, z0, z1);
+    const LIFT: i32 = 4;
+    let (nx, nz) = wall_inward_normal(dir);
+    let corners = [
+        [bl_xy.0 + LIFT * nx, 0, bl_xy.1 + LIFT * nz],
+        [br_xy.0 + LIFT * nx, 0, br_xy.1 + LIFT * nz],
+        [br_xy.0 + LIFT * nx, s, br_xy.1 + LIFT * nz],
+        [bl_xy.0 + LIFT * nx, s, bl_xy.1 + LIFT * nz],
+    ];
+    let projected: [psx_gte::scene::Projected; 4] = [
+        gte_scene::project_vertex(world_to_view(corners[0])),
+        gte_scene::project_vertex(world_to_view(corners[1])),
+        gte_scene::project_vertex(world_to_view(corners[2])),
+        gte_scene::project_vertex(world_to_view(corners[3])),
+    ];
+    if projected.iter().any(|p| p.sz == 0) {
+        return;
+    }
+    for i in 0..4 {
+        push_screen_line(
+            scratch,
+            projected[i],
+            projected[(i + 1) % 4],
+            FACE_OUTLINE_WALL_PAINT,
+        );
+    }
 }
 
 /// Hover and Selected outline styling. RGB plus screen-space line
@@ -741,10 +758,10 @@ fn push_face_outline(
     }
     let sector = grid.sector(face.sx, face.sz);
     let s = grid.sector_size;
-    let x0 = (face.sx as i32) * s;
-    let x1 = ((face.sx as i32) + 1) * s;
-    let z0 = (face.sz as i32) * s;
-    let z1 = ((face.sz as i32) + 1) * s;
+    let x0 = grid.cell_world_x(face.sx);
+    let x1 = x0 + s;
+    let z0 = grid.cell_world_z(face.sz);
+    let z1 = z0 + s;
     // Lift a hair off the surface so the outline doesn't z-fight
     // the face it's marking. Sloped floors keep their relative
     // outline position because we lift each corner by the same

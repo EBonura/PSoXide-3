@@ -198,22 +198,18 @@ impl Graphics {
         project_root: &std::path::Path,
         camera: psxed_ui::ViewportCameraState,
         selected: psxed_project::NodeId,
-        hovered_cell: Option<(u16, u16)>,
-        hovered_edge: Option<(u16, u16, u8)>,
         hovered_face: Option<psxed_ui::FaceRef>,
         selected_face: Option<psxed_ui::FaceRef>,
-        wall_paint_preview: Option<psxed_ui::FaceRef>,
+        paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     ) {
         self.editor_textures.refresh(project, project_root);
         let cmd_log = crate::editor_preview::build_phase1_cmd_log(
             project,
             camera,
             selected,
-            hovered_cell,
-            hovered_edge,
             hovered_face,
             selected_face,
-            wall_paint_preview,
+            paint_target_preview,
             &self.editor_textures,
         );
         self.editor_hw_renderer.render_frame(

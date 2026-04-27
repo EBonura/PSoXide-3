@@ -95,17 +95,6 @@ pub struct EditorWorkspace {
     /// inspector can show per-cell properties without inflating the
     /// scene-tree node count with a node per sector.
     selected_sector: Option<(u16, u16)>,
-    /// Cell currently under the 3D viewport's pointer. Updated each
-    /// frame the panel is hovered; rendered as a translucent overlay
-    /// so the user sees exactly what cell paint / place tools will hit.
-    hovered_3d_sector: Option<(u16, u16)>,
-    /// Wall-edge currently under the pointer when the PaintWall tool
-    /// is active — `(sx, sz, dir_index)` where `dir_index` is the
-    /// `GridDirection` enum discriminant (0=N, 1=E, 2=S, 3=W). The
-    /// frontend overlays a thin strip on this edge so the user sees
-    /// which boundary the next click will target. Cleared whenever
-    /// the active tool isn't PaintWall or the pointer leaves.
-    hovered_3d_edge: Option<(u16, u16, u8)>,
     /// Face under the pointer while the Select tool is active —
     /// floors, walls, ceilings of the active Room. Updated every
     /// frame the panel is hovered and the tool is Select; cleared
@@ -119,13 +108,13 @@ pub struct EditorWorkspace {
     /// `hovered_face`; the inspector panel reads it to surface
     /// per-face properties (material, heights, …).
     selected_face: Option<FaceRef>,
-    /// PaintWall hover preview: the wall the next click would
-    /// place / replace. Re-uses `FaceRef` with `FaceKind::Wall` —
-    /// when the cursor is over an existing wall this is that wall;
-    /// otherwise it's a "ghost" reference whose heights the
-    /// renderer fills in from `sector_size` defaults. Cleared when
-    /// the active tool isn't PaintWall or the pointer leaves.
-    wall_paint_preview: Option<FaceRef>,
+    /// What the next paint click would target. Cell variant fires
+    /// for floor / ceiling / erase / place; Wall variant fires for
+    /// PaintWall. World-cell coords let the preview track cells
+    /// outside the current grid bounds — the renderer outlines
+    /// them as ghosts at the world position the auto-grow would
+    /// place them.
+    paint_target_preview: Option<PaintTargetPreview>,
     /// Last cell `apply_paint` has run on during the current drag.
     /// Used to dedupe per-frame paint events so click-drag with
     /// Wall / Place doesn't stack duplicate walls / spawn N entities
@@ -201,6 +190,27 @@ struct PsxtStats {
     pixel_bytes: u32,
     clut_bytes: u32,
     file_bytes: u32,
+}
+
+/// What the next paint click would target. Carries world-cell
+/// coordinates (which can be negative — outside the current grid)
+/// so the renderer can preview cells the next click would auto-
+/// create. Stays populated for any paint tool, mirroring the
+/// dispatch so what you preview is what you'll paint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintTargetPreview {
+    /// Floor / ceiling / erase / place — outlines the cell.
+    Cell { world_cell_x: i32, world_cell_z: i32 },
+    /// PaintWall — outlines the wall on the targeted edge of the
+    /// cell. `stack` is the next-free wall slot index for that
+    /// edge, used by the renderer to position the ghost above any
+    /// existing walls.
+    Wall {
+        world_cell_x: i32,
+        world_cell_z: i32,
+        dir: GridDirection,
+        stack: u8,
+    },
 }
 
 /// One pickable surface on the active Room's grid. Floors and
@@ -471,11 +481,9 @@ impl EditorWorkspace {
             selected_node: NodeId::ROOT,
             selected_resource: None,
             selected_sector: None,
-            hovered_3d_sector: None,
-            hovered_3d_edge: None,
             hovered_face: None,
             selected_face: None,
-            wall_paint_preview: None,
+            paint_target_preview: None,
             last_paint_cell: None,
             renaming: None,
             pending_rename_focus: false,
@@ -857,12 +865,6 @@ impl EditorWorkspace {
                 .find(|n| matches!(n.kind, NodeKind::Room { .. }))
                 .map(|n| n.id)
         });
-        // Cell-hover quad is a paint-tool affordance — Move /
-        // Rotate / Scale / Select have their own visual idiom (face
-        // outline for Select, no overlay for the rest), so we only
-        // update `hovered_3d_sector` when a paint tool is active.
-        // Otherwise the yellow fill keeps drawing on top of the
-        // viewport even when the user is just orbiting.
         let paint_tool = matches!(
             self.active_tool,
             ViewTool::PaintFloor
@@ -871,20 +873,6 @@ impl EditorWorkspace {
                 | ViewTool::Erase
                 | ViewTool::Place
         );
-        self.hovered_3d_sector = if paint_tool {
-            hover_world
-                .and_then(|world| hover_room.and_then(|room| self.world_to_sector(room, world)))
-        } else {
-            None
-        };
-        self.hovered_3d_edge =
-            if matches!(self.active_tool, ViewTool::PaintWall) {
-                hover_world.and_then(|world| {
-                    hover_room.and_then(|room| self.hovered_wall_edge(room, world))
-                })
-            } else {
-                None
-            };
         // Face hover ray-tests every floor / wall / ceiling in the
         // active Room and reports the closest hit. Used by Select
         // for the outline UI, AND by paint tools to anchor their
@@ -895,16 +883,16 @@ impl EditorWorkspace {
             .hover_pos()
             .and_then(|pointer| self.pick_face_with_hit(rect, pointer));
         self.hovered_face = face_hit.map(|(face, _)| face);
-        // PaintWall preview: build the same FaceRef the next click
-        // would target so the renderer can outline it. Mirrors
-        // `run_paint_action`'s edge resolution exactly so what you
-        // see is what you'll paint.
-        self.wall_paint_preview =
-            if matches!(self.active_tool, ViewTool::PaintWall) {
-                hover_room.and_then(|room| self.preview_paint_wall(room, face_hit, hover_world))
-            } else {
-                None
-            };
+        // Paint preview: world-cell coords let the ghost outline
+        // appear over cells outside the current grid, exactly
+        // where the auto-grow would create them.
+        self.paint_target_preview = if paint_tool {
+            hover_room.and_then(|room| {
+                self.compute_paint_target_preview(room, face_hit, hover_world)
+            })
+        } else {
+            None
+        };
 
         // Primary click / drag: ray-pick the cell under the cursor
         // and dispatch to the active tool. Click starts a fresh
@@ -972,22 +960,6 @@ impl EditorWorkspace {
         self.selected_node
     }
 
-    /// Cell under the 3D pointer last frame, or `None` when the
-    /// pointer is off-panel. Frontend overlays a translucent quad on
-    /// it so paint tools have a Sims-style "you'll hit this cell"
-    /// affordance.
-    pub fn hovered_3d_sector(&self) -> Option<(u16, u16)> {
-        self.hovered_3d_sector
-    }
-
-    /// Wall-edge under the 3D pointer last frame, or `None` when the
-    /// PaintWall tool isn't active or the pointer's off-panel.
-    /// `(sx, sz, dir_index)` where `dir_index` matches the
-    /// `GridDirection` discriminant `(0=N, 1=E, 2=S, 3=W)`.
-    pub fn hovered_3d_edge(&self) -> Option<(u16, u16, u8)> {
-        self.hovered_3d_edge
-    }
-
     /// Face under the 3D pointer when the Select tool is active —
     /// floors / walls / ceilings of the active Room. Frontend reads
     /// this every frame to draw a light hover outline.
@@ -1002,41 +974,13 @@ impl EditorWorkspace {
         self.selected_face
     }
 
-    /// Wall the next PaintWall click would target. Frontend draws
-    /// a translucent outline so the user previews the placement
-    /// before committing. May reference a wall that doesn't exist
-    /// yet — the renderer falls back to default heights for the
-    /// ghost case.
-    pub fn wall_paint_preview(&self) -> Option<FaceRef> {
-        self.wall_paint_preview
-    }
-
-    /// Pick the cell + nearest cardinal edge at `world` within `room`.
-    /// Mirrors the click-time logic in `apply_paint(PaintWall)` so
-    /// the hover preview and the actual placement target agree.
-    fn hovered_wall_edge(&self, room: NodeId, world: [f32; 2]) -> Option<(u16, u16, u8)> {
-        let (sx, sz) = self.world_to_sector(room, world)?;
-        let scene = self.project.active_scene();
-        let node = scene.node(room)?;
-        let NodeKind::Room { grid } = &node.kind else {
-            return None;
-        };
-        let room_center = node_world(node);
-        let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
-        let cell_center = [
-            room_center[0] - half[0] + sx as f32 + 0.5,
-            room_center[1] - half[1] + sz as f32 + 0.5,
-        ];
-        let dx = world[0] - cell_center[0];
-        let dz = world[1] - cell_center[1];
-        let dir: u8 = if dz.abs() > dx.abs() {
-            if dz < 0.0 { 0 /* North */ } else { 2 /* South */ }
-        } else if dx < 0.0 {
-            3 /* West */
-        } else {
-            1 /* East */
-        };
-        Some((sx, sz, dir))
+    /// What the next paint click would target. Frontend reads
+    /// this every frame for paint tools and outlines either a
+    /// cell ghost (Floor / Ceiling / Erase / Place) or a wall
+    /// ghost (PaintWall) at the world position the click would
+    /// commit to.
+    pub fn paint_target_preview(&self) -> Option<PaintTargetPreview> {
+        self.paint_target_preview
     }
 
     /// Commit the most recent hover-tracked face to `selected_face`.
@@ -1046,73 +990,92 @@ impl EditorWorkspace {
     /// ray-on-Y=0 hit lands beyond the room. Also surfaces the
     /// face's material in the resources panel so the user sees
     /// which material is on the picked surface.
-    /// Resolve the `FaceRef` the PaintWall click would target.
-    /// When the cursor's directly over a wall the preview tracks
-    /// that wall (paint replaces it); otherwise it builds a "ghost"
-    /// `FaceRef` for the cell + edge the click would create.
-    /// Mirrors `run_paint_action`'s logic exactly so the preview
-    /// outline never drifts from the actual paint result.
-    fn preview_paint_wall(
+    /// Resolve what the next paint click would target. World-cell
+    /// coords (which can be negative) let the preview track cells
+    /// outside the current grid — exactly the cases `auto-grow`
+    /// would rescue at click time. Mirrors `run_paint_action` /
+    /// `ensure_cell_in_grid` so what you preview is what you'll
+    /// paint.
+    fn compute_paint_target_preview(
         &self,
         room_id: NodeId,
         face_hit: Option<(FaceRef, [f32; 3])>,
         ground_hit: Option<[f32; 2]>,
-    ) -> Option<FaceRef> {
-        if let Some((
-            face @ FaceRef {
-                kind: FaceKind::Wall { .. },
-                ..
-            },
-            _,
-        )) = face_hit
-        {
-            return Some(face);
-        }
-        // Floor / ceiling / no-pick: infer the cell + edge.
-        let (sx, sz, hit_world) = match face_hit {
-            Some((face, hit)) => (face.sx, face.sz, hit),
-            None => {
-                let world = ground_hit?;
-                let (sx, sz) = self.world_to_sector(room_id, world)?;
-                let sector_size = self.room_sector_size(room_id).unwrap_or(1024) as f32;
-                let half = self.room_half_extents(room_id).unwrap_or([0.0, 0.0]);
-                let hit = [
-                    (world[0] + half[0]) * sector_size,
-                    0.0,
-                    (world[1] + half[1]) * sector_size,
-                ];
-                (sx, sz, hit)
+    ) -> Option<PaintTargetPreview> {
+        let grid = self.room_grid_view(room_id)?;
+        let is_paint_wall = matches!(self.active_tool, ViewTool::PaintWall);
+
+        // Cursor over an existing wall while PaintWall is active —
+        // the click would replace that exact wall, so preview it
+        // directly with its array-derived world cell.
+        if is_paint_wall {
+            if let Some((
+                FaceRef {
+                    sx,
+                    sz,
+                    kind: FaceKind::Wall { dir, stack },
+                    ..
+                },
+                _,
+            )) = face_hit
+            {
+                return Some(PaintTargetPreview::Wall {
+                    world_cell_x: grid.origin[0] + sx as i32,
+                    world_cell_z: grid.origin[1] + sz as i32,
+                    dir,
+                    stack,
+                });
             }
+        }
+
+        // Compute the world cell the cursor is over. Use the face
+        // hit when present (works for walls / floors / ceilings of
+        // existing cells); otherwise fall back to the floor-plane
+        // hit, which can land on cells the grid doesn't cover yet.
+        let (world_cell_x, world_cell_z, hit_world) = if let Some((face, hit)) = face_hit {
+            (
+                grid.origin[0] + face.sx as i32,
+                grid.origin[1] + face.sz as i32,
+                hit,
+            )
+        } else {
+            let editor = ground_hit?;
+            let hit = self.editor_world_to_world3(room_id, editor);
+            (
+                grid.world_x_to_cell(hit[0]),
+                grid.world_z_to_cell(hit[2]),
+                hit,
+            )
         };
-        let sector_size = self.room_sector_size(room_id).unwrap_or(1024) as f32;
-        let cell_center = [
-            (sx as f32 + 0.5) * sector_size,
-            (sz as f32 + 0.5) * sector_size,
-        ];
-        let dir = edge_from_world_offset(
-            hit_world[0] - cell_center[0],
-            hit_world[2] - cell_center[1],
-        );
-        // Stack index points past the existing wall stack — that's
-        // where `add_wall` would append. The renderer treats
-        // out-of-bounds stack indices as "no wall data → ghost
-        // outline at default heights".
-        let stack = self
-            .project
-            .active_scene()
-            .node(room_id)
-            .and_then(|node| match &node.kind {
-                NodeKind::Room { grid } => grid.sector(sx, sz),
-                _ => None,
+
+        if is_paint_wall {
+            // Cell centre in raw world units — the inferred edge
+            // matches the dispatch's `run_paint_action` because
+            // both use the same axis convention.
+            let s = grid.sector_size as f32;
+            let cell_center_x = (world_cell_x as f32 + 0.5) * s;
+            let cell_center_z = (world_cell_z as f32 + 0.5) * s;
+            let dir =
+                edge_from_world_offset(hit_world[0] - cell_center_x, hit_world[2] - cell_center_z);
+            // Stack index points just past any existing walls on
+            // that edge — `add_wall` will append there.
+            let stack = grid
+                .world_cell_to_array(world_cell_x, world_cell_z)
+                .and_then(|(sx, sz)| grid.sector(sx, sz))
+                .map(|sector| sector.walls.get(dir).len() as u8)
+                .unwrap_or(0);
+            Some(PaintTargetPreview::Wall {
+                world_cell_x,
+                world_cell_z,
+                dir,
+                stack,
             })
-            .map(|sector| sector.walls.get(dir).len() as u8)
-            .unwrap_or(0);
-        Some(FaceRef {
-            room: room_id,
-            sx,
-            sz,
-            kind: FaceKind::Wall { dir, stack },
-        })
+        } else {
+            Some(PaintTargetPreview::Cell {
+                world_cell_x,
+                world_cell_z,
+            })
+        }
     }
 
     fn commit_face_selection(&mut self) {
@@ -1168,13 +1131,7 @@ impl EditorWorkspace {
                 let Some((sx, sz)) = cell else {
                     return;
                 };
-                let sector_size = self.room_sector_size(room_id).unwrap_or(1024) as f32;
-                let half = self.room_half_extents(room_id).unwrap_or([0.0, 0.0]);
-                let raw_hit = [
-                    (world[0] + half[0]) * sector_size,
-                    0.0,
-                    (world[1] + half[1]) * sector_size,
-                ];
+                let raw_hit = self.editor_world_to_world3(room_id, world);
                 ((sx, sz), raw_hit)
             }
         };
@@ -1198,11 +1155,11 @@ impl EditorWorkspace {
     }
 
     /// Resolve the cell `world` lands in, growing the room's grid
-    /// in `+X` / `+Z` if the click falls beyond the current
-    /// footprint. Negative-side clicks (`-X` / `-Z`) need anchor
-    /// shifting we don't do yet — they surface a hint instead.
-    /// Returns `None` for negative-side or for grows that would
-    /// blow past the safety cap.
+    /// in any direction if the click falls beyond the current
+    /// footprint. Negative-side growth re-anchors via
+    /// `WorldGrid::origin` so existing geometry keeps its world
+    /// position. Returns `None` only when the requested cell sits
+    /// past the safety cap.
     fn ensure_cell_in_grid(
         &mut self,
         room_id: NodeId,
@@ -1217,28 +1174,27 @@ impl EditorWorkspace {
         let NodeKind::Room { grid } = &room.kind else {
             return None;
         };
-        let center = node_world(room);
         let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
-        let lx = (world[0] - (center[0] - half[0])).floor();
-        let lz = (world[1] - (center[1] - half[1])).floor();
-        if lx < 0.0 || lz < 0.0 {
-            self.status =
-                "Cannot grow room toward -X / -Z — adjust the room's transform manually"
-                    .to_string();
-            return None;
-        }
-        let need_w = (lx as u32 + 1).min(AUTO_GROW_LIMIT as u32) as u16;
-        let need_d = (lz as u32 + 1).min(AUTO_GROW_LIMIT as u32) as u16;
-        if (lx as u32 + 1) > AUTO_GROW_LIMIT as u32
-            || (lz as u32 + 1) > AUTO_GROW_LIMIT as u32
+        // Translate editor click → world-cell coord. Editor coord
+        // is grid-centre-relative; cells span [-half, +half) in
+        // editor space, and the world-cell index of editor 0 is
+        // `origin + half`.
+        let wcx = (world[0] + half[0]).floor() as i32 + grid.origin[0];
+        let wcz = (world[1] + half[1]).floor() as i32 + grid.origin[1];
+        // Cap the request before mutating so a wild click can't
+        // explode the sector vec. The cap covers the post-grow
+        // dimensions in either direction.
+        let projected_w = grid.width as i32
+            + (wcx - grid.origin[0] - grid.width as i32 + 1).max(0)
+            + (grid.origin[0] - wcx).max(0);
+        let projected_d = grid.depth as i32
+            + (wcz - grid.origin[1] - grid.depth as i32 + 1).max(0)
+            + (grid.origin[1] - wcz).max(0);
+        if projected_w as u32 > AUTO_GROW_LIMIT as u32
+            || projected_d as u32 > AUTO_GROW_LIMIT as u32
         {
             self.status =
                 format!("Auto-grow capped at {AUTO_GROW_LIMIT} — resize the grid manually");
-            return None;
-        }
-        let new_w = grid.width.max(need_w);
-        let new_d = grid.depth.max(need_d);
-        if new_w == grid.width && new_d == grid.depth {
             return None;
         }
         self.push_undo();
@@ -1247,10 +1203,13 @@ impl EditorWorkspace {
         let NodeKind::Room { grid } = &mut node.kind else {
             return None;
         };
-        grid.resize(new_w, new_d);
-        self.status = format!("Grew grid to {new_w}×{new_d}");
+        let cell = grid.extend_to_include(wcx, wcz);
+        self.status = format!(
+            "Grew grid to {}×{} (origin {},{})",
+            grid.width, grid.depth, grid.origin[0], grid.origin[1]
+        );
         self.mark_dirty();
-        Some((lx as u16, lz as u16))
+        Some(cell)
     }
 
     /// World-space sector size of the named Room, or `None` if the
@@ -1263,13 +1222,26 @@ impl EditorWorkspace {
         }
     }
 
-    /// Half (width, depth) of the named Room in sector units.
-    fn room_half_extents(&self, room_id: NodeId) -> Option<[f32; 2]> {
+    /// Convert an editor (sector-units, room-centre-relative) hit
+    /// position to a raw world `[x, 0, z]` triple. Inverse of the
+    /// grid-centre subtraction `pick_3d_world` performs.
+    fn editor_world_to_world3(&self, room_id: NodeId, editor: [f32; 2]) -> [f32; 3] {
+        let Some(grid) = self.room_grid_view(room_id) else {
+            return [0.0, 0.0, 0.0];
+        };
+        let s = grid.sector_size as f32;
+        let center_x = (grid.origin[0] as f32 + grid.width as f32 * 0.5) * s;
+        let center_z = (grid.origin[1] as f32 + grid.depth as f32 * 0.5) * s;
+        [editor[0] * s + center_x, 0.0, editor[1] * s + center_z]
+    }
+
+    /// Borrow the named Room's grid for the duration of `&self`,
+    /// or `None` if the node isn't a Room. Avoids the
+    /// `node.kind` matching dance at every cell-coord call site.
+    fn room_grid_view(&self, room_id: NodeId) -> Option<&WorldGrid> {
         let node = self.project.active_scene().node(room_id)?;
         match &node.kind {
-            NodeKind::Room { grid } => {
-                Some([grid.width as f32 * 0.5, grid.depth as f32 * 0.5])
-            }
+            NodeKind::Room { grid } => Some(grid),
             _ => None,
         }
     }
@@ -1299,14 +1271,28 @@ impl EditorWorkspace {
             .or(floor_mat);
         let sector_size_i = self.room_sector_size(room_id).unwrap_or(1024);
         let sector_size = sector_size_i as f32;
-        let cell_center = [
-            (sx as f32 + 0.5) * sector_size,
-            (sz as f32 + 0.5) * sector_size,
-        ];
+        let cell_center = self
+            .room_grid_view(room_id)
+            .map(|grid| grid.cell_center_world(sx, sz))
+            .unwrap_or([
+                (sx as f32 + 0.5) * sector_size,
+                (sz as f32 + 0.5) * sector_size,
+            ]);
 
         if matches!(tool, ViewTool::Place) {
             self.push_undo();
-            let half = self.room_half_extents(room_id).unwrap_or([0.0, 0.0]);
+            // World → editor (room-centre-relative, sector units).
+            // Origin contributes via the grid centre, same as in
+            // `pick_3d_world` and `editor_world_to_world3`.
+            let (half, origin) = self
+                .room_grid_view(room_id)
+                .map(|grid| {
+                    (
+                        [grid.width as f32 * 0.5, grid.depth as f32 * 0.5],
+                        [grid.origin[0] as f32, grid.origin[1] as f32],
+                    )
+                })
+                .unwrap_or(([0.0, 0.0], [0.0, 0.0]));
             let id = self.project.active_scene_mut().add_node(
                 room_id,
                 "Spawn",
@@ -1314,9 +1300,9 @@ impl EditorWorkspace {
             );
             if let Some(node) = self.project.active_scene_mut().node_mut(id) {
                 node.transform.translation = [
-                    hit_world[0] / sector_size - half[0],
+                    hit_world[0] / sector_size - half[0] - origin[0],
                     0.0,
-                    hit_world[2] / sector_size - half[1],
+                    hit_world[2] / sector_size - half[1] - origin[1],
                 ];
             }
             self.selected_node = id;
@@ -1522,10 +1508,13 @@ impl EditorWorkspace {
         let sin_p = psx_gte::transform::sin_1_3_12(pitch) as f32 / 4096.0;
         let cos_y = psx_gte::transform::cos_1_3_12(yaw) as f32 / 4096.0;
         let sin_y = psx_gte::transform::sin_1_3_12(yaw) as f32 / 4096.0;
+        // Geometric centre in world coords — must include `origin`
+        // so the camera target stays on the actual middle of the
+        // grid after a -X / -Z grow shifts the data.
         let target_world = [
-            (grid.width as f32 * grid.sector_size as f32) * 0.5,
+            (grid.origin[0] as f32 + grid.width as f32 * 0.5) * grid.sector_size as f32,
             0.0,
-            (grid.depth as f32 * grid.sector_size as f32) * 0.5,
+            (grid.origin[1] as f32 + grid.depth as f32 * 0.5) * grid.sector_size as f32,
         ];
         let cam_pos = [
             target_world[0] + radius * cos_p * sin_y,
@@ -1600,10 +1589,10 @@ impl EditorWorkspace {
                 let Some(sector) = grid.sector(sx, sz) else {
                     continue;
                 };
-                let x0 = sx as f32 * s;
-                let x1 = (sx + 1) as f32 * s;
-                let z0 = sz as f32 * s;
-                let z1 = (sz + 1) as f32 * s;
+                let x0 = grid.cell_world_x(sx) as f32;
+                let x1 = x0 + s;
+                let z0 = grid.cell_world_z(sz) as f32;
+                let z1 = z0 + s;
 
                 if let Some(floor) = &sector.floor {
                     let h = floor.heights;
@@ -1712,10 +1701,13 @@ impl EditorWorkspace {
         let cos_y = psx_gte::transform::cos_1_3_12(yaw) as f32 / 4096.0;
         let sin_y = psx_gte::transform::sin_1_3_12(yaw) as f32 / 4096.0;
 
+        // Geometric centre in world coords — must include `origin`
+        // so the camera target stays on the actual middle of the
+        // grid after a -X / -Z grow shifts the data.
         let target_world = [
-            (grid.width as f32 * grid.sector_size as f32) * 0.5,
+            (grid.origin[0] as f32 + grid.width as f32 * 0.5) * grid.sector_size as f32,
             0.0,
-            (grid.depth as f32 * grid.sector_size as f32) * 0.5,
+            (grid.origin[1] as f32 + grid.depth as f32 * 0.5) * grid.sector_size as f32,
         ];
         let cam_pos = [
             target_world[0] + radius * cos_p * sin_y,

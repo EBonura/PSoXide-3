@@ -681,22 +681,18 @@ impl ApplicationHandler for Shell {
                 // panel opens. Cheap when the project has no Rooms.
                 let editor_camera = state.editor.viewport_3d_camera();
                 let editor_selected = state.editor.selected_node_id();
-                let editor_hover = state.editor.hovered_3d_sector();
-                let editor_hover_edge = state.editor.hovered_3d_edge();
                 let editor_root = state.editor.project_root();
                 let editor_hover_face = state.editor.hovered_face();
                 let editor_selected_face = state.editor.selected_face();
-                let editor_wall_preview = state.editor.wall_paint_preview();
+                let editor_paint_preview = state.editor.paint_target_preview();
                 gfx.render_editor_preview(
                     state.editor.project(),
                     editor_root,
                     editor_camera,
                     editor_selected,
-                    editor_hover,
-                    editor_hover_edge,
                     editor_hover_face,
                     editor_selected_face,
-                    editor_wall_preview,
+                    editor_paint_preview,
                 );
 
                 let vram_tex = gfx.vram_texture_id();
