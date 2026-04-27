@@ -705,7 +705,7 @@ impl EditorWorkspace {
             if scroll.abs() > f32::EPSILON {
                 let factor = if scroll > 0.0 { 0.92 } else { 1.08 };
                 self.viewport_3d_radius =
-                    ((self.viewport_3d_radius as f32) * factor).clamp(512.0, 32_768.0) as i32;
+                    ((self.viewport_3d_radius as f32) * factor).clamp(512.0, 262_144.0) as i32;
             }
         }
 
