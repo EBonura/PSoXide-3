@@ -1,0 +1,54 @@
+(
+    name: "Untitled PS1 Project",
+    scenes: [
+        /*[0]*/ (
+            name: "Main",
+            root: (1),
+            next_node_id: 6,
+            nodes: [
+                /*[0]*/ (id: (1), name: "Root", kind: Node3D, transform: (translation: (0.0, 0.0, 0.0), rotation_degrees: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)), parent: None, children: [(2)]),
+                /*[1]*/ (id: (2), name: "Demo World", kind: World, transform: (translation: (0.0, 0.0, 0.0), rotation_degrees: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)), parent: Some((1)), children: [(3)]),
+                /*[2]*/ (id: (3), name: "Stone Room", kind: Room(grid: (width: 3, depth: 3, sector_size: 1024, sectors: [Some((floor: Some((heights: (0, 0, 0, 0), split: NorthWestSouthEast, material: Some((3)), walkable: true)), ceiling: None, walls: (north: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], east: [], south: [], west: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], north_west_south_east: [], north_east_south_west: []))), Some((floor: Some((heights: (0, 0, 0, 0), split: NorthWestSouthEast, material: Some((3)), walkable: true)), ceiling: None, walls: (north: [], east: [], south: [], west: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], north_west_south_east: [], north_east_south_west: []))), Some((floor: Some((heights: (0, 0, 0, 0), split: NorthWestSouthEast, material: Some((3)), walkable: true)), ceiling: None, walls: (north: [], east: [], south: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], west: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], north_west_south_east: [], north_east_south_west: []))), Some((floor: Some((heights: (0, 0, 0, 0), split: NorthWestSouthEast, material: Some((3)), walkable: true)), ceiling: None, walls: (north: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], east: [], south: [], west: [], north_west_south_east: [], north_east_south_west: []))), Some((floor: Some((heights: (0, 0, 0, 0), split: NorthWestSouthEast, material: Some((3)), walkable: true)), ceiling: None, walls: (north: [], east: [], south: [], west: [], north_west_south_east: [], north_east_south_west: []))), Some((floor: Some((heights: (0, 0, 0, 0), split: NorthWestSouthEast, material: Some((3)), walkable: true)), ceiling: None, walls: (north: [], east: [], south: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], west: [], north_west_south_east: [], north_east_south_west: []))), Some((floor: Some((heights: (0, 0, 0, 0), split: NorthWestSouthEast, material: Some((3)), walkable: true)), ceiling: None, walls: (north: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], east: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], south: [], west: [], north_west_south_east: [], north_east_south_west: []))), Some((floor: Some((heights: (0, 0, 0, 0), split: NorthWestSouthEast, material: Some((3)), walkable: true)), ceiling: None, walls: (north: [], east: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], south: [], west: [], north_west_south_east: [], north_east_south_west: []))), Some((floor: Some((heights: (0, 0, 0, 0), split: NorthWestSouthEast, material: Some((3)), walkable: true)), ceiling: None, walls: (north: [], east: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], south: [(heights: (0, 0, 1024, 1024), material: Some((4)), solid: true)], west: [], north_west_south_east: [], north_east_south_west: [])))], ambient_color: (32, 32, 32), fog_enabled: true)), transform: (translation: (0.0, 0.0, 0.0), rotation_degrees: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)), parent: Some((2)), children: [(4), (5)]),
+                /*[3]*/ (id: (4), name: "Player Spawn", kind: SpawnPoint(player: true), transform: (translation: (-1.0, 0.0, -0.8), rotation_degrees: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)), parent: Some((3)), children: []),
+                /*[4]*/ (id: (5), name: "Preview Light", kind: Light(color: (255, 236, 198), intensity: 1.0, radius: 4096.0), transform: (translation: (1.0, 0.0, 0.85), rotation_degrees: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)), parent: Some((3)), children: []),
+            ],
+        ),
+    ],
+    resources: [
+        /*[0]*/ (
+            id: (1),
+            name: "floor.psxt",
+            data: Texture(
+                psxt_path: "assets/textures/floor.psxt",
+            ),
+        ),
+        /*[1]*/ (
+            id: (2),
+            name: "brick-wall.psxt",
+            data: Texture(
+                psxt_path: "assets/textures/brick-wall.psxt",
+            ),
+        ),
+        /*[2]*/ (
+            id: (3),
+            name: "Floor",
+            data: Material((
+                texture: Some((1)),
+                blend_mode: Opaque,
+                tint: (128, 128, 128),
+                double_sided: false,
+            )),
+        ),
+        /*[3]*/ (
+            id: (4),
+            name: "Brick",
+            data: Material((
+                texture: Some((2)),
+                blend_mode: Opaque,
+                tint: (128, 128, 128),
+                double_sided: false,
+            )),
+        ),
+    ],
+    next_resource_id: 5,
+)

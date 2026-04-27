@@ -85,7 +85,10 @@ impl UndoStack {
 /// Embedded editor workspace state.
 pub struct EditorWorkspace {
     project: ProjectDocument,
-    project_path: Option<PathBuf>,
+    project_dir: PathBuf,
+    new_project_dialog_open: bool,
+    new_project_name: String,
+    new_project_error: Option<String>,
     selected_node: NodeId,
     selected_resource: Option<ResourceId>,
     /// Highlighted sector cell within the active Room. Tracked so the
@@ -381,21 +384,32 @@ fn panel_heading(ui: &mut egui::Ui, icon: char, label: &str) {
 }
 
 impl EditorWorkspace {
-    /// Create a workspace with a starter project.
-    pub fn new() -> Self {
-        let mut workspace = Self::new_blank();
+    /// Open the project at `dir`. Errors when `dir/project.ron` is
+    /// missing or malformed — the frontend wraps the error and falls
+    /// back to the default project so a real load failure surfaces
+    /// in the status bar instead of silently spawning a fresh
+    /// starter (which masked the path-resolution bug previously).
+    pub fn open_directory(dir: impl Into<PathBuf>) -> Result<Self, String> {
+        let dir = dir.into();
+        let project_file = dir.join("project.ron");
+        let project = ProjectDocument::load_from_path(&project_file)
+            .map_err(|error| format!("load {}: {error}", project_file.display()))?;
+        let mut workspace = Self::with_project(dir, project);
+        workspace.status = format!("Loaded {}", short_path(&workspace.project_dir));
         workspace.select_first_room();
-        workspace
+        Ok(workspace)
     }
 
-    /// Bare construction without the post-init selection bump. Used
-    /// internally by `new` / `open_or_new`; external callers should
-    /// stick to `new` so the inspector + paint tools have a Room
-    /// selected from the first frame.
-    fn new_blank() -> Self {
+    /// Construct a workspace around an already-loaded project. Used
+    /// by `open_directory` and `create_and_open_project`; not part
+    /// of the public API.
+    fn with_project(project_dir: PathBuf, project: ProjectDocument) -> Self {
         Self {
-            project: ProjectDocument::starter(),
-            project_path: None,
+            project,
+            project_dir,
+            new_project_dialog_open: false,
+            new_project_name: String::new(),
+            new_project_error: None,
             selected_node: NodeId::ROOT,
             selected_resource: None,
             selected_sector: None,
@@ -432,41 +446,21 @@ impl EditorWorkspace {
         }
     }
 
-    /// Create a workspace backed by `project_path`, loading the project
-    /// if it already exists or seeding a starter project otherwise.
-    pub fn open_or_new(project_path: impl Into<PathBuf>) -> Self {
-        let path = project_path.into();
-        let mut workspace = Self::new();
-        workspace.project_path = Some(path.clone());
-
-        if path.exists() {
-            if let Err(error) = workspace.load_from_path(&path) {
-                workspace.status = format!("Could not load project: {error}");
-                workspace.dirty = false;
-            }
-        } else {
-            workspace.dirty = true;
-            workspace.status = format!("New project at {}", short_path(&path));
-        }
-
-        workspace
-    }
-
     /// Current project document.
     pub fn project(&self) -> &ProjectDocument {
         &self.project
     }
 
-    /// Directory project-relative paths resolve against. Returns the
-    /// project file's parent directory when one is configured, falling
-    /// back to the current working directory otherwise — which is
-    /// what the in-tree starter relies on so `cargo run -p frontend`
-    /// from the repo root finds `assets/textures/*.psxt`.
-    pub fn project_root(&self) -> PathBuf {
-        self.project_path
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    /// Directory containing this project on disk.
+    pub fn project_dir(&self) -> &Path {
+        &self.project_dir
+    }
+
+    /// Directory project-relative resource paths resolve against —
+    /// always the project's own directory now that every project
+    /// owns one. No cwd fallback.
+    pub fn project_root(&self) -> &Path {
+        &self.project_dir
     }
 
     /// True when the project has unsaved edits.
@@ -474,18 +468,15 @@ impl EditorWorkspace {
         self.dirty
     }
 
-    /// Set or replace the path used by [`EditorWorkspace::save`].
-    pub fn set_project_path(&mut self, path: impl Into<PathBuf>) {
-        self.project_path = Some(path.into());
-    }
-
-    /// Save to the currently configured project path.
+    /// Save to `<project_dir>/project.ron`.
     pub fn save(&mut self) -> Result<(), String> {
-        let path = self
-            .project_path
-            .clone()
-            .ok_or_else(|| "no editor project path configured".to_string())?;
-        self.save_to_path(path)
+        let path = self.project_dir.join("project.ron");
+        self.project
+            .save_to_path(&path)
+            .map_err(|error| error.to_string())?;
+        self.dirty = false;
+        self.status = format!("Saved {}", short_path(&self.project_dir));
+        Ok(())
     }
 
     /// Save only when the project contains unsaved edits.
@@ -497,28 +488,57 @@ impl EditorWorkspace {
         Ok(true)
     }
 
-    /// Save to a specific path and make that the current project path.
-    pub fn save_to_path(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
-        let path = path.as_ref();
-        self.project
-            .save_to_path(path)
-            .map_err(|error| error.to_string())?;
-        self.project_path = Some(path.to_path_buf());
-        self.dirty = false;
-        self.status = format!("Saved {}", short_path(path));
-        Ok(())
+    /// Re-read `<project_dir>/project.ron` from disk, discarding
+    /// in-memory edits. Surfaces a load error in the status bar
+    /// rather than failing — the user can still keep editing the
+    /// in-memory state.
+    pub fn reload(&mut self) {
+        let path = self.project_dir.join("project.ron");
+        match ProjectDocument::load_from_path(&path) {
+            Ok(project) => {
+                self.project = project;
+                self.selected_node = NodeId::ROOT;
+                self.selected_resource = None;
+                self.dirty = false;
+                self.status = format!("Reloaded {}", short_path(&self.project_dir));
+                self.select_first_room();
+            }
+            Err(error) => {
+                self.status = format!("Reload failed: {error}");
+            }
+        }
     }
 
-    /// Load a project from disk and make that the current project path.
-    pub fn load_from_path(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
-        let path = path.as_ref();
-        self.project = ProjectDocument::load_from_path(path).map_err(|error| error.to_string())?;
-        self.project_path = Some(path.to_path_buf());
-        self.selected_node = NodeId::ROOT;
-        self.selected_resource = None;
-        self.dirty = false;
-        self.status = format!("Loaded {}", short_path(path));
-        self.select_first_room();
+    /// Create `editor/projects/<name>/` by recursive-copy of the
+    /// default project, then switch this workspace to it.
+    ///
+    /// Validates `name`: non-empty, no path separators, no `..`,
+    /// no leading `.`, target directory must not already exist.
+    /// On success the workspace points at the new project; on
+    /// failure the workspace is unchanged.
+    pub fn create_and_open_project(&mut self, name: &str) -> Result<(), String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("Project name cannot be empty".to_string());
+        }
+        if trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.starts_with('.')
+            || trimmed.contains("..")
+        {
+            return Err(
+                "Project name cannot contain path separators, `..`, or leading `.`".to_string(),
+            );
+        }
+        let target = psxed_project::projects_dir().join(trimmed);
+        if target.exists() {
+            return Err(format!("{} already exists", short_path(&target)));
+        }
+        copy_dir_recursive(&psxed_project::default_project_dir(), &target)
+            .map_err(|error| format!("copy default project: {error}"))?;
+        let opened = Self::open_directory(&target)?;
+        *self = opened;
+        self.status = format!("Created {}", short_path(&self.project_dir));
         Ok(())
     }
 
@@ -575,14 +595,7 @@ impl EditorWorkspace {
     /// when any room's grid cooker rejects its inputs (see
     /// `WorldGridCookError`).
     pub fn cook_world_to_disk(&mut self) -> Result<String, String> {
-        let project_path = self
-            .project_path
-            .clone()
-            .ok_or("Save the project first so cooked rooms have a destination")?;
-        let cooked_dir = project_path
-            .parent()
-            .map(|parent| parent.join("cooked"))
-            .ok_or("Project path has no parent directory")?;
+        let cooked_dir = self.project_dir.join("cooked");
         std::fs::create_dir_all(&cooked_dir)
             .map_err(|error| format!("mkdir {}: {error}", cooked_dir.display()))?;
 
@@ -644,6 +657,78 @@ impl EditorWorkspace {
         self.draw_inspector(ctx);
         self.draw_content_browser(ctx);
         self.draw_viewport(ctx, viewport_3d_tex);
+        self.draw_new_project_dialog(ctx);
+    }
+
+    /// Modal for the File → New Project flow. Pops over the editor
+    /// when `new_project_dialog_open` is true; submit calls
+    /// [`Self::create_and_open_project`] and re-targets the
+    /// workspace at the new directory.
+    fn draw_new_project_dialog(&mut self, ctx: &egui::Context) {
+        if !self.new_project_dialog_open {
+            return;
+        }
+        let mut close = false;
+        let mut submit = false;
+        egui::Window::new(icons::label(icons::FILE_PLUS, "New Project"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label("Project name");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.new_project_name)
+                        .hint_text("e.g. test-room"),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "→ editor/projects/{}/",
+                        if self.new_project_name.trim().is_empty() {
+                            "<name>"
+                        } else {
+                            self.new_project_name.trim()
+                        }
+                    ))
+                    .color(STUDIO_TEXT_WEAK)
+                    .small(),
+                );
+                if let Some(error) = &self.new_project_error {
+                    ui.label(RichText::new(error).color(Color32::from_rgb(0xE0, 0x60, 0x60)));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    if ui.button("Create").clicked() {
+                        submit = true;
+                    }
+                });
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        if submit {
+            let name = self.new_project_name.clone();
+            match self.create_and_open_project(&name) {
+                Ok(()) => {
+                    self.new_project_dialog_open = false;
+                    self.new_project_name.clear();
+                    self.new_project_error = None;
+                }
+                Err(error) => {
+                    self.new_project_error = Some(error);
+                }
+            }
+        }
+        if close {
+            self.new_project_dialog_open = false;
+            self.new_project_error = None;
+        }
     }
 
     /// 3D viewport body — paints the HwRenderer texture into the
@@ -1235,8 +1320,14 @@ impl EditorWorkspace {
             .frame(top_bar_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button(icons::label(icons::FILE_PLUS, "New")).clicked() {
-                        self.reset_project();
+                    if ui
+                        .button(icons::label(icons::FILE_PLUS, "New Project"))
+                        .on_hover_text(
+                            "Create a new project in editor/projects/<name>/ from the default template.",
+                        )
+                        .clicked()
+                    {
+                        self.open_new_project_dialog();
                     }
                     if ui.button(icons::label(icons::SAVE, "Save")).clicked() {
                         if let Err(error) = self.save() {
@@ -1247,7 +1338,7 @@ impl EditorWorkspace {
                         .button(icons::label(icons::ROTATE_CCW, "Reload"))
                         .clicked()
                     {
-                        self.reload_project();
+                        self.reload();
                     }
                     if ui.button(icons::label(icons::FOCUS, "Frame")).clicked() {
                         self.frame_viewport();
@@ -1742,7 +1833,10 @@ impl EditorWorkspace {
     /// signature; rebuilds when the path moves or the file is newly
     /// readable.
     fn refresh_texture_thumbs(&mut self, ctx: &egui::Context) {
-        let project_root = self.project_root();
+        // Clone so the immutable borrow on `self` released here
+        // doesn't fight the mutable borrow on `self.texture_thumbs`
+        // we need below.
+        let project_root = self.project_dir.clone();
         let mut alive: Vec<ResourceId> = Vec::new();
         for resource in self.project.resources.iter() {
             let ResourceData::Texture { psxt_path } = &resource.data else {
@@ -1803,21 +1897,27 @@ impl EditorWorkspace {
     fn draw_resources_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             section_frame().show(ui, |ui| {
-                ui.set_width(180.0);
-                panel_heading(ui, icons::SCAN, "Filter");
-                ui.add_space(2.0);
-                ui.selectable_value(
-                    &mut self.resource_filter,
-                    ResourceFilter::All,
-                    icons::label(ResourceFilter::All.icon(), "All"),
-                );
-                for (filter, count) in resource_filter_counts(&self.project) {
+                // Frame inherits the outer `ui.horizontal` layout, so
+                // every child widget would otherwise flow on a single
+                // row. Force vertical so the filter buttons stack as
+                // intended.
+                ui.vertical(|ui| {
+                    ui.set_width(180.0);
+                    panel_heading(ui, icons::SCAN, "Filter");
+                    ui.add_space(2.0);
                     ui.selectable_value(
                         &mut self.resource_filter,
-                        filter,
-                        format!("{} ({count})", icons::label(filter.icon(), filter.label())),
+                        ResourceFilter::All,
+                        icons::label(ResourceFilter::All.icon(), "All"),
                     );
-                }
+                    for (filter, count) in resource_filter_counts(&self.project) {
+                        ui.selectable_value(
+                            &mut self.resource_filter,
+                            filter,
+                            format!("{} ({count})", icons::label(filter.icon(), filter.label())),
+                        );
+                    }
+                });
             });
 
             ui.add_space(4.0);
@@ -2364,24 +2464,10 @@ impl EditorWorkspace {
         }
     }
 
-    fn reset_project(&mut self) {
-        self.project = ProjectDocument::starter();
-        self.selected_node = NodeId::ROOT;
-        self.selected_resource = None;
-        self.status = "New starter project".to_string();
-        self.frame_viewport();
-        self.mark_dirty();
-        self.select_first_room();
-    }
-
-    fn reload_project(&mut self) {
-        let Some(path) = self.project_path.clone() else {
-            self.status = "Reload unavailable: no project path".to_string();
-            return;
-        };
-        if let Err(error) = self.load_from_path(path) {
-            self.status = format!("Reload failed: {error}");
-        }
+    fn open_new_project_dialog(&mut self) {
+        self.new_project_dialog_open = true;
+        self.new_project_name.clear();
+        self.new_project_error = None;
     }
 
     fn mark_dirty(&mut self) {
@@ -2454,10 +2540,22 @@ impl EditorWorkspace {
     }
 }
 
-impl Default for EditorWorkspace {
-    fn default() -> Self {
-        Self::new()
+/// Recursive directory copy. `std` doesn't ship one and we only
+/// need it for the New-Project flow, so a 15-line helper is
+/// preferable to taking a dep on `fs_extra`.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
     }
+    Ok(())
 }
 
 fn transform_editor(ui: &mut egui::Ui, label: &str, values: &mut [f32; 3], speed: f64) -> bool {
@@ -4876,7 +4974,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_or_new_saves_and_reloads_default_project() {
+    fn open_directory_saves_and_reloads_project() {
         let dir = std::env::temp_dir().join(format!(
             "psxed-ui-test-{}-{}",
             std::process::id(),
@@ -4885,15 +4983,21 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let path = dir.join("workspace.ron");
+        std::fs::create_dir_all(&dir).unwrap();
+        let project_file = dir.join("project.ron");
+        std::fs::write(
+            &project_file,
+            ProjectDocument::starter().to_ron_string().unwrap(),
+        )
+        .unwrap();
 
-        let mut workspace = EditorWorkspace::open_or_new(&path);
-        assert!(workspace.is_dirty());
-        workspace.save().unwrap();
+        let mut workspace = EditorWorkspace::open_directory(&dir).unwrap();
         assert!(!workspace.is_dirty());
-        assert!(path.is_file());
+        assert_eq!(workspace.project_root(), dir);
+        workspace.save().unwrap();
+        assert!(project_file.is_file());
 
-        let loaded = EditorWorkspace::open_or_new(&path);
+        let loaded = EditorWorkspace::open_directory(&dir).unwrap();
         assert!(!loaded.is_dirty());
         assert_eq!(
             loaded.project().resources.len(),
@@ -4901,6 +5005,36 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_directory_errors_when_project_ron_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "psxed-ui-test-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = match EditorWorkspace::open_directory(&dir) {
+            Ok(_) => panic!("expected open_directory to fail on missing project.ron"),
+            Err(e) => e,
+        };
+        assert!(err.contains("project.ron"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn create_and_open_project_validates_name() {
+        let mut ws = EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        assert!(ws.create_and_open_project("").is_err());
+        assert!(ws.create_and_open_project("with/slash").is_err());
+        assert!(ws.create_and_open_project("..").is_err());
+        assert!(ws.create_and_open_project(".hidden").is_err());
+        // "default" is a real existing dir, so this hits the "already exists" branch.
+        assert!(ws.create_and_open_project("default").is_err());
     }
 
     #[test]
@@ -4932,7 +5066,8 @@ mod tests {
 
     #[test]
     fn dragging_selected_node_moves_it_in_xz_space() {
-        let mut workspace = EditorWorkspace::new();
+        let mut workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
         let spawn = workspace
             .project
             .active_scene()

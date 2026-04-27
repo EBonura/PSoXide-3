@@ -35,7 +35,7 @@ pub mod settings;
 pub use library::{Library, LibraryEntry, LibraryError};
 pub use paths::{ConfigPaths, PathError};
 pub use savestate::{SaveStateError, SaveStateV1, SAVESTATE_MAGIC};
-pub use settings::{InputBinding, Settings, SettingsError};
+pub use settings::{EditorSettings, InputBinding, Settings, SettingsError};
 
 /// Current on-disk format version for `settings.ron`. Bumped when
 /// a breaking change lands; the loader migrates older versions in

@@ -112,11 +112,6 @@ impl ConfigPaths {
         self.root.join("editor")
     }
 
-    /// Default embedded-editor workspace file.
-    pub fn editor_project_file(&self) -> PathBuf {
-        self.editor_dir().join("workspace.ron")
-    }
-
     /// Per-game directory under `games/<id>/`. Nothing is created —
     /// callers use `ensure_dir` when they actually need to write.
     pub fn game_dir(&self, game_id: &str) -> PathBuf {
@@ -187,10 +182,7 @@ mod tests {
         let game = "abc123";
         assert_eq!(p.settings_file(), tmp.path().join("settings.ron"));
         assert_eq!(p.library_file(), tmp.path().join("library.ron"));
-        assert_eq!(
-            p.editor_project_file(),
-            tmp.path().join("editor/workspace.ron")
-        );
+        assert_eq!(p.editor_dir(), tmp.path().join("editor"));
         assert_eq!(p.game_dir(game), tmp.path().join("games/abc123"));
         assert_eq!(
             p.savestate_file(game, 3),

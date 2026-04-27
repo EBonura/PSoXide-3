@@ -5,12 +5,63 @@
 //! then later cooker stages flatten it into PS1-friendly world surfaces,
 //! texture pages, entity spawns, and engine data.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ron::ser::PrettyConfig;
 use serde::{Deserialize, Serialize};
 
 pub mod world_cook;
+
+/// Embedded copy of the default project's RON, baked at compile
+/// time so the editor binary always carries a working starter even
+/// if `editor/projects/default/` is absent at runtime. Single source
+/// of truth — edits to the on-disk file propagate to `starter()` on
+/// the next build.
+const DEFAULT_PROJECT_RON: &str =
+    include_str!("../../../projects/default/project.ron");
+
+/// Source-tree projects directory: `editor/projects/`.
+///
+/// Captured via `env!("CARGO_MANIFEST_DIR")` at compile time, so it
+/// resolves wherever cargo built this crate from. Works for the
+/// dev workflow (`cargo run -p frontend` from anywhere in the
+/// repo); will need a different strategy when the editor ever
+/// ships as a standalone binary.
+pub fn projects_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("projects")
+}
+
+/// Default project directory (`editor/projects/default/`). Always
+/// present in the source tree; user "New Project" copies its
+/// contents into a sibling directory.
+pub fn default_project_dir() -> PathBuf {
+    projects_dir().join("default")
+}
+
+/// Enumerate every directory under [`projects_dir`] that contains a
+/// `project.ron`. Cheap directory walk, used by the editor's open /
+/// switch flow once that lands. Returns an empty Vec rather than
+/// erroring when `projects_dir` doesn't exist — fresh checkout
+/// before the dev runs the editor once.
+pub fn list_projects() -> std::io::Result<Vec<PathBuf>> {
+    let root = projects_dir();
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && path.join("project.ron").is_file() {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
 
 pub use world_cook::{
     cook_world_grid, encode_world_grid_psxw, CookedGridHorizontalFace, CookedGridSector,
@@ -873,69 +924,18 @@ impl ProjectDocument {
         }
     }
 
-    /// Create a useful starter project for the embedded editor workspace.
+    /// Deserialize the default project shipped at
+    /// `editor/projects/default/project.ron`. The on-disk RON file
+    /// is the single source of truth — the editor reads the exact
+    /// same bytes a `cargo run` would, so changes to the default
+    /// project are git-trackable and don't require a rebuild.
     ///
-    /// Ships the same two textures the `showcase-textured-sprite`
-    /// runtime demo uses — brick + cobblestone — and one material
-    /// per texture. Both Texture resources reference the canonical
-    /// `assets/textures/*.psxt` paths so the editor's preview
-    /// loads the exact bytes the runtime would embed at compile
-    /// time. No invented placeholders.
+    /// Panics only if the embedded RON drifts out of sync with the
+    /// `ProjectDocument` schema; the `embedded_default_project_ron_deserializes`
+    /// test guards the build-time invariant.
     pub fn starter() -> Self {
-        let mut project = Self::new("Untitled PS1 Project");
-
-        let floor_tex = project.add_resource(
-            "floor.psxt",
-            ResourceData::Texture {
-                psxt_path: "assets/textures/floor.psxt".to_string(),
-            },
-        );
-        let brick_tex = project.add_resource(
-            "brick-wall.psxt",
-            ResourceData::Texture {
-                psxt_path: "assets/textures/brick-wall.psxt".to_string(),
-            },
-        );
-        let floor_mat = project.add_resource(
-            "Floor",
-            ResourceData::Material(MaterialResource::opaque(Some(floor_tex))),
-        );
-        let brick_mat = project.add_resource(
-            "Brick",
-            ResourceData::Material(MaterialResource::opaque(Some(brick_tex))),
-        );
-
-        let scene = project.active_scene_mut();
-        let root = scene.root;
-        let world = scene.add_node(root, "Demo World", NodeKind::World);
-        let stone_room = scene.add_node(
-            world,
-            "Stone Room",
-            NodeKind::Room {
-                grid: WorldGrid::stone_room(3, 3, 1024, Some(floor_mat), Some(brick_mat)),
-            },
-        );
-
-        let spawn =
-            scene.add_node(stone_room, "Player Spawn", NodeKind::SpawnPoint { player: true });
-        if let Some(node) = scene.node_mut(spawn) {
-            node.transform.translation = [-1.0, 0.0, -0.8];
-        }
-
-        let light = scene.add_node(
-            stone_room,
-            "Preview Light",
-            NodeKind::Light {
-                color: [255, 236, 198],
-                intensity: 1.0,
-                radius: 4096.0,
-            },
-        );
-        if let Some(node) = scene.node_mut(light) {
-            node.transform.translation = [1.0, 0.0, 0.85];
-        }
-
-        project
+        Self::from_ron_str(DEFAULT_PROJECT_RON)
+            .expect("editor/projects/default/project.ron is malformed")
     }
 
     /// Active scene.
@@ -1029,6 +1029,31 @@ impl Default for ProjectDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_default_project_ron_deserializes() {
+        let project = ProjectDocument::from_ron_str(DEFAULT_PROJECT_RON).unwrap();
+        assert!(project.resources.iter().any(|r| matches!(
+            &r.data,
+            ResourceData::Texture { psxt_path } if psxt_path.ends_with("floor.psxt")
+        )));
+        assert!(project.resources.iter().any(|r| matches!(
+            &r.data,
+            ResourceData::Texture { psxt_path } if psxt_path.ends_with("brick-wall.psxt")
+        )));
+    }
+
+    #[test]
+    fn projects_dir_resolves_to_real_directory() {
+        assert!(projects_dir().is_dir(), "{}", projects_dir().display());
+        assert!(default_project_dir().join("project.ron").is_file());
+        assert!(default_project_dir()
+            .join("assets/textures/brick-wall.psxt")
+            .is_file());
+        assert!(default_project_dir()
+            .join("assets/textures/floor.psxt")
+            .is_file());
+    }
 
     #[test]
     fn starter_project_has_scene_tree_and_resources() {

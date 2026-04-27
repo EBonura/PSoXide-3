@@ -194,7 +194,18 @@ impl AppState {
             }),
         };
         let _ = paths.ensure_dir(paths.root());
-        let editor = EditorWorkspace::open_or_new(paths.editor_project_file());
+
+        // Legacy file-based workspace: surface once, then ignore.
+        // The new model is project = directory under
+        // editor/projects/. No automated migration; a stale
+        // workspace.ron is just a starter snapshot.
+        let legacy_workspace = paths.editor_dir().join("workspace.ron");
+        if legacy_workspace.is_file() {
+            eprintln!(
+                "[frontend] legacy editor/workspace.ron at {} ignored — projects now live under editor/projects/",
+                legacy_workspace.display()
+            );
+        }
 
         let settings = match Settings::load(&paths.settings_file()) {
             Ok(s) => s,
@@ -203,6 +214,23 @@ impl AppState {
                 Settings::default()
             }
         };
+
+        let preferred_dir = settings
+            .editor
+            .last_project_dir
+            .clone()
+            .unwrap_or_else(psxed_project::default_project_dir);
+        let editor = EditorWorkspace::open_directory(&preferred_dir)
+            .or_else(|first_err| {
+                eprintln!(
+                    "[frontend] open editor project at {} failed: {first_err}; falling back to default",
+                    preferred_dir.display()
+                );
+                EditorWorkspace::open_directory(psxed_project::default_project_dir())
+            })
+            .unwrap_or_else(|err| {
+                panic!("open default editor project: {err}");
+            });
         let library = Library::load_or_empty(&paths.library_file());
 
         // Legacy env-var side-load path: if PSOXIDE_EXE or
@@ -596,11 +624,22 @@ impl AppState {
             .map_err(|e| format!("save settings.ron: {e}"))
     }
 
-    /// Persist the embedded editor project if it has unsaved edits.
+    /// Persist the embedded editor project if it has unsaved edits,
+    /// and remember which project directory is active so the next
+    /// launch reopens it.
     pub fn save_editor_project(&mut self) -> Result<bool, String> {
-        self.editor
+        let saved = self
+            .editor
             .save_if_dirty()
-            .map_err(|e| format!("save editor project: {e}"))
+            .map_err(|e| format!("save editor project: {e}"))?;
+        let current = Some(self.editor.project_dir().to_path_buf());
+        if self.settings.editor.last_project_dir != current {
+            self.settings.editor.last_project_dir = current;
+            if let Err(e) = self.save_settings() {
+                eprintln!("[frontend] {e}");
+            }
+        }
+        Ok(saved)
     }
 
     /// Flip the disc fast-boot preference, keep the Menu label in

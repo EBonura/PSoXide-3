@@ -686,7 +686,7 @@ impl ApplicationHandler for Shell {
                 let editor_root = state.editor.project_root();
                 gfx.render_editor_preview(
                     state.editor.project(),
-                    &editor_root,
+                    editor_root,
                     editor_camera,
                     editor_selected,
                     editor_hover,

@@ -28,7 +28,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -325,6 +325,18 @@ impl Default for EmulatorSettings {
     }
 }
 
+/// Editor-side preferences that persist across sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorSettings {
+    /// Last-opened project directory. `None` on first launch — the
+    /// frontend then opens `psxed_project::default_project_dir()`.
+    /// Updated by the frontend after every successful
+    /// `open_directory` / `create_and_open_project` so re-launches
+    /// resume on the project the user was last editing.
+    #[serde(default)]
+    pub last_project_dir: Option<PathBuf>,
+}
+
 /// The full settings root. Shape is intentionally flat — no deep
 /// nesting — so that someone skimming `settings.ron` can see every
 /// section at once.
@@ -347,6 +359,9 @@ pub struct Settings {
     /// Emulator-level toggles.
     #[serde(default)]
     pub emulator: EmulatorSettings,
+    /// Editor preferences.
+    #[serde(default)]
+    pub editor: EditorSettings,
 }
 
 fn default_version() -> u32 {
@@ -361,6 +376,7 @@ impl Default for Settings {
             video: VideoSettings::default(),
             input: InputSettings::default(),
             emulator: EmulatorSettings::default(),
+            editor: EditorSettings::default(),
         }
     }
 }
