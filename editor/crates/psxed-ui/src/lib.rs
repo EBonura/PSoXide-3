@@ -390,6 +390,16 @@ fn panel_heading(ui: &mut egui::Ui, icon: char, label: &str) {
 impl EditorWorkspace {
     /// Create a workspace with a starter project.
     pub fn new() -> Self {
+        let mut workspace = Self::new_blank();
+        workspace.select_first_room();
+        workspace
+    }
+
+    /// Bare construction without the post-init selection bump. Used
+    /// internally by `new` / `open_or_new`; external callers should
+    /// stick to `new` so the inspector + paint tools have a Room
+    /// selected from the first frame.
+    fn new_blank() -> Self {
         Self {
             project: ProjectDocument::starter(),
             project_path: None,
@@ -501,7 +511,27 @@ impl EditorWorkspace {
         self.selected_resource = None;
         self.dirty = false;
         self.status = format!("Loaded {}", short_path(path));
+        self.select_first_room();
         Ok(())
+    }
+
+    /// Select the first Room in the active scene if one exists.
+    /// Default state is `selected_node = ROOT`, which leaves the
+    /// inspector empty and gates the paint tools — selecting a
+    /// concrete Room straight after construction or load makes the
+    /// editor immediately useful for the common case (one Room per
+    /// project).
+    fn select_first_room(&mut self) {
+        if let Some(room_id) = self
+            .project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Room { .. }))
+            .map(|node| node.id)
+        {
+            self.selected_node = room_id;
+        }
     }
 
     /// Cook every Room in the active scene to a per-Room `.psxw`
@@ -1794,27 +1824,62 @@ impl EditorWorkspace {
             self.active_tool = ViewTool::Select;
         }
         ui.horizontal(|ui| {
-            for (tool, label) in [
-                (ViewTool::Select, icons::label(icons::POINTER, "Select")),
-                (ViewTool::Move, icons::label(icons::MOVE, "Move")),
-                (ViewTool::Rotate, icons::label(icons::ROTATE_3D, "Rotate")),
-                (ViewTool::Scale, icons::label(icons::SCALE_3D, "Scale")),
+            for (tool, label, hint) in [
+                (
+                    ViewTool::Select,
+                    icons::label(icons::POINTER, "Select"),
+                    "Click an entity in the viewport to select it.",
+                ),
+                (
+                    ViewTool::Move,
+                    icons::label(icons::MOVE, "Move"),
+                    "Drag the selected entity onto another cell.",
+                ),
+                (
+                    ViewTool::Rotate,
+                    icons::label(icons::ROTATE_3D, "Rotate"),
+                    "Rotate (2D viewport only for now).",
+                ),
+                (
+                    ViewTool::Scale,
+                    icons::label(icons::SCALE_3D, "Scale"),
+                    "Scale (2D viewport only for now).",
+                ),
             ] {
-                ui.selectable_value(&mut self.active_tool, tool, label);
+                ui.selectable_value(&mut self.active_tool, tool, label)
+                    .on_hover_text(hint);
             }
             ui.separator();
             ui.add_enabled_ui(room_active, |ui| {
-                for (tool, label) in [
-                    (ViewTool::PaintFloor, icons::label(icons::GRID, "Floor")),
-                    (ViewTool::PaintWall, icons::label(icons::BRICK_WALL, "Wall")),
+                for (tool, label, hint) in [
+                    (
+                        ViewTool::PaintFloor,
+                        icons::label(icons::GRID, "Floor"),
+                        "Paint a floor on each cell you click or drag over.",
+                    ),
+                    (
+                        ViewTool::PaintWall,
+                        icons::label(icons::BRICK_WALL, "Wall"),
+                        "Paint a wall on the edge nearest the click.",
+                    ),
                     (
                         ViewTool::PaintCeiling,
                         icons::label(icons::LAYERS, "Ceiling"),
+                        "Paint a ceiling on each cell.",
                     ),
-                    (ViewTool::Erase, icons::label(icons::TRASH, "Erase")),
-                    (ViewTool::Place, icons::label(icons::PLUS, "Place")),
+                    (
+                        ViewTool::Erase,
+                        icons::label(icons::TRASH, "Erase"),
+                        "Clear floor/walls/ceiling from the cell.",
+                    ),
+                    (
+                        ViewTool::Place,
+                        icons::label(icons::PLUS, "Place"),
+                        "Drop a SpawnPoint at the clicked cell.",
+                    ),
                 ] {
-                    ui.selectable_value(&mut self.active_tool, tool, label);
+                    ui.selectable_value(&mut self.active_tool, tool, label)
+                        .on_hover_text(hint);
                 }
             });
             ui.separator();
@@ -2115,6 +2180,7 @@ impl EditorWorkspace {
         self.status = "New starter project".to_string();
         self.frame_viewport();
         self.mark_dirty();
+        self.select_first_room();
     }
 
     fn reload_project(&mut self) {
@@ -2265,7 +2331,28 @@ fn draw_node_kind_editor(
             ui.horizontal(|ui| {
                 ui.label(icons::text(icons::GRID, 12.0).color(STUDIO_TEXT_WEAK));
                 ui.label("Grid");
-                ui.label(format!("{} x {}", grid.width, grid.depth));
+                let mut new_w = grid.width;
+                let mut new_d = grid.depth;
+                let w_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut new_w)
+                            .speed(0.1)
+                            .range(1..=64)
+                            .prefix("W "),
+                    )
+                    .changed();
+                let d_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut new_d)
+                            .speed(0.1)
+                            .range(1..=64)
+                            .prefix("D "),
+                    )
+                    .changed();
+                if w_changed || d_changed {
+                    grid.resize(new_w, new_d);
+                    changed = true;
+                }
             });
             ui.horizontal(|ui| {
                 ui.label(icons::text(icons::WAYPOINT, 12.0).color(STUDIO_TEXT_WEAK));

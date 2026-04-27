@@ -445,6 +445,34 @@ impl WorldGrid {
     pub fn populated_sector_count(&self) -> usize {
         self.sectors.iter().flatten().count()
     }
+
+    /// Reshape the grid to `new_width × new_depth`.
+    ///
+    /// Sectors that lie inside both the old and new bounds keep
+    /// their authored content; cells that were outside the old
+    /// bounds (a grow operation) come up empty; cells outside the
+    /// new bounds (a shrink) are dropped.
+    ///
+    /// No-op when the dims already match.
+    pub fn resize(&mut self, new_width: u16, new_depth: u16) {
+        if new_width == self.width && new_depth == self.depth {
+            return;
+        }
+        let new_len = new_width as usize * new_depth as usize;
+        let mut new_sectors: Vec<Option<GridSector>> = vec![None; new_len];
+        let copy_w = self.width.min(new_width);
+        let copy_d = self.depth.min(new_depth);
+        for x in 0..copy_w {
+            for z in 0..copy_d {
+                let old_idx = x as usize * self.depth as usize + z as usize;
+                let new_idx = x as usize * new_depth as usize + z as usize;
+                new_sectors[new_idx] = self.sectors[old_idx].take();
+            }
+        }
+        self.width = new_width;
+        self.depth = new_depth;
+        self.sectors = new_sectors;
+    }
 }
 
 /// Resource payloads available to editor scenes.
