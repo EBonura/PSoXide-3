@@ -155,12 +155,32 @@ pub struct EditorWorkspace {
     status: String,
 }
 
-/// One cached `.psxt` thumbnail. `signature` is the path the
-/// handle was built from — when the user retypes the path on a
-/// Texture resource, the signature mismatches and the cache rebuilds.
+/// One cached `.psxt` thumbnail plus the metadata the inspector
+/// reads off the same parse. `signature` is the path the handle was
+/// built from — when the user retypes the path on a Texture
+/// resource, the signature mismatches and the cache rebuilds.
 struct ThumbnailEntry {
     signature: String,
     handle: egui::TextureHandle,
+    stats: PsxtStats,
+}
+
+/// Decoded metadata for one `.psxt` blob. Cheap to compute
+/// (header parse + lengths); shown in the resource inspector so
+/// authors can spot mismatches against an authored target depth /
+/// dimensions without leaving the editor.
+#[derive(Debug, Clone, Copy)]
+struct PsxtStats {
+    width: u16,
+    height: u16,
+    /// 4, 8, or 15 — mirrors `psxed_format::texture::Depth`'s
+    /// numeric form.
+    depth_bits: u8,
+    /// 16 for 4bpp, 256 for 8bpp, 0 for 15bpp.
+    clut_entries: u16,
+    pixel_bytes: u32,
+    clut_bytes: u32,
+    file_bytes: u32,
 }
 
 /// Snapshot of the editor's 3D viewport camera, handed to the
@@ -1707,6 +1727,25 @@ impl EditorWorkspace {
     }
 
     fn draw_resource_inspector(&mut self, ui: &mut egui::Ui, id: ResourceId) {
+        // Pull the cached preview before borrowing `self.project`
+        // mutably below. `texture_thumb_entry` takes `&self` and
+        // walks Texture / Material → cached `.psxt` decode, so this
+        // copy is the only way to keep both alive in one inspector.
+        let preview_thumb = self
+            .project
+            .resource(id)
+            .and_then(|resource| self.texture_thumb_entry(resource))
+            .map(|entry| (entry.handle.id(), entry.stats));
+        let texture_options: Vec<(ResourceId, String)> = self
+            .project
+            .resources
+            .iter()
+            .filter_map(|r| match &r.data {
+                ResourceData::Texture { .. } => Some((r.id, r.name.clone())),
+                _ => None,
+            })
+            .collect();
+
         let Some(resource) = self.project.resource_mut(id) else {
             ui.weak("Resource missing");
             return;
@@ -1729,6 +1768,7 @@ impl EditorWorkspace {
 
         match &mut resource.data {
             ResourceData::Texture { psxt_path } => {
+                draw_psxt_preview_block(ui, preview_thumb);
                 egui::CollapsingHeader::new(icons::label(icons::FILE, "PSXT"))
                     .default_open(true)
                     .show(ui, |ui| {
@@ -1742,21 +1782,37 @@ impl EditorWorkspace {
                             .small(),
                         );
                     });
+                if let Some((_, stats)) = preview_thumb {
+                    egui::CollapsingHeader::new(icons::label(icons::SCAN, "Info"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            draw_psxt_stats(ui, stats);
+                        });
+                }
             }
             ResourceData::Material(material) => {
+                draw_psxt_preview_block(ui, preview_thumb);
                 egui::CollapsingHeader::new(icons::label(icons::BLEND, "Material"))
                     .default_open(true)
                     .show(ui, |ui| {
+                        changed |= material_texture_picker(
+                            ui,
+                            &mut material.texture,
+                            &texture_options,
+                        );
                         changed |= blend_mode_editor(ui, &mut material.blend_mode);
                         changed |= color_editor(ui, "Tint", &mut material.tint);
                         changed |= ui
                             .checkbox(&mut material.double_sided, "Double sided")
                             .changed();
-                        ui.label(match material.texture {
-                            Some(texture) => format!("Texture resource #{}", texture.raw()),
-                            None => "No texture assigned".to_string(),
-                        });
                     });
+                if let Some((_, stats)) = preview_thumb {
+                    egui::CollapsingHeader::new(icons::label(icons::SCAN, "Linked Texture"))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            draw_psxt_stats(ui, stats);
+                        });
+                }
             }
             ResourceData::Mesh { source_path }
             | ResourceData::Scene { source_path }
@@ -1857,7 +1913,7 @@ impl EditorWorkspace {
             } else {
                 project_root.join(psxt_path)
             };
-            let Some(image) = std::fs::read(&abs)
+            let Some((image, stats)) = std::fs::read(&abs)
                 .ok()
                 .and_then(|bytes| decode_psxt_thumbnail(&bytes))
             else {
@@ -1874,6 +1930,7 @@ impl EditorWorkspace {
                 ThumbnailEntry {
                     signature: psxt_path.clone(),
                     handle,
+                    stats,
                 },
             );
         }
@@ -1886,12 +1943,20 @@ impl EditorWorkspace {
     /// Texture's own id if `resource` is one. `None` for everything
     /// else.
     fn texture_thumb_id(&self, resource: &Resource) -> Option<egui::TextureId> {
+        self.texture_thumb_entry(resource).map(|e| e.handle.id())
+    }
+
+    /// Look up the cached thumbnail entry (handle + stats) for a
+    /// Texture resource directly, or for a Material via its texture
+    /// link. `None` when the link is unset, the file isn't readable,
+    /// or the depth is unsupported (15bpp at present).
+    fn texture_thumb_entry(&self, resource: &Resource) -> Option<&ThumbnailEntry> {
         let key = match &resource.data {
             ResourceData::Texture { .. } => Some(resource.id),
             ResourceData::Material(mat) => mat.texture,
             _ => None,
         }?;
-        self.texture_thumbs.get(&key).map(|e| e.handle.id())
+        self.texture_thumbs.get(&key)
     }
 
     fn draw_resources_tab(&mut self, ui: &mut egui::Ui) {
@@ -2894,6 +2959,140 @@ fn draw_inline_icon(ui: &mut egui::Ui, icon: char, color: Color32) {
     ui.label(icons::text(icon, 16.0).color(color));
 }
 
+/// Inspector preview header: a 128×128 image of the linked PSXT
+/// (centered, NEAREST-sampled so individual texels are visible at
+/// editor scale) above a one-line summary. Falls back to a
+/// "no preview" placeholder when the resource has no decoded
+/// thumbnail (missing path / unreadable / unsupported depth).
+fn draw_psxt_preview_block(ui: &mut egui::Ui, thumb: Option<(egui::TextureId, PsxtStats)>) {
+    let preview_size = Vec2::splat(128.0);
+    ui.vertical_centered(|ui| match thumb {
+        Some((id, stats)) => {
+            let (rect, _) = ui.allocate_exact_size(preview_size, Sense::hover());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 4.0, STUDIO_PANEL);
+            painter.image(
+                id,
+                rect,
+                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            painter.rect_stroke(
+                rect,
+                4.0,
+                Stroke::new(1.0, STUDIO_BORDER),
+                StrokeKind::Inside,
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "{}×{}  {}bpp  {}",
+                    stats.width,
+                    stats.height,
+                    stats.depth_bits,
+                    human_bytes(stats.file_bytes)
+                ))
+                .color(STUDIO_TEXT_WEAK)
+                .small(),
+            );
+        }
+        None => {
+            let (rect, _) = ui.allocate_exact_size(preview_size, Sense::hover());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 4.0, STUDIO_PANEL);
+            painter.rect_stroke(
+                rect,
+                4.0,
+                Stroke::new(1.0, STUDIO_BORDER),
+                StrokeKind::Inside,
+            );
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "no preview",
+                FontId::proportional(11.0),
+                STUDIO_TEXT_WEAK,
+            );
+        }
+    });
+    ui.add_space(6.0);
+}
+
+/// Tabular `key — value` rows summarizing a `.psxt`. Mirrors the
+/// fields the cooker writes so authors can sanity-check that their
+/// material's texture lines up with the dimensions they expect.
+fn draw_psxt_stats(ui: &mut egui::Ui, stats: PsxtStats) {
+    let row = |ui: &mut egui::Ui, key: &str, value: String| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(key).color(STUDIO_TEXT_WEAK));
+            ui.label(RichText::new(value).monospace());
+        });
+    };
+    row(ui, "Size", format!("{}×{} px", stats.width, stats.height));
+    row(
+        ui,
+        "Depth",
+        match stats.depth_bits {
+            4 => "4bpp indexed (16-color CLUT)".to_string(),
+            8 => "8bpp indexed (256-color CLUT)".to_string(),
+            15 => "15bpp direct".to_string(),
+            other => format!("{other}bpp (?)"),
+        },
+    );
+    row(ui, "CLUT entries", format!("{}", stats.clut_entries));
+    row(ui, "Pixel data", human_bytes(stats.pixel_bytes));
+    if stats.clut_bytes > 0 {
+        row(ui, "CLUT data", human_bytes(stats.clut_bytes));
+    }
+    row(ui, "File total", human_bytes(stats.file_bytes));
+}
+
+/// Combo-box picker for a Material's linked texture. `current` is
+/// the live `material.texture` field; `options` is every Texture
+/// resource in the project. Returns true when the selection moved
+/// so the caller can mark the project dirty.
+fn material_texture_picker(
+    ui: &mut egui::Ui,
+    current: &mut Option<ResourceId>,
+    options: &[(ResourceId, String)],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Texture");
+        let preview = current
+            .and_then(|id| options.iter().find(|(rid, _)| *rid == id).map(|(_, n)| n.as_str()))
+            .unwrap_or("(none)");
+        egui::ComboBox::from_id_salt("material-texture-picker")
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "(none)").clicked() {
+                    *current = None;
+                    changed = true;
+                }
+                for (id, name) in options {
+                    if ui
+                        .selectable_label(*current == Some(*id), name)
+                        .clicked()
+                    {
+                        *current = Some(*id);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    changed
+}
+
+fn human_bytes(n: u32) -> String {
+    if n < 1024 {
+        format!("{} B", n)
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", (n as f64) / 1024.0)
+    } else {
+        format!("{:.1} MB", (n as f64) / (1024.0 * 1024.0))
+    }
+}
+
 fn draw_scene_node_row(
     ui: &mut egui::Ui,
     row: &NodeRow,
@@ -3693,7 +3892,7 @@ fn draw_checker_preview(painter: &egui::Painter, preview: Rect, base: Color32) {
 /// procedural pattern. The CLUT's STP bit (bit 15, set by the
 /// runtime so semi-transparent draws can mask fully transparent
 /// black) is masked out before producing display RGB.
-fn decode_psxt_thumbnail(bytes: &[u8]) -> Option<ColorImage> {
+fn decode_psxt_thumbnail(bytes: &[u8]) -> Option<(ColorImage, PsxtStats)> {
     let texture = psx_asset::Texture::from_bytes(bytes).ok()?;
     let width = u8::try_from(texture.width()).ok()?;
     let height = u8::try_from(texture.height()).ok()?;
@@ -3706,6 +3905,15 @@ fn decode_psxt_thumbnail(bytes: &[u8]) -> Option<ColorImage> {
     if clut_bytes.len() < clut_entries * 2 {
         return None;
     }
+    let stats = PsxtStats {
+        width: texture.width(),
+        height: texture.height(),
+        depth_bits: if clut_entries == 16 { 4 } else { 8 },
+        clut_entries: clut_entries as u16,
+        pixel_bytes: texture.pixel_bytes().len() as u32,
+        clut_bytes: clut_bytes.len() as u32,
+        file_bytes: bytes.len() as u32,
+    };
     let palette: Vec<Color32> = (0..clut_entries)
         .map(|i| {
             let raw = u16::from_le_bytes([clut_bytes[i * 2], clut_bytes[i * 2 + 1]]) & 0x7FFF;
@@ -3759,10 +3967,13 @@ fn decode_psxt_thumbnail(bytes: &[u8]) -> Option<ColorImage> {
     if pixels.len() != width as usize * height as usize {
         return None;
     }
-    Some(ColorImage {
-        size: [width as usize, height as usize],
-        pixels,
-    })
+    Some((
+        ColorImage {
+            size: [width as usize, height as usize],
+            pixels,
+        },
+        stats,
+    ))
 }
 
 fn draw_palette_strip(painter: &egui::Painter, preview: Rect, swatches: [Color32; 5]) {
