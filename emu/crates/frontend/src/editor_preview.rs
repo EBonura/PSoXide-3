@@ -29,9 +29,12 @@ use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::TriFlat;
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
+use psx_gpu::prim::TriTextured;
 use psxed_project::{
     GridDirection, NodeKind, ProjectDocument, ResourceData, ResourceId, WorldGrid,
 };
+
+use crate::editor_textures::{EditorTextures, MaterialSlot};
 use psxed_ui::ViewportCameraState;
 
 /// Maximum sectors we'll attempt to render in one preview pass.
@@ -66,22 +69,36 @@ const PROJ_H: i32 = 320;
 struct PreviewScratch {
     ot: OrderingTable<OT_DEPTH>,
     tris: [TriFlat; TRI_CAP],
+    tex_tris: [TriTextured; TRI_CAP],
+    /// `0` = next free slot in `tris` (flat-shaded);
+    /// `tex_used` = next free slot in `tex_tris`.
     used: usize,
+    tex_used: usize,
     /// GP0(02h) fill-rectangle packet: 1 tag word + 3 data words
     /// (`opcode|color`, `pack_xy(x, y)`, `pack_xy(w, h)`). Must live
-    /// in the same static as the OT for the same reason `tris` does
-    /// — `iter_packets` reconstructs full pointers from the OT's
-    /// 24-bit chain encoding plus the OT struct's high address bits,
-    /// so chained packets must share that 16 MB region.
+    /// in the same static as the OT for the same reason the prim
+    /// arrays do — `iter_packets` reconstructs full pointers from
+    /// the OT's 24-bit chain encoding plus the OT struct's high
+    /// address bits, so chained packets must share that 16 MB
+    /// region.
     clear_packet: [u32; 4],
 }
 
 const EMPTY_TRI: TriFlat = TriFlat::new([(0, 0), (0, 0), (0, 0)], 0, 0, 0);
+const EMPTY_TEX_TRI: TriTextured = TriTextured::new(
+    [(0, 0), (0, 0), (0, 0)],
+    [(0, 0), (0, 0), (0, 0)],
+    0,
+    0,
+    (0x80, 0x80, 0x80),
+);
 
 static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
     ot: OrderingTable::new(),
     tris: [EMPTY_TRI; TRI_CAP],
+    tex_tris: [EMPTY_TEX_TRI; TRI_CAP],
     used: 0,
+    tex_used: 0,
     clear_packet: [0; 4],
 });
 
@@ -96,6 +113,7 @@ pub fn build_phase1_cmd_log(
     camera: ViewportCameraState,
     selected: psxed_project::NodeId,
     hovered_cell: Option<(u16, u16)>,
+    textures: &EditorTextures,
 ) -> Vec<GpuCmdLogEntry> {
     let Some((grid, target)) = first_room_grid(project) else {
         return Vec::new();
@@ -103,11 +121,12 @@ pub fn build_phase1_cmd_log(
 
     let mut scratch = SCRATCH.lock().expect("editor preview scratch mutex");
     scratch.used = 0;
+    scratch.tex_used = 0;
     scratch.ot.clear();
 
     push_clear(&mut scratch);
     setup_gte_for_camera(camera, target);
-    walk_room(project, grid, &mut scratch);
+    walk_room(project, grid, textures, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
     if let Some((sx, sz)) = hovered_cell {
         push_hover_overlay(grid, sx, sz, &mut scratch);
@@ -202,9 +221,16 @@ fn clamp_i16(value: i32) -> i16 {
     value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-/// Walk every populated sector and emit flat-shaded triangles for
-/// floors, ceilings, and the walls on each cardinal edge.
-fn walk_room(project: &ProjectDocument, grid: &WorldGrid, scratch: &mut PreviewScratch) {
+/// Walk every populated sector and emit triangles for floors,
+/// ceilings, and the walls on each cardinal edge. Faces whose
+/// material has a texture in the editor cache draw textured;
+/// everything else falls back to flat shading.
+fn walk_room(
+    project: &ProjectDocument,
+    grid: &WorldGrid,
+    textures: &EditorTextures,
+    scratch: &mut PreviewScratch,
+) {
     let s = grid.sector_size;
     for x in 0..grid.width {
         for z in 0..grid.depth {
@@ -223,7 +249,7 @@ fn walk_room(project: &ProjectDocument, grid: &WorldGrid, scratch: &mut PreviewS
                     scratch,
                     [x0, x1, z0, z1],
                     floor.heights,
-                    material_color(project, floor.material, FALLBACK_FLOOR),
+                    face_shade(project, floor.material, FALLBACK_FLOOR, textures),
                     /* flip_winding */ false,
                 );
             }
@@ -232,7 +258,7 @@ fn walk_room(project: &ProjectDocument, grid: &WorldGrid, scratch: &mut PreviewS
                     scratch,
                     [x0, x1, z0, z1],
                     ceiling.heights,
-                    material_color(project, ceiling.material, FALLBACK_CEILING),
+                    face_shade(project, ceiling.material, FALLBACK_CEILING, textures),
                     // Ceiling normal points down; flipping the winding
                     // keeps backface-cullers happy and pins the inside
                     // surface as the visible side once we add culling.
@@ -246,17 +272,45 @@ fn walk_room(project: &ProjectDocument, grid: &WorldGrid, scratch: &mut PreviewS
                 (GridDirection::West, WallEdge::West),
             ] {
                 for face in sector.walls.get(direction) {
-                    push_wall_face(scratch, [x0, x1, z0, z1], edge, face.heights, {
-                        material_color(project, face.material, FALLBACK_WALL)
-                    });
+                    push_wall_face(
+                        scratch,
+                        [x0, x1, z0, z1],
+                        edge,
+                        face.heights,
+                        face_shade(project, face.material, FALLBACK_WALL, textures),
+                    );
                 }
             }
 
-            if scratch.used >= TRI_CAP {
+            if scratch.used >= TRI_CAP || scratch.tex_used >= TRI_CAP {
                 return;
             }
         }
     }
+}
+
+/// Per-face render description: either a texture sample with neutral
+/// PSX tint, or a flat RGB. Resolved up-front so each face's tri
+/// emit doesn't re-walk the resource table.
+#[derive(Copy, Clone)]
+enum FaceShade {
+    Flat(u8, u8, u8),
+    Textured(MaterialSlot),
+}
+
+fn face_shade(
+    project: &ProjectDocument,
+    material: Option<ResourceId>,
+    fallback: (u8, u8, u8),
+    textures: &EditorTextures,
+) -> FaceShade {
+    if let Some(id) = material {
+        if let Some(slot) = textures.slot(id) {
+            return FaceShade::Textured(slot);
+        }
+    }
+    let (r, g, b) = material_color(project, material, fallback);
+    FaceShade::Flat(r, g, b)
 }
 
 /// Project the four corners of a sector-aligned horizontal face and
@@ -266,7 +320,7 @@ fn push_horizontal_face(
     scratch: &mut PreviewScratch,
     bounds: [i32; 4],
     heights: [i32; 4],
-    color: (u8, u8, u8),
+    shade: FaceShade,
     flip_winding: bool,
 ) {
     let [x0, x1, z0, z1] = bounds;
@@ -274,12 +328,33 @@ fn push_horizontal_face(
     let p_ne = gte_scene::project_vertex(world_to_view([x1, heights[1], z1]));
     let p_se = gte_scene::project_vertex(world_to_view([x1, heights[2], z0]));
     let p_sw = gte_scene::project_vertex(world_to_view([x0, heights[3], z0]));
-    if flip_winding {
-        push_tri(scratch, [p_nw, p_ne, p_sw], color);
-        push_tri(scratch, [p_ne, p_se, p_sw], color);
+    let (uv_nw, uv_ne, uv_se, uv_sw);
+    let max_u;
+    let max_v;
+    if let FaceShade::Textured(slot) = shade {
+        max_u = slot.width.saturating_sub(1);
+        max_v = slot.height.saturating_sub(1);
+        uv_nw = (0u8, 0u8);
+        uv_ne = (max_u, 0);
+        uv_se = (max_u, max_v);
+        uv_sw = (0, max_v);
     } else {
-        push_tri(scratch, [p_nw, p_sw, p_ne], color);
-        push_tri(scratch, [p_ne, p_sw, p_se], color);
+        // Unused but the compiler still needs values; arbitrary.
+        max_u = 0;
+        max_v = 0;
+        uv_nw = (0, 0);
+        uv_ne = (0, 0);
+        uv_se = (0, 0);
+        uv_sw = (0, 0);
+    }
+    let _ = max_u;
+    let _ = max_v;
+    if flip_winding {
+        emit_face_tri(scratch, [p_nw, p_ne, p_sw], [uv_nw, uv_ne, uv_sw], shade);
+        emit_face_tri(scratch, [p_ne, p_se, p_sw], [uv_ne, uv_se, uv_sw], shade);
+    } else {
+        emit_face_tri(scratch, [p_nw, p_sw, p_ne], [uv_nw, uv_sw, uv_ne], shade);
+        emit_face_tri(scratch, [p_ne, p_sw, p_se], [uv_ne, uv_sw, uv_se], shade);
     }
 }
 
@@ -302,7 +377,7 @@ fn push_wall_face(
     bounds: [i32; 4],
     edge: WallEdge,
     heights: [i32; 4],
-    color: (u8, u8, u8),
+    shade: FaceShade,
 ) {
     let [x0, x1, z0, z1] = bounds;
     // For each cardinal edge, "left" and "right" are picked so an
@@ -318,8 +393,15 @@ fn push_wall_face(
     let p_br = gte_scene::project_vertex(world_to_view([br_xy.0, heights[1], br_xy.1]));
     let p_tr = gte_scene::project_vertex(world_to_view([tr_xy.0, heights[2], tr_xy.1]));
     let p_tl = gte_scene::project_vertex(world_to_view([tl_xy.0, heights[3], tl_xy.1]));
-    push_tri(scratch, [p_bl, p_br, p_tr], color);
-    push_tri(scratch, [p_bl, p_tr, p_tl], color);
+    let (uv_bl, uv_br, uv_tr, uv_tl) = if let FaceShade::Textured(slot) = shade {
+        let u_max = slot.width.saturating_sub(1);
+        let v_max = slot.height.saturating_sub(1);
+        ((0, v_max), (u_max, v_max), (u_max, 0), (0, 0))
+    } else {
+        ((0, 0), (0, 0), (0, 0), (0, 0))
+    };
+    emit_face_tri(scratch, [p_bl, p_br, p_tr], [uv_bl, uv_br, uv_tr], shade);
+    emit_face_tri(scratch, [p_bl, p_tr, p_tl], [uv_bl, uv_tr, uv_tl], shade);
 }
 
 /// Walk every placeable child node and stamp a small screen-space
@@ -565,6 +647,57 @@ fn push_clear(scratch: &mut PreviewScratch) {
     unsafe {
         scratch.ot.insert(OT_DEPTH - 1, ptr, 3);
     }
+}
+
+/// Per-face emit: routes to the flat or textured pool based on
+/// `shade`, packing UVs only when textured.
+fn emit_face_tri(
+    scratch: &mut PreviewScratch,
+    p: [psx_gte::scene::Projected; 3],
+    uvs: [(u8, u8); 3],
+    shade: FaceShade,
+) {
+    match shade {
+        FaceShade::Flat(r, g, b) => push_tri(scratch, p, (r, g, b)),
+        FaceShade::Textured(slot) => push_tex_tri(scratch, p, uvs, slot),
+    }
+}
+
+/// Compose a [`TriTextured`] sampling `slot`'s tpage / CLUT, stash
+/// it in the static `tex_tris` arena, and chain it into the OT.
+fn push_tex_tri(
+    scratch: &mut PreviewScratch,
+    p: [psx_gte::scene::Projected; 3],
+    uvs: [(u8, u8); 3],
+    slot: MaterialSlot,
+) {
+    if scratch.tex_used >= TRI_CAP {
+        return;
+    }
+    let idx = scratch.tex_used;
+    scratch.tex_tris[idx] = TriTextured::new(
+        [
+            (p[0].sx, p[0].sy),
+            (p[1].sx, p[1].sy),
+            (p[2].sx, p[2].sy),
+        ],
+        uvs,
+        slot.clut_word,
+        slot.tpage_word,
+        // Neutral PSX tint — the texture sample passes through
+        // unmodulated. Once we add per-light shading we'll vary
+        // this per-vertex via TriTexturedGouraud.
+        (0x80, 0x80, 0x80),
+    );
+    let avg_sz = (p[0].sz as u32 + p[1].sz as u32 + p[2].sz as u32) / 3;
+    let slot_idx = ((avg_sz as usize) >> 6).clamp(1, OT_DEPTH - 2);
+    let packet_ptr: *mut TriTextured = &mut scratch.tex_tris[idx];
+    unsafe {
+        scratch
+            .ot
+            .insert(slot_idx, packet_ptr.cast::<u32>(), TriTextured::WORDS);
+    }
+    scratch.tex_used = idx + 1;
 }
 
 /// Compose a [`TriFlat`] from three projected vertices, store it in

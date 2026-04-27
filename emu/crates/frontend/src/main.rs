@@ -14,6 +14,7 @@ mod audio;
 mod cli;
 mod disasm;
 mod editor_preview;
+mod editor_textures;
 mod gfx;
 mod icons;
 mod input;

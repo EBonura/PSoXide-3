@@ -63,6 +63,10 @@ pub struct Graphics {
     /// preview always renders solid, so we hand it a freshly-zeroed
     /// instance.
     editor_gpu_stub: Gpu,
+    /// Per-material procedural textures + the VRAM mirror they're
+    /// stamped into. Refreshed each frame against the project; new
+    /// materials get a tpage allocated lazily.
+    editor_textures: crate::editor_textures::EditorTextures,
 }
 
 impl Graphics {
@@ -154,6 +158,7 @@ impl Graphics {
             hw_renderer,
             editor_hw_renderer,
             editor_gpu_stub: Gpu::new(),
+            editor_textures: crate::editor_textures::EditorTextures::new(),
         }
     }
 
@@ -194,15 +199,22 @@ impl Graphics {
         selected: psxed_project::NodeId,
         hovered_cell: Option<(u16, u16)>,
     ) {
-        let cmd_log =
-            crate::editor_preview::build_phase1_cmd_log(project, camera, selected, hovered_cell);
-        // Empty VRAM is fine: floor rendering is flat-shaded — no
-        // textured primitives sample VRAM. Texture support arrives
-        // in a later phase along with the editor's static VRAM
-        // upload path.
-        let empty_vram = [0u16; 1];
-        self.editor_hw_renderer
-            .render_frame(&self.editor_gpu_stub, &cmd_log, &empty_vram);
+        // Materials added to the project since last frame get
+        // procedural textures stamped into VRAM here. Cheap when the
+        // resource list is unchanged.
+        self.editor_textures.refresh(project);
+        let cmd_log = crate::editor_preview::build_phase1_cmd_log(
+            project,
+            camera,
+            selected,
+            hovered_cell,
+            &self.editor_textures,
+        );
+        self.editor_hw_renderer.render_frame(
+            &self.editor_gpu_stub,
+            &cmd_log,
+            self.editor_textures.vram_words(),
+        );
     }
 
     /// Current internal scale used by the hardware-renderer target.
