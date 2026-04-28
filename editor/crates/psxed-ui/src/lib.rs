@@ -180,6 +180,33 @@ pub struct EditorWorkspace {
     texture_thumbs: HashMap<ResourceId, ThumbnailEntry>,
     dirty: bool,
     status: String,
+    /// State of the most recent / current playtest launch.
+    /// Cook & Play transitions Idle → Launching → Running, or
+    /// Idle → Failed when something breaks.
+    playtest_state: PlaytestRunState,
+    /// Last few lines of the spawned playtest's stderr/stdout
+    /// captured for display in the editor. Bounded to keep
+    /// memory predictable.
+    playtest_log: Vec<String>,
+    /// Live handle on the running playtest process, if any.
+    /// Held so `Stop Playtest` can kill it. Optional because
+    /// the editor may run on platforms where spawning fails.
+    playtest_child: Option<std::process::Child>,
+}
+
+/// One state the editor's playtest launcher can be in.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PlaytestRunState {
+    /// No active or recent launch.
+    #[default]
+    Idle,
+    /// The cook step succeeded; the build/run command is
+    /// being spawned. Transient.
+    Launching,
+    /// `make run-editor-playtest` is running with this PID.
+    Running { pid: u32 },
+    /// Last attempt failed at cook, build, or spawn.
+    Failed(String),
 }
 
 /// One cached `.psxt` thumbnail plus the metadata the inspector
@@ -801,6 +828,9 @@ impl EditorWorkspace {
             texture_thumbs: HashMap::new(),
             dirty: false,
             status: "Editor ready".to_string(),
+            playtest_state: PlaytestRunState::Idle,
+            playtest_log: Vec::new(),
+            playtest_child: None,
         }
     }
 
@@ -1057,11 +1087,135 @@ impl EditorWorkspace {
             )
         }).unwrap_or_default();
         Ok(format!(
-            "Playtest cooked → {}{}{}.  Run: make run-editor-playtest",
+            "Playtest cooked → {}{}{}",
             dir.display(),
             counts,
             warning_suffix,
         ))
+    }
+
+    /// Cook + launch in one click. The user-visible "Cook & Play"
+    /// path:
+    ///
+    /// 1. cook the active project into the playtest example's
+    ///    `generated/` directory;
+    /// 2. spawn `make run-editor-playtest` from the workspace
+    ///    root and track the resulting child process so the
+    ///    editor can show running state and offer Stop;
+    /// 3. transition `playtest_state` Idle → Launching →
+    ///    Running, or → Failed on any step's failure.
+    ///
+    /// The poll-on-frame helper [`Self::poll_playtest_child`]
+    /// reaps the process when it exits so the state machine
+    /// reflects reality without blocking the UI.
+    pub fn launch_playtest(&mut self) {
+        // Cook first. If validation fails the launcher never
+        // touches the child process slot.
+        self.playtest_log.clear();
+        let cook_status = match self.cook_playtest_to_disk() {
+            Ok(report) => report,
+            Err(error) => {
+                self.playtest_state = PlaytestRunState::Failed(error.clone());
+                self.status = format!("Cook & Play failed: {error}");
+                return;
+            }
+        };
+        self.append_playtest_log(format!("[cook] {cook_status}"));
+
+        // If a previous playtest is still running, kill it
+        // before spawning a fresh one. The user clicked Play —
+        // they want the new build, not two side-by-side
+        // emulators.
+        self.stop_playtest();
+
+        let workspace_root = workspace_root_dir();
+        self.playtest_state = PlaytestRunState::Launching;
+        self.status = "Launching playtest…".to_string();
+        // `make run-editor-playtest` builds the existing cooked
+        // output and side-loads it through whatever runner the
+        // Makefile has wired (today: PCSX-Redux). Doesn't recook
+        // — that already happened above.
+        let mut command = std::process::Command::new("make");
+        command
+            .arg("run-editor-playtest")
+            .current_dir(&workspace_root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        match command.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                self.append_playtest_log(format!("[launch] make run-editor-playtest (pid {pid})"));
+                self.playtest_child = Some(child);
+                self.playtest_state = PlaytestRunState::Running { pid };
+                self.status = format!("Playtest running (pid {pid})");
+            }
+            Err(e) => {
+                let detail = format!("spawn `make run-editor-playtest`: {e}");
+                self.playtest_state = PlaytestRunState::Failed(detail.clone());
+                self.status = format!("Cook & Play failed: {detail}");
+            }
+        }
+    }
+
+    /// Poll the running playtest child. Called once per frame
+    /// from `draw`. Reaps the process on exit, captures the
+    /// exit status into the log, and transitions
+    /// `playtest_state` back to Idle.
+    pub fn poll_playtest_child(&mut self) {
+        let Some(child) = self.playtest_child.as_mut() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.append_playtest_log(format!("[playtest] exited: {status}"));
+                self.playtest_child = None;
+                self.playtest_state = PlaytestRunState::Idle;
+                if !status.success() {
+                    self.status = format!("Playtest exited: {status}");
+                }
+            }
+            Ok(None) => {} // still running
+            Err(e) => {
+                self.append_playtest_log(format!("[playtest] try_wait: {e}"));
+                self.playtest_child = None;
+                self.playtest_state = PlaytestRunState::Failed(e.to_string());
+            }
+        }
+    }
+
+    /// Stop the running playtest if any. Best-effort: a
+    /// well-behaved emulator exits on its own when the user
+    /// closes the window; this is the editor's hard-stop for
+    /// when a build is hung or the user wants the slot back.
+    pub fn stop_playtest(&mut self) {
+        if let Some(mut child) = self.playtest_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.append_playtest_log("[stop] playtest killed".to_string());
+        }
+        self.playtest_state = PlaytestRunState::Idle;
+    }
+
+    /// Read-only view on the playtest run state. The toolbar
+    /// uses this to swap the Cook & Play / Stop button copy.
+    pub fn playtest_state(&self) -> &PlaytestRunState {
+        &self.playtest_state
+    }
+
+    /// Read-only view on the captured playtest log lines.
+    pub fn playtest_log(&self) -> &[String] {
+        &self.playtest_log
+    }
+
+    fn append_playtest_log(&mut self, line: String) {
+        // Bound the log so a chatty playtest doesn't grow the
+        // editor's memory unboundedly.
+        const MAX_LINES: usize = 64;
+        if self.playtest_log.len() >= MAX_LINES {
+            let drop = self.playtest_log.len() - MAX_LINES + 1;
+            self.playtest_log.drain(0..drop);
+        }
+        self.playtest_log.push(line);
     }
 
     /// Draw the full editor workspace.
@@ -1075,6 +1229,7 @@ impl EditorWorkspace {
     /// `HwRenderer` the emulator uses.
     pub fn draw(&mut self, ctx: &egui::Context, viewport_3d_tex: egui::TextureId) {
         apply_studio_visuals(ctx);
+        self.poll_playtest_child();
         self.handle_global_shortcuts(ctx);
         self.draw_menu_bar(ctx);
         self.draw_action_bar(ctx);
@@ -1906,7 +2061,10 @@ impl EditorWorkspace {
                     NodeKind::Light {
                         color: [255, 240, 200],
                         intensity: 1.0,
-                        radius: 1.0,
+                        // Sectors. Matches the Add Child default
+                        // and the Room-fill preset — covers a
+                        // typical 4×4 sector room.
+                        radius: 4.0,
                     },
                 ),
             };
@@ -2806,17 +2964,34 @@ impl EditorWorkspace {
                             Err(error) => self.status = format!("Cook failed: {error}"),
                         }
                     }
+                    let playtest_running = matches!(
+                        self.playtest_state,
+                        PlaytestRunState::Launching | PlaytestRunState::Running { .. }
+                    );
+                    let cook_label = if playtest_running {
+                        "Re-Cook & Play"
+                    } else {
+                        "Cook & Play"
+                    };
                     if ui
-                        .button(icons::label(icons::PLAY, "Cook & Play"))
+                        .button(icons::label(icons::PLAY, cook_label))
                         .on_hover_text(
-                            "Cook the active scene into editor-playtest's generated dir. \
-                             Run `make run-editor-playtest` afterwards to launch.",
+                            "Cook the active scene and launch editor-playtest. \
+                             `make run-editor-playtest` runs as a child process; the \
+                             editor tracks PID and exit status.",
                         )
                         .clicked()
                     {
-                        match self.cook_playtest_to_disk() {
-                            Ok(report) => self.status = report,
-                            Err(error) => self.status = format!("Cook & Play failed: {error}"),
+                        self.launch_playtest();
+                    }
+                    if playtest_running {
+                        if ui
+                            .button(icons::label(icons::TRASH, "Stop Playtest"))
+                            .on_hover_text("Kill the running editor-playtest process.")
+                            .clicked()
+                        {
+                            self.stop_playtest();
+                            self.status = "Playtest stopped".to_string();
                         }
                     }
 
@@ -5998,7 +6173,11 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 8] {
             NodeKind::Light {
                 color: [255, 240, 200],
                 intensity: 1.0,
-                radius: 4096.0,
+                // Sectors. Matches the Place tool default and
+                // the Torch/Room fill presets — historically
+                // this was 4096.0 (4096 sectors!) which lit
+                // every room from across the world.
+                radius: 4.0,
             },
         ),
         ("SpawnPoint", NodeKind::SpawnPoint { player: false }),
@@ -8329,6 +8508,17 @@ fn sanitise_room_filename(name: &str) -> String {
 
 /// Walk the active scene and collect every Room node as an
 /// `(id, display name)` pair, used by Portal pickers.
+/// Repo root resolved at compile time from
+/// `psxed-ui/Cargo.toml` — the launcher uses it as the working
+/// directory for `make run-editor-playtest`. Keeps the dev
+/// workflow path-independent.
+fn workspace_root_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+}
+
 fn collect_room_options(project: &ProjectDocument) -> Vec<(NodeId, String)> {
     project
         .active_scene()

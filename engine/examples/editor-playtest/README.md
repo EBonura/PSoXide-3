@@ -40,8 +40,13 @@ that pivots around the spawn point. No collision yet.
 
 ## Cook + run
 
-Three Make targets, sharply scoped so the editor's cook output
-isn't accidentally clobbered:
+The editor's **Cook & Play** button is one-click: it cooks
+the active project, then spawns `make run-editor-playtest` as
+a child process and tracks its PID + exit status. The toolbar
+swaps to a `Stop Playtest` button while the child is alive.
+
+For headless / CI / manual workflows, three Make targets
+remain:
 
 ```sh
 # Cook the active editor project (or starter, with no args) into
@@ -60,10 +65,6 @@ make run-editor-playtest
 # Convenience: cook starter + build + run.
 make run-starter-playtest
 ```
-
-The editor's "Cook & Play" button performs the cook half and
-prints the exact `make run-editor-playtest` command in its
-status line.
 
 ## Placeholder vs cooked manifest
 

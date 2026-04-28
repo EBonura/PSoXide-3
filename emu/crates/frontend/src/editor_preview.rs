@@ -120,7 +120,7 @@ pub fn build_phase1_cmd_log(
     paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     textures: &EditorTextures,
 ) -> Vec<GpuCmdLogEntry> {
-    let Some((grid, target)) = first_room_grid(project) else {
+    let Some((room_id, grid, target)) = first_room_grid(project) else {
         return Vec::new();
     };
 
@@ -131,7 +131,7 @@ pub fn build_phase1_cmd_log(
 
     push_clear(&mut scratch);
     let world_camera = setup_gte_for_camera(camera, target);
-    walk_room(project, grid, textures, &mut scratch);
+    walk_room(project, room_id, grid, textures, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
     walk_light_gizmos(project, grid, selected, &mut scratch);
 
@@ -174,7 +174,9 @@ pub fn build_phase1_cmd_log(
 /// First Room node in the active scene plus the world-space point we
 /// want the orbit camera to look at (centre of the grid at floor
 /// height). `None` if no Room exists.
-fn first_room_grid(project: &ProjectDocument) -> Option<(&WorldGrid, [i32; 3])> {
+fn first_room_grid(
+    project: &ProjectDocument,
+) -> Option<(psxed_project::NodeId, &WorldGrid, [i32; 3])> {
     let scene = project.active_scene();
     let room = scene
         .nodes()
@@ -189,7 +191,7 @@ fn first_room_grid(project: &ProjectDocument) -> Option<(&WorldGrid, [i32; 3])> 
         grid.origin[0] * grid.sector_size + (grid.width as i32 * grid.sector_size) / 2;
     let center_z =
         grid.origin[1] * grid.sector_size + (grid.depth as i32 * grid.sector_size) / 2;
-    Some((grid, [center_x, 0, center_z]))
+    Some((room.id, grid, [center_x, 0, center_z]))
 }
 
 /// Configure the host-side GTE so subsequent `project_vertex` /
@@ -322,12 +324,13 @@ struct PreviewLight {
 /// centre, and modulates the base material colour.
 fn walk_room(
     project: &ProjectDocument,
+    room_id: psxed_project::NodeId,
     grid: &WorldGrid,
     textures: &EditorTextures,
     scratch: &mut PreviewScratch,
 ) {
     let s = grid.sector_size;
-    let lights = collect_preview_lights(project, grid);
+    let lights = collect_preview_lights(project, room_id, grid);
     let ambient = grid.ambient_color;
     for x in 0..grid.width {
         for z in 0..grid.depth {
@@ -446,10 +449,15 @@ fn face_shade(
 /// Lights authored outside any Room (no enclosing parent) are
 /// skipped silently — the cooker warns about those, the
 /// preview just doesn't render them.
-fn collect_preview_lights(project: &ProjectDocument, grid: &WorldGrid) -> Vec<PreviewLight> {
+fn collect_preview_lights(
+    project: &ProjectDocument,
+    room_id: psxed_project::NodeId,
+    grid: &WorldGrid,
+) -> Vec<PreviewLight> {
     let s = grid.sector_size;
+    let scene = project.active_scene();
     let mut out = Vec::new();
-    for node in project.active_scene().nodes() {
+    for node in scene.nodes() {
         let NodeKind::Light {
             color,
             intensity,
@@ -461,12 +469,27 @@ fn collect_preview_lights(project: &ProjectDocument, grid: &WorldGrid) -> Vec<Pr
         if *radius <= 0.0 || !intensity.is_finite() || *intensity < 0.0 {
             continue;
         }
+        // Filter by enclosing Room — a light authored under
+        // some other Room must not bleed into this one.
+        if !is_descendant_of_room(scene, node.id, room_id) {
+            continue;
+        }
         let pos = node.transform.translation;
+        // World position uses the same convention as
+        // `walk_entities` / `walk_model_instances`: editor
+        // translation is in *sectors relative to the room
+        // origin*, so multiply by `sector_size` and shift by
+        // half-grid. Room `origin` is baked into
+        // `cell_world_x/z` for grid faces; entities use the
+        // half-grid offset.
         let world = [
             ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
             (pos[1] * s as f32) as i32,
             ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
         ];
+        // Editor `radius` is in sector units; convert to
+        // engine units once here so the per-face attenuation
+        // math stays in world space.
         let radius_engine = (radius * s as f32) as i32;
         // Pre-multiply colour × intensity into u32 channels;
         // intensity scaled by 256 (Q8.8) keeps the per-face
@@ -484,6 +507,24 @@ fn collect_preview_lights(project: &ProjectDocument, grid: &WorldGrid) -> Vec<Pr
         });
     }
     out
+}
+
+/// Walk parent links from `node_id` looking for `room_id`.
+/// `true` if `room_id` itself is on the chain. Used to confine
+/// per-room lights to the room they were authored under.
+fn is_descendant_of_room(
+    scene: &psxed_project::Scene,
+    node_id: psxed_project::NodeId,
+    room_id: psxed_project::NodeId,
+) -> bool {
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        if id == room_id {
+            return true;
+        }
+        current = scene.node(id).and_then(|n| n.parent);
+    }
+    false
 }
 
 /// Centre of a horizontal face (floor / ceiling) — average X /
@@ -515,6 +556,19 @@ fn wall_face_center(bounds: [i32; 4], edge: WallEdge, heights: [i32; 4]) -> [i32
 /// Apply per-face lighting: ambient + linear-attenuation sum
 /// of every `PreviewLight` whose radius covers `face_center`.
 /// Final RGB clamps to 8 bits and modulates the input shade.
+/// Lighting convention (PSX-neutral):
+///
+/// * `light_rgb` is in `0..=255` per channel.
+/// * `128` = neutral — material renders at its base brightness.
+/// * `0`   = pitch black.
+/// * `255` = saturated overbright (clamped at the modulate
+///   step).
+///
+/// Both the editor preview and the runtime use this scale.
+/// Final colour = `base * light_rgb / 128`, clamped to `255`.
+pub(crate) const LIGHTING_NEUTRAL: u32 = 128;
+pub(crate) const LIGHTING_MAX: u32 = 255;
+
 fn light_face(
     base: FaceShade,
     face_center: [i32; 3],
@@ -525,46 +579,53 @@ fn light_face(
         FaceShade::Flat(r, g, b) => (r, g, b),
         FaceShade::Textured { tint, .. } => tint,
     };
-    // Start with the room ambient so an unlit surface reads
-    // visibly. Use 16-bit accumulators so two saturating-bright
-    // lights don't roll over before clamp.
-    let mut accum: [u32; 3] = [
-        ambient[0] as u32 * 256,
-        ambient[1] as u32 * 256,
-        ambient[2] as u32 * 256,
+    // Start at room ambient — *not* `ambient * 256`. The
+    // accumulator is the same 0..255 light_rgb space the
+    // modulate step expects: ambient = neutral 128 produces
+    // unmodified base material; ambient < 128 produces a
+    // dimmer surface; ambient > 128 brightens.
+    let mut light_rgb: [u32; 3] = [
+        ambient[0] as u32,
+        ambient[1] as u32,
+        ambient[2] as u32,
     ];
     for light in lights {
-        // Distance² in world units. Cheap saturating-sub so a
-        // light placed directly on a face doesn't underflow.
         let dx = (face_center[0] - light.position[0]) as i64;
         let dy = (face_center[1] - light.position[1]) as i64;
         let dz = (face_center[2] - light.position[2]) as i64;
         let d2 = dx * dx + dy * dy + dz * dz;
         let r = light.radius as i64;
-        let r2 = r * r;
-        if d2 >= r2 || r <= 0 {
+        if r <= 0 || d2 >= r * r {
             continue;
         }
-        // Linear falloff: weight = (radius - distance) / radius
-        // in Q8.8. `distance` via integer sqrt to avoid f32 in
-        // the hot loop.
+        // Linear falloff: weight in Q8 — `0..=256` where 256
+        // means "at the centre".
         let d = isqrt_i64(d2);
-        let weight_q8 = (((r - d) << 8) / r) as u32; // 0..256
+        let weight_q8 = (((r - d) << 8) / r) as u32;
         for c in 0..3 {
-            accum[c] = accum[c]
-                .saturating_add((light.weighted_color[c] >> 8) * weight_q8 / 256);
+            // weighted_color[c] = color[c] * intensity_q8 (up to
+            // 255 * u16::MAX). One contribution lands as
+            //   color * intensity * weight  → in 0..=255 typical
+            //   = (weighted_color * weight_q8) >> 16
+            let contrib = (light.weighted_color[c] as u64) * (weight_q8 as u64);
+            light_rgb[c] = light_rgb[c].saturating_add((contrib >> 16) as u32);
         }
     }
-    // Modulate base material colour by the accumulated light.
-    // Treat `base_color` as multiplicative tint at 256 = neutral
-    // so a bright light × neutral floor stays bright.
-    let modulate = |base: u8, acc: u32| -> u8 {
-        let blended = (base as u32 * acc / 256).min(255);
+    // Saturate light_rgb at 255 before modulating. Guarantees
+    // `base * light / 128` can't exceed `base * 2`, which the
+    // 8-bit clamp catches.
+    for c in 0..3 {
+        if light_rgb[c] > LIGHTING_MAX {
+            light_rgb[c] = LIGHTING_MAX;
+        }
+    }
+    let modulate = |base: u8, light: u32| -> u8 {
+        let blended = (base as u32 * light) / LIGHTING_NEUTRAL;
         blended.min(255) as u8
     };
-    let r = modulate(base_color.0, accum[0]);
-    let g = modulate(base_color.1, accum[1]);
-    let b = modulate(base_color.2, accum[2]);
+    let r = modulate(base_color.0, light_rgb[0]);
+    let g = modulate(base_color.1, light_rgb[1]);
+    let b = modulate(base_color.2, light_rgb[2]);
     match base {
         FaceShade::Flat(_, _, _) => FaceShade::Flat(r, g, b),
         FaceShade::Textured { slot, .. } => FaceShade::Textured {
@@ -2168,5 +2229,96 @@ fn push_tri(
         scratch
             .ot
             .insert(slot, packet_ptr.cast::<u32>(), TriFlat::WORDS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{light_face, FaceShade, PreviewLight};
+
+    fn flat(r: u8, g: u8, b: u8) -> FaceShade {
+        FaceShade::Flat(r, g, b)
+    }
+
+    fn unpack(shade: FaceShade) -> (u8, u8, u8) {
+        match shade {
+            FaceShade::Flat(r, g, b) => (r, g, b),
+            FaceShade::Textured { tint, .. } => tint,
+        }
+    }
+
+    #[test]
+    fn light_face_no_lights_ambient_32_is_not_white() {
+        // Regression: pre-fix the `ambient * 256` bug saturated
+        // every face to 255. With the new convention an unlit
+        // face at ambient 32 should render at ~32, not white.
+        let base = flat(128, 128, 128);
+        let lit = light_face(base, [0, 0, 0], &[], [32, 32, 32]);
+        let (r, g, b) = unpack(lit);
+        assert!(r < 64 && g < 64 && b < 64, "got ({r}, {g}, {b})");
+    }
+
+    #[test]
+    fn light_face_ambient_128_is_neutral() {
+        // 128 ambient is the neutral PSX-tint value; an unlit
+        // 128-base material should land back at exactly 128.
+        let lit = light_face(flat(128, 128, 128), [0, 0, 0], &[], [128, 128, 128]);
+        assert_eq!(unpack(lit), (128, 128, 128));
+    }
+
+    #[test]
+    fn light_face_zero_ambient_zero_lights_black() {
+        let lit = light_face(flat(255, 255, 255), [0, 0, 0], &[], [0, 0, 0]);
+        assert_eq!(unpack(lit), (0, 0, 0));
+    }
+
+    #[test]
+    fn light_face_point_light_inside_radius_brightens() {
+        // White light at the face centre with neutral base
+        // should land at saturating-bright since contribution
+        // (255 × 256 × 256) / 65536 = 255 dominates ambient.
+        let light = PreviewLight {
+            position: [0, 0, 0],
+            radius: 100,
+            // intensity_q8 = 256, color (255, 255, 255).
+            weighted_color: [255 * 256, 255 * 256, 255 * 256],
+        };
+        let lit = light_face(flat(128, 128, 128), [0, 0, 0], &[light], [32, 32, 32]);
+        let (r, g, b) = unpack(lit);
+        assert!(r > 200 && g > 200 && b > 200, "got ({r}, {g}, {b})");
+    }
+
+    #[test]
+    fn light_face_point_light_outside_radius_zero() {
+        // Place the face well outside the light's radius; the
+        // contribution must be exactly zero. Output should
+        // match the no-lights case.
+        let light = PreviewLight {
+            position: [0, 0, 0],
+            radius: 100,
+            weighted_color: [255 * 256, 255 * 256, 255 * 256],
+        };
+        let lit = light_face(flat(128, 128, 128), [10000, 0, 0], &[light], [32, 32, 32]);
+        let baseline = light_face(flat(128, 128, 128), [10000, 0, 0], &[], [32, 32, 32]);
+        assert_eq!(unpack(lit), unpack(baseline));
+    }
+
+    #[test]
+    fn light_face_two_lights_accumulate_and_clamp() {
+        let l = PreviewLight {
+            position: [0, 0, 0],
+            radius: 100,
+            weighted_color: [255 * 256, 255 * 256, 255 * 256],
+        };
+        let lit = light_face(
+            flat(255, 255, 255),
+            [0, 0, 0],
+            &[l, l],
+            [128, 128, 128],
+        );
+        let (r, g, b) = unpack(lit);
+        // Even with two saturating lights, output never
+        // exceeds 255 per channel.
+        assert_eq!((r, g, b), (255, 255, 255));
     }
 }

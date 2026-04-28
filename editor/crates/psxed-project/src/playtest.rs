@@ -704,7 +704,12 @@ pub fn build_package(
                     ));
                     return (None, report);
                 }
-                let radius_clamped = radius.clamp(1.0, u16::MAX as f32) as u16;
+                // Editor radius is in *sector units* — convert
+                // to world units (engine units) at cook time so
+                // the runtime record stays in one canonical
+                // unit regardless of the room's `sector_size`.
+                let radius_world = (radius * grid.sector_size as f32)
+                    .clamp(1.0, u16::MAX as f32) as u16;
                 let intensity_q8 = (intensity * 256.0)
                     .clamp(0.0, u16::MAX as f32) as u16;
                 lights.push(PlaytestLight {
@@ -712,7 +717,7 @@ pub fn build_package(
                     x: pos[0],
                     y: pos[1],
                     z: pos[2],
-                    radius: radius_clamped,
+                    radius: radius_world,
                     intensity_q8,
                     color: *color,
                 });
@@ -2067,6 +2072,32 @@ mod tests {
             "errors: {:?}",
             report.errors,
         );
+    }
+
+    #[test]
+    fn light_radius_converts_sectors_to_world_units() {
+        // Author a 4-sector radius; with sector_size=1024 the
+        // cooked record must store 4096 world units.
+        let mut project = ProjectDocument::starter();
+        let ids: Vec<NodeId> = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Light { .. }))
+            .map(|n| n.id)
+            .collect();
+        let scene = project.active_scene_mut();
+        for id in ids {
+            if let Some(node) = scene.node_mut(id) {
+                if let NodeKind::Light { radius, .. } = &mut node.kind {
+                    *radius = 4.0;
+                }
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.expect("cooks");
+        assert_eq!(package.lights[0].radius, 4096);
     }
 
     #[test]

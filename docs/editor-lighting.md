@@ -18,7 +18,10 @@ manifest → editor 3D viewport + editor-playtest runtime.
 
 ## Authoring
 
-Place a `NodeKind::Light` under a Room subtree. Inspector
+Place a `NodeKind::Light` *under* a Room subtree — lights
+authored outside any Room are dropped at cook time, and the
+editor preview filters them per-room so they only affect
+their enclosing room. Each Light: Inspector
 exposes:
 
 - **Color** — 8-bit RGB.
@@ -53,6 +56,18 @@ pub struct PointLightRecord {
 }
 ```
 
+### Units
+
+- **Editor `radius`**: sector units. `1.0` = one sector. The
+  inspector slider maxes at `8.0` sectors.
+- **Runtime `radius` (`PointLightRecord.radius`)**: engine
+  (world) units. The cooker multiplies `editor_radius *
+  sector_size` to convert; the runtime never has to know
+  about sector_size.
+- **Editor `intensity`**: `f32` (`0..4` typical, with a soft
+  warning above 4).
+- **Runtime `intensity_q8`**: Q8.8 (`256` = 1.0).
+
 The cook-time conversion:
 
 ```text
@@ -63,26 +78,67 @@ position         = node.transform.translation
                    via the same convention model + spawn use.
 ```
 
+### Light defaults
+
+All three light-creation paths use the same defaults:
+
+- Place tool (`PlaceKind::LightMarker`): `radius = 4.0`, `intensity = 1.0`, `color = (255, 240, 200)`.
+- Add Child → Light (scene tree): same.
+- Inspector "Room fill" preset: same.
+
+Historically the Add Child path defaulted to `radius = 4096.0`
+(four thousand sectors!), which lit every room from across
+the world. That's been fixed.
+
+## Lighting convention
+
+Both editor and runtime use the same **PSX-neutral light scale**:
+
+```text
+light_rgb in 0..=255 per channel:
+  0    pitch black
+  128  neutral — material renders at its base brightness
+  255  saturating overbright
+
+final_rgb = clamp(base_rgb * light_rgb / 128, 0, 255)
+```
+
+A face's `light_rgb` is `ambient + sum(per-light contributions)`,
+clamped to 255 per channel. So:
+
+- `ambient = [0, 0, 0]` plus no lights → black surface.
+- `ambient = [32, 32, 32]` plus no lights → dim surface (~25% of base).
+- `ambient = [128, 128, 128]` plus no lights → exactly the base material.
+- A bright light at a face centre saturates that face to 255.
+
+`WorldGrid::ambient_color` ships at `[32, 32, 32]` for the
+starter project so rooms read as dim-but-not-black before any
+Light node is placed.
+
 ## Editor preview lighting
 
 The editor 3D viewport applies **per-face** point-light
 accumulation:
 
-1. `walk_room` calls `collect_preview_lights(project, grid)`
-   once per frame to pre-multiply each light's
-   `color × intensity_q8` into `u32` channels.
-2. For each face (floor, ceiling, wall) the renderer computes
+1. `walk_room` calls `collect_preview_lights(project, room_id, grid)`
+   once per frame. Lights are filtered to the *enclosing* Room
+   — a Light authored under Room A never lights Room B's
+   surfaces.
+2. Each light's `color × intensity_q8` is pre-multiplied into
+   `u32` channels.
+3. For each face (floor, ceiling, wall) the renderer computes
    a face centre and runs every light through
    `light_face(base_shade, center, lights, ambient)`.
-3. Falloff is linear in distance: `weight = (radius - d) / radius`.
-4. The result modulates the material's base tint via
-   `tint × accum / 256`, clamping to 8 bits per channel.
-5. `WorldGrid::ambient_color` provides a baseline so rooms
-   with zero lights still read.
+4. Falloff is linear in distance: `weight = (radius - d) / radius`.
+5. Per-light contribution lands as
+   `(weighted_color * weight_q8) >> 16`, accumulated into
+   `light_rgb`.
+6. The result modulates the material's base tint via
+   `base * light_rgb / 128`.
 
-Selected lights also draw a yellow radius ring at floor level
-for at-a-glance feedback; unselected lights draw a thin ring
-tinted by their authored colour.
+Selected lights draw a bright yellow radius ring at floor
+level; unselected lights draw a thin ring tinted by their
+authored colour.
 
 ## Runtime playtest lighting
 
