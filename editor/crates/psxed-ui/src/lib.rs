@@ -113,6 +113,13 @@ pub struct EditorWorkspace {
     /// boldly than `hovered_primitive`; the inspector reads it to
     /// surface per-primitive properties.
     selected_primitive: Option<Selection>,
+    /// Active drag-translate stroke. Set on drag-start over a
+    /// primitive in Select mode, mutated by every drag frame, and
+    /// cleared on release. Records pre-drag heights of every
+    /// physical vertex involved so the apply step is
+    /// `snap(pre_y + delta)` — clean snapping with no error
+    /// accumulation.
+    primitive_drag: Option<PrimitiveDrag>,
     /// What the next paint click would target. Cell variant fires
     /// for floor / ceiling / erase / place; Wall variant fires for
     /// PaintWall. World-cell coords let the preview track cells
@@ -480,6 +487,37 @@ impl SelectionMode {
     }
 }
 
+/// In-flight drag-translate stroke. Captured at drag-start
+/// over a primitive in Select mode and applied every frame the
+/// pointer moves until release.
+#[derive(Debug, Clone)]
+struct PrimitiveDrag {
+    /// What's being dragged — used to refresh the visual outline
+    /// while the geometry under it shifts.
+    target: Selection,
+    /// Physical vertices to translate — typically 1 (Vertex
+    /// mode), 2 (Edge mode), or 4 (Face mode). Each entry
+    /// carries every coincident face-corner so a single drag
+    /// applies through the universal-coincidence resolver
+    /// without re-walking the grid each frame.
+    vertices: Vec<PhysicalVertex>,
+    /// Pre-drag Y of each entry in `vertices`, in the same
+    /// order. Apply step is `snap(pre_y + total_delta_world)`
+    /// for every vertex — single source of truth for the new
+    /// height, no accumulator drift.
+    pre_drag_ys: Vec<i32>,
+    /// Total mouse-Y travel since drag-start, in screen pixels.
+    /// Sign-flipped at apply time (screen +Y is down, world +Y
+    /// is up). Stored as `f32` because egui hands per-frame
+    /// deltas that way.
+    accumulated_pixel_dy: f32,
+    /// Whether `push_undo` has fired for this stroke. Lazy:
+    /// only fires the first time `accumulated_pixel_dy` causes
+    /// a non-zero quantum delta, so a press-without-drag (a
+    /// pure click) leaves the undo stack alone.
+    snapshot_pushed: bool,
+}
+
 /// Resolved physical vertex: every face-corner that currently
 /// sits at `world` and therefore moves together when the
 /// vertex's height is dragged.
@@ -509,10 +547,11 @@ pub struct ViewportCameraState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewTool {
-    /// Click to select; arrow-key nudge moves the selected node.
+    /// Click to select; press-and-drag on a selected primitive
+    /// (face / edge / vertex) translates it vertically in the
+    /// 3D viewport. No separate "Move" tool — the same gesture
+    /// handles both select and move.
     Select,
-    /// Drag a selected node in the viewport plane.
-    Move,
     /// Paint a floor onto the sector under the cursor (Room context).
     PaintFloor,
     /// Paint a wall on the directed edge under the cursor.
@@ -771,6 +810,7 @@ impl EditorWorkspace {
             selection_mode: SelectionMode::default(),
             hovered_primitive: None,
             selected_primitive: None,
+            primitive_drag: None,
             paint_target_preview: None,
             last_paint_stamp: None,
             renaming: None,
@@ -1231,22 +1271,37 @@ impl EditorWorkspace {
         {
             self.last_paint_stamp = None;
         }
-        let primary_active = response.clicked_by(egui::PointerButton::Primary)
-            || response.dragged_by(egui::PointerButton::Primary);
-        if primary_active {
-            // Select and paint tools both read the hover ray-test
-            // result so the click lands on the actual face under
-            // the cursor, not the floor-plane projection (which is
-            // wrong for back-row walls and gets the cell-edge
-            // direction backwards because of editor / world Z
-            // convention drift). Falls back to ground-plane only
-            // for the empty-cell paint case where there's no face.
-            if matches!(self.active_tool, ViewTool::Select) {
+
+        // Select-tool drag-translate: press on any primitive
+        // (selected or not) arms a vertical-move stroke. Pure
+        // clicks (press without movement) just promote the
+        // hovered primitive to the selection — no undo entry,
+        // no mutation. The first drag frame that crosses a
+        // quantum lazy-pushes undo so a press-and-release
+        // doesn't leave a stale snapshot behind.
+        if matches!(self.active_tool, ViewTool::Select) {
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                self.begin_primitive_drag();
+            }
+            if response.dragged_by(egui::PointerButton::Primary) {
+                let dy = response.drag_delta().y;
+                self.update_primitive_drag(dy);
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                self.end_primitive_drag();
+            }
+            if response.clicked_by(egui::PointerButton::Primary) {
                 self.commit_face_selection();
-            } else if let Some(pos) = response.interact_pointer_pos() {
-                let face_hit = self.pick_face_with_hit(rect, pos);
-                let ground = self.pick_3d_world(rect, pos);
-                self.dispatch_paint_3d(face_hit, ground);
+            }
+        } else {
+            let primary_active = response.clicked_by(egui::PointerButton::Primary)
+                || response.dragged_by(egui::PointerButton::Primary);
+            if primary_active {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let face_hit = self.pick_face_with_hit(rect, pos);
+                    let ground = self.pick_3d_world(rect, pos);
+                    self.dispatch_paint_3d(face_hit, ground);
+                }
             }
         }
 
@@ -1412,6 +1467,130 @@ impl EditorWorkspace {
         }
     }
 
+    /// Press on a primitive: select it AND arm a drag. The
+    /// drag itself doesn't apply any height change yet — that
+    /// happens in `update_primitive_drag` once the pointer
+    /// actually moves. A pure click (no movement) flows through
+    /// `commit_face_selection` and never touches `primitive_drag`.
+    fn begin_primitive_drag(&mut self) {
+        let Some(target) = self.hovered_primitive else {
+            return;
+        };
+        // Make the dragged primitive the selection. The user's
+        // mental model: "I clicked it, so it's mine to drag."
+        // This also drops `selected_resource` so the inspector
+        // doesn't fight for the panel.
+        self.selected_primitive = Some(target);
+        self.selected_node = NodeId::ROOT;
+        if let Selection::Face(face) = target {
+            self.selected_resource = self.face_material(face);
+        } else {
+            self.selected_resource = None;
+        }
+
+        // Resolve the physical vertices the drag will translate
+        // and snapshot their pre-drag Ys. For Face / Edge this
+        // is up to 4 / 2 entries — the universal-coincidence
+        // resolver fans each out to all face-corners that share
+        // the world point, so the drag itself only walks this
+        // small list.
+        let Some(grid) = self.room_grid_view(target.room()) else {
+            return;
+        };
+        let vertices = match drag_corner_seeds(target) {
+            Some(seeds) => seeds
+                .iter()
+                .filter_map(|seed| physical_vertex(grid, *seed))
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        if vertices.is_empty() {
+            return;
+        }
+        let pre_drag_ys = vertices.iter().map(|v| v.world[1]).collect();
+        self.primitive_drag = Some(PrimitiveDrag {
+            target,
+            vertices,
+            pre_drag_ys,
+            accumulated_pixel_dy: 0.0,
+            snapshot_pushed: false,
+        });
+    }
+
+    /// One drag-frame: accumulate mouse-Y travel, convert to a
+    /// world-Y delta (snap-aware), and apply to every captured
+    /// physical vertex.
+    fn update_primitive_drag(&mut self, dy_pixels: f32) {
+        if dy_pixels.abs() < f32::EPSILON {
+            return;
+        }
+        // Pixels per HEIGHT_QUANTUM step — drag 8 px to advance
+        // one quantum. With HEIGHT_QUANTUM = 32 and a 1024-unit
+        // sector, one full sector of height takes 256 pixels of
+        // mouse travel — comfortable for the orbit-cam panel.
+        const PIXELS_PER_QUANTUM: f32 = 8.0;
+        let Some(drag) = self.primitive_drag.as_mut() else {
+            return;
+        };
+        // Screen +Y is down; world +Y is up — invert.
+        drag.accumulated_pixel_dy -= dy_pixels;
+        let total_quanta =
+            (drag.accumulated_pixel_dy / PIXELS_PER_QUANTUM).round() as i32;
+        let world_delta = total_quanta * HEIGHT_QUANTUM;
+        // No-op until the drag has crossed a quantum.
+        if world_delta == 0 && !drag.snapshot_pushed {
+            return;
+        }
+        // Lazy undo snapshot — captures pre-drag state once,
+        // never on a press-without-movement.
+        if !drag.snapshot_pushed {
+            drag.snapshot_pushed = true;
+            self.push_undo();
+        }
+        // Re-borrow after the push_undo(&mut self) call.
+        let Some(drag) = self.primitive_drag.as_ref() else {
+            return;
+        };
+        // Compute every (vertex, new_y) BEFORE entering the
+        // mutable scene borrow so the apply step is one tight
+        // loop without re-borrowing.
+        let updates: Vec<(PhysicalVertex, i32)> = drag
+            .vertices
+            .iter()
+            .zip(drag.pre_drag_ys.iter())
+            .map(|(vertex, pre_y)| {
+                let new_y = snap_height(pre_y + world_delta);
+                (vertex.clone(), new_y)
+            })
+            .collect();
+        let target = drag.target;
+        let scene = self.project.active_scene_mut();
+        let Some(node) = scene.node_mut(target.room()) else {
+            return;
+        };
+        let NodeKind::Room { grid } = &mut node.kind else {
+            return;
+        };
+        for (vertex, new_y) in updates {
+            apply_vertex_height(grid, &vertex, new_y);
+        }
+        self.mark_dirty();
+    }
+
+    /// Drag released. Just clears the stroke; the heights are
+    /// already committed.
+    fn end_primitive_drag(&mut self) {
+        if let Some(drag) = self.primitive_drag.take() {
+            if drag.snapshot_pushed {
+                self.status = format!(
+                    "Translated {} ({} face-corners followed)",
+                    describe_selection(drag.target),
+                    drag.vertices.iter().map(|v| v.members.len()).sum::<usize>(),
+                );
+            }
+        }
+    }
+
     /// Promote the hovered primitive to a selection. When the
     /// hover is a face, also pre-load `selected_resource` with
     /// its material so the resource panel surfaces it without a
@@ -1489,7 +1668,6 @@ impl EditorWorkspace {
         self.last_paint_stamp = Some(stamp);
         self.selected_sector = Some((sx, sz));
         match self.active_tool {
-            ViewTool::Move => self.snap_selected_to_cell(room_id, sx, sz),
             tool => self.run_paint_action(
                 tool,
                 room_id,
@@ -1872,47 +2050,6 @@ impl EditorWorkspace {
             self.mark_dirty();
         }
         updated
-    }
-
-    /// Snap the selected entity's translation to the centre of cell
-    /// `(sx, sz)` inside `room_id`. Editor convention: 1 transform
-    /// unit = 1 sector, with the room at its own translation; cell
-    /// centres land in editor sector-unit space via the canonical
-    /// `WorldGrid::cell_center_world` (origin-aware) post-divide.
-    fn snap_selected_to_cell(&mut self, room_id: NodeId, sx: u16, sz: u16) {
-        if self.selected_node == NodeId::ROOT {
-            return;
-        }
-        let editor = {
-            let scene = self.project.active_scene();
-            let Some(room) = scene.node(room_id) else {
-                return;
-            };
-            let NodeKind::Room { grid } = &room.kind else {
-                return;
-            };
-            // World-space centre of the cell, divided into editor
-            // sector-units, then re-expressed room-centre-relative.
-            let world_centre = grid.cell_center_world(sx, sz);
-            let s = grid.sector_size as f32;
-            grid.world_cells_to_editor([world_centre[0] / s, world_centre[1] / s])
-        };
-        let new_x = editor[0];
-        let new_z = editor[1];
-        let mut moved = None;
-        if let Some(node) = self.project.active_scene_mut().node_mut(self.selected_node) {
-            // Don't move Rooms / Worlds via cell-snap — only entities.
-            if matches!(node.kind, NodeKind::Room { .. } | NodeKind::World) {
-                return;
-            }
-            node.transform.translation[0] = new_x;
-            node.transform.translation[2] = new_z;
-            moved = Some(node.name.clone());
-        }
-        if let Some(name) = moved {
-            self.status = format!("Moved {name} to {sx},{sz}");
-            self.mark_dirty();
-        }
     }
 
     /// Build the camera ray in world units for the given pointer
@@ -3868,12 +4005,7 @@ impl EditorWorkspace {
                     (
                         ViewTool::Select,
                         icons::label(icons::POINTER, "Select"),
-                        "Click a face (floor / wall / ceiling) in the viewport.",
-                    ),
-                    (
-                        ViewTool::Move,
-                        icons::label(icons::MOVE, "Move"),
-                        "Drag the selected entity onto another cell.",
+                        "Click to select; drag the selection vertically to translate it.",
                     ),
                 ] {
                     ui.selectable_value(&mut self.active_tool, tool, label)
@@ -4086,7 +4218,7 @@ impl EditorWorkspace {
     /// Single dispatch point for primary-button clicks on the viewport.
     fn handle_viewport_click(&mut self, world: [f32; 2], hits: &[ViewportHit]) {
         match self.active_tool {
-            ViewTool::Select | ViewTool::Move => {
+            ViewTool::Select => {
                 if let Some(hit) = hits.iter().rev().find(|hit| hit.contains(world)) {
                     self.selected_node = hit.id;
                     self.selected_resource = None;
@@ -7012,6 +7144,54 @@ pub fn physical_vertex(grid: &WorldGrid, seed: FaceCornerRef) -> Option<Physical
         }
     }
     Some(PhysicalVertex { world, members })
+}
+
+/// Face-corner seeds for a drag-translate stroke. The drag
+/// engine resolves each seed through `physical_vertex` so all
+/// coincident face-corners follow.
+///
+/// - Face: 4 corners of the face (preserves slope; same Δ on
+///   each).
+/// - Edge: 2 endpoint corners.
+/// - Vertex: 1 corner.
+fn drag_corner_seeds(selection: Selection) -> Option<Vec<FaceCornerRef>> {
+    Some(match selection {
+        Selection::Face(face) => match face.kind {
+            FaceKind::Floor => [Corner::NW, Corner::NE, Corner::SE, Corner::SW]
+                .iter()
+                .map(|c| FaceCornerRef::Floor {
+                    sx: face.sx,
+                    sz: face.sz,
+                    corner: *c,
+                })
+                .collect(),
+            FaceKind::Ceiling => [Corner::NW, Corner::NE, Corner::SE, Corner::SW]
+                .iter()
+                .map(|c| FaceCornerRef::Ceiling {
+                    sx: face.sx,
+                    sz: face.sz,
+                    corner: *c,
+                })
+                .collect(),
+            FaceKind::Wall { dir, stack } => {
+                [WallCorner::BL, WallCorner::BR, WallCorner::TR, WallCorner::TL]
+                    .iter()
+                    .map(|c| FaceCornerRef::Wall {
+                        sx: face.sx,
+                        sz: face.sz,
+                        dir,
+                        stack,
+                        corner: *c,
+                    })
+                    .collect()
+            }
+        },
+        Selection::Edge(edge) => {
+            let (a, b) = edge_endpoint_corners(edge);
+            vec![a, b]
+        }
+        Selection::Vertex(vertex) => vec![vertex.anchor.as_face_corner()],
+    })
 }
 
 /// Pair of physical vertices that bound `edge`. Returns `None`
