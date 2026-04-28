@@ -112,6 +112,13 @@ What it *does* render:
   `.psxmdl` + `.psxt` + `.psxanim`, uploads the atlas, and
   draws the textured animated model. See
   [`docs/editor-model-authoring.md`](../../../docs/editor-model-authoring.md).
+- **Room-level lighting** — every `Light` node cooks into a
+  `PointLightRecord`; the runtime accumulates contributions
+  at the room centre and modulates each room material's tint.
+  Linear falloff, no shadows, models are not lit yet. The
+  editor preview applies per-face lighting for spatial
+  authoring feedback. See
+  [`docs/editor-lighting.md`](../../../docs/editor-lighting.md).
 - **Entity markers** for legacy `MeshInstance` nodes that
   don't reference a Model (debug cubes, same as before).
 

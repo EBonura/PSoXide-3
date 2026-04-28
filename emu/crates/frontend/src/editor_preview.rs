@@ -30,6 +30,8 @@ use psx_gpu::prim::TriFlat;
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
 use psx_gpu::prim::TriTextured;
+use std::path::Path;
+
 use psxed_project::{
     GridDirection, GridSplit, NodeKind, ProjectDocument, ResourceData, ResourceId, WorldGrid,
 };
@@ -110,6 +112,7 @@ static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
 /// scene to show" affordance.
 pub fn build_phase1_cmd_log(
     project: &ProjectDocument,
+    project_root: &Path,
     camera: ViewportCameraState,
     selected: psxed_project::NodeId,
     hovered_primitive: Option<psxed_ui::Selection>,
@@ -130,14 +133,14 @@ pub fn build_phase1_cmd_log(
     let world_camera = setup_gte_for_camera(camera, target);
     walk_room(project, grid, textures, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
-    walk_model_instances(project, grid, textures, selected, &world_camera, &mut scratch);
-    // Select-tool primitive outlines. Selected drawn first so its
-    // bolder lines sit *under* a possibly-co-located hover — that
-    // way switching focus from selected → hover via mouse-move
-    // doesn't make the bold outline strobe. Edge / vertex
-    // overlays are stubbed to face outlines for now until
-    // `push_edge_outline` / `push_vertex_outline` land in the
-    // visualization batch.
+    walk_light_gizmos(project, grid, selected, &mut scratch);
+
+    // Selection / hover / paint overlays first — they project
+    // through the camera GTE matrix that `setup_gte_for_camera`
+    // installed. Models render LAST because
+    // `walk_model_instances` overwrites the GTE per joint, and
+    // anything projected after that sees the last joint matrix
+    // instead of the camera basis.
     if let Some(selection) = selected_primitive {
         push_selection_outline(grid, selection, OutlineRole::Selected, &mut scratch);
     }
@@ -146,13 +149,21 @@ pub fn build_phase1_cmd_log(
             push_selection_outline(grid, selection, OutlineRole::Hover, &mut scratch);
         }
     }
-    // Paint preview: ghost outline of the cell or wall the next
-    // click would create / replace. Works for cells outside the
-    // current grid by reading world-cell coords directly rather
-    // than via array indices.
     if let Some(preview) = paint_target_preview {
         push_paint_preview(grid, preview, &mut scratch);
     }
+
+    // Models last — clobbers GTE state, no later pass uses
+    // camera-basis projection.
+    walk_model_instances(
+        project,
+        project_root,
+        grid,
+        textures,
+        selected,
+        &world_camera,
+        &mut scratch,
+    );
 
     // SAFETY: `scratch.tris` lives until end of this function (the
     // mutex guard keeps it alive); the OT chain pointers reference
@@ -289,10 +300,26 @@ fn clamp_i16(value: i32) -> i16 {
     value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
+/// One placed light flattened into world coords + the
+/// pre-multiplied colour×intensity_q8 the lighting accumulator
+/// uses. Built once per frame from `walk_room`.
+#[derive(Copy, Clone)]
+struct PreviewLight {
+    position: [i32; 3],
+    radius: i32,
+    /// `color × intensity` in 0..65535 per channel — already
+    /// includes the Q8.8 multiplier so the per-face math
+    /// reduces to one >>8 shift per attenuated channel.
+    weighted_color: [u32; 3],
+}
+
 /// Walk every populated sector and emit triangles for floors,
 /// ceilings, and the walls on each cardinal edge. Faces whose
 /// material has a texture in the editor cache draw textured;
-/// everything else falls back to flat shading.
+/// everything else falls back to flat shading. Light
+/// accumulation happens per-face: the shade walks every
+/// `PreviewLight` once, attenuates by distance to the face
+/// centre, and modulates the base material colour.
 fn walk_room(
     project: &ProjectDocument,
     grid: &WorldGrid,
@@ -300,6 +327,8 @@ fn walk_room(
     scratch: &mut PreviewScratch,
 ) {
     let s = grid.sector_size;
+    let lights = collect_preview_lights(project, grid);
+    let ambient = grid.ambient_color;
     for x in 0..grid.width {
         for z in 0..grid.depth {
             let Some(sector) = grid.sector(x, z) else {
@@ -315,24 +344,38 @@ fn walk_room(
             let z1 = z0 + s;
 
             if let Some(floor) = sector.floor.as_ref() {
+                let center = horizontal_face_center([x0, x1, z0, z1], floor.heights);
+                let shade = light_face(
+                    face_shade(project, floor.material, FALLBACK_FLOOR, textures),
+                    center,
+                    &lights,
+                    ambient,
+                );
                 push_horizontal_face(
                     scratch,
                     [x0, x1, z0, z1],
                     floor.heights,
                     floor.split,
                     floor.dropped_corner,
-                    face_shade(project, floor.material, FALLBACK_FLOOR, textures),
+                    shade,
                     /* flip_winding */ false,
                 );
             }
             if let Some(ceiling) = sector.ceiling.as_ref() {
+                let center = horizontal_face_center([x0, x1, z0, z1], ceiling.heights);
+                let shade = light_face(
+                    face_shade(project, ceiling.material, FALLBACK_CEILING, textures),
+                    center,
+                    &lights,
+                    ambient,
+                );
                 push_horizontal_face(
                     scratch,
                     [x0, x1, z0, z1],
                     ceiling.heights,
                     ceiling.split,
                     ceiling.dropped_corner,
-                    face_shade(project, ceiling.material, FALLBACK_CEILING, textures),
+                    shade,
                     // Ceiling normal points down; flipping the winding
                     // keeps backface-cullers happy and pins the inside
                     // surface as the visible side once we add culling.
@@ -346,13 +389,20 @@ fn walk_room(
                 (GridDirection::West, WallEdge::West),
             ] {
                 for face in sector.walls.get(direction) {
+                    let center = wall_face_center([x0, x1, z0, z1], edge, face.heights);
+                    let shade = light_face(
+                        face_shade(project, face.material, FALLBACK_WALL, textures),
+                        center,
+                        &lights,
+                        ambient,
+                    );
                     push_wall_face(
                         scratch,
                         [x0, x1, z0, z1],
                         edge,
                         face.heights,
                         face.dropped_corner,
-                        face_shade(project, face.material, FALLBACK_WALL, textures),
+                        shade,
                     );
                 }
             }
@@ -389,6 +439,164 @@ fn face_shade(
         }
     }
     FaceShade::Flat(tint.0, tint.1, tint.2)
+}
+
+/// Walk every Light node in `project` whose enclosing room is
+/// the active grid and pre-multiply its colour×intensity_q8.
+/// Lights authored outside any Room (no enclosing parent) are
+/// skipped silently — the cooker warns about those, the
+/// preview just doesn't render them.
+fn collect_preview_lights(project: &ProjectDocument, grid: &WorldGrid) -> Vec<PreviewLight> {
+    let s = grid.sector_size;
+    let mut out = Vec::new();
+    for node in project.active_scene().nodes() {
+        let NodeKind::Light {
+            color,
+            intensity,
+            radius,
+        } = &node.kind
+        else {
+            continue;
+        };
+        if *radius <= 0.0 || !intensity.is_finite() || *intensity < 0.0 {
+            continue;
+        }
+        let pos = node.transform.translation;
+        let world = [
+            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
+            (pos[1] * s as f32) as i32,
+            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
+        ];
+        let radius_engine = (radius * s as f32) as i32;
+        // Pre-multiply colour × intensity into u32 channels;
+        // intensity scaled by 256 (Q8.8) keeps the per-face
+        // accumulator in integer math.
+        let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u32;
+        let weighted_color = [
+            color[0] as u32 * intensity_q8,
+            color[1] as u32 * intensity_q8,
+            color[2] as u32 * intensity_q8,
+        ];
+        out.push(PreviewLight {
+            position: world,
+            radius: radius_engine,
+            weighted_color,
+        });
+    }
+    out
+}
+
+/// Centre of a horizontal face (floor / ceiling) — average X /
+/// Z of the bounds, mean of the four corner heights for Y.
+fn horizontal_face_center(bounds: [i32; 4], heights: [i32; 4]) -> [i32; 3] {
+    let [x0, x1, z0, z1] = bounds;
+    let cx = (x0 + x1) / 2;
+    let cz = (z0 + z1) / 2;
+    let cy = (heights[0] as i64 + heights[1] as i64 + heights[2] as i64 + heights[3] as i64) / 4;
+    [cx, cy as i32, cz]
+}
+
+/// Centre of a wall face — midpoint of the wall's bottom edge
+/// in X/Z, midpoint of the four corner heights for Y. Wall
+/// edges run along one of the cell's four cardinal sides; the
+/// `WallEdge` picks which.
+fn wall_face_center(bounds: [i32; 4], edge: WallEdge, heights: [i32; 4]) -> [i32; 3] {
+    let [x0, x1, z0, z1] = bounds;
+    let (cx, cz) = match edge {
+        WallEdge::North => ((x0 + x1) / 2, z1),
+        WallEdge::East => (x1, (z0 + z1) / 2),
+        WallEdge::South => ((x0 + x1) / 2, z0),
+        WallEdge::West => (x0, (z0 + z1) / 2),
+    };
+    let cy = (heights[0] as i64 + heights[1] as i64 + heights[2] as i64 + heights[3] as i64) / 4;
+    [cx, cy as i32, cz]
+}
+
+/// Apply per-face lighting: ambient + linear-attenuation sum
+/// of every `PreviewLight` whose radius covers `face_center`.
+/// Final RGB clamps to 8 bits and modulates the input shade.
+fn light_face(
+    base: FaceShade,
+    face_center: [i32; 3],
+    lights: &[PreviewLight],
+    ambient: [u8; 3],
+) -> FaceShade {
+    let base_color = match base {
+        FaceShade::Flat(r, g, b) => (r, g, b),
+        FaceShade::Textured { tint, .. } => tint,
+    };
+    // Start with the room ambient so an unlit surface reads
+    // visibly. Use 16-bit accumulators so two saturating-bright
+    // lights don't roll over before clamp.
+    let mut accum: [u32; 3] = [
+        ambient[0] as u32 * 256,
+        ambient[1] as u32 * 256,
+        ambient[2] as u32 * 256,
+    ];
+    for light in lights {
+        // Distance² in world units. Cheap saturating-sub so a
+        // light placed directly on a face doesn't underflow.
+        let dx = (face_center[0] - light.position[0]) as i64;
+        let dy = (face_center[1] - light.position[1]) as i64;
+        let dz = (face_center[2] - light.position[2]) as i64;
+        let d2 = dx * dx + dy * dy + dz * dz;
+        let r = light.radius as i64;
+        let r2 = r * r;
+        if d2 >= r2 || r <= 0 {
+            continue;
+        }
+        // Linear falloff: weight = (radius - distance) / radius
+        // in Q8.8. `distance` via integer sqrt to avoid f32 in
+        // the hot loop.
+        let d = isqrt_i64(d2);
+        let weight_q8 = (((r - d) << 8) / r) as u32; // 0..256
+        for c in 0..3 {
+            accum[c] = accum[c]
+                .saturating_add((light.weighted_color[c] >> 8) * weight_q8 / 256);
+        }
+    }
+    // Modulate base material colour by the accumulated light.
+    // Treat `base_color` as multiplicative tint at 256 = neutral
+    // so a bright light × neutral floor stays bright.
+    let modulate = |base: u8, acc: u32| -> u8 {
+        let blended = (base as u32 * acc / 256).min(255);
+        blended.min(255) as u8
+    };
+    let r = modulate(base_color.0, accum[0]);
+    let g = modulate(base_color.1, accum[1]);
+    let b = modulate(base_color.2, accum[2]);
+    match base {
+        FaceShade::Flat(_, _, _) => FaceShade::Flat(r, g, b),
+        FaceShade::Textured { slot, .. } => FaceShade::Textured {
+            slot,
+            tint: (r, g, b),
+        },
+    }
+}
+
+/// Integer square root for `i64`. Cheap iterative method;
+/// runs once per (face × light) so it's not in a hot inner
+/// loop. Returns 0 for negative input.
+fn isqrt_i64(value: i64) -> i64 {
+    if value <= 0 {
+        return 0;
+    }
+    let mut x = value as u64;
+    let mut r: u64 = 0;
+    let mut bit: u64 = 1u64 << 62;
+    while bit > x {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if x >= r + bit {
+            x -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    r as i64
 }
 
 /// Project the four corners of a sector-aligned horizontal face
@@ -731,6 +939,7 @@ struct PreviewModelInstance<'a> {
 /// elsewhere; the preview just keeps drawing what it can.
 fn walk_model_instances(
     project: &ProjectDocument,
+    project_root: &Path,
     grid: &WorldGrid,
     _textures: &EditorTextures,
     selected: psxed_project::NodeId,
@@ -747,7 +956,6 @@ fn walk_model_instances(
     // stack-allocated arena so the parsed `Model<'_>` borrow
     // is valid for the rest of the frame.
     let scene = project.active_scene();
-    let project_root = psxed_project::default_project_dir();
 
     let mut buffers: Vec<(ResourceId, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut instances_meta: Vec<InstanceMeta> = Vec::new();
@@ -986,9 +1194,10 @@ fn yaw_rotation_q12(yaw_q12: u16) -> Mat3I16 {
 /// IMPORTANT: this clobbers the GTE rotation/translation
 /// registers, so any caller relying on the camera-target
 /// transform set by `setup_gte_for_camera` must restore it
-/// before projecting non-model geometry. Today this runs after
-/// rooms / entities / overlays, so nothing depends on the
-/// camera transform being intact post-call.
+/// before projecting non-model geometry. Today
+/// `walk_model_instances` runs after every overlay (room +
+/// entities + selection / hover / paint previews), so nothing
+/// post-model depends on the camera transform.
 fn draw_preview_model_instance(
     camera: &psx_engine::WorldCamera,
     tick: u32,
@@ -1017,10 +1226,20 @@ fn draw_preview_model_instance(
         }
     }
 
-    // Per-part projection + face emit. Skin-blend vertices
-    // (vertex.is_blend()) get projected from the primary joint
-    // only — the editor preview doesn't run the host-CPU LERP
-    // path the runtime uses on PSX target.
+    // Per-part projection + face emit.
+    //
+    // Editor-preview limitation: skin-blend vertices (those
+    // with `vertex.is_blend() == true`, i.e. carrying a
+    // secondary joint + blend weight) project from the primary
+    // joint only here. The runtime's `submit_textured_model`
+    // implements the secondary-joint LERP path; the editor
+    // preview takes the cheaper single-joint shortcut. For
+    // models that use only rigid skinning (one joint per
+    // vertex — current Wraith / Hooded Wretch rigs) the editor
+    // preview matches the runtime exactly. For models with
+    // secondary joint weights the preview will diverge at
+    // those vertices; placement / clip / atlas validation
+    // remain correct.
     let mut projected: Vec<psx_gte::scene::Projected> = Vec::with_capacity(64);
     for part_index in 0..instance.model.part_count() {
         let Some(part) = instance.model.part(part_index) else {
@@ -1083,6 +1302,102 @@ fn draw_preview_model_instance(
             push_tex_tri(scratch, p, uvs, instance.atlas, (0x80, 0x80, 0x80));
         }
     }
+}
+
+/// Draw a horizontal radius ring at floor level for every
+/// `NodeKind::Light` in the scene. Selected lights get a
+/// thicker, brighter ring; unselected lights get a thin one
+/// in the light's own colour. Marker squares + selection
+/// gizmos are still drawn by `walk_entities` (the ring is
+/// additive).
+fn walk_light_gizmos(
+    project: &ProjectDocument,
+    grid: &WorldGrid,
+    selected: psxed_project::NodeId,
+    scratch: &mut PreviewScratch,
+) {
+    let s = grid.sector_size;
+    let scene = project.active_scene();
+    for node in scene.nodes() {
+        let NodeKind::Light {
+            color,
+            intensity: _,
+            radius,
+        } = &node.kind
+        else {
+            continue;
+        };
+        let pos = node.transform.translation;
+        let center_world = [
+            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
+            (pos[1] * s as f32) as i32,
+            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
+        ];
+        // Light radius is authored in *sector units*; scale to
+        // engine units so the ring matches the light's actual
+        // attenuation footprint.
+        let radius_engine = (radius * s as f32) as i32;
+        if radius_engine <= 0 {
+            continue;
+        }
+
+        let is_selected = node.id == selected;
+        let style = if is_selected {
+            FaceOutlineStyle {
+                rgb: (0xFF, 0xE0, 0x80),
+                thickness_px: 3,
+            }
+        } else {
+            // Tint the unlit ring toward the authored colour
+            // so multiple lights in a room read at a glance.
+            FaceOutlineStyle {
+                rgb: (
+                    color[0].max(0x40),
+                    color[1].max(0x40),
+                    color[2].max(0x40),
+                ),
+                thickness_px: 1,
+            }
+        };
+        push_horizontal_ring(scratch, center_world, radius_engine, 16, style);
+    }
+}
+
+/// Project a horizontal `segments`-sided polygon at world
+/// `center` with `radius` into screen space and emit one
+/// `push_screen_line` per edge. Used for light radius gizmos
+/// and any future ground-plane affordances.
+fn push_horizontal_ring(
+    scratch: &mut PreviewScratch,
+    center: [i32; 3],
+    radius: i32,
+    segments: u16,
+    style: FaceOutlineStyle,
+) {
+    if segments < 3 || radius <= 0 {
+        return;
+    }
+    let mut prev_world = [center[0] + radius, center[1], center[2]];
+    let mut prev_proj = gte_scene::project_vertex(world_to_view(prev_world));
+    for i in 1..=segments {
+        // PSX trig uses 4096 units per turn; sample the unit
+        // circle around the light origin once per segment.
+        let angle_q12 = ((i as u32 * 4096) / segments as u32) as u16;
+        let s = psx_gte::transform::sin_1_3_12(angle_q12) as i32;
+        let c = psx_gte::transform::cos_1_3_12(angle_q12) as i32;
+        let next_world = [
+            center[0] + ((c * radius) >> 12),
+            center[1],
+            center[2] + ((s * radius) >> 12),
+        ];
+        let next_proj = gte_scene::project_vertex(world_to_view(next_world));
+        if prev_proj.sz != 0 && next_proj.sz != 0 {
+            push_screen_line(scratch, prev_proj, next_proj, style);
+        }
+        prev_world = next_world;
+        prev_proj = next_proj;
+    }
+    let _ = prev_world; // silence the unused-final-assignment lint
 }
 
 fn synth(sx: i16, sy: i16, sz: u16) -> psx_gte::scene::Projected {

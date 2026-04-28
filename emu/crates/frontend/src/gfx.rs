@@ -206,6 +206,7 @@ impl Graphics {
         self.editor_textures.refresh_models(project, project_root);
         let cmd_log = crate::editor_preview::build_phase1_cmd_log(
             project,
+            project_root,
             camera,
             selected,
             hovered_primitive,

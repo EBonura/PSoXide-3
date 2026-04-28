@@ -278,6 +278,41 @@ pub struct LevelModelInstanceRecord {
 /// "inherit model default".
 pub const MODEL_CLIP_INHERIT: u16 = 0xFFFF;
 
+/// One placed point light. Coordinates are room-local engine
+/// units (same convention as model instances and player
+/// spawn). Lighting model is dynamic point-light only — no
+/// shadows, no baked lightmaps. Both editor and runtime
+/// accumulate per-surface contribution from every record in
+/// the same room and clamp to 8-bit RGB.
+///
+/// `intensity_q8` is the multiplier in Q8.8 fixed-point
+/// (256 = 1.0, 512 = 2.0, ...); the cooker derives it from
+/// the editor's `f32` intensity field so the host UI keeps
+/// floats while the wire format stays integer-only. `radius`
+/// is engine units; surfaces past the radius receive zero
+/// contribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointLightRecord {
+    /// Owning room index.
+    pub room: u16,
+    /// Room-local X.
+    pub x: i32,
+    /// Y.
+    pub y: i32,
+    /// Room-local Z.
+    pub z: i32,
+    /// Cutoff distance in engine units. Surfaces beyond this
+    /// receive zero contribution. Cooker rejects `0`.
+    pub radius: u16,
+    /// Brightness multiplier, Q8.8. `256` = 1.0.
+    pub intensity_q8: u16,
+    /// 8-bit RGB tint applied before the per-surface
+    /// attenuation weight.
+    pub color: [u8; 3],
+    /// Reserved.
+    pub flags: u16,
+}
+
 /// Linear scan over the master asset table. `O(n)` is fine for
 /// the asset counts this pass targets (few rooms × handful of
 /// textures); a binary search lands when manifests grow.

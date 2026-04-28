@@ -4912,15 +4912,58 @@ fn draw_node_kind_editor(
             changed |= ui
                 .add(
                     egui::Slider::new(intensity, 0.0..=4.0)
-                        .text(icons::label(icons::SUN, "Intensity")),
+                        .text(icons::label(icons::SUN, "Intensity (× 1.0)")),
                 )
                 .changed();
             changed |= ui
                 .add(
-                    egui::Slider::new(radius, 0.0..=16000.0)
-                        .text(icons::label(icons::WAYPOINT, "Radius")),
+                    egui::Slider::new(radius, 0.0..=8.0)
+                        .text(icons::label(icons::WAYPOINT, "Radius (sectors)")),
                 )
                 .changed();
+            // Quick presets — author-friendly starting points;
+            // the user can still drag the sliders below.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Preset").color(STUDIO_TEXT_WEAK));
+                if ui.small_button("Torch").clicked() {
+                    *color = [0xFF, 0xCC, 0x80];
+                    *intensity = 1.0;
+                    *radius = 2.0;
+                    changed = true;
+                }
+                if ui.small_button("Room fill").clicked() {
+                    *color = [0xFF, 0xF0, 0xD8];
+                    *intensity = 0.6;
+                    *radius = 4.0;
+                    changed = true;
+                }
+                if ui.small_button("Bright sun").clicked() {
+                    *color = [0xFF, 0xFF, 0xF0];
+                    *intensity = 2.0;
+                    *radius = 8.0;
+                    changed = true;
+                }
+            });
+            // Validation warnings — match what the playtest cooker
+            // refuses, so authors see the issue before they cook.
+            if *radius <= 0.0 {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Radius must be > 0 (cook will fail)",
+                );
+            }
+            if !intensity.is_finite() || *intensity < 0.0 {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Intensity must be finite and ≥ 0 (cook will fail)",
+                );
+            }
+            if *intensity > 4.0 {
+                ui.colored_label(
+                    Color32::from_rgb(220, 160, 80),
+                    "Intensity above 4.0 saturates almost every surface",
+                );
+            }
         }
         NodeKind::SpawnPoint { player } => {
             changed |= ui

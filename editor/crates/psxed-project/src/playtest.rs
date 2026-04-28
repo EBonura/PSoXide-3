@@ -214,6 +214,29 @@ pub struct PlaytestModelInstance {
 /// [`psx_level::MODEL_CLIP_INHERIT`].
 pub const MODEL_CLIP_INHERIT: u16 = 0xFFFF;
 
+/// One placed point light, room-local engine units. Mirrors
+/// [`psx_level::PointLightRecord`] one-for-one — intensity is
+/// already quantised to Q8.8 so the cook output is a direct
+/// copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaytestLight {
+    /// Room index in [`PlaytestPackage::rooms`].
+    pub room: u16,
+    /// Room-local X.
+    pub x: i32,
+    /// Y.
+    pub y: i32,
+    /// Room-local Z.
+    pub z: i32,
+    /// Cutoff distance in engine units. Cooker rejects `0`.
+    pub radius: u16,
+    /// Brightness multiplier in Q8.8 (`256` = 1.0). Derived
+    /// from the editor's `f32` intensity at cook time.
+    pub intensity_q8: u16,
+    /// 8-bit RGB tint.
+    pub color: [u8; 3],
+}
+
 /// Player spawn record. Coordinates are room-local engine units
 /// (the same space the cooked `.psxw` lives in — array-rooted at
 /// world `(0, 0)`).
@@ -283,6 +306,8 @@ pub struct PlaytestPackage {
     pub model_clips: Vec<PlaytestModelClip>,
     /// Placed model instances, room-local coordinates.
     pub model_instances: Vec<PlaytestModelInstance>,
+    /// Placed point lights, room-local coordinates.
+    pub lights: Vec<PlaytestLight>,
     /// Single player spawn — required.
     pub spawn: Option<PlaytestSpawn>,
     /// Optional entity markers (legacy, non-Model MeshInstance).
@@ -535,12 +560,13 @@ pub fn build_package(
         return (None, report);
     }
 
-    // Pass 3: spawn + entities + model instances.
+    // Pass 3: spawn + entities + model instances + lights.
     let mut player_spawns: Vec<(NodeId, &SceneNode, u16)> = Vec::new();
     let mut entities: Vec<PlaytestEntity> = Vec::new();
     let mut models: Vec<PlaytestModel> = Vec::new();
     let mut model_clips: Vec<PlaytestModelClip> = Vec::new();
     let mut model_instances: Vec<PlaytestModelInstance> = Vec::new();
+    let mut lights: Vec<PlaytestLight> = Vec::new();
     // ResourceId → index into `models` for instance dedup.
     let mut model_for_resource: std::collections::HashMap<ResourceId, u16> =
         std::collections::HashMap::new();
@@ -655,10 +681,41 @@ pub fn build_package(
                     });
                 }
             }
-            NodeKind::Light { .. } => {
-                if warned_unsupported.insert("Light") {
-                    report.warn("Light nodes are skipped in this pass (no runtime lighting yet)");
+            NodeKind::Light {
+                color,
+                intensity,
+                radius,
+            } => {
+                // Reject obviously broken lights at cook time
+                // — radius 0 contributes nothing, negative
+                // intensity is meaningless. Clamp the rest into
+                // the wire format's u16 ranges.
+                if *radius <= 0.0 {
+                    report.error(format!(
+                        "Light '{}' has radius {} (must be > 0)",
+                        node.name, radius
+                    ));
+                    return (None, report);
                 }
+                if !intensity.is_finite() || *intensity < 0.0 {
+                    report.error(format!(
+                        "Light '{}' has invalid intensity {}",
+                        node.name, intensity
+                    ));
+                    return (None, report);
+                }
+                let radius_clamped = radius.clamp(1.0, u16::MAX as f32) as u16;
+                let intensity_q8 = (intensity * 256.0)
+                    .clamp(0.0, u16::MAX as f32) as u16;
+                lights.push(PlaytestLight {
+                    room: room_index,
+                    x: pos[0],
+                    y: pos[1],
+                    z: pos[2],
+                    radius: radius_clamped,
+                    intensity_q8,
+                    color: *color,
+                });
             }
             NodeKind::Trigger { .. } => {
                 if warned_unsupported.insert("Trigger") {
@@ -727,6 +784,7 @@ pub fn build_package(
             models,
             model_clips,
             model_instances,
+            lights,
             spawn,
             entities,
         }),
@@ -1271,6 +1329,25 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n\n");
 
+    out.push_str("/// Placed point lights, room-local coordinates.\n");
+    out.push_str("pub static LIGHTS: &[PointLightRecord] = &[\n");
+    for light in &package.lights {
+        let _ = writeln!(
+            out,
+            "    PointLightRecord {{ room: {}, x: {}, y: {}, z: {}, radius: {}, intensity_q8: {}, color: [{}, {}, {}], flags: 0 }},",
+            light.room,
+            light.x,
+            light.y,
+            light.z,
+            light.radius,
+            light.intensity_q8,
+            light.color[0],
+            light.color[1],
+            light.color[2],
+        );
+    }
+    out.push_str("];\n\n");
+
     out.push_str("/// Entity markers (legacy MeshInstance with no Model resource).\n");
     out.push_str("pub static ENTITIES: &[EntityRecord] = &[\n");
     for entity in &package.entities {
@@ -1341,6 +1418,7 @@ use psx_level::{
     LevelModelRecord,
     LevelRoomRecord,
     PlayerSpawnRecord,
+    PointLightRecord,
     RoomResidencyRecord,
 };
 
@@ -1915,6 +1993,90 @@ mod tests {
             "errors: {:?}",
             report.errors,
         );
+    }
+
+    #[test]
+    fn starter_project_emits_one_light_record() {
+        // Starter Stone Room ships with a "Preview Light" node.
+        // It should now appear in `package.lights` with a
+        // sensible intensity_q8 derived from the editor's
+        // 1.0 intensity float.
+        let project = ProjectDocument::starter();
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.expect("starter cooks");
+        assert_eq!(package.lights.len(), 1);
+        let light = package.lights[0];
+        assert_eq!(light.room, 0);
+        assert!(light.radius > 0);
+        // intensity 1.0 → Q8.8 256.
+        assert_eq!(light.intensity_q8, 256);
+        // Starter colour authored as (255, 236, 198).
+        assert_eq!(light.color, [255, 236, 198]);
+    }
+
+    #[test]
+    fn light_with_zero_radius_fails() {
+        let mut project = ProjectDocument::starter();
+        let ids: Vec<NodeId> = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Light { .. }))
+            .map(|n| n.id)
+            .collect();
+        let scene = project.active_scene_mut();
+        for id in ids {
+            if let Some(node) = scene.node_mut(id) {
+                if let NodeKind::Light { radius, .. } = &mut node.kind {
+                    *radius = 0.0;
+                }
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(package.is_none());
+        assert!(
+            report.errors.iter().any(|e| e.contains("radius")),
+            "errors: {:?}",
+            report.errors,
+        );
+    }
+
+    #[test]
+    fn light_with_negative_intensity_fails() {
+        let mut project = ProjectDocument::starter();
+        let ids: Vec<NodeId> = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Light { .. }))
+            .map(|n| n.id)
+            .collect();
+        let scene = project.active_scene_mut();
+        for id in ids {
+            if let Some(node) = scene.node_mut(id) {
+                if let NodeKind::Light { intensity, .. } = &mut node.kind {
+                    *intensity = -0.5;
+                }
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(package.is_none());
+        assert!(
+            report.errors.iter().any(|e| e.contains("intensity")),
+            "errors: {:?}",
+            report.errors,
+        );
+    }
+
+    #[test]
+    fn rendered_manifest_emits_lights_block() {
+        let project = ProjectDocument::starter();
+        let (package, _) = build_package(&project, &starter_project_root());
+        let src = render_manifest_source(&package.expect("cooks"));
+        assert!(src.contains("PointLightRecord"));
+        assert!(src.contains("pub static LIGHTS"));
+        assert!(src.contains("intensity_q8"));
     }
 
     #[test]

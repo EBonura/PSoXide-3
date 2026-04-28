@@ -51,8 +51,8 @@ mod generated {
 }
 
 use generated::{
-    ASSETS, ENTITIES, MATERIALS, MODELS, MODEL_CLIPS, MODEL_INSTANCES, PLAYER_SPAWN, ROOMS,
-    ROOM_RESIDENCY,
+    ASSETS, ENTITIES, LIGHTS, MATERIALS, MODELS, MODEL_CLIPS, MODEL_INSTANCES, PLAYER_SPAWN,
+    ROOMS, ROOM_RESIDENCY,
 };
 
 // VRAM layout. Room materials and model atlases live in
@@ -267,7 +267,7 @@ impl Scene for Playtest {
         // of MATERIALS. For each entry: ensure VRAM-resident
         // (uploading on first sight), then build the
         // TextureMaterial referencing the slot's CLUT/tpage.
-        self.material_count = build_room_materials(room_record, &mut self.materials);
+        self.material_count = build_room_materials(room_record, 0, &mut self.materials);
 
         self.player_x = PLAYER_SPAWN.x;
         self.player_y = PLAYER_SPAWN.y;
@@ -391,18 +391,27 @@ impl Scene for Playtest {
 /// in-use prefix length.
 fn build_room_materials(
     room: &LevelRoomRecord,
+    room_index: u16,
     out: &mut [Option<TextureMaterial>; MAX_ROOM_MATERIALS],
 ) -> usize {
     let first = room.material_first as usize;
     let count = room.material_count as usize;
     let slice: &[LevelMaterialRecord] = &MATERIALS[first..first + count];
 
+    // Compute a single room-center light contribution and
+    // modulate every material tint by it. Per-face lighting
+    // would need a draw_room change — for this pass we ship
+    // room-level lighting that honours light colour /
+    // intensity / radius without a renderer rewrite. The
+    // editor preview does per-face lighting so authors still
+    // see spatial variation while authoring.
+    let room_center = room_center_world(room);
+    let lit_tint_factor = accumulate_room_light(room_center, room_index);
+
     let mut max_slot: usize = 0;
     for material in slice {
         let slot = material.local_slot as usize;
         if slot >= MAX_ROOM_MATERIALS {
-            // Cooker should already have failed validation;
-            // skip rather than crash if it slips through.
             continue;
         }
         let Some(asset) =
@@ -413,20 +422,113 @@ fn build_room_materials(
         let Some(slot_record) = ensure_texture_uploaded(asset.id, asset.bytes) else {
             continue;
         };
+        let lit = modulate_tint(material.tint_rgb, lit_tint_factor);
         out[slot] = Some(TextureMaterial::opaque(
             slot_record.clut_word,
             slot_record.tpage_word,
-            (
-                material.tint_rgb[0],
-                material.tint_rgb[1],
-                material.tint_rgb[2],
-            ),
+            lit,
         ));
         if slot + 1 > max_slot {
             max_slot = slot + 1;
         }
     }
     max_slot
+}
+
+/// World coords of the room centre. Cooker normalizes geometry
+/// to be array-rooted so the centre is `(width/2 * S, 0,
+/// depth/2 * S)`. We can't see `width`/`depth` from the room
+/// record at runtime — so the cook-time origin is fine for now.
+/// Authors who want per-face spatial lighting use the editor
+/// preview.
+fn room_center_world(room: &LevelRoomRecord) -> [i32; 3] {
+    // Without parsed `.psxw`, fall back to the room origin.
+    // Once draw_room exposes per-room geometry centre we can
+    // upgrade this; today the cooker emits origin = (0, 0, 0)
+    // for array-rooted rooms so this matches the room middle
+    // for square rooms close enough for ambient lighting.
+    [room.origin_x, 0, room.origin_z]
+}
+
+/// Walk every `LIGHTS` record for `room_index` and accumulate
+/// `(R, G, B)` brightness contributions at `world_center`. Each
+/// channel returned is in 0..=255 — neutral light produces
+/// 128 (matching `tint_rgb`'s neutral value); bright lights
+/// can saturate to 255.
+fn accumulate_room_light(world_center: [i32; 3], room_index: u16) -> (u32, u32, u32) {
+    // Start at neutral 128 so an unlit room is not pitch black.
+    let mut accum: [u32; 3] = [128, 128, 128];
+    for light in LIGHTS {
+        if light.room != room_index {
+            continue;
+        }
+        let dx = (world_center[0] - light.x) as i64;
+        let dy = (world_center[1] - light.y) as i64;
+        let dz = (world_center[2] - light.z) as i64;
+        let d2 = dx * dx + dy * dy + dz * dz;
+        let r = light.radius as i64;
+        if r <= 0 {
+            continue;
+        }
+        let r2 = r * r;
+        if d2 >= r2 {
+            continue;
+        }
+        let d = isqrt(d2);
+        // Linear falloff in Q8: weight = 256 * (r - d) / r.
+        let weight_q8 = (((r - d) << 8) / r) as u32;
+        // intensity_q8 already = intensity × 256.
+        let intensity_q8 = light.intensity_q8 as u32;
+        for c in 0..3 {
+            let contrib = (light.color[c] as u32) * intensity_q8 / 256 * weight_q8 / 256;
+            accum[c] = accum[c].saturating_add(contrib);
+        }
+    }
+    (
+        accum[0].min(255),
+        accum[1].min(255),
+        accum[2].min(255),
+    )
+}
+
+/// Multiply a base tint (`128 = neutral`) by a Q8 lighting
+/// factor, clamping to 8-bit. Output goes straight into
+/// `TextureMaterial::opaque`.
+fn modulate_tint(base: [u8; 3], factor: (u32, u32, u32)) -> (u8, u8, u8) {
+    let mod_channel = |b: u8, f: u32| -> u8 {
+        let scaled = (b as u32) * f / 128;
+        scaled.min(255) as u8
+    };
+    (
+        mod_channel(base[0], factor.0),
+        mod_channel(base[1], factor.1),
+        mod_channel(base[2], factor.2),
+    )
+}
+
+/// Simple integer square root for `i64` — same shape as the
+/// host editor's helper; needed because `f32` would drag in
+/// libm on the no_std target.
+fn isqrt(value: i64) -> i64 {
+    if value <= 0 {
+        return 0;
+    }
+    let mut x = value as u64;
+    let mut r: u64 = 0;
+    let mut bit: u64 = 1u64 << 62;
+    while bit > x {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if x >= r + bit {
+            x -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    r as i64
 }
 
 /// Upload `asset_bytes` to VRAM if not already resident; return

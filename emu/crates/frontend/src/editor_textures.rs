@@ -386,16 +386,29 @@ impl EditorTextures {
         let height_px = texture.height();
         let pixel_bytes = texture.pixel_bytes();
 
-        // Pick the next free model atlas slot. Halfword stride
-        // packing: each atlas takes `halfwords_per_row` columns
-        // in the tpage row at y=256.
-        if self.next_model_tpage_x as u32 + halfwords_per_row as u32 > VRAM_WIDTH as u32 {
+        // PSX tpage word can only address tpage *bases*: each
+        // page is 64 halfwords wide × 256 rows tall, identified
+        // by `tpage_index = base_x / 64`. There's no per-atlas
+        // base-X offset inside a page, so an atlas placed at a
+        // non-64-halfword boundary would sample from the wrong
+        // page. Editor-preview contract: each 8bpp model atlas
+        // occupies exactly one 64-halfword tpage column. That
+        // covers up to a 128-pixel-wide 8bpp atlas (which the
+        // current Wraith / Hooded Wretch atlases match).
+        const HALFWORDS_PER_TPAGE: u16 = 64;
+        if halfwords_per_row > HALFWORDS_PER_TPAGE {
+            // Wider than one tpage column — not addressable
+            // from a single primitive.
+            return None;
+        }
+        let aligned_tpage_x = align_up_to(self.next_model_tpage_x, HALFWORDS_PER_TPAGE);
+        if aligned_tpage_x as u32 + HALFWORDS_PER_TPAGE as u32 > VRAM_WIDTH as u32 {
             return None;
         }
         if self.next_model_clut_y as usize >= VRAM_HEIGHT as usize {
             return None;
         }
-        let tpage_x = self.next_model_tpage_x;
+        let tpage_x = aligned_tpage_x;
         let tpage_y: u16 = 256;
         let clut_y = self.next_model_clut_y;
 
@@ -430,10 +443,10 @@ impl EditorTextures {
             self.vram[vram_idx] = marked;
         }
 
-        // Tpage word: the model atlas tpage row is at y=256 →
-        // tpage_y_block = 1. Tpage X is `tpage_x / 64` (always
-        // 0..15). 8bpp depth bit pattern is `1` (4bpp = 0).
-        let tpage_index = tpage_x / 64;
+        // Tpage word: tpage row at y=256 → tpage_y_block = 1.
+        // Tpage X is `tpage_x / 64` (always 0..15 within a row).
+        // 8bpp depth bit pattern is `1` (4bpp = 0).
+        let tpage_index = tpage_x / HALFWORDS_PER_TPAGE;
         let slot = MaterialSlot {
             tpage_word: pack_8bpp_tpage_word(tpage_index, 1),
             clut_word: pack_clut_word(0, clut_y),
@@ -441,7 +454,12 @@ impl EditorTextures {
             height,
         };
 
-        self.next_model_tpage_x = self.next_model_tpage_x.saturating_add(halfwords_per_row);
+        // Advance to the next aligned slot. Each atlas consumes
+        // one 64-halfword tpage column regardless of actual
+        // halfword stride — even a 32-halfword (64-pixel) atlas
+        // burns a whole column to keep the tpage_index math
+        // self-contained.
+        self.next_model_tpage_x = aligned_tpage_x.saturating_add(HALFWORDS_PER_TPAGE);
         self.next_model_clut_y = self.next_model_clut_y.saturating_add(1);
         Some(slot)
     }
@@ -779,4 +797,39 @@ fn pack_clut_word(clut_x_halfwords: u16, clut_y: u16) -> u16 {
     let cx = (clut_x_halfwords / 16) & 0x3F;
     let cy = clut_y & 0x1FF;
     cx | (cy << 6)
+}
+
+/// Round `value` up to the next multiple of `boundary`.
+/// `boundary` must be a power of two for the bitmask path; the
+/// general formula handles arbitrary moduli but the model
+/// atlas allocator only ever passes 64.
+fn align_up_to(value: u16, boundary: u16) -> u16 {
+    if boundary == 0 {
+        return value;
+    }
+    let rem = value % boundary;
+    if rem == 0 {
+        value
+    } else {
+        value.saturating_add(boundary - rem)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::align_up_to;
+
+    #[test]
+    fn align_up_to_handles_aligned_and_misaligned_values() {
+        assert_eq!(align_up_to(0, 64), 0);
+        assert_eq!(align_up_to(1, 64), 64);
+        assert_eq!(align_up_to(63, 64), 64);
+        assert_eq!(align_up_to(64, 64), 64);
+        assert_eq!(align_up_to(65, 64), 128);
+        assert_eq!(align_up_to(127, 64), 128);
+        assert_eq!(align_up_to(128, 64), 128);
+        // Boundary 0 is a no-op (defensive — the allocator
+        // only ever passes 64).
+        assert_eq!(align_up_to(33, 0), 33);
+    }
 }

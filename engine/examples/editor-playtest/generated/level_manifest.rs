@@ -20,6 +20,7 @@ use psx_level::{
     LevelModelRecord,
     LevelRoomRecord,
     PlayerSpawnRecord,
+    PointLightRecord,
     RoomResidencyRecord,
 };
 
@@ -53,6 +54,9 @@ pub static MODELS: &[LevelModelRecord] = &[];
 
 /// Placed model instances.
 pub static MODEL_INSTANCES: &[LevelModelInstanceRecord] = &[];
+
+/// Placed point lights.
+pub static LIGHTS: &[PointLightRecord] = &[];
 
 /// Entity markers (legacy MeshInstance with no Model resource).
 pub static ENTITIES: &[EntityRecord] = &[];
