@@ -3767,6 +3767,30 @@ impl EditorWorkspace {
                         self.status = "Added texture".to_string();
                         self.mark_dirty();
                     }
+                    if ui
+                        .button(icons::label(icons::PLUS, "Model"))
+                        .on_hover_text(
+                            "Add an empty Model resource. Use the inspector's \
+                             'Register Cooked Folder' button to populate it from \
+                             an existing bundle, or fill in the paths by hand.",
+                        )
+                        .clicked()
+                    {
+                        let id = self.project.add_resource(
+                            "New Model",
+                            ResourceData::Model(psxed_project::ModelResource {
+                                model_path: String::new(),
+                                texture_path: None,
+                                clips: Vec::new(),
+                                default_clip: None,
+                                preview_clip: None,
+                                world_height: 1024,
+                            }),
+                        );
+                        self.selected_resource = Some(id);
+                        self.status = "Added model".to_string();
+                        self.mark_dirty();
+                    }
                 });
                 ui.separator();
                 self.draw_resources_tab(ui);
@@ -5115,7 +5139,10 @@ fn draw_psxt_stats(ui: &mut egui::Ui, stats: PsxtStats) {
 /// Inspector for a [`ResourceData::Model`]. Lets the user edit
 /// the model + atlas paths, manage the clip list, choose
 /// preview / default clips, and view parsed model + clip
-/// statistics.
+/// statistics. The "Register Cooked Folder" / "Import GLB"
+/// helpers run via deferred actions stored in
+/// [`ModelInspectorAction`] so the caller can apply them after
+/// dropping the mutable resource borrow.
 fn draw_model_resource_editor(
     ui: &mut egui::Ui,
     model: &mut psxed_project::ModelResource,
@@ -5130,6 +5157,73 @@ fn draw_model_resource_editor(
     if preview_thumb.is_some() {
         draw_psxt_preview_block(ui, preview_thumb);
     }
+
+    egui::CollapsingHeader::new(icons::label(icons::FOLDER, "Bundle helpers"))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "Register a cooked bundle (folder with one .psxmdl, optional .psxt, any number of .psxanim). Paths and clip metadata fill in automatically. Bundle dir resolves against the project root.",
+                )
+                .color(STUDIO_TEXT_WEAK)
+                .small(),
+            );
+            // egui memory keeps the input + last status across
+            // frames without leaking into ModelResource itself.
+            let input_id = ui.id().with("model_bundle_input");
+            let status_id = ui.id().with("model_bundle_status");
+            let mut bundle_dir: String = ui
+                .memory_mut(|m| m.data.get_persisted::<String>(input_id))
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.label("Bundle dir");
+                ui.text_edit_singleline(&mut bundle_dir);
+            });
+            ui.memory_mut(|m| m.data.insert_persisted(input_id, bundle_dir.clone()));
+
+            if ui
+                .button(icons::label(icons::PLUS, "Register Cooked Folder"))
+                .on_hover_text(
+                    "Walks the directory, validates every blob, and replaces this Model's paths + clip list with the bundle contents.",
+                )
+                .clicked()
+                && !bundle_dir.is_empty()
+            {
+                let path = if Path::new(&bundle_dir).is_absolute() {
+                    PathBuf::from(&bundle_dir)
+                } else {
+                    project_root.join(&bundle_dir)
+                };
+                let new_status = match register_bundle_into_model(model, &path, project_root) {
+                    Ok(clip_count) => {
+                        changed = true;
+                        format!("Registered: {clip_count} clip(s)")
+                    }
+                    Err(e) => format!("Failed: {e}"),
+                };
+                ui.memory_mut(|m| m.data.insert_persisted(status_id, new_status));
+            }
+
+            let status: String = ui
+                .memory_mut(|m| m.data.get_persisted::<String>(status_id))
+                .unwrap_or_default();
+            if !status.is_empty() {
+                let color = if status.starts_with("Failed") {
+                    Color32::from_rgb(220, 120, 100)
+                } else {
+                    STUDIO_TEXT_WEAK
+                };
+                ui.colored_label(color, status);
+            }
+
+            ui.label(
+                RichText::new(
+                    "GLB import (psxed_project::model_import::import_glb_model) is wired in code; UI button lands when the editor adds a native file picker.",
+                )
+                .color(STUDIO_TEXT_WEAK)
+                .small(),
+            );
+        });
 
     egui::CollapsingHeader::new(icons::label(icons::BOX, "Model"))
         .default_open(true)
@@ -5307,65 +5401,38 @@ fn draw_model_resource_editor(
             changed |= clip_picker(ui, "Preview clip", &mut model.preview_clip, &model.clips);
         });
 
-    egui::CollapsingHeader::new(icons::label(icons::PLAY, "Animation Clips"))
-        .default_open(true)
-        .show(ui, |ui| {
-            // Walk a copy of the indices so we can offer add /
-            // remove buttons without confusing the borrow checker.
-            let mut to_remove: Option<usize> = None;
-            for (i, clip) in model.clips.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("#{i}")).color(STUDIO_TEXT_WEAK));
-                    if ui.text_edit_singleline(&mut clip.name).changed() {
-                        changed = true;
-                    }
-                    if ui.small_button(icons::label(icons::TRASH, "")).clicked() {
-                        to_remove = Some(i);
-                    }
-                });
-                ui.label(RichText::new("Path").color(STUDIO_TEXT_WEAK).small());
-                if ui.text_edit_singleline(&mut clip.psxanim_path).changed() {
-                    changed = true;
-                }
-                ui.add_space(2.0);
-            }
-            if let Some(i) = to_remove {
-                model.clips.remove(i);
-                // Drop indices that referenced the removed clip
-                // or anything past it so they stay valid.
-                if let Some(d) = model.default_clip {
-                    model.default_clip = match (d as usize).cmp(&i) {
-                        std::cmp::Ordering::Less => Some(d),
-                        std::cmp::Ordering::Equal => None,
-                        std::cmp::Ordering::Greater => Some(d.saturating_sub(1)),
-                    };
-                }
-                if let Some(p) = model.preview_clip {
-                    model.preview_clip = match (p as usize).cmp(&i) {
-                        std::cmp::Ordering::Less => Some(p),
-                        std::cmp::Ordering::Equal => None,
-                        std::cmp::Ordering::Greater => Some(p.saturating_sub(1)),
-                    };
-                }
-                changed = true;
-            }
-            if ui
-                .button(icons::label(icons::PLUS, "Add clip"))
-                .clicked()
-            {
-                model.clips.push(psxed_project::ModelAnimationClip {
-                    name: format!("clip_{}", model.clips.len()),
-                    psxanim_path: String::new(),
-                });
-                changed = true;
-            }
-
-            ui.separator();
-            changed |= clip_picker(ui, "Default clip", &mut model.default_clip, &model.clips);
-            changed |= clip_picker(ui, "Preview clip", &mut model.preview_clip, &model.clips);
-        });
-
     changed
+}
+
+/// Adapt `psxed_project::model_import::register_cooked_model_bundle`
+/// to in-place editing: build a fresh ModelResource from the
+/// bundle, then overwrite `target`. Returns the registered clip
+/// count so the UI status line can confirm what landed.
+fn register_bundle_into_model(
+    target: &mut psxed_project::ModelResource,
+    bundle_dir: &Path,
+    project_root: &Path,
+) -> Result<usize, String> {
+    // The library helper takes a `&mut ProjectDocument` and
+    // pushes a *new* resource. Here we want to overwrite the
+    // existing resource's payload in place. Easiest path:
+    // build a throwaway scratch project, register into it, then
+    // copy the produced ModelResource back over `target`.
+    let mut scratch = psxed_project::ProjectDocument::new("scratch");
+    let id = psxed_project::model_import::register_cooked_model_bundle(
+        &mut scratch,
+        bundle_dir,
+        "Scratch",
+        Some(project_root),
+    )
+    .map_err(|e| e.to_string())?;
+    let resource = scratch.resource(id).ok_or_else(|| "lost id".to_string())?;
+    let psxed_project::ResourceData::Model(model) = &resource.data else {
+        return Err("scratch resource is not a Model".to_string());
+    };
+    let clip_count = model.clips.len();
+    *target = model.clone();
+    Ok(clip_count)
 }
 
 /// Combo-box picker for a clip index. `None` means "unset" and

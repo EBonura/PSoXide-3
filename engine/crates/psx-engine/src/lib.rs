@@ -70,6 +70,10 @@ pub use render3d::{
     WorldProjection, WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions,
     WorldTriCommand, WorldVertex,
 };
+// Re-export the GTE math types callers need to construct
+// arguments for `submit_textured_model` (instance rotation,
+// joint transforms) without pulling in `psx-gte` directly.
+pub use psx_gte::math::Mat3I16;
 pub use scene::{Ctx, Scene};
 pub use time::EngineTime;
 pub use transform::{ActorTransform, Vec3World};

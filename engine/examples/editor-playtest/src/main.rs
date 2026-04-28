@@ -31,9 +31,9 @@ extern crate psx_rt;
 use psx_asset::{Animation, Model, Texture, World as AssetWorld};
 use psx_engine::{
     button, draw_room, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange,
-    JointViewTransform, OtFrame, PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex,
-    RuntimeRoom, Scene, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions,
-    WorldTriCommand, WorldVertex,
+    JointViewTransform, Mat3I16, OtFrame, PrimitiveArena, ProjectedTexturedVertex,
+    ProjectedVertex, RuntimeRoom, Scene, WorldCamera, WorldProjection, WorldRenderPass,
+    WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_gte::transform::{cos_1_3_12, sin_1_3_12};
@@ -433,15 +433,27 @@ fn build_room_materials(
 /// the slot record so the caller can build a TextureMaterial.
 /// Returns `None` if the texture parse fails or the VRAM table
 /// is full.
+/// Look up the VRAM slot a previously-uploaded asset occupies.
+/// VRAM_SLOTS is the source of truth — `RESIDENCY` only tracks
+/// the *contract*, which is pre-marked by `ensure_room_resident`
+/// before any actual upload runs.
+fn find_vram_slot(asset_id: AssetId) -> Option<VramSlot> {
+    unsafe {
+        VRAM_SLOTS
+            .iter()
+            .filter_map(|s| *s)
+            .find(|s| s.asset == asset_id)
+    }
+}
+
 fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<VramSlot> {
-    // Already uploaded? Look up the slot record.
-    if unsafe { RESIDENCY.contains_vram(asset_id) } {
-        return unsafe {
-            VRAM_SLOTS
-                .iter()
-                .filter_map(|s| *s)
-                .find(|s| s.asset == asset_id)
-        };
+    // VRAM_SLOTS is the source of truth for "have we actually
+    // uploaded this asset". `RESIDENCY` is the *contract* — it's
+    // pre-marked by `ensure_room_resident` before any upload runs,
+    // so reading it here would falsely report assets as uploaded
+    // and skip the upload entirely.
+    if let Some(slot) = find_vram_slot(asset_id) {
+        return Some(slot);
     }
 
     let texture = Texture::from_bytes(asset_bytes).ok()?;
@@ -492,13 +504,10 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
 /// a `Texture` whose CLUT carries 256 entries (8bpp). Anything
 /// else returns `None`.
 fn ensure_model_atlas_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<VramSlot> {
-    if unsafe { RESIDENCY.contains_vram(asset_id) } {
-        return unsafe {
-            VRAM_SLOTS
-                .iter()
-                .filter_map(|s| *s)
-                .find(|s| s.asset == asset_id)
-        };
+    // Same caveat as `ensure_texture_uploaded`: VRAM_SLOTS is
+    // the source of truth, not the residency tracker.
+    if let Some(slot) = find_vram_slot(asset_id) {
+        return Some(slot);
     }
     let texture = Texture::from_bytes(asset_bytes).ok()?;
     if texture.clut_entries() != 256 {
@@ -632,6 +641,10 @@ fn draw_model_instances(
 
         // Origin: room-local instance position.
         let origin = WorldVertex::new(inst.x, inst.y, inst.z);
+        // Instance Y-axis rotation from authored yaw. PSX angle
+        // units (4096 per turn) → Q12 sin/cos via the existing
+        // GTE shim, then composed into a rotation matrix.
+        let instance_rotation = yaw_rotation_matrix(inst.yaw as u16);
 
         // Render: animated when we have a clip, else hold the
         // first frame of any clip we *can* find as a static
@@ -644,6 +657,7 @@ fn draw_model_instances(
                 phase,
                 *camera,
                 origin,
+                instance_rotation,
                 unsafe { &mut MODEL_VERTICES },
                 unsafe { &mut JOINT_VIEW_TRANSFORMS },
                 material,
@@ -654,6 +668,21 @@ fn draw_model_instances(
             }
         }
         drawn += 1;
+    }
+}
+
+/// Rotation matrix around the world Y axis for `yaw` in PSX
+/// angle units (`0..4096` = full turn). Q12 fixed-point — drop
+/// straight into `submit_textured_model`'s `instance_rotation`.
+fn yaw_rotation_matrix(yaw: u16) -> Mat3I16 {
+    let s = sin_1_3_12(yaw);
+    let c = cos_1_3_12(yaw);
+    Mat3I16 {
+        m: [
+            [c, 0, s],
+            [0, 0x1000, 0],
+            [-s, 0, c],
+        ],
     }
 }
 

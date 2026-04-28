@@ -747,6 +747,27 @@ fn register_model_for_instance(
         return None;
     };
 
+    // Runtime contract: a placed model must carry an atlas
+    // (the runtime renders textured) and at least one clip
+    // (the runtime renders animated). Bind-pose / untextured
+    // rendering would need engine-side work the current pass
+    // doesn't ship — fail loud at cook so the editor surfaces
+    // it rather than silently dropping the instance at runtime.
+    if model.texture_path.is_none() {
+        report.error(format!(
+            "Model '{}' has no atlas; the runtime can't render untextured models in this pass",
+            resource.name
+        ));
+        return None;
+    }
+    if model.clips.is_empty() {
+        report.error(format!(
+            "Model '{}' has no animation clips; the runtime requires at least one clip",
+            resource.name
+        ));
+        return None;
+    }
+
     let model_index = u16::try_from(models.len()).unwrap_or(u16::MAX);
     let safe = sanitise_model_dirname(&resource.name);
     let folder = format!("{MODELS_DIRNAME}/model_{:03}_{safe}", model_index);
@@ -1782,6 +1803,53 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.contains("clip override 999 out of range")),
+            "errors: {:?}",
+            report.errors,
+        );
+    }
+
+    #[test]
+    fn model_with_no_atlas_fails_when_placed() {
+        // Strip the starter Wraith's texture_path; cook must
+        // refuse the placed instance instead of silently
+        // dropping it at runtime.
+        let mut project = ProjectDocument::starter();
+        for resource in project.resources.iter_mut() {
+            if let ResourceData::Model(model) = &mut resource.data {
+                model.texture_path = None;
+                break;
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(package.is_none());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("no atlas")),
+            "errors: {:?}",
+            report.errors,
+        );
+    }
+
+    #[test]
+    fn model_with_no_clips_fails_when_placed() {
+        let mut project = ProjectDocument::starter();
+        for resource in project.resources.iter_mut() {
+            if let ResourceData::Model(model) = &mut resource.data {
+                model.clips.clear();
+                model.default_clip = None;
+                model.preview_clip = None;
+                break;
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(package.is_none());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("no animation clips")),
             "errors: {:?}",
             report.errors,
         );

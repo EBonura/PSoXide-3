@@ -1025,6 +1025,13 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
     /// `frame_q12` is a looping sampled-frame phase with 12
     /// fractional bits, so decimated animation clips can still play
     /// smoothly between stored poses.
+    ///
+    /// `instance_rotation` is composed *between* the per-joint pose
+    /// matrix and the camera view matrix, so callers placing the
+    /// model in a world with a non-identity orientation (e.g. a
+    /// yawed enemy / NPC) can pass that rotation here. Use
+    /// `Mat3I16::IDENTITY` for unrotated instances — that's the
+    /// existing showcase-model behaviour.
     pub fn submit_textured_model(
         &mut self,
         triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -1033,6 +1040,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         frame_q12: u32,
         camera: WorldCamera,
         origin: WorldVertex,
+        instance_rotation: Mat3I16,
         projected_vertices: &mut [ProjectedTexturedVertex],
         joint_view_transforms: &mut [JointViewTransform],
         material: TextureMaterial,
@@ -1046,8 +1054,13 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         for joint in 0..joint_count {
             joint_view_transforms[joint] = match animation.pose_looped_q12(frame_q12, joint as u16) {
                 Some(pose) => {
-                    let (rotation, translation) =
-                        textured_model_part_gte_transform(camera, pose, local_to_world, origin);
+                    let (rotation, translation) = textured_model_part_gte_transform(
+                        camera,
+                        pose,
+                        instance_rotation,
+                        local_to_world,
+                        origin,
+                    );
                     JointViewTransform {
                         rotation,
                         translation,
@@ -1721,23 +1734,34 @@ fn load_world_projection_gte(projection: WorldProjection) {
 fn textured_model_part_gte_transform(
     camera: WorldCamera,
     pose: JointPose,
+    instance_rotation: Mat3I16,
     local_to_world: LocalToWorldScale,
     origin: WorldVertex,
 ) -> (Mat3I16, Vec3I32) {
     let view = camera_gte_view_matrix(camera);
     let model = scaled_pose_matrix(pose, local_to_world);
-    let rotation = mat3_mul_q12(&view, &model);
+    // Composition order: view × instance × model. `instance` is
+    // pre-multiplied through to rotate the joint pose around
+    // the model origin in world space; `view` then rotates the
+    // already-oriented model into camera space.
+    let oriented = mat3_mul_q12(&instance_rotation, &model);
+    let rotation = mat3_mul_q12(&view, &oriented);
+
+    // Pose translation needs the same instance rotation before
+    // it lands at world space — otherwise a yawed model's joints
+    // would translate along model-local axes rather than world
+    // axes.
+    let scaled_pose_translation = Vec3I32::new(
+        local_to_world.apply(pose.translation.x),
+        local_to_world.apply(pose.translation.y),
+        local_to_world.apply(pose.translation.z),
+    );
+    let rotated_pose_translation = rotate_translation_q12(&instance_rotation, scaled_pose_translation);
 
     let world_translation = WorldVertex::new(
-        origin
-            .x
-            .saturating_add(local_to_world.apply(pose.translation.x)),
-        origin
-            .y
-            .saturating_add(local_to_world.apply(pose.translation.y)),
-        origin
-            .z
-            .saturating_add(local_to_world.apply(pose.translation.z)),
+        origin.x.saturating_add(rotated_pose_translation.x),
+        origin.y.saturating_add(rotated_pose_translation.y),
+        origin.z.saturating_add(rotated_pose_translation.z),
     );
     let delta = WorldVertex::new(
         world_translation.x.saturating_sub(camera.position.x),
@@ -1751,6 +1775,19 @@ fn textured_model_part_gte_transform(
     );
 
     (rotation, translation)
+}
+
+/// Apply a Q12 rotation matrix to an i32 translation vector.
+/// Each row dot-product happens in widened i64 space so big
+/// translations don't overflow before the >>12 shift.
+fn rotate_translation_q12(rot: &Mat3I16, t: Vec3I32) -> Vec3I32 {
+    let row = |r: [i16; 3]| -> i32 {
+        let x = (r[0] as i64) * (t.x as i64);
+        let y = (r[1] as i64) * (t.y as i64);
+        let z = (r[2] as i64) * (t.z as i64);
+        ((x + y + z) >> 12) as i32
+    };
+    Vec3I32::new(row(rot.m[0]), row(rot.m[1]), row(rot.m[2]))
 }
 
 fn camera_gte_view_matrix(camera: WorldCamera) -> Mat3I16 {

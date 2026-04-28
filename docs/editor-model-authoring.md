@@ -36,9 +36,13 @@ already knows how to parse:
 | `.psxanim` | `PSXA` skeletal animation — frames × joints | `psx_asset::Animation::from_bytes` |
 
 A `Model` resource is *required* to point at a valid `.psxmdl`.
-The atlas + clips are recommended but not strictly required (a
-bundle with no atlas renders untextured at runtime; one with no
-clips renders in bind pose).
+The atlas + clips are technically optional in the data model
+(allowed for in-progress authoring), but the playtest cooker
+hard-fails any *placed* instance whose model has no atlas or
+no clips — the runtime currently has no path for untextured
+or bind-pose-only rendering. Author-time bundles without an
+atlas / clips are fine; just don't place them in a Room until
+they're complete.
 
 ## How to register a cooked model bundle
 
@@ -200,9 +204,15 @@ The cook (`build_package`) hard-fails on:
 - `MeshInstance::animation_clip` index out of range for the
   bound model.
 - A `MeshInstance` referencing a non-Model resource.
+- A placed model has no atlas (runtime can't render
+  untextured in this pass).
+- A placed model has no clips (runtime requires at least
+  one clip — bind-pose rendering is not implemented).
 
-Warnings (non-fatal): missing texture (rendering will skip
-this instance), zero clips (renders bind pose).
+The Model resource itself is allowed to ship without an atlas
+or without clips while the author is still building it; the
+hard-fails only fire when an instance of an incomplete model
+is placed in a Room.
 
 ## Currently out of scope
 
