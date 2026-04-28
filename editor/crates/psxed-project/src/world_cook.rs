@@ -11,6 +11,7 @@ use psxed_format::world;
 use crate::{
     GridDirection, GridHorizontalFace, GridSector, GridSplit, GridVerticalFace, GridWalls,
     MaterialResource, ProjectDocument, PsxBlendMode, ResourceData, ResourceId, WorldGrid,
+    MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH, MAX_WALL_STACK,
 };
 
 /// Authored grid face referenced by a cooker diagnostic.
@@ -121,6 +122,64 @@ pub enum WorldGridCookError {
         /// Diagonal direction.
         direction: GridDirection,
     },
+    /// Grid width / depth past the runtime cap. Caught at cook
+    /// time so the editor's inspector warning lines up with a
+    /// hard failure when the user actually ships.
+    RoomDimensionExceeded {
+        /// `'X'` or `'Z'`.
+        axis: char,
+        /// Authored size.
+        value: u16,
+        /// Cap.
+        limit: u16,
+    },
+    /// Triangle count past `MAX_ROOM_TRIANGLES`.
+    RoomTriangleBudgetExceeded {
+        /// Triangles the cooker would emit.
+        triangles: usize,
+        /// Cap.
+        limit: usize,
+    },
+    /// Cooked `.psxw` payload past `MAX_ROOM_BYTES`.
+    RoomByteBudgetExceeded {
+        /// Estimated wire size.
+        bytes: usize,
+        /// Cap.
+        limit: usize,
+    },
+    /// Wall stack on a single edge past `MAX_WALL_STACK`.
+    WallStackExceeded {
+        /// Sector X coordinate.
+        x: u16,
+        /// Sector Z coordinate.
+        z: u16,
+        /// Edge.
+        direction: GridDirection,
+        /// Authored wall count on this edge.
+        count: usize,
+        /// Cap.
+        limit: usize,
+    },
+    /// Two cells claim the same physical wall — `East(x, z)`
+    /// and `West(x+1, z)` describe the same vertical face, and
+    /// authoring both would double-render and double-collide.
+    /// The cooker rejects rather than silently dedup-pick: a
+    /// future "low-index-cell wins" rule is fine but should be
+    /// an explicit cooker pass, not implicit.
+    DuplicatePhysicalWall {
+        /// First wall's sector.
+        x: u16,
+        /// First wall's sector.
+        z: u16,
+        /// First wall's direction.
+        direction: GridDirection,
+        /// Second wall's sector.
+        other_x: u16,
+        /// Second wall's sector.
+        other_z: u16,
+        /// Second wall's direction.
+        other_direction: GridDirection,
+    },
 }
 
 impl std::fmt::Display for WorldGridCookError {
@@ -178,6 +237,39 @@ impl std::fmt::Display for WorldGridCookError {
             Self::UnsupportedDiagonalWall { x, z, direction } => write!(
                 f,
                 "sector {x},{z} has a {direction:?} diagonal wall — diagonals aren't supported by the v1 cooker / runtime yet"
+            ),
+            Self::RoomDimensionExceeded { axis, value, limit } => write!(
+                f,
+                "room {axis} = {value} exceeds the runtime cap of {limit} sectors"
+            ),
+            Self::RoomTriangleBudgetExceeded { triangles, limit } => write!(
+                f,
+                "room would emit {triangles} triangles; cap is {limit}"
+            ),
+            Self::RoomByteBudgetExceeded { bytes, limit } => write!(
+                f,
+                "cooked room is {bytes} bytes; cap is {limit}"
+            ),
+            Self::WallStackExceeded {
+                x,
+                z,
+                direction,
+                count,
+                limit,
+            } => write!(
+                f,
+                "sector {x},{z} {direction:?} edge has {count} walls; cap is {limit}"
+            ),
+            Self::DuplicatePhysicalWall {
+                x,
+                z,
+                direction,
+                other_x,
+                other_z,
+                other_direction,
+            } => write!(
+                f,
+                "physical wall claimed twice: ({x},{z}) {direction:?} and ({other_x},{other_z}) {other_direction:?}"
             ),
         }
     }
@@ -317,6 +409,8 @@ pub fn cook_world_grid(
     grid: &WorldGrid,
 ) -> Result<CookedWorldGrid, WorldGridCookError> {
     validate_grid_shape(grid)?;
+    validate_grid_budget(grid)?;
+    validate_no_duplicate_walls(grid)?;
 
     let mut materials = Vec::new();
     let mut material_slots = HashMap::new();
@@ -375,6 +469,161 @@ fn validate_grid_shape(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
         });
     }
     Ok(())
+}
+
+/// Enforce the runtime caps the inspector surfaces. Cooker and
+/// inspector now share `WorldGridBudget::over_budget` semantics:
+/// what the editor warned about will fail at cook time.
+fn validate_grid_budget(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
+    if grid.width > MAX_ROOM_WIDTH {
+        return Err(WorldGridCookError::RoomDimensionExceeded {
+            axis: 'X',
+            value: grid.width,
+            limit: MAX_ROOM_WIDTH,
+        });
+    }
+    if grid.depth > MAX_ROOM_DEPTH {
+        return Err(WorldGridCookError::RoomDimensionExceeded {
+            axis: 'Z',
+            value: grid.depth,
+            limit: MAX_ROOM_DEPTH,
+        });
+    }
+    // Per-edge wall stack — caught at the source rather than
+    // after wall records have been laid out, so the error
+    // message points at the authored sector.
+    for x in 0..grid.width {
+        for z in 0..grid.depth {
+            let Some(sector) = grid.sector(x, z) else {
+                continue;
+            };
+            for direction in [
+                GridDirection::North,
+                GridDirection::East,
+                GridDirection::South,
+                GridDirection::West,
+            ] {
+                let count = sector.walls.get(direction).len();
+                if count > MAX_WALL_STACK as usize {
+                    return Err(WorldGridCookError::WallStackExceeded {
+                        x,
+                        z,
+                        direction,
+                        count,
+                        limit: MAX_WALL_STACK as usize,
+                    });
+                }
+            }
+        }
+    }
+    let budget = grid.budget();
+    if budget.triangles > MAX_ROOM_TRIANGLES {
+        return Err(WorldGridCookError::RoomTriangleBudgetExceeded {
+            triangles: budget.triangles,
+            limit: MAX_ROOM_TRIANGLES,
+        });
+    }
+    if budget.psxw_v1_bytes > MAX_ROOM_BYTES {
+        return Err(WorldGridCookError::RoomByteBudgetExceeded {
+            bytes: budget.psxw_v1_bytes,
+            limit: MAX_ROOM_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Reject duplicate physical walls. The wall between cells
+/// `(x, z)` and `(x+1, z)` is the same vertical face whether
+/// it's authored as `East(x, z)` or `West(x+1, z)`. Authoring
+/// both would double-render and double-collide, so the cooker
+/// fails loud and points at both cells. A future "low-index-
+/// cell wins" normalization pass is fine but should be an
+/// explicit, opted-in cooker step.
+fn validate_no_duplicate_walls(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
+    use std::collections::HashMap;
+
+    // Each entry: which (x, z, dir) was the first to claim a
+    // given physical edge. Diagonals don't share with anyone
+    // (and the cooker rejects them anyway via cook_walls), so
+    // they don't enter the map.
+    let mut claims: HashMap<PhysicalEdge, (u16, u16, GridDirection)> = HashMap::new();
+    for x in 0..grid.width {
+        for z in 0..grid.depth {
+            let Some(sector) = grid.sector(x, z) else {
+                continue;
+            };
+            for direction in [
+                GridDirection::North,
+                GridDirection::East,
+                GridDirection::South,
+                GridDirection::West,
+            ] {
+                if sector.walls.get(direction).is_empty() {
+                    continue;
+                }
+                let Some(edge) = canonical_edge(x, z, direction) else {
+                    continue;
+                };
+                if let Some(&(other_x, other_z, other_direction)) = claims.get(&edge) {
+                    return Err(WorldGridCookError::DuplicatePhysicalWall {
+                        x,
+                        z,
+                        direction,
+                        other_x,
+                        other_z,
+                        other_direction,
+                    });
+                }
+                claims.insert(edge, (x, z, direction));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The vertical face between two cells, addressed canonically
+/// so opposing-cell descriptions collide on insert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PhysicalEdge {
+    x: i32,
+    z: i32,
+    axis: EdgeAxis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EdgeAxis {
+    /// Edge runs north-south (separates two cells across the X
+    /// axis): West / East walls land here.
+    NorthSouth,
+    /// Edge runs east-west (separates across Z): North / South
+    /// walls land here.
+    EastWest,
+}
+
+fn canonical_edge(x: u16, z: u16, dir: GridDirection) -> Option<PhysicalEdge> {
+    match dir {
+        GridDirection::North => Some(PhysicalEdge {
+            x: x as i32,
+            z: z as i32,
+            axis: EdgeAxis::EastWest,
+        }),
+        GridDirection::South => Some(PhysicalEdge {
+            x: x as i32,
+            z: z as i32 + 1,
+            axis: EdgeAxis::EastWest,
+        }),
+        GridDirection::West => Some(PhysicalEdge {
+            x: x as i32,
+            z: z as i32,
+            axis: EdgeAxis::NorthSouth,
+        }),
+        GridDirection::East => Some(PhysicalEdge {
+            x: x as i32 + 1,
+            z: z as i32,
+            axis: EdgeAxis::NorthSouth,
+        }),
+        GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => None,
+    }
 }
 
 fn cook_sector(
@@ -498,11 +747,11 @@ fn cook_walls(
             return Err(WorldGridCookError::UnsupportedDiagonalWall { x, z, direction });
         }
     }
-    // Cardinal walls only. The cooker keeps each cell's locally-
-    // authored walls — the wall-ownership normalization
-    // (deduping the east wall of (x,z) against the west wall of
-    // (x+1,z)) lives in `normalize_shared_walls` so the runtime
-    // never gets two coplanar walls on the same physical edge.
+    // Cardinal walls only. Duplicate physical walls (east of
+    // (x,z) and west of (x+1,z) describe the same face) are
+    // already rejected upstream by `validate_no_duplicate_walls`
+    // — by the time we reach this loop the grid is guaranteed
+    // to claim each physical edge from at most one side.
     for direction in [
         GridDirection::North,
         GridDirection::East,
@@ -948,6 +1197,80 @@ mod tests {
 
         assert!(psxt_path_for_slot(0).ends_with("floor.psxt"));
         assert!(psxt_path_for_slot(1).ends_with("brick-wall.psxt"));
+    }
+
+    #[test]
+    fn rejects_oversized_room_dimensions() {
+        let project = ProjectDocument::starter();
+        let grid = WorldGrid::empty(MAX_ROOM_WIDTH + 1, 4, world::SECTOR_SIZE);
+        match cook_world_grid(&project, &grid) {
+            Err(WorldGridCookError::RoomDimensionExceeded { axis, value, limit }) => {
+                assert_eq!(axis, 'X');
+                assert_eq!(value, MAX_ROOM_WIDTH + 1);
+                assert_eq!(limit, MAX_ROOM_WIDTH);
+            }
+            other => panic!("expected RoomDimensionExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_excessive_wall_stacks() {
+        let project = ProjectDocument::starter();
+        let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
+        for _ in 0..(MAX_WALL_STACK as usize + 1) {
+            grid.add_wall(
+                0,
+                0,
+                GridDirection::North,
+                0,
+                world::SECTOR_SIZE,
+                None,
+            );
+        }
+        match cook_world_grid(&project, &grid) {
+            Err(WorldGridCookError::WallStackExceeded {
+                x,
+                z,
+                direction,
+                count,
+                limit,
+            }) => {
+                assert_eq!((x, z), (0, 0));
+                assert_eq!(direction, GridDirection::North);
+                assert_eq!(count, MAX_WALL_STACK as usize + 1);
+                assert_eq!(limit, MAX_WALL_STACK as usize);
+            }
+            other => panic!("expected WallStackExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_physical_walls() {
+        // East(0, 0) and West(1, 0) describe the same physical
+        // wall. Authoring both must surface a clear cook error.
+        let project = ProjectDocument::starter();
+        let mut grid = WorldGrid::empty(2, 1, world::SECTOR_SIZE);
+        grid.add_wall(0, 0, GridDirection::East, 0, world::SECTOR_SIZE, None);
+        grid.add_wall(1, 0, GridDirection::West, 0, world::SECTOR_SIZE, None);
+        match cook_world_grid(&project, &grid) {
+            Err(WorldGridCookError::DuplicatePhysicalWall {
+                x,
+                z,
+                direction,
+                other_x,
+                other_z,
+                other_direction,
+            }) => {
+                // The cooker walks (x, z) major; East(0,0) is
+                // claimed first, so the duplicate is West(1,0).
+                assert_eq!((x, z, direction), (1, 0, GridDirection::West));
+                assert_eq!(
+                    (other_x, other_z, other_direction),
+                    (0, 0, GridDirection::East)
+                );
+            }
+            other => panic!("expected DuplicatePhysicalWall, got {other:?}"),
+        }
     }
 
     #[test]

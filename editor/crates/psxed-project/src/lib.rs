@@ -308,12 +308,12 @@ impl GridVerticalFace {
 /// **Ownership rule**: a physical wall between cells `(x, z)` and
 /// `(x+1, z)` is the **East** wall of `(x, z)` AND the **West**
 /// wall of `(x+1, z)` simultaneously. The editor's PaintWall tool
-/// stamps only one side (whichever the user clicked); the cooker
-/// is responsible for normalizing any duplicate-opposing-coplanar
-/// walls — when both sides exist, the **lower-index cell wins**
-/// (i.e., `East(x,z)` survives, `West(x+1,z)` is dropped if
-/// they're identical). North/South share `North(x, z)` ↔
-/// `South(x, z+1)` with the same low-index-wins rule.
+/// stamps only one side (whichever the user clicked). When both
+/// sides claim the same physical edge the cooker rejects the grid
+/// with `DuplicatePhysicalWall` — render-+-collision-correct
+/// double walls aren't a thing, and silent-dedup risks the editor
+/// and runtime disagreeing about which side won. North/South share
+/// `North(x, z)` ↔ `South(x, z+1)` under the same rule.
 ///
 /// Diagonal walls are authoring-only for now: cooker rejects them
 /// (`UnsupportedDiagonalWall`) until render / pick / collision
@@ -417,13 +417,25 @@ pub const MAX_ROOM_BYTES: usize = 64 * 1024;
 /// repaints.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WorldGridBudget {
+    /// Grid width in sectors.
+    pub width: u16,
+    /// Grid depth in sectors.
+    pub depth: u16,
+    /// `width * depth`. v1 `.psxw` stores a sector record for
+    /// every cell whether it's populated or not, so this is
+    /// what the wire-size formula multiplies against.
     pub total_cells: usize,
+    /// Cells that have any geometry (floor / ceiling / walls).
+    /// Useful for surface-area / drawcall estimates; not the
+    /// driver of the byte budget.
     pub populated_cells: usize,
     pub floors: usize,
     pub ceilings: usize,
     pub walls: usize,
     pub triangles: usize,
-    /// `.psxw` v1 wire size with 44-byte sectors / 24-byte walls.
+    /// `.psxw` v1 wire size with 44-byte sectors / 24-byte
+    /// walls. v1 stores a record for **every** cell, so this
+    /// uses `total_cells`, not `populated_cells`.
     pub psxw_v1_bytes: usize,
     /// `.psxw` v2 estimate — 28-byte sectors / 12-byte walls.
     /// Surfaced even before v2 ships so authors can see the
@@ -432,11 +444,14 @@ pub struct WorldGridBudget {
 }
 
 impl WorldGridBudget {
-    /// `true` if any of the cap constants is exceeded.
+    /// `true` if any cap is exceeded. Mirrors the validation the
+    /// cooker now enforces — UI and cooker can't disagree about
+    /// what counts as "too big."
     pub fn over_budget(&self) -> bool {
-        self.triangles > MAX_ROOM_TRIANGLES
+        self.width > MAX_ROOM_WIDTH
+            || self.depth > MAX_ROOM_DEPTH
+            || self.triangles > MAX_ROOM_TRIANGLES
             || self.psxw_v1_bytes > MAX_ROOM_BYTES
-            || self.psxw_v2_estimated_bytes > MAX_ROOM_BYTES
     }
 }
 
@@ -576,6 +591,8 @@ impl WorldGrid {
     /// limits before cook time.
     pub fn budget(&self) -> WorldGridBudget {
         let mut b = WorldGridBudget {
+            width: self.width,
+            depth: self.depth,
             total_cells: (self.width as usize) * (self.depth as usize),
             ..Default::default()
         };
@@ -604,11 +621,14 @@ impl WorldGrid {
         }
         // v1 wire layout (matches `psxed_format::world` records):
         //   AssetHeader = 12, WorldHeader = 20, Sector = 44, Wall = 24.
-        b.psxw_v1_bytes = 12 + 20 + b.populated_cells * 44 + b.walls * 24;
-        // v2 target (designed in P6): Sector = 28, Wall = 12. We
-        // surface this even before v2 lands so authors see the
-        // savings the format change is buying.
-        b.psxw_v2_estimated_bytes = 12 + 20 + b.populated_cells * 28 + b.walls * 12;
+        // v1 stores a sector record for every cell — empty or not —
+        // so the byte count uses `total_cells`. Using
+        // `populated_cells` here was the original bug: it under-
+        // reported the wire size by ~44 B per empty cell.
+        b.psxw_v1_bytes = 12 + 20 + b.total_cells * 44 + b.walls * 24;
+        // v2 target (designed in P6): Sector = 28, Wall = 12. Same
+        // dense-table layout, so still indexed by `total_cells`.
+        b.psxw_v2_estimated_bytes = 12 + 20 + b.total_cells * 28 + b.walls * 12;
         b
     }
 
@@ -1381,15 +1401,20 @@ mod tests {
     fn budget_empty_grid_reports_no_geometry() {
         let grid = WorldGrid::empty(3, 3, 1024);
         let b = grid.budget();
+        assert_eq!(b.width, 3);
+        assert_eq!(b.depth, 3);
         assert_eq!(b.total_cells, 9);
         assert_eq!(b.populated_cells, 0);
         assert_eq!(b.floors, 0);
         assert_eq!(b.ceilings, 0);
         assert_eq!(b.walls, 0);
         assert_eq!(b.triangles, 0);
-        // Just the AssetHeader (12) + WorldHeader (20).
-        assert_eq!(b.psxw_v1_bytes, 32);
-        assert_eq!(b.psxw_v2_estimated_bytes, 32);
+        // AssetHeader (12) + WorldHeader (20) + 9 sector records.
+        // v1 stores a record per cell whether populated or not, so
+        // an "empty" 3×3 still costs 9 * 44 = 396 B in sector
+        // records on top of the headers.
+        assert_eq!(b.psxw_v1_bytes, 12 + 20 + 9 * 44);
+        assert_eq!(b.psxw_v2_estimated_bytes, 12 + 20 + 9 * 28);
         assert!(!b.over_budget());
     }
 
@@ -1431,6 +1456,17 @@ mod tests {
         // v2: 32 + 1024 * 28 = 28704 — well under cap.
         assert!(b.psxw_v2_estimated_bytes <= MAX_ROOM_BYTES);
         assert!(!b.over_budget());
+    }
+
+    #[test]
+    fn budget_flags_oversized_room_dimensions() {
+        // 64×16 fits the byte cap but blows past MAX_ROOM_WIDTH.
+        // The old `over_budget` check only watched triangles +
+        // bytes; this test pins the new width/depth check that
+        // catches asymmetric over-sized rooms.
+        let grid = WorldGrid::empty(MAX_ROOM_WIDTH * 2, MAX_ROOM_DEPTH / 2, 1024);
+        let b = grid.budget();
+        assert!(b.over_budget(), "{b:?}");
     }
 
     #[test]

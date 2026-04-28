@@ -1,0 +1,7 @@
+# Cooked room blobs land here via `cook-playtest`. They're a
+# function of the editor's project state, deterministic, and
+# easy to regenerate — committing them would just churn diffs
+# every time someone cooks. The committed `level_manifest.rs`
+# is in placeholder state (zero rooms) so the example still
+# compiles without these files.
+rooms/*.psxw

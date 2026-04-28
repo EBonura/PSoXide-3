@@ -26,7 +26,7 @@
         showcase-particles run-showcase-particles \
         hello-engine run-hello-engine \
         showcase-room run-showcase-room \
-        cook-playtest editor-playtest run-editor-playtest
+        cook-playtest build-editor-playtest run-editor-playtest run-starter-playtest
 
 help:
 	@echo "PSoXide targets:"
@@ -194,16 +194,19 @@ showcase-particles:
 showcase-room:
 	cd engine/examples/showcase-room && cargo build --release
 
-# Cook the editor's active project into the editor-playtest
-# example's `generated/` directory. Re-run after any scene-tree
-# change. Falls through to running cargo on psxed-project so
-# the host workspace's Cargo.lock stays in sync.
+# Cook a project into editor-playtest/generated/. With no
+# arguments cooks the embedded starter project; pass
+# `PROJECT=<path/to/project.ron>` to cook a specific one.
+# This target is **destructive**: it overwrites whatever was
+# in generated/ before. Don't run it after the editor's "Cook
+# & Play" unless you want the editor's output replaced.
 cook-playtest:
-	cd editor && cargo run --release -p psxed-project --bin cook-playtest
+	cd editor && cargo run --release -p psxed-project --bin cook-playtest -- $(PROJECT)
 
-# Build the editor-playtest example. Depends on cook-playtest
-# so a fresh checkout produces a valid binary on the first run.
-editor-playtest: cook-playtest
+# Build the editor-playtest example against whatever is in
+# `generated/` right now. Does NOT recook — that's the editor's
+# job (or `make cook-playtest` if you want the starter).
+build-editor-playtest:
 	cd engine/examples/editor-playtest && cargo build --release
 
 # --- Content pipeline (host-side editor tooling) ------------------------
@@ -317,10 +320,15 @@ run-hello-engine: hello-engine
 run-showcase-room: showcase-room
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-room.exe cargo run -p frontend --release
 
-# Editor-driven playtest loop: cooks the active project into
-# the example's generated/ dir, builds the PSX EXE, and side-
-# loads it through the desktop frontend. Pairs with the
-# editor's "Cook & Play" button which performs the cook half
-# and asks the user to run this target afterwards.
-run-editor-playtest: editor-playtest
+# Build + run editor-playtest against whatever's already in
+# `generated/`. **Does not recook**, so it's safe to invoke
+# right after the editor's "Cook & Play" button — your custom
+# scene won't be overwritten by the starter.
+run-editor-playtest: build-editor-playtest
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/editor-playtest.exe cargo run -p frontend --release
+
+# Convenience: cook the starter project AND run. Equivalent to
+# `make cook-playtest` followed by `make run-editor-playtest`.
+# Use this from a fresh checkout or when you specifically want
+# the starter scene; otherwise prefer the editor's cook button.
+run-starter-playtest: cook-playtest run-editor-playtest
