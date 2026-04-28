@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use ron::ser::PrettyConfig;
 use serde::{Deserialize, Serialize};
 
+pub mod model_import;
 pub mod playtest;
 pub mod world_cook;
 
@@ -983,6 +984,78 @@ impl WorldGrid {
     }
 }
 
+/// One cooked animation clip referenced by a [`ModelResource`].
+///
+/// `psxanim_path` resolves with the same precedence rules as
+/// [`ResourceData::Texture::psxt_path`]: absolute → project-relative →
+/// workspace cwd-relative. Stored relative to the project when the
+/// editor registers a bundle, so projects move freely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAnimationClip {
+    /// Display name surfaced in the inspector (clip dropdown,
+    /// scrubber). Derived from the source filename when registered
+    /// via a cooked bundle; user-editable.
+    pub name: String,
+    /// Path to the cooked `.psxanim` artifact.
+    pub psxanim_path: String,
+}
+
+/// Cooked PSX model bundle: a `.psxmdl` plus optional atlas
+/// `.psxt` plus zero or more `.psxanim` clips.
+///
+/// All paths follow the project-relative resolution rule shared
+/// with `Texture` resources. `clips` is ordered deterministically
+/// (by file name at registration time); `default_clip` /
+/// `preview_clip` index into that list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelResource {
+    /// Path to the cooked `.psxmdl` artifact.
+    pub model_path: String,
+    /// Optional atlas. Required for textured rendering at runtime;
+    /// omitting is allowed for placeholder / debug bundles.
+    #[serde(default)]
+    pub texture_path: Option<String>,
+    /// Cooked animation clips, sorted by file name. Empty for
+    /// static models (rendered in bind pose).
+    #[serde(default)]
+    pub clips: Vec<ModelAnimationClip>,
+    /// Index into `clips` used at runtime when no per-instance
+    /// override is set. `None` means "first clip if any, else
+    /// bind pose".
+    #[serde(default)]
+    pub default_clip: Option<u16>,
+    /// Index into `clips` shown in the editor inspector preview.
+    /// Falls back to `default_clip` when unset.
+    #[serde(default)]
+    pub preview_clip: Option<u16>,
+    /// Suggested world-space height in engine units (mirrors the
+    /// value the cooker stamped into the `.psxmdl` header). Used
+    /// by the inspector for sanity checks and by the editor
+    /// preview to size selection gizmos.
+    #[serde(default = "default_model_world_height")]
+    pub world_height: u16,
+}
+
+const fn default_model_world_height() -> u16 {
+    1024
+}
+
+impl ModelResource {
+    /// Index of the clip the editor inspector should preview —
+    /// `preview_clip` if set, else `default_clip`, else `None`.
+    pub fn effective_preview_clip(&self) -> Option<u16> {
+        self.preview_clip.or(self.default_clip)
+    }
+
+    /// Index of the clip a runtime instance with no override
+    /// should play — `default_clip` if set, else clip 0 if any
+    /// clip exists, else `None`.
+    pub fn effective_runtime_clip(&self) -> Option<u16> {
+        self.default_clip
+            .or_else(|| (!self.clips.is_empty()).then_some(0))
+    }
+}
+
 /// Resource payloads available to editor scenes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourceData {
@@ -1004,7 +1077,12 @@ pub enum ResourceData {
     },
     /// Editor material.
     Material(MaterialResource),
-    /// Source mesh.
+    /// Cooked animated PSX model — `.psxmdl` + optional `.psxt`
+    /// atlas + animation clips. Instantiated in scenes via
+    /// [`NodeKind::MeshInstance`] referencing this resource id.
+    Model(ModelResource),
+    /// Legacy / generic source mesh path. Kept for backward
+    /// compatibility; new authoring should use [`ResourceData::Model`].
     Mesh {
         /// Project-relative source path.
         source_path: String,
@@ -1032,6 +1110,7 @@ impl ResourceData {
         match self {
             Self::Texture { .. } => "Texture",
             Self::Material(_) => "Material",
+            Self::Model(_) => "Model",
             Self::Mesh { .. } => "Mesh",
             Self::Scene { .. } => "Scene",
             Self::Script { .. } => "Script",
@@ -1072,12 +1151,23 @@ pub enum NodeKind {
         /// Authored grid-world payload.
         grid: WorldGrid,
     },
-    /// Static or dynamic mesh instance.
+    /// Static or dynamic mesh / model instance.
+    ///
+    /// `mesh` references either a legacy [`ResourceData::Mesh`] or a
+    /// cooked [`ResourceData::Model`]. When it points at a Model,
+    /// `animation_clip` selects which clip plays — an explicit
+    /// `Some(idx)` overrides the model's `default_clip`; `None`
+    /// inherits the model default. Instances of legacy meshes
+    /// ignore this field.
     MeshInstance {
-        /// Mesh resource.
+        /// Mesh / model resource.
         mesh: Option<ResourceId>,
-        /// Material override.
+        /// Material override (legacy mesh path; ignored for Model
+        /// resources, which embed material data in the `.psxmdl`).
         material: Option<ResourceId>,
+        /// Per-instance animation clip override.
+        #[serde(default)]
+        animation_clip: Option<u16>,
     },
     /// Simple authoring light.
     Light {
@@ -1697,6 +1787,35 @@ mod tests {
             &r.data,
             ResourceData::Texture { psxt_path } if psxt_path.ends_with("brick-wall.psxt")
         )));
+        // Starter ships the obsidian wraith model so users can
+        // place + playtest a real animated character without
+        // running the import flow first.
+        let wraith = project
+            .resources
+            .iter()
+            .find_map(|r| match &r.data {
+                ResourceData::Model(m) if r.name == "Obsidian Wraith" => Some(m),
+                _ => None,
+            })
+            .expect("starter model resource missing");
+        assert!(wraith.model_path.ends_with("obsidian_wraith.psxmdl"));
+        assert!(wraith.texture_path.is_some());
+        assert!(!wraith.clips.is_empty());
+        assert!(wraith.default_clip.is_some());
+    }
+
+    #[test]
+    fn starter_model_files_present_on_disk() {
+        let root = default_project_dir();
+        assert!(root
+            .join("assets/models/obsidian_wraith/obsidian_wraith.psxmdl")
+            .is_file());
+        assert!(root
+            .join("assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt")
+            .is_file());
+        assert!(root
+            .join("assets/models/obsidian_wraith/obsidian_wraith_idle.psxanim")
+            .is_file());
     }
 
     #[test]
@@ -1812,6 +1931,139 @@ mod tests {
 
         assert!(ron.contains("Stone Room"));
         assert_eq!(ProjectDocument::from_ron_str(&ron).unwrap(), project);
+    }
+
+    #[test]
+    fn model_resource_roundtrips_through_ron_string() {
+        let mut project = ProjectDocument::starter();
+        let id = project.add_resource(
+            "TestModel",
+            ResourceData::Model(ModelResource {
+                model_path: "assets/models/x/x.psxmdl".to_string(),
+                texture_path: Some("assets/models/x/x.psxt".to_string()),
+                clips: vec![
+                    ModelAnimationClip {
+                        name: "idle".to_string(),
+                        psxanim_path: "assets/models/x/x_idle.psxanim".to_string(),
+                    },
+                    ModelAnimationClip {
+                        name: "walk".to_string(),
+                        psxanim_path: "assets/models/x/x_walk.psxanim".to_string(),
+                    },
+                ],
+                default_clip: Some(0),
+                preview_clip: Some(1),
+                world_height: 1280,
+            }),
+        );
+        let ron = project.to_ron_string().unwrap();
+        let restored = ProjectDocument::from_ron_str(&ron).unwrap();
+        assert_eq!(restored, project);
+        let resource = restored.resource(id).unwrap();
+        match &resource.data {
+            ResourceData::Model(m) => {
+                assert_eq!(m.clips.len(), 2);
+                assert_eq!(m.default_clip, Some(0));
+                assert_eq!(m.preview_clip, Some(1));
+                assert_eq!(m.world_height, 1280);
+                assert_eq!(m.effective_preview_clip(), Some(1));
+                assert_eq!(m.effective_runtime_clip(), Some(0));
+            }
+            _ => panic!("expected Model"),
+        }
+    }
+
+    #[test]
+    fn mesh_instance_with_animation_clip_roundtrips() {
+        let mut project = ProjectDocument::starter();
+        let scene = project.active_scene_mut();
+        let room_id = scene
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::Room { .. }))
+            .map(|n| n.id)
+            .unwrap();
+        let model_resource_id = ResourceId(99);
+        scene.add_node(
+            room_id,
+            "TestWraith",
+            NodeKind::MeshInstance {
+                mesh: Some(model_resource_id),
+                material: None,
+                animation_clip: Some(2),
+            },
+        );
+        let ron = project.to_ron_string().unwrap();
+        let restored = ProjectDocument::from_ron_str(&ron).unwrap();
+        assert_eq!(restored, project);
+        // Confirm the new field survives.
+        let surviving = restored
+            .active_scene()
+            .nodes()
+            .iter()
+            .find(|n| n.name == "TestWraith")
+            .unwrap();
+        assert!(matches!(
+            surviving.kind,
+            NodeKind::MeshInstance {
+                mesh: Some(_),
+                animation_clip: Some(2),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_mesh_instance_without_animation_clip_loads() {
+        // Synthesize the pre-extension MeshInstance shape — `animation_clip`
+        // missing — and confirm `#[serde(default)]` lands `None`.
+        let ron = r#"
+            (
+                name: "Legacy",
+                next_resource_id: 1,
+                resources: [],
+                scenes: [
+                    Scene(
+                        name: "Demo",
+                        next_node_id: 3,
+                        root: NodeId(1),
+                        nodes: [
+                            (
+                                id: NodeId(1),
+                                name: "Root",
+                                parent: None,
+                                children: [NodeId(2)],
+                                kind: Node3D,
+                                transform: (translation: (0.0, 0.0, 0.0), rotation_degrees: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                            ),
+                            (
+                                id: NodeId(2),
+                                name: "OldMesh",
+                                parent: Some(NodeId(1)),
+                                children: [],
+                                kind: MeshInstance(mesh: None, material: None),
+                                transform: (translation: (0.0, 0.0, 0.0), rotation_degrees: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                            ),
+                        ],
+                    ),
+                ],
+            )
+        "#;
+        let project = ProjectDocument::from_ron_str(ron).unwrap();
+        let mesh = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find(|n| n.name == "OldMesh")
+            .unwrap();
+        assert!(matches!(
+            mesh.kind,
+            NodeKind::MeshInstance {
+                mesh: None,
+                material: None,
+                animation_clip: None,
+            }
+        ));
     }
 
     #[test]

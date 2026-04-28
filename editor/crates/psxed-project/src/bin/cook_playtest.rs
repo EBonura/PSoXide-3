@@ -66,30 +66,59 @@ fn main() -> ExitCode {
             // cook_to_dir) and gives operators a quick read on
             // what landed in generated/.
             if let (Some(package), _) = build_package(&project, &project_root) {
-                let total_required_ram: usize = package.rooms.iter().map(|_| 1).sum();
-                let total_required_vram: usize = package
-                    .rooms
-                    .iter()
-                    .map(|r| {
-                        let first = r.material_first as usize;
-                        let count = r.material_count as usize;
-                        let mut seen: Vec<usize> = Vec::with_capacity(count);
-                        for m in &package.materials[first..first + count] {
-                            if !seen.contains(&m.texture_asset_index) {
-                                seen.push(m.texture_asset_index);
+                // Per-room residency counts: room world is
+                // always RAM-required; deduped texture assets
+                // (room materials + model atlases) are
+                // VRAM-required; model meshes + clips bump RAM.
+                let mut total_ram_refs: usize = 0;
+                let mut total_vram_refs: usize = 0;
+                for (i, r) in package.rooms.iter().enumerate() {
+                    let mut ram_seen: Vec<usize> = vec![r.world_asset_index];
+                    let mut vram_seen: Vec<usize> = Vec::new();
+                    let first = r.material_first as usize;
+                    let count = r.material_count as usize;
+                    for m in &package.materials[first..first + count] {
+                        if !vram_seen.contains(&m.texture_asset_index) {
+                            vram_seen.push(m.texture_asset_index);
+                        }
+                    }
+                    let i_u16 = i as u16;
+                    let mut seen_models: Vec<u16> = Vec::new();
+                    for inst in &package.model_instances {
+                        if inst.room != i_u16 || seen_models.contains(&inst.model) {
+                            continue;
+                        }
+                        seen_models.push(inst.model);
+                        let model = &package.models[inst.model as usize];
+                        if !ram_seen.contains(&model.mesh_asset_index) {
+                            ram_seen.push(model.mesh_asset_index);
+                        }
+                        if let Some(atlas) = model.texture_asset_index {
+                            if !vram_seen.contains(&atlas) {
+                                vram_seen.push(atlas);
                             }
                         }
-                        seen.len()
-                    })
-                    .sum();
+                        let cf = model.clip_first as usize;
+                        let cc = model.clip_count as usize;
+                        for clip in &package.model_clips[cf..cf + cc] {
+                            if !ram_seen.contains(&clip.animation_asset_index) {
+                                ram_seen.push(clip.animation_asset_index);
+                            }
+                        }
+                    }
+                    total_ram_refs += ram_seen.len();
+                    total_vram_refs += vram_seen.len();
+                }
                 println!(
-                    "[cook-playtest] Rooms: {}  Assets: {}  Textures: {}  Materials: {}  RAM residency refs: {}  VRAM residency refs: {}  Entities: {}",
+                    "[cook-playtest] Rooms: {}  Assets: {}  Textures: {}  Models: {}  Model instances: {}  Materials: {}  RAM residency refs: {}  VRAM residency refs: {}  Entities: {}",
                     package.rooms.len(),
                     package.assets.len(),
                     package.texture_asset_count(),
+                    package.models.len(),
+                    package.model_instances.len(),
                     package.materials.len(),
-                    total_required_ram,
-                    total_required_vram,
+                    total_ram_refs,
+                    total_vram_refs,
                     package.entities.len(),
                 );
             }

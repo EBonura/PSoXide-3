@@ -529,9 +529,11 @@ enum PlaceKind {
     PlayerSpawn,
     /// `SpawnPoint { player: false }`. Multiple OK.
     SpawnMarker,
-    /// `MeshInstance` with no resource yet — useful as a
-    /// physical entity placeholder during authoring.
-    EntityMarker,
+    /// `MeshInstance` referencing a [`ResourceData::Model`].
+    /// Place flow picks the selected Model resource if set,
+    /// auto-picks the only Model resource if exactly one
+    /// exists, or refuses with an actionable error otherwise.
+    ModelInstance,
     /// `Light` with default color / intensity / radius.
     LightMarker,
 }
@@ -541,7 +543,7 @@ impl PlaceKind {
         match self {
             Self::PlayerSpawn => "Player Spawn",
             Self::SpawnMarker => "Spawn",
-            Self::EntityMarker => "Entity",
+            Self::ModelInstance => "Model",
             Self::LightMarker => "Light",
         }
     }
@@ -568,6 +570,7 @@ enum ResourceFilter {
     All,
     Texture,
     Material,
+    Model,
     Mesh,
     Room,
     Other,
@@ -579,6 +582,7 @@ impl ResourceFilter {
             Self::All => "All Resources",
             Self::Texture => "Texture",
             Self::Material => "Material",
+            Self::Model => "Model",
             Self::Mesh => "Mesh",
             Self::Room => "Room",
             Self::Other => "Other",
@@ -590,6 +594,7 @@ impl ResourceFilter {
             Self::All => icons::LAYERS,
             Self::Texture => icons::PALETTE,
             Self::Material => icons::BLEND,
+            Self::Model => icons::BOX,
             Self::Mesh => icons::BOX,
             Self::Room => icons::GRID,
             Self::Other => icons::FILE,
@@ -601,6 +606,7 @@ impl ResourceFilter {
             Self::All => true,
             Self::Texture => matches!(data, ResourceData::Texture { .. }),
             Self::Material => matches!(data, ResourceData::Material(_)),
+            Self::Model => matches!(data, ResourceData::Model(_)),
             Self::Mesh => matches!(data, ResourceData::Mesh { .. }),
             Self::Room => matches!(data, ResourceData::Scene { .. }),
             Self::Other => matches!(
@@ -1865,18 +1871,38 @@ impl EditorWorkspace {
                     }
                 }
             }
-            let (default_name, node_kind) = match kind {
-                PlaceKind::PlayerSpawn => ("Player Spawn", NodeKind::SpawnPoint { player: true }),
-                PlaceKind::SpawnMarker => ("Spawn", NodeKind::SpawnPoint { player: false }),
-                PlaceKind::EntityMarker => (
-                    "Entity",
-                    NodeKind::MeshInstance {
-                        mesh: None,
-                        material: None,
-                    },
+            let (default_name, node_kind): (String, NodeKind) = match kind {
+                PlaceKind::PlayerSpawn => (
+                    "Player Spawn".to_string(),
+                    NodeKind::SpawnPoint { player: true },
                 ),
+                PlaceKind::SpawnMarker => (
+                    "Spawn".to_string(),
+                    NodeKind::SpawnPoint { player: false },
+                ),
+                PlaceKind::ModelInstance => {
+                    // Resolve which Model resource to bind. Order:
+                    // (a) user has a Model selected in the resource
+                    //     panel — use it; (b) exactly one Model
+                    //     resource exists project-wide — auto-pick;
+                    //     (c) refuse with an actionable status.
+                    match self.resolve_place_model_resource() {
+                        Ok((model_id, name)) => (
+                            name,
+                            NodeKind::MeshInstance {
+                                mesh: Some(model_id),
+                                material: None,
+                                animation_clip: None,
+                            },
+                        ),
+                        Err(message) => {
+                            self.status = message;
+                            return;
+                        }
+                    }
+                }
                 PlaceKind::LightMarker => (
-                    "Light",
+                    "Light".to_string(),
                     NodeKind::Light {
                         color: [255, 240, 200],
                         intensity: 1.0,
@@ -3579,6 +3605,11 @@ impl EditorWorkspace {
             .resource(id)
             .and_then(|resource| self.texture_thumb_entry(resource))
             .map(|entry| (entry.handle.id(), entry.stats));
+        // Snapshot project_dir for path resolution inside the
+        // model inspector (parses .psxmdl / .psxanim for live
+        // stats display). Cloned so the mutable resource borrow
+        // below doesn't fight `&self.project_dir`.
+        let project_root = self.project_dir.clone();
         let texture_options: Vec<(ResourceId, String)> = self
             .project
             .resources
@@ -3663,6 +3694,9 @@ impl EditorWorkspace {
                             draw_psxt_stats(ui, stats);
                         });
                 }
+            }
+            ResourceData::Model(model) => {
+                changed |= draw_model_resource_editor(ui, model, &project_root, preview_thumb);
             }
             ResourceData::Mesh { source_path }
             | ResourceData::Scene { source_path }
@@ -3751,12 +3785,21 @@ impl EditorWorkspace {
         let project_root = self.project_dir.clone();
         let mut alive: Vec<ResourceId> = Vec::new();
         for resource in self.project.resources.iter() {
-            let ResourceData::Texture { psxt_path } = &resource.data else {
-                continue;
+            // Texture resources point straight at a `.psxt`;
+            // Model resources have a `texture_path` field — both
+            // share the same on-disk format and decoder, so the
+            // thumbnail cache treats them uniformly.
+            let psxt_path: &str = match &resource.data {
+                ResourceData::Texture { psxt_path } => psxt_path.as_str(),
+                ResourceData::Model(model) => match &model.texture_path {
+                    Some(p) => p.as_str(),
+                    None => continue,
+                },
+                _ => continue,
             };
             alive.push(resource.id);
             if let Some(entry) = self.texture_thumbs.get(&resource.id) {
-                if entry.signature == *psxt_path {
+                if entry.signature == psxt_path {
                     continue;
                 }
             }
@@ -3784,7 +3827,7 @@ impl EditorWorkspace {
             self.texture_thumbs.insert(
                 resource.id,
                 ThumbnailEntry {
-                    signature: psxt_path.clone(),
+                    signature: psxt_path.to_string(),
                     handle,
                     stats,
                 },
@@ -4139,10 +4182,43 @@ impl EditorWorkspace {
         for kind in [
             PlaceKind::PlayerSpawn,
             PlaceKind::SpawnMarker,
-            PlaceKind::EntityMarker,
+            PlaceKind::ModelInstance,
             PlaceKind::LightMarker,
         ] {
             ui.selectable_value(&mut self.place_kind, kind, kind.label());
+        }
+    }
+
+    /// Pick the Model resource a `PlaceKind::ModelInstance` click
+    /// should bind to. Returns `(id, default_node_name)` on
+    /// success or an actionable status message on failure. The
+    /// caller renders the failure into `self.status` and skips
+    /// the place altogether — never silently substitutes a
+    /// generic marker.
+    fn resolve_place_model_resource(&self) -> Result<(ResourceId, String), String> {
+        // (a) Selected resource is a Model? Use it.
+        if let Some(id) = self.selected_resource {
+            if let Some(resource) = self.project.resource(id) {
+                if matches!(resource.data, ResourceData::Model(_)) {
+                    return Ok((id, resource.name.clone()));
+                }
+            }
+        }
+        // (b) Exactly one Model resource? Auto-pick.
+        let models: Vec<&Resource> = self
+            .project
+            .resources
+            .iter()
+            .filter(|r| matches!(r.data, ResourceData::Model(_)))
+            .collect();
+        match models.len() {
+            0 => Err(
+                "No Model resources exist. Register or import a model first.".to_string(),
+            ),
+            1 => Ok((models[0].id, models[0].name.clone())),
+            n => Err(format!(
+                "Select a Model resource before placing a model ({n} available)"
+            )),
         }
     }
 
@@ -4701,7 +4777,11 @@ fn draw_node_kind_editor(
                 .checkbox(&mut grid.fog_enabled, icons::label(icons::SCAN, "Fog"))
                 .changed();
         }
-        NodeKind::MeshInstance { mesh, material } => {
+        NodeKind::MeshInstance {
+            mesh,
+            material,
+            animation_clip,
+        } => {
             ui.horizontal(|ui| {
                 ui.label(icons::text(icons::BOX, 12.0).color(STUDIO_TEXT_WEAK));
                 ui.label(match mesh {
@@ -4713,6 +4793,34 @@ fn draw_node_kind_editor(
             // Same `material_picker` the face inspector uses, so
             // the `→` jump button is available here too.
             changed |= material_picker(ui, "Material", material, material_options, nav_target);
+            // Animation clip override: shown as a numeric DragValue
+            // for now — the model-aware inspector with clip names
+            // and a scrubber lives in the model UI pass. `None`
+            // means "inherit Model::default_clip".
+            ui.horizontal(|ui| {
+                ui.label("Animation clip");
+                let mut current = animation_clip.map(|i| i as i32).unwrap_or(-1);
+                let response = ui.add(
+                    egui::DragValue::new(&mut current)
+                        .speed(0.1)
+                        .range(-1..=255)
+                        .custom_formatter(|n, _| {
+                            if n < 0.0 {
+                                "default".to_string()
+                            } else {
+                                format!("{}", n as i32)
+                            }
+                        }),
+                );
+                if response.changed() {
+                    *animation_clip = if current < 0 {
+                        None
+                    } else {
+                        Some(current as u16)
+                    };
+                    changed = true;
+                }
+            });
         }
         NodeKind::Light {
             color,
@@ -5002,6 +5110,306 @@ fn draw_psxt_stats(ui: &mut egui::Ui, stats: PsxtStats) {
         row(ui, "CLUT data", human_bytes(stats.clut_bytes));
     }
     row(ui, "File total", human_bytes(stats.file_bytes));
+}
+
+/// Inspector for a [`ResourceData::Model`]. Lets the user edit
+/// the model + atlas paths, manage the clip list, choose
+/// preview / default clips, and view parsed model + clip
+/// statistics.
+fn draw_model_resource_editor(
+    ui: &mut egui::Ui,
+    model: &mut psxed_project::ModelResource,
+    project_root: &Path,
+    preview_thumb: Option<(egui::TextureId, PsxtStats)>,
+) -> bool {
+    let mut changed = false;
+
+    // Atlas thumbnail block: same panel the Texture inspector
+    // uses, but driven from `model.texture_path` via the shared
+    // thumbnail cache that already learned about Model atlases.
+    if preview_thumb.is_some() {
+        draw_psxt_preview_block(ui, preview_thumb);
+    }
+
+    egui::CollapsingHeader::new(icons::label(icons::BOX, "Model"))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label("Cooked .psxmdl path");
+            changed |= ui.text_edit_singleline(&mut model.model_path).changed();
+
+            ui.add_space(4.0);
+            ui.label("Atlas .psxt path (optional)");
+            let mut atlas = model.texture_path.clone().unwrap_or_default();
+            let atlas_response = ui.text_edit_singleline(&mut atlas);
+            if atlas_response.changed() {
+                model.texture_path = if atlas.is_empty() { None } else { Some(atlas) };
+                changed = true;
+            }
+
+            ui.add_space(4.0);
+            ui.label("World height (engine units)");
+            let mut h = model.world_height as i32;
+            let h_response = ui.add(egui::DragValue::new(&mut h).speed(8.0).range(0..=4096));
+            if h_response.changed() {
+                model.world_height = h.clamp(0, u16::MAX as i32) as u16;
+                changed = true;
+            }
+        });
+
+    // Live-parse the model + clips for stats. Cheap on every
+    // inspector frame for the model sizes this editor targets;
+    // a cache lands when authoring scales beyond that.
+    let model_path = psxed_project::model_import::resolve_path(&model.model_path, Some(project_root));
+    let model_stats = std::fs::read(&model_path)
+        .ok()
+        .and_then(|b| psxed_project::model_import::model_stats_from_bytes(&b).ok());
+    if let Some(stats) = &model_stats {
+        egui::CollapsingHeader::new(icons::label(icons::SCAN, "Stats"))
+            .default_open(true)
+            .show(ui, |ui| {
+                let row = |ui: &mut egui::Ui, key: &str, value: String| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(key).color(STUDIO_TEXT_WEAK));
+                        ui.label(RichText::new(value).monospace());
+                    });
+                };
+                row(ui, "Joints", format!("{}", stats.joint_count));
+                row(ui, "Parts", format!("{}", stats.part_count));
+                row(ui, "Vertices", format!("{}", stats.vertex_count));
+                row(ui, "Faces", format!("{}", stats.face_count));
+                row(ui, "Materials", format!("{}", stats.material_count));
+                row(
+                    ui,
+                    "Atlas (header)",
+                    format!("{}×{}", stats.texture_width, stats.texture_height),
+                );
+                row(
+                    ui,
+                    "Bounds X",
+                    format!("{}..{}", stats.bounds_min[0], stats.bounds_max[0]),
+                );
+                row(
+                    ui,
+                    "Bounds Y",
+                    format!("{}..{}", stats.bounds_min[1], stats.bounds_max[1]),
+                );
+                row(
+                    ui,
+                    "Bounds Z",
+                    format!("{}..{}", stats.bounds_min[2], stats.bounds_max[2]),
+                );
+                row(ui, "Model bytes", format!("{}", stats.model_bytes));
+            });
+    } else if !model.model_path.is_empty() {
+        ui.colored_label(
+            Color32::from_rgb(220, 120, 100),
+            format!("Failed to parse model at {}", model_path.display()),
+        );
+    }
+
+    egui::CollapsingHeader::new(icons::label(icons::PLAY, "Animation Clips"))
+        .default_open(true)
+        .show(ui, |ui| {
+            // Walk a copy of the indices so we can offer add /
+            // remove buttons without confusing the borrow checker.
+            let mut to_remove: Option<usize> = None;
+            for (i, clip) in model.clips.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("#{i}")).color(STUDIO_TEXT_WEAK));
+                    if ui.text_edit_singleline(&mut clip.name).changed() {
+                        changed = true;
+                    }
+                    if ui.small_button(icons::label(icons::TRASH, "")).clicked() {
+                        to_remove = Some(i);
+                    }
+                });
+                ui.label(RichText::new("Path").color(STUDIO_TEXT_WEAK).small());
+                if ui.text_edit_singleline(&mut clip.psxanim_path).changed() {
+                    changed = true;
+                }
+                // Inline per-clip stats: parse on the fly. Joint
+                // mismatch is the most actionable thing to surface
+                // — the cooker rejects the bundle if it persists.
+                if let Some(model_stats) = &model_stats {
+                    let clip_path = psxed_project::model_import::resolve_path(
+                        &clip.psxanim_path,
+                        Some(project_root),
+                    );
+                    if let Ok(bytes) = std::fs::read(&clip_path) {
+                        match psxed_project::model_import::animation_stats_from_bytes(
+                            &clip.name,
+                            &bytes,
+                            model_stats.joint_count,
+                        ) {
+                            Ok(stats) => {
+                                let label = format!(
+                                    "{} frames @ {} Hz, {} joints",
+                                    stats.frame_count, stats.sample_rate_hz, stats.joint_count,
+                                );
+                                if stats.valid_for_model {
+                                    ui.label(
+                                        RichText::new(label).color(STUDIO_TEXT_WEAK).small(),
+                                    );
+                                } else {
+                                    ui.colored_label(
+                                        Color32::from_rgb(220, 160, 80),
+                                        format!(
+                                            "{label} — joint mismatch (model {})",
+                                            model_stats.joint_count
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                ui.colored_label(
+                                    Color32::from_rgb(220, 120, 100),
+                                    format!("parse failed: {e}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                ui.add_space(2.0);
+            }
+            if let Some(i) = to_remove {
+                model.clips.remove(i);
+                // Drop indices that referenced the removed clip
+                // or anything past it so they stay valid.
+                if let Some(d) = model.default_clip {
+                    model.default_clip = match (d as usize).cmp(&i) {
+                        std::cmp::Ordering::Less => Some(d),
+                        std::cmp::Ordering::Equal => None,
+                        std::cmp::Ordering::Greater => Some(d.saturating_sub(1)),
+                    };
+                }
+                if let Some(p) = model.preview_clip {
+                    model.preview_clip = match (p as usize).cmp(&i) {
+                        std::cmp::Ordering::Less => Some(p),
+                        std::cmp::Ordering::Equal => None,
+                        std::cmp::Ordering::Greater => Some(p.saturating_sub(1)),
+                    };
+                }
+                changed = true;
+            }
+            if ui
+                .button(icons::label(icons::PLUS, "Add clip"))
+                .clicked()
+            {
+                model.clips.push(psxed_project::ModelAnimationClip {
+                    name: format!("clip_{}", model.clips.len()),
+                    psxanim_path: String::new(),
+                });
+                changed = true;
+            }
+
+            ui.separator();
+            changed |= clip_picker(ui, "Default clip", &mut model.default_clip, &model.clips);
+            changed |= clip_picker(ui, "Preview clip", &mut model.preview_clip, &model.clips);
+        });
+
+    egui::CollapsingHeader::new(icons::label(icons::PLAY, "Animation Clips"))
+        .default_open(true)
+        .show(ui, |ui| {
+            // Walk a copy of the indices so we can offer add /
+            // remove buttons without confusing the borrow checker.
+            let mut to_remove: Option<usize> = None;
+            for (i, clip) in model.clips.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("#{i}")).color(STUDIO_TEXT_WEAK));
+                    if ui.text_edit_singleline(&mut clip.name).changed() {
+                        changed = true;
+                    }
+                    if ui.small_button(icons::label(icons::TRASH, "")).clicked() {
+                        to_remove = Some(i);
+                    }
+                });
+                ui.label(RichText::new("Path").color(STUDIO_TEXT_WEAK).small());
+                if ui.text_edit_singleline(&mut clip.psxanim_path).changed() {
+                    changed = true;
+                }
+                ui.add_space(2.0);
+            }
+            if let Some(i) = to_remove {
+                model.clips.remove(i);
+                // Drop indices that referenced the removed clip
+                // or anything past it so they stay valid.
+                if let Some(d) = model.default_clip {
+                    model.default_clip = match (d as usize).cmp(&i) {
+                        std::cmp::Ordering::Less => Some(d),
+                        std::cmp::Ordering::Equal => None,
+                        std::cmp::Ordering::Greater => Some(d.saturating_sub(1)),
+                    };
+                }
+                if let Some(p) = model.preview_clip {
+                    model.preview_clip = match (p as usize).cmp(&i) {
+                        std::cmp::Ordering::Less => Some(p),
+                        std::cmp::Ordering::Equal => None,
+                        std::cmp::Ordering::Greater => Some(p.saturating_sub(1)),
+                    };
+                }
+                changed = true;
+            }
+            if ui
+                .button(icons::label(icons::PLUS, "Add clip"))
+                .clicked()
+            {
+                model.clips.push(psxed_project::ModelAnimationClip {
+                    name: format!("clip_{}", model.clips.len()),
+                    psxanim_path: String::new(),
+                });
+                changed = true;
+            }
+
+            ui.separator();
+            changed |= clip_picker(ui, "Default clip", &mut model.default_clip, &model.clips);
+            changed |= clip_picker(ui, "Preview clip", &mut model.preview_clip, &model.clips);
+        });
+
+    changed
+}
+
+/// Combo-box picker for a clip index. `None` means "unset" and
+/// shows as `(none)`.
+fn clip_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    current: &mut Option<u16>,
+    clips: &[psxed_project::ModelAnimationClip],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(STUDIO_TEXT_WEAK));
+        let preview = match *current {
+            Some(i) => clips
+                .get(i as usize)
+                .map(|c| c.name.as_str())
+                .unwrap_or("(invalid)")
+                .to_string(),
+            None => "(none)".to_string(),
+        };
+        egui::ComboBox::from_id_salt(label)
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(current.is_none(), "(none)")
+                    .clicked()
+                {
+                    *current = None;
+                    changed = true;
+                }
+                for (i, clip) in clips.iter().enumerate() {
+                    let label = format!("{}: {}", i, clip.name);
+                    if ui
+                        .selectable_label(*current == Some(i as u16), label)
+                        .clicked()
+                    {
+                        *current = Some(i as u16);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    changed
 }
 
 /// Combo-box picker for a Material's linked texture. `current` is
@@ -5415,6 +5823,7 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 8] {
             NodeKind::MeshInstance {
                 mesh: None,
                 material: None,
+                animation_clip: None,
             },
         ),
         (
@@ -5509,6 +5918,7 @@ fn project_filesystem_rows(project: &ProjectDocument) -> Vec<ProjectFileRow> {
 
     push_resource_folder(project, &mut rows, "materials", ResourceFilter::Material);
     push_resource_folder(project, &mut rows, "textures", ResourceFilter::Texture);
+    push_resource_folder(project, &mut rows, "models", ResourceFilter::Model);
     push_resource_folder(project, &mut rows, "meshes", ResourceFilter::Mesh);
     push_resource_folder(project, &mut rows, "spawns", ResourceFilter::Other);
     rows
@@ -5574,6 +5984,7 @@ fn resource_file_name(resource: &Resource) -> String {
             cooked_name(&resource.name, psxt_path, "psxt")
         }
         ResourceData::Material(_) => cooked_name(&resource.name, "", "mat"),
+        ResourceData::Model(model) => cooked_name(&resource.name, &model.model_path, "psxmdl"),
         ResourceData::Mesh { source_path } => cooked_name(&resource.name, source_path, "psxmesh"),
         ResourceData::Scene { source_path } => cooked_name(&resource.name, source_path, "room"),
         ResourceData::Script { source_path } => cooked_name(&resource.name, source_path, "script"),
@@ -5605,9 +6016,10 @@ fn snake_name(name: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
-fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize); 5] {
+fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize); 6] {
     let mut texture = 0;
     let mut material = 0;
+    let mut model = 0;
     let mut mesh = 0;
     let mut room = 0;
     let mut other = 0;
@@ -5615,6 +6027,7 @@ fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize)
         match &resource.data {
             ResourceData::Texture { .. } => texture += 1,
             ResourceData::Material(_) => material += 1,
+            ResourceData::Model(_) => model += 1,
             ResourceData::Mesh { .. } => mesh += 1,
             ResourceData::Scene { .. } => room += 1,
             ResourceData::Script { .. } | ResourceData::Audio { .. } => other += 1,
@@ -5623,6 +6036,7 @@ fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize)
     [
         (ResourceFilter::Texture, texture),
         (ResourceFilter::Material, material),
+        (ResourceFilter::Model, model),
         (ResourceFilter::Mesh, mesh),
         (ResourceFilter::Room, room),
         (ResourceFilter::Other, other),
@@ -5645,6 +6059,7 @@ fn resource_matches_filter(resource: &Resource, filter: ResourceFilter, search: 
 fn resource_source_path(resource: &Resource) -> Option<&str> {
     match &resource.data {
         ResourceData::Texture { psxt_path } => Some(psxt_path.as_str()),
+        ResourceData::Model(model) => Some(model.model_path.as_str()),
         ResourceData::Mesh { source_path }
         | ResourceData::Scene { source_path }
         | ResourceData::Script { source_path }
@@ -5657,6 +6072,7 @@ fn resource_lucide_icon(data: &ResourceData) -> char {
     match data {
         ResourceData::Texture { .. } => icons::PALETTE,
         ResourceData::Material(_) => icons::BLEND,
+        ResourceData::Model(_) => icons::BOX,
         ResourceData::Mesh { .. } => icons::BOX,
         ResourceData::Scene { .. } => icons::GRID,
         ResourceData::Script { .. } => icons::FILE,
@@ -5672,6 +6088,7 @@ fn resource_lucide_color(data: &ResourceData, selected: bool) -> Color32 {
     match data {
         ResourceData::Texture { .. } => Color32::from_rgb(163, 182, 198),
         ResourceData::Material(_) => Color32::from_rgb(208, 112, 162),
+        ResourceData::Model(_) => Color32::from_rgb(186, 178, 124),
         ResourceData::Mesh { .. } => Color32::from_rgb(156, 174, 190),
         ResourceData::Scene { .. } => Color32::from_rgb(209, 118, 71),
         ResourceData::Script { .. } => Color32::from_rgb(188, 176, 104),
@@ -6037,6 +6454,7 @@ fn resource_preview_color(resource: &Resource) -> Color32 {
         match &resource.data {
             ResourceData::Texture { .. } => Color32::from_rgb(92, 116, 140),
             ResourceData::Material(_) => Color32::from_rgb(120, 92, 135),
+            ResourceData::Model(_) => Color32::from_rgb(140, 124, 96),
             ResourceData::Mesh { .. } => Color32::from_rgb(110, 120, 130),
             ResourceData::Scene { .. } => Color32::from_rgb(92, 130, 106),
             ResourceData::Script { .. } => Color32::from_rgb(128, 126, 80),
@@ -6049,6 +6467,7 @@ fn resource_detail(resource: &Resource) -> &'static str {
     match &resource.data {
         ResourceData::Texture { .. } => "Texture - 4bpp",
         ResourceData::Material(_) => "Material - 4bpp",
+        ResourceData::Model(_) => "Model",
         ResourceData::Mesh { .. } => "Mesh",
         ResourceData::Scene { .. } => "Room",
         ResourceData::Script { .. } => "Script",

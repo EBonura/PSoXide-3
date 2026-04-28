@@ -43,8 +43,15 @@ pub struct AssetId(pub u16);
 pub enum AssetKind {
     /// Cooked `.psxw` room blob.
     RoomWorld,
-    /// Cooked `.psxt` texture blob.
+    /// Cooked `.psxt` texture blob (room material atlas, model
+    /// atlas, etc — any cooked indexed-colour PSX texture).
     Texture,
+    /// Cooked `.psxmdl` animated/static model blob, bound to a
+    /// model atlas asset and any number of clip assets.
+    ModelMesh,
+    /// Cooked `.psxanim` skeletal animation clip — references
+    /// joint count + frames matching its owning model.
+    ModelAnimation,
 }
 
 /// One asset in the master table. The byte slice is the live
@@ -197,6 +204,75 @@ pub struct EntityRecord {
     /// Reserved.
     pub flags: u16,
 }
+
+/// One animation clip bound to a [`LevelModelRecord`]. The clip
+/// asset's joint count is checked against the owning model's
+/// joint count at cook time; runtime trusts the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelModelClipRecord {
+    /// Owning model index in [`LevelModelRecord`] order.
+    pub model: u16,
+    /// Display name — surfaces in editor logs / debug HUDs.
+    pub name: &'static str,
+    /// Cooked `.psxanim` asset.
+    pub animation_asset: AssetId,
+}
+
+/// One cooked PSX model: `.psxmdl` mesh, optional `.psxt`
+/// atlas, and a slice of clips. Instances reference this record
+/// by index via [`LevelModelInstanceRecord::model`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelModelRecord {
+    /// Display name.
+    pub name: &'static str,
+    /// Cooked `.psxmdl` asset.
+    pub mesh_asset: AssetId,
+    /// Atlas texture asset, if the model carries one. Models
+    /// without atlases render flat-shaded at runtime — the
+    /// editor refuses to cook untextured models for now.
+    pub texture_asset: Option<AssetId>,
+    /// First index into the global `MODEL_CLIPS` table.
+    pub clip_first: u16,
+    /// Number of clips in this model's slice.
+    pub clip_count: u16,
+    /// Default clip index *within this model's slice* — runtime
+    /// instances with no per-instance override pick this clip.
+    /// Out-of-range = "play bind pose".
+    pub default_clip: u16,
+    /// Suggested world-space height (engine units) — mirrors
+    /// the `.psxmdl` header's `local_to_world` hint.
+    pub world_height: u16,
+    /// Reserved.
+    pub flags: u16,
+}
+
+/// One placed model instance. Coordinates are room-local
+/// engine units. `clip` is an index into the owning model's
+/// clip slice; `0xFFFF` means "use the model's `default_clip`".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelModelInstanceRecord {
+    /// Owning room index.
+    pub room: u16,
+    /// Model index in [`LevelModelRecord`] order.
+    pub model: u16,
+    /// Per-instance clip override, or `0xFFFF` to inherit the
+    /// model's `default_clip`.
+    pub clip: u16,
+    /// Room-local X.
+    pub x: i32,
+    /// Y.
+    pub y: i32,
+    /// Room-local Z.
+    pub z: i32,
+    /// Yaw, PSX angle units.
+    pub yaw: i16,
+    /// Reserved.
+    pub flags: u16,
+}
+
+/// Sentinel for [`LevelModelInstanceRecord::clip`] meaning
+/// "inherit model default".
+pub const MODEL_CLIP_INHERIT: u16 = 0xFFFF;
 
 /// Linear scan over the master asset table. `O(n)` is fine for
 /// the asset counts this pass targets (few rooms × handful of

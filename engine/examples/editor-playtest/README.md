@@ -94,13 +94,26 @@ From a fresh clone:
 ## Scope
 
 This is a vertical slice. It uses `.psxw` v1, has no collision,
-no portal traversal, no CD streaming, and no entity scripting.
-Lights / Triggers / Portals / AudioSources surface as warnings
-during cook and are skipped from the runtime manifest.
+no portal traversal, no CD streaming, no enemies, no AI, no
+lights, and no entity scripting. Lights / Triggers / Portals /
+AudioSources surface as warnings during cook and are skipped
+from the runtime manifest.
 
-The renderer is `psx_engine::draw_room`. Material slots come
-from generated `MATERIALS` records — no hardcoded
-floor.psxt / brick-wall.psxt path remains in this example.
+What it *does* render:
+
+- **Rooms** via `psx_engine::draw_room`. Material slots come
+  from generated `MATERIALS` records — no hardcoded
+  floor.psxt / brick-wall.psxt path remains.
+- **Animated model instances** via the same
+  `WorldRenderPass::submit_textured_model` path
+  `showcase-model` uses. Each `MeshInstance` whose `mesh`
+  references a `ResourceData::Model` produces a
+  `LevelModelInstanceRecord`; the runtime parses the cooked
+  `.psxmdl` + `.psxt` + `.psxanim`, uploads the atlas, and
+  draws the textured animated model. See
+  [`docs/editor-model-authoring.md`](../../../docs/editor-model-authoring.md).
+- **Entity markers** for legacy `MeshInstance` nodes that
+  don't reference a Model (debug cubes, same as before).
 
 ## Files
 
@@ -110,6 +123,8 @@ floor.psxt / brick-wall.psxt path remains in this example.
 - `generated/level_manifest.rs` — generated; do not edit.
 - `generated/rooms/*.psxw` — generated; do not edit; gitignored.
 - `generated/textures/*.psxt` — generated; do not edit; gitignored.
+- `generated/models/model_NNN_*/` — per-model folders carrying
+  cooked `.psxmdl` + `.psxt` + `.psxanim`; do not edit; gitignored.
 
 ## See also
 

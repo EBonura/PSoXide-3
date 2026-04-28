@@ -28,9 +28,10 @@
 
 extern crate psx_rt;
 
-use psx_asset::{Texture, World as AssetWorld};
+use psx_asset::{Animation, Model, Texture, World as AssetWorld};
 use psx_engine::{
-    button, draw_room, App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena,
+    button, draw_room, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange,
+    JointViewTransform, OtFrame, PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex,
     RuntimeRoom, Scene, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions,
     WorldTriCommand, WorldVertex,
 };
@@ -38,7 +39,7 @@ use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_gte::transform::{cos_1_3_12, sin_1_3_12};
 use psx_level::{
     find_asset_of_kind, AssetId, AssetKind, EntityRecord, LevelMaterialRecord, LevelRoomRecord,
-    ResidencyManager,
+    ResidencyManager, MODEL_CLIP_INHERIT,
 };
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
@@ -49,18 +50,34 @@ mod generated {
     include!("../generated/level_manifest.rs");
 }
 
-use generated::{ASSETS, ENTITIES, MATERIALS, PLAYER_SPAWN, ROOMS, ROOM_RESIDENCY};
+use generated::{
+    ASSETS, ENTITIES, MATERIALS, MODELS, MODEL_CLIPS, MODEL_INSTANCES, PLAYER_SPAWN, ROOMS,
+    ROOM_RESIDENCY,
+};
 
-// VRAM layout. We reserve one tpage at (640, 0) for textured
-// materials and stripe textures left-to-right inside it. Each
-// material gets one CLUT row above the framebuffer (y >= 480).
-// Both ranges are deliberately generous for the per-room cap of
-// `MAX_ROOM_MATERIALS`.
+// VRAM layout. Room materials and model atlases live in
+// disjoint regions so a model atlas upload never overwrites a
+// room texture (and vice versa).
+//
+// Room materials: 4bpp tpage at (640, 0); stripe textures
+// left-to-right; one CLUT row per material at y >= 480.
+//
+// Model atlases: 8bpp tpage at (384, 256); stripe atlases
+// left-to-right (each atlas occupies its own halfword stride);
+// one CLUT row per atlas at y starting at 484 (below the
+// material CLUT band so the two never collide).
 const SHARED_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
 const TPAGE_WORD: u16 = SHARED_TPAGE.uv_tpage_word(0);
-/// First CLUT row used by uploaded textures. Row N below this
-/// belongs to material N's CLUT.
+/// First CLUT row used by room material textures. Row N below
+/// this belongs to material N's CLUT.
 const CLUT_BASE_Y: u16 = 480;
+
+const MODEL_TPAGE: Tpage = Tpage::new(384, 256, TexDepth::Bit8);
+const MODEL_TPAGE_WORD: u16 = MODEL_TPAGE.uv_tpage_word(0);
+/// First CLUT row used by model atlases. 256-entry CLUTs span
+/// y..y+1 only; we step one row down per uploaded atlas, so
+/// `MODEL_CLUT_BASE_Y - n` is the row for the n-th atlas.
+const MODEL_CLUT_BASE_Y: u16 = 484;
 
 const SCREEN_CX: i16 = 160;
 const SCREEN_CY: i16 = 120;
@@ -96,10 +113,22 @@ const MAX_TEXTURED_TRIS: usize = 4096;
 /// the cook report should also flag.
 const MAX_ROOM_MATERIALS: usize = 32;
 
-/// Capacity of the residency manager's RAM table.
-const MAX_RESIDENT_RAM_ASSETS: usize = 64;
-/// Capacity of the residency manager's VRAM table.
+/// Capacity of the residency manager's RAM table. Holds room
+/// world + model meshes + animation clips.
+const MAX_RESIDENT_RAM_ASSETS: usize = 128;
+/// Capacity of the residency manager's VRAM table. Holds room
+/// material atlases + model atlases.
 const MAX_RESIDENT_VRAM_ASSETS: usize = 32;
+
+/// Per-frame projected-vertex scratch for the model renderer.
+/// Sized to the largest part vertex count we expect; instances
+/// over this cap drop their over-budget triangles graceful.
+const MODEL_VERTEX_CAP: usize = 1024;
+/// Joint-transform scratch — all biped rigs we currently cook
+/// fit comfortably in 32.
+const JOINT_CAP: usize = 32;
+/// Cap on placed model instances rendered per frame.
+const MAX_MODEL_INSTANCES: usize = 16;
 
 /// Marker visualization tuning. Markers are debug stubs — keep
 /// them visible at orbit-camera scales without dominating the
@@ -121,6 +150,10 @@ static mut TEXTURED_TRIS: [TriTextured; MAX_TEXTURED_TRIS] =
     [const { TRI_ZERO }; MAX_TEXTURED_TRIS];
 static mut WORLD_COMMANDS: [WorldTriCommand; MAX_TEXTURED_TRIS] =
     [WorldTriCommand::EMPTY; MAX_TEXTURED_TRIS];
+static mut MODEL_VERTICES: [ProjectedTexturedVertex; MODEL_VERTEX_CAP] =
+    [ProjectedTexturedVertex::new(ProjectedVertex::new(0, 0, 0), 0, 0); MODEL_VERTEX_CAP];
+static mut JOINT_VIEW_TRANSFORMS: [JointViewTransform; JOINT_CAP] =
+    [JointViewTransform::ZERO; JOINT_CAP];
 
 /// Residency manager — tracks which AssetIds are RAM/VRAM
 /// resident across frames. Static so it survives across the
@@ -144,9 +177,19 @@ static mut VRAM_SLOTS: [Option<VramSlot>; MAX_RESIDENT_VRAM_ASSETS] =
     [VRAM_SLOT_EMPTY; MAX_RESIDENT_VRAM_ASSETS];
 /// Number of VRAM slots used so far (next CLUT row + tpage cursor).
 static mut VRAM_SLOT_COUNT: usize = 0;
-/// Tpage X cursor (in halfwords). Each uploaded texture advances
-/// it by `halfwords_per_row`.
+/// Tpage X cursor (in halfwords) for the room-material 4bpp
+/// region. Each uploaded room texture advances it by
+/// `halfwords_per_row`.
 static mut TPAGE_X_CURSOR: u16 = 0;
+
+/// Tpage X cursor (in halfwords) for the model-atlas 8bpp
+/// region. Distinct cursor so room-material uploads don't shift
+/// model atlas positions and vice versa.
+static mut MODEL_TPAGE_X_CURSOR: u16 = 0;
+/// Number of model atlases uploaded so far. Doubles as the
+/// CLUT row offset: each 8bpp atlas needs a fresh 256-entry
+/// CLUT row.
+static mut MODEL_ATLAS_COUNT: usize = 0;
 
 struct Playtest {
     /// Active room. `None` until `init` runs and only `Some`
@@ -272,7 +315,7 @@ impl Scene for Playtest {
         }
     }
 
-    fn render(&mut self, _ctx: &mut Ctx) {
+    fn render(&mut self, ctx: &mut Ctx) {
         let camera = if self.free_orbit {
             WorldCamera::orbit_yaw(
                 PROJECTION,
@@ -319,6 +362,17 @@ impl Scene for Playtest {
                 &mut world,
             );
             draw_entity_markers(ENTITIES, materials, &camera, options, &mut triangles, &mut world);
+            // Currently just room 0; future passes wire room
+            // switching to a level-graph traversal.
+            draw_model_instances(
+                0,
+                ctx.time.elapsed_vblanks(),
+                ctx.time.video_hz(),
+                &camera,
+                options,
+                &mut triangles,
+                &mut world,
+            );
         }
 
         world.flush();
@@ -427,6 +481,180 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
     }
 
     Some(slot)
+}
+
+/// Upload an 8bpp model atlas to the dedicated model VRAM
+/// region. Returns a `VramSlot` carrying the 8bpp tpage word
+/// and the atlas's CLUT word. Reuses an existing slot when the
+/// asset's already resident.
+///
+/// Caller is responsible for confirming `asset_bytes` parses as
+/// a `Texture` whose CLUT carries 256 entries (8bpp). Anything
+/// else returns `None`.
+fn ensure_model_atlas_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<VramSlot> {
+    if unsafe { RESIDENCY.contains_vram(asset_id) } {
+        return unsafe {
+            VRAM_SLOTS
+                .iter()
+                .filter_map(|s| *s)
+                .find(|s| s.asset == asset_id)
+        };
+    }
+    let texture = Texture::from_bytes(asset_bytes).ok()?;
+    if texture.clut_entries() != 256 {
+        // Only 8bpp atlases supported — 4bpp model atlases
+        // would round-trip through `ensure_texture_uploaded`.
+        return None;
+    }
+
+    let count = unsafe { VRAM_SLOT_COUNT };
+    let atlas_count = unsafe { MODEL_ATLAS_COUNT };
+    if count >= MAX_RESIDENT_VRAM_ASSETS {
+        return None;
+    }
+
+    let tpage_x = MODEL_TPAGE.x() + unsafe { MODEL_TPAGE_X_CURSOR };
+    let pix_rect = VramRect::new(
+        tpage_x,
+        MODEL_TPAGE.y(),
+        texture.halfwords_per_row(),
+        texture.height(),
+    );
+    upload_bytes(pix_rect, texture.pixel_bytes());
+
+    // 256-entry CLUT: 256 halfwords on a single row.
+    let clut_y = MODEL_CLUT_BASE_Y + atlas_count as u16;
+    let clut_rect = VramRect::new(0, clut_y, texture.clut_entries(), 1);
+    upload_clut(clut_rect, texture.clut_bytes());
+
+    let slot = VramSlot {
+        asset: asset_id,
+        clut_word: Clut::new(0, clut_y).uv_clut_word(),
+        tpage_word: MODEL_TPAGE_WORD,
+    };
+
+    unsafe {
+        VRAM_SLOTS[count] = Some(slot);
+        VRAM_SLOT_COUNT = count + 1;
+        MODEL_TPAGE_X_CURSOR += texture.halfwords_per_row();
+        MODEL_ATLAS_COUNT = atlas_count + 1;
+        let _ = RESIDENCY.mark_vram_resident(asset_id);
+    }
+    Some(slot)
+}
+
+/// Animate + render every placed model instance whose owning
+/// room matches `current_room`. Each instance:
+/// 1. parses its `LevelModelRecord` mesh asset bytes;
+/// 2. parses its current clip's `.psxanim` bytes (or holds bind
+///    pose if the model has no clips / clip out of range);
+/// 3. ensures the atlas is VRAM-resident;
+/// 4. runs the GTE-driven `submit_textured_model` path with a
+///    transform anchored at `(instance.x, instance.y, instance.z)`.
+///
+/// Errors (parse failure, missing asset) skip the instance
+/// rather than crashing.
+fn draw_model_instances(
+    current_room: u16,
+    elapsed_vblanks: u32,
+    video_hz: u16,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+) {
+    let mut drawn = 0usize;
+    for inst in MODEL_INSTANCES {
+        if inst.room != current_room || drawn >= MAX_MODEL_INSTANCES {
+            continue;
+        }
+        let model_record = match MODELS.get(inst.model as usize) {
+            Some(m) => m,
+            None => continue,
+        };
+        let mesh_asset = match find_asset_of_kind(
+            ASSETS,
+            model_record.mesh_asset,
+            AssetKind::ModelMesh,
+        ) {
+            Some(a) => a,
+            None => continue,
+        };
+        let model = match Model::from_bytes(mesh_asset.bytes) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Atlas: required for textured rendering. Fall back to
+        // skip when missing rather than rendering untextured —
+        // the editor's validation should have already complained.
+        let atlas_slot = match model_record.texture_asset {
+            Some(id) => match find_asset_of_kind(ASSETS, id, AssetKind::Texture) {
+                Some(asset) => match ensure_model_atlas_uploaded(asset.id, asset.bytes) {
+                    Some(slot) => slot,
+                    None => continue,
+                },
+                None => continue,
+            },
+            None => continue,
+        };
+        let material = TextureMaterial::opaque(
+            atlas_slot.clut_word,
+            atlas_slot.tpage_word,
+            (0x80, 0x80, 0x80),
+        );
+        let model_options = options
+            .with_depth_policy(DepthPolicy::Average)
+            .with_cull_mode(CullMode::Back)
+            .with_material_layer(material);
+
+        // Clip resolution: per-instance override → model
+        // default → bind pose.
+        let clip_local = if inst.clip == MODEL_CLIP_INHERIT {
+            model_record.default_clip
+        } else {
+            inst.clip
+        };
+        let frame_q12 = if (clip_local as u16) < model_record.clip_count {
+            let global = (model_record.clip_first + clip_local) as usize;
+            let clip_record = &MODEL_CLIPS[global];
+            match find_asset_of_kind(ASSETS, clip_record.animation_asset, AssetKind::ModelAnimation)
+            {
+                Some(asset) => match Animation::from_bytes(asset.bytes) {
+                    Ok(anim) => Some((anim, anim.phase_at_tick_q12(elapsed_vblanks, video_hz))),
+                    Err(_) => None,
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        // Origin: room-local instance position.
+        let origin = WorldVertex::new(inst.x, inst.y, inst.z);
+
+        // Render: animated when we have a clip, else hold the
+        // first frame of any clip we *can* find as a static
+        // pose (showcase-model parity for bind-pose preview).
+        if let Some((anim, phase)) = frame_q12 {
+            let stats = world.submit_textured_model(
+                triangles,
+                model,
+                anim,
+                phase,
+                *camera,
+                origin,
+                unsafe { &mut MODEL_VERTICES },
+                unsafe { &mut JOINT_VIEW_TRANSFORMS },
+                material,
+                model_options,
+            );
+            if stats.primitive_overflow || stats.command_overflow {
+                return;
+            }
+        }
+        drawn += 1;
+    }
 }
 
 /// Draw one tinted cube per generated entity record. Cubes

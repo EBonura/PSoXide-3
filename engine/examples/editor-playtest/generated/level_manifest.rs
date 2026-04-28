@@ -15,6 +15,9 @@ use psx_level::{
     EntityRecord,
     LevelAssetRecord,
     LevelMaterialRecord,
+    LevelModelClipRecord,
+    LevelModelInstanceRecord,
+    LevelModelRecord,
     LevelRoomRecord,
     PlayerSpawnRecord,
     RoomResidencyRecord,
@@ -42,7 +45,16 @@ pub static PLAYER_SPAWN: PlayerSpawnRecord = PlayerSpawnRecord {
     flags: 0,
 };
 
-/// Entity markers (debug cubes for now).
+/// Per-model clip records.
+pub static MODEL_CLIPS: &[LevelModelClipRecord] = &[];
+
+/// Cooked models.
+pub static MODELS: &[LevelModelRecord] = &[];
+
+/// Placed model instances.
+pub static MODEL_INSTANCES: &[LevelModelInstanceRecord] = &[];
+
+/// Entity markers (legacy MeshInstance with no Model resource).
 pub static ENTITIES: &[EntityRecord] = &[];
 
 // Keep imports in scope so generated and placeholder tracks
