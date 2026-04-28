@@ -5910,8 +5910,8 @@ fn draw_room_budget(ui: &mut egui::Ui, budget: WorldGridBudget) {
             row(
                 ui,
                 ".psxw v2 est.",
-                format!("{}", human_bytes(budget.psxw_v2_estimated_bytes as u32)),
-                budget.psxw_v2_estimated_bytes > MAX_ROOM_BYTES,
+                format!("{}", human_bytes(budget.future_compact_estimated_bytes as u32)),
+                budget.future_compact_estimated_bytes > MAX_ROOM_BYTES,
             );
         });
 }

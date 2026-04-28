@@ -193,9 +193,10 @@ fn upload_textures() {
     // `world_render` both start at `u=0` — i.e. each slot's
     // CLUT word selects which 64×64 tile inside the page is read.
     //
-    // A tighter v2 layout will pack each material's tpage / clut
-    // straight from `MaterialRecordV2` and remove this hand-wired
-    // mapping.
+    // The future compact `.psxw` format will pack each material's
+    // tpage / clut straight from an embedded material table and
+    // remove this hand-wired mapping. See
+    // `docs/world-format-roadmap.md`.
     let floor_pix_rect = VramRect::new(
         SHARED_TPAGE.x(),
         SHARED_TPAGE.y(),

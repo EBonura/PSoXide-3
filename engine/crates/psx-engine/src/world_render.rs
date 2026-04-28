@@ -2,10 +2,10 @@
 //!
 //! Walks a [`RoomRender`] and emits its floors / ceilings / walls
 //! through [`WorldRenderPass::submit_textured_quad`]. Material slot
-//! → runtime material is provided by the caller — v1 `.psxw`
-//! doesn't carry an embedded material table, so the example or
-//! game knows the mapping out of band. v2's `MaterialRecordV2`
-//! will let this helper resolve materials itself.
+//! → runtime material is provided by the caller because the
+//! current `.psxw` (VERSION 1) doesn't embed a material table.
+//! See `docs/world-format-roadmap.md` for the future compact
+//! format that will let this helper resolve materials itself.
 
 use psx_gpu::{material::TextureMaterial, prim::TriTextured};
 
@@ -14,11 +14,11 @@ use crate::{
     WorldSurfaceOptions, WorldVertex,
 };
 
-/// Texture-page-relative tile size used by the helper when the
-/// cooker's v1 records don't carry per-face UV info. Floors,
-/// ceilings, and walls all UV-tile a single 64×64 patch over the
-/// quad. v2's `MaterialRecordV2` will eventually carry per-face
-/// UV authoring; until then this constant is the contract.
+/// Texture-page-relative tile size used by the helper. v1 records
+/// don't carry per-face UV info, so floors / ceilings / walls
+/// all UV-tile a single 64×64 patch over the quad. Per-face UVs
+/// would land alongside the future compact material table — see
+/// `docs/world-format-roadmap.md`.
 const TILE_UV: u8 = 64;
 
 /// Direction id for the north edge.

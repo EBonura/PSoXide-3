@@ -89,9 +89,10 @@ The renderer is `psx_engine::draw_room` from the
 `engine/examples/showcase-room` work — no per-frame allocation,
 i16-safe vertices via `WorldVertex`, materials resolved from a
 caller-provided slot table (slot 0 = floor, slot 1 = brick for
-the starter project). v2 `MaterialRecordV2` will let the runtime
-do its own material lookup; for now the example knows the
-mapping out of band.
+the starter project). The future compact `.psxw` format
+described in `docs/world-format-roadmap.md` will embed material
+records directly so the runtime can do its own lookup; for now
+the example knows the mapping out of band.
 
 ## Files
 

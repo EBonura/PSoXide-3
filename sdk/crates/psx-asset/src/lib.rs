@@ -1510,6 +1510,34 @@ mod tests {
         ));
     }
 
+    /// Pin the `.psxw` parser to v1 only. The compact format
+    /// described in `docs/world-format-roadmap.md` will eventually
+    /// claim VERSION = 2, but it isn't emitted or parsed today —
+    /// any blob claiming v2 must be rejected, not silently
+    /// accepted via a future `_ =>` arm slipping into the parser.
+    #[test]
+    fn world_rejects_version_two() {
+        let mut bad = [0u8; 12];
+        bad[0..4].copy_from_slice(&psxed_format::world::MAGIC);
+        bad[4..6].copy_from_slice(&2u16.to_le_bytes());
+        // Payload length 0 — won't matter; version check fires first.
+        bad[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            World::from_bytes(&bad),
+            Err(ParseError::UnsupportedVersion(2))
+        ));
+    }
+
+    /// Sizes the cooker / runtime have agreed on for VERSION 1.
+    /// Drift would invalidate every committed `.psxw` blob, so
+    /// pin them at the format crate's records, not the wire.
+    #[test]
+    fn world_v1_record_sizes_match_contract() {
+        assert_eq!(psxed_format::world::WorldHeader::SIZE, 20);
+        assert_eq!(psxed_format::world::SectorRecord::SIZE, 44);
+        assert_eq!(psxed_format::world::WallRecord::SIZE, 24);
+    }
+
     #[test]
     fn texture_round_trip_4bpp() {
         use psxed_format::texture::Depth;

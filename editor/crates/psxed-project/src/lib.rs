@@ -437,10 +437,11 @@ pub struct WorldGridBudget {
     /// walls. v1 stores a record for **every** cell, so this
     /// uses `total_cells`, not `populated_cells`.
     pub psxw_v1_bytes: usize,
-    /// `.psxw` v2 estimate — 28-byte sectors / 12-byte walls.
-    /// Surfaced even before v2 ships so authors can see the
-    /// savings the format change is targeting.
-    pub psxw_v2_estimated_bytes: usize,
+    /// Estimated size if we shipped the future compact format
+    /// described in `docs/world-format-roadmap.md` (28-byte
+    /// sectors, 12-byte walls). Surfaced as a planning aid, not
+    /// a contract — no live `.psxw` is ever this size today.
+    pub future_compact_estimated_bytes: usize,
 }
 
 impl WorldGridBudget {
@@ -625,10 +626,24 @@ impl WorldGrid {
         // so the byte count uses `total_cells`. Using
         // `populated_cells` here was the original bug: it under-
         // reported the wire size by ~44 B per empty cell.
-        b.psxw_v1_bytes = 12 + 20 + b.total_cells * 44 + b.walls * 24;
-        // v2 target (designed in P6): Sector = 28, Wall = 12. Same
-        // dense-table layout, so still indexed by `total_cells`.
-        b.psxw_v2_estimated_bytes = 12 + 20 + b.total_cells * 28 + b.walls * 12;
+        const ASSET_HEADER_BYTES: usize = 12;
+        const WORLD_HEADER_BYTES: usize = 20;
+        const V1_SECTOR_BYTES: usize = 44;
+        const V1_WALL_BYTES: usize = 24;
+        // Target compact-format sizes for the planning estimate.
+        // See `docs/world-format-roadmap.md`. Plain numeric
+        // constants rather than struct sizes so this block doesn't
+        // pretend a v2 format exists in code.
+        const FUTURE_COMPACT_SECTOR_BYTES: usize = 28;
+        const FUTURE_COMPACT_WALL_BYTES: usize = 12;
+        b.psxw_v1_bytes = ASSET_HEADER_BYTES
+            + WORLD_HEADER_BYTES
+            + b.total_cells * V1_SECTOR_BYTES
+            + b.walls * V1_WALL_BYTES;
+        b.future_compact_estimated_bytes = ASSET_HEADER_BYTES
+            + WORLD_HEADER_BYTES
+            + b.total_cells * FUTURE_COMPACT_SECTOR_BYTES
+            + b.walls * FUTURE_COMPACT_WALL_BYTES;
         b
     }
 
@@ -1414,7 +1429,7 @@ mod tests {
         // an "empty" 3×3 still costs 9 * 44 = 396 B in sector
         // records on top of the headers.
         assert_eq!(b.psxw_v1_bytes, 12 + 20 + 9 * 44);
-        assert_eq!(b.psxw_v2_estimated_bytes, 12 + 20 + 9 * 28);
+        assert_eq!(b.future_compact_estimated_bytes, 12 + 20 + 9 * 28);
         assert!(!b.over_budget());
     }
 
@@ -1432,7 +1447,7 @@ mod tests {
         // v2 should be strictly smaller than v1 once any geometry
         // exists — the size delta is the whole point of the v2
         // record reshape.
-        assert!(b.psxw_v2_estimated_bytes < b.psxw_v1_bytes);
+        assert!(b.future_compact_estimated_bytes < b.psxw_v1_bytes);
         assert!(!b.over_budget());
     }
 
@@ -1454,7 +1469,7 @@ mod tests {
         // v1: 32 + 1024 * 44 = 45088 — over the 64KiB cap on the
         // wall-stack-heavy worst case but fine on floors-only.
         // v2: 32 + 1024 * 28 = 28704 — well under cap.
-        assert!(b.psxw_v2_estimated_bytes <= MAX_ROOM_BYTES);
+        assert!(b.future_compact_estimated_bytes <= MAX_ROOM_BYTES);
         assert!(!b.over_budget());
     }
 

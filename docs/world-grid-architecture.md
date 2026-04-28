@@ -70,27 +70,15 @@ discipline at the API level (a draw pass cannot accidentally branch on
 walkability; a collision query cannot reach a tpage word).
 
 The cooker today writes one record per sector / wall, with both render and
-collision concerns interleaved. When the v2 byte format lands, those two
+collision concerns interleaved. When the compact byte format lands, those two
 concerns split into separate tables — the cooker pipeline is already organized
 by render-emit / collision-emit phases so that future split is a small change.
 
-## Tomb Raider Analogy
+## Tomb Raider parallels
 
 Bonnie-32's room model deliberately echoes the original Tomb Raider runtime,
 because the constraints are similar: 1 MB working set, sector-based level
-geometry, integer math throughout. The mapping:
-
-| TR concept                          | PSoXide equivalent                          |
-| ----------------------------------- | ------------------------------------------- |
-| `tr_room`                           | `RuntimeRoom<'a>` / one `.psxw` blob        |
-| `tr_room_data` (vertex/face arrays) | not yet emitted — render path WIP           |
-| `tr_room_sector` (4 B floor / ceiling height + flags) | `SectorRecordV2` (28 B) |
-| FloorData stream (triggers / slopes) | `SectorLogicStream` (designed, not wired)  |
-| `tr_room_portal` (visibility)       | `RoomPortalRecord`                          |
-| `room_below` / `room_above` / wall portal | `SectorPortalRecord`                  |
-| Object texture table                | `MaterialRecordV2` (embedded in v2 .psxw)   |
-
-Two TR lessons we deliberately keep:
+geometry, integer math throughout. Two lessons we keep:
 
 * **Sectors are a strong addressing mode**, not just a layout convenience. Once
   you commit to "1024 world units per sector, world-grid coords are sector
@@ -99,14 +87,14 @@ Two TR lessons we deliberately keep:
   → sector coords division single-instruction; resist temptation to break the
   grid.
 
-* **Heights are room-local, not world-absolute.** TR stores room-relative
-  i16 heights so a level can address ±32 KU vertically with 2 bytes per height
-  set. PSoXide v2 follows the same trick: `i16` heights room-local, the
-  renderer adds the room origin during vertex emission. The
-  `editor_preview::VIEW_ANCHOR` exists for the same reason on the editor side
-  — keeping vertex data within i16 range from the camera target.
+* **Heights stay room-local once compact format lands.** Today v1 ships
+  absolute `i32` heights; the future compact format (see
+  `docs/world-format-roadmap.md`) follows TR's `i16`-room-relative trick so a
+  level can address ±32 KU vertically with 2 bytes per height set. The
+  editor's `editor_preview::VIEW_ANCHOR` already does the same on the
+  authoring side, keeping vertex data within i16 range from the camera target.
 
-Two TR lessons we deliberately ignore:
+Two lessons we deliberately ignore for now:
 
 * **No `tr_face4` / `tr_face3` lists** today. TR's render path iterates an
   explicit face list per room because sector geometry alone doesn't capture
@@ -118,6 +106,9 @@ Two TR lessons we deliberately ignore:
 * **No item / entity table inside `.psxw`**. TR mixes statics into the room
   blob; we keep entities in scene nodes outside the cooked world. Cleaner
   authoring, slightly more bookkeeping at level-load.
+
+The full TR-to-PSoXide name mapping (per future-format records) lives in
+`docs/world-format-roadmap.md`.
 
 ## Contract
 
@@ -156,14 +147,14 @@ Authoring is bounded by the runtime's tolerance:
 | `MAX_ROOM_BYTES`   | 64 KiB    |
 
 `WorldGrid::budget()` rolls up populated cells, faces, walls, triangles, plus
-v1 wire size and a v2-format estimate. The editor inspector shows the rollup
-and tints any over-cap metric red.
+exact v1 wire size and a future-compact-format size estimate (see the
+roadmap). The editor inspector shows the rollup and tints any over-cap metric
+red. Cooker enforces the same caps so what the editor warns about also fails
+at cook time.
 
 ## Binary Shape
 
-### v1 (current shipping)
-
-`.psxw` starts with the standard `AssetHeader` using magic `PSXW`. The
+`.psxw` starts with the standard `AssetHeader` using magic `PSXW`. The v1
 payload is:
 
 ```text
@@ -175,22 +166,9 @@ WallRecord[]       (24 B each, wall_count records)
 Heights are `[i32; 4]` per face. Materials resolve via an external bank slot.
 No sector logic. No portals.
 
-### v2 (designed, not yet emitted)
-
-```text
-WorldHeaderV2          (20 B)
-MaterialRecordV2[]     (12 B each, embedded — no external bank)
-SectorRecordV2[]       (28 B each, room-local i16 heights)
-WallRecordV2[]         (12 B each, room-local i16 heights)
-SectorLogicStream      (variable, FloorData-style sparse byte stream)
-RoomPortalRecord[]     (visibility portals between rooms)
-SectorPortalRecord[]   (8 B each, traversal: wall / pit / sky)
-```
-
-Records are defined alongside v1 in `psxed-format::world`; each has a
-`const _: () = assert!(SIZE == N)` so layout drift fails the build. The
-`WorldGridBudget` already exposes a v2 estimate so authors see the savings
-the format change is buying.
+A future compact format is sketched in `docs/world-format-roadmap.md`; it is
+**not** in `psxed-format` as Rust types. The format crate carries only the
+active wire records.
 
 ## i16 Vertex Safety
 
