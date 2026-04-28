@@ -112,8 +112,8 @@ pub fn build_phase1_cmd_log(
     project: &ProjectDocument,
     camera: ViewportCameraState,
     selected: psxed_project::NodeId,
-    hovered_face: Option<psxed_ui::FaceRef>,
-    selected_face: Option<psxed_ui::FaceRef>,
+    hovered_primitive: Option<psxed_ui::Selection>,
+    selected_primitive: Option<psxed_ui::Selection>,
     paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     textures: &EditorTextures,
 ) -> Vec<GpuCmdLogEntry> {
@@ -130,16 +130,19 @@ pub fn build_phase1_cmd_log(
     setup_gte_for_camera(camera, target);
     walk_room(project, grid, textures, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
-    // Select-tool face outlines. Selected drawn first so its
+    // Select-tool primitive outlines. Selected drawn first so its
     // bolder lines sit *under* a possibly-co-located hover — that
     // way switching focus from selected → hover via mouse-move
-    // doesn't make the bold outline strobe.
-    if let Some(face) = selected_face {
-        push_face_outline(grid, face, FACE_OUTLINE_SELECTED, &mut scratch);
+    // doesn't make the bold outline strobe. Edge / vertex
+    // overlays are stubbed to face outlines for now until
+    // `push_edge_outline` / `push_vertex_outline` land in the
+    // visualization batch.
+    if let Some(selection) = selected_primitive {
+        push_selection_outline(grid, selection, OutlineRole::Selected, &mut scratch);
     }
-    if let Some(face) = hovered_face {
-        if Some(face) != selected_face {
-            push_face_outline(grid, face, FACE_OUTLINE_HOVER, &mut scratch);
+    if let Some(selection) = hovered_primitive {
+        if Some(selection) != selected_primitive {
+            push_selection_outline(grid, selection, OutlineRole::Hover, &mut scratch);
         }
     }
     // Paint preview: ghost outline of the cell or wall the next
@@ -778,6 +781,210 @@ const FACE_OUTLINE_WALL_PAINT: FaceOutlineStyle = FaceOutlineStyle {
 struct FaceOutlineStyle {
     rgb: (u8, u8, u8),
     thickness_px: i16,
+}
+
+/// Hover vs Selected — outline style picker for the unified
+/// selection dispatch. Hover uses the lighter yellow; selected
+/// uses the bolder cyan. Same constants the original face-only
+/// path consumed.
+#[derive(Copy, Clone)]
+enum OutlineRole {
+    Hover,
+    Selected,
+}
+
+impl OutlineRole {
+    fn face_style(self) -> FaceOutlineStyle {
+        match self {
+            Self::Hover => FACE_OUTLINE_HOVER,
+            Self::Selected => FACE_OUTLINE_SELECTED,
+        }
+    }
+}
+
+/// Dispatch a `Selection` to the appropriate outline helper.
+/// Each variant gets its own screen-space overlay: face → 4
+/// edge lines, edge → 1 line, vertex → cross.
+fn push_selection_outline(
+    grid: &WorldGrid,
+    selection: psxed_ui::Selection,
+    role: OutlineRole,
+    scratch: &mut PreviewScratch,
+) {
+    match selection {
+        psxed_ui::Selection::Face(face) => {
+            push_face_outline(grid, face, role.face_style(), scratch);
+        }
+        psxed_ui::Selection::Edge(edge) => {
+            push_edge_outline(grid, edge, role.face_style(), scratch);
+        }
+        psxed_ui::Selection::Vertex(vertex) => {
+            push_vertex_outline(grid, vertex, role.face_style(), scratch);
+        }
+    }
+}
+
+/// One thick screen-space line between the edge's two world
+/// endpoints. Lifted slightly off the surface (same `LIFT` as
+/// `push_face_outline`) so it doesn't z-fight the geometry it
+/// outlines.
+fn push_edge_outline(
+    grid: &WorldGrid,
+    edge: psxed_ui::EdgeRef,
+    style: FaceOutlineStyle,
+    scratch: &mut PreviewScratch,
+) {
+    let Some((a, b)) = edge_world_endpoints(grid, edge) else {
+        return;
+    };
+    let projected_a = gte_scene::project_vertex(world_to_view(a));
+    let projected_b = gte_scene::project_vertex(world_to_view(b));
+    if projected_a.sz == 0 || projected_b.sz == 0 {
+        return;
+    }
+    push_screen_line(scratch, projected_a, projected_b, style);
+}
+
+/// Small screen-space cross at the vertex's world position.
+/// The cross is drawn as four short line segments offset along
+/// world axes so its on-screen size scales naturally with
+/// distance — close vertices read clearly, far ones don't
+/// dominate the viewport.
+fn push_vertex_outline(
+    grid: &WorldGrid,
+    vertex: psxed_ui::VertexRef,
+    style: FaceOutlineStyle,
+    scratch: &mut PreviewScratch,
+) {
+    let Some(world) = vertex_world_position(grid, vertex) else {
+        return;
+    };
+    // Half-extent of the cross in world units. ~32 reads as a
+    // few px in the viewport at orbit distances we use.
+    const ARM: i32 = 32;
+    let arms = [
+        (
+            [world[0] - ARM, world[1], world[2]],
+            [world[0] + ARM, world[1], world[2]],
+        ),
+        (
+            [world[0], world[1] - ARM, world[2]],
+            [world[0], world[1] + ARM, world[2]],
+        ),
+        (
+            [world[0], world[1], world[2] - ARM],
+            [world[0], world[1], world[2] + ARM],
+        ),
+    ];
+    for (a, b) in arms {
+        let pa = gte_scene::project_vertex(world_to_view(a));
+        let pb = gte_scene::project_vertex(world_to_view(b));
+        if pa.sz == 0 || pb.sz == 0 {
+            continue;
+        }
+        push_screen_line(scratch, pa, pb, style);
+    }
+}
+
+fn edge_world_endpoints(
+    grid: &WorldGrid,
+    edge: psxed_ui::EdgeRef,
+) -> Option<([i32; 3], [i32; 3])> {
+    use psxed_ui::{EdgeAnchor, FaceCornerRef};
+    let (a, b) = match edge.anchor {
+        EdgeAnchor::Floor { sx, sz, dir } => (
+            FaceCornerRef::Floor {
+                sx,
+                sz,
+                corner: floor_edge_a(dir),
+            },
+            FaceCornerRef::Floor {
+                sx,
+                sz,
+                corner: floor_edge_b(dir),
+            },
+        ),
+        EdgeAnchor::Ceiling { sx, sz, dir } => (
+            FaceCornerRef::Ceiling {
+                sx,
+                sz,
+                corner: floor_edge_a(dir),
+            },
+            FaceCornerRef::Ceiling {
+                sx,
+                sz,
+                corner: floor_edge_b(dir),
+            },
+        ),
+        EdgeAnchor::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            edge: e,
+        } => (
+            FaceCornerRef::Wall {
+                sx,
+                sz,
+                dir,
+                stack,
+                corner: wall_edge_a(e),
+            },
+            FaceCornerRef::Wall {
+                sx,
+                sz,
+                dir,
+                stack,
+                corner: wall_edge_b(e),
+            },
+        ),
+    };
+    Some((
+        psxed_ui::face_corner_world(grid, a)?,
+        psxed_ui::face_corner_world(grid, b)?,
+    ))
+}
+
+fn vertex_world_position(grid: &WorldGrid, vertex: psxed_ui::VertexRef) -> Option<[i32; 3]> {
+    psxed_ui::face_corner_world(grid, vertex.anchor.as_face_corner())
+}
+
+const fn floor_edge_a(dir: GridDirection) -> psxed_ui::Corner {
+    match dir {
+        GridDirection::North => psxed_ui::Corner::NW,
+        GridDirection::East => psxed_ui::Corner::NE,
+        GridDirection::South => psxed_ui::Corner::SE,
+        GridDirection::West => psxed_ui::Corner::SW,
+        _ => psxed_ui::Corner::NW,
+    }
+}
+
+const fn floor_edge_b(dir: GridDirection) -> psxed_ui::Corner {
+    match dir {
+        GridDirection::North => psxed_ui::Corner::NE,
+        GridDirection::East => psxed_ui::Corner::SE,
+        GridDirection::South => psxed_ui::Corner::SW,
+        GridDirection::West => psxed_ui::Corner::NW,
+        _ => psxed_ui::Corner::SE,
+    }
+}
+
+const fn wall_edge_a(edge: psxed_ui::WallEdge) -> psxed_ui::WallCorner {
+    match edge {
+        psxed_ui::WallEdge::Bottom => psxed_ui::WallCorner::BL,
+        psxed_ui::WallEdge::Right => psxed_ui::WallCorner::BR,
+        psxed_ui::WallEdge::Top => psxed_ui::WallCorner::TR,
+        psxed_ui::WallEdge::Left => psxed_ui::WallCorner::TL,
+    }
+}
+
+const fn wall_edge_b(edge: psxed_ui::WallEdge) -> psxed_ui::WallCorner {
+    match edge {
+        psxed_ui::WallEdge::Bottom => psxed_ui::WallCorner::BR,
+        psxed_ui::WallEdge::Right => psxed_ui::WallCorner::TR,
+        psxed_ui::WallEdge::Top => psxed_ui::WallCorner::TL,
+        psxed_ui::WallEdge::Left => psxed_ui::WallCorner::BL,
+    }
 }
 
 /// Stamp four short, screen-space-thick line segments along the

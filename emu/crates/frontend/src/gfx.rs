@@ -198,8 +198,8 @@ impl Graphics {
         project_root: &std::path::Path,
         camera: psxed_ui::ViewportCameraState,
         selected: psxed_project::NodeId,
-        hovered_face: Option<psxed_ui::FaceRef>,
-        selected_face: Option<psxed_ui::FaceRef>,
+        hovered_primitive: Option<psxed_ui::Selection>,
+        selected_primitive: Option<psxed_ui::Selection>,
         paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     ) {
         self.editor_textures.refresh(project, project_root);
@@ -207,8 +207,8 @@ impl Graphics {
             project,
             camera,
             selected,
-            hovered_face,
-            selected_face,
+            hovered_primitive,
+            selected_primitive,
             paint_target_preview,
             &self.editor_textures,
         );

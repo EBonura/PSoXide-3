@@ -97,19 +97,22 @@ pub struct EditorWorkspace {
     /// inspector can show per-cell properties without inflating the
     /// scene-tree node count with a node per sector.
     selected_sector: Option<(u16, u16)>,
-    /// Face under the pointer while the Select tool is active —
-    /// floors, walls, ceilings of the active Room. Updated every
-    /// frame the panel is hovered and the tool is Select; cleared
-    /// when the pointer leaves or another tool takes over. The
-    /// renderer outlines this face lightly so the user sees what
-    /// the next click will pick.
-    hovered_face: Option<FaceRef>,
-    /// Face the user clicked with the Select tool last. Persists
-    /// across frames until the user clicks a different face or
-    /// switches tools. The renderer outlines it more boldly than
-    /// `hovered_face`; the inspector panel reads it to surface
-    /// per-face properties (material, heights, …).
-    selected_face: Option<FaceRef>,
+    /// Selection mode the Select tool picks at: a whole face,
+    /// one of its edges, or one of its corners. Hotkeys 1 / 2 / 3
+    /// toggle.
+    selection_mode: SelectionMode,
+    /// Primitive under the pointer while the Select tool is
+    /// active. Updated every frame the panel is hovered and the
+    /// tool is Select; cleared when the pointer leaves or another
+    /// tool takes over. The renderer outlines this lightly so the
+    /// user sees what the next click will pick.
+    hovered_primitive: Option<Selection>,
+    /// Primitive the user clicked with the Select tool last.
+    /// Persists across frames until the user clicks a different
+    /// one or switches tools. The renderer outlines it more
+    /// boldly than `hovered_primitive`; the inspector reads it to
+    /// surface per-primitive properties.
+    selected_primitive: Option<Selection>,
     /// What the next paint click would target. Cell variant fires
     /// for floor / ceiling / erase / place; Wall variant fires for
     /// PaintWall. World-cell coords let the preview track cells
@@ -256,6 +259,238 @@ pub struct FaceRef {
     pub sx: u16,
     pub sz: u16,
     pub kind: FaceKind,
+}
+
+/// Floor / ceiling corner index. Stored values map directly to
+/// the `[NW, NE, SE, SW]` order every height array uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corner {
+    NW,
+    NE,
+    SE,
+    SW,
+}
+
+impl Corner {
+    /// Index into `[NW, NE, SE, SW]`.
+    pub const fn idx(self) -> usize {
+        match self {
+            Self::NW => 0,
+            Self::NE => 1,
+            Self::SE => 2,
+            Self::SW => 3,
+        }
+    }
+}
+
+/// Wall corner index. Stored values map to the
+/// `[bottom-left, bottom-right, top-right, top-left]` order in
+/// every wall heights array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallCorner {
+    BL,
+    BR,
+    TR,
+    TL,
+}
+
+impl WallCorner {
+    pub const fn idx(self) -> usize {
+        match self {
+            Self::BL => 0,
+            Self::BR => 1,
+            Self::TR => 2,
+            Self::TL => 3,
+        }
+    }
+
+    /// `true` when this corner sits at the wall's bottom (uses
+    /// `heights[0]` or `heights[1]`). The other two corners are
+    /// at the top.
+    pub const fn is_bottom(self) -> bool {
+        matches!(self, Self::BL | Self::BR)
+    }
+}
+
+/// Which of the four edges of a wall quad. Order matches the
+/// perimeter walk used by the picker:
+/// `Bottom = BL-BR`, `Right = BR-TR`, `Top = TR-TL`,
+/// `Left = TL-BL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallEdge {
+    Bottom,
+    Right,
+    Top,
+    Left,
+}
+
+/// One face-corner. `Selection::Vertex(_)` resolves through
+/// [`physical_vertex`] to a `Vec<FaceCornerRef>` listing every
+/// face-corner currently sharing the same world position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaceCornerRef {
+    Floor {
+        sx: u16,
+        sz: u16,
+        corner: Corner,
+    },
+    Ceiling {
+        sx: u16,
+        sz: u16,
+        corner: Corner,
+    },
+    Wall {
+        sx: u16,
+        sz: u16,
+        dir: GridDirection,
+        stack: u8,
+        corner: WallCorner,
+    },
+}
+
+/// Vertex in a `Selection`. Carries the *seed* corner — the one
+/// the user actually clicked. Resolve to a `PhysicalVertex` to
+/// get every coincident face-corner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexRef {
+    pub room: NodeId,
+    pub anchor: VertexAnchor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexAnchor {
+    Floor {
+        sx: u16,
+        sz: u16,
+        corner: Corner,
+    },
+    Ceiling {
+        sx: u16,
+        sz: u16,
+        corner: Corner,
+    },
+    Wall {
+        sx: u16,
+        sz: u16,
+        dir: GridDirection,
+        stack: u8,
+        corner: WallCorner,
+    },
+}
+
+impl VertexAnchor {
+    pub const fn as_face_corner(self) -> FaceCornerRef {
+        match self {
+            Self::Floor { sx, sz, corner } => FaceCornerRef::Floor { sx, sz, corner },
+            Self::Ceiling { sx, sz, corner } => FaceCornerRef::Ceiling { sx, sz, corner },
+            Self::Wall {
+                sx,
+                sz,
+                dir,
+                stack,
+                corner,
+            } => FaceCornerRef::Wall {
+                sx,
+                sz,
+                dir,
+                stack,
+                corner,
+            },
+        }
+    }
+}
+
+/// Edge in a `Selection`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeRef {
+    pub room: NodeId,
+    pub anchor: EdgeAnchor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeAnchor {
+    Floor {
+        sx: u16,
+        sz: u16,
+        dir: GridDirection,
+    },
+    Ceiling {
+        sx: u16,
+        sz: u16,
+        dir: GridDirection,
+    },
+    Wall {
+        sx: u16,
+        sz: u16,
+        dir: GridDirection,
+        stack: u8,
+        edge: WallEdge,
+    },
+}
+
+/// Tagged selection used by the editor's Select tool. Replaces
+/// the previous `selected_face: Option<FaceRef>` so all three
+/// modes share one piece of state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    Face(FaceRef),
+    Edge(EdgeRef),
+    Vertex(VertexRef),
+}
+
+impl Selection {
+    /// The room this selection belongs to.
+    pub const fn room(&self) -> NodeId {
+        match self {
+            Self::Face(f) => f.room,
+            Self::Edge(e) => e.room,
+            Self::Vertex(v) => v.room,
+        }
+    }
+
+    /// Convenience: when the selection is a face, hand it to
+    /// callers that still want the old `FaceRef` shape (e.g.
+    /// the per-face inspector).
+    pub const fn as_face(&self) -> Option<FaceRef> {
+        match self {
+            Self::Face(f) => Some(*f),
+            _ => None,
+        }
+    }
+}
+
+/// Three-mode selection switch — Blender-style. `Face` keeps
+/// the existing whole-face semantics; `Edge` and `Vertex` pick
+/// finer primitives via local-UV math on the picked face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionMode {
+    #[default]
+    Face,
+    Edge,
+    Vertex,
+}
+
+impl SelectionMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Face => "Face",
+            Self::Edge => "Edge",
+            Self::Vertex => "Vertex",
+        }
+    }
+}
+
+/// Resolved physical vertex: every face-corner that currently
+/// sits at `world` and therefore moves together when the
+/// vertex's height is dragged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalVertex {
+    /// Integer world position. Every member is at exactly this
+    /// `(X, Y, Z)`.
+    pub world: [i32; 3],
+    /// Face-corners that share the position. Always non-empty
+    /// (contains at least the seed).
+    pub members: Vec<FaceCornerRef>,
 }
 
 /// Snapshot of the editor's 3D viewport camera, handed to the
@@ -533,8 +768,9 @@ impl EditorWorkspace {
             selected_node: NodeId::ROOT,
             selected_resource: None,
             selected_sector: None,
-            hovered_face: None,
-            selected_face: None,
+            selection_mode: SelectionMode::default(),
+            hovered_primitive: None,
+            selected_primitive: None,
             paint_target_preview: None,
             last_paint_stamp: None,
             renaming: None,
@@ -966,7 +1202,14 @@ impl EditorWorkspace {
         let face_hit = response
             .hover_pos()
             .and_then(|pointer| self.pick_face_with_hit(rect, pointer));
-        self.hovered_face = face_hit.map(|(face, _)| face);
+        // Hover-track via the unified selection. `pick_primitive`
+        // (added below) maps the same face-hit to a finer
+        // primitive when the selection mode demands one. For now
+        // the hover always carries a `Selection::Face` — the
+        // hover preview ignores edge / vertex modes until the
+        // mode-aware pick replaces this line.
+        self.hovered_primitive = face_hit
+            .map(|(face, hit)| self.pick_primitive_from_hit(face, hit));
         // Paint preview: world-cell coords let the ghost outline
         // appear over cells outside the current grid, exactly
         // where the auto-grow would create them.
@@ -1044,18 +1287,25 @@ impl EditorWorkspace {
         self.selected_node
     }
 
-    /// Face under the 3D pointer when the Select tool is active —
-    /// floors / walls / ceilings of the active Room. Frontend reads
-    /// this every frame to draw a light hover outline.
-    pub fn hovered_face(&self) -> Option<FaceRef> {
-        self.hovered_face
+    /// Primitive under the 3D pointer when the Select tool is
+    /// active — face / edge / vertex of a floor, wall, or
+    /// ceiling on the active Room. Frontend reads this every
+    /// frame to draw a light hover outline.
+    pub fn hovered_primitive(&self) -> Option<Selection> {
+        self.hovered_primitive
     }
 
-    /// Face the user picked with the Select tool. Frontend draws a
-    /// bold outline; the inspector reads it to surface per-face
-    /// editable fields (material, heights, …).
-    pub fn selected_face(&self) -> Option<FaceRef> {
-        self.selected_face
+    /// Primitive the user clicked with the Select tool. Frontend
+    /// draws a bold outline; the inspector reads it to surface
+    /// per-primitive editable fields.
+    pub fn selected_primitive(&self) -> Option<Selection> {
+        self.selected_primitive
+    }
+
+    /// Active selection mode (Face / Edge / Vertex). Hotkeys
+    /// 1 / 2 / 3 cycle.
+    pub fn selection_mode(&self) -> SelectionMode {
+        self.selection_mode
     }
 
     /// What the next paint click would target. Frontend reads
@@ -1162,16 +1412,28 @@ impl EditorWorkspace {
         }
     }
 
+    /// Promote the hovered primitive to a selection. When the
+    /// hover is a face, also pre-load `selected_resource` with
+    /// its material so the resource panel surfaces it without a
+    /// second click. Edge / vertex modes don't pre-load — the
+    /// inspector renders directly from the selection.
     fn commit_face_selection(&mut self) {
-        if let Some(face) = self.hovered_face {
-            self.selected_face = Some(face);
-            self.selected_node = NodeId::ROOT;
-            self.selected_resource = self.face_material(face);
-            self.status = format!("Selected {}", describe_face(face));
-        } else {
-            self.selected_face = None;
-            self.selected_resource = None;
-            self.status = "Cleared face selection".to_string();
+        match self.hovered_primitive {
+            Some(selection) => {
+                self.selected_primitive = Some(selection);
+                self.selected_node = NodeId::ROOT;
+                if let Selection::Face(face) = selection {
+                    self.selected_resource = self.face_material(face);
+                } else {
+                    self.selected_resource = None;
+                }
+                self.status = format!("Selected {}", describe_selection(selection));
+            }
+            None => {
+                self.selected_primitive = None;
+                self.selected_resource = None;
+                self.status = "Cleared selection".to_string();
+            }
         }
     }
 
@@ -1719,6 +1981,139 @@ impl EditorWorkspace {
         Some((cam_pos, dir))
     }
 
+    /// Map a `(face, world-hit)` pair from `pick_face_with_hit`
+    /// to a `Selection`, refining to an edge or vertex of the
+    /// face when `selection_mode` demands one. Local-UV math
+    /// happens here; the picker's heavy lifting (ray vs every
+    /// face) was already paid above.
+    fn pick_primitive_from_hit(&self, face: FaceRef, hit: [f32; 3]) -> Selection {
+        match self.selection_mode {
+            SelectionMode::Face => Selection::Face(face),
+            SelectionMode::Edge => self
+                .face_edge_at_hit(face, hit)
+                .map(Selection::Edge)
+                .unwrap_or(Selection::Face(face)),
+            SelectionMode::Vertex => self
+                .face_vertex_at_hit(face, hit)
+                .map(Selection::Vertex)
+                .unwrap_or(Selection::Face(face)),
+        }
+    }
+
+    /// Closest edge of `face` to the world-space hit. Computes
+    /// distance to each of the four perimeter line segments in
+    /// 3D (so sloped floors / non-rectangular walls still pick
+    /// the right edge) and returns the smallest.
+    fn face_edge_at_hit(&self, face: FaceRef, hit: [f32; 3]) -> Option<EdgeRef> {
+        let corners = self.face_world_corners(face)?;
+        let edge_idx = closest_edge_idx(&corners, hit);
+        let anchor = match face.kind {
+            FaceKind::Floor => EdgeAnchor::Floor {
+                sx: face.sx,
+                sz: face.sz,
+                dir: floor_edge_dir(edge_idx),
+            },
+            FaceKind::Ceiling => EdgeAnchor::Ceiling {
+                sx: face.sx,
+                sz: face.sz,
+                dir: floor_edge_dir(edge_idx),
+            },
+            FaceKind::Wall { dir, stack } => EdgeAnchor::Wall {
+                sx: face.sx,
+                sz: face.sz,
+                dir,
+                stack,
+                edge: wall_edge_idx(edge_idx),
+            },
+        };
+        Some(EdgeRef {
+            room: face.room,
+            anchor,
+        })
+    }
+
+    /// Closest corner of `face` to the world-space hit. Distance
+    /// computed in world space against the four corner points.
+    fn face_vertex_at_hit(&self, face: FaceRef, hit: [f32; 3]) -> Option<VertexRef> {
+        let corners = self.face_world_corners(face)?;
+        let corner_idx = closest_corner_idx(&corners, hit);
+        let anchor = match face.kind {
+            FaceKind::Floor => VertexAnchor::Floor {
+                sx: face.sx,
+                sz: face.sz,
+                corner: floor_corner_idx(corner_idx),
+            },
+            FaceKind::Ceiling => VertexAnchor::Ceiling {
+                sx: face.sx,
+                sz: face.sz,
+                corner: floor_corner_idx(corner_idx),
+            },
+            FaceKind::Wall { dir, stack } => VertexAnchor::Wall {
+                sx: face.sx,
+                sz: face.sz,
+                dir,
+                stack,
+                corner: wall_corner_idx(corner_idx),
+            },
+        };
+        Some(VertexRef {
+            room: face.room,
+            anchor,
+        })
+    }
+
+    /// Four world-space corners of `face` in canonical
+    /// perimeter order — `[NW, NE, SE, SW]` for floors / ceilings,
+    /// `[BL, BR, TR, TL]` for walls. Returns `None` if the face
+    /// no longer exists (cell out of bounds, geometry missing).
+    fn face_world_corners(&self, face: FaceRef) -> Option<[[f32; 3]; 4]> {
+        let scene = self.project.active_scene();
+        let room = scene.node(face.room)?;
+        let NodeKind::Room { grid } = &room.kind else {
+            return None;
+        };
+        if face.sx >= grid.width || face.sz >= grid.depth {
+            return None;
+        }
+        let sector = grid.sector(face.sx, face.sz)?;
+        let s = grid.sector_size as f32;
+        let x0 = grid.cell_world_x(face.sx) as f32;
+        let x1 = x0 + s;
+        let z0 = grid.cell_world_z(face.sz) as f32;
+        let z1 = z0 + s;
+        match face.kind {
+            FaceKind::Floor => sector.floor.as_ref().map(|f| {
+                let h = f.heights;
+                [
+                    [x0, h[0] as f32, z1],
+                    [x1, h[1] as f32, z1],
+                    [x1, h[2] as f32, z0],
+                    [x0, h[3] as f32, z0],
+                ]
+            }),
+            FaceKind::Ceiling => sector.ceiling.as_ref().map(|c| {
+                let h = c.heights;
+                [
+                    [x0, h[0] as f32, z1],
+                    [x1, h[1] as f32, z1],
+                    [x1, h[2] as f32, z0],
+                    [x0, h[3] as f32, z0],
+                ]
+            }),
+            FaceKind::Wall { dir, stack } => {
+                let wall = sector.walls.get(dir).get(stack as usize)?;
+                let h = wall.heights;
+                let (bl_xy, br_xy) = wall_xy_endpoints(dir, x0, x1, z0, z1);
+                Some([
+                    [bl_xy.0, h[0] as f32, bl_xy.1],
+                    [br_xy.0, h[1] as f32, br_xy.1],
+                    [br_xy.0, h[2] as f32, br_xy.1],
+                    [bl_xy.0, h[3] as f32, bl_xy.1],
+                ])
+            }
+        }
+    }
+
     /// Walk every floor / ceiling / wall in the active Room and
     /// return the closest face the camera ray hits. Mirrors the
     /// triangle layout `editor_preview` emits so what the user sees
@@ -1969,7 +2364,72 @@ impl EditorWorkspace {
             if rot && self.renaming.is_none() {
                 self.rotate_selected_yaw_90();
             }
+            // Selection-mode hotkeys: 1 / 2 / 3 = Face / Edge /
+            // Vertex (Blender convention). The focus guard above
+            // already keeps these from firing while a TextEdit
+            // owns focus.
+            let num1 = ctx.input_mut(|i| i.key_pressed(egui::Key::Num1));
+            if num1 {
+                self.set_selection_mode(SelectionMode::Face);
+            }
+            let num2 = ctx.input_mut(|i| i.key_pressed(egui::Key::Num2));
+            if num2 {
+                self.set_selection_mode(SelectionMode::Edge);
+            }
+            let num3 = ctx.input_mut(|i| i.key_pressed(egui::Key::Num3));
+            if num3 {
+                self.set_selection_mode(SelectionMode::Vertex);
+            }
         }
+    }
+
+    /// Switch the Select tool's primitive mode. Tries to adapt
+    /// the existing selection to the new mode (a face → its NW
+    /// corner, a vertex → its parent face) so the user doesn't
+    /// lose their place. Falls back to clearing if the current
+    /// selection has no natural counterpart.
+    fn set_selection_mode(&mut self, mode: SelectionMode) {
+        if self.selection_mode == mode {
+            return;
+        }
+        self.selection_mode = mode;
+        self.selected_primitive = match (self.selected_primitive, mode) {
+            (Some(Selection::Face(face)), SelectionMode::Face) => Some(Selection::Face(face)),
+            (Some(Selection::Face(face)), SelectionMode::Edge) => {
+                Some(Selection::Edge(face_first_edge(face)))
+            }
+            (Some(Selection::Face(face)), SelectionMode::Vertex) => {
+                Some(Selection::Vertex(face_first_vertex(face)))
+            }
+            (Some(Selection::Edge(edge)), SelectionMode::Face) => {
+                edge_owning_face_ref(edge).map(Selection::Face)
+            }
+            (Some(Selection::Edge(edge)), SelectionMode::Vertex) => {
+                Some(Selection::Vertex(edge_first_vertex(edge)))
+            }
+            (Some(Selection::Vertex(v)), SelectionMode::Face) => {
+                vertex_owning_face_ref(v).map(Selection::Face)
+            }
+            (Some(Selection::Vertex(v)), SelectionMode::Edge) => {
+                Some(Selection::Edge(vertex_first_edge(v)))
+            }
+            (Some(s), m) if Self::matches_mode(s, m) => Some(s),
+            _ => None,
+        };
+        // Clear the hover too — its mode is the old one, and
+        // the next mouse-move re-pick will repopulate under the
+        // new mode anyway.
+        self.hovered_primitive = None;
+        self.status = format!("Selection mode: {}", mode.label());
+    }
+
+    fn matches_mode(selection: Selection, mode: SelectionMode) -> bool {
+        matches!(
+            (selection, mode),
+            (Selection::Face(_), SelectionMode::Face)
+                | (Selection::Edge(_), SelectionMode::Edge)
+                | (Selection::Vertex(_), SelectionMode::Vertex)
+        )
     }
 
     /// Snap the selected node's Y-rotation up by 90°. No-op on
@@ -2350,12 +2810,18 @@ impl EditorWorkspace {
                 panel_heading(ui, icons::SCAN, "Inspector");
                 ui.separator();
 
-                // Selection priority: face (Select tool product) →
-                // resource (clicked in the bottom panel) → node
-                // (scene tree row). Faces win because they're the
-                // active edit target during paint workflows.
-                if let Some(face) = self.selected_face {
-                    self.draw_face_inspector(ui, face);
+                // Selection priority: primitive (Select tool's
+                // product — face, edge, or vertex) → resource
+                // (clicked in the bottom panel) → node (scene
+                // tree row). The primitive branch wins because
+                // it's the active edit target during paint and
+                // height-edit workflows.
+                if let Some(selection) = self.selected_primitive {
+                    match selection {
+                        Selection::Face(face) => self.draw_face_inspector(ui, face),
+                        Selection::Edge(edge) => self.draw_edge_inspector(ui, edge),
+                        Selection::Vertex(vertex) => self.draw_vertex_inspector(ui, vertex),
+                    }
                     return;
                 }
 
@@ -2567,6 +3033,175 @@ impl EditorWorkspace {
     /// Select tool. Surfaces material picker, height fields, and a
     /// preview thumbnail of the linked texture so the user can
     /// retarget materials without opening the resources panel.
+    /// Edge inspector — height of both endpoint vertices, with
+    /// a "Both" toggle for paired drag. Each endpoint resolves
+    /// through `physical_vertex` so a height edit propagates to
+    /// every face-corner sharing that physical point.
+    fn draw_edge_inspector(&mut self, ui: &mut egui::Ui, edge: EdgeRef) {
+        // Resolve both endpoints up front while the project is
+        // borrowed immutably. Keeps the edit phase below clear
+        // of cross-borrow tangles.
+        let (mut endpoint_a, mut endpoint_b) = match self
+            .room_grid_view(edge.room)
+            .and_then(|grid| edge_endpoints(grid, edge))
+        {
+            Some(pair) => pair,
+            None => {
+                ui.weak("Edge target is gone");
+                return;
+            }
+        };
+
+        ui.horizontal(|ui| {
+            draw_inline_icon(ui, icons::GRID, STUDIO_ACCENT);
+            ui.strong(describe_edge(edge));
+        });
+        ui.separator();
+
+        let mut new_a = endpoint_a.world[1];
+        let mut new_b = endpoint_b.world[1];
+        let mut changed_a = false;
+        let mut changed_b = false;
+        ui.horizontal(|ui| {
+            ui.label("    A");
+            if ui
+                .add(egui::DragValue::new(&mut new_a).speed(HEIGHT_QUANTUM as f32))
+                .changed()
+            {
+                changed_a = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("    B");
+            if ui
+                .add(egui::DragValue::new(&mut new_b).speed(HEIGHT_QUANTUM as f32))
+                .changed()
+            {
+                changed_b = true;
+            }
+        });
+
+        if !(changed_a || changed_b) {
+            return;
+        }
+
+        // Apply against the active project. Push undo BEFORE
+        // mutating so the snapshot captures the pre-edit state.
+        self.push_undo();
+        let new_a = snap_height(new_a);
+        let new_b = snap_height(new_b);
+        endpoint_a.world[1] = new_a;
+        endpoint_b.world[1] = new_b;
+        let scene = self.project.active_scene_mut();
+        let Some(node) = scene.node_mut(edge.room) else {
+            return;
+        };
+        let NodeKind::Room { grid } = &mut node.kind else {
+            return;
+        };
+        if changed_a {
+            apply_vertex_height(grid, &endpoint_a, new_a);
+        }
+        if changed_b {
+            apply_vertex_height(grid, &endpoint_b, new_b);
+        }
+        let total_members = endpoint_a.members.len() + endpoint_b.members.len();
+        self.status = format!(
+            "Moved edge endpoints ({} face-corners follow)",
+            total_members
+        );
+        self.mark_dirty();
+    }
+
+    /// Vertex inspector — one Y handle for the whole
+    /// physical-vertex group. Lists every member so the user
+    /// sees what will move; a `Break` button raises the seed
+    /// alone by `HEIGHT_QUANTUM` so the user can split a shared
+    /// vertex into two.
+    fn draw_vertex_inspector(&mut self, ui: &mut egui::Ui, vertex: VertexRef) {
+        let mut physical = match self
+            .room_grid_view(vertex.room)
+            .and_then(|grid| physical_vertex(grid, vertex.anchor.as_face_corner()))
+        {
+            Some(pv) => pv,
+            None => {
+                ui.weak("Vertex target is gone");
+                return;
+            }
+        };
+
+        ui.horizontal(|ui| {
+            draw_inline_icon(ui, icons::GRID, STUDIO_ACCENT);
+            ui.strong(describe_vertex(vertex));
+        });
+        ui.label(format!(
+            "world {} {} {}",
+            physical.world[0], physical.world[1], physical.world[2]
+        ));
+        ui.separator();
+
+        let mut new_y = physical.world[1];
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("    Y");
+            if ui
+                .add(egui::DragValue::new(&mut new_y).speed(HEIGHT_QUANTUM as f32))
+                .changed()
+            {
+                changed = true;
+            }
+        });
+
+        let break_clicked = ui
+            .button("Break")
+            .on_hover_text(
+                "Move this corner alone by one quantum, splitting it from the shared group.",
+            )
+            .clicked();
+
+        egui::CollapsingHeader::new(format!(
+            "Members ({})",
+            physical.members.len()
+        ))
+        .default_open(false)
+        .show(ui, |ui| {
+            for member in &physical.members {
+                ui.label(face_corner_label(*member));
+            }
+        });
+
+        if changed {
+            self.push_undo();
+            let new_y = snap_height(new_y);
+            physical.world[1] = new_y;
+            let scene = self.project.active_scene_mut();
+            if let Some(node) = scene.node_mut(vertex.room) {
+                if let NodeKind::Room { grid } = &mut node.kind {
+                    apply_vertex_height(grid, &physical, new_y);
+                    self.status = format!(
+                        "Moved vertex ({} face-corners follow)",
+                        physical.members.len()
+                    );
+                    self.mark_dirty();
+                }
+            }
+        } else if break_clicked {
+            self.push_undo();
+            let new_y = snap_height(physical.world[1] + HEIGHT_QUANTUM);
+            // Apply only to the seed — the rest of the group
+            // stays put, so they cease being coincident.
+            let seed = vertex.anchor.as_face_corner();
+            let scene = self.project.active_scene_mut();
+            if let Some(node) = scene.node_mut(vertex.room) {
+                if let NodeKind::Room { grid } = &mut node.kind {
+                    write_face_corner_height(grid, seed, new_y);
+                    self.status = "Broke vertex; seed corner moved by one quantum".to_string();
+                    self.mark_dirty();
+                }
+            }
+        }
+    }
+
     fn draw_face_inspector(&mut self, ui: &mut egui::Ui, face: FaceRef) {
         // Deferred navigation request: pickers fill this in when
         // the user clicks the `→` jump button. Applied after the
@@ -2745,7 +3380,7 @@ impl EditorWorkspace {
         // buttons. Safe here because the mutable scene borrow
         // ended at the end of the match block above.
         if let Some(target) = nav_target {
-            self.selected_face = None;
+            self.selected_primitive = None;
             self.selected_resource = Some(target);
         }
     }
@@ -3099,7 +3734,11 @@ impl EditorWorkspace {
                         self.project.resource(id).map(|r| &r.data),
                         Some(ResourceData::Material(_))
                     );
-                    if let (true, Some(face)) = (is_material, self.selected_face) {
+                    let face_for_assign = self
+                        .selected_primitive
+                        .and_then(|s| s.as_face())
+                        .filter(|_| is_material);
+                    if let Some(face) = face_for_assign {
                         if self.assign_face_material(face, Some(id)) {
                             self.status =
                                 format!("Assigned material to {}", describe_face(face));
@@ -3108,7 +3747,7 @@ impl EditorWorkspace {
                     } else {
                         self.selected_resource = Some(id);
                         self.selected_node = NodeId::ROOT;
-                        self.selected_face = None;
+                        self.selected_primitive = None;
                     }
                 }
             });
@@ -3274,7 +3913,9 @@ impl EditorWorkspace {
                     }
                 });
                 ui.separator();
-                if matches!(self.active_tool, ViewTool::Place) {
+                if matches!(self.active_tool, ViewTool::Select) {
+                    self.draw_selection_mode_picker(ui);
+                } else if matches!(self.active_tool, ViewTool::Place) {
                     self.draw_place_kind_picker(ui);
                 } else {
                     self.draw_brush_material_picker(ui);
@@ -3323,6 +3964,29 @@ impl EditorWorkspace {
     /// Toolbar selector for the Place tool's node kind. Shown
     /// only while `active_tool == Place` — otherwise the brush
     /// material picker takes the same slot.
+    /// Toolbar selector for the Select tool's primitive mode.
+    /// Visible only while `active_tool == Select`. Mirrors the
+    /// `1` / `2` / `3` hotkeys; clicking goes through
+    /// `set_selection_mode` so the existing selection adapts.
+    fn draw_selection_mode_picker(&mut self, ui: &mut egui::Ui) {
+        ui.label(icons::label(icons::POINTER, "Mode"));
+        for mode in [SelectionMode::Face, SelectionMode::Edge, SelectionMode::Vertex] {
+            if ui
+                .selectable_label(self.selection_mode == mode, mode.label())
+                .on_hover_text(match mode {
+                    SelectionMode::Face => "Pick a whole face (1).",
+                    SelectionMode::Edge => "Pick the closest edge of the face under the cursor (2).",
+                    SelectionMode::Vertex => {
+                        "Pick the closest corner of the face under the cursor (3)."
+                    }
+                })
+                .clicked()
+            {
+                self.set_selection_mode(mode);
+            }
+        }
+    }
+
     fn draw_place_kind_picker(&mut self, ui: &mut egui::Ui) {
         ui.label(icons::label(icons::PLUS, "Place"));
         for kind in [
@@ -3367,8 +4031,8 @@ impl EditorWorkspace {
     /// selection sits outside the scene tree (e.g. a face the user
     /// just picked, which clears `selected_node` to ROOT).
     fn active_room_id(&self) -> Option<NodeId> {
-        if let Some(face) = self.selected_face {
-            return Some(face.room);
+        if let Some(selection) = self.selected_primitive {
+            return Some(selection.room());
         }
         let scene = self.project.active_scene();
         let mut current = self.selected_node;
@@ -5895,6 +6559,298 @@ fn describe_face(face: FaceRef) -> String {
     }
 }
 
+/// Status-line / breadcrumb text for any `Selection`. Falls
+/// through to `describe_face` for face selections so existing
+/// face copy stays identical.
+pub fn describe_selection(selection: Selection) -> String {
+    match selection {
+        Selection::Face(face) => describe_face(face),
+        Selection::Edge(edge) => describe_edge(edge),
+        Selection::Vertex(vertex) => describe_vertex(vertex),
+    }
+}
+
+fn describe_edge(edge: EdgeRef) -> String {
+    match edge.anchor {
+        EdgeAnchor::Floor { sx, sz, dir } => {
+            format!("Floor {} edge at {sx},{sz}", direction_label(dir))
+        }
+        EdgeAnchor::Ceiling { sx, sz, dir } => {
+            format!("Ceiling {} edge at {sx},{sz}", direction_label(dir))
+        }
+        EdgeAnchor::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            edge,
+        } => format!(
+            "{} wall #{stack} {} edge at {sx},{sz}",
+            direction_label(dir),
+            wall_edge_label(edge),
+        ),
+    }
+}
+
+fn describe_vertex(vertex: VertexRef) -> String {
+    match vertex.anchor {
+        VertexAnchor::Floor { sx, sz, corner } => {
+            format!("Floor {} vertex at {sx},{sz}", corner_label(corner))
+        }
+        VertexAnchor::Ceiling { sx, sz, corner } => {
+            format!("Ceiling {} vertex at {sx},{sz}", corner_label(corner))
+        }
+        VertexAnchor::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            corner,
+        } => format!(
+            "{} wall #{stack} {} vertex at {sx},{sz}",
+            direction_label(dir),
+            wall_corner_label(corner),
+        ),
+    }
+}
+
+/// Adapter: face → its first edge (north for floor / ceiling,
+/// bottom for walls). Used by mode-switch logic so a face
+/// selection naturally promotes into one of its edges.
+fn face_first_edge(face: FaceRef) -> EdgeRef {
+    let anchor = match face.kind {
+        FaceKind::Floor => EdgeAnchor::Floor {
+            sx: face.sx,
+            sz: face.sz,
+            dir: GridDirection::North,
+        },
+        FaceKind::Ceiling => EdgeAnchor::Ceiling {
+            sx: face.sx,
+            sz: face.sz,
+            dir: GridDirection::North,
+        },
+        FaceKind::Wall { dir, stack } => EdgeAnchor::Wall {
+            sx: face.sx,
+            sz: face.sz,
+            dir,
+            stack,
+            edge: WallEdge::Bottom,
+        },
+    };
+    EdgeRef {
+        room: face.room,
+        anchor,
+    }
+}
+
+/// Adapter: face → its first vertex (NW for floor / ceiling,
+/// BL for walls).
+fn face_first_vertex(face: FaceRef) -> VertexRef {
+    let anchor = match face.kind {
+        FaceKind::Floor => VertexAnchor::Floor {
+            sx: face.sx,
+            sz: face.sz,
+            corner: Corner::NW,
+        },
+        FaceKind::Ceiling => VertexAnchor::Ceiling {
+            sx: face.sx,
+            sz: face.sz,
+            corner: Corner::NW,
+        },
+        FaceKind::Wall { dir, stack } => VertexAnchor::Wall {
+            sx: face.sx,
+            sz: face.sz,
+            dir,
+            stack,
+            corner: WallCorner::BL,
+        },
+    };
+    VertexRef {
+        room: face.room,
+        anchor,
+    }
+}
+
+/// Adapter: edge → the face that owns it. Used when the user
+/// switches from Edge mode back to Face mode and we don't want
+/// to lose context.
+fn edge_owning_face_ref(edge: EdgeRef) -> Option<FaceRef> {
+    let kind = match edge.anchor {
+        EdgeAnchor::Floor { .. } => FaceKind::Floor,
+        EdgeAnchor::Ceiling { .. } => FaceKind::Ceiling,
+        EdgeAnchor::Wall { dir, stack, .. } => FaceKind::Wall { dir, stack },
+    };
+    let (sx, sz) = match edge.anchor {
+        EdgeAnchor::Floor { sx, sz, .. }
+        | EdgeAnchor::Ceiling { sx, sz, .. }
+        | EdgeAnchor::Wall { sx, sz, .. } => (sx, sz),
+    };
+    Some(FaceRef {
+        room: edge.room,
+        sx,
+        sz,
+        kind,
+    })
+}
+
+/// Adapter: edge → its first endpoint vertex. Edge perimeter
+/// convention: floor / ceiling north = NW-NE, east = NE-SE,
+/// south = SE-SW, west = SW-NW. Wall bottom = BL-BR, right =
+/// BR-TR, top = TR-TL, left = TL-BL. The "first" vertex is
+/// the leading corner of that walk.
+fn edge_first_vertex(edge: EdgeRef) -> VertexRef {
+    let anchor = match edge.anchor {
+        EdgeAnchor::Floor { sx, sz, dir } => VertexAnchor::Floor {
+            sx,
+            sz,
+            corner: edge_first_floor_corner(dir),
+        },
+        EdgeAnchor::Ceiling { sx, sz, dir } => VertexAnchor::Ceiling {
+            sx,
+            sz,
+            corner: edge_first_floor_corner(dir),
+        },
+        EdgeAnchor::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            edge,
+        } => VertexAnchor::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            corner: edge_first_wall_corner(edge),
+        },
+    };
+    VertexRef {
+        room: edge.room,
+        anchor,
+    }
+}
+
+const fn edge_first_floor_corner(dir: GridDirection) -> Corner {
+    match dir {
+        GridDirection::North => Corner::NW,
+        GridDirection::East => Corner::NE,
+        GridDirection::South => Corner::SE,
+        GridDirection::West => Corner::SW,
+        // Diagonals shouldn't reach this code path (cooker
+        // rejects them); pick NW arbitrarily so the function
+        // stays total.
+        _ => Corner::NW,
+    }
+}
+
+const fn edge_first_wall_corner(edge: WallEdge) -> WallCorner {
+    match edge {
+        WallEdge::Bottom => WallCorner::BL,
+        WallEdge::Right => WallCorner::BR,
+        WallEdge::Top => WallCorner::TR,
+        WallEdge::Left => WallCorner::TL,
+    }
+}
+
+/// Adapter: vertex → owning face.
+fn vertex_owning_face_ref(vertex: VertexRef) -> Option<FaceRef> {
+    let kind = match vertex.anchor {
+        VertexAnchor::Floor { .. } => FaceKind::Floor,
+        VertexAnchor::Ceiling { .. } => FaceKind::Ceiling,
+        VertexAnchor::Wall { dir, stack, .. } => FaceKind::Wall { dir, stack },
+    };
+    let (sx, sz) = match vertex.anchor {
+        VertexAnchor::Floor { sx, sz, .. }
+        | VertexAnchor::Ceiling { sx, sz, .. }
+        | VertexAnchor::Wall { sx, sz, .. } => (sx, sz),
+    };
+    Some(FaceRef {
+        room: vertex.room,
+        sx,
+        sz,
+        kind,
+    })
+}
+
+/// Adapter: vertex → one of the two edges it sits on. Picks
+/// the first walking the perimeter from this corner.
+fn vertex_first_edge(vertex: VertexRef) -> EdgeRef {
+    let anchor = match vertex.anchor {
+        VertexAnchor::Floor { sx, sz, corner } => EdgeAnchor::Floor {
+            sx,
+            sz,
+            dir: floor_corner_first_edge(corner),
+        },
+        VertexAnchor::Ceiling { sx, sz, corner } => EdgeAnchor::Ceiling {
+            sx,
+            sz,
+            dir: floor_corner_first_edge(corner),
+        },
+        VertexAnchor::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            corner,
+        } => EdgeAnchor::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            edge: wall_corner_first_edge(corner),
+        },
+    };
+    EdgeRef {
+        room: vertex.room,
+        anchor,
+    }
+}
+
+const fn floor_corner_first_edge(corner: Corner) -> GridDirection {
+    match corner {
+        Corner::NW => GridDirection::North,
+        Corner::NE => GridDirection::East,
+        Corner::SE => GridDirection::South,
+        Corner::SW => GridDirection::West,
+    }
+}
+
+const fn wall_corner_first_edge(corner: WallCorner) -> WallEdge {
+    match corner {
+        WallCorner::BL => WallEdge::Bottom,
+        WallCorner::BR => WallEdge::Right,
+        WallCorner::TR => WallEdge::Top,
+        WallCorner::TL => WallEdge::Left,
+    }
+}
+
+const fn corner_label(corner: Corner) -> &'static str {
+    match corner {
+        Corner::NW => "NW",
+        Corner::NE => "NE",
+        Corner::SE => "SE",
+        Corner::SW => "SW",
+    }
+}
+
+const fn wall_corner_label(corner: WallCorner) -> &'static str {
+    match corner {
+        WallCorner::BL => "bottom-left",
+        WallCorner::BR => "bottom-right",
+        WallCorner::TR => "top-right",
+        WallCorner::TL => "top-left",
+    }
+}
+
+const fn wall_edge_label(edge: WallEdge) -> &'static str {
+    match edge {
+        WallEdge::Bottom => "bottom",
+        WallEdge::Right => "right",
+        WallEdge::Top => "top",
+        WallEdge::Left => "left",
+    }
+}
+
 fn direction_label(dir: GridDirection) -> &'static str {
     match dir {
         GridDirection::North => "North",
@@ -5921,6 +6877,399 @@ fn edge_from_world_offset(dx: f32, dz: f32) -> GridDirection {
         GridDirection::East
     } else {
         GridDirection::West
+    }
+}
+
+/// World-space integer position of `corner` in the room
+/// described by `grid`. Returns `None` if the addressed face
+/// no longer exists (cell out of bounds, geometry missing).
+pub fn face_corner_world(grid: &WorldGrid, corner: FaceCornerRef) -> Option<[i32; 3]> {
+    match corner {
+        FaceCornerRef::Floor { sx, sz, corner } => {
+            if sx >= grid.width || sz >= grid.depth {
+                return None;
+            }
+            let face = grid.sector(sx, sz)?.floor.as_ref()?;
+            Some(floor_corner_world(grid, sx, sz, corner, face.heights))
+        }
+        FaceCornerRef::Ceiling { sx, sz, corner } => {
+            if sx >= grid.width || sz >= grid.depth {
+                return None;
+            }
+            let face = grid.sector(sx, sz)?.ceiling.as_ref()?;
+            Some(floor_corner_world(grid, sx, sz, corner, face.heights))
+        }
+        FaceCornerRef::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            corner,
+        } => {
+            if sx >= grid.width || sz >= grid.depth {
+                return None;
+            }
+            let walls = grid.sector(sx, sz)?.walls.get(dir);
+            let wall = walls.get(stack as usize)?;
+            Some(wall_corner_world(grid, sx, sz, dir, corner, wall.heights))
+        }
+    }
+}
+
+fn floor_corner_world(
+    grid: &WorldGrid,
+    sx: u16,
+    sz: u16,
+    corner: Corner,
+    heights: [i32; 4],
+) -> [i32; 3] {
+    let s = grid.sector_size;
+    let x0 = grid.cell_world_x(sx);
+    let x1 = x0 + s;
+    let z0 = grid.cell_world_z(sz);
+    let z1 = z0 + s;
+    let (x, z) = match corner {
+        Corner::NW => (x0, z1),
+        Corner::NE => (x1, z1),
+        Corner::SE => (x1, z0),
+        Corner::SW => (x0, z0),
+    };
+    [x, heights[corner.idx()], z]
+}
+
+fn wall_corner_world(
+    grid: &WorldGrid,
+    sx: u16,
+    sz: u16,
+    dir: GridDirection,
+    corner: WallCorner,
+    heights: [i32; 4],
+) -> [i32; 3] {
+    let s = grid.sector_size as f32;
+    let x0 = grid.cell_world_x(sx) as f32;
+    let x1 = x0 + s;
+    let z0 = grid.cell_world_z(sz) as f32;
+    let z1 = z0 + s;
+    let (bl, br) = wall_xy_endpoints(dir, x0, x1, z0, z1);
+    let (x_f, z_f) = match corner {
+        // BL / TL share the BL endpoint; BR / TR share BR.
+        WallCorner::BL | WallCorner::TL => bl,
+        WallCorner::BR | WallCorner::TR => br,
+    };
+    [x_f as i32, heights[corner.idx()], z_f as i32]
+}
+
+/// Universal coincidence resolver. Returns the physical vertex
+/// containing `seed` — every face-corner whose current world
+/// position equals the seed's world position. Walks every
+/// floor / ceiling / wall corner in the grid (`O(faces × 4)`,
+/// runs in microseconds for 32×32 rooms).
+pub fn physical_vertex(grid: &WorldGrid, seed: FaceCornerRef) -> Option<PhysicalVertex> {
+    let world = face_corner_world(grid, seed)?;
+    let mut members = Vec::new();
+    for sx in 0..grid.width {
+        for sz in 0..grid.depth {
+            let Some(sector) = grid.sector(sx, sz) else {
+                continue;
+            };
+            if sector.floor.is_some() {
+                for c in [Corner::NW, Corner::NE, Corner::SE, Corner::SW] {
+                    let r = FaceCornerRef::Floor { sx, sz, corner: c };
+                    if face_corner_world(grid, r) == Some(world) {
+                        members.push(r);
+                    }
+                }
+            }
+            if sector.ceiling.is_some() {
+                for c in [Corner::NW, Corner::NE, Corner::SE, Corner::SW] {
+                    let r = FaceCornerRef::Ceiling { sx, sz, corner: c };
+                    if face_corner_world(grid, r) == Some(world) {
+                        members.push(r);
+                    }
+                }
+            }
+            for dir in [
+                GridDirection::North,
+                GridDirection::East,
+                GridDirection::South,
+                GridDirection::West,
+            ] {
+                for (stack_idx, _) in sector.walls.get(dir).iter().enumerate() {
+                    for c in [WallCorner::BL, WallCorner::BR, WallCorner::TR, WallCorner::TL] {
+                        let r = FaceCornerRef::Wall {
+                            sx,
+                            sz,
+                            dir,
+                            stack: stack_idx as u8,
+                            corner: c,
+                        };
+                        if face_corner_world(grid, r) == Some(world) {
+                            members.push(r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(PhysicalVertex { world, members })
+}
+
+/// Pair of physical vertices that bound `edge`. Returns `None`
+/// if either endpoint can't be resolved (face removed, cell
+/// out of bounds).
+pub fn edge_endpoints(
+    grid: &WorldGrid,
+    edge: EdgeRef,
+) -> Option<(PhysicalVertex, PhysicalVertex)> {
+    let (a, b) = edge_endpoint_corners(edge);
+    let pa = physical_vertex(grid, a)?;
+    let pb = physical_vertex(grid, b)?;
+    Some((pa, pb))
+}
+
+/// Endpoint face-corners of `edge` as `(start, end)`. Order
+/// matches the perimeter walk used elsewhere — north = NW→NE,
+/// east = NE→SE, etc.
+fn edge_endpoint_corners(edge: EdgeRef) -> (FaceCornerRef, FaceCornerRef) {
+    match edge.anchor {
+        EdgeAnchor::Floor { sx, sz, dir } => {
+            let (ca, cb) = floor_edge_endpoints(dir);
+            (
+                FaceCornerRef::Floor {
+                    sx,
+                    sz,
+                    corner: ca,
+                },
+                FaceCornerRef::Floor {
+                    sx,
+                    sz,
+                    corner: cb,
+                },
+            )
+        }
+        EdgeAnchor::Ceiling { sx, sz, dir } => {
+            let (ca, cb) = floor_edge_endpoints(dir);
+            (
+                FaceCornerRef::Ceiling {
+                    sx,
+                    sz,
+                    corner: ca,
+                },
+                FaceCornerRef::Ceiling {
+                    sx,
+                    sz,
+                    corner: cb,
+                },
+            )
+        }
+        EdgeAnchor::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            edge,
+        } => {
+            let (ca, cb) = wall_edge_endpoints(edge);
+            (
+                FaceCornerRef::Wall {
+                    sx,
+                    sz,
+                    dir,
+                    stack,
+                    corner: ca,
+                },
+                FaceCornerRef::Wall {
+                    sx,
+                    sz,
+                    dir,
+                    stack,
+                    corner: cb,
+                },
+            )
+        }
+    }
+}
+
+const fn floor_edge_endpoints(dir: GridDirection) -> (Corner, Corner) {
+    match dir {
+        GridDirection::North => (Corner::NW, Corner::NE),
+        GridDirection::East => (Corner::NE, Corner::SE),
+        GridDirection::South => (Corner::SE, Corner::SW),
+        GridDirection::West => (Corner::SW, Corner::NW),
+        // Diagonals — pick the two corners on the diagonal so
+        // the inspector can at least show something. Picker
+        // doesn't produce these because the cooker rejects
+        // diagonal walls.
+        _ => (Corner::NW, Corner::SE),
+    }
+}
+
+const fn wall_edge_endpoints(edge: WallEdge) -> (WallCorner, WallCorner) {
+    match edge {
+        WallEdge::Bottom => (WallCorner::BL, WallCorner::BR),
+        WallEdge::Right => (WallCorner::BR, WallCorner::TR),
+        WallEdge::Top => (WallCorner::TR, WallCorner::TL),
+        WallEdge::Left => (WallCorner::TL, WallCorner::BL),
+    }
+}
+
+/// Inspector member-list label.
+fn face_corner_label(corner: FaceCornerRef) -> String {
+    match corner {
+        FaceCornerRef::Floor { sx, sz, corner } => {
+            format!("Floor ({sx},{sz}) {}", corner_label(corner))
+        }
+        FaceCornerRef::Ceiling { sx, sz, corner } => {
+            format!("Ceiling ({sx},{sz}) {}", corner_label(corner))
+        }
+        FaceCornerRef::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            corner,
+        } => format!(
+            "{} wall #{stack} ({sx},{sz}) {}",
+            direction_label(dir),
+            wall_corner_label(corner)
+        ),
+    }
+}
+
+/// Apply a new Y to every member of `vertex`. X / Z are
+/// preserved by construction — `face_corner_world` returns the
+/// current `(X, Y, Z)` and we only ever rewrite the corner's
+/// height array entry.
+pub fn apply_vertex_height(grid: &mut WorldGrid, vertex: &PhysicalVertex, new_y: i32) {
+    let new_y = snap_height(new_y);
+    for member in &vertex.members {
+        write_face_corner_height(grid, *member, new_y);
+    }
+}
+
+fn write_face_corner_height(grid: &mut WorldGrid, corner: FaceCornerRef, new_y: i32) {
+    match corner {
+        FaceCornerRef::Floor { sx, sz, corner } => {
+            if let Some(sector) = grid.sector_mut(sx, sz) {
+                if let Some(face) = sector.floor.as_mut() {
+                    face.heights[corner.idx()] = new_y;
+                }
+            }
+        }
+        FaceCornerRef::Ceiling { sx, sz, corner } => {
+            if let Some(sector) = grid.sector_mut(sx, sz) {
+                if let Some(face) = sector.ceiling.as_mut() {
+                    face.heights[corner.idx()] = new_y;
+                }
+            }
+        }
+        FaceCornerRef::Wall {
+            sx,
+            sz,
+            dir,
+            stack,
+            corner,
+        } => {
+            if let Some(sector) = grid.sector_mut(sx, sz) {
+                if let Some(wall) = sector.walls.get_mut(dir).get_mut(stack as usize) {
+                    wall.heights[corner.idx()] = new_y;
+                }
+            }
+        }
+    }
+}
+
+/// Index of the corner closest (3D distance) to `hit` among
+/// the four `corners`. Caller is responsible for the corner
+/// ordering convention — `[NW, NE, SE, SW]` for floors /
+/// ceilings, `[BL, BR, TR, TL]` for walls.
+fn closest_corner_idx(corners: &[[f32; 3]; 4], hit: [f32; 3]) -> usize {
+    let mut best = 0usize;
+    let mut best_d2 = f32::INFINITY;
+    for (i, c) in corners.iter().enumerate() {
+        let d2 = dist2_3d(*c, hit);
+        if d2 < best_d2 {
+            best = i;
+            best_d2 = d2;
+        }
+    }
+    best
+}
+
+/// Index of the edge (perimeter walk: 0..3) closest to `hit`.
+/// Edge `i` runs `corners[i] → corners[(i+1) % 4]`.
+fn closest_edge_idx(corners: &[[f32; 3]; 4], hit: [f32; 3]) -> usize {
+    let mut best = 0usize;
+    let mut best_d2 = f32::INFINITY;
+    for i in 0..4 {
+        let a = corners[i];
+        let b = corners[(i + 1) % 4];
+        let d2 = point_segment_dist2(hit, a, b);
+        if d2 < best_d2 {
+            best = i;
+            best_d2 = d2;
+        }
+    }
+    best
+}
+
+fn dist2_3d(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
+}
+
+/// Squared distance from point `p` to the segment `a-b`.
+fn point_segment_dist2(p: [f32; 3], a: [f32; 3], b: [f32; 3]) -> f32 {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let t = if len2 > 0.0 {
+        ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let q = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+    dist2_3d(q, p)
+}
+
+/// Floor / ceiling corner index `0..3` → `Corner` (NW, NE,
+/// SE, SW in perimeter order).
+const fn floor_corner_idx(idx: usize) -> Corner {
+    match idx {
+        0 => Corner::NW,
+        1 => Corner::NE,
+        2 => Corner::SE,
+        _ => Corner::SW,
+    }
+}
+
+const fn wall_corner_idx(idx: usize) -> WallCorner {
+    match idx {
+        0 => WallCorner::BL,
+        1 => WallCorner::BR,
+        2 => WallCorner::TR,
+        _ => WallCorner::TL,
+    }
+}
+
+/// Floor / ceiling edge index `0..3` → cardinal `GridDirection`.
+const fn floor_edge_dir(idx: usize) -> GridDirection {
+    match idx {
+        0 => GridDirection::North,
+        1 => GridDirection::East,
+        2 => GridDirection::South,
+        _ => GridDirection::West,
+    }
+}
+
+const fn wall_edge_idx(idx: usize) -> WallEdge {
+    match idx {
+        0 => WallEdge::Bottom,
+        1 => WallEdge::Right,
+        2 => WallEdge::Top,
+        _ => WallEdge::Left,
     }
 }
 
@@ -6579,5 +7928,159 @@ mod tests {
             ResourceFilter::Material,
             "brick"
         ));
+    }
+
+    fn cell_with_floor(material: Option<psxed_project::ResourceId>) -> psxed_project::GridSector {
+        psxed_project::GridSector {
+            floor: Some(psxed_project::GridHorizontalFace::flat(0, material)),
+            ceiling: None,
+            walls: psxed_project::GridWalls::default(),
+        }
+    }
+
+    fn populated_grid(width: u16, depth: u16) -> WorldGrid {
+        let mut grid = WorldGrid::empty(width, depth, 1024);
+        for sx in 0..width {
+            for sz in 0..depth {
+                if let Some(s) = grid.ensure_sector(sx, sz) {
+                    *s = cell_with_floor(None);
+                }
+            }
+        }
+        grid
+    }
+
+    #[test]
+    fn physical_vertex_isolated_corner_returns_self_only() {
+        let grid = populated_grid(1, 1);
+        let seed = FaceCornerRef::Floor {
+            sx: 0,
+            sz: 0,
+            corner: Corner::NW,
+        };
+        let pv = physical_vertex(&grid, seed).unwrap();
+        assert_eq!(pv.members, vec![seed]);
+    }
+
+    #[test]
+    fn physical_vertex_interior_grid_corner_returns_four_floors() {
+        let grid = populated_grid(2, 2);
+        // Cell (0, 0) NE shares its world position with three
+        // other cells' corresponding corners.
+        let seed = FaceCornerRef::Floor {
+            sx: 0,
+            sz: 0,
+            corner: Corner::NE,
+        };
+        let pv = physical_vertex(&grid, seed).unwrap();
+        assert_eq!(pv.members.len(), 4, "{:?}", pv.members);
+        // Spot-check that the expected siblings are in the set.
+        assert!(pv.members.contains(&FaceCornerRef::Floor {
+            sx: 1,
+            sz: 0,
+            corner: Corner::NW,
+        }));
+        assert!(pv.members.contains(&FaceCornerRef::Floor {
+            sx: 0,
+            sz: 1,
+            corner: Corner::SE,
+        }));
+        assert!(pv.members.contains(&FaceCornerRef::Floor {
+            sx: 1,
+            sz: 1,
+            corner: Corner::SW,
+        }));
+    }
+
+    #[test]
+    fn physical_vertex_skips_unpopulated_cells() {
+        // 2×2 grid with only three cells populated. The corner
+        // they all share should yield exactly 3 members.
+        let mut grid = WorldGrid::empty(2, 2, 1024);
+        for (sx, sz) in [(0u16, 0u16), (1, 0), (0, 1)] {
+            if let Some(s) = grid.ensure_sector(sx, sz) {
+                *s = cell_with_floor(None);
+            }
+        }
+        let seed = FaceCornerRef::Floor {
+            sx: 0,
+            sz: 0,
+            corner: Corner::NE,
+        };
+        let pv = physical_vertex(&grid, seed).unwrap();
+        assert_eq!(pv.members.len(), 3);
+    }
+
+    #[test]
+    fn apply_vertex_height_writes_every_member() {
+        let mut grid = populated_grid(2, 2);
+        let seed = FaceCornerRef::Floor {
+            sx: 0,
+            sz: 0,
+            corner: Corner::NE,
+        };
+        let pv = physical_vertex(&grid, seed).unwrap();
+        apply_vertex_height(&mut grid, &pv, 64);
+        for member in &pv.members {
+            let world = face_corner_world(&grid, *member).unwrap();
+            assert_eq!(world[1], 64, "{:?}", member);
+        }
+    }
+
+    #[test]
+    fn apply_vertex_height_break_action_separates_seed() {
+        let mut grid = populated_grid(2, 2);
+        let seed = FaceCornerRef::Floor {
+            sx: 0,
+            sz: 0,
+            corner: Corner::NE,
+        };
+        let pv = physical_vertex(&grid, seed).unwrap();
+        // Move only the seed by writing directly via the helper.
+        write_face_corner_height(&mut grid, seed, 32);
+        // Re-resolve from a former neighbour. Should now contain
+        // 3 members (the seed has departed).
+        let neighbour = FaceCornerRef::Floor {
+            sx: 1,
+            sz: 0,
+            corner: Corner::NW,
+        };
+        let after = physical_vertex(&grid, neighbour).unwrap();
+        assert_eq!(after.members.len(), 3);
+        assert!(!after.members.contains(&seed));
+    }
+
+    #[test]
+    fn closest_corner_idx_picks_nearest_corner() {
+        let corners = [
+            [0.0_f32, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 0.0, 10.0],
+            [0.0, 0.0, 10.0],
+        ];
+        // Each quadrant of the unit square should resolve to
+        // the nearest corner.
+        assert_eq!(closest_corner_idx(&corners, [1.0, 0.0, 1.0]), 0);
+        assert_eq!(closest_corner_idx(&corners, [9.0, 0.0, 1.0]), 1);
+        assert_eq!(closest_corner_idx(&corners, [9.0, 0.0, 9.0]), 2);
+        assert_eq!(closest_corner_idx(&corners, [1.0, 0.0, 9.0]), 3);
+    }
+
+    #[test]
+    fn closest_edge_idx_picks_nearest_edge() {
+        let corners = [
+            [0.0_f32, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 0.0, 10.0],
+            [0.0, 0.0, 10.0],
+        ];
+        // (5, 0, 0.5) → near edge 0 (corners 0–1).
+        assert_eq!(closest_edge_idx(&corners, [5.0, 0.0, 0.5]), 0);
+        // (9.5, 0, 5) → near edge 1 (corners 1–2).
+        assert_eq!(closest_edge_idx(&corners, [9.5, 0.0, 5.0]), 1);
+        // (5, 0, 9.5) → near edge 2 (corners 2–3).
+        assert_eq!(closest_edge_idx(&corners, [5.0, 0.0, 9.5]), 2);
+        // (0.5, 0, 5) → near edge 3 (corners 3–0).
+        assert_eq!(closest_edge_idx(&corners, [0.5, 0.0, 5.0]), 3);
     }
 }
