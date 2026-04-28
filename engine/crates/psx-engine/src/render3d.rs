@@ -34,6 +34,25 @@ const MAX_TEXTURED_HW_SPLIT_DEPTH: u8 = 5;
 const WORLD_COMMAND_NONE: u16 = u16::MAX;
 const GOURAUD_COMMAND_NONE: u16 = u16::MAX;
 
+/// Canonical quad → triangle split.
+///
+/// Quad corners arrive in perimeter order `[0, 1, 2, 3]`:
+///
+/// ```text
+///   0 ─────── 1
+///   │         │
+///   3 ─────── 2
+/// ```
+///
+/// Both triangles share the `0`–`2` diagonal so the union covers
+/// the whole quad with no overlap. A pre-history version split
+/// the second triangle as `(2, 1, 3)`, which uses the OTHER
+/// diagonal — the two halves overlap at the `1`–`2` edge and
+/// leave a triangular hole near corner `3`. That manifested as
+/// the "black triangular gaps" floor-rendering bug. Centralised
+/// here so every quad-submitting path uses the same split.
+const TEXTURED_QUAD_TRIANGLES: [[usize; 3]; 2] = [[0, 1, 2], [0, 2, 3]];
+
 /// Scalar depth policy used to bucket a triangle into the ordering table.
 ///
 /// The PS1 has no z-buffer, so every triangle eventually becomes one
@@ -818,6 +837,11 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
 
     /// Submit a projected textured quad as two independently culled
     /// and sorted textured triangles.
+    ///
+    /// Corners arrive in perimeter order `[0, 1, 2, 3]`. Triangles
+    /// are split along the `0`–`2` diagonal — see
+    /// [`TEXTURED_QUAD_TRIANGLES`] for why the alternate split is
+    /// wrong.
     pub fn submit_textured_quad(
         &mut self,
         triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -826,10 +850,11 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         material: TextureMaterial,
         options: WorldSurfaceOptions,
     ) -> WorldRenderStats {
+        let [a, b, c] = TEXTURED_QUAD_TRIANGLES[0];
         let mut stats = self.submit_textured_triangle(
             triangles,
-            [verts[0], verts[1], verts[2]],
-            [uvs[0], uvs[1], uvs[2]],
+            [verts[a], verts[b], verts[c]],
+            [uvs[a], uvs[b], uvs[c]],
             material,
             options,
         );
@@ -837,10 +862,11 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             return stats;
         }
 
+        let [a, b, c] = TEXTURED_QUAD_TRIANGLES[1];
         let second = self.submit_textured_triangle(
             triangles,
-            [verts[2], verts[1], verts[3]],
-            [uvs[2], uvs[1], uvs[3]],
+            [verts[a], verts[b], verts[c]],
+            [uvs[a], uvs[b], uvs[c]],
             material,
             options,
         );
@@ -904,6 +930,9 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
 
     /// Submit a textured quad in camera space as two clipped,
     /// independently culled and sorted triangles.
+    ///
+    /// Corners arrive in perimeter order `[0, 1, 2, 3]`. Triangles
+    /// share the `0`–`2` diagonal per [`TEXTURED_QUAD_TRIANGLES`].
     pub fn submit_textured_view_quad(
         &mut self,
         triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -912,9 +941,10 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         material: TextureMaterial,
         options: WorldSurfaceOptions,
     ) -> WorldRenderStats {
+        let [a, b, c] = TEXTURED_QUAD_TRIANGLES[0];
         let mut stats = self.submit_textured_view_triangle(
             triangles,
-            [verts[0], verts[1], verts[2]],
+            [verts[a], verts[b], verts[c]],
             projection,
             material,
             options,
@@ -923,9 +953,10 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             return stats;
         }
 
+        let [a, b, c] = TEXTURED_QUAD_TRIANGLES[1];
         let second = self.submit_textured_view_triangle(
             triangles,
-            [verts[2], verts[1], verts[3]],
+            [verts[a], verts[b], verts[c]],
             projection,
             material,
             options,
@@ -2207,6 +2238,106 @@ mod tests {
             words: 0,
             order,
             next: WORLD_COMMAND_NONE,
+        }
+    }
+
+    /// The canonical quad split must always share the `0`–`2`
+    /// diagonal. The pre-fix bug used `(0,1,2)` + `(2,1,3)`,
+    /// which puts the second triangle on the OTHER diagonal and
+    /// leaves a triangular hole near corner `3`. This test fails
+    /// loudly if anyone reintroduces that pattern.
+    #[test]
+    fn textured_quad_triangles_share_zero_two_diagonal() {
+        assert_eq!(TEXTURED_QUAD_TRIANGLES[0], [0, 1, 2]);
+        assert_eq!(TEXTURED_QUAD_TRIANGLES[1], [0, 2, 3]);
+        // Both triangles must contain the diagonal endpoints.
+        for tri in TEXTURED_QUAD_TRIANGLES {
+            assert!(tri.contains(&0), "{tri:?} missing corner 0");
+            assert!(tri.contains(&2), "{tri:?} missing corner 2");
+        }
+        // All four corners must appear at least once across the
+        // two triangles — otherwise some part of the quad is
+        // never drawn.
+        for corner in 0..4 {
+            assert!(
+                TEXTURED_QUAD_TRIANGLES
+                    .iter()
+                    .any(|tri| tri.contains(&corner)),
+                "corner {corner} not covered"
+            );
+        }
+    }
+
+    /// For a convex unit square laid out as
+    ///
+    /// ```text
+    ///   (0,0) ─── (1,0)        0 ─ 1
+    ///     │         │          │   │
+    ///   (0,1) ─── (1,1)        3 ─ 2
+    /// ```
+    ///
+    /// both generated triangles must have the same signed-area
+    /// orientation. If they don't, one of them is flipped and a
+    /// `CullMode::Back` pass would reject one half — which is
+    /// exactly how the old buggy split looked: half the quad
+    /// rendered, half disappeared.
+    #[test]
+    fn textured_quad_split_produces_consistent_winding() {
+        // Screen-space corners as if the renderer just projected
+        // a unit-aligned floor quad. Y grows downward in PSX
+        // screen space, but the sign of the cross product is
+        // what we're checking — the absolute orientation
+        // doesn't matter.
+        let v: [(i32, i32); 4] = [(0, 0), (10, 0), (10, 10), (0, 10)];
+        let signed_area = |a: (i32, i32), b: (i32, i32), c: (i32, i32)| -> i32 {
+            let abx = b.0 - a.0;
+            let aby = b.1 - a.1;
+            let acx = c.0 - a.0;
+            let acy = c.1 - a.1;
+            abx * acy - aby * acx
+        };
+        let [a0, b0, c0] = TEXTURED_QUAD_TRIANGLES[0];
+        let [a1, b1, c1] = TEXTURED_QUAD_TRIANGLES[1];
+        let area0 = signed_area(v[a0], v[b0], v[c0]);
+        let area1 = signed_area(v[a1], v[b1], v[c1]);
+        assert!(area0 != 0, "first triangle is degenerate");
+        assert!(area1 != 0, "second triangle is degenerate");
+        assert_eq!(
+            area0.signum(),
+            area1.signum(),
+            "split halves must wind the same way (got {area0} vs {area1})"
+        );
+    }
+
+    /// The two halves must tile the quad without overlap. Picking
+    /// a point that lies strictly above the `0`–`2` diagonal should
+    /// land in exactly one triangle; the same goes for a point
+    /// below. Reproduces the old bug: under `(0,1,2)+(2,1,3)`, a
+    /// point in the lower-left quadrant (near corner `3`) lies in
+    /// neither half.
+    #[test]
+    fn textured_quad_split_tiles_the_quad_without_holes() {
+        let v: [(i32, i32); 4] = [(0, 0), (10, 0), (10, 10), (0, 10)];
+        // Inside-triangle test using barycentric sign check.
+        let in_triangle = |t: [usize; 3], p: (i32, i32)| -> bool {
+            let a = v[t[0]];
+            let b = v[t[1]];
+            let c = v[t[2]];
+            let s1 = (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+            let s2 = (c.0 - b.0) * (p.1 - b.1) - (c.1 - b.1) * (p.0 - b.0);
+            let s3 = (a.0 - c.0) * (p.1 - c.1) - (a.1 - c.1) * (p.0 - c.0);
+            (s1 >= 0 && s2 >= 0 && s3 >= 0) || (s1 <= 0 && s2 <= 0 && s3 <= 0)
+        };
+        // Probes carefully chosen so they're strictly *inside* one
+        // half or the other, never on the diagonal. The point
+        // (2, 7) is the killer probe: under the OLD `(2,1,3)`
+        // second triangle it falls into the hole (y > x AND
+        // x+y < 10), so the assertion below would have caught
+        // the bug at unit-test time.
+        for &p in &[(2, 1), (8, 2), (8, 8), (2, 7)] {
+            let covered = in_triangle(TEXTURED_QUAD_TRIANGLES[0], p)
+                || in_triangle(TEXTURED_QUAD_TRIANGLES[1], p);
+            assert!(covered, "point {p:?} fell into the split's hole");
         }
     }
 

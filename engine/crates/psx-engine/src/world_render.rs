@@ -53,6 +53,20 @@ const WALL_UVS: [(u8, u8); 4] = [(0, TILE_UV), (TILE_UV, TILE_UV), (TILE_UV, 0),
 /// only `cull_mode` per face kind: floors and ceilings use
 /// [`CullMode::None`], walls use [`CullMode::Back`].
 ///
+/// # Quad corner conventions
+///
+/// All four-corner inputs to [`WorldRenderPass::submit_textured_quad`]
+/// are emitted in perimeter order. The renderer splits along the
+/// `0`–`2` diagonal (see `TEXTURED_QUAD_TRIANGLES` in `render3d.rs`),
+/// so corner positions and UVs must agree on what `0`, `1`, `2`,
+/// `3` mean.
+///
+/// * **Floors / ceilings** — `[NW, NE, SE, SW]`. UVs match in the
+///   same order: `[(0,0), (T,0), (T,T), (0,T)]`.
+/// * **Walls** — `[bottom-left, bottom-right, top-right, top-left]`,
+///   measured from inside the cell looking at the wall. UVs match:
+///   `[(0,T), (T,T), (T,0), (0,0)]`.
+///
 /// [`SectorRender::floor_material`]: crate::SectorRender::floor_material
 /// [`SectorRender::ceiling_material`]: crate::SectorRender::ceiling_material
 /// [`WallRender::material`]: crate::WallRender::material
