@@ -227,9 +227,11 @@ pub struct LevelModelRecord {
     pub name: &'static str,
     /// Cooked `.psxmdl` asset.
     pub mesh_asset: AssetId,
-    /// Atlas texture asset, if the model carries one. Models
-    /// without atlases render flat-shaded at runtime — the
-    /// editor refuses to cook untextured models for now.
+    /// Atlas texture asset. The schema keeps this `Option` for
+    /// future flat-shaded / untextured model paths, but the
+    /// playtest cooker rejects placed instances of any model
+    /// without an atlas — the runtime model path renders
+    /// textured animated models only.
     pub texture_asset: Option<AssetId>,
     /// First index into the global `MODEL_CLIPS` table.
     pub clip_first: u16,
@@ -237,7 +239,9 @@ pub struct LevelModelRecord {
     pub clip_count: u16,
     /// Default clip index *within this model's slice* — runtime
     /// instances with no per-instance override pick this clip.
-    /// Out-of-range = "play bind pose".
+    /// Cooker validation guarantees this resolves to a valid
+    /// clip; the runtime never has to fall back to bind pose
+    /// (no bind-pose path exists in this pass).
     pub default_clip: u16,
     /// Suggested world-space height (engine units) — mirrors
     /// the `.psxmdl` header's `local_to_world` hint.

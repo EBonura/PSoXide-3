@@ -59,15 +59,51 @@ struct CacheEntry {
 
 /// Owns the editor renderer's VRAM mirror plus the per-material
 /// texture cache.
+///
+/// VRAM regions:
+///
+/// * `y = 0`,  tpages 0..4   — framebuffer (editor paints x=0..320).
+/// * `y = 0`,  tpages 5..15  — 4bpp room material textures, 64×64
+///   each, packed left-to-right.
+/// * `y = 256`, tpage row 1   — 8bpp model atlases, packed
+///   left-to-right by halfwords. Disjoint from the room region.
+/// * `y = 480`                — 4bpp CLUTs, 16 halfwords each.
+/// * `y = 481..`              — 8bpp CLUTs, 256 halfwords each.
+///
+/// Each Model resource maps to one cache entry keyed by its
+/// `ResourceId`; same for Material resources. The two halves of
+/// the cache use disjoint VRAM regions so a model atlas upload
+/// never overwrites a room material and vice versa.
 pub struct EditorTextures {
     vram: Box<[u16]>,
     cache: HashMap<ResourceId, CacheEntry>,
+    model_cache: HashMap<ResourceId, ModelAtlasCacheEntry>,
     /// Index into the tpage row, starts at 5 (after the framebuffer
     /// at tpages 0..4) and bumps by 1 per uploaded texture.
     next_tpage: u8,
-    /// Halfword X-coord of the next free CLUT slot. Each 4bpp CLUT
-    /// is 16 halfwords wide, so we step by 16.
+    /// Halfword X-coord of the next free 4bpp CLUT slot. Each
+    /// 4bpp CLUT is 16 halfwords wide.
     next_clut_x: u16,
+    /// Halfword X-coord cursor inside the 8bpp model atlas tpage
+    /// row at y=256. Each atlas advances this by its halfword
+    /// stride.
+    next_model_tpage_x: u16,
+    /// Y-coord of the next free 8bpp CLUT row. Steps down by 1
+    /// per uploaded atlas (256-entry CLUTs are one row each).
+    next_model_clut_y: u16,
+}
+
+/// Model atlas cache entry. Same shape as `CacheEntry` but
+/// keyed by the Model resource id and signed by the atlas path
+/// so editing `texture_path` triggers a re-upload on the next
+/// `refresh_models` call.
+#[derive(Debug, Clone)]
+struct ModelAtlasCacheEntry {
+    slot: MaterialSlot,
+    /// Atlas path that produced this slot; empty when the model
+    /// has no atlas (no slot is uploaded in that case — entry
+    /// just records the empty signature so we don't re-walk).
+    signature: String,
 }
 
 impl EditorTextures {
@@ -75,11 +111,17 @@ impl EditorTextures {
         Self {
             vram: vec![0u16; (VRAM_WIDTH * VRAM_HEIGHT) as usize].into_boxed_slice(),
             cache: HashMap::new(),
+            model_cache: HashMap::new(),
             // tpages 0..4 cover the framebuffer at x=0..256; the
             // editor paints into the 320×240 subrect of x=0..320,
             // so tpage 5 (x=320) is the first one fully clear.
             next_tpage: 5,
             next_clut_x: 0,
+            // Model atlases live at the tpage row at y=256.
+            // Cursor advances by halfword stride per atlas.
+            next_model_tpage_x: 0,
+            // 8bpp CLUTs sit just below the 4bpp band.
+            next_model_clut_y: 481,
         }
     }
 
@@ -93,6 +135,13 @@ impl EditorTextures {
     /// shading in that case).
     pub fn slot(&self, id: ResourceId) -> Option<MaterialSlot> {
         self.cache.get(&id).map(|e| e.slot)
+    }
+
+    /// Look up a Model resource's atlas slot, or `None` if no
+    /// atlas has been uploaded for that model (no atlas path,
+    /// or upload failed).
+    pub fn model_atlas_slot(&self, id: ResourceId) -> Option<MaterialSlot> {
+        self.model_cache.get(&id).map(|e| e.slot)
     }
 
     /// Walk every Material resource and ensure its texture is in VRAM.
@@ -276,6 +325,125 @@ impl EditorTextures {
             let vram_idx = (clut_y as usize) * VRAM_WIDTH as usize + clut_x as usize + i;
             self.vram[vram_idx] = entry;
         }
+    }
+
+    /// Walk every Model resource and ensure its atlas (if any)
+    /// is uploaded into the dedicated 8bpp model atlas region.
+    /// Models without `texture_path` get an empty cache entry so
+    /// the walk doesn't repeatedly try to resolve them.
+    pub fn refresh_models(&mut self, project: &ProjectDocument, project_root: &Path) {
+        for resource in &project.resources {
+            let ResourceData::Model(model) = &resource.data else {
+                continue;
+            };
+            let signature = model.texture_path.clone().unwrap_or_default();
+            if self
+                .model_cache
+                .get(&resource.id)
+                .is_some_and(|entry| entry.signature == signature)
+            {
+                continue;
+            }
+            if signature.is_empty() {
+                // No atlas to upload; record an empty signature
+                // so subsequent refreshes skip cleanly.
+                self.model_cache.remove(&resource.id);
+                continue;
+            }
+            let abs = if Path::new(&signature).is_absolute() {
+                PathBuf::from(&signature)
+            } else {
+                project_root.join(&signature)
+            };
+            let Some(slot) = self.upload_model_atlas_psxt(&abs) else {
+                self.model_cache.remove(&resource.id);
+                continue;
+            };
+            self.model_cache.insert(
+                resource.id,
+                ModelAtlasCacheEntry { slot, signature },
+            );
+        }
+    }
+
+    /// Read an 8bpp `.psxt` atlas and upload pixels + 256-entry
+    /// CLUT into the dedicated model VRAM region. Returns `None`
+    /// on missing file, parse failure, unsupported depth (only
+    /// 8bpp is allowed), or VRAM exhaustion.
+    fn upload_model_atlas_psxt(&mut self, abs: &Path) -> Option<MaterialSlot> {
+        let bytes = std::fs::read(abs).ok()?;
+        let texture = Texture::from_bytes(&bytes).ok()?;
+        if texture.clut_entries() != 256 {
+            // Only 8bpp atlases supported in this region — 4bpp
+            // model atlases would belong in the room-material
+            // path which we leave alone here.
+            return None;
+        }
+        let width = u8::try_from(texture.width()).ok()?;
+        let height = u8::try_from(texture.height()).ok()?;
+
+        let halfwords_per_row = texture.halfwords_per_row();
+        let height_px = texture.height();
+        let pixel_bytes = texture.pixel_bytes();
+
+        // Pick the next free model atlas slot. Halfword stride
+        // packing: each atlas takes `halfwords_per_row` columns
+        // in the tpage row at y=256.
+        if self.next_model_tpage_x as u32 + halfwords_per_row as u32 > VRAM_WIDTH as u32 {
+            return None;
+        }
+        if self.next_model_clut_y as usize >= VRAM_HEIGHT as usize {
+            return None;
+        }
+        let tpage_x = self.next_model_tpage_x;
+        let tpage_y: u16 = 256;
+        let clut_y = self.next_model_clut_y;
+
+        // Pixels.
+        if pixel_bytes.len() < (halfwords_per_row as usize) * (height_px as usize) * 2 {
+            return None;
+        }
+        for row in 0..height_px as usize {
+            for hw in 0..halfwords_per_row as usize {
+                let off = (row * halfwords_per_row as usize + hw) * 2;
+                let word = u16::from_le_bytes([pixel_bytes[off], pixel_bytes[off + 1]]);
+                let vram_idx = (tpage_y as usize + row) * VRAM_WIDTH as usize
+                    + tpage_x as usize
+                    + hw;
+                self.vram[vram_idx] = word;
+            }
+        }
+
+        // CLUT: 256 halfwords on a single row. Stamp the STP bit
+        // on non-zero entries the same way the room-material
+        // path does so opaque atlases never accidentally trigger
+        // semi-transparency.
+        let clut_bytes = texture.clut_bytes();
+        if clut_bytes.len() < 512 {
+            return None;
+        }
+        for i in 0..256 {
+            let off = i * 2;
+            let raw = u16::from_le_bytes([clut_bytes[off], clut_bytes[off + 1]]);
+            let marked = if raw == 0 { 0 } else { raw | 0x8000 };
+            let vram_idx = (clut_y as usize) * VRAM_WIDTH as usize + i;
+            self.vram[vram_idx] = marked;
+        }
+
+        // Tpage word: the model atlas tpage row is at y=256 →
+        // tpage_y_block = 1. Tpage X is `tpage_x / 64` (always
+        // 0..15). 8bpp depth bit pattern is `1` (4bpp = 0).
+        let tpage_index = tpage_x / 64;
+        let slot = MaterialSlot {
+            tpage_word: pack_8bpp_tpage_word(tpage_index, 1),
+            clut_word: pack_clut_word(0, clut_y),
+            width,
+            height,
+        };
+
+        self.next_model_tpage_x = self.next_model_tpage_x.saturating_add(halfwords_per_row);
+        self.next_model_clut_y = self.next_model_clut_y.saturating_add(1);
+        Some(slot)
     }
 }
 
@@ -593,6 +761,15 @@ fn psx_555(rgb: (u8, u8, u8)) -> u16 {
 fn pack_tpage_word(tpage_index: u16, tpage_y_block: u16) -> u16 {
     let depth = 0u16; // 4bpp
     let semi_trans = 0u16; // 0.5*bg + 0.5*fg blend bits
+    (tpage_index & 0xF) | (tpage_y_block << 4) | (semi_trans << 5) | (depth << 7)
+}
+
+/// Same as `pack_tpage_word` but with the 8bpp depth bit set —
+/// used for model atlas slots which always live in the 8bpp
+/// model VRAM region.
+fn pack_8bpp_tpage_word(tpage_index: u16, tpage_y_block: u16) -> u16 {
+    let depth = 1u16; // 8bpp
+    let semi_trans = 0u16;
     (tpage_index & 0xF) | (tpage_y_block << 4) | (semi_trans << 5) | (depth << 7)
 }
 

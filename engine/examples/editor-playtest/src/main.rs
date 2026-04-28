@@ -594,9 +594,9 @@ fn draw_model_instances(
             Err(_) => continue,
         };
 
-        // Atlas: required for textured rendering. Fall back to
-        // skip when missing rather than rendering untextured —
-        // the editor's validation should have already complained.
+        // Atlas: cooker validation guarantees `texture_asset` is
+        // `Some` for every placed model — runtime treats a `None`
+        // as a stale manifest and skips rather than crashing.
         let atlas_slot = match model_record.texture_asset {
             Some(id) => match find_asset_of_kind(ASSETS, id, AssetKind::Texture) {
                 Some(asset) => match ensure_model_atlas_uploaded(asset.id, asset.bytes) {
@@ -617,27 +617,29 @@ fn draw_model_instances(
             .with_cull_mode(CullMode::Back)
             .with_material_layer(material);
 
-        // Clip resolution: per-instance override → model
-        // default → bind pose.
+        // Clip resolution: per-instance override → model default.
+        // The cooker validates that both end up `< clip_count`,
+        // so by the time we get here `clip_local` is in-range.
         let clip_local = if inst.clip == MODEL_CLIP_INHERIT {
             model_record.default_clip
         } else {
             inst.clip
         };
-        let frame_q12 = if (clip_local as u16) < model_record.clip_count {
-            let global = (model_record.clip_first + clip_local) as usize;
-            let clip_record = &MODEL_CLIPS[global];
-            match find_asset_of_kind(ASSETS, clip_record.animation_asset, AssetKind::ModelAnimation)
-            {
-                Some(asset) => match Animation::from_bytes(asset.bytes) {
-                    Ok(anim) => Some((anim, anim.phase_at_tick_q12(elapsed_vblanks, video_hz))),
-                    Err(_) => None,
-                },
-                None => None,
-            }
-        } else {
-            None
+        if clip_local >= model_record.clip_count {
+            // Defensive — cooker guarantees this won't happen.
+            continue;
+        }
+        let global = (model_record.clip_first + clip_local) as usize;
+        let clip_record = &MODEL_CLIPS[global];
+        let Some(anim_asset) =
+            find_asset_of_kind(ASSETS, clip_record.animation_asset, AssetKind::ModelAnimation)
+        else {
+            continue;
         };
+        let Ok(anim) = Animation::from_bytes(anim_asset.bytes) else {
+            continue;
+        };
+        let phase = anim.phase_at_tick_q12(elapsed_vblanks, video_hz);
 
         // Origin: room-local instance position.
         let origin = WorldVertex::new(inst.x, inst.y, inst.z);
@@ -646,26 +648,21 @@ fn draw_model_instances(
         // GTE shim, then composed into a rotation matrix.
         let instance_rotation = yaw_rotation_matrix(inst.yaw as u16);
 
-        // Render: animated when we have a clip, else hold the
-        // first frame of any clip we *can* find as a static
-        // pose (showcase-model parity for bind-pose preview).
-        if let Some((anim, phase)) = frame_q12 {
-            let stats = world.submit_textured_model(
-                triangles,
-                model,
-                anim,
-                phase,
-                *camera,
-                origin,
-                instance_rotation,
-                unsafe { &mut MODEL_VERTICES },
-                unsafe { &mut JOINT_VIEW_TRANSFORMS },
-                material,
-                model_options,
-            );
-            if stats.primitive_overflow || stats.command_overflow {
-                return;
-            }
+        let stats = world.submit_textured_model(
+            triangles,
+            model,
+            anim,
+            phase,
+            *camera,
+            origin,
+            instance_rotation,
+            unsafe { &mut MODEL_VERTICES },
+            unsafe { &mut JOINT_VIEW_TRANSFORMS },
+            material,
+            model_options,
+        );
+        if stats.primitive_overflow || stats.command_overflow {
+            return;
         }
         drawn += 1;
     }

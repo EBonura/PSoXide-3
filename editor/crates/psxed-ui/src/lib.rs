@@ -3010,6 +3010,7 @@ impl EditorWorkspace {
 
                 let material_options = self.project.material_options();
                 let room_options = collect_room_options(&self.project);
+                let model_options = collect_model_options(&self.project);
                 let selected = self.selected_node;
                 let active_room = self.active_room_id();
                 let selected_sector = self.selected_sector;
@@ -3068,6 +3069,7 @@ impl EditorWorkspace {
                                 &mut node.kind,
                                 &material_options,
                                 &room_options,
+                                &model_options,
                                 &mut nav_target,
                             );
                         });
@@ -4737,6 +4739,7 @@ fn draw_node_kind_editor(
     kind: &mut NodeKind,
     material_options: &[(ResourceId, String)],
     room_options: &[(NodeId, String)],
+    model_options: &[(ResourceId, String, Vec<String>)],
     nav_target: &mut Option<ResourceId>,
 ) -> bool {
     let mut changed = false;
@@ -4806,43 +4809,97 @@ fn draw_node_kind_editor(
             material,
             animation_clip,
         } => {
+            // Look up the bound model (if any) so we can show
+            // a real clip-name combo for animation_clip.
+            let bound_model: Option<&(ResourceId, String, Vec<String>)> = mesh
+                .and_then(|id| model_options.iter().find(|(rid, _, _)| *rid == id));
+
             ui.horizontal(|ui| {
                 ui.label(icons::text(icons::BOX, 12.0).color(STUDIO_TEXT_WEAK));
-                ui.label(match mesh {
-                    Some(id) => format!("Mesh resource #{}", id.raw()),
-                    None => "No mesh resource assigned".to_string(),
+                ui.label(match (mesh, bound_model) {
+                    (Some(_), Some((_, name, _))) => format!("Model: {name}"),
+                    (Some(id), None) => format!("Mesh resource #{}", id.raw()),
+                    (None, _) => "No mesh resource assigned".to_string(),
                 });
             });
             ui.separator();
             // Same `material_picker` the face inspector uses, so
-            // the `→` jump button is available here too.
+            // the `→` jump button is available here too. (Models
+            // ignore this field — material is baked into .psxmdl.)
             changed |= material_picker(ui, "Material", material, material_options, nav_target);
-            // Animation clip override: shown as a numeric DragValue
-            // for now — the model-aware inspector with clip names
-            // and a scrubber lives in the model UI pass. `None`
-            // means "inherit Model::default_clip".
+
+            // Animation clip override. When the bound mesh is a
+            // Model, render a clip-name combo so the user picks
+            // by name; otherwise fall back to a numeric override
+            // for legacy mesh instances.
             ui.horizontal(|ui| {
-                ui.label("Animation clip");
-                let mut current = animation_clip.map(|i| i as i32).unwrap_or(-1);
-                let response = ui.add(
-                    egui::DragValue::new(&mut current)
-                        .speed(0.1)
-                        .range(-1..=255)
-                        .custom_formatter(|n, _| {
-                            if n < 0.0 {
-                                "default".to_string()
-                            } else {
-                                format!("{}", n as i32)
-                            }
-                        }),
-                );
-                if response.changed() {
-                    *animation_clip = if current < 0 {
-                        None
-                    } else {
-                        Some(current as u16)
+                ui.label(RichText::new("Animation clip").color(STUDIO_TEXT_WEAK));
+                if let Some((_, _, clips)) = bound_model {
+                    let preview = match *animation_clip {
+                        Some(idx) => clips
+                            .get(idx as usize)
+                            .map(|n| n.as_str())
+                            .unwrap_or("(invalid)")
+                            .to_string(),
+                        None => "(inherit default)".to_string(),
                     };
-                    changed = true;
+                    egui::ComboBox::from_id_salt("mesh_instance_clip")
+                        .selected_text(preview)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    animation_clip.is_none(),
+                                    "(inherit default)",
+                                )
+                                .clicked()
+                            {
+                                *animation_clip = None;
+                                changed = true;
+                            }
+                            for (i, name) in clips.iter().enumerate() {
+                                let label = format!("{i}: {name}");
+                                if ui
+                                    .selectable_label(
+                                        *animation_clip == Some(i as u16),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    *animation_clip = Some(i as u16);
+                                    changed = true;
+                                }
+                            }
+                        });
+                    if let Some(idx) = *animation_clip {
+                        if (idx as usize) >= clips.len() {
+                            ui.colored_label(
+                                Color32::from_rgb(220, 160, 80),
+                                format!("clip {idx} out of range ({} clips)", clips.len()),
+                            );
+                        }
+                    }
+                } else {
+                    let mut current = animation_clip.map(|i| i as i32).unwrap_or(-1);
+                    let response = ui.add(
+                        egui::DragValue::new(&mut current)
+                            .speed(0.1)
+                            .range(-1..=255)
+                            .custom_formatter(|n, _| {
+                                if n < 0.0 {
+                                    "default".to_string()
+                                } else {
+                                    format!("{}", n as i32)
+                                }
+                            }),
+                    );
+                    if response.changed() {
+                        *animation_clip = if current < 0 {
+                            None
+                        } else {
+                            Some(current as u16)
+                        };
+                        changed = true;
+                    }
                 }
             });
         }
@@ -8236,6 +8293,24 @@ fn collect_room_options(project: &ProjectDocument) -> Vec<(NodeId, String)> {
         .iter()
         .filter(|node| matches!(node.kind, NodeKind::Room { .. }))
         .map(|node| (node.id, node.name.clone()))
+        .collect()
+}
+
+/// Collect every Model resource as a `(resource id, display
+/// name, clip names)` row. The MeshInstance inspector uses
+/// this to render its clip-name combo box.
+fn collect_model_options(project: &ProjectDocument) -> Vec<(ResourceId, String, Vec<String>)> {
+    project
+        .resources
+        .iter()
+        .filter_map(|r| match &r.data {
+            ResourceData::Model(m) => Some((
+                r.id,
+                r.name.clone(),
+                m.clips.iter().map(|c| c.name.clone()).collect(),
+            )),
+            _ => None,
+        })
         .collect()
 }
 

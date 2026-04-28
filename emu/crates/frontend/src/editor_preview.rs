@@ -127,9 +127,10 @@ pub fn build_phase1_cmd_log(
     scratch.ot.clear();
 
     push_clear(&mut scratch);
-    setup_gte_for_camera(camera, target);
+    let world_camera = setup_gte_for_camera(camera, target);
     walk_room(project, grid, textures, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
+    walk_model_instances(project, grid, textures, selected, &world_camera, &mut scratch);
     // Select-tool primitive outlines. Selected drawn first so its
     // bolder lines sit *under* a possibly-co-located hover — that
     // way switching focus from selected → hover via mouse-move
@@ -183,7 +184,7 @@ fn first_room_grid(project: &ProjectDocument) -> Option<(&WorldGrid, [i32; 3])> 
 /// Configure the host-side GTE so subsequent `project_vertex` /
 /// `project_triangle` calls produce screen-space coords for the
 /// requested orbit camera.
-fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) {
+fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) -> psx_engine::WorldCamera {
     // Orbit camera world position: target offset by radius along the
     // unit vector implied by yaw + pitch. Pitch positive = camera
     // raised above the target, looking down.
@@ -238,6 +239,23 @@ fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) {
     gte_scene::load_translation(tr);
     gte_scene::set_screen_offset((SCREEN_CX as i32) << 16, (SCREEN_CY as i32) << 16);
     gte_scene::set_projection_plane(PROJ_H as u16);
+
+    // Build a `WorldCamera` matching the same basis so the
+    // model preview path can compose joint transforms with
+    // `psx_engine::compute_joint_view_transform`.
+    psx_engine::WorldCamera::from_basis(
+        psx_engine::WorldProjection::new(
+            SCREEN_CX as i16,
+            SCREEN_CY as i16,
+            PROJ_H as i32,
+            32,
+        ),
+        psx_engine::WorldVertex::new(cam_x, cam_y, cam_z),
+        sin_y,
+        cos_y,
+        sin_p,
+        cos_p,
+    )
 }
 
 /// Shared anchor that `world_to_view` subtracts from each vertex
@@ -595,6 +613,17 @@ fn walk_entities(
     let s = grid.sector_size;
     let scene = project.active_scene();
     for node in scene.nodes() {
+        // Skip Model-backed MeshInstances — `walk_model_instances`
+        // renders them as real textured models. Without this guard
+        // they'd get *both* a marker square and the real model on
+        // top of each other.
+        if let NodeKind::MeshInstance { mesh: Some(id), .. } = &node.kind {
+            if let Some(resource) = project.resource(*id) {
+                if matches!(resource.data, ResourceData::Model(_)) {
+                    continue;
+                }
+            }
+        }
         let Some(kind_color) = entity_marker_color(&node.kind) else {
             continue;
         };
@@ -650,6 +679,408 @@ fn walk_entities(
             push_tri(scratch, [r_bl, p_br, p_bl], outline);
             push_tri(scratch, [r_bl, p_bl, r_tl], outline);
             push_tri(scratch, [r_tl, p_bl, p_tl], outline);
+        }
+    }
+}
+
+/// Cap on placed Model-backed MeshInstance nodes the editor
+/// preview will render in one frame. Excess instances skip
+/// silently (the manifest hasn't filtered them) — keeps a
+/// runaway scene from busting the per-frame budget.
+const MAX_PREVIEW_MODEL_INSTANCES: usize = 8;
+/// Cap on joints any one previewed model can carry. Matches
+/// the runtime `JOINT_CAP` so a model that renders in
+/// editor-playtest also renders here.
+const PREVIEW_JOINT_CAP: usize = 32;
+
+/// Per-frame tick used to advance animation phase for the
+/// editor's looping model preview. Bumped once per
+/// `build_phase1_cmd_log` call. PSX angle / phase math needs
+/// monotonic ticks rather than wall-clock, and the editor
+/// frame rate fluctuates on host — so this is "preview
+/// frames", not real-time. Good enough for inspector preview.
+static PREVIEW_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// One placed model the preview pass should render. Resolved
+/// once per call to `walk_model_instances` so the per-instance
+/// loop only does projection + emit work.
+struct PreviewModelInstance<'a> {
+    /// Cached parsed model. Owns no allocation; references
+    /// bytes the caller keeps alive.
+    model: psx_asset::Model<'a>,
+    /// Cached parsed animation clip. Resolved through the
+    /// preview / default clip rule.
+    animation: psx_asset::Animation<'a>,
+    /// Atlas slot in the editor's model atlas region.
+    atlas: MaterialSlot,
+    /// World position (room-local engine units).
+    origin: psx_engine::WorldVertex,
+    /// Y-axis rotation matrix derived from the node's yaw.
+    instance_rotation: Mat3I16,
+}
+
+/// Render every Model-backed `MeshInstance` in the scene as a
+/// real textured animated model. Mirrors the runtime path in
+/// `editor-playtest`: parse `.psxmdl` + `.psxt` + `.psxanim`,
+/// upload atlas (lazily — done by `EditorTextures::refresh_models`),
+/// compose joint transforms via `compute_joint_view_transform`,
+/// project per-vertex, emit textured triangles into the OT.
+///
+/// Models with bad/missing data are skipped silently — the
+/// editor inspector + cook validation surface those errors
+/// elsewhere; the preview just keeps drawing what it can.
+fn walk_model_instances(
+    project: &ProjectDocument,
+    grid: &WorldGrid,
+    _textures: &EditorTextures,
+    selected: psxed_project::NodeId,
+    camera: &psx_engine::WorldCamera,
+    scratch: &mut PreviewScratch,
+) {
+    // Bump the global preview tick once per frame so the
+    // animation loops at a stable rate regardless of how many
+    // instances we render.
+    let tick = PREVIEW_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Cache asset bytes per Model resource to avoid re-reading
+    // the same file once per instance. Bytes are kept on the
+    // stack-allocated arena so the parsed `Model<'_>` borrow
+    // is valid for the rest of the frame.
+    let scene = project.active_scene();
+    let project_root = psxed_project::default_project_dir();
+
+    let mut buffers: Vec<(ResourceId, Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut instances_meta: Vec<InstanceMeta> = Vec::new();
+
+    for node in scene.nodes() {
+        if instances_meta.len() >= MAX_PREVIEW_MODEL_INSTANCES {
+            break;
+        }
+        let NodeKind::MeshInstance {
+            mesh: Some(mesh_id),
+            animation_clip,
+            ..
+        } = &node.kind
+        else {
+            continue;
+        };
+        let Some(model_resource) = project.resource(*mesh_id) else {
+            continue;
+        };
+        let ResourceData::Model(model) = &model_resource.data else {
+            continue;
+        };
+        // Atlas required — runtime contract.
+        if model.texture_path.is_none() {
+            continue;
+        }
+        // Atlas slot must already be uploaded (refresh_models
+        // ran earlier in the frame). Skip if not — lets the
+        // user know visually that the atlas is broken.
+        let Some(atlas_slot) = _textures.model_atlas_slot(*mesh_id) else {
+            continue;
+        };
+
+        // Resolve clip: explicit instance override → preview clip → default.
+        let clip_local = animation_clip
+            .or(model.preview_clip)
+            .or(model.default_clip)
+            .unwrap_or(0);
+        let Some(clip) = model.clips.get(clip_local as usize) else {
+            continue;
+        };
+
+        // Load mesh + animation bytes once per resource id.
+        if !buffers.iter().any(|(id, _, _)| *id == *mesh_id) {
+            let mesh_path = if std::path::Path::new(&model.model_path).is_absolute() {
+                std::path::PathBuf::from(&model.model_path)
+            } else {
+                project_root.join(&model.model_path)
+            };
+            let Ok(mesh_bytes) = std::fs::read(&mesh_path) else {
+                continue;
+            };
+            let anim_path = if std::path::Path::new(&clip.psxanim_path).is_absolute() {
+                std::path::PathBuf::from(&clip.psxanim_path)
+            } else {
+                project_root.join(&clip.psxanim_path)
+            };
+            let Ok(anim_bytes) = std::fs::read(&anim_path) else {
+                continue;
+            };
+            buffers.push((*mesh_id, mesh_bytes, anim_bytes));
+        }
+
+        // World position: same convention `walk_entities` uses
+        // for marker nodes — translation is in sectors relative
+        // to the room centre, so multiply by sector_size and
+        // shift by half-grid.
+        let s = grid.sector_size;
+        let pos = node.transform.translation;
+        let origin = psx_engine::WorldVertex::new(
+            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
+            (pos[1] * s as f32) as i32,
+            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
+        );
+
+        let yaw_q12 = yaw_to_q12(node.transform.rotation_degrees[1]);
+        let instance_rotation = yaw_rotation_q12(yaw_q12);
+
+        instances_meta.push(InstanceMeta {
+            mesh_id: *mesh_id,
+            origin,
+            instance_rotation,
+            atlas: atlas_slot,
+            is_selected: node.id == selected,
+            yaw_q12,
+            world_height: model.world_height as i32,
+        });
+    }
+
+    // Resolve parsed model + animation per instance now that
+    // bytes are stable. Borrow checker happy: buffers Vec lives
+    // for the rest of the function.
+    let mut instances: Vec<PreviewModelInstance> = Vec::new();
+    for meta in &instances_meta {
+        let Some((_, mesh_bytes, anim_bytes)) =
+            buffers.iter().find(|(id, _, _)| *id == meta.mesh_id)
+        else {
+            continue;
+        };
+        let Ok(model) = psx_asset::Model::from_bytes(mesh_bytes) else {
+            continue;
+        };
+        let Ok(animation) = psx_asset::Animation::from_bytes(anim_bytes) else {
+            continue;
+        };
+        instances.push(PreviewModelInstance {
+            model,
+            animation,
+            atlas: meta.atlas,
+            origin: meta.origin,
+            instance_rotation: meta.instance_rotation,
+        });
+    }
+
+    // Gizmos first while GTE still holds the camera matrix —
+    // `draw_preview_model_instance` overrides rotation/translation
+    // per joint so any project_vertex after a model render uses
+    // joint-space, not world-space.
+    for meta in &instances_meta {
+        if meta.is_selected {
+            draw_model_selection_gizmo(meta, scratch);
+        }
+    }
+    for instance in instances {
+        draw_preview_model_instance(camera, tick, &instance, scratch);
+    }
+}
+
+/// Selection gizmo for a placed model: a cyan vertical line
+/// at the origin (visible against any backdrop) plus a yellow
+/// forward arrow showing the yaw direction. The model itself
+/// draws underneath the gizmo via the OT depth slot system.
+///
+/// Restores the camera GTE rotation/translation before
+/// projecting because `draw_preview_model_instance` left the
+/// GTE primed with the *last part's* joint transform.
+fn draw_model_selection_gizmo(meta: &InstanceMeta, scratch: &mut PreviewScratch) {
+    // Re-prime the GTE with the camera transform — model
+    // rendering left it set to the last joint's view.
+    // `world_to_view` already does the anchor subtract so we
+    // just need rotation+translation back to camera basis.
+    // Cheap: re-derive from VIEW_ANCHOR + the existing camera
+    // matrix is harder than just calling project_vertex with
+    // the camera setup. Skip the explicit restore and use
+    // the existing set_view_anchor → world_to_view pipeline
+    // by projecting via gte_scene::project_vertex with the
+    // camera matrix re-loaded explicitly.
+    //
+    // Pragmatic shortcut: emit screen-space lines built from
+    // worldspace endpoints projected with `gte_scene::project_vertex`
+    // after we restore the camera transform via setup_gte_for_camera.
+    // We don't have access to the camera state here, so the gizmo
+    // routes through the same world_to_view + project_vertex path
+    // the room geometry uses *before* model rendering kicks in.
+    // To make this work we run gizmo emit *before* model render
+    // in the caller; for now route it through and accept that
+    // gizmos may use the last-joint transform if rendered after
+    // the model. We'll fix ordering in the caller.
+
+    let height = meta.world_height.max(256);
+    let origin_w = [meta.origin.x, meta.origin.y, meta.origin.z];
+    let top_w = [meta.origin.x, meta.origin.y - height, meta.origin.z];
+    let mid_w = [meta.origin.x, meta.origin.y - height / 4, meta.origin.z];
+    let len = (height / 3).max(128);
+    let s = psx_gte::transform::sin_1_3_12(meta.yaw_q12) as i32;
+    let c = psx_gte::transform::cos_1_3_12(meta.yaw_q12) as i32;
+    let forward_w = [
+        meta.origin.x + ((s * len) >> 12),
+        meta.origin.y - height / 4,
+        meta.origin.z + ((c * len) >> 12),
+    ];
+
+    let origin_p = gte_scene::project_vertex(world_to_view(origin_w));
+    let top_p = gte_scene::project_vertex(world_to_view(top_w));
+    let mid_p = gte_scene::project_vertex(world_to_view(mid_w));
+    let forward_p = gte_scene::project_vertex(world_to_view(forward_w));
+
+    let cyan = FaceOutlineStyle {
+        rgb: (0x40, 0xC8, 0xE8),
+        thickness_px: 3,
+    };
+    let yellow = FaceOutlineStyle {
+        rgb: (0xF0, 0xC8, 0x40),
+        thickness_px: 3,
+    };
+    if origin_p.sz != 0 && top_p.sz != 0 {
+        push_screen_line(scratch, origin_p, top_p, cyan);
+    }
+    if mid_p.sz != 0 && forward_p.sz != 0 {
+        push_screen_line(scratch, mid_p, forward_p, yellow);
+    }
+}
+
+struct InstanceMeta {
+    mesh_id: ResourceId,
+    origin: psx_engine::WorldVertex,
+    instance_rotation: Mat3I16,
+    atlas: MaterialSlot,
+    /// `true` when the placed instance is the currently
+    /// selected scene node. Drives the selection gizmo.
+    is_selected: bool,
+    /// Yaw in PSX angle units, retained for the facing arrow.
+    yaw_q12: u16,
+    /// Approximate world-space height for the facing arrow's
+    /// vertical extent. Lifted from `ModelResource::world_height`.
+    world_height: i32,
+}
+
+/// Convert editor-Y rotation in degrees to PSX angle units
+/// (Q12, 4096 per turn). Matches the playtest writer's
+/// `yaw_from_degrees`.
+fn yaw_to_q12(degrees: f32) -> u16 {
+    let normalised = degrees.rem_euclid(360.0);
+    (normalised * (4096.0 / 360.0)) as i32 as u16
+}
+
+/// Y-axis rotation matrix in Q12. Mirrors `yaw_rotation_matrix`
+/// in editor-playtest's runtime.
+fn yaw_rotation_q12(yaw_q12: u16) -> Mat3I16 {
+    let s = psx_gte::transform::sin_1_3_12(yaw_q12);
+    let c = psx_gte::transform::cos_1_3_12(yaw_q12);
+    Mat3I16 {
+        m: [
+            [c, 0, s],
+            [0, 0x1000, 0],
+            [-s, 0, c],
+        ],
+    }
+}
+
+/// Per-instance projection + face emit. Loops every part,
+/// composes the joint view transform via the engine helper,
+/// reloads the GTE per-part, projects vertices, emits one
+/// textured triangle per face.
+///
+/// IMPORTANT: this clobbers the GTE rotation/translation
+/// registers, so any caller relying on the camera-target
+/// transform set by `setup_gte_for_camera` must restore it
+/// before projecting non-model geometry. Today this runs after
+/// rooms / entities / overlays, so nothing depends on the
+/// camera transform being intact post-call.
+fn draw_preview_model_instance(
+    camera: &psx_engine::WorldCamera,
+    tick: u32,
+    instance: &PreviewModelInstance<'_>,
+    scratch: &mut PreviewScratch,
+) {
+    let local_to_world =
+        psx_engine::LocalToWorldScale::from_q12(instance.model.local_to_world_q12());
+    let frame_q12 = instance.animation.phase_at_tick_q12(tick, 60);
+
+    // Joint view transforms — one per joint, capped.
+    let joint_count = (instance.model.joint_count() as usize).min(PREVIEW_JOINT_CAP);
+    let mut joint_view_transforms: [psx_engine::JointViewTransform; PREVIEW_JOINT_CAP] =
+        [psx_engine::JointViewTransform::ZERO; PREVIEW_JOINT_CAP];
+    for joint in 0..joint_count {
+        if let Some(pose) = instance.animation.pose_looped_q12(frame_q12, joint as u16) {
+            let (rotation, translation) = psx_engine::compute_joint_view_transform(
+                *camera,
+                pose,
+                instance.instance_rotation,
+                local_to_world,
+                instance.origin,
+            );
+            joint_view_transforms[joint] =
+                psx_engine::JointViewTransform { rotation, translation };
+        }
+    }
+
+    // Per-part projection + face emit. Skin-blend vertices
+    // (vertex.is_blend()) get projected from the primary joint
+    // only — the editor preview doesn't run the host-CPU LERP
+    // path the runtime uses on PSX target.
+    let mut projected: Vec<psx_gte::scene::Projected> = Vec::with_capacity(64);
+    for part_index in 0..instance.model.part_count() {
+        let Some(part) = instance.model.part(part_index) else {
+            break;
+        };
+        let primary_joint = part.joint_index() as usize;
+        if primary_joint >= joint_count {
+            continue;
+        }
+        let primary = joint_view_transforms[primary_joint];
+
+        gte_scene::load_rotation(&primary.rotation);
+        gte_scene::load_translation(primary.translation);
+
+        let part_vertex_count = part.vertex_count() as usize;
+        projected.clear();
+        let first_vertex = part.first_vertex();
+        for local in 0..part_vertex_count {
+            let global = first_vertex.saturating_add(local as u16);
+            let Some(v) = instance.model.vertex(global) else {
+                break;
+            };
+            projected.push(gte_scene::project_vertex(v.position));
+        }
+
+        // Per-face triangle emit. UV pairs come straight from
+        // the model vertex table; tint stays neutral.
+        let first_face = part.first_face();
+        let face_count = part.face_count();
+        for face in 0..face_count {
+            let Some((ia, ib, ic)) = instance.model.face(first_face + face) else {
+                break;
+            };
+            let local_indices = [
+                (ia as i32 - first_vertex as i32) as usize,
+                (ib as i32 - first_vertex as i32) as usize,
+                (ic as i32 - first_vertex as i32) as usize,
+            ];
+            if local_indices.iter().any(|&i| i >= projected.len()) {
+                continue;
+            }
+            let p = [
+                projected[local_indices[0]],
+                projected[local_indices[1]],
+                projected[local_indices[2]],
+            ];
+            // Skip near-plane / behind-camera triangles.
+            if p[0].sz == 0 || p[1].sz == 0 || p[2].sz == 0 {
+                continue;
+            }
+            // UV lookup straight off the model's vertex table.
+            let uv = |idx: u16| -> (u8, u8) {
+                instance
+                    .model
+                    .vertex(idx)
+                    .map(|v| (v.uv.0, v.uv.1))
+                    .unwrap_or((0, 0))
+            };
+            let uvs = [uv(ia), uv(ib), uv(ic)];
+            push_tex_tri(scratch, p, uvs, instance.atlas, (0x80, 0x80, 0x80));
         }
     }
 }

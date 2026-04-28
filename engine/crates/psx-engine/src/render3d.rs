@@ -1731,6 +1731,22 @@ fn load_world_projection_gte(projection: WorldProjection) {
     scene::set_projection_plane(clamp_u16_i32(projection.focal_length));
 }
 
+/// Compose the GTE transform for one joint of a placed model
+/// instance: `view × instance × pose_model_to_world`. The
+/// returned matrix loads into GTE rotation; the returned vector
+/// is the camera-space translation (already pre-rotated by the
+/// view matrix). Public so the host editor preview can drive
+/// the same math without re-implementing it.
+pub fn compute_joint_view_transform(
+    camera: WorldCamera,
+    pose: JointPose,
+    instance_rotation: Mat3I16,
+    local_to_world: LocalToWorldScale,
+    origin: WorldVertex,
+) -> (Mat3I16, Vec3I32) {
+    textured_model_part_gte_transform(camera, pose, instance_rotation, local_to_world, origin)
+}
+
 fn textured_model_part_gte_transform(
     camera: WorldCamera,
     pose: JointPose,
@@ -2556,8 +2572,13 @@ mod tests {
         let cpu_view = camera.view_vertex(cpu_world);
         let cpu_projected = camera.project_world(cpu_world).expect("in front");
 
-        let (rotation, translation) =
-            textured_model_part_gte_transform(camera, pose, LocalToWorldScale::IDENTITY, origin);
+        let (rotation, translation) = textured_model_part_gte_transform(
+            camera,
+            pose,
+            Mat3I16::IDENTITY,
+            LocalToWorldScale::IDENTITY,
+            origin,
+        );
         let gte_x = translation.x + dot_q12_row_i16(rotation.m[0], local);
         let gte_y = translation.y + dot_q12_row_i16(rotation.m[1], local);
         let gte_z = translation.z + dot_q12_row_i16(rotation.m[2], local);

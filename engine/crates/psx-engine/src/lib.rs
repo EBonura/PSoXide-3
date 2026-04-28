@@ -64,11 +64,11 @@ pub use app::{App, Config};
 pub use frames::{Frames, Ticks};
 pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
 pub use render3d::{
-    CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand,
-    JointViewTransform, LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex,
-    ProjectedVertex, TexturedModelRenderStats, TexturedViewVertex, ViewVertex, WorldCamera,
-    WorldProjection, WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions,
-    WorldTriCommand, WorldVertex,
+    compute_joint_view_transform, CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass,
+    GouraudTriCommand, JointViewTransform, LocalToWorldScale, MeshRenderStats,
+    ProjectedTexturedVertex, ProjectedVertex, TexturedModelRenderStats, TexturedViewVertex,
+    ViewVertex, WorldCamera, WorldProjection, WorldRenderLayer, WorldRenderPass,
+    WorldRenderStats, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 // Re-export the GTE math types callers need to construct
 // arguments for `submit_textured_model` (instance rotation,

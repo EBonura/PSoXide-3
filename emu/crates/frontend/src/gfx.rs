@@ -203,6 +203,7 @@ impl Graphics {
         paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     ) {
         self.editor_textures.refresh(project, project_root);
+        self.editor_textures.refresh_models(project, project_root);
         let cmd_log = crate::editor_preview::build_phase1_cmd_log(
             project,
             camera,

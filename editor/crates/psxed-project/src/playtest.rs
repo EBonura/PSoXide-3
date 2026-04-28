@@ -166,7 +166,10 @@ pub struct PlaytestModel {
     /// `.psxmdl` blob.
     pub mesh_asset_index: usize,
     /// Index into [`PlaytestPackage::assets`] of the atlas
-    /// `.psxt` blob, or `None` for untextured models.
+    /// `.psxt` blob. Always `Some` for placed models — the
+    /// playtest cooker rejects instances of models without an
+    /// atlas. Kept as `Option` so the schema can later carry
+    /// untextured author-time bundles unchanged.
     pub texture_asset_index: Option<usize>,
     /// First index into [`PlaytestPackage::model_clips`] for
     /// this model's clip slice.
@@ -174,8 +177,9 @@ pub struct PlaytestModel {
     /// Number of clips in this model's slice. Matches the
     /// editor resource's clip count exactly.
     pub clip_count: u16,
-    /// Default clip index *within this model's slice*. Out of
-    /// range = "play bind pose".
+    /// Default clip index *within this model's slice*.
+    /// Cooker validation guarantees this is `< clip_count`,
+    /// so the runtime always has a clip to play.
     pub default_clip: u16,
     /// World-space height (engine units) — propagated from the
     /// editor resource.
@@ -481,6 +485,18 @@ pub fn build_package(
                             return (None, report);
                         }
                     };
+                    // Room materials must be 4bpp (16-entry CLUT) —
+                    // both the editor preview's material upload
+                    // path and the runtime room material slots
+                    // assume the 4bpp tpage layout. Loud failure
+                    // here beats wrong-colour rendering at runtime.
+                    if let Err(msg) = expect_room_material_depth(texture_resource, &bytes) {
+                        report.error(format!(
+                            "Room '{}' material slot {}: {}",
+                            room_node.name, cooked_material.slot, msg,
+                        ));
+                        return (None, report);
+                    }
                     let texture_index = texture_asset_for_resource.len();
                     let new_index = assets.len();
                     assets.push(PlaytestAsset {
@@ -818,10 +834,25 @@ fn register_model_for_instance(
                 return None;
             }
         };
-        if let Err(e) = psx_asset::Texture::from_bytes(&bytes) {
+        let parsed_atlas = match psx_asset::Texture::from_bytes(&bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                report.error(format!(
+                    "Model '{}' atlas parse failed: {e:?}",
+                    resource.name
+                ));
+                return None;
+            }
+        };
+        // Model atlases must be 8bpp (256-entry CLUT) — the
+        // runtime model atlas region uses an 8bpp tpage and a
+        // 256-entry CLUT row per atlas. Other depths render with
+        // wrong colours, so reject loud at cook time.
+        if parsed_atlas.clut_entries() != 256 {
             report.error(format!(
-                "Model '{}' atlas parse failed: {e:?}",
-                resource.name
+                "Model '{}' atlas must be 8bpp (256-entry CLUT); found {} entries",
+                resource.name,
+                parsed_atlas.clut_entries(),
             ));
             return None;
         }
@@ -890,12 +921,26 @@ fn register_model_for_instance(
     }
     let clip_count = u16::try_from(model_clips.len() - clip_first as usize).unwrap_or(u16::MAX);
 
-    // Resolve the model's default clip — clamp to slice range
-    // or out-of-range sentinel if invalid.
-    let default_clip = model
-        .effective_runtime_clip()
-        .filter(|i| (*i as u16) < clip_count)
-        .unwrap_or(u16::MAX);
+    // Resolve the model's default clip. Validation rules:
+    //   - explicit `model.default_clip = Some(idx)` MUST be in
+    //     range; out-of-range is a hard cook error so the user
+    //     fixes the resource rather than a runtime instance
+    //     silently pointing at clip 0.
+    //   - `None` falls back to clip 0. Cooker has already
+    //     refused empty-clip placed models, so `clip_count >= 1`.
+    let default_clip = match model.default_clip {
+        Some(idx) => {
+            if idx >= clip_count {
+                report.error(format!(
+                    "Model '{}' default_clip {idx} is out of range ({} clips)",
+                    resource.name, clip_count
+                ));
+                return None;
+            }
+            idx
+        }
+        None => 0,
+    };
 
     models.push(PlaytestModel {
         name: resource.name.clone(),
@@ -1325,6 +1370,23 @@ fn find_resource(project: &ProjectDocument, id: ResourceId) -> Option<&Resource>
 /// `psxt_path` first as-is (absolute paths), then relative to
 /// `project_root`. Returns a string error rather than `io::Error`
 /// so callers can prepend room/material context.
+/// Validate a room-material `.psxt` blob is 4bpp (16-entry
+/// CLUT). Both the editor preview material upload path and the
+/// runtime room material slots assume 4bpp; other depths
+/// render with wrong colours.
+fn expect_room_material_depth(resource: &Resource, bytes: &[u8]) -> Result<(), String> {
+    let texture = psx_asset::Texture::from_bytes(bytes)
+        .map_err(|e| format!("texture '{}' parse failed: {e:?}", resource.name))?;
+    if texture.clut_entries() != 16 {
+        return Err(format!(
+            "texture '{}' must be 4bpp (16-entry CLUT) for room materials; found {} entries",
+            resource.name,
+            texture.clut_entries(),
+        ));
+    }
+    Ok(())
+}
+
 fn load_texture_bytes(resource: &Resource, project_root: &Path) -> Result<Vec<u8>, String> {
     let ResourceData::Texture { psxt_path } = &resource.data else {
         return Err(format!(
@@ -1850,6 +1912,103 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.contains("no animation clips")),
+            "errors: {:?}",
+            report.errors,
+        );
+    }
+
+    #[test]
+    fn out_of_range_model_default_clip_fails_at_cook() {
+        // Bend the starter Wraith's default_clip past its clip
+        // count; cook must refuse rather than emit a runtime
+        // record that resolves to no animation.
+        let mut project = ProjectDocument::starter();
+        for resource in project.resources.iter_mut() {
+            if let ResourceData::Model(model) = &mut resource.data {
+                model.default_clip = Some(999);
+                break;
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(package.is_none());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("default_clip 999")),
+            "errors: {:?}",
+            report.errors,
+        );
+    }
+
+    #[test]
+    fn missing_default_clip_resolves_to_clip_zero() {
+        // A model with `default_clip: None` plus a populated
+        // clip list should cook fine — runtime gets clip 0 as
+        // the resolved default. No bind-pose sentinel.
+        let mut project = ProjectDocument::starter();
+        for resource in project.resources.iter_mut() {
+            if let ResourceData::Model(model) = &mut resource.data {
+                model.default_clip = None;
+                break;
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.expect("cooks");
+        let model = &package.models[0];
+        assert_eq!(model.default_clip, 0);
+        // Sanity: never emit the old u16::MAX sentinel.
+        assert!(model.default_clip < model.clip_count);
+    }
+
+    #[test]
+    fn room_material_must_be_4bpp() {
+        // Swap the starter's brick material to point at the
+        // model's 8bpp atlas, which lives at the same project.
+        // Cook should refuse the room material 8bpp depth.
+        let mut project = ProjectDocument::starter();
+        // Rewire `brick-wall.psxt` resource to the wraith atlas
+        // path so it parses but with the wrong CLUT entry count.
+        for resource in project.resources.iter_mut() {
+            if let ResourceData::Texture { psxt_path } = &mut resource.data {
+                if psxt_path.ends_with("brick-wall.psxt") {
+                    *psxt_path =
+                        "assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt"
+                            .to_string();
+                }
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(package.is_none());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("must be 4bpp")),
+            "errors: {:?}",
+            report.errors,
+        );
+    }
+
+    #[test]
+    fn model_atlas_must_be_8bpp() {
+        // Swap the wraith atlas to a 4bpp room texture path so
+        // the cook runs the depth check on a known-bad atlas.
+        let mut project = ProjectDocument::starter();
+        for resource in project.resources.iter_mut() {
+            if let ResourceData::Model(model) = &mut resource.data {
+                model.texture_path = Some("assets/textures/floor.psxt".to_string());
+                break;
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(package.is_none());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("must be 8bpp")),
             "errors: {:?}",
             report.errors,
         );

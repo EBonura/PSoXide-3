@@ -205,20 +205,32 @@ The cook (`build_package`) hard-fails on:
   bound model.
 - A `MeshInstance` referencing a non-Model resource.
 - A placed model has no atlas (runtime can't render
-  untextured in this pass).
+  untextured).
 - A placed model has no clips (runtime requires at least
   one clip — bind-pose rendering is not implemented).
+- `ModelResource::default_clip` set to an out-of-range index
+  (would emit a runtime record that can't resolve to a clip).
+- Room material texture is not 4bpp / 16-entry CLUT (the
+  runtime room material upload path requires 4bpp).
+- Model atlas texture is not 8bpp / 256-entry CLUT (the
+  runtime model atlas region uses an 8bpp tpage).
 
 The Model resource itself is allowed to ship without an atlas
 or without clips while the author is still building it; the
 hard-fails only fire when an instance of an incomplete model
-is placed in a Room.
+is placed in a Room. `default_clip` validation runs whenever
+the model is registered into the playtest package (whether
+or not it has a placed instance).
+
+The runtime `default_clip` is always a valid in-range index —
+either the user's choice, or `0` when they didn't pick one.
+There is no bind-pose sentinel.
 
 ## Currently out of scope
 
 | Feature | Status |
 | ------- | ------ |
-| Editor 3D viewport rendering of placed models | **Deferred** — placed models still appear via their `MeshInstance` marker in the editor preview today. Inspector previews atlas + stats; runtime renders the textured animated model. The 3D-viewport renderer port lands as a follow-up. |
+| Editor 3D viewport rendering of placed models | **Done.** `walk_model_instances` in `editor_preview.rs` resolves model + atlas + clip per instance, composes joint transforms via `psx_engine::compute_joint_view_transform`, and emits textured triangles into the OT. Animation phase loops via a per-frame tick counter; selection adds a cyan vertical gizmo + yellow facing arrow. Marker fallback still kicks in for legacy MeshInstance nodes that don't reference a Model resource. |
 | Lights | Out of scope. |
 | Enemies / AI / actor archetypes | Out of scope. |
 | Combat / player model | Out of scope. |
@@ -227,6 +239,8 @@ is placed in a Room.
 | Runtime baking / farfield | Out of scope. |
 | CD streaming | Out of scope. |
 | Material editor for model materials | Out of scope (model materials are baked into the `.psxmdl`). |
+| Bind-pose / untextured model rendering | Out of scope. The runtime model path renders textured animated models only; the cooker rejects placed instances of any model without an atlas or without clips. |
+| GLB-import-from-UI button | Out of scope (helper exists in `psxed_project::model_import::import_glb_model`; UI button lands once the editor adds a native file picker). |
 
 ## See also
 
