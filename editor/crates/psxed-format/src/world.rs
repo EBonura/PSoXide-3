@@ -306,9 +306,11 @@ pub mod material_flags {
 /// Compact sector record for the v2 layout.
 ///
 /// 28 B vs v1's 44 B — heights drop to room-local `i16`, the
-/// padding byte is repurposed as `logic_offset_kind`, and the
-/// `flags` field widens to `u16` to carry future per-sector
-/// markers (death sector, water, …) without another reshape.
+/// `flags` field widens to `u16` for per-sector marker headroom,
+/// and the two split bytes collapse into a single `split_bits`
+/// bitfield so `logic_offset` can be a real `u16` index into the
+/// FloorData-style logic stream rather than the previous
+/// "kind tag" placeholder.
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]
 pub struct SectorRecordV2 {
@@ -320,18 +322,20 @@ pub struct SectorRecordV2 {
     pub ceiling_material: u16,
     /// First wall record index for this sector.
     pub first_wall: u16,
+    /// Byte offset into the world's logic stream, or
+    /// [`NO_SECTOR_LOGIC`] when this sector has no triggers /
+    /// slopes / portals attached. The runtime parser bound-
+    /// checks this against `WorldHeaderV2::logic_stream_bytes`.
+    pub logic_offset: u16,
     /// Number of wall records belonging to this sector.
     /// `u8` because [`MAX_WALL_STACK`] caps any one edge low and
     /// the per-sector total stays small enough for a byte.
     pub wall_count: u8,
-    /// Floor split id, see [`split`].
-    pub floor_split: u8,
-    /// Ceiling split id, see [`split`].
-    pub ceiling_split: u8,
-    /// `0` when the sector has no logic; non-zero values key into
-    /// the logic stream (interpretation TBD as the trigger /
-    /// slope / portal types land).
-    pub logic_offset_kind: u8,
+    /// Packed floor + ceiling diagonal split bits, see
+    /// [`split_bits`]. Two booleans share one byte so that
+    /// expanding `logic_offset_kind` to `logic_offset: u16`
+    /// fits inside the same 28 B record.
+    pub split_bits: u8,
     /// Floor heights `[NW, NE, SE, SW]`, room-local `i16`.
     pub floor_heights: [i16; 4],
     /// Ceiling heights `[NW, NE, SE, SW]`, room-local `i16`.
@@ -343,6 +347,16 @@ impl SectorRecordV2 {
     pub const SIZE: usize = core::mem::size_of::<Self>();
 }
 const _: () = assert!(SectorRecordV2::SIZE == 28);
+
+/// Bit positions for [`SectorRecordV2::split_bits`]. A clear bit
+/// means the surface uses the default NW-SE diagonal; a set bit
+/// flips the split to NE-SW.
+pub mod split_bits {
+    /// Floor surface split is NE-SW (else NW-SE).
+    pub const FLOOR_NE_SW: u8 = 1 << 0;
+    /// Ceiling surface split is NE-SW (else NW-SE).
+    pub const CEILING_NE_SW: u8 = 1 << 1;
+}
 
 /// Compact wall record for the v2 layout.
 ///

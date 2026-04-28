@@ -702,6 +702,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Helper: starter project with the player spawn moved to
+    /// editor coord `(ex, ez)`. Reuses the starter so materials
+    /// are wired, then walks the scene to find the existing
+    /// `SpawnPoint { player: true }` and repositions it.
+    /// Returns the project plus the room and spawn NodeIds.
+    fn project_with_spawn_at(ex: f32, ez: f32) -> (ProjectDocument, NodeId, NodeId) {
+        let mut project = ProjectDocument::starter();
+        let (room_id, spawn_id) = {
+            let scene = project.active_scene();
+            let room = scene
+                .nodes()
+                .iter()
+                .find(|n| matches!(n.kind, crate::NodeKind::Room { .. }))
+                .expect("starter has a room");
+            let spawn = scene
+                .nodes()
+                .iter()
+                .find(|n| matches!(n.kind, crate::NodeKind::SpawnPoint { player: true }))
+                .expect("starter has a player spawn");
+            (room.id, spawn.id)
+        };
+        if let Some(node) = project.active_scene_mut().node_mut(spawn_id) {
+            node.transform.translation = [ex, 0.0, ez];
+        }
+        (project, room_id, spawn_id)
+    }
+
+    #[test]
+    fn spawn_at_room_centre_lands_at_array_centre() {
+        // Editor coord (0, 0) = room centre. With a 3×3 grid and
+        // sector_size=1024, the cooked room-local position should
+        // be (half_w * S, _, half_d * S) = (1536, _, 1536) — the
+        // centre of array cell (1, 1).
+        let (project, _, _) = project_with_spawn_at(0.0, 0.0);
+        let (package, report) = build_package(&project);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let spawn = package.unwrap().spawn.unwrap();
+        assert_eq!((spawn.x, spawn.z), (1536, 1536));
+    }
+
+    #[test]
+    fn spawn_after_negative_grow_lands_in_same_physical_cell() {
+        // Author a spawn at editor (-1.0, 0) — centre of cell
+        // (0, 1) in a 3×3 grid (room-centre-relative). Cook
+        // before and after a -X grow; the room-local Z stays
+        // put, the X shifts by half a sector because the
+        // array-rooted runtime room got 1 cell wider on the
+        // -X side. Same physical cell, just renumbered.
+        let (mut project, room_id, _) = project_with_spawn_at(-1.0, 0.0);
+
+        let (pre, _) = build_package(&project);
+        let pre_spawn = pre.unwrap().spawn.unwrap();
+        // Pre-grow: half_w = 1.5; (-1.0 + 1.5) * 1024 = 512.
+        // half_d = 1.5; (0 + 1.5) * 1024 = 1536.
+        assert_eq!((pre_spawn.x, pre_spawn.z), (512, 1536));
+
+        // -X grow.
+        let scene = project.active_scene_mut();
+        if let Some(node) = scene.node_mut(room_id) {
+            if let crate::NodeKind::Room { grid } = &mut node.kind {
+                grid.extend_to_include(-1, 0);
+            }
+        }
+
+        let (post, report) = build_package(&project);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let post_spawn = post.unwrap().spawn.unwrap();
+        // Post-grow: width = 4, so half_w = 2.0; editor stays
+        // -1.0 → (-1.0 + 2.0) * 1024 = 1024. Z unchanged at 1536.
+        assert_eq!((post_spawn.x, post_spawn.z), (1024, 1536));
+    }
+
+    #[test]
+    fn entity_after_negative_grow_uses_same_array_relative_formula() {
+        // Same idea but for a non-player marker — confirms the
+        // entity emit path uses the same `(editor + half) * S`
+        // formula and stays origin-agnostic.
+        let (mut project, room_id, _) = project_with_spawn_at(0.0, 0.0);
+        let scene = project.active_scene_mut();
+        let entity_id = scene.add_node(
+            room_id,
+            "Marker",
+            crate::NodeKind::SpawnPoint { player: false },
+        );
+        if let Some(node) = scene.node_mut(entity_id) {
+            node.transform.translation = [1.0, 0.0, -1.0];
+        }
+        // -Z grow.
+        if let Some(node) = scene.node_mut(room_id) {
+            if let crate::NodeKind::Room { grid } = &mut node.kind {
+                grid.extend_to_include(0, -1);
+            }
+        }
+
+        let (package, report) = build_package(&project);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.unwrap();
+        assert_eq!(package.entities.len(), 1);
+        let e = package.entities[0];
+        // Post-grow: half_d = 2.0. Editor (1.0, _, -1.0):
+        //   x = (1.0 + 1.5) * 1024 = 2560
+        //   z = (-1.0 + 2.0) * 1024 = 1024
+        assert_eq!((e.x, e.z), (2560, 1024));
+    }
+
     #[test]
     fn empty_package_renders_a_valid_skeleton() {
         let package = PlaytestPackage::default();
