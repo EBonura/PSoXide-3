@@ -1001,8 +1001,28 @@ impl EditorWorkspace {
     /// hands back the exact command to run.
     pub fn cook_playtest_to_disk(&self) -> Result<String, String> {
         let dir = psxed_project::playtest::default_generated_dir();
-        let report = psxed_project::playtest::cook_to_dir(&self.project, &dir)
-            .map_err(|e| format!("write playtest output: {e}"))?;
+        // Re-run build_package up front to grab the asset/material
+        // counts for the status string. cook_to_dir does this
+        // internally too; the duplicate cost is negligible
+        // compared to the IO it saves a step later.
+        let (package, _report) =
+            psxed_project::playtest::build_package(&self.project, &self.project_dir);
+        let summary = package.as_ref().map(|p| {
+            (
+                p.rooms.len(),
+                p.assets.len(),
+                p.texture_asset_count(),
+                p.materials.len(),
+                p.entities.len(),
+            )
+        });
+
+        let report = psxed_project::playtest::cook_to_dir(
+            &self.project,
+            &self.project_dir,
+            &dir,
+        )
+        .map_err(|e| format!("write playtest output: {e}"))?;
         if !report.is_ok() {
             return Err(format!(
                 "playtest validation failed: {}",
@@ -1015,9 +1035,25 @@ impl EditorWorkspace {
             format!(" ({} warning{})", report.warnings.len(),
                 if report.warnings.len() == 1 { "" } else { "s" })
         };
+        let counts = summary.map(|(rooms, assets, textures, materials, entities)| {
+            format!(
+                " — {} room{}, {} asset{}, {} texture{}, {} material{}, {} entit{}",
+                rooms,
+                if rooms == 1 { "" } else { "s" },
+                assets,
+                if assets == 1 { "" } else { "s" },
+                textures,
+                if textures == 1 { "" } else { "s" },
+                materials,
+                if materials == 1 { "" } else { "s" },
+                entities,
+                if entities == 1 { "y" } else { "ies" },
+            )
+        }).unwrap_or_default();
         Ok(format!(
-            "Playtest cooked → {}{}.  Run: make run-editor-playtest",
+            "Playtest cooked → {}{}{}.  Run: make run-editor-playtest",
             dir.display(),
+            counts,
             warning_suffix,
         ))
     }

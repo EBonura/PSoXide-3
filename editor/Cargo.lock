@@ -380,6 +380,10 @@ name = "psx-gte-core"
 version = "0.1.0"
 
 [[package]]
+name = "psx-level"
+version = "0.1.0"
+
+[[package]]
 name = "psxed"
 version = "0.1.0"
 dependencies = [
@@ -416,6 +420,7 @@ name = "psxed-project"
 version = "0.1.0"
 dependencies = [
  "psx-asset",
+ "psx-level",
  "psxed-format",
  "ron",
  "serde",

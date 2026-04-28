@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/psx-engine",
+    "crates/psx-level",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ repository = "https://github.com/EBonura/PSoXide"
 # here once; engine crates inherit them via `{ workspace = true }`
 # so version pinning stays in one place.
 psx-asset = { path = "../sdk/crates/psx-asset" }
+psx-level = { path = "crates/psx-level" }
 psx-fx    = { path = "../sdk/crates/psx-fx" }
 psx-gpu   = { path = "../sdk/crates/psx-gpu" }
 psx-gte   = { path = "../sdk/crates/psx-gte" }

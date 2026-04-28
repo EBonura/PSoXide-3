@@ -16,6 +16,7 @@ dependencies = [
  "psx-engine",
  "psx-gpu",
  "psx-gte",
+ "psx-level",
  "psx-math",
  "psx-rt",
  "psx-vram",
@@ -75,6 +76,10 @@ version = "0.1.0"
 dependencies = [
  "psx-hw",
 ]
+
+[[package]]
+name = "psx-level"
+version = "0.1.0"
 
 [[package]]
 name = "psx-math"
