@@ -45,7 +45,7 @@ mod generated {
     include!("../generated/level_manifest.rs");
 }
 
-use generated::{PLAYER_SPAWN, ROOMS};
+use generated::{PlaytestEntityRecord, ENTITIES, PLAYER_SPAWN, ROOMS};
 
 // Same texture VRAM layout as showcase-room. The cooker emits
 // slot 0 = floor.psxt, slot 1 = brick-wall.psxt for the starter
@@ -96,8 +96,21 @@ const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, FAR_Z);
 
 // 32×32 max room budget: 1024 floors + 1024 ceilings + walls.
 // Cap at 2048 to match `MAX_ROOM_TRIANGLES`. 4096 tri buffer
-// covers two passes plus HUD headroom.
+// covers room + entity markers (12 tris each) + HUD headroom.
 const MAX_TEXTURED_TRIS: usize = 4096;
+
+/// Half-extent of an entity marker cube, in engine units.
+/// Visible at orbit-cam radius without dominating the room.
+const MARKER_HALF: i32 = 96;
+/// Y-up offset so a marker authored at room-floor height
+/// (`entity.y == 0`) draws as a cube sitting on the floor with
+/// its base at y=0 and top at y=2*MARKER_HALF. Lifts the
+/// marker out of any z-fight with the floor.
+const MARKER_LIFT: i32 = MARKER_HALF;
+/// Tint applied to the brick texture when drawing markers.
+/// Yellow-orange, distinctly different from the brick's natural
+/// reddish tone, so markers stand out at a glance.
+const MARKER_TINT: (u8, u8, u8) = (0xff, 0xa8, 0x40);
 
 const TRI_ZERO: TriTextured = TriTextured::new(
     [(0, 0), (0, 0), (0, 0)],
@@ -261,10 +274,95 @@ impl Scene for Playtest {
                 &mut triangles,
                 &mut world,
             );
+            draw_entity_markers(ENTITIES, &camera, options, &mut triangles, &mut world);
         }
 
         world.flush();
         ot.submit();
+    }
+}
+
+/// Draw one tinted cube per generated entity record. Cubes
+/// share the brick texture with a yellow-orange tint so they
+/// stand out from the cobblestone floor + reddish brick walls
+/// without needing a dedicated texture upload.
+///
+/// No-alloc: emits at most `entities.len() * 6` quads through
+/// the same `WorldRenderPass` the room uses.
+fn draw_entity_markers(
+    entities: &[PlaytestEntityRecord],
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+) {
+    if entities.is_empty() {
+        return;
+    }
+    let material = TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, MARKER_TINT);
+    let opts = options.with_material_layer(material);
+    // Whole-cube UVs match the floor's 64×64 tile so the brick
+    // pattern wraps cleanly across each face. Reuse for every
+    // face to keep the helper trivial.
+    const UVS: [(u8, u8); 4] = [(0, 0), (64, 0), (64, 64), (0, 64)];
+
+    for entity in entities {
+        let cx = entity.x;
+        let cy = entity.y - MARKER_LIFT - MARKER_HALF;
+        let cz = entity.z;
+        let h = MARKER_HALF;
+
+        // Six faces. Each `[a, b, c, d]` picks four corners in
+        // the (NW, NE, SE, SW)-style winding `submit_textured_quad`
+        // expects (split into triangles 0-1-2 and 2-1-3).
+        // Top (y - h, "lower" if +Y is down):
+        let top = [
+            WorldVertex::new(cx - h, cy - h, cz - h),
+            WorldVertex::new(cx + h, cy - h, cz - h),
+            WorldVertex::new(cx + h, cy - h, cz + h),
+            WorldVertex::new(cx - h, cy - h, cz + h),
+        ];
+        // Bottom:
+        let bottom = [
+            WorldVertex::new(cx - h, cy + h, cz + h),
+            WorldVertex::new(cx + h, cy + h, cz + h),
+            WorldVertex::new(cx + h, cy + h, cz - h),
+            WorldVertex::new(cx - h, cy + h, cz - h),
+        ];
+        // North (z = cz - h):
+        let north = [
+            WorldVertex::new(cx - h, cy - h, cz - h),
+            WorldVertex::new(cx + h, cy - h, cz - h),
+            WorldVertex::new(cx + h, cy + h, cz - h),
+            WorldVertex::new(cx - h, cy + h, cz - h),
+        ];
+        // South (z = cz + h):
+        let south = [
+            WorldVertex::new(cx + h, cy - h, cz + h),
+            WorldVertex::new(cx - h, cy - h, cz + h),
+            WorldVertex::new(cx - h, cy + h, cz + h),
+            WorldVertex::new(cx + h, cy + h, cz + h),
+        ];
+        // East (x = cx + h):
+        let east = [
+            WorldVertex::new(cx + h, cy - h, cz - h),
+            WorldVertex::new(cx + h, cy - h, cz + h),
+            WorldVertex::new(cx + h, cy + h, cz + h),
+            WorldVertex::new(cx + h, cy + h, cz - h),
+        ];
+        // West (x = cx - h):
+        let west = [
+            WorldVertex::new(cx - h, cy - h, cz + h),
+            WorldVertex::new(cx - h, cy - h, cz - h),
+            WorldVertex::new(cx - h, cy + h, cz - h),
+            WorldVertex::new(cx - h, cy + h, cz + h),
+        ];
+
+        for face in [top, bottom, north, south, east, west] {
+            if let Some(projected) = camera.project_world_quad(face) {
+                let _ = world.submit_textured_quad(triangles, projected, UVS, material, opts);
+            }
+        }
     }
 }
 

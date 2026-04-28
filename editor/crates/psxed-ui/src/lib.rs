@@ -3320,8 +3320,13 @@ impl EditorWorkspace {
             .and_then(|room| self.world_to_sector(room, world));
     }
 
-    /// Apply a paint/erase/place tool to one sector. Marks the project
-    /// dirty so save/cook prompts work; status bar reflects the action.
+    /// Apply a 2D-viewport click through the same logic as a 3D
+    /// click. Old behaviour kept a separate `apply_paint` body
+    /// here that diverged from the 3D `run_paint_action` (no
+    /// origin awareness, no wall replacement, no `PlaceKind`
+    /// dispatch). Now: lift the click into editor coords, pre-
+    /// compute a `picked_face` for PaintWall when the inferred
+    /// edge already has a wall stack, and hand off.
     fn apply_paint(
         &mut self,
         tool: ViewTool,
@@ -3330,20 +3335,13 @@ impl EditorWorkspace {
         sz: u16,
         world: [f32; 2],
     ) {
-        self.push_undo();
-        // Toolbar picker overrides the name-based default. The picker
-        // lives in the workspace state so the choice survives across
-        // tool switches and across cells in a single drag-paint.
-        let floor_mat = self
-            .brush_material
-            .or_else(|| self.default_brush_material("floor"));
-        let wall_mat = self
-            .brush_material
-            .or_else(|| self.default_brush_material("brick"))
-            .or(floor_mat);
-        let room_center;
-        let sector_center;
-        {
+        // 2D `world` is already in editor sector-units (the 2D
+        // viewport's native space, room-centre-relative around
+        // `node_world(room)`). Convert through the canonical
+        // helper to get a room-local 3D position the rest of the
+        // paint flow can chew on. `editor_to_room_local` is
+        // origin-aware, so this stays correct after a -X / -Z grow.
+        let (hit_world, picked_face) = {
             let scene = self.project.active_scene();
             let Some(room) = scene.node(room_id) else {
                 return;
@@ -3351,79 +3349,38 @@ impl EditorWorkspace {
             let NodeKind::Room { grid } = &room.kind else {
                 return;
             };
-            room_center = node_world(room);
-            let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
-            sector_center = [
-                room_center[0] - half[0] + sx as f32 + 0.5,
-                room_center[1] - half[1] + sz as f32 + 0.5,
-            ];
-        }
+            let room_center = node_world(room);
+            let editor = [world[0] - room_center[0], world[1] - room_center[1]];
+            let hit = grid.editor_to_room_local(editor);
 
-        if matches!(tool, ViewTool::Place) {
-            let id = self.project.active_scene_mut().add_node(
-                room_id,
-                "Spawn",
-                NodeKind::SpawnPoint { player: false },
-            );
-            if let Some(node) = self.project.active_scene_mut().node_mut(id) {
-                node.transform.translation = [
-                    world[0] - room_center[0],
-                    0.0,
-                    world[1] - room_center[1],
-                ];
-            }
-            self.selected_node = id;
-            self.status = format!("Placed entity at {sx},{sz}");
-            self.mark_dirty();
-            return;
-        }
+            // For PaintWall: if the inferred edge already has at
+            // least one wall, hand `run_paint_action` a `FaceRef`
+            // pointing at the top of the stack so it replaces
+            // material instead of appending. Empty edge → None
+            // → append path.
+            let face = if matches!(tool, ViewTool::PaintWall) {
+                let centre = grid.cell_center_world(sx, sz);
+                let dir = edge_from_world_offset(hit[0] - centre[0], hit[2] - centre[1]);
+                grid.sector(sx, sz).and_then(|sector| {
+                    let walls = sector.walls.get(dir);
+                    let stack = walls.len().checked_sub(1)?;
+                    Some(FaceRef {
+                        room: room_id,
+                        sx,
+                        sz,
+                        kind: FaceKind::Wall {
+                            dir,
+                            stack: stack as u8,
+                        },
+                    })
+                })
+            } else {
+                None
+            };
+            (hit, face)
+        };
 
-        let scene = self.project.active_scene_mut();
-        let Some(room) = scene.node_mut(room_id) else {
-            return;
-        };
-        let NodeKind::Room { grid } = &mut room.kind else {
-            return;
-        };
-        let sector_size = grid.sector_size;
-        let status = match tool {
-            ViewTool::PaintFloor => {
-                grid.set_floor(sx, sz, 0, floor_mat);
-                format!("Painted floor at {sx},{sz}")
-            }
-            ViewTool::PaintCeiling => {
-                if let Some(sector) = grid.ensure_sector(sx, sz) {
-                    sector.ceiling = Some(GridHorizontalFace::flat(sector_size, floor_mat));
-                }
-                format!("Painted ceiling at {sx},{sz}")
-            }
-            ViewTool::PaintWall => {
-                let dx = world[0] - sector_center[0];
-                let dz = world[1] - sector_center[1];
-                let dir = if dz.abs() > dx.abs() {
-                    if dz < 0.0 {
-                        GridDirection::North
-                    } else {
-                        GridDirection::South
-                    }
-                } else if dx < 0.0 {
-                    GridDirection::West
-                } else {
-                    GridDirection::East
-                };
-                grid.add_wall(sx, sz, dir, 0, sector_size, wall_mat);
-                format!("Added {dir:?} wall at {sx},{sz}")
-            }
-            ViewTool::Erase => {
-                if let Some(index) = grid.sector_index(sx, sz) {
-                    grid.sectors[index] = None;
-                }
-                format!("Erased sector {sx},{sz}")
-            }
-            _ => return,
-        };
-        self.status = status;
-        self.mark_dirty();
+        self.run_paint_action(tool, room_id, sx, sz, picked_face, hit_world);
     }
 
     fn add_child(&mut self, kind: NodeKind, name: &str) {
