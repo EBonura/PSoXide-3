@@ -78,9 +78,11 @@ fn main() {
 
     // `--config-dir` also applies to the GUI path — lets testers
     // point the app at a scratch directory without touching their
-    // real settings. Ditto `--fullscreen`.
+    // real settings. The GUI defaults to borderless-fullscreen;
+    // `--windowed` opts back into a regular floating window for
+    // development next to a terminal / docs.
     let config_dir = cli.config_dir;
-    let fullscreen = cli.fullscreen;
+    let fullscreen = !cli.windowed;
     let gpu_compute = cli.gpu_compute;
 
     let event_loop = EventLoop::new().expect("event loop");
@@ -252,10 +254,9 @@ impl ApplicationHandler for Shell {
             return;
         }
 
-        // Borderless-fullscreen on the primary monitor when
-        // `--fullscreen` was passed. Falls back to a windowed
-        // 1600×1000 otherwise so development on a laptop with
-        // panels + a terminal remains bearable.
+        // Borderless-fullscreen on the primary monitor by default.
+        // `--windowed` switches to a 1600×1000 floating window so
+        // dev work next to a terminal / docs stays bearable.
         let mut attrs = Window::default_attributes()
             .with_title("PSoXide")
             .with_inner_size(winit::dpi::PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))

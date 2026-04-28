@@ -45,11 +45,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
 
-    /// Launch the GUI in true borderless-fullscreen mode (primary
-    /// monitor). Only meaningful when no headless subcommand is
-    /// given — subcommands always run windowless.
+    /// Launch the GUI in a regular floating window instead of the
+    /// default borderless-fullscreen mode. Useful when developing
+    /// with the editor side-by-side with a terminal or docs. Only
+    /// meaningful when no headless subcommand is given —
+    /// subcommands always run windowless.
     #[arg(long)]
-    pub fullscreen: bool,
+    pub windowed: bool,
 
     /// Run the experimental compute-shader rasterizer in parallel
     /// with the CPU rasterizer (Phase C). Per-frame the frontend
