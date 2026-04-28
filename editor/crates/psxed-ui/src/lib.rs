@@ -13,8 +13,8 @@ use egui::{
     Stroke, StrokeKind, Vec2,
 };
 use psxed_project::{
-    snap_height, GridDirection, GridHorizontalFace, GridVerticalFace, MaterialResource, NodeId,
-    NodeKind, NodeRow, ProjectDocument, PsxBlendMode, Resource, ResourceData, ResourceId,
+    snap_height, GridDirection, GridHorizontalFace, GridSplit, GridVerticalFace, MaterialResource,
+    NodeId, NodeKind, NodeRow, ProjectDocument, PsxBlendMode, Resource, ResourceData, ResourceId,
     WorldGrid, WorldGridBudget, HEIGHT_QUANTUM, MAX_ROOM_BYTES, MAX_ROOM_DEPTH,
     MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
 };
@@ -268,56 +268,10 @@ pub struct FaceRef {
     pub kind: FaceKind,
 }
 
-/// Floor / ceiling corner index. Stored values map directly to
-/// the `[NW, NE, SE, SW]` order every height array uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Corner {
-    NW,
-    NE,
-    SE,
-    SW,
-}
-
-impl Corner {
-    /// Index into `[NW, NE, SE, SW]`.
-    pub const fn idx(self) -> usize {
-        match self {
-            Self::NW => 0,
-            Self::NE => 1,
-            Self::SE => 2,
-            Self::SW => 3,
-        }
-    }
-}
-
-/// Wall corner index. Stored values map to the
-/// `[bottom-left, bottom-right, top-right, top-left]` order in
-/// every wall heights array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WallCorner {
-    BL,
-    BR,
-    TR,
-    TL,
-}
-
-impl WallCorner {
-    pub const fn idx(self) -> usize {
-        match self {
-            Self::BL => 0,
-            Self::BR => 1,
-            Self::TR => 2,
-            Self::TL => 3,
-        }
-    }
-
-    /// `true` when this corner sits at the wall's bottom (uses
-    /// `heights[0]` or `heights[1]`). The other two corners are
-    /// at the top.
-    pub const fn is_bottom(self) -> bool {
-        matches!(self, Self::BL | Self::BR)
-    }
-}
+// Corner / WallCorner live in `psxed-project` so faces can carry
+// `dropped_corner` data with serde support. Re-exported here so
+// existing imports (`use psxed_ui::Corner`) keep working.
+pub use psxed_project::{Corner, WallCorner};
 
 /// Which of the four edges of a wall quad. Order matches the
 /// perimeter walk used by the picker:
@@ -2309,11 +2263,18 @@ impl EditorWorkspace {
                         sz,
                         kind: FaceKind::Floor,
                     };
-                    if let Some(t) = ray_triangle(origin, dir, nw, sw, ne) {
-                        consider(face, t);
-                    }
-                    if let Some(t) = ray_triangle(origin, dir, ne, sw, se) {
-                        consider(face, t);
+                    for (a, b, c, members) in
+                        horizontal_triangles(nw, ne, se, sw, floor.split)
+                    {
+                        if floor
+                            .dropped_corner
+                            .is_some_and(|d| members.iter().any(|m| *m == d))
+                        {
+                            continue;
+                        }
+                        if let Some(t) = ray_triangle(origin, dir, a, b, c) {
+                            consider(face, t);
+                        }
                     }
                 }
                 if let Some(ceiling) = &sector.ceiling {
@@ -2328,11 +2289,18 @@ impl EditorWorkspace {
                         sz,
                         kind: FaceKind::Ceiling,
                     };
-                    if let Some(t) = ray_triangle(origin, dir, nw, ne, sw) {
-                        consider(face, t);
-                    }
-                    if let Some(t) = ray_triangle(origin, dir, ne, se, sw) {
-                        consider(face, t);
+                    for (a, b, c, members) in
+                        horizontal_triangles(nw, ne, se, sw, ceiling.split)
+                    {
+                        if ceiling
+                            .dropped_corner
+                            .is_some_and(|d| members.iter().any(|m| *m == d))
+                        {
+                            continue;
+                        }
+                        if let Some(t) = ray_triangle(origin, dir, a, b, c) {
+                            consider(face, t);
+                        }
                     }
                 }
                 for dir_card in [
@@ -2357,11 +2325,18 @@ impl EditorWorkspace {
                                 stack: stack_idx as u8,
                             },
                         };
-                        if let Some(t) = ray_triangle(origin, dir, bl, br, tr) {
-                            consider(face, t);
-                        }
-                        if let Some(t) = ray_triangle(origin, dir, bl, tr, tl) {
-                            consider(face, t);
+                        for (a, b, c, members) in
+                            wall_triangles(bl, br, tr, tl, wall.dropped_corner)
+                        {
+                            if wall
+                                .dropped_corner
+                                .is_some_and(|d| members.iter().any(|m| *m == d))
+                            {
+                                continue;
+                            }
+                            if let Some(t) = ray_triangle(origin, dir, a, b, c) {
+                                consider(face, t);
+                            }
                         }
                     }
                 }
@@ -2494,8 +2469,12 @@ impl EditorWorkspace {
             let del = ctx.input_mut(|i| {
                 i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
             });
-            if del && self.selected_node != NodeId::ROOT && self.renaming.is_none() {
-                self.apply_tree_action(TreeAction::Delete(self.selected_node));
+            if del && self.renaming.is_none() {
+                if self.selected_primitive.is_some() {
+                    self.delete_selected_primitive();
+                } else if self.selected_node != NodeId::ROOT {
+                    self.apply_tree_action(TreeAction::Delete(self.selected_node));
+                }
             }
             let rot = ctx.input_mut(|i| i.key_pressed(egui::Key::R));
             if rot && self.renaming.is_none() {
@@ -4358,6 +4337,128 @@ impl EditorWorkspace {
             self.selected_resource = None;
             self.status = "Deleted node".to_string();
             self.mark_dirty();
+        }
+    }
+
+    /// Delete dispatch for the active selection:
+    /// - Face   → remove the face from its sector.
+    /// - Edge   → remove the face that owns the edge.
+    /// - Vertex → drop the corner on the seed face, turning it
+    ///   into a triangle (split is auto-flipped to the surviving
+    ///   diagonal). The other coincident face-corners are left
+    ///   untouched.
+    fn delete_selected_primitive(&mut self) {
+        let Some(selection) = self.selected_primitive else {
+            return;
+        };
+        let outcome = match selection {
+            Selection::Face(face) => self.remove_face(face),
+            Selection::Edge(edge) => edge_owning_face_ref(edge)
+                .map(|face| self.remove_face(face))
+                .unwrap_or(DeleteOutcome::Missing),
+            Selection::Vertex(vertex) => self.drop_vertex(vertex),
+        };
+        match outcome {
+            DeleteOutcome::Removed(label) => {
+                self.selected_primitive = None;
+                self.hovered_primitive = None;
+                self.status = format!("Deleted {label}");
+                self.mark_dirty();
+            }
+            DeleteOutcome::Triangulated(label) => {
+                self.status = format!("Dropped {label}");
+                self.mark_dirty();
+            }
+            DeleteOutcome::Missing => {
+                self.status = "Nothing to delete".to_string();
+            }
+        }
+    }
+
+    /// Detach a face from its sector. Floors / ceilings clear the
+    /// `Option<>`; walls splice the entry out of the per-direction
+    /// `Vec`. Returns `Removed` on success so the caller can update
+    /// status / clear the selection.
+    fn remove_face(&mut self, face: FaceRef) -> DeleteOutcome {
+        self.push_undo();
+        let scene = self.project.active_scene_mut();
+        let Some(node) = scene.node_mut(face.room) else {
+            return DeleteOutcome::Missing;
+        };
+        let NodeKind::Room { grid } = &mut node.kind else {
+            return DeleteOutcome::Missing;
+        };
+        let Some(sector) = grid.sector_mut(face.sx, face.sz) else {
+            return DeleteOutcome::Missing;
+        };
+        let removed = match face.kind {
+            FaceKind::Floor => sector.floor.take().is_some(),
+            FaceKind::Ceiling => sector.ceiling.take().is_some(),
+            FaceKind::Wall { dir, stack } => {
+                let walls = sector.walls.get_mut(dir);
+                if (stack as usize) < walls.len() {
+                    walls.remove(stack as usize);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if removed {
+            DeleteOutcome::Removed(describe_face_kind(face.kind))
+        } else {
+            DeleteOutcome::Missing
+        }
+    }
+
+    /// Drop a corner from the vertex's seed face. Floors / ceilings
+    /// gain a `dropped_corner` and have their split forced to the
+    /// surviving diagonal. Walls do the same with `WallCorner`.
+    fn drop_vertex(&mut self, vertex: VertexRef) -> DeleteOutcome {
+        self.push_undo();
+        let scene = self.project.active_scene_mut();
+        let Some(node) = scene.node_mut(vertex.room) else {
+            return DeleteOutcome::Missing;
+        };
+        let NodeKind::Room { grid } = &mut node.kind else {
+            return DeleteOutcome::Missing;
+        };
+        let (sx, sz) = match vertex.anchor {
+            VertexAnchor::Floor { sx, sz, .. }
+            | VertexAnchor::Ceiling { sx, sz, .. }
+            | VertexAnchor::Wall { sx, sz, .. } => (sx, sz),
+        };
+        let Some(sector) = grid.sector_mut(sx, sz) else {
+            return DeleteOutcome::Missing;
+        };
+        match vertex.anchor {
+            VertexAnchor::Floor { corner, .. } => {
+                let Some(floor) = sector.floor.as_mut() else {
+                    return DeleteOutcome::Missing;
+                };
+                floor.drop_corner(corner);
+                DeleteOutcome::Triangulated("floor corner")
+            }
+            VertexAnchor::Ceiling { corner, .. } => {
+                let Some(ceiling) = sector.ceiling.as_mut() else {
+                    return DeleteOutcome::Missing;
+                };
+                ceiling.drop_corner(corner);
+                DeleteOutcome::Triangulated("ceiling corner")
+            }
+            VertexAnchor::Wall {
+                dir,
+                stack,
+                corner,
+                ..
+            } => {
+                let walls = sector.walls.get_mut(dir);
+                let Some(wall) = walls.get_mut(stack as usize) else {
+                    return DeleteOutcome::Missing;
+                };
+                wall.drop_corner(corner);
+                DeleteOutcome::Triangulated("wall corner")
+            }
         }
     }
 
@@ -6672,6 +6773,27 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// Outcome of a primitive delete. `Removed` => the face is gone
+/// (user selected a face or edge). `Triangulated` => one corner
+/// was dropped and the face is still alive as a triangle.
+/// `Missing` => the face / sector wasn't where the selection
+/// thought it was (stale state) — caller should leave things
+/// alone.
+enum DeleteOutcome {
+    Removed(&'static str),
+    Triangulated(&'static str),
+    Missing,
+}
+
+/// Short label for a face kind, used in delete status messages.
+const fn describe_face_kind(kind: FaceKind) -> &'static str {
+    match kind {
+        FaceKind::Floor => "floor",
+        FaceKind::Ceiling => "ceiling",
+        FaceKind::Wall { .. } => "wall",
+    }
+}
+
 /// One-line human description of a `FaceRef` for status messages
 /// and the inspector header. Walls include their cardinal direction
 /// + stack index since a single edge can carry several stacked
@@ -7356,6 +7478,55 @@ fn write_face_corner_height(grid: &mut WorldGrid, corner: FaceCornerRef, new_y: 
                 }
             }
         }
+    }
+}
+
+/// Decompose a horizontal face into its two ray-test
+/// triangles, tagged with the corners they're built from. The
+/// pick path skips a triangle whose member list contains the
+/// face's `dropped_corner`.
+type HorizontalTri = ([f32; 3], [f32; 3], [f32; 3], [Corner; 3]);
+fn horizontal_triangles(
+    nw: [f32; 3],
+    ne: [f32; 3],
+    se: [f32; 3],
+    sw: [f32; 3],
+    split: GridSplit,
+) -> [HorizontalTri; 2] {
+    match split {
+        GridSplit::NorthWestSouthEast => [
+            (nw, ne, se, [Corner::NW, Corner::NE, Corner::SE]),
+            (nw, se, sw, [Corner::NW, Corner::SE, Corner::SW]),
+        ],
+        GridSplit::NorthEastSouthWest => [
+            (nw, ne, sw, [Corner::NW, Corner::NE, Corner::SW]),
+            (ne, se, sw, [Corner::NE, Corner::SE, Corner::SW]),
+        ],
+    }
+}
+
+/// Wall-quad triangle decomposition. The diagonal flips when
+/// the dropped corner sits on the BL-TR line — `BL` / `TR`
+/// trigger the BR-TL diagonal.
+type WallTri = ([f32; 3], [f32; 3], [f32; 3], [WallCorner; 3]);
+fn wall_triangles(
+    bl: [f32; 3],
+    br: [f32; 3],
+    tr: [f32; 3],
+    tl: [f32; 3],
+    dropped: Option<WallCorner>,
+) -> [WallTri; 2] {
+    let use_br_tl = matches!(dropped, Some(WallCorner::BL) | Some(WallCorner::TR));
+    if use_br_tl {
+        [
+            (bl, br, tl, [WallCorner::BL, WallCorner::BR, WallCorner::TL]),
+            (br, tr, tl, [WallCorner::BR, WallCorner::TR, WallCorner::TL]),
+        ]
+    } else {
+        [
+            (bl, br, tr, [WallCorner::BL, WallCorner::BR, WallCorner::TR]),
+            (bl, tr, tl, [WallCorner::BL, WallCorner::TR, WallCorner::TL]),
+        ]
     }
 }
 

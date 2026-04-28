@@ -31,7 +31,7 @@ use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
 use psx_gpu::prim::TriTextured;
 use psxed_project::{
-    GridDirection, NodeKind, ProjectDocument, ResourceData, ResourceId, WorldGrid,
+    GridDirection, GridSplit, NodeKind, ProjectDocument, ResourceData, ResourceId, WorldGrid,
 };
 
 use crate::editor_textures::{EditorTextures, MaterialSlot};
@@ -301,6 +301,8 @@ fn walk_room(
                     scratch,
                     [x0, x1, z0, z1],
                     floor.heights,
+                    floor.split,
+                    floor.dropped_corner,
                     face_shade(project, floor.material, FALLBACK_FLOOR, textures),
                     /* flip_winding */ false,
                 );
@@ -310,6 +312,8 @@ fn walk_room(
                     scratch,
                     [x0, x1, z0, z1],
                     ceiling.heights,
+                    ceiling.split,
+                    ceiling.dropped_corner,
                     face_shade(project, ceiling.material, FALLBACK_CEILING, textures),
                     // Ceiling normal points down; flipping the winding
                     // keeps backface-cullers happy and pins the inside
@@ -329,6 +333,7 @@ fn walk_room(
                         [x0, x1, z0, z1],
                         edge,
                         face.heights,
+                        face.dropped_corner,
                         face_shade(project, face.material, FALLBACK_WALL, textures),
                     );
                 }
@@ -368,16 +373,23 @@ fn face_shade(
     FaceShade::Flat(tint.0, tint.1, tint.2)
 }
 
-/// Project the four corners of a sector-aligned horizontal face and
-/// emit two triangles for it. `heights` is `[NW, NE, SE, SW]`.
+/// Project the four corners of a sector-aligned horizontal face
+/// and emit one or two triangles. `heights` is `[NW, NE, SE, SW]`.
 /// `flip_winding=true` reverses the vertex order for ceilings.
+/// `dropped_corner=Some(c)` makes the face a triangle: the half
+/// containing `c` is skipped (`split` must already be on the
+/// diagonal that keeps the other half alive — `Corner::surviving_split`
+/// enforces this at the data layer).
 fn push_horizontal_face(
     scratch: &mut PreviewScratch,
     bounds: [i32; 4],
     heights: [i32; 4],
+    split: GridSplit,
+    dropped_corner: Option<psxed_project::Corner>,
     shade: FaceShade,
     flip_winding: bool,
 ) {
+    use psxed_project::Corner;
     let [x0, x1, z0, z1] = bounds;
     let p_nw = gte_scene::project_vertex(world_to_view([x0, heights[0], z1]));
     let p_ne = gte_scene::project_vertex(world_to_view([x1, heights[1], z1]));
@@ -394,7 +406,6 @@ fn push_horizontal_face(
         uv_se = (max_u, max_v);
         uv_sw = (0, max_v);
     } else {
-        // Unused but the compiler still needs values; arbitrary.
         max_u = 0;
         max_v = 0;
         uv_nw = (0, 0);
@@ -404,12 +415,73 @@ fn push_horizontal_face(
     }
     let _ = max_u;
     let _ = max_v;
-    if flip_winding {
-        emit_face_tri(scratch, [p_nw, p_ne, p_sw], [uv_nw, uv_ne, uv_sw], shade);
-        emit_face_tri(scratch, [p_ne, p_se, p_sw], [uv_ne, uv_se, uv_sw], shade);
-    } else {
-        emit_face_tri(scratch, [p_nw, p_sw, p_ne], [uv_nw, uv_sw, uv_ne], shade);
-        emit_face_tri(scratch, [p_ne, p_sw, p_se], [uv_ne, uv_sw, uv_se], shade);
+
+    // Per split, pick the two triangles. Triangle A is the
+    // perimeter walk's "first" half, B the "second" — under
+    // each split the dropped corner exists in exactly one of
+    // them so we can skip cleanly.
+    let (tri_a, tri_b) = match split {
+        GridSplit::NorthWestSouthEast => (
+            // (NW, NE, SE) and (NW, SE, SW) — diagonal NW–SE.
+            (
+                [p_nw, p_ne, p_se],
+                [uv_nw, uv_ne, uv_se],
+                [Corner::NW, Corner::NE, Corner::SE],
+            ),
+            (
+                [p_nw, p_se, p_sw],
+                [uv_nw, uv_se, uv_sw],
+                [Corner::NW, Corner::SE, Corner::SW],
+            ),
+        ),
+        GridSplit::NorthEastSouthWest => (
+            // (NW, NE, SW) and (NE, SE, SW) — diagonal NE–SW.
+            (
+                [p_nw, p_ne, p_sw],
+                [uv_nw, uv_ne, uv_sw],
+                [Corner::NW, Corner::NE, Corner::SW],
+            ),
+            (
+                [p_ne, p_se, p_sw],
+                [uv_ne, uv_se, uv_sw],
+                [Corner::NE, Corner::SE, Corner::SW],
+            ),
+        ),
+    };
+
+    let triangle_contains = |members: [Corner; 3], target: Corner| -> bool {
+        members.iter().any(|c| *c == target)
+    };
+    let emit_triangle = |scratch: &mut PreviewScratch,
+                         verts: [psx_gte::scene::Projected; 3],
+                         uvs: [(u8, u8); 3]| {
+        if flip_winding {
+            // Ceilings: forward `[0, 1, 2]` walk (CW from above
+            // = CCW from below) so the inward normal points down.
+            emit_face_tri(scratch, verts, uvs, shade);
+        } else {
+            // Floors: reverse to `[0, 2, 1]` (CCW from above),
+            // matching the legacy non-flip winding.
+            emit_face_tri(
+                scratch,
+                [verts[0], verts[2], verts[1]],
+                [uvs[0], uvs[2], uvs[1]],
+                shade,
+            );
+        }
+    };
+
+    let skip_a = dropped_corner
+        .map(|c| triangle_contains(tri_a.2, c))
+        .unwrap_or(false);
+    let skip_b = dropped_corner
+        .map(|c| triangle_contains(tri_b.2, c))
+        .unwrap_or(false);
+    if !skip_a {
+        emit_triangle(scratch, tri_a.0, tri_a.1);
+    }
+    if !skip_b {
+        emit_triangle(scratch, tri_b.0, tri_b.1);
     }
 }
 
@@ -424,16 +496,21 @@ enum WallEdge {
     West,
 }
 
-/// Build the four world-space corners of a wall face on `edge` and
-/// emit two triangles for it. `heights` is the `GridVerticalFace`
-/// `[bottom_left, bottom_right, top_right, top_left]` quad.
+/// Build the four world-space corners of a wall face on `edge`
+/// and emit one or two triangles. `heights` is the
+/// `GridVerticalFace` `[bl, br, tr, tl]` quad. `dropped_corner`
+/// makes the face a triangle: BR / TL skip the second triangle
+/// of the BL-TR diagonal split; BL / TR fall through to the
+/// other diagonal.
 fn push_wall_face(
     scratch: &mut PreviewScratch,
     bounds: [i32; 4],
     edge: WallEdge,
     heights: [i32; 4],
+    dropped_corner: Option<psxed_project::WallCorner>,
     shade: FaceShade,
 ) {
+    use psxed_project::WallCorner;
     let [x0, x1, z0, z1] = bounds;
     // For each cardinal edge, "left" and "right" are picked so an
     // observer standing inside the sector sees the wall the right
@@ -455,8 +532,50 @@ fn push_wall_face(
     } else {
         ((0, 0), (0, 0), (0, 0), (0, 0))
     };
-    emit_face_tri(scratch, [p_bl, p_br, p_tr], [uv_bl, uv_br, uv_tr], shade);
-    emit_face_tri(scratch, [p_bl, p_tr, p_tl], [uv_bl, uv_tr, uv_tl], shade);
+
+    // Two diagonals to choose between. `BlTr` is the renderer's
+    // legacy split; switch to `BrTl` only when BL or TR is the
+    // dropped corner so a triangle survives.
+    let use_br_tl = matches!(dropped_corner, Some(WallCorner::BL) | Some(WallCorner::TR));
+    let (tri_a, tri_b) = if use_br_tl {
+        (
+            // (BL, BR, TL) and (BR, TR, TL) — diagonal BR-TL.
+            (
+                [p_bl, p_br, p_tl],
+                [uv_bl, uv_br, uv_tl],
+                [WallCorner::BL, WallCorner::BR, WallCorner::TL],
+            ),
+            (
+                [p_br, p_tr, p_tl],
+                [uv_br, uv_tr, uv_tl],
+                [WallCorner::BR, WallCorner::TR, WallCorner::TL],
+            ),
+        )
+    } else {
+        (
+            // (BL, BR, TR) and (BL, TR, TL) — diagonal BL-TR.
+            (
+                [p_bl, p_br, p_tr],
+                [uv_bl, uv_br, uv_tr],
+                [WallCorner::BL, WallCorner::BR, WallCorner::TR],
+            ),
+            (
+                [p_bl, p_tr, p_tl],
+                [uv_bl, uv_tr, uv_tl],
+                [WallCorner::BL, WallCorner::TR, WallCorner::TL],
+            ),
+        )
+    };
+
+    let skip = |members: [WallCorner; 3]| -> bool {
+        dropped_corner.is_some_and(|c| members.iter().any(|m| *m == c))
+    };
+    if !skip(tri_a.2) {
+        emit_face_tri(scratch, tri_a.0, tri_a.1, shade);
+    }
+    if !skip(tri_b.2) {
+        emit_face_tri(scratch, tri_b.0, tri_b.1, shade);
+    }
 }
 
 /// Walk every placeable child node and stamp a small screen-space

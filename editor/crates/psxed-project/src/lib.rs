@@ -239,6 +239,79 @@ pub enum GridSplit {
     NorthEastSouthWest,
 }
 
+/// Floor / ceiling corner index. Maps directly to the
+/// `[NW, NE, SE, SW]` order every height array uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Corner {
+    NW,
+    NE,
+    SE,
+    SW,
+}
+
+impl Corner {
+    /// Index into `[NW, NE, SE, SW]`.
+    pub const fn idx(self) -> usize {
+        match self {
+            Self::NW => 0,
+            Self::NE => 1,
+            Self::SE => 2,
+            Self::SW => 3,
+        }
+    }
+
+    /// Diagonal-opposite corner. NW ↔ SE, NE ↔ SW. Used by the
+    /// vertex-delete pinch flow to find which neighbour the
+    /// dropped corner welds to.
+    pub const fn diagonal(self) -> Self {
+        match self {
+            Self::NW => Self::SE,
+            Self::NE => Self::SW,
+            Self::SE => Self::NW,
+            Self::SW => Self::NE,
+        }
+    }
+
+    /// Diagonal split that keeps a triangle alive when this
+    /// corner is dropped. Drop NE / SW → NW-SE keeps one half;
+    /// drop NW / SE → NE-SW keeps one half. Picking the *other*
+    /// diagonal would put the dropped corner on the cut line,
+    /// killing both triangles.
+    pub const fn surviving_split(self) -> GridSplit {
+        match self {
+            Self::NE | Self::SW => GridSplit::NorthWestSouthEast,
+            Self::NW | Self::SE => GridSplit::NorthEastSouthWest,
+        }
+    }
+}
+
+/// Wall corner index. Maps to the
+/// `[bottom-left, bottom-right, top-right, top-left]` order in
+/// every wall heights array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WallCorner {
+    BL,
+    BR,
+    TR,
+    TL,
+}
+
+impl WallCorner {
+    pub const fn idx(self) -> usize {
+        match self {
+            Self::BL => 0,
+            Self::BR => 1,
+            Self::TR => 2,
+            Self::TL => 3,
+        }
+    }
+
+    /// `true` when this corner sits at the wall's bottom.
+    pub const fn is_bottom(self) -> bool {
+        matches!(self, Self::BL | Self::BR)
+    }
+}
+
 /// Cardinal or diagonal grid edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GridDirection {
@@ -267,6 +340,13 @@ pub struct GridHorizontalFace {
     pub material: Option<ResourceId>,
     /// Whether character collision treats this face as walkable.
     pub walkable: bool,
+    /// `Some(corner)` when one corner has been deleted, turning
+    /// the face into a triangle. The renderer skips the half
+    /// containing the missing corner; `split` is forced to the
+    /// surviving diagonal at edit time. Default `None` =
+    /// authored as a normal quad.
+    #[serde(default)]
+    pub dropped_corner: Option<Corner>,
 }
 
 impl GridHorizontalFace {
@@ -277,7 +357,28 @@ impl GridHorizontalFace {
             split: GridSplit::NorthWestSouthEast,
             material,
             walkable: true,
+            dropped_corner: None,
         }
+    }
+
+    /// Drop one corner — the face becomes a visible triangle.
+    /// Forces `split` to the diagonal that keeps a triangle
+    /// alive (drop NE / SW → NW-SE; drop NW / SE → NE-SW). The
+    /// dropped corner's stored height is left untouched so the
+    /// user can recover by un-dropping.
+    pub fn drop_corner(&mut self, corner: Corner) {
+        self.dropped_corner = Some(corner);
+        self.split = corner.surviving_split();
+    }
+
+    /// Restore the face to a full quad.
+    pub fn restore_corner(&mut self) {
+        self.dropped_corner = None;
+    }
+
+    /// `true` when the face is currently a triangle.
+    pub const fn is_triangle(&self) -> bool {
+        self.dropped_corner.is_some()
     }
 }
 
@@ -290,6 +391,10 @@ pub struct GridVerticalFace {
     pub material: Option<ResourceId>,
     /// Whether collision treats this wall as blocking.
     pub solid: bool,
+    /// `Some(corner)` when one wall corner has been deleted,
+    /// turning the wall quad into a triangle. Default `None`.
+    #[serde(default)]
+    pub dropped_corner: Option<WallCorner>,
 }
 
 impl GridVerticalFace {
@@ -299,7 +404,20 @@ impl GridVerticalFace {
             heights: [bottom, bottom, top, top],
             material,
             solid: true,
+            dropped_corner: None,
         }
+    }
+
+    pub fn drop_corner(&mut self, corner: WallCorner) {
+        self.dropped_corner = Some(corner);
+    }
+
+    pub fn restore_corner(&mut self) {
+        self.dropped_corner = None;
+    }
+
+    pub const fn is_triangle(&self) -> bool {
+        self.dropped_corner.is_some()
     }
 }
 
@@ -1715,5 +1833,37 @@ mod tests {
         assert_eq!(ProjectDocument::load_from_path(&path).unwrap(), project);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn corner_surviving_split_picks_diagonal_that_keeps_a_triangle() {
+        // Drop NE → only the NW-SE diagonal keeps a triangle.
+        // Drop NW → only the NE-SW diagonal keeps a triangle.
+        assert_eq!(Corner::NE.surviving_split(), GridSplit::NorthWestSouthEast);
+        assert_eq!(Corner::SW.surviving_split(), GridSplit::NorthWestSouthEast);
+        assert_eq!(Corner::NW.surviving_split(), GridSplit::NorthEastSouthWest);
+        assert_eq!(Corner::SE.surviving_split(), GridSplit::NorthEastSouthWest);
+    }
+
+    #[test]
+    fn drop_corner_marks_face_as_triangle_and_flips_split() {
+        let mut face = GridHorizontalFace::flat(0, None);
+        face.split = GridSplit::NorthWestSouthEast; // would die if NW dropped
+        face.drop_corner(Corner::NW);
+        assert!(face.is_triangle());
+        assert_eq!(face.dropped_corner, Some(Corner::NW));
+        assert_eq!(face.split, GridSplit::NorthEastSouthWest);
+
+        face.restore_corner();
+        assert!(!face.is_triangle());
+        assert_eq!(face.dropped_corner, None);
+    }
+
+    #[test]
+    fn drop_corner_on_wall_marks_triangle() {
+        let mut wall = GridVerticalFace::flat(0, 64, None);
+        wall.drop_corner(WallCorner::TL);
+        assert!(wall.is_triangle());
+        assert_eq!(wall.dropped_corner, Some(WallCorner::TL));
     }
 }

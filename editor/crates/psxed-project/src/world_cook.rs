@@ -197,6 +197,19 @@ pub enum WorldGridCookError {
         /// Required step.
         quantum: i32,
     },
+    /// A face has a `dropped_corner` set — the editor models it
+    /// as a triangle, but the v1 `.psxw` wire format only carries
+    /// quad faces. Render / pick / collision in the editor live
+    /// preview already honour the drop, but the cooked runtime
+    /// payload doesn't have a slot for it yet.
+    TriangleFaceNotSupported {
+        /// Sector X coordinate.
+        x: u16,
+        /// Sector Z coordinate.
+        z: u16,
+        /// Which face is triangulated.
+        face: WorldGridFaceKind,
+    },
 }
 
 impl std::fmt::Display for WorldGridCookError {
@@ -297,6 +310,10 @@ impl std::fmt::Display for WorldGridCookError {
             } => write!(
                 f,
                 "sector {x},{z} {face} has height {value} not aligned to {quantum}-unit quantum"
+            ),
+            Self::TriangleFaceNotSupported { x, z, face } => write!(
+                f,
+                "sector {x},{z} {face} is a triangle (dropped corner); v1 .psxw only carries quad faces"
             ),
         }
     }
@@ -791,6 +808,9 @@ fn cook_horizontal_face(
     materials: &mut Vec<CookedWorldMaterial>,
     material_slots: &mut HashMap<ResourceId, u16>,
 ) -> Result<CookedGridHorizontalFace, WorldGridCookError> {
+    if face.is_triangle() {
+        return Err(WorldGridCookError::TriangleFaceNotSupported { x, z, face: kind });
+    }
     Ok(CookedGridHorizontalFace {
         heights: face.heights,
         split: face.split,
@@ -840,6 +860,13 @@ fn cook_walls(
         GridDirection::West,
     ] {
         for wall in walls.get(direction) {
+            if wall.is_triangle() {
+                return Err(WorldGridCookError::TriangleFaceNotSupported {
+                    x,
+                    z,
+                    face: WorldGridFaceKind::Wall(direction),
+                });
+            }
             validate_wall_heights(wall, x, z, direction)?;
             let material = material_slot(
                 project,
@@ -1103,7 +1130,7 @@ const fn direction_id(direction: GridDirection) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NodeKind, ResourceData};
+    use crate::{Corner, NodeKind, ResourceData, WallCorner};
 
     fn starter_grid(project: &ProjectDocument) -> WorldGrid {
         project
@@ -1382,6 +1409,49 @@ mod tests {
                 assert_eq!(quantum, HEIGHT_QUANTUM);
             }
             other => panic!("expected HeightNotQuantized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_triangle_floor() {
+        // Drop a corner on the starter floor and confirm the
+        // cooker refuses it: v1 .psxw doesn't carry triangles.
+        let project = ProjectDocument::starter();
+        let mut grid = WorldGrid::stone_room(1, 1, world::SECTOR_SIZE, None, None);
+        if let Some(sector) = grid.sector_mut(0, 0) {
+            if let Some(floor) = sector.floor.as_mut() {
+                floor.drop_corner(Corner::NW);
+            }
+        }
+        match cook_world_grid(&project, &grid) {
+            Err(WorldGridCookError::TriangleFaceNotSupported { x, z, face }) => {
+                assert_eq!((x, z), (0, 0));
+                assert_eq!(face, WorldGridFaceKind::Floor);
+            }
+            other => panic!("expected TriangleFaceNotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_triangle_wall() {
+        // Wall-only grid (no floor) so the cooker's first stop is
+        // the wall validator; otherwise UnassignedMaterial on the
+        // floor fires before we reach the wall path.
+        let project = ProjectDocument::starter();
+        let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
+        grid.add_wall(0, 0, GridDirection::North, 0, world::SECTOR_SIZE, None);
+        if let Some(sector) = grid.sector_mut(0, 0) {
+            let walls = sector.walls.get_mut(GridDirection::North);
+            if let Some(wall) = walls.first_mut() {
+                wall.drop_corner(WallCorner::TL);
+            }
+        }
+        match cook_world_grid(&project, &grid) {
+            Err(WorldGridCookError::TriangleFaceNotSupported { x, z, face }) => {
+                assert_eq!((x, z), (0, 0));
+                assert_eq!(face, WorldGridFaceKind::Wall(GridDirection::North));
+            }
+            other => panic!("expected TriangleFaceNotSupported, got {other:?}"),
         }
     }
 
