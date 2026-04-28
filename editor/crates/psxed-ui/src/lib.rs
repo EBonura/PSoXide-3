@@ -2371,6 +2371,9 @@ impl EditorWorkspace {
                 let selected_sector = self.selected_sector;
 
                 let mut changed = false;
+                // Picker `→` jump-to requests bubble up here.
+                // Applied after both phases release their borrows.
+                let mut nav_target: Option<ResourceId> = None;
 
                 // Phase 1: mutate the selected node (transform + kind props).
                 {
@@ -2421,6 +2424,7 @@ impl EditorWorkspace {
                                 &mut node.kind,
                                 &material_options,
                                 &room_options,
+                                &mut nav_target,
                             );
                         });
                 }
@@ -2444,6 +2448,7 @@ impl EditorWorkspace {
                             sx,
                             sz,
                             &material_options,
+                            &mut nav_target,
                         ) {
                             changed = true;
                         }
@@ -2510,7 +2515,52 @@ impl EditorWorkspace {
                 if changed {
                     self.mark_dirty();
                 }
+
+                // Apply any picker `→` jump-to. Phase 1 / 2 borrows
+                // are released by the time the closure body reaches
+                // here, and the next frame the inspector will see
+                // `selected_resource = Some(target)` and route to
+                // `draw_resource_inspector`.
+                if let Some(target) = nav_target {
+                    self.selected_resource = Some(target);
+                }
             });
+    }
+
+    /// Build the breadcrumb crumbs shown above the face inspector.
+    /// Always starts with the face itself; appends a clickable
+    /// `Material: <name>` crumb when the face has a material, and
+    /// further appends a clickable `Texture: <name>` crumb when
+    /// that material wraps one. The chain shortens naturally for
+    /// partially-assigned faces.
+    fn face_breadcrumb(
+        &self,
+        face: FaceRef,
+        current_material: Option<ResourceId>,
+    ) -> Vec<BreadcrumbCrumb> {
+        let mut crumbs = vec![BreadcrumbCrumb {
+            label: format!("Face: {}", describe_face(face)),
+            nav: None,
+        }];
+        if let Some(material_id) = current_material {
+            if let Some(material_resource) = self.project.resource(material_id) {
+                crumbs.push(BreadcrumbCrumb {
+                    label: format!("Material: {}", material_resource.name),
+                    nav: Some(material_id),
+                });
+                if let ResourceData::Material(m) = &material_resource.data {
+                    if let Some(tex_id) = m.texture {
+                        if let Some(tex_resource) = self.project.resource(tex_id) {
+                            crumbs.push(BreadcrumbCrumb {
+                                label: format!("Texture: {}", tex_resource.name),
+                                nav: Some(tex_id),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        crumbs
     }
 
     /// Inspector panel for the face currently selected by the
@@ -2518,6 +2568,11 @@ impl EditorWorkspace {
     /// preview thumbnail of the linked texture so the user can
     /// retarget materials without opening the resources panel.
     fn draw_face_inspector(&mut self, ui: &mut egui::Ui, face: FaceRef) {
+        // Deferred navigation request: pickers fill this in when
+        // the user clicks the `→` jump button. Applied after the
+        // mutable scene borrow below releases so we never mutate
+        // `self.selected_*` while the project is borrowed.
+        let mut nav_target: Option<ResourceId> = None;
         let material_options = self.project.material_options();
         // Snapshot the face's current material id BEFORE we borrow
         // the scene mutably, so the preview lookup below can run
@@ -2545,10 +2600,18 @@ impl EditorWorkspace {
             .and_then(|resource| self.texture_thumb_entry(resource))
             .map(|entry| (entry.handle.id(), entry.stats));
 
+        // Build the Face › Material › Texture breadcrumb up
+        // front while the project is still only borrowed
+        // immutably. Crumbs link to whatever's reachable; the
+        // chain auto-shortens when the face has no material or
+        // the material has no texture.
+        let crumbs = self.face_breadcrumb(face, current_material);
+
         ui.horizontal(|ui| {
             draw_inline_icon(ui, icons::GRID, STUDIO_ACCENT);
             ui.strong(describe_face(face));
         });
+        draw_breadcrumb(ui, &crumbs, &mut nav_target);
         ui.separator();
         draw_psxt_preview_block(ui, preview_thumb);
 
@@ -2586,6 +2649,7 @@ impl EditorWorkspace {
                             "    Material",
                             &mut face_data.material,
                             &material_options,
+                            &mut nav_target,
                         );
                     });
                 egui::CollapsingHeader::new(icons::label(icons::MOVE, "Heights"))
@@ -2607,6 +2671,7 @@ impl EditorWorkspace {
                             "    Material",
                             &mut face_data.material,
                             &material_options,
+                            &mut nav_target,
                         );
                     });
                 egui::CollapsingHeader::new(icons::label(icons::MOVE, "Heights"))
@@ -2629,6 +2694,7 @@ impl EditorWorkspace {
                             "    Material",
                             &mut wall.material,
                             &material_options,
+                            &mut nav_target,
                         );
                     });
                 egui::CollapsingHeader::new(icons::label(icons::MOVE, "Span"))
@@ -2674,9 +2740,49 @@ impl EditorWorkspace {
         if changed {
             self.mark_dirty();
         }
+
+        // Apply any deferred nav request from the picker `→`
+        // buttons. Safe here because the mutable scene borrow
+        // ended at the end of the match block above.
+        if let Some(target) = nav_target {
+            self.selected_face = None;
+            self.selected_resource = Some(target);
+        }
+    }
+
+    /// Breadcrumb crumbs for the resource inspector. A texture
+    /// shows just `Texture: <name>` (we don't track which
+    /// materials reference it, so there's no parent crumb to
+    /// add). A material shows `Material: <name> › Texture: <name>`
+    /// when its texture is set. Other resource kinds get a
+    /// single self-crumb.
+    fn resource_breadcrumb(&self, id: ResourceId) -> Vec<BreadcrumbCrumb> {
+        let Some(resource) = self.project.resource(id) else {
+            return Vec::new();
+        };
+        let label_for = |kind: &str, name: &str| format!("{kind}: {name}");
+        let mut crumbs = vec![BreadcrumbCrumb {
+            label: label_for(resource.data.label(), &resource.name),
+            nav: None,
+        }];
+        if let ResourceData::Material(m) = &resource.data {
+            if let Some(tex_id) = m.texture {
+                if let Some(tex) = self.project.resource(tex_id) {
+                    crumbs.push(BreadcrumbCrumb {
+                        label: label_for(tex.data.label(), &tex.name),
+                        nav: Some(tex_id),
+                    });
+                }
+            }
+        }
+        crumbs
     }
 
     fn draw_resource_inspector(&mut self, ui: &mut egui::Ui, id: ResourceId) {
+        // Deferred jump-to navigation, same pattern as
+        // `draw_face_inspector`. Applied after the mutable
+        // resource borrow releases.
+        let mut nav_target: Option<ResourceId> = None;
         // Pull the cached preview before borrowing `self.project`
         // mutably below. `texture_thumb_entry` takes `&self` and
         // walks Texture / Material → cached `.psxt` decode, so this
@@ -2696,6 +2802,11 @@ impl EditorWorkspace {
             })
             .collect();
 
+        // Build the breadcrumb before the mutable borrow on
+        // `resource_mut` — we need other resources by id to
+        // resolve the material → texture link.
+        let crumbs = self.resource_breadcrumb(id);
+
         let Some(resource) = self.project.resource_mut(id) else {
             ui.weak("Resource missing");
             return;
@@ -2710,6 +2821,7 @@ impl EditorWorkspace {
             );
             ui.strong(format!("{} #{}", resource.data.label(), resource.id.raw()));
         });
+        draw_breadcrumb(ui, &crumbs, &mut nav_target);
         ui.horizontal(|ui| {
             ui.label("Name");
             changed |= ui.text_edit_singleline(&mut resource.name).changed();
@@ -2749,6 +2861,7 @@ impl EditorWorkspace {
                             ui,
                             &mut material.texture,
                             &texture_options,
+                            &mut nav_target,
                         );
                         changed |= blend_mode_editor(ui, &mut material.blend_mode);
                         changed |= color_editor(ui, "Tint", &mut material.tint);
@@ -2779,6 +2892,12 @@ impl EditorWorkspace {
 
         if changed {
             self.mark_dirty();
+        }
+
+        // Apply deferred nav so the user can drill straight
+        // into the linked texture.
+        if let Some(target) = nav_target {
+            self.selected_resource = Some(target);
         }
     }
 
@@ -3585,6 +3704,7 @@ fn draw_node_kind_editor(
     kind: &mut NodeKind,
     material_options: &[(ResourceId, String)],
     room_options: &[(NodeId, String)],
+    nav_target: &mut Option<ResourceId>,
 ) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -3657,22 +3777,9 @@ fn draw_node_kind_editor(
                 });
             });
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(icons::text(icons::BLEND, 12.0).color(STUDIO_TEXT_WEAK));
-                ui.label("Material");
-            });
-            if ui.selectable_label(material.is_none(), "None").clicked() && material.is_some() {
-                *material = None;
-                changed = true;
-            }
-            for (id, name) in material_options {
-                if ui.selectable_label(*material == Some(*id), name).clicked()
-                    && *material != Some(*id)
-                {
-                    *material = Some(*id);
-                    changed = true;
-                }
-            }
+            // Same `material_picker` the face inspector uses, so
+            // the `→` jump button is available here too.
+            changed |= material_picker(ui, "Material", material, material_options, nav_target);
         }
         NodeKind::Light {
             color,
@@ -3967,11 +4074,58 @@ fn draw_psxt_stats(ui: &mut egui::Ui, stats: PsxtStats) {
 /// Combo-box picker for a Material's linked texture. `current` is
 /// the live `material.texture` field; `options` is every Texture
 /// resource in the project. Returns true when the selection moved
-/// so the caller can mark the project dirty.
+/// One segment of the inspector breadcrumb.
+///
+/// Rendered as plain bold text when `nav` is `None` (the current
+/// view, no click target) or as a clickable link otherwise — a
+/// click fires the deferred jump-to that the inspector applies
+/// once its mutable borrows release.
+struct BreadcrumbCrumb {
+    label: String,
+    nav: Option<ResourceId>,
+}
+
+/// Render an inspector breadcrumb: `Face › Material › Texture`
+/// (or any subset). Click any link-style crumb to jump.
+fn draw_breadcrumb(
+    ui: &mut egui::Ui,
+    crumbs: &[BreadcrumbCrumb],
+    nav_target: &mut Option<ResourceId>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (i, crumb) in crumbs.iter().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("›").color(STUDIO_TEXT_WEAK));
+            }
+            match crumb.nav {
+                None => {
+                    // Current view — non-interactive, slightly
+                    // brighter so the eye lands on "where I am".
+                    ui.label(RichText::new(&crumb.label).strong());
+                }
+                Some(id) => {
+                    if ui.link(&crumb.label).clicked() {
+                        *nav_target = Some(id);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Texture-picker dropdown for the material inspector.
+///
+/// `jump_to` is an out-param: when the user clicks the `→`
+/// button next to the dropdown the picker writes the texture's
+/// resource id into it, and the calling inspector applies the
+/// navigation after its borrows release. Returns `true` if the
+/// picker changed `current`.
 fn material_texture_picker(
     ui: &mut egui::Ui,
     current: &mut Option<ResourceId>,
     options: &[(ResourceId, String)],
+    jump_to: &mut Option<ResourceId>,
 ) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -3996,6 +4150,15 @@ fn material_texture_picker(
                     }
                 }
             });
+        if let Some(id) = *current {
+            if ui
+                .small_button("→")
+                .on_hover_text("Open this texture in the inspector")
+                .clicked()
+            {
+                *jump_to = Some(id);
+            }
+        }
     });
     changed
 }
@@ -5941,6 +6104,7 @@ fn draw_sector_inspector(
     sx: u16,
     sz: u16,
     material_options: &[(ResourceId, String)],
+    nav_target: &mut Option<ResourceId>,
 ) -> bool {
     let scene = project.active_scene_mut();
     let Some(room) = scene.node_mut(room_id) else {
@@ -5983,7 +6147,13 @@ fn draw_sector_inspector(
             });
             if let Some(floor) = sector.floor.as_mut() {
                 changed |= height_row("    Height", &mut floor.heights, ui);
-                changed |= material_picker(ui, "    Material", &mut floor.material, material_options);
+                changed |= material_picker(
+                    ui,
+                    "    Material",
+                    &mut floor.material,
+                    material_options,
+                    nav_target,
+                );
             }
 
             ui.separator();
@@ -6007,6 +6177,7 @@ fn draw_sector_inspector(
                     "    Material",
                     &mut ceiling.material,
                     material_options,
+                    nav_target,
                 );
             }
 
@@ -6018,7 +6189,14 @@ fn draw_sector_inspector(
                 ("South", GridDirection::South),
                 ("West", GridDirection::West),
             ] {
-                changed |= wall_stack_row(label, sector.walls.get_mut(dir), sector_size, material_options, ui);
+                changed |= wall_stack_row(
+                    label,
+                    sector.walls.get_mut(dir),
+                    sector_size,
+                    material_options,
+                    nav_target,
+                    ui,
+                );
             }
         });
 
@@ -6038,6 +6216,7 @@ fn wall_stack_row(
     walls: &mut Vec<GridVerticalFace>,
     sector_size: i32,
     material_options: &[(ResourceId, String)],
+    nav_target: &mut Option<ResourceId>,
     ui: &mut egui::Ui,
 ) -> bool {
     let mut changed = false;
@@ -6088,7 +6267,13 @@ fn wall_stack_row(
             }
         });
         let pick_label = format!("    #{i} mat");
-        changed |= material_picker(ui, &pick_label, &mut wall.material, material_options);
+        changed |= material_picker(
+            ui,
+            &pick_label,
+            &mut wall.material,
+            material_options,
+            nav_target,
+        );
     }
     if let Some(i) = remove_at {
         walls.remove(i);
@@ -6178,12 +6363,18 @@ fn height_row(label: &str, heights: &mut [i32; 4], ui: &mut egui::Ui) -> bool {
     changed
 }
 
-/// Shared single-material picker used by the sector inspector.
+/// Material picker used by the sector / face inspector.
+///
+/// `jump_to` is an out-param: clicking the `→` button writes
+/// the selected material's resource id into it. The caller
+/// applies the navigation after its borrows release. Returns
+/// `true` if the picker changed `current`.
 fn material_picker(
     ui: &mut egui::Ui,
     label: &str,
     current: &mut Option<ResourceId>,
     options: &[(ResourceId, String)],
+    jump_to: &mut Option<ResourceId>,
 ) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -6208,6 +6399,15 @@ fn material_picker(
                     }
                 }
             });
+        if let Some(id) = *current {
+            if ui
+                .small_button("→")
+                .on_hover_text("Open this material in the inspector")
+                .clicked()
+            {
+                *jump_to = Some(id);
+            }
+        }
     });
     changed
 }
