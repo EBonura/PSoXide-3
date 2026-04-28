@@ -13,9 +13,10 @@ use egui::{
     Stroke, StrokeKind, Vec2,
 };
 use psxed_project::{
-    GridDirection, GridHorizontalFace, GridVerticalFace, MaterialResource, NodeId, NodeKind,
-    NodeRow, ProjectDocument, PsxBlendMode, Resource, ResourceData, ResourceId, WorldGrid,
-    WorldGridBudget, MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
+    snap_height, GridDirection, GridHorizontalFace, GridVerticalFace, MaterialResource, NodeId,
+    NodeKind, NodeRow, ProjectDocument, PsxBlendMode, Resource, ResourceData, ResourceId,
+    WorldGrid, WorldGridBudget, HEIGHT_QUANTUM, MAX_ROOM_BYTES, MAX_ROOM_DEPTH,
+    MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
 };
 
 /// Maximum undo / redo snapshots retained.
@@ -2636,7 +2637,14 @@ impl EditorWorkspace {
                         ui.horizontal(|ui| {
                             ui.label("    Bottom");
                             let mut bot = wall.heights[0];
-                            if ui.add(egui::DragValue::new(&mut bot).speed(8.0)).changed() {
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut bot)
+                                        .speed(HEIGHT_QUANTUM as f32),
+                                )
+                                .changed()
+                            {
+                                let bot = snap_height(bot);
                                 wall.heights[0] = bot;
                                 wall.heights[1] = bot;
                                 changed = true;
@@ -2645,7 +2653,14 @@ impl EditorWorkspace {
                         ui.horizontal(|ui| {
                             ui.label("    Top");
                             let mut top = wall.heights[2];
-                            if ui.add(egui::DragValue::new(&mut top).speed(8.0)).changed() {
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut top)
+                                        .speed(HEIGHT_QUANTUM as f32),
+                                )
+                                .changed()
+                            {
+                                let top = snap_height(top);
                                 wall.heights[2] = top;
                                 wall.heights[3] = top;
                                 changed = true;
@@ -6049,13 +6064,21 @@ fn wall_stack_row(
             // bottom height = heights[0] = heights[1]; top = heights[2] = heights[3].
             let mut bot = wall.heights[0];
             let mut top = wall.heights[2];
-            if ui.add(egui::DragValue::new(&mut bot).speed(8.0)).changed() {
+            if ui
+                .add(egui::DragValue::new(&mut bot).speed(HEIGHT_QUANTUM as f32))
+                .changed()
+            {
+                let bot = snap_height(bot);
                 wall.heights[0] = bot;
                 wall.heights[1] = bot;
                 changed = true;
             }
             ui.label("top");
-            if ui.add(egui::DragValue::new(&mut top).speed(8.0)).changed() {
+            if ui
+                .add(egui::DragValue::new(&mut top).speed(HEIGHT_QUANTUM as f32))
+                .changed()
+            {
+                let top = snap_height(top);
                 wall.heights[2] = top;
                 wall.heights[3] = top;
                 changed = true;
@@ -6106,6 +6129,10 @@ fn height_row(label: &str, heights: &mut [i32; 4], ui: &mut egui::Ui) -> bool {
         }
     });
 
+    // DragValue speed must equal HEIGHT_QUANTUM so each "tick" of
+    // mouse drag advances by one snap step. Combined with the
+    // `snap_height` post-clamp, the value visibly walks
+    // 0 → 32 → 64 → … without intermediate noise.
     if sloped {
         // 2×2 grid: NW NE on top row (z+), SW SE on bottom (z−).
         // The order in `heights` is [NW, NE, SE, SW] — index map:
@@ -6115,21 +6142,19 @@ fn height_row(label: &str, heights: &mut [i32; 4], ui: &mut egui::Ui) -> bool {
             .num_columns(2)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
-                for &idx in &[0usize, 1] {
+                for &idx in &[0usize, 1, 3, 2] {
                     if ui
-                        .add(egui::DragValue::new(&mut heights[idx]).speed(8.0))
+                        .add(
+                            egui::DragValue::new(&mut heights[idx])
+                                .speed(HEIGHT_QUANTUM as f32),
+                        )
                         .changed()
                     {
+                        heights[idx] = snap_height(heights[idx]);
                         changed = true;
                     }
-                }
-                ui.end_row();
-                for &idx in &[3usize, 2] {
-                    if ui
-                        .add(egui::DragValue::new(&mut heights[idx]).speed(8.0))
-                        .changed()
-                    {
-                        changed = true;
+                    if idx == 1 {
+                        ui.end_row();
                     }
                 }
                 ui.end_row();
@@ -6139,8 +6164,12 @@ fn height_row(label: &str, heights: &mut [i32; 4], ui: &mut egui::Ui) -> bool {
             // Indent so the field aligns with the per-corner grid above.
             ui.label("    ");
             let mut h = heights[0];
-            if ui.add(egui::DragValue::new(&mut h).speed(8.0)).changed() {
-                *heights = [h; 4];
+            if ui
+                .add(egui::DragValue::new(&mut h).speed(HEIGHT_QUANTUM as f32))
+                .changed()
+            {
+                let snapped = snap_height(h);
+                *heights = [snapped; 4];
                 changed = true;
             }
         });

@@ -11,7 +11,8 @@ use psxed_format::world;
 use crate::{
     GridDirection, GridHorizontalFace, GridSector, GridSplit, GridVerticalFace, GridWalls,
     MaterialResource, ProjectDocument, PsxBlendMode, ResourceData, ResourceId, WorldGrid,
-    MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH, MAX_WALL_STACK,
+    HEIGHT_QUANTUM, MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
+    MAX_WALL_STACK,
 };
 
 /// Authored grid face referenced by a cooker diagnostic.
@@ -180,6 +181,22 @@ pub enum WorldGridCookError {
         /// Second wall's direction.
         other_direction: GridDirection,
     },
+    /// A vertex height is not aligned to [`HEIGHT_QUANTUM`]. The
+    /// editor snaps every drag through `snap_height`; values
+    /// that slip through come from programmatic writes, hand-
+    /// edited RON, or a legacy project predating the quantum.
+    HeightNotQuantized {
+        /// Sector X coordinate.
+        x: u16,
+        /// Sector Z coordinate.
+        z: u16,
+        /// Which face the height belongs to.
+        face: WorldGridFaceKind,
+        /// Offending height.
+        value: i32,
+        /// Required step.
+        quantum: i32,
+    },
 }
 
 impl std::fmt::Display for WorldGridCookError {
@@ -270,6 +287,16 @@ impl std::fmt::Display for WorldGridCookError {
             } => write!(
                 f,
                 "physical wall claimed twice: ({x},{z}) {direction:?} and ({other_x},{other_z}) {other_direction:?}"
+            ),
+            Self::HeightNotQuantized {
+                x,
+                z,
+                face,
+                value,
+                quantum,
+            } => write!(
+                f,
+                "sector {x},{z} {face} has height {value} not aligned to {quantum}-unit quantum"
             ),
         }
     }
@@ -411,6 +438,7 @@ pub fn cook_world_grid(
     validate_grid_shape(grid)?;
     validate_grid_budget(grid)?;
     validate_no_duplicate_walls(grid)?;
+    validate_quantized_heights(grid)?;
 
     let mut materials = Vec::new();
     let mut material_slots = HashMap::new();
@@ -624,6 +652,59 @@ fn canonical_edge(x: u16, z: u16, dir: GridDirection) -> Option<PhysicalEdge> {
         }),
         GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => None,
     }
+}
+
+/// Reject any authored vertex height that isn't a multiple of
+/// [`HEIGHT_QUANTUM`]. The editor snaps every drag through
+/// `snap_height`, so values that survive to here come from
+/// programmatic writes, hand-edited RON, or projects authored
+/// before the quantum landed. Catching them at cook time keeps
+/// the runtime free of jitter the snap was meant to remove.
+fn validate_quantized_heights(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
+    for x in 0..grid.width {
+        for z in 0..grid.depth {
+            let Some(sector) = grid.sector(x, z) else {
+                continue;
+            };
+            if let Some(face) = &sector.floor {
+                check_face_heights(x, z, WorldGridFaceKind::Floor, &face.heights)?;
+            }
+            if let Some(face) = &sector.ceiling {
+                check_face_heights(x, z, WorldGridFaceKind::Ceiling, &face.heights)?;
+            }
+            for direction in [
+                GridDirection::North,
+                GridDirection::East,
+                GridDirection::South,
+                GridDirection::West,
+            ] {
+                for wall in sector.walls.get(direction) {
+                    check_face_heights(x, z, WorldGridFaceKind::Wall(direction), &wall.heights)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_face_heights(
+    x: u16,
+    z: u16,
+    face: WorldGridFaceKind,
+    heights: &[i32; 4],
+) -> Result<(), WorldGridCookError> {
+    for &h in heights {
+        if h % HEIGHT_QUANTUM != 0 {
+            return Err(WorldGridCookError::HeightNotQuantized {
+                x,
+                z,
+                face,
+                value: h,
+                quantum: HEIGHT_QUANTUM,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn cook_sector(
@@ -1270,6 +1351,37 @@ mod tests {
                 );
             }
             other => panic!("expected DuplicatePhysicalWall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_quantized_heights() {
+        // Floor with one corner off the quantum grid. Using
+        // `set_floor` with a snap-aligned value, then mutating
+        // a single corner directly so the test bypasses the
+        // editor's drag snap (which is the runtime path the
+        // cooker validator catches).
+        let project = ProjectDocument::starter();
+        let mut grid = WorldGrid::stone_room(1, 1, world::SECTOR_SIZE, None, None);
+        if let Some(sector) = grid.sector_mut(0, 0) {
+            if let Some(floor) = sector.floor.as_mut() {
+                floor.heights[0] = 17; // Not a multiple of 32.
+            }
+        }
+        match cook_world_grid(&project, &grid) {
+            Err(WorldGridCookError::HeightNotQuantized {
+                x,
+                z,
+                face,
+                value,
+                quantum,
+            }) => {
+                assert_eq!((x, z), (0, 0));
+                assert_eq!(face, WorldGridFaceKind::Floor);
+                assert_eq!(value, 17);
+                assert_eq!(quantum, HEIGHT_QUANTUM);
+            }
+            other => panic!("expected HeightNotQuantized, got {other:?}"),
         }
     }
 

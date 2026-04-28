@@ -411,6 +411,35 @@ pub const MAX_WALL_STACK: usize = 4;
 pub const MAX_ROOM_TRIANGLES: usize = 2048;
 pub const MAX_ROOM_BYTES: usize = 64 * 1024;
 
+/// World-unit step every authored vertex height must align to.
+///
+/// The X / Z grid is locked by construction — corners are always
+/// computed from the cell's array index and `sector_size`. Y is
+/// the only free axis, and we constrain it to multiples of this
+/// step so the editor can't author noise heights that the runtime
+/// quantises away anyway.
+///
+/// 32 is `sector_size / 32` at the default 1024 — fine enough that
+/// authored slopes look smooth, coarse enough that PS1 i16 vertex
+/// jitter never fights the snap.
+pub const HEIGHT_QUANTUM: i32 = 32;
+
+/// Snap a vertex height to the nearest [`HEIGHT_QUANTUM`] multiple.
+///
+/// Round-half-away-from-zero so the snap is symmetric for
+/// negative heights — `snap_height(-15)` returns `0`,
+/// `snap_height(-16)` returns `-32`. Plain integer math; no
+/// float intermediaries.
+pub fn snap_height(y: i32) -> i32 {
+    let q = HEIGHT_QUANTUM;
+    let half = q / 2;
+    if y >= 0 {
+        ((y + half) / q) * q
+    } else {
+        -(((-y + half) / q) * q)
+    }
+}
+
 /// Snapshot of a [`WorldGrid`]'s authoring footprint + cooked-
 /// byte estimate. Cheap to compute (single sector pass); the
 /// editor recomputes it whenever the inspector for a Room
@@ -1339,6 +1368,32 @@ impl Default for ProjectDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snap_height_rounds_to_nearest_quantum() {
+        assert_eq!(HEIGHT_QUANTUM, 32);
+        // Exact multiples are unchanged (positive + negative).
+        assert_eq!(snap_height(0), 0);
+        assert_eq!(snap_height(32), 32);
+        assert_eq!(snap_height(1024), 1024);
+        assert_eq!(snap_height(-32), -32);
+        assert_eq!(snap_height(-1024), -1024);
+        // Below half-quantum rounds down toward zero.
+        assert_eq!(snap_height(15), 0);
+        assert_eq!(snap_height(-15), 0);
+        // At half-quantum (16), away-from-zero on both sides.
+        assert_eq!(snap_height(16), 32);
+        assert_eq!(snap_height(-16), -32);
+        // Above half-quantum rounds up away from zero.
+        assert_eq!(snap_height(17), 32);
+        assert_eq!(snap_height(-17), -32);
+        // Past one quantum the same rule applies — round to the
+        // nearest multiple.
+        assert_eq!(snap_height(47), 32);
+        assert_eq!(snap_height(48), 64);
+        assert_eq!(snap_height(-47), -32);
+        assert_eq!(snap_height(-48), -64);
+    }
 
     #[test]
     fn editor_to_room_local_round_trip_origin_zero() {
