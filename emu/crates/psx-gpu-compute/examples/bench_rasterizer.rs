@@ -94,8 +94,11 @@ fn capture_cmd_log(
     let mut hist: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
     for e in &accumulated {
         let k = match e.opcode {
-            0x00..=0x1F => "state/nop",
+            // `0x02` is GP0 fill-rectangle. Match it before the
+            // 0x00..=0x1F state/nop range so it doesn't get
+            // swallowed silently.
             0x02 => "fill",
+            0x00..=0x1F => "state/nop",
             0x20..=0x23 => "mono-tri",
             0x24..=0x27 => "tex-tri",
             0x28..=0x2B => "mono-quad",

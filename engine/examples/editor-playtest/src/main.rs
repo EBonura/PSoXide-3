@@ -377,7 +377,23 @@ impl Scene for Playtest {
         // of MATERIALS. For each entry: ensure VRAM-resident
         // (uploading on first sight), then build the
         // TextureMaterial referencing the slot's CLUT/tpage.
-        self.material_count = build_room_materials(room_record, 0, &mut self.materials);
+        // Pass parsed room dimensions through so room-level
+        // lighting samples the *actual* room centre — not the
+        // authored origin, which would land outside the room
+        // on any non-1×1 grid.
+        let room_dims = self
+            .room
+            .map(|r| {
+                let render = r.render();
+                RoomDims {
+                    width: render.width(),
+                    depth: render.depth(),
+                    sector_size: render.sector_size(),
+                }
+            })
+            .unwrap_or(RoomDims::ZERO);
+        self.material_count =
+            build_room_materials(room_record, room_dims, 0, &mut self.materials);
 
         // Player init: prefer PLAYER_CONTROLLER (cook output)
         // for spawn + character; fall back to the bare
@@ -735,8 +751,32 @@ fn draw_player(
 ///
 /// Returns the highest `local_slot + 1` so the caller knows the
 /// in-use prefix length.
+/// Parsed room dimensions in the runtime's preferred shape.
+/// Pulled off `RuntimeRoom` once at init so the per-frame light
+/// sampler can compute the room centre without re-parsing the
+/// `.psxw` blob.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct RoomDims {
+    width: u16,
+    depth: u16,
+    sector_size: i32,
+}
+
+impl RoomDims {
+    /// Sentinel used when the room couldn't be parsed.
+    /// `room_center_world` falls back to the cooked origin in
+    /// that case so an unparseable manifest still picks *some*
+    /// sample point.
+    const ZERO: Self = Self {
+        width: 0,
+        depth: 0,
+        sector_size: 0,
+    };
+}
+
 fn build_room_materials(
     room: &LevelRoomRecord,
+    room_dims: RoomDims,
     room_index: u16,
     out: &mut [Option<TextureMaterial>; MAX_ROOM_MATERIALS],
 ) -> usize {
@@ -751,7 +791,7 @@ fn build_room_materials(
     // intensity / radius without a renderer rewrite. The
     // editor preview does per-face lighting so authors still
     // see spatial variation while authoring.
-    let room_center = room_center_world(room);
+    let room_center = room_center_world(room, room_dims);
     let lit_tint_factor = accumulate_room_light(room_center, room_index);
 
     let mut max_slot: usize = 0;
@@ -781,19 +821,21 @@ fn build_room_materials(
     max_slot
 }
 
-/// World coords of the room centre. Cooker normalizes geometry
-/// to be array-rooted so the centre is `(width/2 * S, 0,
-/// depth/2 * S)`. We can't see `width`/`depth` from the room
-/// record at runtime — so the cook-time origin is fine for now.
-/// Authors who want per-face spatial lighting use the editor
-/// preview.
-fn room_center_world(room: &LevelRoomRecord) -> [i32; 3] {
-    // Without parsed `.psxw`, fall back to the room origin.
-    // Once draw_room exposes per-room geometry centre we can
-    // upgrade this; today the cooker emits origin = (0, 0, 0)
-    // for array-rooted rooms so this matches the room middle
-    // for square rooms close enough for ambient lighting.
-    [room.origin_x, 0, room.origin_z]
+/// World coords of the room centre. Cooker emits geometry
+/// array-rooted at world `(0, 0)`, so the centre is
+/// `(width * sector_size / 2, 0, depth * sector_size / 2)`.
+/// Without parsed dimensions (placeholder manifest, parse
+/// failure) we fall back to the cooked origin so the sampler
+/// still has *some* sample point.
+fn room_center_world(room: &LevelRoomRecord, dims: RoomDims) -> [i32; 3] {
+    if dims.sector_size <= 0 || (dims.width == 0 && dims.depth == 0) {
+        return [room.origin_x, 0, room.origin_z];
+    }
+    [
+        (dims.width as i32) * dims.sector_size / 2,
+        0,
+        (dims.depth as i32) * dims.sector_size / 2,
+    ]
 }
 
 /// Walk every `LIGHTS` record for `room_index` and accumulate

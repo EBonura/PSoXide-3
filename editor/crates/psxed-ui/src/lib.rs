@@ -3,7 +3,10 @@
 //! The frontend owns the window/Menu. This crate owns the editor panels and
 //! the in-memory authoring document they manipulate.
 
+mod history;
 mod icons;
+
+use crate::history::UndoStack;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,9 +21,6 @@ use psxed_project::{
     WorldGrid, WorldGridBudget, HEIGHT_QUANTUM, MAX_ROOM_BYTES, MAX_ROOM_DEPTH,
     MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
 };
-
-/// Maximum undo / redo snapshots retained.
-const UNDO_CAPACITY: usize = 64;
 
 /// Discrete action a scene-tree row can produce in one frame.
 ///
@@ -45,43 +45,6 @@ enum TreeAction {
         target_parent: NodeId,
         position: usize,
     },
-}
-
-/// Snapshot-based undo. Each entry is a full `ProjectDocument` clone;
-/// for hand-authored level data this is cheap and avoids the
-/// command-pattern bookkeeping that operation-based undo demands.
-#[derive(Default)]
-struct UndoStack {
-    undo: std::collections::VecDeque<ProjectDocument>,
-    redo: std::collections::VecDeque<ProjectDocument>,
-}
-
-impl UndoStack {
-    fn record(&mut self, snapshot: ProjectDocument) {
-        if self.undo.len() == UNDO_CAPACITY {
-            self.undo.pop_front();
-        }
-        self.undo.push_back(snapshot);
-        self.redo.clear();
-    }
-
-    fn undo(&mut self, current: ProjectDocument) -> Option<ProjectDocument> {
-        let prev = self.undo.pop_back()?;
-        if self.redo.len() == UNDO_CAPACITY {
-            self.redo.pop_front();
-        }
-        self.redo.push_back(current);
-        Some(prev)
-    }
-
-    fn redo(&mut self, current: ProjectDocument) -> Option<ProjectDocument> {
-        let next = self.redo.pop_back()?;
-        if self.undo.len() == UNDO_CAPACITY {
-            self.undo.pop_front();
-        }
-        self.undo.push_back(current);
-        Some(next)
-    }
 }
 
 /// Embedded editor workspace state.
@@ -10287,7 +10250,11 @@ mod tests {
             sz: 0,
             corner: Corner::NE,
         };
-        let pv = physical_vertex(&grid, seed).unwrap();
+        // Capture the pre-break member set so we can confirm
+        // exactly one corner left (the seed) when the break
+        // mutates only the seed's height.
+        let before = physical_vertex(&grid, seed).unwrap();
+        assert_eq!(before.members.len(), 4);
         // Move only the seed by writing directly via the helper.
         write_face_corner_height(&mut grid, seed, 32);
         // Re-resolve from a former neighbour. Should now contain

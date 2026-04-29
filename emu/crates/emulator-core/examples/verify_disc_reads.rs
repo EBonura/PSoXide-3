@@ -6,7 +6,6 @@
 //! DMA3 / SetMode / timing).
 
 use psx_iso::Disc;
-use std::path::PathBuf;
 
 fn main() {
     let disc_path = std::env::var("PSOXIDE_DISC").expect("set PSOXIDE_DISC");

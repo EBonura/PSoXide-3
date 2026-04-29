@@ -1520,9 +1520,9 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
 
     // Per-room residency: required RAM = the room's world
     // asset + every model mesh + every animation clip
-    // referenced by an instance in this room; required VRAM =
-    // every distinct texture asset (room materials + model
-    // atlases) referenced by this room.
+    // referenced by an instance OR by the player character in
+    // this room; required VRAM = every distinct texture asset
+    // (room materials + model atlases) referenced by this room.
     for (i, room) in package.rooms.iter().enumerate() {
         let first = room.material_first as usize;
         let count = room.material_count as usize;
@@ -1534,9 +1534,13 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         }
         let mut required_ram: Vec<usize> = vec![room.world_asset_index];
 
-        // Walk model instances in this room — every distinct
-        // model used drags in its mesh asset (RAM), atlas asset
-        // (VRAM), and clip assets (RAM).
+        // Models the room references — placed MeshInstance
+        // bindings *plus* the player controller's character
+        // when its spawn lives in this room. The player's
+        // model is residency-required even when it's never
+        // placed as a regular MeshInstance; otherwise the
+        // runtime would render the player from un-resident
+        // bytes the moment the room loads.
         let i_u16 = i as u16;
         let mut seen_models: Vec<u16> = Vec::new();
         for inst in &package.model_instances {
@@ -1544,20 +1548,24 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
                 continue;
             }
             seen_models.push(inst.model);
-            let model = &package.models[inst.model as usize];
-            if !required_ram.contains(&model.mesh_asset_index) {
-                required_ram.push(model.mesh_asset_index);
-            }
-            if let Some(atlas) = model.texture_asset_index {
-                if !required_vram.contains(&atlas) {
-                    required_vram.push(atlas);
-                }
-            }
-            let cf = model.clip_first as usize;
-            let cc = model.clip_count as usize;
-            for clip in &package.model_clips[cf..cf + cc] {
-                if !required_ram.contains(&clip.animation_asset_index) {
-                    required_ram.push(clip.animation_asset_index);
+            include_model_in_residency(
+                package,
+                inst.model,
+                &mut required_ram,
+                &mut required_vram,
+            );
+        }
+        if let Some(pc) = package.player_controller {
+            if pc.spawn.room == i_u16 {
+                let model = package.characters[pc.character as usize].model;
+                if !seen_models.contains(&model) {
+                    seen_models.push(model);
+                    include_model_in_residency(
+                        package,
+                        model,
+                        &mut required_ram,
+                        &mut required_vram,
+                    );
                 }
             }
         }
@@ -1798,6 +1806,47 @@ use psx_level::{
 
 ";
 
+/// Add `model_index`'s mesh + atlas + every clip to a room's
+/// residency lists. Idempotent through the caller's seen-set
+/// — also dedupes within `required_ram` / `required_vram` so
+/// callers don't have to.
+///
+/// Pulled out so the per-room walk can register both placed
+/// MeshInstance models and the player character's model
+/// without duplicating bookkeeping. Without the player path,
+/// a Character whose backing model isn't also placed as a
+/// MeshInstance would be missing from residency entirely —
+/// the runtime would then render the player from un-resident
+/// bytes the moment the room loaded.
+fn include_model_in_residency(
+    package: &PlaytestPackage,
+    model_index: u16,
+    required_ram: &mut Vec<usize>,
+    required_vram: &mut Vec<usize>,
+) {
+    let Some(model) = package.models.get(model_index as usize) else {
+        return;
+    };
+    if !required_ram.contains(&model.mesh_asset_index) {
+        required_ram.push(model.mesh_asset_index);
+    }
+    if let Some(atlas) = model.texture_asset_index {
+        if !required_vram.contains(&atlas) {
+            required_vram.push(atlas);
+        }
+    }
+    let cf = model.clip_first as usize;
+    let cc = model.clip_count as usize;
+    if cf + cc > package.model_clips.len() {
+        return;
+    }
+    for clip in &package.model_clips[cf..cf + cc] {
+        if !required_ram.contains(&clip.animation_asset_index) {
+            required_ram.push(clip.animation_asset_index);
+        }
+    }
+}
+
 /// Resolve the per-asset `static` name for the include_bytes
 /// statement. Mirrors the filename so a reader can grep
 /// `ROOM_000_BYTES` and immediately know it points at
@@ -2018,6 +2067,110 @@ mod tests {
             .model_instances
             .iter()
             .any(|inst| inst.model == 0));
+    }
+
+    #[test]
+    fn player_character_model_lands_in_room_residency_without_placed_meshinstance() {
+        // Simulate a project where the player Character points
+        // at a Model that *isn't* also placed as a MeshInstance.
+        // The starter has both, so we delete the placed Wraith
+        // before cooking and assert residency still picks up the
+        // Wraith mesh + atlas + clips via the player path.
+        let mut project = project_with_one_room();
+        let scene = project.active_scene_mut();
+        let placed_ids: Vec<NodeId> = scene
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::MeshInstance { mesh: Some(_), .. }))
+            .map(|n| n.id)
+            .collect();
+        for id in placed_ids {
+            scene.remove_node(id);
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.expect("package returned on ok report");
+        // Only the player path should have registered the Wraith
+        // — there's no MeshInstance left to pull it in.
+        assert!(package.model_instances.is_empty());
+        assert_eq!(package.models.len(), 1);
+        assert_eq!(package.characters.len(), 1);
+
+        let manifest = render_manifest_source(&package);
+        // Asset indexes for the Wraith mesh, atlas, and clips
+        // come straight from `package.assets` — every one of
+        // them must show up in ROOM_0_REQUIRED_RAM/VRAM.
+        let wraith = &package.models[0];
+        let mesh_token = format!("AssetId({})", wraith.mesh_asset_index);
+        assert!(
+            manifest_contains_required(&manifest, "RAM", 0, &mesh_token),
+            "RAM missing wraith mesh: {mesh_token}"
+        );
+        let atlas_token = format!(
+            "AssetId({})",
+            wraith.texture_asset_index.expect("starter wraith has atlas")
+        );
+        assert!(
+            manifest_contains_required(&manifest, "VRAM", 0, &atlas_token),
+            "VRAM missing wraith atlas: {atlas_token}"
+        );
+        let cf = wraith.clip_first as usize;
+        let cc = wraith.clip_count as usize;
+        for clip in &package.model_clips[cf..cf + cc] {
+            let tok = format!("AssetId({})", clip.animation_asset_index);
+            assert!(
+                manifest_contains_required(&manifest, "RAM", 0, &tok),
+                "RAM missing clip {}: {tok}",
+                clip.name
+            );
+        }
+    }
+
+    #[test]
+    fn player_character_model_assets_dedupe_with_placed_meshinstance() {
+        // Starter's Wraith is referenced twice: by the placed
+        // MeshInstance *and* by the Character. Each asset still
+        // shows up exactly once in the manifest's residency
+        // slice — the player path mustn't double-add.
+        let project = project_with_one_room();
+        let (package, _) = build_package(&project, &starter_project_root());
+        let package = package.expect("starter cooks");
+        let manifest = render_manifest_source(&package);
+        let wraith = &package.models[0];
+
+        let mesh_token = format!("AssetId({})", wraith.mesh_asset_index);
+        assert_eq!(
+            count_required_occurrences(&manifest, "RAM", 0, &mesh_token),
+            1,
+            "wraith mesh appears more than once in RAM residency"
+        );
+        let atlas = wraith.texture_asset_index.unwrap();
+        let atlas_token = format!("AssetId({atlas})");
+        assert_eq!(
+            count_required_occurrences(&manifest, "VRAM", 0, &atlas_token),
+            1,
+            "wraith atlas appears more than once in VRAM residency"
+        );
+    }
+
+    /// `true` when `ROOM_<idx>_REQUIRED_<kind>` contains `token`.
+    fn manifest_contains_required(manifest: &str, kind: &str, idx: u16, token: &str) -> bool {
+        count_required_occurrences(manifest, kind, idx, token) > 0
+    }
+
+    /// Count occurrences of `token` inside the
+    /// `ROOM_<idx>_REQUIRED_<kind>` slice declaration. Robust
+    /// enough for residency assertions; not a full Rust parser.
+    fn count_required_occurrences(manifest: &str, kind: &str, idx: u16, token: &str) -> usize {
+        let header = format!("ROOM_{idx}_REQUIRED_{kind}: &[AssetId] = &[");
+        let Some(start) = manifest.find(&header) else {
+            return 0;
+        };
+        let body = &manifest[start + header.len()..];
+        let Some(end) = body.find("];") else {
+            return 0;
+        };
+        body[..end].matches(token).count()
     }
 
     #[test]

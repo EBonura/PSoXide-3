@@ -67,6 +67,11 @@ pub struct Graphics {
     /// stamped into. Refreshed each frame against the project; new
     /// materials get a tpage allocated lazily.
     editor_textures: crate::editor_textures::EditorTextures,
+    /// Persistent on-disk byte cache for `.psxmdl` + `.psxanim`
+    /// reads. Walked once per frame to pull in newly-authored
+    /// models / clips and evict stale entries; the per-frame
+    /// preview pass never touches the filesystem.
+    editor_assets: crate::editor_assets::EditorAssets,
 }
 
 impl Graphics {
@@ -159,6 +164,7 @@ impl Graphics {
             editor_hw_renderer,
             editor_gpu_stub: Gpu::new(),
             editor_textures: crate::editor_textures::EditorTextures::new(),
+            editor_assets: crate::editor_assets::EditorAssets::new(),
         }
     }
 
@@ -206,9 +212,9 @@ impl Graphics {
     ) {
         self.editor_textures.refresh(project, project_root);
         self.editor_textures.refresh_models(project, project_root);
+        self.editor_assets.refresh(project, project_root);
         let cmd_log = crate::editor_preview::build_phase1_cmd_log(
             project,
-            project_root,
             camera,
             selected,
             hovered_primitive,
@@ -217,6 +223,7 @@ impl Graphics {
             entity_bounds,
             hovered_entity_node,
             &self.editor_textures,
+            &self.editor_assets,
         );
         self.editor_hw_renderer.render_frame(
             &self.editor_gpu_stub,

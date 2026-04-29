@@ -13,6 +13,7 @@ mod app;
 mod audio;
 mod cli;
 mod disasm;
+mod editor_assets;
 mod editor_preview;
 mod editor_textures;
 mod gfx;

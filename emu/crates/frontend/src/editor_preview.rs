@@ -30,7 +30,6 @@ use psx_gpu::prim::TriFlat;
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
 use psx_gpu::prim::TriTextured;
-use std::path::Path;
 
 use psxed_project::{
     GridDirection, GridSplit, NodeKind, ProjectDocument, ResourceData, ResourceId, WorldGrid,
@@ -112,7 +111,6 @@ static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
 /// scene to show" affordance.
 pub fn build_phase1_cmd_log(
     project: &ProjectDocument,
-    project_root: &Path,
     camera: ViewportCameraState,
     selected: psxed_project::NodeId,
     hovered_primitive: Option<psxed_ui::Selection>,
@@ -121,6 +119,7 @@ pub fn build_phase1_cmd_log(
     entity_bounds: &[psxed_ui::EntityBounds],
     hovered_entity_node: Option<psxed_project::NodeId>,
     textures: &EditorTextures,
+    assets: &crate::editor_assets::EditorAssets,
 ) -> Vec<GpuCmdLogEntry> {
     let Some((room_id, grid, target)) = first_room_grid(project) else {
         return Vec::new();
@@ -158,9 +157,9 @@ pub fn build_phase1_cmd_log(
 
     walk_model_instances(
         project,
-        project_root,
         grid,
         textures,
+        assets,
         selected,
         &world_camera,
         &mut scratch,
@@ -1007,9 +1006,9 @@ struct PreviewModelInstance<'a> {
 /// elsewhere; the preview just keeps drawing what it can.
 fn walk_model_instances(
     project: &ProjectDocument,
-    project_root: &Path,
     grid: &WorldGrid,
-    _textures: &EditorTextures,
+    textures: &EditorTextures,
+    assets: &crate::editor_assets::EditorAssets,
     selected: psxed_project::NodeId,
     camera: &psx_engine::WorldCamera,
     scratch: &mut PreviewScratch,
@@ -1019,13 +1018,12 @@ fn walk_model_instances(
     // instances we render.
     let tick = PREVIEW_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // Cache asset bytes per Model resource to avoid re-reading
-    // the same file once per instance. Bytes are kept on the
-    // stack-allocated arena so the parsed `Model<'_>` borrow
-    // is valid for the rest of the frame.
+    // The persistent `EditorAssets` cache owns mesh + animation
+    // bytes. We only borrow into it here; nothing in this loop
+    // touches the filesystem. Per-instance state (which clip is
+    // active, where it lives in the world) lives in
+    // `instances_meta`.
     let scene = project.active_scene();
-
-    let mut buffers: Vec<(ResourceId, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut instances_meta: Vec<InstanceMeta> = Vec::new();
 
     for node in scene.nodes() {
@@ -1053,7 +1051,7 @@ fn walk_model_instances(
         // Atlas slot must already be uploaded (refresh_models
         // ran earlier in the frame). Skip if not — lets the
         // user know visually that the atlas is broken.
-        let Some(atlas_slot) = _textures.model_atlas_slot(*mesh_id) else {
+        let Some(atlas_slot) = textures.model_atlas_slot(*mesh_id) else {
             continue;
         };
 
@@ -1062,29 +1060,8 @@ fn walk_model_instances(
             .or(model.preview_clip)
             .or(model.default_clip)
             .unwrap_or(0);
-        let Some(clip) = model.clips.get(clip_local as usize) else {
+        if (clip_local as usize) >= model.clips.len() {
             continue;
-        };
-
-        // Load mesh + animation bytes once per resource id.
-        if !buffers.iter().any(|(id, _, _)| *id == *mesh_id) {
-            let mesh_path = if std::path::Path::new(&model.model_path).is_absolute() {
-                std::path::PathBuf::from(&model.model_path)
-            } else {
-                project_root.join(&model.model_path)
-            };
-            let Ok(mesh_bytes) = std::fs::read(&mesh_path) else {
-                continue;
-            };
-            let anim_path = if std::path::Path::new(&clip.psxanim_path).is_absolute() {
-                std::path::PathBuf::from(&clip.psxanim_path)
-            } else {
-                project_root.join(&clip.psxanim_path)
-            };
-            let Ok(anim_bytes) = std::fs::read(&anim_path) else {
-                continue;
-            };
-            buffers.push((*mesh_id, mesh_bytes, anim_bytes));
         }
 
         // World position: same convention `walk_entities` uses
@@ -1104,6 +1081,7 @@ fn walk_model_instances(
 
         instances_meta.push(InstanceMeta {
             mesh_id: *mesh_id,
+            clip_local,
             origin,
             instance_rotation,
             atlas: atlas_slot,
@@ -1117,24 +1095,20 @@ fn walk_model_instances(
     // the spawn so level designers see where the player starts
     // *and* what they look like. Reuses the same model render
     // path — no separate player renderer.
-    walk_player_spawn_preview(
-        project,
-        grid,
-        _textures,
-        selected,
-        &mut buffers,
-        &mut instances_meta,
-        project_root,
-    );
+    walk_player_spawn_preview(project, grid, textures, selected, &mut instances_meta);
 
-    // Resolve parsed model + animation per instance now that
-    // bytes are stable. Borrow checker happy: buffers Vec lives
-    // for the rest of the function.
+    // Resolve parsed model + animation per instance straight
+    // out of the cache. Each meta carries its own
+    // `(mesh_id, clip_local)` pair so two instances of the
+    // same model with different clips resolve to two different
+    // animation entries — fixes the prior shared-buffer bug
+    // where whichever clip got loaded first won.
     let mut instances: Vec<PreviewModelInstance> = Vec::new();
     for meta in &instances_meta {
-        let Some((_, mesh_bytes, anim_bytes)) =
-            buffers.iter().find(|(id, _, _)| *id == meta.mesh_id)
-        else {
+        let Some(mesh_bytes) = assets.mesh_bytes(meta.mesh_id) else {
+            continue;
+        };
+        let Some(anim_bytes) = assets.clip_bytes(meta.mesh_id, meta.clip_local) else {
             continue;
         };
         let Ok(model) = psx_asset::Model::from_bytes(mesh_bytes) else {
@@ -1167,11 +1141,12 @@ fn walk_model_instances(
 }
 
 /// For every Player Spawn (`SpawnPoint { player: true, .. }`),
-/// resolve its `character` link to a Model + idle clip and emit
-/// an `InstanceMeta` at the spawn position. Reuses the same
-/// `buffers` cache the placed-model walker fills so a project
-/// where a model is *both* placed and used as the player only
-/// loads the mesh once.
+/// resolve its `character` link to a Model + idle clip and
+/// queue an `InstanceMeta` so the same render path placed
+/// model instances follow renders the character at the spawn.
+/// `(mesh_id, clip_local)` is the cache key — different player
+/// idle clips and different placed-instance clips each resolve
+/// to their own animation entry.
 ///
 /// Resolution rule mirrors the cooker:
 /// 1. Explicit `character` assignment wins.
@@ -1184,9 +1159,7 @@ fn walk_player_spawn_preview(
     grid: &WorldGrid,
     textures: &EditorTextures,
     selected: psxed_project::NodeId,
-    buffers: &mut Vec<(ResourceId, Vec<u8>, Vec<u8>)>,
     instances_meta: &mut Vec<InstanceMeta>,
-    project_root: &Path,
 ) {
     let scene = project.active_scene();
     for node in scene.nodes() {
@@ -1236,28 +1209,8 @@ fn walk_player_spawn_preview(
             .or(model.preview_clip)
             .or(model.default_clip)
             .unwrap_or(0);
-        let Some(clip) = model.clips.get(clip_local as usize) else {
+        if (clip_local as usize) >= model.clips.len() {
             continue;
-        };
-
-        if !buffers.iter().any(|(id, _, _)| *id == model_id) {
-            let mesh_path = if std::path::Path::new(&model.model_path).is_absolute() {
-                std::path::PathBuf::from(&model.model_path)
-            } else {
-                project_root.join(&model.model_path)
-            };
-            let Ok(mesh_bytes) = std::fs::read(&mesh_path) else {
-                continue;
-            };
-            let anim_path = if std::path::Path::new(&clip.psxanim_path).is_absolute() {
-                std::path::PathBuf::from(&clip.psxanim_path)
-            } else {
-                project_root.join(&clip.psxanim_path)
-            };
-            let Ok(anim_bytes) = std::fs::read(&anim_path) else {
-                continue;
-            };
-            buffers.push((model_id, mesh_bytes, anim_bytes));
         }
 
         let s = grid.sector_size;
@@ -1272,6 +1225,7 @@ fn walk_player_spawn_preview(
 
         instances_meta.push(InstanceMeta {
             mesh_id: model_id,
+            clip_local,
             origin,
             instance_rotation,
             atlas: atlas_slot,
@@ -1376,6 +1330,12 @@ fn draw_model_selection_gizmo(meta: &InstanceMeta, scratch: &mut PreviewScratch)
 
 struct InstanceMeta {
     mesh_id: ResourceId,
+    /// Clip index inside the model's clip list. Two instances
+    /// of the same model with different clip overrides carry
+    /// different `clip_local` values, which keys the
+    /// `EditorAssets::clip_bytes` lookup so each instance's
+    /// animation lands separately.
+    clip_local: u16,
     origin: psx_engine::WorldVertex,
     instance_rotation: Mat3I16,
     atlas: MaterialSlot,
