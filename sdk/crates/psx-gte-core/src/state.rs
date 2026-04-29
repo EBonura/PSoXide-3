@@ -774,14 +774,15 @@ impl Gte {
             (self.rgbc[0], self.rgbc[1], self.rgbc[2])
         };
         let sf = cmd.shift();
-        // [MAC1,2,3] = [R,G,B,...] << 16  +  IR0 * (limE(FC - [R,G,B] << 16))
+        // [MAC1,2,3] = [R,G,B,...] << 16
+        //   + IR0 * limB((FC << 12) - ([R,G,B] << 16))
         // Per PSX-SPX, the difference is computed in 12-bit fractional
         // intermediate via IR clamp (lm=false). We follow that.
         let bases = [r as i64, g as i64, b as i64];
         let fc = self.far_color;
         for i in 0..3 {
             let base = bases[i] << 16;
-            let diff = fc[i] as i64 - base;
+            let diff = ((fc[i] as i64) << 12) - base;
             let temp = self.check_mac((i + 1) as u8, diff) >> sf;
             let ir = self.saturate_value_for_ir(temp as i32, false);
             let _ = self.saturate_ir_flag_only((i + 1) as u8, temp as i32, false);
@@ -808,7 +809,7 @@ impl Gte {
         let initial_ir = self.ir;
         for i in 0..3 {
             let base = (initial_ir[i] as i64) << 12;
-            let diff = (fc[i] as i64) - base;
+            let diff = ((fc[i] as i64) << 12) - base;
             let temp = self.check_mac((i + 1) as u8, diff) >> sf;
             let _ = self.saturate_ir_flag_only((i + 1) as u8, temp as i32, false);
             let ir = self.saturate_value_for_ir(temp as i32, false);
@@ -821,7 +822,8 @@ impl Gte {
     }
 
     /// `NCS` — normal colour single. Lights `V[idx]` against the LLM,
-    /// then colours via LCM.
+    /// then colours via LCM. Unlike NCCS/NCDS/CC, this opcode does
+    /// not modulate the result by RGBC.
     ///
     /// Stage 1 formula per PSX-SPX: `MAC = (LLM × V) >> (sf×12)` —
     /// *no* BK bias. (The previous implementation added BK in both
@@ -847,16 +849,6 @@ impl Gte {
                 + (self.light_color[i][1] as i64) * (n[1] as i64)
                 + (self.light_color[i][2] as i64) * (n[2] as i64);
             let mac = self.check_mac((i + 1) as u8, bias + prod) >> sf;
-            self.mac[i] = mac as i32;
-            self.ir[i] = self.saturate_ir((i + 1) as u8, mac as i32, cmd.lm);
-        }
-        // [MAC1,2,3] = ([R,G,B] << 4) * IR
-        let r = self.rgbc[0] as i64;
-        let g = self.rgbc[1] as i64;
-        let b = self.rgbc[2] as i64;
-        let cs = [r << 4, g << 4, b << 4];
-        for i in 0..3 {
-            let mac = self.check_mac((i + 1) as u8, cs[i] * (self.ir[i] as i64)) >> sf;
             self.mac[i] = mac as i32;
             self.ir[i] = self.saturate_ir((i + 1) as u8, mac as i32, cmd.lm);
         }
@@ -1785,6 +1777,64 @@ mod tests {
         // 0x1000>>4 = 0x100 → clamps to 0xFF, setting COLOR_G_SAT.
         assert_eq!(g.read_data(22), 0x0020_FF80);
         assert!(g.read_control(31) & flag::COLOR_G_SAT != 0);
+    }
+
+    #[test]
+    fn ncs_does_not_modulate_by_rgbc() {
+        // Redux/PSX NCS emits the lit colour after LCM+BK directly.
+        // NCCS/NCDS/CC are the opcodes that multiply by RGBC. This
+        // distinction matters for Crash's Naughty Dog logo, whose
+        // material RGBC can be tiny while the lit colour should remain
+        // visible.
+        let mut g = Gte::new();
+        g.write_data(0, pack_xy_i16(0x1000, 0));
+        g.write_data(1, 0);
+        g.write_data(6, 0x0001_0101); // tiny RGBC; NCS must ignore it.
+
+        // LLM row 0 = [1,0,0], LCM row 0 = [0.25,0,0].
+        g.write_control(8, pack_xy_i16(0x1000, 0));
+        g.write_control(16, pack_xy_i16(0x0400, 0));
+
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x1E)); // NCS sf=1
+
+        assert_eq!(g.read_data(25) as i32, 0x0400, "MAC1 after LCM");
+        assert_eq!(g.read_data(22), 0x0000_0040, "RGB2 should ignore tiny RGBC");
+    }
+
+    #[test]
+    fn dpcs_far_color_uses_twelve_bit_fractional_scale() {
+        let mut g = Gte::new();
+        g.write_data(6, 0x0000_0000); // RGBC = black
+        g.write_data(8, 0x1000); // IR0 = 1.0
+        g.write_control(21, 0x0100); // RFC
+        g.write_control(22, 0x0200); // GFC
+        g.write_control(23, 0x0300); // BFC
+
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x10)); // DPCS sf=1
+
+        assert_eq!(g.read_data(25) as i32, 0x0100, "MAC1");
+        assert_eq!(g.read_data(26) as i32, 0x0200, "MAC2");
+        assert_eq!(g.read_data(27) as i32, 0x0300, "MAC3");
+        assert_eq!(g.read_data(22), 0x0030_2010, "RGB2");
+    }
+
+    #[test]
+    fn intpl_far_color_uses_twelve_bit_fractional_scale() {
+        let mut g = Gte::new();
+        g.write_data(8, 0x1000); // IR0 = 1.0
+        g.write_data(9, 0);
+        g.write_data(10, 0);
+        g.write_data(11, 0);
+        g.write_control(21, 0x0100); // RFC
+        g.write_control(22, 0x0200); // GFC
+        g.write_control(23, 0x0300); // BFC
+
+        g.execute(cmd_word(true, false, 0, 0, 0, 0x11)); // INTPL sf=1
+
+        assert_eq!(g.read_data(25) as i32, 0x0100, "MAC1");
+        assert_eq!(g.read_data(26) as i32, 0x0200, "MAC2");
+        assert_eq!(g.read_data(27) as i32, 0x0300, "MAC3");
+        assert_eq!(g.read_data(22), 0x0030_2010, "RGB2");
     }
 
     #[test]
