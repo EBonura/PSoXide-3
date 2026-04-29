@@ -918,9 +918,6 @@ impl AppState {
 /// Seconds a status toast stays visible.
 const STATUS_MESSAGE_TTL_SECS: f32 = 3.5;
 
-/// Pick the BIOS path the launcher should read, honouring
-/// precedence: explicit settings field > env var > compiled-in
-/// fallback. Centralised so every caller agrees.
 /// Format the right-aligned subtitle the Menu shows next to a
 /// game's title. Keeps everything in one place so the Games and
 /// Examples columns stay visually consistent.
@@ -952,6 +949,10 @@ fn format_subtitle(e: &LibraryEntry) -> String {
     }
 }
 
+/// Pick the BIOS path the launcher should read, honouring
+/// precedence: explicit settings field > env var. Centralised so
+/// every normal frontend caller agrees and no local path leaks into
+/// app defaults.
 pub(crate) fn resolve_bios_path(settings: &Settings) -> Result<PathBuf, String> {
     if !settings.paths.bios.is_empty() {
         Ok(PathBuf::from(&settings.paths.bios))

@@ -254,11 +254,11 @@ SHOWCASE_LIGHTS := engine/examples/showcase-lights
 SHOWCASE_FOG := engine/examples/showcase-fog
 HELLO_TEX := sdk/examples/hello-tex
 
-# Texture sources (.jpg / .png) are gitignored because they're
-# multi-MB photographs; the small cooked .psxt blobs in assets/
-# are the repo artifact. `make assets` cooks only when the source
-# is present, so fresh clones — which lack the sources — finish
-# without errors and the committed .psxt blobs remain valid.
+# Texture sources committed under example `vendor/` directories are
+# small pre-cropped JPGs. Larger originals are intentionally not
+# committed. `make assets` still skips missing source files so local
+# experiments with ignored high-res replacements do not break fresh
+# clones or CI.
 define cook_texture
 	@if [ -f "$(1)" ]; then \
 	    $(PSXED) tex "$(1)" -o "$(2)" --size $(3) --depth $(4) --resample lanczos3 ; \

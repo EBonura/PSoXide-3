@@ -87,14 +87,15 @@ impl Default for VideoSettings {
 }
 
 /// Where on the filesystem the app pulls assets from at startup.
-/// Empty strings mean "no preference — use built-in defaults /
-/// env-var fallbacks." All paths are stored as strings so the
+/// Empty strings mean "no preference — use built-in defaults or
+/// explicit env-var fallbacks." All paths are stored as strings so the
 /// RON file stays platform-portable (Path on disk uses forward
 /// slashes even on Windows — we join via `PathBuf` at read time).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Paths {
     /// Preferred BIOS image (`SCPH1001.BIN` & friends). Empty =
-    /// use the `PSOXIDE_BIOS` env var or the hardcoded fallback.
+    /// use the `PSOXIDE_BIOS` env var. Normal frontend paths do
+    /// not use a hardcoded BIOS fallback.
     pub bios: String,
     /// Root directory for the game library scanner. Empty =
     /// library feature inactive until the user sets one.
