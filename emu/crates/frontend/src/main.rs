@@ -310,6 +310,7 @@ impl ApplicationHandler for Shell {
 
         match event {
             WindowEvent::CloseRequested => {
+                self.state.stop_embedded_playtest();
                 // Flush any dirty memory card so save progress
                 // survives a window-close. A hard crash still
                 // loses whatever hasn't been flushed — the run
@@ -347,7 +348,9 @@ impl ApplicationHandler for Shell {
                 // so held buttons keep polling as "pressed". Auto-repeat
                 // events are ignored — the key is already down, and the
                 // BIOS polls every frame anyway.
-                if !repeat && !self.state.workspace.is_editor() {
+                let route_keyboard_to_game = !self.state.workspace.is_editor()
+                    || self.state.embedded_playtest_input_captured();
+                if !repeat && route_keyboard_to_game {
                     if let Some(mask) =
                         key_to_pad_button(&logical_key, &self.state.settings.input.port1)
                     {
@@ -455,7 +458,12 @@ impl ApplicationHandler for Shell {
                 if input.toggle_open {
                     input.toggle_open = false;
                     input.back = false;
-                    if self.state.running {
+                    if self.state.workspace.is_editor()
+                        && self.state.embedded_playtest_running()
+                        && self.state.embedded_playtest_input_captured()
+                    {
+                        self.state.release_embedded_playtest_input();
+                    } else if self.state.running {
                         // Game mode → menu mode: pause and open overlay.
                         self.state.running = false;
                         self.state.menu.sync_run_label(false);
@@ -465,7 +473,10 @@ impl ApplicationHandler for Shell {
                         // live game to resume; otherwise just close
                         // the overlay.
                         self.state.menu.open = false;
-                        if self.state.bus.is_some() && self.state.current_game.is_some() {
+                        if self.state.bus.is_some()
+                            && (self.state.current_game.is_some()
+                                || self.state.embedded_playtest_input_captured())
+                        {
                             self.state.running = true;
                             self.state.menu.sync_run_label(true);
                         }
@@ -478,6 +489,7 @@ impl ApplicationHandler for Shell {
 
                 if let Some(action) = self.state.menu.update(&input) {
                     if ui::apply_menu_action(&mut self.state, action) == MenuOutcome::Quit {
+                        self.state.stop_embedded_playtest();
                         if let Err(e) = self.state.flush_memcard_port1() {
                             eprintln!("[frontend] memcard flush on quit: {e}");
                         }
@@ -491,6 +503,7 @@ impl ApplicationHandler for Shell {
                         return;
                     }
                 }
+                self.state.poll_embedded_playtest_build();
                 profile.input_ms = elapsed_ms(input_start);
 
                 // Arm GPU command capture before stepping so the HW /
@@ -712,29 +725,31 @@ impl ApplicationHandler for Shell {
                 }
 
                 // Editor 3D preview: drive the editor-owned HwRenderer
-                // once per frame, regardless of editor visibility, so
-                // the texture is always current the moment the editor
-                // panel opens. Cheap when the project has no Rooms.
-                let editor_camera = state.editor.viewport_3d_camera();
-                let editor_selected = state.editor.selected_node_id();
-                let editor_root = state.editor.project_root();
-                let editor_hover = state.editor.hovered_primitive();
-                let editor_selection = state.editor.selected_primitive();
-                let editor_paint_preview = state.editor.paint_target_preview();
-                let editor_active_room = state.editor.active_room_id();
-                let editor_entity_bounds = state.editor.collect_entity_bounds(editor_active_room);
-                let editor_hovered_entity = state.editor.hovered_entity_node();
-                gfx.render_editor_preview(
-                    state.editor.project(),
-                    editor_root,
-                    editor_camera,
-                    editor_selected,
-                    editor_hover,
-                    editor_selection,
-                    editor_paint_preview,
-                    &editor_entity_bounds,
-                    editor_hovered_entity,
-                );
+                // while editing. During embedded Play, the viewport
+                // paints the live emulator framebuffer instead.
+                if !state.embedded_playtest_running() {
+                    let editor_camera = state.editor.viewport_3d_camera();
+                    let editor_selected = state.editor.selected_node_id();
+                    let editor_root = state.editor.project_root();
+                    let editor_hover = state.editor.hovered_primitive();
+                    let editor_selection = state.editor.selected_primitive();
+                    let editor_paint_preview = state.editor.paint_target_preview();
+                    let editor_active_room = state.editor.active_room_id();
+                    let editor_entity_bounds =
+                        state.editor.collect_entity_bounds(editor_active_room);
+                    let editor_hovered_entity = state.editor.hovered_entity_node();
+                    gfx.render_editor_preview(
+                        state.editor.project(),
+                        editor_root,
+                        editor_camera,
+                        editor_selected,
+                        editor_hover,
+                        editor_selection,
+                        editor_paint_preview,
+                        &editor_entity_bounds,
+                        editor_hovered_entity,
+                    );
+                }
 
                 let vram_tex = gfx.vram_texture_id();
                 let use_24bpp_display = state
@@ -753,18 +768,28 @@ impl ApplicationHandler for Shell {
                         ui::framebuffer::FramebufferSource::HardwareVram,
                     )
                 };
-                let editor_viewport_tex = gfx.editor_hw_texture_id();
+                let editor_viewport = if state.embedded_playtest_running() {
+                    psxed_ui::EditorViewport3dPresentation::play(
+                        display_tex,
+                        editor_play_uv(state.bus.as_ref(), framebuffer_source),
+                    )
+                } else {
+                    psxed_ui::EditorViewport3dPresentation::edit(gfx.editor_hw_texture_id())
+                };
                 profile.egui = gfx.render(|ctx| {
                     app::build_ui(
                         ctx,
                         state,
                         vram_tex,
                         display_tex,
-                        editor_viewport_tex,
+                        editor_viewport.clone(),
                         framebuffer_source,
                         dt,
                     )
                 });
+                if let Some(request) = state.editor.take_playtest_request() {
+                    state.handle_editor_playtest_request(request);
+                }
                 profile.total_ms = elapsed_ms(profile_start);
                 if let Some(line) = state.profiler.record(profile) {
                     eprintln!("{line}");
@@ -821,6 +846,42 @@ fn gpu_log_counters(log: &[emulator_core::gpu::GpuCmdLogEntry]) -> (usize, usize
 
 fn gpu_log_has_draw(log: &[emulator_core::gpu::GpuCmdLogEntry]) -> bool {
     log.iter().any(|entry| matches!(entry.opcode, 0x20..=0x7F))
+}
+
+fn editor_play_uv(
+    bus: Option<&emulator_core::Bus>,
+    source: ui::framebuffer::FramebufferSource,
+) -> egui::Rect {
+    let area = bus
+        .map(|b| b.gpu.display_area())
+        .unwrap_or(emulator_core::DisplayArea {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 240,
+            bpp24: false,
+        });
+    let width = area.width.max(320) as f32;
+    let height = area.height.max(240) as f32;
+    match source {
+        ui::framebuffer::FramebufferSource::CpuDisplay => egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(
+                width / gfx::MAX_DISPLAY_WIDTH as f32,
+                height / gfx::MAX_DISPLAY_HEIGHT as f32,
+            ),
+        ),
+        ui::framebuffer::FramebufferSource::HardwareVram => egui::Rect::from_min_max(
+            egui::pos2(
+                area.x as f32 / psx_gpu_render::VRAM_WIDTH as f32,
+                area.y as f32 / psx_gpu_render::VRAM_HEIGHT as f32,
+            ),
+            egui::pos2(
+                (area.x as f32 + width) / psx_gpu_render::VRAM_WIDTH as f32,
+                (area.y as f32 + height) / psx_gpu_render::VRAM_HEIGHT as f32,
+            ),
+        ),
+    }
 }
 
 #[cfg(test)]

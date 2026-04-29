@@ -5,7 +5,7 @@ real PSX hardware (or PCSX-Redux).
 
 ## What it does
 
-The editor's "Cook & Play" action serializes the active scene
+The editor's Play action serializes the active scene
 into this crate's `generated/` directory:
 
 ```
@@ -38,15 +38,16 @@ LEFT/RIGHT yaws the player; UP/DOWN walks forward/back along
 the player's facing. SELECT toggles a free-orbit debug camera
 that pivots around the spawn point. No collision yet.
 
-## Cook + run
+## Embedded Play
 
-The editor's **Cook & Play** button is one-click: it cooks
-the active project, then spawns `make run-editor-playtest` as
-a child process and tracks its PID + exit status. The toolbar
-swaps to a `Stop Playtest` button while the child is alive.
+The editor's **Play** button is one-click: it cooks the active
+project, runs `make build-editor-playtest`, side-loads the built
+EXE into the already-running frontend emulator, and paints the
+live framebuffer into the editor's 3D viewport. No second window
+or child frontend is launched. The toolbar swaps to `Stop` while
+embedded play mode is active.
 
-For headless / CI / manual workflows, three Make targets
-remain:
+For headless / CI workflows, these Make targets remain:
 
 ```sh
 # Cook the active editor project (or starter, with no args) into
@@ -56,14 +57,6 @@ make cook-playtest [PROJECT=path/to/project.ron]
 # Build the EXE against whatever's in generated/ right now.
 # Doesn't recook.
 make build-editor-playtest
-
-# Build + side-load the existing cooked output.
-# Safe to run after the editor's "Cook & Play" — won't touch
-# your scene.
-make run-editor-playtest
-
-# Convenience: cook starter + build + run.
-make run-starter-playtest
 ```
 
 ## Placeholder vs cooked manifest
@@ -88,9 +81,8 @@ generated/
 From a fresh clone:
 
 1. `make build-editor-playtest` — works, shows clear screen.
-2. `make run-starter-playtest` — cooks the starter, runs.
-3. Editor → "Cook & Play" → `make run-editor-playtest` — your
-   custom scene, kept across runs until you cook again.
+2. Editor -> "Play" — your custom scene runs inside the editor
+   3D viewport until you press Stop.
 
 ## Scope
 
@@ -102,7 +94,7 @@ cook and are skipped from the runtime manifest.
 
 The runtime renders a player character at the spawn — driven
 by the Character resource the Player Spawn references. The
-camera follows behind, and D-pad input + CROSS toggles
+camera follows behind, and analog movement + Circle drive
 idle / walk / run animations on the character's authored
 clips. See [`docs/playable-character.md`](../../../docs/playable-character.md)
 for the full Character → cook → runtime contract.

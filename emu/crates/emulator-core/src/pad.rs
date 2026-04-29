@@ -285,6 +285,12 @@ impl PortDevice {
             .is_some_and(DigitalPad::press_analog_button)
     }
 
+    /// Force the attached pad into Analog mode when the pad accepts
+    /// host-side mode changes.
+    pub fn force_analog_mode(&mut self) -> bool {
+        self.pad.as_mut().is_some_and(DigitalPad::force_analog_mode)
+    }
+
     /// Immutable access to the attached memory card, if any. The
     /// frontend uses this to snapshot card bytes for persistence
     /// at shutdown.
@@ -575,6 +581,17 @@ impl DigitalPad {
             PadMode::Analog => PadMode::Digital,
             PadMode::Config => PadMode::Config,
         };
+        true
+    }
+
+    /// Force the visible poll mode to Analog without toggling back to
+    /// Digital if it is already Analog. Returns `true` when the mode
+    /// changed.
+    pub fn force_analog_mode(&mut self) -> bool {
+        if self.analog_locked || self.mode == PadMode::Config || self.mode == PadMode::Analog {
+            return false;
+        }
+        self.mode = PadMode::Analog;
         true
     }
 

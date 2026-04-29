@@ -22,7 +22,7 @@ pub fn draw_layout(
     state: &mut AppState,
     vram_tex: egui::TextureId,
     display_tex: egui::TextureId,
-    editor_viewport_tex: egui::TextureId,
+    editor_viewport: psxed_ui::EditorViewport3dPresentation,
     framebuffer_source: framebuffer::FramebufferSource,
     dt: f32,
 ) {
@@ -30,7 +30,8 @@ pub fn draw_layout(
     state.tick_status(dt);
 
     if state.workspace.is_editor() {
-        state.editor.draw(ctx, editor_viewport_tex);
+        let playtest_status = state.editor_playtest_status();
+        state.editor.draw(ctx, editor_viewport, playtest_status);
         if state.panels.profiler {
             profiler::draw(ctx, &mut state.profiler);
         }

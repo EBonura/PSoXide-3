@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 
 use emulator_core::{
     fast_boot_disc_with_hle, warm_bios_for_disc_fast_boot, Bus, Cpu, DISC_FAST_BOOT_WARMUP_STEPS,
@@ -13,7 +14,7 @@ use psoxide_settings::library::{GameKind, Region};
 use psoxide_settings::{ConfigPaths, Library, LibraryEntry, Settings};
 use psx_iso::{Disc, Exe, SECTOR_BYTES};
 use psx_trace::InstructionRecord;
-use psxed_ui::EditorWorkspace;
+use psxed_ui::{EditorPlaytestStatus, EditorWorkspace};
 
 use crate::ui;
 use crate::ui::hud::HudState;
@@ -100,6 +101,8 @@ pub struct AppState {
     /// Embedded editor workspace. Kept alive while hidden so editor
     /// state survives a quick trip back to the Menu/emulator.
     pub editor: EditorWorkspace,
+    /// In-process playtest launched from the editor viewport.
+    pub embedded_playtest: EmbeddedPlaytestState,
     pub panels: PanelVisibility,
     /// Framebuffer mode — shared HW renderer at native scale vs
     /// window-fitted high resolution. Toggled via the debug toolbar.
@@ -167,6 +170,24 @@ pub struct AppState {
     /// Toolbar mute latch. Kept separate from `audio_volume` so
     /// unmuting restores the prior level.
     pub audio_muted: bool,
+}
+
+/// Frontend-owned embedded editor playtest state.
+pub enum EmbeddedPlaytestState {
+    /// No embedded playtest is active.
+    Idle,
+    /// `make build-editor-playtest` is running in the background.
+    Building { child: Child },
+    /// The editor viewport is displaying the live emulator.
+    Running { input_captured: bool },
+    /// Last play attempt failed.
+    Failed,
+}
+
+impl Default for EmbeddedPlaytestState {
+    fn default() -> Self {
+        Self::Idle
+    }
 }
 
 impl Default for AppState {
@@ -257,6 +278,7 @@ impl AppState {
         let mut out = Self {
             workspace: Workspace::Emulator,
             editor,
+            embedded_playtest: EmbeddedPlaytestState::Idle,
             panels: PanelVisibility::default(),
             scale_mode: ScaleMode::default(),
             framebuffer_present_size_px: (320, 240),
@@ -676,6 +698,7 @@ impl AppState {
 
     /// Return from the editor workspace to the emulator view.
     pub fn close_editor_workspace(&mut self) {
+        self.stop_embedded_playtest();
         let save_result = self.save_editor_project();
         self.workspace = Workspace::Emulator;
         self.menu.sync_editor_label(false);
@@ -696,6 +719,202 @@ impl AppState {
         } else {
             self.open_editor_workspace();
         }
+    }
+
+    /// Editor-facing status mirror for the embedded play controls.
+    pub fn editor_playtest_status(&self) -> EditorPlaytestStatus {
+        match &self.embedded_playtest {
+            EmbeddedPlaytestState::Idle => EditorPlaytestStatus::Idle,
+            EmbeddedPlaytestState::Building { .. } => EditorPlaytestStatus::Building,
+            EmbeddedPlaytestState::Running { input_captured } => EditorPlaytestStatus::Running {
+                input_captured: *input_captured,
+            },
+            EmbeddedPlaytestState::Failed => EditorPlaytestStatus::Failed,
+        }
+    }
+
+    /// True when the editor viewport is currently the live game.
+    pub fn embedded_playtest_running(&self) -> bool {
+        matches!(
+            self.embedded_playtest,
+            EmbeddedPlaytestState::Running { .. }
+        )
+    }
+
+    /// True when keyboard/gamepad input should be routed to the
+    /// embedded game even though the editor workspace is visible.
+    pub fn embedded_playtest_input_captured(&self) -> bool {
+        matches!(
+            self.embedded_playtest,
+            EmbeddedPlaytestState::Running {
+                input_captured: true
+            }
+        )
+    }
+
+    /// Cook the active editor project, then spawn the existing MIPS
+    /// build target. The build is asynchronous; call
+    /// [`Self::poll_embedded_playtest_build`] once per frame to load
+    /// the resulting EXE when it exits successfully.
+    pub fn start_embedded_playtest(&mut self) {
+        self.stop_embedded_playtest();
+        self.editor.set_status("Cooking embedded playtest...");
+        if let Err(error) = self.save_editor_project() {
+            let message = format!("Embedded Play failed: {error}");
+            self.editor.set_status(message.clone());
+            self.embedded_playtest = EmbeddedPlaytestState::Failed;
+            return;
+        }
+        let cook_status = match self.editor.cook_playtest_to_disk() {
+            Ok(status) => status,
+            Err(error) => {
+                let message = format!("Embedded Play cook failed: {error}");
+                self.editor.set_status(message.clone());
+                self.embedded_playtest = EmbeddedPlaytestState::Failed;
+                return;
+            }
+        };
+        self.editor
+            .set_status(format!("{cook_status}; building editor-playtest..."));
+
+        let workspace_root = repo_root_dir();
+        let mut command = Command::new("make");
+        command
+            .arg("build-editor-playtest")
+            .current_dir(&workspace_root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match command.spawn() {
+            Ok(child) => {
+                self.embedded_playtest = EmbeddedPlaytestState::Building { child };
+                self.status_message_set("Building embedded playtest");
+            }
+            Err(error) => {
+                let message = format!("Embedded Play build failed: spawn make: {error}");
+                self.editor.set_status(message.clone());
+                self.embedded_playtest = EmbeddedPlaytestState::Failed;
+            }
+        }
+    }
+
+    /// Poll the background build child and side-load the resulting
+    /// editor-playtest EXE when the build succeeds.
+    pub fn poll_embedded_playtest_build(&mut self) {
+        let EmbeddedPlaytestState::Building { child } = &mut self.embedded_playtest else {
+            return;
+        };
+        let status = match child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => return,
+            Err(error) => {
+                let message = format!("Embedded Play build poll failed: {error}");
+                self.editor.set_status(message.clone());
+                self.embedded_playtest = EmbeddedPlaytestState::Failed;
+                return;
+            }
+        };
+
+        if !status.success() {
+            let message = format!("Embedded Play build failed: {status}");
+            self.editor.set_status(message.clone());
+            self.embedded_playtest = EmbeddedPlaytestState::Failed;
+            return;
+        }
+
+        match self.load_embedded_playtest_exe() {
+            Ok(()) => {
+                self.embedded_playtest = EmbeddedPlaytestState::Running {
+                    input_captured: true,
+                };
+                self.running = true;
+                self.menu.open = false;
+                self.menu.sync_run_label(true);
+                self.editor
+                    .set_status("Embedded Play running in the 3D viewport");
+                self.status_message_set("Embedded Play running");
+            }
+            Err(error) => {
+                let message = format!("Embedded Play load failed: {error}");
+                self.editor.set_status(message.clone());
+                self.embedded_playtest = EmbeddedPlaytestState::Failed;
+            }
+        }
+    }
+
+    /// Stop embedded play mode and return the editor viewport to the
+    /// authored 3D preview.
+    pub fn stop_embedded_playtest(&mut self) {
+        if let EmbeddedPlaytestState::Building { child } = &mut self.embedded_playtest {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.embedded_playtest = EmbeddedPlaytestState::Idle;
+        self.running = false;
+        self.menu.sync_run_label(false);
+    }
+
+    /// Capture input for the embedded game and resume emulation.
+    pub fn capture_embedded_playtest_input(&mut self) {
+        if let EmbeddedPlaytestState::Running { input_captured } = &mut self.embedded_playtest {
+            *input_captured = true;
+            self.running = true;
+            self.menu.open = false;
+            self.menu.sync_run_label(true);
+            self.editor.set_status("Embedded Play input captured");
+        }
+    }
+
+    /// Release input capture from the embedded game and pause it.
+    pub fn release_embedded_playtest_input(&mut self) {
+        if let EmbeddedPlaytestState::Running { input_captured } = &mut self.embedded_playtest {
+            *input_captured = false;
+            self.running = false;
+            self.menu.open = true;
+            self.menu.sync_run_label(false);
+            self.editor
+                .set_status("Embedded Play paused; click viewport to resume");
+        }
+    }
+
+    /// Handle one request emitted by the editor UI.
+    pub fn handle_editor_playtest_request(&mut self, request: psxed_ui::EditorPlaytestRequest) {
+        match request {
+            psxed_ui::EditorPlaytestRequest::Play | psxed_ui::EditorPlaytestRequest::Rebuild => {
+                self.start_embedded_playtest();
+            }
+            psxed_ui::EditorPlaytestRequest::Stop => {
+                self.stop_embedded_playtest();
+                self.editor
+                    .set_status("Embedded Play stopped; returned to edit preview");
+            }
+            psxed_ui::EditorPlaytestRequest::CaptureInput => {
+                self.capture_embedded_playtest_input();
+            }
+        }
+    }
+
+    fn load_embedded_playtest_exe(&mut self) -> Result<(), String> {
+        let bios_path = resolve_bios_path(&self.settings);
+        let bios =
+            std::fs::read(&bios_path).map_err(|e| format!("BIOS {}: {e}", bios_path.display()))?;
+        let mut bus = Bus::new(bios).map_err(|e| format!("BIOS rejected: {e}"))?;
+        let exe_path = editor_playtest_exe_path();
+        let bytes = std::fs::read(&exe_path).map_err(|e| format!("{}: {e}", exe_path.display()))?;
+        let exe = Exe::parse(&bytes).map_err(|e| format!("parse EXE: {e:?}"))?;
+        let mut cpu = Cpu::new();
+        bus.load_exe_payload(exe.load_addr, &exe.payload);
+        bus.clear_exe_bss(exe.bss_addr, exe.bss_size);
+        cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
+        bus.enable_hle_bios();
+        bus.attach_digital_pad_port1();
+        let _ = bus.force_port1_analog_mode();
+
+        self.bus = Some(bus);
+        self.cpu = cpu;
+        self.exec_history.clear();
+        self.gpr_snapshot = None;
+        self.current_game = None;
+        Ok(())
     }
 
     /// Flush any dirty memory-card state on port 1 back to its
@@ -987,6 +1206,22 @@ fn load_exe() -> Option<Exe> {
     }
 }
 
+fn repo_root_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+}
+
+fn editor_playtest_exe_path() -> PathBuf {
+    repo_root_dir()
+        .join("build")
+        .join("examples")
+        .join("mipsel-sony-psx")
+        .join("release")
+        .join("editor-playtest.exe")
+}
+
 /// Read `PSOXIDE_DISC` → disc image → `Disc`. Accepts raw BIN/ISO and
 /// CUE-backed multitrack images. Logs and returns `None` on any trouble
 /// so a misconfigured path doesn't wedge the frontend.
@@ -1042,7 +1277,7 @@ pub fn build_ui(
     state: &mut AppState,
     vram_tex: egui::TextureId,
     display_tex: egui::TextureId,
-    editor_viewport_tex: egui::TextureId,
+    editor_viewport: psxed_ui::EditorViewport3dPresentation,
     framebuffer_source: ui::framebuffer::FramebufferSource,
     dt: f32,
 ) {
@@ -1051,7 +1286,7 @@ pub fn build_ui(
         state,
         vram_tex,
         display_tex,
-        editor_viewport_tex,
+        editor_viewport,
         framebuffer_source,
         dt,
     );

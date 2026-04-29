@@ -491,6 +491,12 @@ impl Bus {
         self.sio0.port1_mut().press_analog_button()
     }
 
+    /// Force the port-1 DualShock into Analog mode without toggling
+    /// back to Digital if it is already Analog.
+    pub fn force_port1_analog_mode(&mut self) -> bool {
+        self.sio0.port1_mut().force_analog_mode()
+    }
+
     /// Current port-1 pad mode, if a pad is attached.
     pub fn port1_pad_mode(&self) -> Option<crate::pad::PadMode> {
         self.sio0.port1().pad().map(|pad| pad.mode())

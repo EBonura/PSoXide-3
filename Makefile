@@ -26,7 +26,7 @@
         showcase-particles run-showcase-particles \
         hello-engine run-hello-engine \
         showcase-room run-showcase-room \
-        cook-playtest build-editor-playtest run-editor-playtest run-starter-playtest
+        cook-playtest build-editor-playtest
 
 help:
 	@echo "PSoXide targets:"
@@ -198,8 +198,8 @@ showcase-room:
 # arguments cooks the embedded starter project; pass
 # `PROJECT=<path/to/project.ron>` to cook a specific one.
 # This target is **destructive**: it overwrites whatever was
-# in generated/ before. Don't run it after the editor's "Cook
-# & Play" unless you want the editor's output replaced.
+# in generated/ before. Don't run it after the editor's Play
+# action unless you want the editor's output replaced.
 cook-playtest:
 	cd editor && cargo run --release -p psxed-project --bin cook-playtest -- $(PROJECT)
 
@@ -319,16 +319,3 @@ run-hello-engine: hello-engine
 
 run-showcase-room: showcase-room
 	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/showcase-room.exe cargo run -p frontend --release
-
-# Build + run editor-playtest against whatever's already in
-# `generated/`. **Does not recook**, so it's safe to invoke
-# right after the editor's "Cook & Play" button — your custom
-# scene won't be overwritten by the starter.
-run-editor-playtest: build-editor-playtest
-	cd emu && PSOXIDE_EXE=$(CURDIR)/$(EXAMPLE_OUT)/editor-playtest.exe cargo run -p frontend --release
-
-# Convenience: cook the starter project AND run. Equivalent to
-# `make cook-playtest` followed by `make run-editor-playtest`.
-# Use this from a fresh checkout or when you specifically want
-# the starter scene; otherwise prefer the editor's cook button.
-run-starter-playtest: cook-playtest run-editor-playtest

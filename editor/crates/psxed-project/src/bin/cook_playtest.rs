@@ -1,10 +1,11 @@
 //! CLI: cook the editor's starter project (or a named project
 //! file) into the playtest example's `generated/` directory.
 //!
-//! The editor's "Cook & Play" menu action calls the same
-//! `psxed_project::playtest::cook_to_dir` underneath. This bin
-//! exists so CI scripts and the Makefile can drive the cook
-//! without spinning up the full GUI.
+//! The editor's Play action calls the same
+//! `psxed_project::playtest::cook_to_dir` underneath before the
+//! frontend builds and side-loads the runtime. This bin exists so CI
+//! scripts and the Makefile can drive the cook without spinning up the
+//! full GUI.
 //!
 //! Usage:
 //!   cook-playtest                     — cook the embedded starter
@@ -123,7 +124,7 @@ fn main() -> ExitCode {
                 );
             }
             println!("[cook-playtest] wrote → {}", dir.display());
-            println!("[cook-playtest] Run: make run-editor-playtest");
+            println!("[cook-playtest] Build: make build-editor-playtest");
             ExitCode::SUCCESS
         }
         Err(e) => {

@@ -2,7 +2,7 @@
 
 How a `Character` resource flows from authoring → cooked
 manifest → editor preview + editor-playtest runtime so a
-designer can press **Cook & Play** and walk a textured animated
+designer can press **Play** and walk a textured animated
 character around an authored room.
 
 ## Scope of this pass
@@ -42,12 +42,13 @@ at runtime.
    Pick the Character. If exactly one Character resource
    exists project-wide, leaving this unset auto-picks it at
    cook time with a warning.
-5. **Cook & Play**: the toolbar action validates the project,
-   cooks the manifest, and launches `make run-editor-playtest`.
+5. **Play**: the toolbar action validates the project, cooks the
+   manifest, builds `editor-playtest`, and side-loads it into the
+   editor viewport.
 
 The starter project ships a "Wraith Hero" Character bound to
-"Obsidian Wraith" — a fresh clone Cook-&-Plays into a walking
-player with no manual setup.
+"Obsidian Wraith" - a fresh clone Plays into a walking player
+with no manual setup.
 
 ## Resource shape
 
