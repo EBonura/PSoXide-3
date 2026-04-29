@@ -1326,14 +1326,7 @@ mod tests {
         let project = ProjectDocument::starter();
         let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
         for _ in 0..(MAX_WALL_STACK as usize + 1) {
-            grid.add_wall(
-                0,
-                0,
-                GridDirection::North,
-                0,
-                world::SECTOR_SIZE,
-                None,
-            );
+            grid.add_wall(0, 0, GridDirection::North, 0, world::SECTOR_SIZE, None);
         }
         match cook_world_grid(&project, &grid) {
             Err(WorldGridCookError::WallStackExceeded {

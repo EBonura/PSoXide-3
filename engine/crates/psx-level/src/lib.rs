@@ -454,9 +454,7 @@ pub struct ResidencyManager<const RAM_CAP: usize, const VRAM_CAP: usize> {
     vram: [Option<AssetId>; VRAM_CAP],
 }
 
-impl<const RAM_CAP: usize, const VRAM_CAP: usize> Default
-    for ResidencyManager<RAM_CAP, VRAM_CAP>
-{
+impl<const RAM_CAP: usize, const VRAM_CAP: usize> Default for ResidencyManager<RAM_CAP, VRAM_CAP> {
     fn default() -> Self {
         Self::new()
     }
@@ -600,8 +598,14 @@ mod tests {
 
     #[test]
     fn find_asset_returns_record_by_id() {
-        assert_eq!(find_asset(ASSETS, AssetId(0)).map(|a| a.id), Some(AssetId(0)));
-        assert_eq!(find_asset(ASSETS, AssetId(1)).map(|a| a.id), Some(AssetId(1)));
+        assert_eq!(
+            find_asset(ASSETS, AssetId(0)).map(|a| a.id),
+            Some(AssetId(0))
+        );
+        assert_eq!(
+            find_asset(ASSETS, AssetId(1)).map(|a| a.id),
+            Some(AssetId(1))
+        );
         assert!(find_asset(ASSETS, AssetId(42)).is_none());
     }
 

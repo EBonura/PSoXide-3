@@ -82,7 +82,11 @@ impl Frames {
     /// this for any `n ≥ 1`.
     #[inline]
     pub const fn every(self, n: u32) -> bool {
-        if n == 0 { false } else { self.0 % n == 0 }
+        if n == 0 {
+            false
+        } else {
+            self.0 % n == 0
+        }
     }
 }
 

@@ -34,10 +34,10 @@ pub use fastboot::{
     DISC_FAST_BOOT_WARMUP_STEPS,
 };
 pub use gpu::{DisplayArea, Gpu};
-pub use psx_gte_core::{Gte, GteProfileSnapshot};
 pub use irq::{Irq, IrqSource};
 pub use mmio_trace::{MmioKind, MmioTrace};
 pub use pad::{button, ButtonState, DigitalPad, PortDevice};
+pub use psx_gte_core::{Gte, GteProfileSnapshot};
 pub use sio::Sio0;
 pub use spu::{Spu, XaDecoderState};
 pub use timers::{Timer, Timers};

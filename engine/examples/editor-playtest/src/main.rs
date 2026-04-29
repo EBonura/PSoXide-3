@@ -19,8 +19,9 @@
 //! textures — the asset table is the source of truth.
 //!
 //! Controls (free-orbit toggled with SELECT):
-//! * D-pad LEFT / RIGHT — yaw camera (orbit) or player (tank).
-//! * D-pad UP / DOWN    — zoom (orbit) or walk (tank).
+//! * Left stick / D-pad — camera-relative movement.
+//! * Right stick        — camera yaw; vertical adjusts camera height.
+//! * CIRCLE            — run while moving.
 
 #![no_std]
 #![no_main]
@@ -30,12 +31,15 @@ extern crate psx_rt;
 
 use psx_asset::{Animation, Model, Texture, World as AssetWorld};
 use psx_engine::{
-    button, draw_room, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange,
-    JointViewTransform, Mat3I16, OtFrame, PrimitiveArena, ProjectedTexturedVertex,
-    ProjectedVertex, RuntimeRoom, Scene, WorldCamera, WorldProjection, WorldRenderPass,
-    WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    button, draw_room, App, CharacterMotorAnim, CharacterMotorConfig, CharacterMotorInput,
+    CharacterMotorState, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange,
+    JointViewTransform, Mat3I16, OtFrame, PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex,
+    RuntimeRoom, Scene, ThirdPersonCameraConfig, ThirdPersonCameraInput, ThirdPersonCameraState,
+    ThirdPersonCameraTarget, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions,
+    WorldTriCommand, WorldVertex,
 };
-use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
+use psx_font::{fonts::BASIC, FontAtlas};
+use psx_gpu::{draw_quad_flat, material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_gte::transform::{cos_1_3_12, sin_1_3_12};
 use psx_level::{
     find_asset_of_kind, AssetId, AssetKind, EntityRecord, LevelCharacterRecord,
@@ -60,8 +64,10 @@ use generated::{
 // disjoint regions so a model atlas upload never overwrites a
 // room texture (and vice versa).
 //
-// Room materials: 4bpp tpage at (640, 0); stripe textures
-// left-to-right; one CLUT row per material at y >= 480.
+// Room materials: 4bpp pages starting at (640, 0), one tpage per
+// material. `draw_room` v1 UVs always start at (0,0), so packing
+// multiple 64x64 textures side-by-side inside one tpage would make
+// every material sample the first texture with a different CLUT.
 //
 // Model atlases: 8bpp tpage at (384, 256); stripe atlases
 // left-to-right (each atlas occupies its own halfword stride);
@@ -69,17 +75,28 @@ use generated::{
 // material CLUT band so the two never collide).
 const SHARED_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
 const TPAGE_WORD: u16 = SHARED_TPAGE.uv_tpage_word(0);
-/// First CLUT row used by room material textures. Row N below
-/// this belongs to material N's CLUT.
-const CLUT_BASE_Y: u16 = 480;
+const ROOM_TPAGE_STRIDE_HW: u16 = 64;
+const ROOM_TPAGE_LIMIT_X: u16 = 1024;
+/// CLUT strip used by room material textures. Keep it outside the
+/// 320-pixel-wide double-buffered framebuffer (`x=0..319`,
+/// `y=0..479`) so frame clears cannot overwrite palettes.
+const ROOM_CLUT_BASE_X: u16 = 320;
+const ROOM_CLUT_STRIDE: u16 = 16;
+const ROOM_CLUT_Y: u16 = 480;
 
 const MODEL_TPAGE: Tpage = Tpage::new(384, 256, TexDepth::Bit8);
 const MODEL_TPAGE_WORD: u16 = MODEL_TPAGE.uv_tpage_word(0);
 /// First CLUT row used by model atlases. 256-entry CLUTs span
-/// y..y+1 only; we step one row down per uploaded atlas, so
-/// `MODEL_CLUT_BASE_Y - n` is the row for the n-th atlas.
+/// a single row; we step one row down per uploaded atlas, so
+/// `MODEL_CLUT_BASE_Y + n` is the row for the n-th atlas.
 const MODEL_CLUT_BASE_Y: u16 = 484;
 
+/// 4bpp 8x8 BIOS-style font atlas for the analog-mode gate prompt.
+const FONT_TPAGE: Tpage = Tpage::new(320, 0, TexDepth::Bit4);
+const FONT_CLUT: Clut = Clut::new(320, 256);
+
+const SCREEN_W: i16 = 320;
+const SCREEN_H: i16 = 240;
 const SCREEN_CX: i16 = 160;
 const SCREEN_CY: i16 = 120;
 const FOCAL: i32 = 320;
@@ -94,6 +111,18 @@ const CAMERA_RADIUS_MAX: i32 = 5200;
 const CAMERA_RADIUS_STEP: i32 = 64;
 const CAMERA_START_YAW: u16 = 220;
 const CAMERA_YAW_STEP: u16 = 12;
+const MOVE_STICK_DEADZONE: i16 = 18;
+const STICK_MAX: i16 = 127;
+const CAMERA_STICK_DEADZONE: i16 = 18;
+const CAMERA_STICK_YAW_STEP: i16 = 24;
+const CAMERA_HEIGHT_STICK_STEP: i32 = 18;
+const CAMERA_HEIGHT_OFFSET_MIN: i32 = -512;
+const CAMERA_HEIGHT_OFFSET_MAX: i32 = 768;
+const CAMERA_SOFT_LOCK_BREAK_STICK: i16 = 72;
+const LOCK_RANGE: i32 = 4096;
+const LOCK_BREAK_RANGE: i32 = 5120;
+const SOFT_LOCK_RANGE: i32 = 3072;
+const SOFT_LOCK_BREAK_RANGE: i32 = 3840;
 
 const HALF_TURN_Q12: u16 = 2048;
 /// Fallback follow camera params used when no PLAYER_CONTROLLER
@@ -106,7 +135,7 @@ const FOLLOW_TARGET_HEIGHT_DEFAULT: i32 = 0;
 /// debug value.
 const FALLBACK_PLAYER_YAW_STEP: u16 = 32;
 const FALLBACK_PLAYER_SPEED: i32 = 32;
-const RUN_BUTTON: u16 = button::CROSS;
+const RUN_BUTTON: u16 = button::CIRCLE;
 
 const OT_DEPTH: usize = 64;
 const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 1);
@@ -144,6 +173,7 @@ const MAX_MODEL_INSTANCES: usize = 16;
 const MARKER_HALF: i32 = 96;
 const MARKER_LIFT: i32 = MARKER_HALF;
 const MARKER_TINT: (u8, u8, u8) = (0xff, 0xa8, 0x40);
+const ROOM_LIGHT_MAX_Q8: u32 = 144;
 
 const TRI_ZERO: TriTextured = TriTextured::new(
     [(0, 0), (0, 0), (0, 0)],
@@ -183,12 +213,12 @@ struct VramSlot {
 const VRAM_SLOT_EMPTY: Option<VramSlot> = None;
 static mut VRAM_SLOTS: [Option<VramSlot>; MAX_RESIDENT_VRAM_ASSETS] =
     [VRAM_SLOT_EMPTY; MAX_RESIDENT_VRAM_ASSETS];
-/// Number of VRAM slots used so far (next CLUT row + tpage cursor).
+/// Number of VRAM slots used so far across room textures and model atlases.
 static mut VRAM_SLOT_COUNT: usize = 0;
-/// Tpage X cursor (in halfwords) for the room-material 4bpp
-/// region. Each uploaded room texture advances it by
-/// `halfwords_per_row`.
-static mut TPAGE_X_CURSOR: u16 = 0;
+/// Number of room material textures uploaded. Drives the per-material
+/// tpage page and CLUT row; kept separate from `VRAM_SLOT_COUNT` so
+/// model atlas uploads cannot shift room texture addressing.
+static mut ROOM_TEXTURE_COUNT: usize = 0;
 
 /// Tpage X cursor (in halfwords) for the model-atlas 8bpp
 /// region. Distinct cursor so room-material uploads don't shift
@@ -199,9 +229,8 @@ static mut MODEL_TPAGE_X_CURSOR: u16 = 0;
 /// CLUT row.
 static mut MODEL_ATLAS_COUNT: usize = 0;
 
-/// Animation state machine for the player. Idle / Walk / Run
-/// — turn is folded into Idle with a yaw input, per the spec
-/// (turn clip is optional and only previewed if assigned).
+/// Animation state machine for the player: idle with no movement,
+/// walking for normal movement, running while Circle is held.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PlayerAnim {
     Idle,
@@ -248,8 +277,7 @@ impl RuntimeCharacter {
         // 60 Hz target ≈ 0.19 q12 per deg/frame. We approximate
         // as `(deg * 4096) / (360 * 60)` which is exact for the
         // 180 deg/s default (= 34 quanta/frame).
-        let yaw_step_q12 = ((c.turn_speed_degrees_per_second as u32 * 4096)
-            / (360 * 60)) as u16;
+        let yaw_step_q12 = ((c.turn_speed_degrees_per_second as u32 * 4096) / (360 * 60)) as u16;
         Self {
             model: c.model,
             idle_clip: c.idle_clip,
@@ -281,6 +309,15 @@ impl RuntimeCharacter {
             }
         }
     }
+
+    fn motor_config(&self) -> CharacterMotorConfig {
+        CharacterMotorConfig::character(
+            self.radius,
+            self.walk_speed,
+            self.run_speed,
+            self.yaw_step_q12,
+        )
+    }
 }
 
 struct Playtest {
@@ -298,11 +335,8 @@ struct Playtest {
     /// `materials[..material_count]` is the in-use slice; rest
     /// is `None`.
     material_count: usize,
-    /// Player position in room-local engine units.
-    player_x: i32,
-    player_y: i32,
-    player_z: i32,
-    player_yaw: u16,
+    /// Player locomotion state: position, yaw, stamina, and evade actions.
+    motor: CharacterMotorState,
     /// Resolved Character driving the player — `None` when no
     /// `PLAYER_CONTROLLER` was authored. Falls back to the
     /// pre-character debug controls in that case.
@@ -319,8 +353,24 @@ struct Playtest {
     free_orbit: bool,
     orbit_yaw: u16,
     orbit_radius: i32,
+    /// Runtime third-person camera rig. Updated from render so it
+    /// can consume the same room collision view used for drawing.
+    camera: ThirdPersonCameraState,
+    /// Manual right-stick vertical offset layered on top of the
+    /// authored camera height.
+    camera_height_offset: i32,
+    /// Index into `ENTITIES` for the current lock-on target. In this
+    /// vertical-slice pass generic entity markers stand in for
+    /// enemies until enemy records exist.
+    lock_target: Option<usize>,
+    /// Automatic camera-only target. Suppressed after strong
+    /// manual camera input until the player leaves target range.
+    soft_lock_target: Option<usize>,
+    soft_lock_suppressed: bool,
     /// Spawn position retained for orbit-mode targeting.
     spawn: WorldVertex,
+    /// Font atlas used for the analog-mode required prompt.
+    font: Option<FontAtlas>,
 }
 
 impl Playtest {
@@ -330,23 +380,28 @@ impl Playtest {
             room_index: 0,
             materials: [const { None }; MAX_ROOM_MATERIALS],
             material_count: 0,
-            player_x: 0,
-            player_y: 0,
-            player_z: 0,
-            player_yaw: 0,
+            motor: CharacterMotorState::new(WorldVertex::ZERO, 0),
             character: None,
             anim_state: PlayerAnim::Idle,
             anim_start_tick: 0,
             free_orbit: false,
             orbit_yaw: CAMERA_START_YAW,
             orbit_radius: CAMERA_START_RADIUS,
+            camera: ThirdPersonCameraState::new(CAMERA_START_YAW),
+            camera_height_offset: 0,
+            lock_target: None,
+            soft_lock_target: None,
+            soft_lock_suppressed: false,
             spawn: WorldVertex::ZERO,
+            font: None,
         }
     }
 }
 
 impl Scene for Playtest {
     fn init(&mut self, _ctx: &mut Ctx) {
+        self.font = Some(FontAtlas::upload(&BASIC, FONT_TPAGE, FONT_CLUT));
+
         // Empty manifest? Boot to a clear-coloured screen.
         let Some(room_record) = ROOMS.first() else {
             return;
@@ -365,8 +420,7 @@ impl Scene for Playtest {
         let _ = unsafe { RESIDENCY.ensure_room_resident(residency_record) };
 
         // Resolve and parse the room's world bytes.
-        let world_asset =
-            find_asset_of_kind(ASSETS, room_record.world_asset, AssetKind::RoomWorld);
+        let world_asset = find_asset_of_kind(ASSETS, room_record.world_asset, AssetKind::RoomWorld);
         if let Some(asset) = world_asset {
             if let Ok(world) = AssetWorld::from_bytes(asset.bytes) {
                 self.room = Some(RuntimeRoom::from_world(world));
@@ -392,36 +446,43 @@ impl Scene for Playtest {
                 }
             })
             .unwrap_or(RoomDims::ZERO);
-        self.material_count =
-            build_room_materials(room_record, room_dims, 0, &mut self.materials);
+        self.material_count = build_room_materials(room_record, room_dims, 0, &mut self.materials);
 
         // Player init: prefer PLAYER_CONTROLLER (cook output)
         // for spawn + character; fall back to the bare
         // PLAYER_SPAWN for placeholder manifests.
         let (spawn, character) = match PLAYER_CONTROLLER {
             Some(pc) => {
-                let character = CHARACTERS.get(pc.character as usize)
+                let character = CHARACTERS
+                    .get(pc.character as usize)
                     .map(RuntimeCharacter::from_record);
                 (pc.spawn, character)
             }
             None => (PLAYER_SPAWN, None),
         };
-        self.player_x = spawn.x;
-        self.player_y = spawn.y;
-        self.player_z = spawn.z;
-        self.player_yaw = spawn.yaw as u16;
         self.spawn = WorldVertex::new(spawn.x, spawn.y, spawn.z);
         self.character = character;
+        self.motor.snap_to(self.spawn, spawn.yaw as u16);
         self.room_index = spawn.room;
         self.anim_state = PlayerAnim::Idle;
         self.anim_start_tick = 0;
+        self.camera
+            .snap_to_player(self.camera_target(None, false), self.camera_config());
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
+        if !ctx.pad.is_analog() {
+            return;
+        }
+
         if ctx.just_pressed(button::SELECT) {
             self.free_orbit = !self.free_orbit;
         }
         if self.free_orbit {
+            let (right_x, right_y) = ctx.pad.sticks.right_centered();
+            self.orbit_yaw = add_signed_q12(self.orbit_yaw, stick_to_yaw_delta(right_x));
+            self.orbit_radius = (self.orbit_radius + stick_to_radius_delta(right_y))
+                .clamp(CAMERA_RADIUS_MIN, CAMERA_RADIUS_MAX);
             if ctx.is_held(button::RIGHT) {
                 self.orbit_yaw = self.orbit_yaw.wrapping_add(CAMERA_YAW_STEP);
             }
@@ -429,94 +490,57 @@ impl Scene for Playtest {
                 self.orbit_yaw = self.orbit_yaw.wrapping_sub(CAMERA_YAW_STEP);
             }
             if ctx.is_held(button::UP) {
-                self.orbit_radius =
-                    (self.orbit_radius - CAMERA_RADIUS_STEP).max(CAMERA_RADIUS_MIN);
+                self.orbit_radius = (self.orbit_radius - CAMERA_RADIUS_STEP).max(CAMERA_RADIUS_MIN);
             }
             if ctx.is_held(button::DOWN) {
-                self.orbit_radius =
-                    (self.orbit_radius + CAMERA_RADIUS_STEP).min(CAMERA_RADIUS_MAX);
+                self.orbit_radius = (self.orbit_radius + CAMERA_RADIUS_STEP).min(CAMERA_RADIUS_MAX);
             }
             return;
         }
 
-        // Tank controls: D-pad LEFT/RIGHT yaws the player; UP
-        // walks forward, DOWN backpedals; CROSS held while
-        // moving switches to run speed (when the Character has
-        // a run clip — otherwise just runs faster on the walk
-        // clip per the spec).
-        let (yaw_step, walk_speed, run_speed) = match self.character {
-            Some(c) => (c.yaw_step_q12, c.walk_speed, c.run_speed),
-            None => (FALLBACK_PLAYER_YAW_STEP, FALLBACK_PLAYER_SPEED, FALLBACK_PLAYER_SPEED),
-        };
-        if ctx.is_held(button::RIGHT) {
-            self.player_yaw = self.player_yaw.wrapping_add(yaw_step);
-        }
-        if ctx.is_held(button::LEFT) {
-            self.player_yaw = self.player_yaw.wrapping_sub(yaw_step);
-        }
+        self.update_camera_height_offset(ctx);
 
-        let want_run = ctx.is_held(RUN_BUTTON);
-        let speed = if want_run { run_speed } else { walk_speed };
+        let input = motor_input(ctx, self.camera.yaw_q12());
+        let config = self.motor_config();
+        let collision = self.room.as_ref().map(|room| room.collision());
+        let motor_frame = self.motor.update(collision, input, config);
 
-        let sin_y = sin_1_3_12(self.player_yaw) as i32;
-        let cos_y = cos_1_3_12(self.player_yaw) as i32;
-        let mut moving = false;
-        let mut dx = 0i32;
-        let mut dz = 0i32;
-        if ctx.is_held(button::UP) {
-            dx += (sin_y * speed) >> 12;
-            dz += (cos_y * speed) >> 12;
-            moving = true;
-        }
-        if ctx.is_held(button::DOWN) {
-            dx -= (sin_y * speed) >> 12;
-            dz -= (cos_y * speed) >> 12;
-            moving = true;
-        }
-
-        // Coarse collision: only commit the move if the
-        // destination sector has a walkable floor.
-        if moving {
-            let target_x = self.player_x + dx;
-            let target_z = self.player_z + dz;
-            let radius = self.character.map(|c| c.radius).unwrap_or(0);
-            if self.can_stand_at(target_x, target_z, radius) {
-                self.player_x = target_x;
-                self.player_z = target_z;
-            }
-        }
-
-        // Animation state: idle when stationary; walk for any
-        // movement (forward + back); run when CROSS is held +
-        // moving + a run clip is available. State changes reset
-        // the phase so the new clip starts from frame 0.
-        let new_state = if !moving {
-            PlayerAnim::Idle
-        } else if want_run && self.character.is_some_and(|c| c.run_clip != CHARACTER_CLIP_NONE) {
-            PlayerAnim::Run
-        } else {
-            PlayerAnim::Walk
-        };
+        // Animation state comes from the reusable motor, but the
+        // playtest intentionally exposes only the core locomotion
+        // trio for now: idle, walking, running.
+        let new_state = player_anim_from_motor(motor_frame.anim);
         if new_state != self.anim_state {
             self.anim_state = new_state;
             self.anim_start_tick = ctx.time.elapsed_vblanks();
         }
+
+        if ctx.just_pressed(button::R3) {
+            self.lock_target = match self.lock_target {
+                Some(_) => None,
+                None => self.find_best_lock_target(LOCK_RANGE),
+            };
+            self.soft_lock_target = None;
+        }
+        if self.lock_target.is_some() {
+            if !self.lock_target_valid(LOCK_BREAK_RANGE) {
+                self.lock_target = None;
+            } else if ctx.just_pressed(button::R2) {
+                self.switch_lock_target(1);
+            } else if ctx.just_pressed(button::L2) {
+                self.switch_lock_target(-1);
+            }
+        }
+        self.update_soft_lock(ctx);
     }
 
     fn render(&mut self, ctx: &mut Ctx) {
-        // Third-person follow camera: take distance / height /
-        // target-height from the character record when one's
-        // resolved; fall back to the original debug values
-        // otherwise. Camera sits behind the player (yaw + half
-        // turn) and looks at a point above the character origin.
-        let (follow_distance, follow_height, target_height) = match self.character {
-            Some(c) => (c.camera_distance, c.camera_height, c.camera_target_height),
-            None => (
-                FOLLOW_RADIUS_DEFAULT,
-                FOLLOW_HEIGHT_DEFAULT,
-                FOLLOW_TARGET_HEIGHT_DEFAULT,
-            ),
-        };
+        if !ctx.pad.is_analog() {
+            if let Some(font) = self.font.as_ref() {
+                draw_analog_required_prompt(font);
+            }
+            return;
+        }
+
         let camera = if self.free_orbit {
             WorldCamera::orbit_yaw(
                 PROJECTION,
@@ -526,18 +550,7 @@ impl Scene for Playtest {
                 self.orbit_yaw,
             )
         } else {
-            let target = WorldVertex::new(
-                self.player_x,
-                self.player_y - target_height,
-                self.player_z,
-            );
-            WorldCamera::orbit_yaw(
-                PROJECTION,
-                target,
-                self.player_y - follow_height,
-                follow_distance,
-                self.player_yaw.wrapping_add(HALF_TURN_Q12),
-            )
+            self.update_follow_camera(ctx)
         };
 
         let mut ot = unsafe { OtFrame::begin(&mut OT) };
@@ -566,7 +579,14 @@ impl Scene for Playtest {
                 &mut triangles,
                 &mut world,
             );
-            draw_entity_markers(ENTITIES, materials, &camera, options, &mut triangles, &mut world);
+            draw_entity_markers(
+                ENTITIES,
+                materials,
+                &camera,
+                options,
+                &mut triangles,
+                &mut world,
+            );
             // Currently just room 0; future passes wire room
             // switching to a level-graph traversal.
             draw_model_instances(
@@ -585,12 +605,13 @@ impl Scene for Playtest {
             // is the one driven by PLAYER_CONTROLLER and lives
             // at the player position.
             if let Some(character) = self.character {
+                let player = self.motor.position();
                 draw_player(
                     character,
-                    self.player_x,
-                    self.player_y,
-                    self.player_z,
-                    self.player_yaw,
+                    player.x,
+                    player.y,
+                    player.z,
+                    self.motor.yaw_q12(),
                     character.clip_for(self.anim_state),
                     self.anim_start_tick,
                     ctx.time.elapsed_vblanks(),
@@ -609,40 +630,338 @@ impl Scene for Playtest {
 }
 
 impl Playtest {
-    /// Coarse "can the player stand here" check: target world
-    /// position must land inside a populated, walkable sector
-    /// of the active room. Caller passes a non-negative
-    /// `radius`; for now we sample the centre point only — the
-    /// radius is reserved for a future per-axis slide test.
-    ///
-    /// Out-of-bounds, unpopulated, or unwalkable cells are
-    /// rejected. This intentionally cannot leave the room
-    /// through a perimeter edge because the cells beyond the
-    /// grid are simply out-of-bounds.
-    fn can_stand_at(&self, world_x: i32, world_z: i32, _radius: i32) -> bool {
-        let Some(room) = self.room else {
-            return true;
-        };
-        let collision = room.collision();
-        let s = collision.sector_size();
-        if s <= 0 {
-            return false;
+    fn motor_config(&self) -> CharacterMotorConfig {
+        match self.character {
+            Some(c) => c.motor_config(),
+            None => CharacterMotorConfig::character(
+                0,
+                FALLBACK_PLAYER_SPEED,
+                FALLBACK_PLAYER_SPEED,
+                FALLBACK_PLAYER_YAW_STEP,
+            ),
         }
-        // Cooker emits array-rooted geometry — sector (sx, sz)
-        // covers world `[sx*S, (sx+1)*S)` on each axis.
-        if world_x < 0 || world_z < 0 {
-            return false;
-        }
-        let sx = (world_x / s) as i64;
-        let sz = (world_z / s) as i64;
-        if sx < 0 || sz < 0 || sx >= collision.width() as i64 || sz >= collision.depth() as i64 {
-            return false;
-        }
-        let Some(sector) = collision.sector(sx as u16, sz as u16) else {
-            return false;
-        };
-        sector.has_floor() && sector.floor_walkable()
     }
+
+    fn camera_config(&self) -> ThirdPersonCameraConfig {
+        let mut config = match self.character {
+            Some(c) => ThirdPersonCameraConfig::character(
+                c.camera_distance,
+                c.camera_height,
+                c.camera_target_height,
+            ),
+            None => ThirdPersonCameraConfig::character(
+                FOLLOW_RADIUS_DEFAULT,
+                FOLLOW_HEIGHT_DEFAULT,
+                FOLLOW_TARGET_HEIGHT_DEFAULT,
+            ),
+        };
+        config.height = config
+            .height
+            .saturating_add(self.camera_height_offset)
+            .max(256);
+        config
+    }
+
+    fn camera_target(
+        &self,
+        lock_target: Option<WorldVertex>,
+        moving: bool,
+    ) -> ThirdPersonCameraTarget {
+        ThirdPersonCameraTarget {
+            player: self.motor.position(),
+            player_yaw_q12: self.motor.yaw_q12(),
+            moving,
+            lock_target,
+        }
+    }
+
+    fn update_follow_camera(&mut self, ctx: &Ctx) -> WorldCamera {
+        let input = camera_input(ctx);
+        let lock_target = self
+            .lock_target_position()
+            .or_else(|| self.soft_lock_target_position());
+        let target = self.camera_target(lock_target, self.anim_state != PlayerAnim::Idle);
+        let config = self.camera_config();
+        let collision = self.room.as_ref().map(|room| room.collision());
+        self.camera
+            .update(PROJECTION, collision, target, input, config)
+            .camera
+    }
+
+    fn update_camera_height_offset(&mut self, ctx: &Ctx) {
+        let (_, right_y) = ctx.pad.sticks.right_centered();
+        self.camera_height_offset = self
+            .camera_height_offset
+            .saturating_add(stick_to_height_delta(right_y))
+            .clamp(CAMERA_HEIGHT_OFFSET_MIN, CAMERA_HEIGHT_OFFSET_MAX);
+    }
+
+    fn lock_target_position(&self) -> Option<WorldVertex> {
+        self.target_position(self.lock_target?)
+    }
+
+    fn soft_lock_target_position(&self) -> Option<WorldVertex> {
+        self.target_position(self.soft_lock_target?)
+    }
+
+    fn target_position(&self, index: usize) -> Option<WorldVertex> {
+        let target = ENTITIES.get(index)?;
+        if target.room != self.room_index {
+            return None;
+        }
+        Some(WorldVertex::new(target.x, target.y, target.z))
+    }
+
+    fn lock_target_valid(&self, range: i32) -> bool {
+        self.lock_target
+            .is_some_and(|index| self.target_index_valid(index, range))
+    }
+
+    fn target_index_valid(&self, index: usize, range: i32) -> bool {
+        let Some(target) = self.target_position(index) else {
+            return false;
+        };
+        distance_xz_sq(self.motor.position(), target) <= (range as i64 * range as i64)
+    }
+
+    fn find_best_lock_target(&self, range: i32) -> Option<usize> {
+        let player = self.motor.position();
+        let view_yaw = self.camera.yaw_q12().wrapping_add(HALF_TURN_Q12);
+        let sin_yaw = sin_1_3_12(view_yaw) as i64;
+        let cos_yaw = cos_1_3_12(view_yaw) as i64;
+        let range_sq = range as i64 * range as i64;
+        let mut best: Option<(usize, i64)> = None;
+        for (index, entity) in ENTITIES.iter().enumerate() {
+            if entity.room != self.room_index {
+                continue;
+            }
+            let target = WorldVertex::new(entity.x, entity.y, entity.z);
+            let dx = (target.x - player.x) as i64;
+            let dz = (target.z - player.z) as i64;
+            let dist_sq = dx * dx + dz * dz;
+            if dist_sq == 0 || dist_sq > range_sq {
+                continue;
+            }
+            let dot = dx * sin_yaw + dz * cos_yaw;
+            if dot <= 0 {
+                continue;
+            }
+            let score = (dot >> 4) - (dist_sq >> 12);
+            match best {
+                Some((_, best_score)) if best_score >= score => {}
+                _ => best = Some((index, score)),
+            }
+        }
+        best.map(|(index, _)| index)
+    }
+
+    fn update_soft_lock(&mut self, ctx: &Ctx) {
+        if self.lock_target.is_some() {
+            self.soft_lock_target = None;
+            self.soft_lock_suppressed = false;
+            return;
+        }
+        let (right_x, _) = ctx.pad.sticks.right_centered();
+        if abs_i16(right_x) >= CAMERA_SOFT_LOCK_BREAK_STICK {
+            self.soft_lock_target = None;
+            self.soft_lock_suppressed = true;
+            return;
+        }
+        if self.soft_lock_suppressed {
+            if self.find_best_lock_target(SOFT_LOCK_BREAK_RANGE).is_none() {
+                self.soft_lock_suppressed = false;
+            }
+            return;
+        }
+        match self.soft_lock_target {
+            Some(index) if self.target_index_valid(index, SOFT_LOCK_BREAK_RANGE) => {}
+            _ => self.soft_lock_target = self.find_best_lock_target(SOFT_LOCK_RANGE),
+        }
+    }
+
+    fn switch_lock_target(&mut self, direction: i32) {
+        let Some(current_index) = self.lock_target else {
+            return;
+        };
+        let Some(current) = ENTITIES.get(current_index) else {
+            self.lock_target = None;
+            return;
+        };
+        let player = self.motor.position();
+        let current_dx = (current.x - player.x) as i64;
+        let current_dz = (current.z - player.z) as i64;
+        if current_dx == 0 && current_dz == 0 {
+            return;
+        }
+        let range_sq = LOCK_RANGE as i64 * LOCK_RANGE as i64;
+        let mut best: Option<(usize, i64)> = None;
+        for (index, entity) in ENTITIES.iter().enumerate() {
+            if index == current_index || entity.room != self.room_index {
+                continue;
+            }
+            let dx = (entity.x - player.x) as i64;
+            let dz = (entity.z - player.z) as i64;
+            let dist_sq = dx * dx + dz * dz;
+            if dist_sq == 0 || dist_sq > range_sq {
+                continue;
+            }
+            let cross = current_dx * dz - current_dz * dx;
+            if direction > 0 {
+                if cross >= 0 {
+                    continue;
+                }
+            } else if cross <= 0 {
+                continue;
+            }
+            let dot = current_dx * dx + current_dz * dz;
+            let score = ((dot.max(0) << 8) / dist_sq.max(1)) - (dist_sq >> 14);
+            match best {
+                Some((_, best_score)) if best_score >= score => {}
+                _ => best = Some((index, score)),
+            }
+        }
+        if let Some((index, _)) = best {
+            self.lock_target = Some(index);
+        }
+    }
+}
+
+fn motor_input(ctx: &Ctx, camera_yaw_q12: u16) -> CharacterMotorInput {
+    let (strafe, forward) = local_move_axes(ctx);
+    let (move_x_q12, move_z_q12, walk) =
+        camera_relative_move_q12(strafe, forward, camera_yaw_q12);
+
+    CharacterMotorInput {
+        turn: 0,
+        walk,
+        move_x_q12,
+        move_z_q12,
+        sprint: ctx.is_held(RUN_BUTTON),
+        evade: false,
+    }
+}
+
+fn local_move_axes(ctx: &Ctx) -> (i16, i16) {
+    let (left_x, left_y) = ctx.pad.sticks.left_centered();
+    let stick_mag = isqrt(left_x as i64 * left_x as i64 + left_y as i64 * left_y as i64);
+    if stick_mag > MOVE_STICK_DEADZONE as i64 {
+        return (left_x.clamp(-STICK_MAX, STICK_MAX), (-left_y).clamp(-STICK_MAX, STICK_MAX));
+    }
+
+    let mut strafe = 0i16;
+    let mut forward = 0i16;
+    if ctx.is_held(button::RIGHT) {
+        strafe += STICK_MAX;
+    }
+    if ctx.is_held(button::LEFT) {
+        strafe -= STICK_MAX;
+    }
+    if ctx.is_held(button::UP) {
+        forward += STICK_MAX;
+    }
+    if ctx.is_held(button::DOWN) {
+        forward -= STICK_MAX;
+    }
+    (strafe, forward)
+}
+
+fn camera_relative_move_q12(
+    strafe: i16,
+    forward: i16,
+    camera_yaw_q12: u16,
+) -> (i16, i16, i8) {
+    let mag = isqrt(strafe as i64 * strafe as i64 + forward as i64 * forward as i64);
+    if mag <= MOVE_STICK_DEADZONE as i64 {
+        return (0, 0, 0);
+    }
+    let clamped_mag = mag.min(STICK_MAX as i64);
+    let scaled_mag_q12 =
+        ((clamped_mag - MOVE_STICK_DEADZONE as i64) * 4096)
+            / (STICK_MAX - MOVE_STICK_DEADZONE) as i64;
+    let local_strafe_q12 = (strafe as i64 * scaled_mag_q12 / mag) as i32;
+    let local_forward_q12 = (forward as i64 * scaled_mag_q12 / mag) as i32;
+
+    let forward_yaw = camera_yaw_q12.wrapping_add(HALF_TURN_Q12);
+    let right_yaw = forward_yaw.wrapping_sub(1024);
+    let world_x = (((sin_1_3_12(forward_yaw) as i32) * local_forward_q12)
+        + ((sin_1_3_12(right_yaw) as i32) * local_strafe_q12))
+        >> 12;
+    let world_z = (((cos_1_3_12(forward_yaw) as i32) * local_forward_q12)
+        + ((cos_1_3_12(right_yaw) as i32) * local_strafe_q12))
+        >> 12;
+    let walk = if forward < -MOVE_STICK_DEADZONE {
+        -1
+    } else if forward > MOVE_STICK_DEADZONE {
+        1
+    } else {
+        0
+    };
+    (clamp_i16(world_x), clamp_i16(world_z), walk)
+}
+
+fn player_anim_from_motor(anim: CharacterMotorAnim) -> PlayerAnim {
+    match anim {
+        CharacterMotorAnim::Idle => PlayerAnim::Idle,
+        CharacterMotorAnim::Walk => PlayerAnim::Walk,
+        CharacterMotorAnim::Run => PlayerAnim::Run,
+        CharacterMotorAnim::Roll => PlayerAnim::Run,
+        CharacterMotorAnim::Backstep => PlayerAnim::Walk,
+    }
+}
+
+fn camera_input(ctx: &Ctx) -> ThirdPersonCameraInput {
+    let (right_x, _) = ctx.pad.sticks.right_centered();
+    ThirdPersonCameraInput {
+        yaw_delta_q12: stick_to_yaw_delta(right_x),
+        recenter: ctx.is_held(button::L1),
+    }
+}
+
+fn stick_to_yaw_delta(axis: i16) -> i16 {
+    stick_axis_delta(axis, CAMERA_STICK_YAW_STEP)
+}
+
+fn stick_to_radius_delta(axis: i16) -> i32 {
+    stick_axis_delta(axis, CAMERA_RADIUS_STEP as i16) as i32
+}
+
+fn stick_to_height_delta(axis: i16) -> i32 {
+    stick_axis_delta(axis, CAMERA_HEIGHT_STICK_STEP as i16) as i32
+}
+
+fn stick_axis_delta(axis: i16, max_step: i16) -> i16 {
+    let magnitude = abs_i16(axis);
+    if magnitude <= CAMERA_STICK_DEADZONE {
+        return 0;
+    }
+    let sign = if axis < 0 { -1 } else { 1 };
+    let effective = magnitude.saturating_sub(CAMERA_STICK_DEADZONE) as i32;
+    let range = (STICK_MAX - CAMERA_STICK_DEADZONE) as i32;
+    (sign * effective * max_step as i32 / range) as i16
+}
+
+fn add_signed_q12(angle: u16, delta: i16) -> u16 {
+    ((angle as i32 + delta as i32) & 0x0FFF) as u16
+}
+
+fn clamp_i16(value: i32) -> i16 {
+    value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+fn abs_i16(value: i16) -> i16 {
+    if value == i16::MIN {
+        i16::MAX
+    } else if value < 0 {
+        -value
+    } else {
+        value
+    }
+}
+
+fn distance_xz_sq(a: WorldVertex, b: WorldVertex) -> i64 {
+    let dx = (a.x - b.x) as i64;
+    let dz = (a.z - b.z) as i64;
+    dx * dx + dz * dz
 }
 
 /// Render the player using the same `submit_textured_model`
@@ -669,11 +988,11 @@ fn draw_player(
         Some(m) => m,
         None => return,
     };
-    let mesh_asset =
-        match find_asset_of_kind(ASSETS, model_record.mesh_asset, AssetKind::ModelMesh) {
-            Some(a) => a,
-            None => return,
-        };
+    let mesh_asset = match find_asset_of_kind(ASSETS, model_record.mesh_asset, AssetKind::ModelMesh)
+    {
+        Some(a) => a,
+        None => return,
+    };
     let model = match Model::from_bytes(mesh_asset.bytes) {
         Ok(m) => m,
         Err(_) => return,
@@ -724,7 +1043,7 @@ fn draw_player(
     let local_tick = elapsed_vblanks.saturating_sub(anim_start_tick);
     let phase = anim.phase_at_tick_q12(local_tick, video_hz);
 
-    let origin = WorldVertex::new(x, y, z);
+    let origin = floor_anchored_model_origin(x, y, z, model_record.world_height);
     let instance_rotation = yaw_rotation_matrix(yaw);
 
     let _ = world.submit_textured_model(
@@ -800,8 +1119,7 @@ fn build_room_materials(
         if slot >= MAX_ROOM_MATERIALS {
             continue;
         }
-        let Some(asset) =
-            find_asset_of_kind(ASSETS, material.texture_asset, AssetKind::Texture)
+        let Some(asset) = find_asset_of_kind(ASSETS, material.texture_asset, AssetKind::Texture)
         else {
             continue;
         };
@@ -840,9 +1158,10 @@ fn room_center_world(room: &LevelRoomRecord, dims: RoomDims) -> [i32; 3] {
 
 /// Walk every `LIGHTS` record for `room_index` and accumulate
 /// `(R, G, B)` brightness contributions at `world_center`. Each
-/// channel returned is in 0..=255 — neutral light produces
-/// 128 (matching `tint_rgb`'s neutral value); bright lights
-/// can saturate to 255.
+/// channel returned is in 0..=ROOM_LIGHT_MAX_Q8 — neutral light
+/// produces 128 (matching `tint_rgb`'s neutral value); bright
+/// lights get a little headroom without crushing authored textures
+/// to white.
 fn accumulate_room_light(world_center: [i32; 3], room_index: u16) -> (u32, u32, u32) {
     // Start at neutral 128 so an unlit room is not pitch black.
     let mut accum: [u32; 3] = [128, 128, 128];
@@ -873,9 +1192,9 @@ fn accumulate_room_light(world_center: [i32; 3], room_index: u16) -> (u32, u32, 
         }
     }
     (
-        accum[0].min(255),
-        accum[1].min(255),
-        accum[2].min(255),
+        accum[0].min(ROOM_LIGHT_MAX_Q8),
+        accum[1].min(ROOM_LIGHT_MAX_Q8),
+        accum[2].min(ROOM_LIGHT_MAX_Q8),
     )
 }
 
@@ -947,35 +1266,56 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
     }
 
     let texture = Texture::from_bytes(asset_bytes).ok()?;
+    if texture.clut_entries() != 16 {
+        return None;
+    }
 
     // Capacity check before we touch any VRAM state.
     let count = unsafe { VRAM_SLOT_COUNT };
+    let room_count = unsafe { ROOM_TEXTURE_COUNT };
     if count >= MAX_RESIDENT_VRAM_ASSETS {
         return None;
     }
 
-    // Pick the next CLUT row and tpage stride offset, then
-    // upload pixels + CLUT.
-    let clut_y = CLUT_BASE_Y - count as u16;
-    let tpage_x = SHARED_TPAGE.x() + unsafe { TPAGE_X_CURSOR };
+    // Pick a full 4bpp tpage page per room material. v1 world UVs
+    // are page-relative and always start at u=0, so page isolation is
+    // the material selector; the CLUT only selects the palette.
+    let room_index = u16::try_from(room_count).ok()?;
+    let tpage_x = SHARED_TPAGE
+        .x()
+        .checked_add(room_index.checked_mul(ROOM_TPAGE_STRIDE_HW)?)?;
+    let end_x = tpage_x.checked_add(texture.halfwords_per_row())?;
+    if end_x > ROOM_TPAGE_LIMIT_X {
+        return None;
+    }
+    let clut_x = ROOM_CLUT_BASE_X.checked_add(room_index.checked_mul(ROOM_CLUT_STRIDE)?)?;
+    if clut_x.checked_add(texture.clut_entries())? > 1024 {
+        return None;
+    }
+    let tpage = Tpage::new(tpage_x, SHARED_TPAGE.y(), TexDepth::Bit4);
 
-    let pix_rect = VramRect::new(tpage_x, SHARED_TPAGE.y(), texture.halfwords_per_row(), texture.height());
+    let pix_rect = VramRect::new(
+        tpage_x,
+        SHARED_TPAGE.y(),
+        texture.halfwords_per_row(),
+        texture.height(),
+    );
     upload_bytes(pix_rect, texture.pixel_bytes());
 
-    let clut_rect = VramRect::new(0, clut_y, texture.clut_entries(), 1);
+    let clut_rect = VramRect::new(clut_x, ROOM_CLUT_Y, texture.clut_entries(), 1);
     upload_clut(clut_rect, texture.clut_bytes());
 
-    let clut = Clut::new(0, clut_y);
+    let clut = Clut::new(clut_x, ROOM_CLUT_Y);
     let slot = VramSlot {
         asset: asset_id,
         clut_word: clut.uv_clut_word(),
-        tpage_word: TPAGE_WORD,
+        tpage_word: tpage.uv_tpage_word(0),
     };
 
     unsafe {
         VRAM_SLOTS[count] = Some(slot);
         VRAM_SLOT_COUNT = count + 1;
-        TPAGE_X_CURSOR += texture.halfwords_per_row();
+        ROOM_TEXTURE_COUNT = room_count + 1;
         // Mirror VRAM into the residency tracker. mark_vram_resident
         // returns false if it overflows; we already reserved a
         // slot so this should always succeed.
@@ -1071,14 +1411,11 @@ fn draw_model_instances(
             Some(m) => m,
             None => continue,
         };
-        let mesh_asset = match find_asset_of_kind(
-            ASSETS,
-            model_record.mesh_asset,
-            AssetKind::ModelMesh,
-        ) {
-            Some(a) => a,
-            None => continue,
-        };
+        let mesh_asset =
+            match find_asset_of_kind(ASSETS, model_record.mesh_asset, AssetKind::ModelMesh) {
+                Some(a) => a,
+                None => continue,
+            };
         let model = match Model::from_bytes(mesh_asset.bytes) {
             Ok(m) => m,
             Err(_) => continue,
@@ -1121,9 +1458,11 @@ fn draw_model_instances(
         }
         let global = (model_record.clip_first + clip_local) as usize;
         let clip_record = &MODEL_CLIPS[global];
-        let Some(anim_asset) =
-            find_asset_of_kind(ASSETS, clip_record.animation_asset, AssetKind::ModelAnimation)
-        else {
+        let Some(anim_asset) = find_asset_of_kind(
+            ASSETS,
+            clip_record.animation_asset,
+            AssetKind::ModelAnimation,
+        ) else {
             continue;
         };
         let Ok(anim) = Animation::from_bytes(anim_asset.bytes) else {
@@ -1131,8 +1470,9 @@ fn draw_model_instances(
         };
         let phase = anim.phase_at_tick_q12(elapsed_vblanks, video_hz);
 
-        // Origin: room-local instance position.
-        let origin = WorldVertex::new(inst.x, inst.y, inst.z);
+        // Authored instance positions are floor anchors; cooked
+        // model vertices are centred around their bounds.
+        let origin = floor_anchored_model_origin(inst.x, inst.y, inst.z, model_record.world_height);
         // Instance Y-axis rotation from authored yaw. PSX angle
         // units (4096 per turn) → Q12 sin/cos via the existing
         // GTE shim, then composed into a rotation matrix.
@@ -1165,12 +1505,20 @@ fn yaw_rotation_matrix(yaw: u16) -> Mat3I16 {
     let s = sin_1_3_12(yaw);
     let c = cos_1_3_12(yaw);
     Mat3I16 {
-        m: [
-            [c, 0, s],
-            [0, 0x1000, 0],
-            [-s, 0, c],
-        ],
+        m: [[c, 0, s], [0, 0x1000, 0], [-s, 0, c]],
     }
+}
+
+fn floor_anchored_model_origin(x: i32, y: i32, z: i32, world_height: u16) -> WorldVertex {
+    WorldVertex::new(
+        x,
+        y.saturating_add(model_origin_floor_lift(world_height)),
+        z,
+    )
+}
+
+fn model_origin_floor_lift(world_height: u16) -> i32 {
+    (world_height as i32) / 2
 }
 
 /// Draw one tinted cube per generated entity record. Cubes
@@ -1192,11 +1540,7 @@ fn draw_entity_markers(
     // dedicated marker texture. Tint override picks up the
     // existing CLUT + tpage but recolours.
     let base = materials[0];
-    let material = TextureMaterial::opaque(
-        material_clut_word(base),
-        material_tpage_word(base),
-        MARKER_TINT,
-    );
+    let material = TextureMaterial::opaque(base.clut_word(), base.tpage_word(), MARKER_TINT);
     let opts = options.with_material_layer(material);
     const UVS: [(u8, u8); 4] = [(0, 0), (64, 0), (64, 64), (0, 64)];
 
@@ -1251,26 +1595,42 @@ fn draw_entity_markers(
     }
 }
 
-/// Extract a `TextureMaterial`'s CLUT word for re-tinting.
-/// `TextureMaterial`'s fields are private, so we reconstruct
-/// via a helper that round-trips through the public API.
-fn material_clut_word(_m: TextureMaterial) -> u16 {
-    // The marker reuses material[0]'s CLUT/tpage. We don't have
-    // a public getter, so the cleanest workaround is to use the
-    // first uploaded slot's CLUT word from VRAM_SLOTS, which is
-    // stable across the program's lifetime. Marker code only
-    // runs after `init` has populated at least one slot.
-    unsafe {
-        VRAM_SLOTS
-            .iter()
-            .find_map(|s| *s)
-            .map(|s| s.clut_word)
-            .unwrap_or(0)
-    }
+fn draw_analog_required_prompt(font: &FontAtlas) {
+    const BOX_X0: i16 = 32;
+    const BOX_Y0: i16 = (SCREEN_H - 64) / 2;
+    const BOX_X1: i16 = 288;
+    const BOX_Y1: i16 = BOX_Y0 + 64;
+    draw_quad_flat(
+        [
+            (BOX_X0, BOX_Y0),
+            (BOX_X1, BOX_Y0),
+            (BOX_X0, BOX_Y1),
+            (BOX_X1, BOX_Y1),
+        ],
+        18,
+        20,
+        28,
+    );
+    draw_quad_flat(
+        [
+            (BOX_X0 - 2, BOX_Y0 - 2),
+            (BOX_X1 + 2, BOX_Y0 - 2),
+            (BOX_X0 - 2, BOX_Y0),
+            (BOX_X1 + 2, BOX_Y0),
+        ],
+        120,
+        130,
+        160,
+    );
+    draw_centered_text(font, 104, "ANALOG MODE REQUIRED", (245, 245, 255));
+    draw_centered_text(font, 121, "TURN ON ANALOG MODE", (200, 220, 245));
+    draw_centered_text(font, 134, "TO START PLAYTEST", (200, 220, 245));
 }
 
-fn material_tpage_word(_m: TextureMaterial) -> u16 {
-    TPAGE_WORD
+fn draw_centered_text(font: &FontAtlas, y: i16, text: &str, tint: (u8, u8, u8)) {
+    let width = font.text_width(text) as i16;
+    let x = (SCREEN_W - width) / 2;
+    font.draw_text(x, y, text, tint);
 }
 
 #[no_mangle]

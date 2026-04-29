@@ -48,7 +48,10 @@ fn main() {
 /// first-use order while iterating sectors `[x * depth + z]`,
 /// so the starter (floor first, walls second) yields exactly
 /// that order. Pin it.
-fn assert_slot_ordering(project: &ProjectDocument, cooked: &psxed_project::world_cook::CookedWorldGrid) {
+fn assert_slot_ordering(
+    project: &ProjectDocument,
+    cooked: &psxed_project::world_cook::CookedWorldGrid,
+) {
     assert_eq!(
         cooked.materials.len(),
         2,

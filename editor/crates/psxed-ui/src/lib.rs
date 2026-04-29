@@ -6628,22 +6628,34 @@ fn auto_assign_character_clips(
     clips: &[String],
 ) {
     let lower: Vec<String> = clips.iter().map(|c| c.to_ascii_lowercase()).collect();
-    let find = |needle: &str| -> Option<u16> {
+    let find_exact = |needles: &[&str]| -> Option<u16> {
         lower
             .iter()
-            .position(|name| name.contains(needle))
+            .position(|name| needles.iter().any(|needle| name == needle))
             .map(|i| i as u16)
     };
-    if let Some(i) = find("idle") {
+    let find_contains = |needle: &str, reject: &[&str]| -> Option<u16> {
+        lower
+            .iter()
+            .position(|name| {
+                name.contains(needle) && !reject.iter().any(|blocked| name.contains(blocked))
+            })
+            .map(|i| i as u16)
+    };
+
+    if let Some(i) = find_exact(&["idle"]).or_else(|| find_contains("idle", &[])) {
         character.idle_clip = Some(i);
     }
-    if let Some(i) = find("walk") {
+    if let Some(i) = find_exact(&["walking", "walk", "walk_forward", "forward_walk"])
+        .or_else(|| find_contains("walk", &["back", "backward", "unsteady"]))
+        .or_else(|| find_contains("walk", &[]))
+    {
         character.walk_clip = Some(i);
     }
-    if let Some(i) = find("run") {
+    if let Some(i) = find_exact(&["running", "run"]).or_else(|| find_contains("run", &[])) {
         character.run_clip = Some(i);
     }
-    if let Some(i) = find("turn") {
+    if let Some(i) = find_exact(&["turn", "turning"]).or_else(|| find_contains("turn", &[])) {
         character.turn_clip = Some(i);
     }
 }

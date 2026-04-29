@@ -38,6 +38,8 @@ impl ButtonState {
 
     /// Bit layout (same as the PSX wire format for easy mapping):
     /// - 0: SELECT
+    /// - 1: L3
+    /// - 2: R3
     /// - 3: START
     /// - 4: D-pad Up
     /// - 5: D-pad Right
@@ -75,6 +77,10 @@ impl ButtonState {
 pub mod button {
     /// SELECT.
     pub const SELECT: u16 = 1 << 0;
+    /// Left stick click (DualShock L3).
+    pub const L3: u16 = 1 << 1;
+    /// Right stick click (DualShock R3).
+    pub const R3: u16 = 1 << 2;
     /// START.
     pub const START: u16 = 1 << 3;
     /// D-pad up.
@@ -269,6 +275,14 @@ impl PortDevice {
     /// through the SIO protocol loop.
     pub fn pad_mut(&mut self) -> Option<&mut DigitalPad> {
         self.pad.as_mut()
+    }
+
+    /// Simulate pressing the physical DualShock Analog button.
+    /// Returns `true` when the mode changed.
+    pub fn press_analog_button(&mut self) -> bool {
+        self.pad
+            .as_mut()
+            .is_some_and(DigitalPad::press_analog_button)
     }
 
     /// Immutable access to the attached memory card, if any. The
@@ -545,6 +559,23 @@ impl DigitalPad {
     /// directly (they infer it from the ID byte in the poll).
     pub fn mode(&self) -> PadMode {
         self.mode
+    }
+
+    /// Simulate the physical DualShock Analog button. Real pads only
+    /// let this toggle Digital/Analog while not in config mode and not
+    /// locked by the game via command `0x44`.
+    ///
+    /// Returns `true` when the visible poll mode changed.
+    pub fn press_analog_button(&mut self) -> bool {
+        if self.analog_locked || self.mode == PadMode::Config {
+            return false;
+        }
+        self.mode = match self.mode {
+            PadMode::Digital => PadMode::Analog,
+            PadMode::Analog => PadMode::Digital,
+            PadMode::Config => PadMode::Config,
+        };
+        true
     }
 
     /// Set the analog-stick state. `(right_x, right_y, left_x,
@@ -1433,6 +1464,27 @@ mod tests {
             let _ = pad.exchange(0x00);
         }
         assert_eq!(pad.mode(), PadMode::Analog);
+    }
+
+    #[test]
+    fn analog_button_toggles_between_digital_and_analog() {
+        let mut pad = DigitalPad::new();
+        assert_eq!(pad.mode(), PadMode::Digital);
+
+        assert!(pad.press_analog_button());
+        assert_eq!(pad.mode(), PadMode::Analog);
+
+        assert!(pad.press_analog_button());
+        assert_eq!(pad.mode(), PadMode::Digital);
+    }
+
+    #[test]
+    fn analog_button_respects_game_lock() {
+        let mut pad = DigitalPad::new();
+        pad.analog_locked = true;
+
+        assert!(!pad.press_analog_button());
+        assert_eq!(pad.mode(), PadMode::Digital);
     }
 
     #[test]

@@ -19,8 +19,7 @@ pub mod world_cook;
 /// if `editor/projects/default/` is absent at runtime. Single source
 /// of truth — edits to the on-disk file propagate to `starter()` on
 /// the next build.
-const DEFAULT_PROJECT_RON: &str =
-    include_str!("../../../projects/default/project.ron");
+const DEFAULT_PROJECT_RON: &str = include_str!("../../../projects/default/project.ron");
 
 /// Source-tree projects directory: `editor/projects/`.
 ///
@@ -952,7 +951,10 @@ impl WorldGrid {
         self.origin[0] -= shift_x as i32;
         self.origin[1] -= shift_z as i32;
         self.sectors = new_sectors;
-        ((rel_x + shift_x as i32) as u16, (rel_z + shift_z as i32) as u16)
+        (
+            (rel_x + shift_x as i32) as u16,
+            (rel_z + shift_z as i32) as u16,
+        )
     }
 
     /// Reshape the grid to `new_width × new_depth`.
@@ -1704,8 +1706,14 @@ mod tests {
         for editor in [[0.0_f32, 0.0], [1.5, -0.25], [-1.4, 1.49]] {
             let world = grid.editor_to_room_local(editor);
             let back = grid.room_local_to_editor(world);
-            assert!((back[0] - editor[0]).abs() < 1e-3, "x: {editor:?} → {back:?}");
-            assert!((back[1] - editor[1]).abs() < 1e-3, "z: {editor:?} → {back:?}");
+            assert!(
+                (back[0] - editor[0]).abs() < 1e-3,
+                "x: {editor:?} → {back:?}"
+            );
+            assert!(
+                (back[1] - editor[1]).abs() < 1e-3,
+                "z: {editor:?} → {back:?}"
+            );
         }
     }
 
@@ -1720,8 +1728,14 @@ mod tests {
         for editor in [[0.0_f32, 0.0], [2.0, -1.25], [-3.5, 1.0]] {
             let world = grid.editor_to_room_local(editor);
             let back = grid.room_local_to_editor(world);
-            assert!((back[0] - editor[0]).abs() < 1e-3, "x: {editor:?} → {back:?}");
-            assert!((back[1] - editor[1]).abs() < 1e-3, "z: {editor:?} → {back:?}");
+            assert!(
+                (back[0] - editor[0]).abs() < 1e-3,
+                "x: {editor:?} → {back:?}"
+            );
+            assert!(
+                (back[1] - editor[1]).abs() < 1e-3,
+                "z: {editor:?} → {back:?}"
+            );
         }
     }
 
@@ -2006,10 +2020,7 @@ mod tests {
 
         // Reorder b before a at the root.
         assert!(scene.move_node(b, scene.root, 0));
-        assert_eq!(
-            scene.node(scene.root).unwrap().children,
-            vec![b, a]
-        );
+        assert_eq!(scene.node(scene.root).unwrap().children, vec![b, a]);
     }
 
     #[test]

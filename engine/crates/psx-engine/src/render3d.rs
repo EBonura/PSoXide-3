@@ -1052,7 +1052,8 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
 
         let joint_count = (model.joint_count() as usize).min(joint_view_transforms.len());
         for joint in 0..joint_count {
-            joint_view_transforms[joint] = match animation.pose_looped_q12(frame_q12, joint as u16) {
+            joint_view_transforms[joint] = match animation.pose_looped_q12(frame_q12, joint as u16)
+            {
                 Some(pose) => {
                     let (rotation, translation) = textured_model_part_gte_transform(
                         camera,
@@ -1103,9 +1104,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
                 let Some(vertex) = model.vertex(global_index) else {
                     break;
                 };
-                let projected = if !vertex.is_blend()
-                    || (vertex.joint1 as usize) >= joint_count
-                {
+                let projected = if !vertex.is_blend() || (vertex.joint1 as usize) >= joint_count {
                     let proj = scene::project_vertex(vertex.position);
                     ProjectedVertex::new(proj.sx, proj.sy, proj.sz as i32)
                 } else {
@@ -1118,11 +1117,8 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
                         None => ProjectedVertex::new(0, 0, camera.projection.near_z - 1),
                     }
                 };
-                projected_vertices[local_index] = ProjectedTexturedVertex::new(
-                    projected,
-                    vertex.uv.0 as i32,
-                    vertex.uv.1 as i32,
-                );
+                projected_vertices[local_index] =
+                    ProjectedTexturedVertex::new(projected, vertex.uv.0 as i32, vertex.uv.1 as i32);
                 local_index += 1;
             }
 
@@ -1772,7 +1768,8 @@ fn textured_model_part_gte_transform(
         local_to_world.apply(pose.translation.y),
         local_to_world.apply(pose.translation.z),
     );
-    let rotated_pose_translation = rotate_translation_q12(&instance_rotation, scaled_pose_translation);
+    let rotated_pose_translation =
+        rotate_translation_q12(&instance_rotation, scaled_pose_translation);
 
     let world_translation = WorldVertex::new(
         origin.x.saturating_add(rotated_pose_translation.x),

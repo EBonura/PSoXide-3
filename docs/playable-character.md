@@ -13,12 +13,13 @@ character around an authored room.
   `character` field.
 - Runtime renders that character at the spawn, lets the user
   walk in third-person, switches idle / walk / run animations
-  based on input, rejects movement into empty cells.
+  based on input, rejects movement into empty cells, and drives a
+  collision-aware third-person camera.
 
 Out of scope (deliberately): enemies, AI, combat, jumping,
-camera collision, animation blending, keyframe editing, runtime
-streaming, portal traversal, per-face runtime lighting on
-characters, model lighting at runtime.
+animation blending, keyframe editing, runtime streaming, portal
+traversal, per-face runtime lighting on characters, model lighting
+at runtime.
 
 ## Authoring flow
 
@@ -26,7 +27,8 @@ characters, model lighting at runtime.
    inspector exposes a Model picker, four role-clip selectors
    (idle / walk / run / turn), capsule (radius, height),
    controller (walk / run / turn speed), and camera (distance,
-   height, target height) sections.
+   height, target height) sections. Camera height and target height
+   are positive upward offsets from the player root.
 2. **Pick a Model**: any `ResourceData::Model` resource is
    allowed. The clip pickers populate from the model's clip
    list once a model is bound.
@@ -125,24 +127,54 @@ Per-frame update:
 
 - D-pad LEFT / RIGHT: yaw player at `turn_speed`.
 - D-pad UP / DOWN: walk forward / back at `walk_speed`.
-- CROSS held while moving: switch to `run_speed`. If the
+- CROSS held while moving forward: switch to `run_speed` while
+  stamina is available. If the
   character has a run clip, `Run` animation; otherwise the
   walk animation plays at run speed.
+- CIRCLE pressed: start an evasive roll; CIRCLE while backing up
+  starts a shorter backstep. These expose motor flags for
+  invulnerability / recovery, while reusing existing walk/run clips
+  until authored evade clips exist.
 - SELECT: toggle a free-orbit debug camera.
+- Right stick: manual third-person camera orbit when the pad is in
+  analog mode.
+- L1: recenter the third-person camera behind the player.
+- R3: hard-lock / unlock the most central entity target in range.
+- L2 / R2: switch lock-on target left / right.
+- Soft-lock: when no hard lock is active, the camera can bias
+  toward a central target in range; strong right-stick input
+  suppresses it until the player leaves and re-enters range.
 
-Movement is rejected when the destination sector has no
-walkable floor — coarse but enough to keep the player inside
-the room until proper capsule sliding lands.
+Movement is owned by `psx_engine::CharacterMotorState`: game or AI
+code feeds abstract intent (`turn`, `walk`, `sprint`, `evade`), and
+the motor advances position / yaw / stamina / action state. Movement
+is rejected when the destination capsule sample has no walkable
+floor — coarse but enough to keep the player inside the room until
+proper capsule sliding lands. The committed Y position follows the
+sampled floor height under the player's root.
 
-Animation state: `Idle` / `Walk` / `Run`. State changes reset
-the animation phase so transitions don't pop into the middle
-of a clip.
+Animation state: `Idle` / `Walk` / `Run` / `Roll` / `Backstep`.
+State changes reset the animation phase so transitions don't pop
+into the middle of a clip.
 
-Camera: third-person follow. Camera sits at
-`(player + back) - (0, camera_height, 0)` and looks at
-`(player) - (0, camera_target_height, 0)` — the engine's Y
-axis is negative-up, so subtracting raises the focal point
-above the character's origin.
+Camera: `psx_engine::ThirdPersonCameraState` owns the follow rig.
+It starts from the Character camera defaults, placing the focus and
+camera at positive upward offsets from the player's floor/root
+position, then applies:
+
+- manual input cooldown, so right-stick orbit does not fight
+  automatic re-alignment;
+- automatic re-alignment behind the player while moving;
+- lock-on framing, where the focus is biased between the player and
+  the hard- or soft-locked target and vertical pitch is computed
+  from that focus;
+- position / focus / distance lag for rubber-band motion;
+- a fixed fan of whisker probes against `RoomCollision`, first
+  trying to rotate around blocking wall geometry, then pulling the
+  camera closer when no clear orbit exists.
+
+The implementation is PS1-shaped: no allocation, bounded ray work,
+integer math, and direct sampling against the cooked grid room.
 
 ## Validation (cook-time)
 
@@ -170,10 +202,13 @@ Warnings:
 - Multiple Character types at once (NPCs, enemies).
 - Animation blending or transition crossfades.
 - Keyframe editing inside the editor.
-- Camera collision / occlusion fades.
+- Enemy-specific lock targets. The current vertical slice uses
+  cooked `EntityRecord` markers as lock-on targets until enemies
+  have their own runtime records.
+- Occlusion fades when collision pulls the camera very close.
 - Per-face runtime character lighting (room-level Q8 ambient
   applies to room surfaces only).
-- Floor-height tracking under sloped or stepped sectors.
+- Capsule wall sliding and step-height limits.
 - Wall-slide collision response.
 - Jump / crouch / strafe actions.
 - Portal / room-to-room transitions.

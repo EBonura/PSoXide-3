@@ -186,7 +186,15 @@ fn emit_floor<const OT: usize>(
         WorldVertex::new(x0, heights[3], z1),
     ];
     submit_split_quad(
-        camera, options, CullMode::None, material, verts, FLOOR_UVS, split, triangles, world,
+        camera,
+        options,
+        CullMode::None,
+        material,
+        verts,
+        FLOOR_UVS,
+        split,
+        triangles,
+        world,
     );
 }
 
@@ -215,7 +223,15 @@ fn emit_ceiling<const OT: usize>(
         WorldVertex::new(x0, heights[3], z1),
     ];
     submit_split_quad(
-        camera, options, CullMode::None, material, verts, FLOOR_UVS, split, triangles, world,
+        camera,
+        options,
+        CullMode::None,
+        material,
+        verts,
+        FLOOR_UVS,
+        split,
+        triangles,
+        world,
     );
 }
 
@@ -263,7 +279,16 @@ fn emit_wall<const OT: usize>(
         ],
         _ => return,
     };
-    submit_quad(camera, options, CullMode::Back, material, verts, WALL_UVS, triangles, world);
+    submit_quad(
+        camera,
+        options,
+        CullMode::Back,
+        material,
+        verts,
+        WALL_UVS,
+        triangles,
+        world,
+    );
 }
 
 /// Project + submit one textured quad along the standard
@@ -308,7 +333,9 @@ fn submit_split_quad<const OT: usize>(
     if split != SPLIT_NE_SW {
         // Standard split shares the existing helper — same
         // triangulation `submit_textured_quad` always used.
-        submit_quad(camera, options, cull, material, verts, uvs, triangles, world);
+        submit_quad(
+            camera, options, cull, material, verts, uvs, triangles, world,
+        );
         return;
     }
     let Some(projected) = camera.project_world_quad(verts) else {

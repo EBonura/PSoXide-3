@@ -485,6 +485,17 @@ impl Bus {
         }
     }
 
+    /// Simulate pressing the port-1 DualShock Analog button.
+    /// Returns `true` when the pad accepted the toggle.
+    pub fn press_port1_analog_button(&mut self) -> bool {
+        self.sio0.port1_mut().press_analog_button()
+    }
+
+    /// Current port-1 pad mode, if a pad is attached.
+    pub fn port1_pad_mode(&self) -> Option<crate::pad::PadMode> {
+        self.sio0.port1().pad().map(|pad| pad.mode())
+    }
+
     /// Snapshot of the port-1 DualShock vibration-motor state:
     /// `(small_on, big_strength)` where `small_on` is a binary
     /// on/off and `big_strength` is 0..=255. Returns `(false, 0)`

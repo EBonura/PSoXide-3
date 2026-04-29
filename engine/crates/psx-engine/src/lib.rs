@@ -49,11 +49,13 @@
 
 pub mod angle;
 pub mod app;
+pub mod character_motor;
 pub mod frames;
 pub mod render;
 pub mod render3d;
 pub mod scene;
 pub mod sfx;
+pub mod third_person_camera;
 pub mod time;
 pub mod transform;
 pub mod world;
@@ -61,20 +63,28 @@ pub mod world_render;
 
 pub use angle::Angle;
 pub use app::{App, Config};
+pub use character_motor::{
+    CharacterMotorAction, CharacterMotorAnim, CharacterMotorConfig, CharacterMotorFrame,
+    CharacterMotorInput, CharacterMotorState,
+};
 pub use frames::{Frames, Ticks};
 pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
 pub use render3d::{
     compute_joint_view_transform, CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass,
     GouraudTriCommand, JointViewTransform, LocalToWorldScale, MeshRenderStats,
     ProjectedTexturedVertex, ProjectedVertex, TexturedModelRenderStats, TexturedViewVertex,
-    ViewVertex, WorldCamera, WorldProjection, WorldRenderLayer, WorldRenderPass,
-    WorldRenderStats, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    ViewVertex, WorldCamera, WorldProjection, WorldRenderLayer, WorldRenderPass, WorldRenderStats,
+    WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 // Re-export the GTE math types callers need to construct
 // arguments for `submit_textured_model` (instance rotation,
 // joint transforms) without pulling in `psx-gte` directly.
 pub use psx_gte::math::Mat3I16;
 pub use scene::{Ctx, Scene};
+pub use third_person_camera::{
+    ThirdPersonCameraConfig, ThirdPersonCameraFrame, ThirdPersonCameraInput,
+    ThirdPersonCameraState, ThirdPersonCameraTarget,
+};
 pub use time::EngineTime;
 pub use transform::{ActorTransform, Vec3World};
 pub use world::{
@@ -89,3 +99,5 @@ pub use world_render::draw_room;
 /// `is_held` don't need a direct `psx-pad` dep just for the button
 /// names.
 pub use psx_pad::button;
+/// Pad-state types re-exported for scenes that need analog stick data.
+pub use psx_pad::{AnalogSticks, PadMode, PadState};

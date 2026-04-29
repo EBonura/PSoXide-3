@@ -13,7 +13,7 @@
 //! update, replay without re-rendering, etc).
 
 use psx_gpu::framebuf::FrameBuffer;
-use psx_pad::{button, ButtonState};
+use psx_pad::{button, PadState};
 
 use crate::time::EngineTime;
 
@@ -35,11 +35,11 @@ pub struct Ctx {
     /// rendered FPS.
     pub time: EngineTime,
     /// Port-1 pad state this frame.
-    pub pad: ButtonState,
+    pub pad: PadState,
     /// Port-1 pad state last frame — used by [`Ctx::just_pressed`]
     /// to distinguish "newly pressed this frame" from "held across
     /// multiple frames".
-    pub pad_prev: ButtonState,
+    pub pad_prev: PadState,
     /// Frame buffer the scene draws into. The engine clears it
     /// before [`Scene::render`] runs, and swaps it after.
     pub fb: FrameBuffer,
@@ -49,7 +49,7 @@ impl Ctx {
     /// `true` if `button` is pressed right now (held).
     #[inline]
     pub fn is_held(&self, button: u16) -> bool {
-        self.pad.is_held(button)
+        self.pad.buttons.is_held(button)
     }
 
     /// `true` if `button` transitioned from released to pressed
@@ -58,14 +58,14 @@ impl Ctx {
     /// have to track `pad_prev` themselves.
     #[inline]
     pub fn just_pressed(&self, button: u16) -> bool {
-        self.pad.is_held(button) && !self.pad_prev.is_held(button)
+        self.pad.buttons.is_held(button) && !self.pad_prev.buttons.is_held(button)
     }
 
     /// `true` if `button` transitioned from pressed to released
     /// this frame.
     #[inline]
     pub fn just_released(&self, button: u16) -> bool {
-        !self.pad.is_held(button) && self.pad_prev.is_held(button)
+        !self.pad.buttons.is_held(button) && self.pad_prev.buttons.is_held(button)
     }
 
     /// Convenience: any D-pad direction currently held.

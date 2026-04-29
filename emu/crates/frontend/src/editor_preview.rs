@@ -988,7 +988,9 @@ struct PreviewModelInstance<'a> {
     animation: psx_asset::Animation<'a>,
     /// Atlas slot in the editor's model atlas region.
     atlas: MaterialSlot,
-    /// World position (room-local engine units).
+    /// Render origin (room-local engine units). Model placement
+    /// stays floor-anchored in `InstanceMeta`; this is lifted to
+    /// the cooked model's centre before drawing.
     origin: psx_engine::WorldVertex,
     /// Y-axis rotation matrix derived from the node's yaw.
     instance_rotation: Mat3I16,
@@ -1121,7 +1123,7 @@ fn walk_model_instances(
             model,
             animation,
             atlas: meta.atlas,
-            origin: meta.origin,
+            origin: floor_anchored_model_origin(meta.origin, meta.world_height),
             instance_rotation: meta.instance_rotation,
         });
     }
@@ -1347,6 +1349,25 @@ struct InstanceMeta {
     /// Approximate world-space height for the facing arrow's
     /// vertical extent. Lifted from `ModelResource::world_height`.
     world_height: i32,
+}
+
+fn floor_anchored_model_origin(
+    origin: psx_engine::WorldVertex,
+    world_height: i32,
+) -> psx_engine::WorldVertex {
+    psx_engine::WorldVertex::new(
+        origin.x,
+        origin.y.saturating_add(model_origin_floor_lift(world_height)),
+        origin.z,
+    )
+}
+
+fn model_origin_floor_lift(world_height: i32) -> i32 {
+    // Imported model vertices are normalized around their bounds
+    // centre, while editor placements describe the floor contact
+    // point. The model path's projected Y convention needs the
+    // render origin offset by +half height for that floor anchor.
+    world_height.max(0) / 2
 }
 
 /// Convert editor-Y rotation in degrees to PSX angle units
@@ -2508,7 +2529,8 @@ fn push_tri(
 
 #[cfg(test)]
 mod tests {
-    use super::{light_face, FaceShade, PreviewLight};
+    use super::{floor_anchored_model_origin, light_face, FaceShade, PreviewLight};
+    use psx_engine::WorldVertex;
 
     fn flat(r: u8, g: u8, b: u8) -> FaceShade {
         FaceShade::Flat(r, g, b)
@@ -2519,6 +2541,18 @@ mod tests {
             FaceShade::Flat(r, g, b) => (r, g, b),
             FaceShade::Textured { tint, .. } => tint,
         }
+    }
+
+    #[test]
+    fn floor_anchored_model_origin_offsets_by_half_world_height() {
+        let origin = floor_anchored_model_origin(WorldVertex::new(10, 0, 20), 1024);
+        assert_eq!(origin, WorldVertex::new(10, 512, 20));
+    }
+
+    #[test]
+    fn floor_anchored_model_origin_ignores_negative_height() {
+        let origin = floor_anchored_model_origin(WorldVertex::new(10, 32, 20), -128);
+        assert_eq!(origin, WorldVertex::new(10, 32, 20));
     }
 
     #[test]

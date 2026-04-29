@@ -408,11 +408,7 @@ mod tests {
         // Build a matrix with a negative off-diagonal and confirm
         // scaling preserves sign.
         let m = Mat3I16 {
-            m: [
-                [0x1000, -0x0800, 0],
-                [0, 0x1000, 0],
-                [0, 0, 0x1000],
-            ],
+            m: [[0x1000, -0x0800, 0], [0, 0x1000, 0], [0, 0, 0x1000]],
         };
         let out = scale_mat_uniform(&m, 0x0800);
         // 0x1000 × 0x0800 >> 12 = 0x0800 on the diagonal.

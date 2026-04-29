@@ -138,6 +138,12 @@ pub enum InputBinding {
     Unbound,
 }
 
+impl Default for InputBinding {
+    fn default() -> Self {
+        Self::Unbound
+    }
+}
+
 impl InputBinding {
     /// Convenience constructor for a named-key binding — keeps
     /// call-site noise down (`named("Enter")` vs
@@ -157,7 +163,7 @@ impl InputBinding {
     }
 }
 
-/// Digital-pad key bindings for a single controller port.
+/// Controller key bindings for a single port.
 ///
 /// Button naming follows the PSX convention: `cross` (X),
 /// `circle` (O), `square`, `triangle`. Those are the real button
@@ -193,6 +199,11 @@ pub struct PortBindings {
     pub start: InputBinding,
     /// Select.
     pub select: InputBinding,
+    /// DualShock Analog button. This is not part of the normal
+    /// button bitmask; it toggles whether the controller reports
+    /// Digital (`0x41`) or Analog (`0x73`) poll IDs.
+    #[serde(default)]
+    pub analog: InputBinding,
 }
 
 impl Default for PortBindings {
@@ -218,8 +229,13 @@ impl Default for PortBindings {
             r2: InputBinding::Character('3'),
             start: InputBinding::named("Enter"),
             select: InputBinding::named("Backspace"),
+            analog: default_port1_analog_binding(),
         }
     }
+}
+
+fn default_port1_analog_binding() -> InputBinding {
+    InputBinding::named("F9")
 }
 
 /// Input-related settings across all ports.
@@ -252,6 +268,7 @@ impl Default for InputSettings {
                 r2: InputBinding::Unbound,
                 start: InputBinding::Unbound,
                 select: InputBinding::Unbound,
+                analog: InputBinding::Unbound,
             },
         }
     }
@@ -458,8 +475,10 @@ impl Settings {
     /// version field to the current value — as the schema evolves,
     /// this branches on `self.version` to upgrade.
     pub fn migrate(&mut self) {
-        // When SETTINGS_VERSION is bumped: match on self.version,
-        // run upgrade steps, then set version = SETTINGS_VERSION.
+        if self.version < 2 {
+            self.input.port1.analog = default_port1_analog_binding();
+            self.input.port2.analog = InputBinding::Unbound;
+        }
         self.version = SETTINGS_VERSION;
     }
 }
@@ -548,6 +567,59 @@ mod tests {
         assert_eq!(loaded.input.port1.cross, InputBinding::Character('j'));
         assert_eq!(loaded.input.port1.circle, InputBinding::named("Space"));
         assert_eq!(loaded.input.port2.start, InputBinding::Unbound);
+        assert_eq!(loaded.input.port1.analog, default_port1_analog_binding());
+    }
+
+    #[test]
+    fn older_settings_gain_analog_button_binding() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.ron");
+        std::fs::write(
+            &path,
+            "(
+                version: 1,
+                input: (
+                    port1: (
+                        up: Named(\"ArrowUp\"),
+                        down: Named(\"ArrowDown\"),
+                        left: Named(\"ArrowLeft\"),
+                        right: Named(\"ArrowRight\"),
+                        cross: Character('x'),
+                        circle: Character('c'),
+                        square: Character('z'),
+                        triangle: Character('s'),
+                        l1: Character('q'),
+                        r1: Character('e'),
+                        l2: Character('1'),
+                        r2: Character('3'),
+                        start: Named(\"Enter\"),
+                        select: Named(\"Backspace\"),
+                    ),
+                    port2: (
+                        up: Unbound,
+                        down: Unbound,
+                        left: Unbound,
+                        right: Unbound,
+                        cross: Unbound,
+                        circle: Unbound,
+                        square: Unbound,
+                        triangle: Unbound,
+                        l1: Unbound,
+                        r1: Unbound,
+                        l2: Unbound,
+                        r2: Unbound,
+                        start: Unbound,
+                        select: Unbound,
+                    ),
+                ),
+            )",
+        )
+        .unwrap();
+
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.version, crate::SETTINGS_VERSION);
+        assert_eq!(loaded.input.port1.analog, default_port1_analog_binding());
+        assert_eq!(loaded.input.port2.analog, InputBinding::Unbound);
     }
 
     #[test]

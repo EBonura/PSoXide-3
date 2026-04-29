@@ -463,16 +463,22 @@ pub fn register_cooked_model_bundle(
         });
     }
 
+    let default_clip = if clips.is_empty() {
+        None
+    } else {
+        Some(default_clip_index(&clips))
+    };
+
     let model_resource = ModelResource {
         model_path: relativise(&model_path, project_root),
         texture_path: texture_path.as_ref().map(|p| relativise(p, project_root)),
         clips,
-        // Default to clip 0 if any exist — keeps newly-registered
-        // bundles immediately playable in the inspector preview
-        // and at runtime without forcing the user to wire the
-        // pickers manually.
-        default_clip: if psxanim.is_empty() { None } else { Some(0) },
-        preview_clip: if psxanim.is_empty() { None } else { Some(0) },
+        // Prefer an authored idle clip for first preview/runtime
+        // playback. Alphabetical bundle order often puts one-shot
+        // clips like "dead" before "idle", which makes index 0 a bad
+        // default even though the clip list itself is valid.
+        default_clip,
+        preview_clip: default_clip,
         world_height: 1024,
     };
 
@@ -583,6 +589,22 @@ fn clip_name_from_path(path: &Path) -> String {
     stem.to_string()
 }
 
+fn default_clip_index(clips: &[ModelAnimationClip]) -> u16 {
+    if let Some(index) = clips
+        .iter()
+        .position(|clip| clip.name.eq_ignore_ascii_case("idle"))
+    {
+        return index as u16;
+    }
+    if let Some(index) = clips
+        .iter()
+        .position(|clip| clip.name.to_ascii_lowercase().contains("idle"))
+    {
+        return index as u16;
+    }
+    0
+}
+
 /// Convert `path` into a relative-to-project string when
 /// `project_root` is provided and `path` lives under it. Falls
 /// back to an absolute path so the editor can still find the
@@ -687,11 +709,13 @@ mod tests {
         assert!(model.model_path.ends_with("obsidian_wraith.psxmdl"));
         assert!(model.texture_path.is_some());
         assert!(!model.clips.is_empty(), "expected at least one clip");
-        // Clips are sorted by file name → first one alphabetically
-        // (idle / dead / etc) is a stable bind for the test.
+        // Clips are sorted by file name, but default/preview should
+        // prefer the idle clip instead of blindly picking slot 0.
         let mut sorted_names: Vec<&str> = model.clips.iter().map(|c| c.name.as_str()).collect();
         sorted_names.sort();
-        assert_eq!(model.default_clip, Some(0));
+        assert!(sorted_names.contains(&"idle"));
+        assert_eq!(model.default_clip, Some(3));
+        assert_eq!(model.preview_clip, Some(3));
     }
 
     #[test]

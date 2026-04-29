@@ -637,11 +637,7 @@ impl<'a, 'b> RoomCollision<'a, 'b> {
     }
 
     /// Wall record by sector-local index, collision view.
-    pub fn sector_wall(
-        self,
-        sector: SectorCollision,
-        local_index: u16,
-    ) -> Option<WallCollision> {
+    pub fn sector_wall(self, sector: SectorCollision, local_index: u16) -> Option<WallCollision> {
         self.room
             .sector_wall(sector.0, local_index)
             .map(WallCollision)

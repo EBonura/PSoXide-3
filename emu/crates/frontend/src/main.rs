@@ -38,7 +38,7 @@ use crate::gfx::Graphics;
 use crate::ui::profiler::FrameProfileSample;
 use crate::ui::{menu::MenuInput, MenuOutcome};
 
-use emulator_core::{button, spu::SAMPLE_CYCLES};
+use emulator_core::{button, pad::PadMode, spu::SAMPLE_CYCLES};
 use psoxide_settings::settings::{InputBinding, PortBindings};
 
 /// Default window size when not running fullscreen. Chosen big
@@ -195,6 +195,26 @@ impl Shell {
     }
 }
 
+fn press_port1_analog_button(state: &mut AppState) {
+    let Some(bus) = state.bus.as_mut() else {
+        state.status_message_set("No running pad to toggle");
+        return;
+    };
+
+    let changed = bus.press_port1_analog_button();
+    let mode = match bus.port1_pad_mode() {
+        Some(PadMode::Digital) => "Digital",
+        Some(PadMode::Analog) => "Analog",
+        Some(PadMode::Config) => "Config",
+        None => "No pad",
+    };
+    if changed {
+        state.status_message_set(format!("DualShock Analog button: {mode}"));
+    } else {
+        state.status_message_set(format!("DualShock Analog unchanged: {mode}"));
+    }
+}
+
 /// Map a winit logical key to a PSX digital-pad bitmask using the
 /// persisted port-1 bindings. Returns `None` for keys that aren't
 /// bound.
@@ -217,6 +237,11 @@ fn key_to_pad_button(key: &Key, bindings: &PortBindings) -> Option<u16> {
     ]
     .into_iter()
     .find_map(|(mask, binding)| binding_matches_key(binding, key).then_some(mask))
+}
+
+/// `true` when the key should act as the DualShock Analog button.
+fn key_is_analog_button(key: &Key, bindings: &PortBindings) -> bool {
+    binding_matches_key(&bindings.analog, key)
 }
 
 fn binding_matches_key(binding: &InputBinding, key: &Key) -> bool {
@@ -245,6 +270,7 @@ fn named_key_label(key: &NamedKey) -> Option<&'static str> {
         NamedKey::Space => Some("Space"),
         NamedKey::Tab => Some("Tab"),
         NamedKey::Escape => Some("Escape"),
+        NamedKey::F9 => Some("F9"),
         _ => None,
     }
 }
@@ -330,6 +356,11 @@ impl ApplicationHandler for Shell {
                             ElementState::Released => self.pad1_mask &= !mask,
                         }
                     }
+                    if state == ElementState::Pressed
+                        && key_is_analog_button(&logical_key, &self.state.settings.input.port1)
+                    {
+                        press_port1_analog_button(&mut self.state);
+                    }
                 }
                 // The Menu *does* honour OS-level key-repeat: holding
                 // down-arrow scrolls through a long Examples list one
@@ -397,6 +428,9 @@ impl ApplicationHandler for Shell {
                     // path so there's exactly one place that decides
                     // what "PS button" does based on current state.
                     input.toggle_open = true;
+                }
+                if pad_frame.analog_button {
+                    press_port1_analog_button(&mut self.state);
                 }
                 // When the Menu is open OR currently paused, the
                 // gamepad doubles as the menu navigator. D-pad /
@@ -813,6 +847,7 @@ mod tests {
             key_to_pad_button(&Key::Named(NamedKey::Backspace), &bindings),
             Some(button::SELECT)
         );
+        assert!(key_is_analog_button(&Key::Named(NamedKey::F9), &bindings));
     }
 
     #[test]

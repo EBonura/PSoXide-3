@@ -26,10 +26,10 @@
 
 extern crate psx_rt;
 
-use psx_font::{FontAtlas, fonts::BASIC};
-use psx_gpu::{self as gpu, Resolution, VideoMode, framebuf::FrameBuffer};
-use psx_pad::{ButtonState, button, poll_port1};
-use psx_spu::{self as spu, Adsr, Pitch, SpuAddr, Voice, Volume, tones};
+use psx_font::{fonts::BASIC, FontAtlas};
+use psx_gpu::{self as gpu, framebuf::FrameBuffer, Resolution, VideoMode};
+use psx_pad::{button, poll_port1, ButtonState};
+use psx_spu::{self as spu, tones, Adsr, Pitch, SpuAddr, Voice, Volume};
 use psx_vram::{Clut, TexDepth, Tpage};
 
 /// Font atlas tpage — past the 320-wide display buffers.
@@ -119,7 +119,7 @@ fn main() {
     let mut prev_pad = ButtonState::NONE;
 
     loop {
-        let pad = poll_port1();
+        let pad = poll_port1().buttons;
 
         // Compute which channels are newly pressed / newly released.
         let mut on_mask: u32 = 0;

@@ -18,9 +18,8 @@ extern crate psx_rt;
 use psx_asset::{Animation, Model, Texture};
 use psx_engine::{
     button, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange, JointViewTransform,
-    Mat3I16, OtFrame, PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex, Scene,
-    WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
-    WorldVertex,
+    Mat3I16, OtFrame, PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex, Scene, WorldCamera,
+    WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
@@ -43,33 +42,13 @@ struct ModelEntry {
 /// either character. We cook the eight clips off the obsidian glb
 /// because that's the drop with the full move list — the hooded
 /// wretch glb only ships running and walking.
+///
+/// The source export's animation names are offset from the actual
+/// tracks. Labels here describe the observed motion, not the original
+/// filename suffix.
 const SHARED_CLIPS: &[ClipEntry] = &[
     ClipEntry {
-        label: "idle",
-        blob: include_bytes!(
-            "../../../../assets/models/obsidian_wraith/obsidian_wraith_idle.psxanim"
-        ),
-    },
-    ClipEntry {
-        label: "walking",
-        blob: include_bytes!(
-            "../../../../assets/models/obsidian_wraith/obsidian_wraith_walking.psxanim"
-        ),
-    },
-    ClipEntry {
-        label: "running",
-        blob: include_bytes!(
-            "../../../../assets/models/obsidian_wraith/obsidian_wraith_running.psxanim"
-        ),
-    },
-    ClipEntry {
-        label: "unsteady_walk",
-        blob: include_bytes!(
-            "../../../../assets/models/obsidian_wraith/obsidian_wraith_unsteady_walk.psxanim"
-        ),
-    },
-    ClipEntry {
-        label: "walk_backward",
+        label: "dead",
         blob: include_bytes!(
             "../../../../assets/models/obsidian_wraith/obsidian_wraith_walk_backward_inplace.psxanim"
         ),
@@ -77,19 +56,43 @@ const SHARED_CLIPS: &[ClipEntry] = &[
     ClipEntry {
         label: "double_combo_attack",
         blob: include_bytes!(
-            "../../../../assets/models/obsidian_wraith/obsidian_wraith_double_combo_attack.psxanim"
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_walking.psxanim"
         ),
     },
     ClipEntry {
         label: "hit_reaction",
         blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_dead.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "idle",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_double_combo_attack.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "running",
+        blob: include_bytes!(
             "../../../../assets/models/obsidian_wraith/obsidian_wraith_hit_reaction.psxanim"
         ),
     },
     ClipEntry {
-        label: "dead",
+        label: "unsteady_walk",
         blob: include_bytes!(
-            "../../../../assets/models/obsidian_wraith/obsidian_wraith_dead.psxanim"
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_idle.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "walk_backward_inplace",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_running.psxanim"
+        ),
+    },
+    ClipEntry {
+        label: "walking",
+        blob: include_bytes!(
+            "../../../../assets/models/obsidian_wraith/obsidian_wraith_unsteady_walk.psxanim"
         ),
     },
 ];
@@ -114,6 +117,7 @@ const MODELS: &[ModelEntry] = &[
 ];
 
 const MAX_CLIPS: usize = 8;
+const SHOWCASE_START_CLIP: usize = 3;
 
 const SCREEN_CX: i32 = 160;
 const SCREEN_CY: i32 = 118;
@@ -234,9 +238,7 @@ impl Scene for ModelShowcase {
 
     fn render(&mut self, ctx: &mut Ctx) {
         let entry = &MODELS[self.current_model];
-        if let (Some(model), Some(animation)) =
-            (self.model, self.animations[self.current_clip])
-        {
+        if let (Some(model), Some(animation)) = (self.model, self.animations[self.current_clip]) {
             let material = TextureMaterial::opaque(
                 TEX_CLUT.uv_clut_word(),
                 TEX_TPAGE.uv_tpage_word(0),
@@ -309,9 +311,9 @@ impl ModelShowcase {
     /// frame 0.
     fn activate_model(&mut self, index: usize, now_vblanks: u32) {
         self.current_model = index;
-        self.current_clip = 0;
-        self.clip_origin_vblanks = now_vblanks;
         let entry = &MODELS[index];
+        self.current_clip = SHOWCASE_START_CLIP.min(entry.clips.len().saturating_sub(1));
+        self.clip_origin_vblanks = now_vblanks;
         self.model = Some(Model::from_bytes(entry.model).expect(entry.label));
         upload_model_texture(entry.texture);
         for slot in self.animations.iter_mut() {

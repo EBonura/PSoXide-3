@@ -32,14 +32,17 @@ static ROOM_PSXW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/room.psxw"))
 static FLOOR_BLOB: &[u8] = include_bytes!("../../../../assets/textures/floor.psxt");
 static BRICK_BLOB: &[u8] = include_bytes!("../../../../assets/textures/brick-wall.psxt");
 
-// VRAM layout copied verbatim from showcase-textured-sprite —
-// known to fit the two 64×64 4-bit textures + their CLUTs in
-// one tpage with two distinct CLUT rows.
-const SHARED_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
+// VRAM layout: each 64x64 4bpp material owns a full tpage page.
+// `draw_room`'s v1 UVs are page-relative and start at (0,0) for
+// every material, so material selection must happen via tpage word,
+// not by side-by-side packing inside one page.
+const FLOOR_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
+const BRICK_TPAGE: Tpage = Tpage::new(704, 0, TexDepth::Bit4);
 const BRICK_CLUT: Clut = Clut::new(0, 480);
 const FLOOR_CLUT: Clut = Clut::new(0, 481);
 
-const TPAGE_WORD: u16 = SHARED_TPAGE.uv_tpage_word(0);
+const FLOOR_TPAGE_WORD: u16 = FLOOR_TPAGE.uv_tpage_word(0);
+const BRICK_TPAGE_WORD: u16 = BRICK_TPAGE.uv_tpage_word(0);
 const FLOOR_CLUT_WORD: u16 = FLOOR_CLUT.uv_clut_word();
 const BRICK_CLUT_WORD: u16 = BRICK_CLUT.uv_clut_word();
 const NEUTRAL_TINT: (u8, u8, u8) = (0x80, 0x80, 0x80);
@@ -150,8 +153,8 @@ impl Scene for Showcase {
 
         if let Some(room) = self.room {
             let materials = [
-                TextureMaterial::opaque(FLOOR_CLUT_WORD, TPAGE_WORD, NEUTRAL_TINT),
-                TextureMaterial::opaque(BRICK_CLUT_WORD, TPAGE_WORD, NEUTRAL_TINT),
+                TextureMaterial::opaque(FLOOR_CLUT_WORD, FLOOR_TPAGE_WORD, NEUTRAL_TINT),
+                TextureMaterial::opaque(BRICK_CLUT_WORD, BRICK_TPAGE_WORD, NEUTRAL_TINT),
             ];
             let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE);
             draw_room(
@@ -179,27 +182,19 @@ fn main() -> ! {
     App::run(config, &mut scene);
 }
 
-/// Upload `floor.psxt` and `brick-wall.psxt` to the shared 4-bit
-/// tpage with one CLUT row each. Layout matches
-/// `showcase-textured-sprite` so future shared helpers can lift
-/// this verbatim.
+/// Upload `floor.psxt` and `brick-wall.psxt` to separate 4-bit
+/// tpages with one CLUT row each.
 fn upload_textures() {
     let floor = Texture::from_bytes(FLOOR_BLOB).expect("floor.psxt");
     let brick = Texture::from_bytes(BRICK_BLOB).expect("brick-wall.psxt");
 
-    // Slot 0 (floor) sits at u=0 inside the tpage; slot 1 (brick)
-    // sits past the floor's stride. The cooker's slot ids match
-    // these positions because `WALL_UVS` / `FLOOR_UVS` in
-    // `world_render` both start at `u=0` — i.e. each slot's
-    // CLUT word selects which 64×64 tile inside the page is read.
-    //
     // The future compact `.psxw` format will pack each material's
     // tpage / clut straight from an embedded material table and
     // remove this hand-wired mapping. See
     // `docs/world-format-roadmap.md`.
     let floor_pix_rect = VramRect::new(
-        SHARED_TPAGE.x(),
-        SHARED_TPAGE.y(),
+        FLOOR_TPAGE.x(),
+        FLOOR_TPAGE.y(),
         floor.halfwords_per_row(),
         floor.height(),
     );
@@ -208,8 +203,8 @@ fn upload_textures() {
     upload_clut(floor_clut_rect, floor.clut_bytes());
 
     let brick_pix_rect = VramRect::new(
-        SHARED_TPAGE.x() + floor.halfwords_per_row(),
-        SHARED_TPAGE.y(),
+        BRICK_TPAGE.x(),
+        BRICK_TPAGE.y(),
         brick.halfwords_per_row(),
         brick.height(),
     );

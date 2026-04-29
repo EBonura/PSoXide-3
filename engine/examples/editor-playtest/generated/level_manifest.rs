@@ -43,8 +43,8 @@ pub static CLIP_03_IDLE_BYTES: &[u8] = include_bytes!("models/model_000_obsidian
 pub static CLIP_04_RUNNING_BYTES: &[u8] = include_bytes!("models/model_000_obsidian_wraith/clip_04_running.psxanim");
 /// CLIP_05_UNSTEADY_WALK_BYTES — Obsidian Wraith / unsteady_walk
 pub static CLIP_05_UNSTEADY_WALK_BYTES: &[u8] = include_bytes!("models/model_000_obsidian_wraith/clip_05_unsteady_walk.psxanim");
-/// CLIP_06_WALK_BACKWARD_BYTES — Obsidian Wraith / walk_backward
-pub static CLIP_06_WALK_BACKWARD_BYTES: &[u8] = include_bytes!("models/model_000_obsidian_wraith/clip_06_walk_backward.psxanim");
+/// CLIP_06_WALK_BACKWARD_INPLACE_BYTES — Obsidian Wraith / walk_backward_inplace
+pub static CLIP_06_WALK_BACKWARD_INPLACE_BYTES: &[u8] = include_bytes!("models/model_000_obsidian_wraith/clip_06_walk_backward_inplace.psxanim");
 /// CLIP_07_WALKING_BYTES — Obsidian Wraith / walking
 pub static CLIP_07_WALKING_BYTES: &[u8] = include_bytes!("models/model_000_obsidian_wraith/clip_07_walking.psxanim");
 
@@ -61,7 +61,7 @@ pub static ASSETS: &[LevelAssetRecord] = &[
     LevelAssetRecord { id: AssetId(8), kind: AssetKind::ModelAnimation, bytes: CLIP_03_IDLE_BYTES, ram_bytes: CLIP_03_IDLE_BYTES.len() as u32, vram_bytes: 0, flags: 0 },
     LevelAssetRecord { id: AssetId(9), kind: AssetKind::ModelAnimation, bytes: CLIP_04_RUNNING_BYTES, ram_bytes: CLIP_04_RUNNING_BYTES.len() as u32, vram_bytes: 0, flags: 0 },
     LevelAssetRecord { id: AssetId(10), kind: AssetKind::ModelAnimation, bytes: CLIP_05_UNSTEADY_WALK_BYTES, ram_bytes: CLIP_05_UNSTEADY_WALK_BYTES.len() as u32, vram_bytes: 0, flags: 0 },
-    LevelAssetRecord { id: AssetId(11), kind: AssetKind::ModelAnimation, bytes: CLIP_06_WALK_BACKWARD_BYTES, ram_bytes: CLIP_06_WALK_BACKWARD_BYTES.len() as u32, vram_bytes: 0, flags: 0 },
+    LevelAssetRecord { id: AssetId(11), kind: AssetKind::ModelAnimation, bytes: CLIP_06_WALK_BACKWARD_INPLACE_BYTES, ram_bytes: CLIP_06_WALK_BACKWARD_INPLACE_BYTES.len() as u32, vram_bytes: 0, flags: 0 },
     LevelAssetRecord { id: AssetId(12), kind: AssetKind::ModelAnimation, bytes: CLIP_07_WALKING_BYTES, ram_bytes: CLIP_07_WALKING_BYTES.len() as u32, vram_bytes: 0, flags: 0 },
 ];
 
@@ -73,7 +73,7 @@ pub static MATERIALS: &[LevelMaterialRecord] = &[
 
 /// Rooms with material-slice metadata.
 pub static ROOMS: &[LevelRoomRecord] = &[
-    LevelRoomRecord { name: "Stone Room", world_asset: AssetId(0), origin_x: 0, origin_z: 0, sector_size: 1024, material_first: 0, material_count: 2, flags: 0 },
+    LevelRoomRecord { name: "Stone Room", world_asset: AssetId(0), origin_x: -1, origin_z: -3, sector_size: 1024, material_first: 0, material_count: 2, flags: 0 },
 ];
 
 /// Room 0 required RAM assets.
@@ -87,7 +87,7 @@ pub static ROOM_RESIDENCY: &[RoomResidencyRecord] = &[
 ];
 
 /// Player spawn.
-pub static PLAYER_SPAWN: PlayerSpawnRecord = PlayerSpawnRecord { room: 0, x: 512, y: 0, z: 716, yaw: 0, flags: 1 };
+pub static PLAYER_SPAWN: PlayerSpawnRecord = PlayerSpawnRecord { room: 0, x: 2095, y: 0, z: 2355, yaw: 0, flags: 1 };
 
 /// Per-model clip records, ordered (model, clip).
 pub static MODEL_CLIPS: &[LevelModelClipRecord] = &[
@@ -97,7 +97,7 @@ pub static MODEL_CLIPS: &[LevelModelClipRecord] = &[
     LevelModelClipRecord { model: 0, name: "idle", animation_asset: AssetId(8) },
     LevelModelClipRecord { model: 0, name: "running", animation_asset: AssetId(9) },
     LevelModelClipRecord { model: 0, name: "unsteady_walk", animation_asset: AssetId(10) },
-    LevelModelClipRecord { model: 0, name: "walk_backward", animation_asset: AssetId(11) },
+    LevelModelClipRecord { model: 0, name: "walk_backward_inplace", animation_asset: AssetId(11) },
     LevelModelClipRecord { model: 0, name: "walking", animation_asset: AssetId(12) },
 ];
 
@@ -108,12 +108,12 @@ pub static MODELS: &[LevelModelRecord] = &[
 
 /// Placed model instances, room-local coordinates.
 pub static MODEL_INSTANCES: &[LevelModelInstanceRecord] = &[
-    LevelModelInstanceRecord { room: 0, model: 0, clip: 65535, x: 1536, y: 0, z: 1536, yaw: 0, flags: 0 },
+    LevelModelInstanceRecord { room: 0, model: 0, clip: 65535, x: 2572, y: 0, z: 1696, yaw: 0, flags: 0 },
 ];
 
 /// Placed point lights, room-local coordinates.
 pub static LIGHTS: &[PointLightRecord] = &[
-    PointLightRecord { room: 0, x: 2560, y: 0, z: 2406, radius: 4096, intensity_q8: 256, color: [255, 236, 198], flags: 0 },
+    PointLightRecord { room: 0, x: 3072, y: 0, z: 4454, radius: 4096, intensity_q8: 256, color: [255, 236, 198], flags: 0 },
 ];
 
 /// Cooked Character resources — gameplay metadata layered on top of MODELS.
@@ -122,7 +122,7 @@ pub static CHARACTERS: &[LevelCharacterRecord] = &[
 ];
 
 /// Player controller — spawn + Character that drives the player.
-pub static PLAYER_CONTROLLER: Option<PlayerControllerRecord> = Some(PlayerControllerRecord { spawn: PlayerSpawnRecord { room: 0, x: 512, y: 0, z: 716, yaw: 0, flags: 1 }, character: 0, flags: 0 });
+pub static PLAYER_CONTROLLER: Option<PlayerControllerRecord> = Some(PlayerControllerRecord { spawn: PlayerSpawnRecord { room: 0, x: 2095, y: 0, z: 2355, yaw: 0, flags: 1 }, character: 0, flags: 0 });
 
 /// Entity markers (legacy MeshInstance with no Model resource).
 pub static ENTITIES: &[EntityRecord] = &[

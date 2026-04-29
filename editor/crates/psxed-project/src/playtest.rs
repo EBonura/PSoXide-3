@@ -603,8 +603,8 @@ pub fn build_package(
                 tint_rgb: cooked_material.tint,
             });
         }
-        let material_count = u16::try_from(materials.len() - material_first as usize)
-            .unwrap_or(u16::MAX);
+        let material_count =
+            u16::try_from(materials.len() - material_first as usize).unwrap_or(u16::MAX);
 
         rooms.push(PlaytestRoom {
             name: room_node.name.clone(),
@@ -639,7 +639,10 @@ pub fn build_package(
             continue;
         }
         let Some((room_node, room_index)) = enclosing_room(scene, node, &node_to_room_index) else {
-            if !matches!(node.kind, NodeKind::Node | NodeKind::Node3D | NodeKind::World) {
+            if !matches!(
+                node.kind,
+                NodeKind::Node | NodeKind::Node3D | NodeKind::World
+            ) {
                 report.warn(format!(
                     "{} '{}' has no enclosing Room — dropped",
                     node.kind.label(),
@@ -770,10 +773,9 @@ pub fn build_package(
                 // to world units (engine units) at cook time so
                 // the runtime record stays in one canonical
                 // unit regardless of the room's `sector_size`.
-                let radius_world = (radius * grid.sector_size as f32)
-                    .clamp(1.0, u16::MAX as f32) as u16;
-                let intensity_q8 = (intensity * 256.0)
-                    .clamp(0.0, u16::MAX as f32) as u16;
+                let radius_world =
+                    (radius * grid.sector_size as f32).clamp(1.0, u16::MAX as f32) as u16;
+                let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u16;
                 lights.push(PlaytestLight {
                     room: room_index,
                     x: pos[0],
@@ -805,9 +807,7 @@ pub fn build_package(
 
     let spawn = match player_spawns.len() {
         0 => {
-            report.error(
-                "playtest needs exactly one SpawnPoint with `player: true` — none found",
-            );
+            report.error("playtest needs exactly one SpawnPoint with `player: true` — none found");
             None
         }
         1 => {
@@ -1003,55 +1003,51 @@ fn cook_player_character(
     let model = &models[model_index as usize];
 
     let clip_count = model.clip_count;
-    let validate_required = |role: &str, slot: Option<u16>, report: &mut PlaytestValidationReport| -> Option<u16> {
-        match slot {
-            Some(idx) if idx < clip_count => Some(idx),
-            Some(idx) => {
-                report.error(format!(
+    let validate_required =
+        |role: &str, slot: Option<u16>, report: &mut PlaytestValidationReport| -> Option<u16> {
+            match slot {
+                Some(idx) if idx < clip_count => Some(idx),
+                Some(idx) => {
+                    report.error(format!(
                     "Character '{}' {role} clip {idx} out of range ({clip_count} clips on model)",
                     resource.name
                 ));
-                None
+                    None
+                }
+                None => {
+                    report.error(format!(
+                        "Character '{}' has no {role} clip assigned",
+                        resource.name
+                    ));
+                    None
+                }
             }
-            None => {
-                report.error(format!(
-                    "Character '{}' has no {role} clip assigned",
-                    resource.name
-                ));
-                None
-            }
-        }
-    };
-    let validate_optional = |role: &str, slot: Option<u16>, report: &mut PlaytestValidationReport| -> u16 {
-        match slot {
-            Some(idx) if idx < clip_count => idx,
-            Some(idx) => {
-                report.error(format!(
+        };
+    let validate_optional =
+        |role: &str, slot: Option<u16>, report: &mut PlaytestValidationReport| -> u16 {
+            match slot {
+                Some(idx) if idx < clip_count => idx,
+                Some(idx) => {
+                    report.error(format!(
                     "Character '{}' {role} clip {idx} out of range ({clip_count} clips on model)",
                     resource.name
                 ));
-                CHARACTER_CLIP_NONE
+                    CHARACTER_CLIP_NONE
+                }
+                None => CHARACTER_CLIP_NONE,
             }
-            None => CHARACTER_CLIP_NONE,
-        }
-    };
+        };
     let idle_clip = validate_required("idle", character.idle_clip, report)?;
     let walk_clip = validate_required("walk", character.walk_clip, report)?;
     let run_clip = validate_optional("run", character.run_clip, report);
     let turn_clip = validate_optional("turn", character.turn_clip, report);
 
     if character.radius == 0 {
-        report.error(format!(
-            "Character '{}' radius must be > 0",
-            resource.name
-        ));
+        report.error(format!("Character '{}' radius must be > 0", resource.name));
         return None;
     }
     if character.height == 0 {
-        report.error(format!(
-            "Character '{}' height must be > 0",
-            resource.name
-        ));
+        report.error(format!("Character '{}' height must be > 0", resource.name));
         return None;
     }
     if character.walk_speed <= 0 {
@@ -1090,10 +1086,7 @@ fn cook_player_character(
         ));
     }
     if turn_clip == CHARACTER_CLIP_NONE {
-        report.warn(format!(
-            "Character '{}' has no turn clip",
-            resource.name
-        ));
+        report.warn(format!("Character '{}' has no turn clip", resource.name));
     }
 
     let character_index = u16::try_from(characters.len()).unwrap_or(u16::MAX);
@@ -1381,10 +1374,7 @@ fn _model_resource_re_export(_: &ModelResource) {}
 /// strips any stale `.psxw` / `.psxt` files inside them, and
 /// writes the manifest source last (so a half-failed write
 /// doesn't leave a manifest pointing at missing files).
-pub fn write_package(
-    package: &PlaytestPackage,
-    generated_dir: &Path,
-) -> std::io::Result<()> {
+pub fn write_package(package: &PlaytestPackage, generated_dir: &Path) -> std::io::Result<()> {
     let rooms_dir = generated_dir.join(ROOMS_DIRNAME);
     let textures_dir = generated_dir.join(TEXTURES_DIRNAME);
     let models_dir = generated_dir.join(MODELS_DIRNAME);
@@ -1548,12 +1538,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
                 continue;
             }
             seen_models.push(inst.model);
-            include_model_in_residency(
-                package,
-                inst.model,
-                &mut required_ram,
-                &mut required_vram,
-            );
+            include_model_in_residency(package, inst.model, &mut required_ram, &mut required_vram);
         }
         if let Some(pc) = package.player_controller {
             if pc.spawn.room == i_u16 {
@@ -1571,7 +1556,9 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         }
 
         let _ = writeln!(out, "/// Room {i} required RAM assets.");
-        out.push_str(&format!("pub static ROOM_{i}_REQUIRED_RAM: &[AssetId] = &["));
+        out.push_str(&format!(
+            "pub static ROOM_{i}_REQUIRED_RAM: &[AssetId] = &["
+        ));
         for (j, idx) in required_ram.iter().enumerate() {
             if j > 0 {
                 out.push_str(", ");
@@ -1580,7 +1567,9 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         }
         out.push_str("];\n");
         let _ = writeln!(out, "/// Room {i} required VRAM assets.");
-        out.push_str(&format!("pub static ROOM_{i}_REQUIRED_VRAM: &[AssetId] = &["));
+        out.push_str(&format!(
+            "pub static ROOM_{i}_REQUIRED_VRAM: &[AssetId] = &["
+        ));
         for (j, idx) in required_vram.iter().enumerate() {
             if j > 0 {
                 out.push_str(", ");
@@ -1897,7 +1886,10 @@ fn load_texture_bytes(resource: &Resource, project_root: &Path) -> Result<Vec<u8
         ));
     };
     if psxt_path.is_empty() {
-        return Err(format!("texture resource '{}' has empty path", resource.name));
+        return Err(format!(
+            "texture resource '{}' has empty path",
+            resource.name
+        ));
     }
     let path = if Path::new(psxt_path).is_absolute() {
         PathBuf::from(psxt_path)
@@ -2035,7 +2027,9 @@ mod tests {
             1,
             "starter ships exactly one Character (Wraith Hero)"
         );
-        let pc = package.player_controller.expect("player controller emitted");
+        let pc = package
+            .player_controller
+            .expect("player controller emitted");
         assert_eq!(pc.character, 0);
         assert_eq!(pc.spawn, package.spawn.unwrap());
         let character = &package.characters[0];
@@ -2063,10 +2057,7 @@ mod tests {
         );
         // Player character + placed instance both reference model index 0.
         assert_eq!(package.characters[0].model, 0);
-        assert!(package
-            .model_instances
-            .iter()
-            .any(|inst| inst.model == 0));
+        assert!(package.model_instances.iter().any(|inst| inst.model == 0));
     }
 
     #[test]
@@ -2108,7 +2099,9 @@ mod tests {
         );
         let atlas_token = format!(
             "AssetId({})",
-            wraith.texture_asset_index.expect("starter wraith has atlas")
+            wraith
+                .texture_asset_index
+                .expect("starter wraith has atlas")
         );
         assert!(
             manifest_contains_required(&manifest, "VRAM", 0, &atlas_token),
@@ -2231,10 +2224,7 @@ mod tests {
         let (package, report) = build_package(&project, &starter_project_root());
         let package = package.expect("auto-pick should succeed");
         assert!(package.player_controller.is_some());
-        assert!(report
-            .warnings
-            .iter()
-            .any(|w| w.contains("auto-picked")));
+        assert!(report.warnings.iter().any(|w| w.contains("auto-picked")));
     }
 
     #[test]
@@ -2255,7 +2245,10 @@ mod tests {
         }
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(package.is_none());
-        assert!(report.errors.iter().any(|e| e.contains("radius must be > 0")));
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("radius must be > 0")));
     }
 
     #[test]
@@ -2488,8 +2481,8 @@ mod tests {
         let report = cook_to_dir(&project, &starter_project_root(), &dir).expect("cook IO");
         assert!(report.is_ok(), "errors: {:?}", report.errors);
 
-        let manifest = std::fs::read_to_string(dir.join(MANIFEST_FILENAME))
-            .expect("manifest written");
+        let manifest =
+            std::fs::read_to_string(dir.join(MANIFEST_FILENAME)).expect("manifest written");
         assert!(manifest.contains("rooms/room_000.psxw"));
         assert!(manifest.contains("textures/texture_000.psxt"));
 
@@ -2698,10 +2691,7 @@ mod tests {
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(package.is_none());
         assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| e.contains("no atlas")),
+            report.errors.iter().any(|e| e.contains("no atlas")),
             "errors: {:?}",
             report.errors,
         );
@@ -2855,10 +2845,7 @@ mod tests {
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(package.is_none());
         assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| e.contains("default_clip 999")),
+            report.errors.iter().any(|e| e.contains("default_clip 999")),
             "errors: {:?}",
             report.errors,
         );
@@ -2896,19 +2883,15 @@ mod tests {
         for resource in project.resources.iter_mut() {
             if let ResourceData::Texture { psxt_path } = &mut resource.data {
                 if psxt_path.ends_with("brick-wall.psxt") {
-                    *psxt_path =
-                        "assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt"
-                            .to_string();
+                    *psxt_path = "assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt"
+                        .to_string();
                 }
             }
         }
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(package.is_none());
         assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| e.contains("must be 4bpp")),
+            report.errors.iter().any(|e| e.contains("must be 4bpp")),
             "errors: {:?}",
             report.errors,
         );
@@ -2928,10 +2911,7 @@ mod tests {
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(package.is_none());
         assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| e.contains("must be 8bpp")),
+            report.errors.iter().any(|e| e.contains("must be 8bpp")),
             "errors: {:?}",
             report.errors,
         );

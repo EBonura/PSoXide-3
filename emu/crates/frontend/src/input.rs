@@ -54,6 +54,11 @@
 //! with their own "Select + Start = [special action]" handlers
 //! would also see the combination and fire the in-game action the
 //! moment the menu opens.
+//!
+//! The DualShock Analog button is routed separately from the
+//! standard button mask because PS1 software does not see it as a
+//! normal held button. It toggles the controller's Digital/Analog
+//! response mode instead.
 
 use emulator_core::button;
 use gilrs::{Axis, Button, Event, EventType, GamepadId, Gilrs};
@@ -118,6 +123,11 @@ pub struct InputFrame {
     /// Escape goes through.
     pub toggle_menu: bool,
 
+    /// Rising-edge of the host pad's Analog/Mode button. The shell
+    /// turns this into a DualShock mode toggle rather than a normal
+    /// PSX button press.
+    pub analog_button: bool,
+
     /// Menu-navigation edges: `true` the frame a direction just
     /// became held on any pad. Single-press semantics so holding
     /// the D-pad doesn't spam nav events (cf. keyboard's OS-level
@@ -159,6 +169,8 @@ pub struct InputRouter {
     /// Previous frame's merged mask — used for rising-edge
     /// detection on both the chord and the menu-nav buttons.
     prev_mask: u16,
+    /// Previous frame's host Analog/Mode button state.
+    prev_analog_button: bool,
     /// Hotplug notices generated during startup before the first
     /// frame could display them.
     pending_notices: Vec<InputNotice>,
@@ -223,6 +235,7 @@ impl InputRouter {
             gilrs,
             pads,
             prev_mask: 0,
+            prev_analog_button: false,
             pending_notices,
         }
     }
@@ -275,6 +288,7 @@ impl InputRouter {
         //    multiple pads contribute to port 1's digital mask.
         let mut mask: u16 = 0;
         let mut first_sticks: Option<((f32, f32), (f32, f32))> = None;
+        let mut analog_down = false;
 
         // Iterate through our *own* tracked set instead of
         // `gilrs.gamepads()` — deterministic order across frames
@@ -286,6 +300,7 @@ impl InputRouter {
                 continue;
             }
             mask |= sample_pad(&gp);
+            analog_down |= gp.is_pressed(Button::Mode);
             if first_sticks.is_none() {
                 first_sticks = Some((
                     (gp.value(Axis::LeftStickX), gp.value(Axis::LeftStickY)),
@@ -302,6 +317,7 @@ impl InputRouter {
         let chord_active = (mask & CHORD_MASK) == CHORD_MASK;
         let chord_was_active = (self.prev_mask & CHORD_MASK) == CHORD_MASK;
         let toggle_menu = chord_active && !chord_was_active;
+        let analog_button = analog_down && !self.prev_analog_button;
 
         // 4. Build the frame.
         //    Menu-nav edges are derived from the raw merged mask
@@ -319,6 +335,7 @@ impl InputRouter {
                 mask
             },
             toggle_menu,
+            analog_button,
             menu_up: (edge & button::UP) != 0,
             menu_down: (edge & button::DOWN) != 0,
             menu_left: (edge & button::LEFT) != 0,
@@ -335,6 +352,7 @@ impl InputRouter {
         //    value would make the chord re-fire every frame it
         //    stayed held.
         self.prev_mask = mask;
+        self.prev_analog_button = analog_down;
 
         frame
     }
@@ -397,6 +415,12 @@ fn sample_pad(gp: &gilrs::Gamepad<'_>) -> u16 {
     }
     if gp.is_pressed(Button::RightTrigger2) || gp.value(Axis::RightZ) > TRIGGER_THRESHOLD {
         mask |= button::R2;
+    }
+    if gp.is_pressed(Button::LeftThumb) {
+        mask |= button::L3;
+    }
+    if gp.is_pressed(Button::RightThumb) {
+        mask |= button::R3;
     }
 
     // D-pad.

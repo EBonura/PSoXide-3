@@ -34,7 +34,7 @@
 
 use psx_gpu::framebuf::FrameBuffer;
 use psx_gpu::{self as gpu, Resolution, VideoMode};
-use psx_pad::{poll_port1, ButtonState};
+use psx_pad::{poll_port1, PadState};
 
 use crate::scene::{Ctx, Scene};
 use crate::time::{EngineClock, EngineTime};
@@ -120,8 +120,8 @@ impl App {
         let mut ctx = Ctx {
             frame: 0,
             time: EngineTime::start(config.video_hz()),
-            pad: ButtonState::NONE,
-            pad_prev: ButtonState::NONE,
+            pad: PadState::NONE,
+            pad_prev: PadState::NONE,
             fb,
         };
 
