@@ -104,3 +104,60 @@ tabs later, and an immediate emulator preview loop.
 5. Let the user add nodes and edit names/transforms/material assignments.
 6. Save/load the editor project as RON under the app config tree.
 7. Add scene cooking after the material/world render path is stable.
+
+## Entity selection + 3D move
+
+Every entity-kind scene node (model instances, spawn points, lights,
+triggers, portals, audio sources, legacy mesh markers) carries a
+world-space AABB the user can click to select and drag to move.
+
+### Selection priority
+
+3D-viewport clicks resolve in this order:
+
+1. **Entity bound** — `EditorWorkspace::pick_entity_bound` ray-tests
+   the active room's collected `EntityBounds` and returns the nearest
+   hit. A successful hit promotes that node to `selected_node`.
+2. **Grid primitive** — `pick_face_with_hit` falls through to face /
+   edge / vertex picking on the room geometry under the same ray.
+3. **Empty space** — clears the selection.
+
+This priority lets the user click directly on a light marker even
+when it sits over a floor cell.
+
+### Bound generation
+
+`collect_entity_bounds(room_filter)` walks the active scene and emits
+one `EntityBounds` per entity-kind node. Each bound carries:
+
+- **`kind`** — selects the wireframe colour and whether a facing arrow
+  is drawn (models / spawn points have a yaw arrow; lights / audio /
+  portals don't).
+- **`center` + `half_extents`** — world-space AABB. Sizes are
+  per-kind heuristics (`entity_bound_kind_and_size` in psxed-ui):
+  models use the parsed model bounds when available; spawns / lights /
+  triggers / portals / audio fall back to fixed marker boxes sized to
+  remain pickable without blocking grid clicks underneath.
+- **`yaw_degrees`** — copy of the node's authored Y rotation, retained
+  so the renderer can draw a facing arrow without re-walking the tree.
+
+The picker filters by `room_filter` so a click in the active room
+can't pick an entity from a neighbouring room. Bound rendering uses
+the same filter for visual / picking consistency.
+
+### Drag
+
+`begin_node_drag` snapshots the entity's start translation and locks
+the drag plane to its current world Y. `update_node_drag` re-casts
+the cursor onto that plane each frame and writes
+`start + (world_delta / sector_size)` back into the node's
+translation, so 1 cursor-sector ≈ 1 editor-space sector. Undo is
+lazy — the first non-zero delta pushes one snapshot, so a click that
+doesn't move doesn't churn the undo stack.
+
+### 2D parity
+
+The 2D viewport selects by clicking a marker; both 2D and 3D paths
+write to the same `selected_node` field and mutate
+`transform.translation` directly, so a node moved in either viewport
+is immediately reflected in the other.

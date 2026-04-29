@@ -38,8 +38,9 @@ use psx_engine::{
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_gte::transform::{cos_1_3_12, sin_1_3_12};
 use psx_level::{
-    find_asset_of_kind, AssetId, AssetKind, EntityRecord, LevelMaterialRecord, LevelRoomRecord,
-    ResidencyManager, MODEL_CLIP_INHERIT,
+    find_asset_of_kind, AssetId, AssetKind, EntityRecord, LevelCharacterRecord,
+    LevelMaterialRecord, LevelRoomRecord, ResidencyManager, CHARACTER_CLIP_NONE,
+    MODEL_CLIP_INHERIT,
 };
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
@@ -51,8 +52,8 @@ mod generated {
 }
 
 use generated::{
-    ASSETS, ENTITIES, LIGHTS, MATERIALS, MODELS, MODEL_CLIPS, MODEL_INSTANCES, PLAYER_SPAWN,
-    ROOMS, ROOM_RESIDENCY,
+    ASSETS, CHARACTERS, ENTITIES, LIGHTS, MATERIALS, MODELS, MODEL_CLIPS, MODEL_INSTANCES,
+    PLAYER_CONTROLLER, PLAYER_SPAWN, ROOMS, ROOM_RESIDENCY,
 };
 
 // VRAM layout. Room materials and model atlases live in
@@ -95,10 +96,17 @@ const CAMERA_START_YAW: u16 = 220;
 const CAMERA_YAW_STEP: u16 = 12;
 
 const HALF_TURN_Q12: u16 = 2048;
-const FOLLOW_RADIUS: i32 = 1400;
-const FOLLOW_HEIGHT: i32 = 700;
-const PLAYER_SPEED: i32 = 32;
-const PLAYER_YAW_STEP: u16 = 32;
+/// Fallback follow camera params used when no PLAYER_CONTROLLER
+/// was authored — matches the prior debug behaviour.
+const FOLLOW_RADIUS_DEFAULT: i32 = 1400;
+const FOLLOW_HEIGHT_DEFAULT: i32 = 700;
+const FOLLOW_TARGET_HEIGHT_DEFAULT: i32 = 0;
+/// Quanta-per-frame turn rate when the runtime can't resolve a
+/// Character (no PLAYER_CONTROLLER). Mirrors the pre-character
+/// debug value.
+const FALLBACK_PLAYER_YAW_STEP: u16 = 32;
+const FALLBACK_PLAYER_SPEED: i32 = 32;
+const RUN_BUTTON: u16 = button::CROSS;
 
 const OT_DEPTH: usize = 64;
 const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 1);
@@ -191,11 +199,98 @@ static mut MODEL_TPAGE_X_CURSOR: u16 = 0;
 /// CLUT row.
 static mut MODEL_ATLAS_COUNT: usize = 0;
 
+/// Animation state machine for the player. Idle / Walk / Run
+/// — turn is folded into Idle with a yaw input, per the spec
+/// (turn clip is optional and only previewed if assigned).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PlayerAnim {
+    Idle,
+    Walk,
+    Run,
+}
+
+/// Runtime view of the cooked LevelCharacterRecord — the same
+/// fields, decoded into runtime-friendly types. Resolved once
+/// at init time so per-frame movement / animation / camera code
+/// doesn't keep re-resolving the manifest.
+#[derive(Copy, Clone, Debug)]
+struct RuntimeCharacter {
+    /// Index into `MODELS`.
+    model: u16,
+    idle_clip: u16,
+    walk_clip: u16,
+    /// Optional run clip — `CHARACTER_CLIP_NONE` when unset.
+    /// Runtime falls back to `walk_clip` for run input.
+    run_clip: u16,
+    /// Optional turn clip (currently unused at runtime — turn
+    /// is folded into idle with yaw input).
+    _turn_clip: u16,
+    /// Capsule radius for collision. Engine units.
+    radius: i32,
+    walk_speed: i32,
+    run_speed: i32,
+    /// Yaw rate translated from degrees/second to PSX angle
+    /// units / 60 Hz frame at init time.
+    yaw_step_q12: u16,
+    camera_distance: i32,
+    camera_height: i32,
+    camera_target_height: i32,
+}
+
+impl RuntimeCharacter {
+    /// Resolve the cooked record into the runtime's preferred
+    /// units. Yaw is converted from degrees/second to per-frame
+    /// quanta (`4096 quanta = full turn`, runtime targets 60 Hz)
+    /// up-front so the per-frame update path is just a wrapping
+    /// add.
+    const fn from_record(c: &LevelCharacterRecord) -> Self {
+        // 4096 q12 / 360 deg = 11 q12 per deg, divided by
+        // 60 Hz target ≈ 0.19 q12 per deg/frame. We approximate
+        // as `(deg * 4096) / (360 * 60)` which is exact for the
+        // 180 deg/s default (= 34 quanta/frame).
+        let yaw_step_q12 = ((c.turn_speed_degrees_per_second as u32 * 4096)
+            / (360 * 60)) as u16;
+        Self {
+            model: c.model,
+            idle_clip: c.idle_clip,
+            walk_clip: c.walk_clip,
+            run_clip: c.run_clip,
+            _turn_clip: c.turn_clip,
+            radius: c.radius as i32,
+            walk_speed: c.walk_speed,
+            run_speed: c.run_speed,
+            yaw_step_q12,
+            camera_distance: c.camera_distance,
+            camera_height: c.camera_height,
+            camera_target_height: c.camera_target_height,
+        }
+    }
+
+    /// Pick the clip index for an animation state, with the
+    /// "run falls back to walk when unassigned" rule.
+    fn clip_for(&self, anim: PlayerAnim) -> u16 {
+        match anim {
+            PlayerAnim::Idle => self.idle_clip,
+            PlayerAnim::Walk => self.walk_clip,
+            PlayerAnim::Run => {
+                if self.run_clip == CHARACTER_CLIP_NONE {
+                    self.walk_clip
+                } else {
+                    self.run_clip
+                }
+            }
+        }
+    }
+}
+
 struct Playtest {
     /// Active room. `None` until `init` runs and only `Some`
     /// when the manifest had at least one room and its bytes
     /// parsed.
     room: Option<RuntimeRoom<'static>>,
+    /// Index in ROOMS the player is currently in. Used to scope
+    /// model-instance + light queries.
+    room_index: u16,
     /// Active room's material table, ordered by `local_slot`.
     /// Indexed directly by the slot value the cooked `.psxw`
     /// stores per face.
@@ -208,6 +303,17 @@ struct Playtest {
     player_y: i32,
     player_z: i32,
     player_yaw: u16,
+    /// Resolved Character driving the player — `None` when no
+    /// `PLAYER_CONTROLLER` was authored. Falls back to the
+    /// pre-character debug controls in that case.
+    character: Option<RuntimeCharacter>,
+    /// Current animation state. Source of truth for which clip
+    /// `draw_player` plays each frame.
+    anim_state: PlayerAnim,
+    /// Tick the current animation started at — used to phase
+    /// the loop relative to clip switches so transitions don't
+    /// pop into the middle of the new clip.
+    anim_start_tick: u32,
     /// `true` toggles a free-orbit camera around the spawn for
     /// debug inspection. Default = follow.
     free_orbit: bool,
@@ -221,12 +327,16 @@ impl Playtest {
     const fn new() -> Self {
         Self {
             room: None,
+            room_index: 0,
             materials: [const { None }; MAX_ROOM_MATERIALS],
             material_count: 0,
             player_x: 0,
             player_y: 0,
             player_z: 0,
             player_yaw: 0,
+            character: None,
+            anim_state: PlayerAnim::Idle,
+            anim_start_tick: 0,
             free_orbit: false,
             orbit_yaw: CAMERA_START_YAW,
             orbit_radius: CAMERA_START_RADIUS,
@@ -269,11 +379,26 @@ impl Scene for Playtest {
         // TextureMaterial referencing the slot's CLUT/tpage.
         self.material_count = build_room_materials(room_record, 0, &mut self.materials);
 
-        self.player_x = PLAYER_SPAWN.x;
-        self.player_y = PLAYER_SPAWN.y;
-        self.player_z = PLAYER_SPAWN.z;
-        self.player_yaw = PLAYER_SPAWN.yaw as u16;
-        self.spawn = WorldVertex::new(PLAYER_SPAWN.x, PLAYER_SPAWN.y, PLAYER_SPAWN.z);
+        // Player init: prefer PLAYER_CONTROLLER (cook output)
+        // for spawn + character; fall back to the bare
+        // PLAYER_SPAWN for placeholder manifests.
+        let (spawn, character) = match PLAYER_CONTROLLER {
+            Some(pc) => {
+                let character = CHARACTERS.get(pc.character as usize)
+                    .map(RuntimeCharacter::from_record);
+                (pc.spawn, character)
+            }
+            None => (PLAYER_SPAWN, None),
+        };
+        self.player_x = spawn.x;
+        self.player_y = spawn.y;
+        self.player_z = spawn.z;
+        self.player_yaw = spawn.yaw as u16;
+        self.spawn = WorldVertex::new(spawn.x, spawn.y, spawn.z);
+        self.character = character;
+        self.room_index = spawn.room;
+        self.anim_state = PlayerAnim::Idle;
+        self.anim_start_tick = 0;
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
@@ -295,27 +420,87 @@ impl Scene for Playtest {
                 self.orbit_radius =
                     (self.orbit_radius + CAMERA_RADIUS_STEP).min(CAMERA_RADIUS_MAX);
             }
+            return;
+        }
+
+        // Tank controls: D-pad LEFT/RIGHT yaws the player; UP
+        // walks forward, DOWN backpedals; CROSS held while
+        // moving switches to run speed (when the Character has
+        // a run clip — otherwise just runs faster on the walk
+        // clip per the spec).
+        let (yaw_step, walk_speed, run_speed) = match self.character {
+            Some(c) => (c.yaw_step_q12, c.walk_speed, c.run_speed),
+            None => (FALLBACK_PLAYER_YAW_STEP, FALLBACK_PLAYER_SPEED, FALLBACK_PLAYER_SPEED),
+        };
+        if ctx.is_held(button::RIGHT) {
+            self.player_yaw = self.player_yaw.wrapping_add(yaw_step);
+        }
+        if ctx.is_held(button::LEFT) {
+            self.player_yaw = self.player_yaw.wrapping_sub(yaw_step);
+        }
+
+        let want_run = ctx.is_held(RUN_BUTTON);
+        let speed = if want_run { run_speed } else { walk_speed };
+
+        let sin_y = sin_1_3_12(self.player_yaw) as i32;
+        let cos_y = cos_1_3_12(self.player_yaw) as i32;
+        let mut moving = false;
+        let mut dx = 0i32;
+        let mut dz = 0i32;
+        if ctx.is_held(button::UP) {
+            dx += (sin_y * speed) >> 12;
+            dz += (cos_y * speed) >> 12;
+            moving = true;
+        }
+        if ctx.is_held(button::DOWN) {
+            dx -= (sin_y * speed) >> 12;
+            dz -= (cos_y * speed) >> 12;
+            moving = true;
+        }
+
+        // Coarse collision: only commit the move if the
+        // destination sector has a walkable floor.
+        if moving {
+            let target_x = self.player_x + dx;
+            let target_z = self.player_z + dz;
+            let radius = self.character.map(|c| c.radius).unwrap_or(0);
+            if self.can_stand_at(target_x, target_z, radius) {
+                self.player_x = target_x;
+                self.player_z = target_z;
+            }
+        }
+
+        // Animation state: idle when stationary; walk for any
+        // movement (forward + back); run when CROSS is held +
+        // moving + a run clip is available. State changes reset
+        // the phase so the new clip starts from frame 0.
+        let new_state = if !moving {
+            PlayerAnim::Idle
+        } else if want_run && self.character.is_some_and(|c| c.run_clip != CHARACTER_CLIP_NONE) {
+            PlayerAnim::Run
         } else {
-            if ctx.is_held(button::RIGHT) {
-                self.player_yaw = self.player_yaw.wrapping_add(PLAYER_YAW_STEP);
-            }
-            if ctx.is_held(button::LEFT) {
-                self.player_yaw = self.player_yaw.wrapping_sub(PLAYER_YAW_STEP);
-            }
-            let sin_y = sin_1_3_12(self.player_yaw) as i32;
-            let cos_y = cos_1_3_12(self.player_yaw) as i32;
-            if ctx.is_held(button::UP) {
-                self.player_x += (sin_y * PLAYER_SPEED) >> 12;
-                self.player_z += (cos_y * PLAYER_SPEED) >> 12;
-            }
-            if ctx.is_held(button::DOWN) {
-                self.player_x -= (sin_y * PLAYER_SPEED) >> 12;
-                self.player_z -= (cos_y * PLAYER_SPEED) >> 12;
-            }
+            PlayerAnim::Walk
+        };
+        if new_state != self.anim_state {
+            self.anim_state = new_state;
+            self.anim_start_tick = ctx.time.elapsed_vblanks();
         }
     }
 
     fn render(&mut self, ctx: &mut Ctx) {
+        // Third-person follow camera: take distance / height /
+        // target-height from the character record when one's
+        // resolved; fall back to the original debug values
+        // otherwise. Camera sits behind the player (yaw + half
+        // turn) and looks at a point above the character origin.
+        let (follow_distance, follow_height, target_height) = match self.character {
+            Some(c) => (c.camera_distance, c.camera_height, c.camera_target_height),
+            None => (
+                FOLLOW_RADIUS_DEFAULT,
+                FOLLOW_HEIGHT_DEFAULT,
+                FOLLOW_TARGET_HEIGHT_DEFAULT,
+            ),
+        };
         let camera = if self.free_orbit {
             WorldCamera::orbit_yaw(
                 PROJECTION,
@@ -325,12 +510,16 @@ impl Scene for Playtest {
                 self.orbit_yaw,
             )
         } else {
-            let target = WorldVertex::new(self.player_x, self.player_y, self.player_z);
+            let target = WorldVertex::new(
+                self.player_x,
+                self.player_y - target_height,
+                self.player_z,
+            );
             WorldCamera::orbit_yaw(
                 PROJECTION,
                 target,
-                self.player_y + FOLLOW_HEIGHT,
-                FOLLOW_RADIUS,
+                self.player_y - follow_height,
+                follow_distance,
                 self.player_yaw.wrapping_add(HALF_TURN_Q12),
             )
         };
@@ -365,7 +554,7 @@ impl Scene for Playtest {
             // Currently just room 0; future passes wire room
             // switching to a level-graph traversal.
             draw_model_instances(
-                0,
+                self.room_index,
                 ctx.time.elapsed_vblanks(),
                 ctx.time.video_hz(),
                 &camera,
@@ -373,11 +562,168 @@ impl Scene for Playtest {
                 &mut triangles,
                 &mut world,
             );
+            // Player draws on top of model instances. Same
+            // `submit_textured_model` path; the scene-tree
+            // duplicate (Wraith MeshInstance at room centre)
+            // is the *placement preview* — the active player
+            // is the one driven by PLAYER_CONTROLLER and lives
+            // at the player position.
+            if let Some(character) = self.character {
+                draw_player(
+                    character,
+                    self.player_x,
+                    self.player_y,
+                    self.player_z,
+                    self.player_yaw,
+                    character.clip_for(self.anim_state),
+                    self.anim_start_tick,
+                    ctx.time.elapsed_vblanks(),
+                    ctx.time.video_hz(),
+                    &camera,
+                    options,
+                    &mut triangles,
+                    &mut world,
+                );
+            }
         }
 
         world.flush();
         ot.submit();
     }
+}
+
+impl Playtest {
+    /// Coarse "can the player stand here" check: target world
+    /// position must land inside a populated, walkable sector
+    /// of the active room. Caller passes a non-negative
+    /// `radius`; for now we sample the centre point only — the
+    /// radius is reserved for a future per-axis slide test.
+    ///
+    /// Out-of-bounds, unpopulated, or unwalkable cells are
+    /// rejected. This intentionally cannot leave the room
+    /// through a perimeter edge because the cells beyond the
+    /// grid are simply out-of-bounds.
+    fn can_stand_at(&self, world_x: i32, world_z: i32, _radius: i32) -> bool {
+        let Some(room) = self.room else {
+            return true;
+        };
+        let collision = room.collision();
+        let s = collision.sector_size();
+        if s <= 0 {
+            return false;
+        }
+        // Cooker emits array-rooted geometry — sector (sx, sz)
+        // covers world `[sx*S, (sx+1)*S)` on each axis.
+        if world_x < 0 || world_z < 0 {
+            return false;
+        }
+        let sx = (world_x / s) as i64;
+        let sz = (world_z / s) as i64;
+        if sx < 0 || sz < 0 || sx >= collision.width() as i64 || sz >= collision.depth() as i64 {
+            return false;
+        }
+        let Some(sector) = collision.sector(sx as u16, sz as u16) else {
+            return false;
+        };
+        sector.has_floor() && sector.floor_walkable()
+    }
+}
+
+/// Render the player using the same `submit_textured_model`
+/// path placed model instances use. `clip_local` is an index
+/// into the Character's model's clip slice; the cooker
+/// validates it lands in-range before we get here.
+#[allow(clippy::too_many_arguments)]
+fn draw_player(
+    character: RuntimeCharacter,
+    x: i32,
+    y: i32,
+    z: i32,
+    yaw: u16,
+    clip_local: u16,
+    anim_start_tick: u32,
+    elapsed_vblanks: u32,
+    video_hz: u16,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+) {
+    let model_record = match MODELS.get(character.model as usize) {
+        Some(m) => m,
+        None => return,
+    };
+    let mesh_asset =
+        match find_asset_of_kind(ASSETS, model_record.mesh_asset, AssetKind::ModelMesh) {
+            Some(a) => a,
+            None => return,
+        };
+    let model = match Model::from_bytes(mesh_asset.bytes) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    let atlas_slot = match model_record.texture_asset {
+        Some(id) => match find_asset_of_kind(ASSETS, id, AssetKind::Texture) {
+            Some(asset) => match ensure_model_atlas_uploaded(asset.id, asset.bytes) {
+                Some(slot) => slot,
+                None => return,
+            },
+            None => return,
+        },
+        None => return,
+    };
+    let material = TextureMaterial::opaque(
+        atlas_slot.clut_word,
+        atlas_slot.tpage_word,
+        (0x80, 0x80, 0x80),
+    );
+    let model_options = options
+        .with_depth_policy(DepthPolicy::Average)
+        .with_cull_mode(CullMode::Back)
+        .with_material_layer(material);
+
+    if clip_local >= model_record.clip_count {
+        return;
+    }
+    let global = (model_record.clip_first + clip_local) as usize;
+    let clip_record = match MODEL_CLIPS.get(global) {
+        Some(c) => c,
+        None => return,
+    };
+    let anim_asset = match find_asset_of_kind(
+        ASSETS,
+        clip_record.animation_asset,
+        AssetKind::ModelAnimation,
+    ) {
+        Some(a) => a,
+        None => return,
+    };
+    let anim = match Animation::from_bytes(anim_asset.bytes) {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    // Phase the animation relative to the clip-start tick so
+    // state changes don't pop into the middle of a new clip.
+    let local_tick = elapsed_vblanks.saturating_sub(anim_start_tick);
+    let phase = anim.phase_at_tick_q12(local_tick, video_hz);
+
+    let origin = WorldVertex::new(x, y, z);
+    let instance_rotation = yaw_rotation_matrix(yaw);
+
+    let _ = world.submit_textured_model(
+        triangles,
+        model,
+        anim,
+        phase,
+        *camera,
+        origin,
+        instance_rotation,
+        unsafe { &mut MODEL_VERTICES },
+        unsafe { &mut JOINT_VIEW_TRANSFORMS },
+        material,
+        model_options,
+    );
 }
 
 /// Walk `room.material_first..material_first + material_count`,

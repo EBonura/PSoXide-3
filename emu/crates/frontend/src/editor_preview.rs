@@ -118,6 +118,8 @@ pub fn build_phase1_cmd_log(
     hovered_primitive: Option<psxed_ui::Selection>,
     selected_primitive: Option<psxed_ui::Selection>,
     paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
+    entity_bounds: &[psxed_ui::EntityBounds],
+    hovered_entity_node: Option<psxed_project::NodeId>,
     textures: &EditorTextures,
 ) -> Vec<GpuCmdLogEntry> {
     let Some((room_id, grid, target)) = first_room_grid(project) else {
@@ -135,12 +137,13 @@ pub fn build_phase1_cmd_log(
     walk_entities(project, grid, selected, &mut scratch);
     walk_light_gizmos(project, grid, selected, &mut scratch);
 
-    // Selection / hover / paint overlays first — they project
-    // through the camera GTE matrix that `setup_gte_for_camera`
-    // installed. Models render LAST because
-    // `walk_model_instances` overwrites the GTE per joint, and
-    // anything projected after that sees the last joint matrix
-    // instead of the camera basis.
+    // Selection / hover / paint overlays drawn before models —
+    // they project through the camera GTE matrix that
+    // `setup_gte_for_camera` installed. Models render after,
+    // overwriting per-joint GTE state. We re-install the
+    // camera state below before drawing entity bounds so they
+    // pick up the same camera basis instead of the last
+    // model joint matrix.
     if let Some(selection) = selected_primitive {
         push_selection_outline(grid, selection, OutlineRole::Selected, &mut scratch);
     }
@@ -153,8 +156,6 @@ pub fn build_phase1_cmd_log(
         push_paint_preview(grid, preview, &mut scratch);
     }
 
-    // Models last — clobbers GTE state, no later pass uses
-    // camera-basis projection.
     walk_model_instances(
         project,
         project_root,
@@ -164,6 +165,12 @@ pub fn build_phase1_cmd_log(
         &world_camera,
         &mut scratch,
     );
+
+    // Re-prime the GTE with the camera matrix — model
+    // rendering left it set to the last joint's view, which
+    // would project entity bound lines into junk.
+    let _ = setup_gte_for_camera(camera, target);
+    walk_entity_bounds(entity_bounds, selected, hovered_entity_node, &mut scratch);
 
     // SAFETY: `scratch.tris` lives until end of this function (the
     // mutex guard keeps it alive); the OT chain pointers reference
@@ -1106,6 +1113,20 @@ fn walk_model_instances(
         });
     }
 
+    // Player-spawn preview: render the player's character at
+    // the spawn so level designers see where the player starts
+    // *and* what they look like. Reuses the same model render
+    // path — no separate player renderer.
+    walk_player_spawn_preview(
+        project,
+        grid,
+        _textures,
+        selected,
+        &mut buffers,
+        &mut instances_meta,
+        project_root,
+    );
+
     // Resolve parsed model + animation per instance now that
     // bytes are stable. Borrow checker happy: buffers Vec lives
     // for the rest of the function.
@@ -1143,6 +1164,149 @@ fn walk_model_instances(
     for instance in instances {
         draw_preview_model_instance(camera, tick, &instance, scratch);
     }
+}
+
+/// For every Player Spawn (`SpawnPoint { player: true, .. }`),
+/// resolve its `character` link to a Model + idle clip and emit
+/// an `InstanceMeta` at the spawn position. Reuses the same
+/// `buffers` cache the placed-model walker fills so a project
+/// where a model is *both* placed and used as the player only
+/// loads the mesh once.
+///
+/// Resolution rule mirrors the cooker:
+/// 1. Explicit `character` assignment wins.
+/// 2. If unset and exactly one Character resource exists,
+///    auto-pick it.
+/// 3. Otherwise skip the preview (the cook step's validation
+///    will surface the missing character).
+fn walk_player_spawn_preview(
+    project: &ProjectDocument,
+    grid: &WorldGrid,
+    textures: &EditorTextures,
+    selected: psxed_project::NodeId,
+    buffers: &mut Vec<(ResourceId, Vec<u8>, Vec<u8>)>,
+    instances_meta: &mut Vec<InstanceMeta>,
+    project_root: &Path,
+) {
+    let scene = project.active_scene();
+    for node in scene.nodes() {
+        if instances_meta.len() >= MAX_PREVIEW_MODEL_INSTANCES {
+            break;
+        }
+        let NodeKind::SpawnPoint {
+            player: true,
+            character,
+        } = &node.kind
+        else {
+            continue;
+        };
+        let Some(character_id) = resolve_player_spawn_character(project, *character) else {
+            continue;
+        };
+        let Some(character_resource) = project.resource(character_id) else {
+            continue;
+        };
+        let ResourceData::Character(char_resource) = &character_resource.data else {
+            continue;
+        };
+        let Some(model_id) = char_resource.model else {
+            continue;
+        };
+        let Some(model_resource) = project.resource(model_id) else {
+            continue;
+        };
+        let ResourceData::Model(model) = &model_resource.data else {
+            continue;
+        };
+        if model.texture_path.is_none() {
+            continue;
+        }
+        let Some(atlas_slot) = textures.model_atlas_slot(model_id) else {
+            continue;
+        };
+
+        // Idle clip drives the preview loop — the spec wants
+        // designers to see "what would the player be doing
+        // standing still here". Falls through to the model's
+        // preview / default clip if the Character has no idle
+        // assigned, so the surface still renders even when the
+        // Character is mid-author.
+        let clip_local = char_resource
+            .idle_clip
+            .or(model.preview_clip)
+            .or(model.default_clip)
+            .unwrap_or(0);
+        let Some(clip) = model.clips.get(clip_local as usize) else {
+            continue;
+        };
+
+        if !buffers.iter().any(|(id, _, _)| *id == model_id) {
+            let mesh_path = if std::path::Path::new(&model.model_path).is_absolute() {
+                std::path::PathBuf::from(&model.model_path)
+            } else {
+                project_root.join(&model.model_path)
+            };
+            let Ok(mesh_bytes) = std::fs::read(&mesh_path) else {
+                continue;
+            };
+            let anim_path = if std::path::Path::new(&clip.psxanim_path).is_absolute() {
+                std::path::PathBuf::from(&clip.psxanim_path)
+            } else {
+                project_root.join(&clip.psxanim_path)
+            };
+            let Ok(anim_bytes) = std::fs::read(&anim_path) else {
+                continue;
+            };
+            buffers.push((model_id, mesh_bytes, anim_bytes));
+        }
+
+        let s = grid.sector_size;
+        let pos = node.transform.translation;
+        let origin = psx_engine::WorldVertex::new(
+            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
+            (pos[1] * s as f32) as i32,
+            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
+        );
+        let yaw_q12 = yaw_to_q12(node.transform.rotation_degrees[1]);
+        let instance_rotation = yaw_rotation_q12(yaw_q12);
+
+        instances_meta.push(InstanceMeta {
+            mesh_id: model_id,
+            origin,
+            instance_rotation,
+            atlas: atlas_slot,
+            // Spawn node is selected, not the model — but the
+            // preview gizmo still helps designers see *which*
+            // spawn they have selected.
+            is_selected: node.id == selected,
+            yaw_q12,
+            world_height: model.world_height as i32,
+        });
+    }
+}
+
+/// Resolve a Player Spawn's character reference, applying the
+/// "auto-pick the only one" rule when no explicit character is
+/// set. `None` means the editor preview can't render a player
+/// model — typically because the project has zero or multiple
+/// Characters and the spawn is mid-author.
+fn resolve_player_spawn_character(
+    project: &ProjectDocument,
+    explicit: Option<ResourceId>,
+) -> Option<ResourceId> {
+    if let Some(id) = explicit {
+        return Some(id);
+    }
+    let mut found: Option<ResourceId> = None;
+    for r in &project.resources {
+        if matches!(r.data, ResourceData::Character(_)) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(r.id);
+        }
+    }
+    found
 }
 
 /// Selection gizmo for a placed model: a cyan vertical line
@@ -1424,6 +1588,156 @@ fn walk_light_gizmos(
     }
 }
 
+/// Wireframe AABB + facing arrow per selectable scene entity.
+/// Bounds are gathered by `EditorWorkspace::collect_entity_bounds`
+/// — every entity-kind node (model, spawn, light, trigger,
+/// portal, audio source, legacy mesh) carries an AABB the user
+/// can click to select and drag to move. This pass renders the
+/// box wireframe so the user can *see* what they're picking;
+/// the picker itself runs in psxed-ui and never reads from the
+/// editor preview.
+///
+/// Idle bounds draw thin and muted so they don't dominate the
+/// viewport over the room they sit in. Hover and selected reuse
+/// the room face palette for cross-tool consistency: yellow for
+/// hover, cyan-bold for selected.
+fn walk_entity_bounds(
+    bounds: &[psxed_ui::EntityBounds],
+    selected: psxed_project::NodeId,
+    hovered: Option<psxed_project::NodeId>,
+    scratch: &mut PreviewScratch,
+) {
+    for b in bounds {
+        let is_selected = b.node == selected;
+        let is_hovered = hovered == Some(b.node);
+        let style = entity_bound_style(b.kind, is_selected, is_hovered);
+        push_aabb_wireframe(scratch, b.center, b.half_extents, style);
+
+        // Yaw arrow only for kinds with meaningful facing —
+        // models and spawn points point at where they'll
+        // render / face. Lights / triggers / portals / audio
+        // are either omnidirectional or carry their own
+        // direction gizmo elsewhere (light radius ring).
+        if matches!(
+            b.kind,
+            psxed_ui::EntityBoundKind::Model
+                | psxed_ui::EntityBoundKind::SpawnPoint
+                | psxed_ui::EntityBoundKind::MeshFallback
+        ) {
+            push_facing_arrow(
+                scratch,
+                b.center,
+                b.half_extents,
+                b.yaw_degrees,
+                style,
+            );
+        }
+    }
+}
+
+/// Pick the outline style for one bound. Selected wins over
+/// hover; idle uses a muted kind-tinted thin line so multiple
+/// boxes in a busy room read at a glance without dominating.
+fn entity_bound_style(
+    kind: psxed_ui::EntityBoundKind,
+    selected: bool,
+    hovered: bool,
+) -> FaceOutlineStyle {
+    if selected {
+        return FACE_OUTLINE_SELECTED;
+    }
+    if hovered {
+        return FACE_OUTLINE_HOVER;
+    }
+    let rgb = match kind {
+        psxed_ui::EntityBoundKind::Model => (0xC0, 0xC8, 0xD0),
+        psxed_ui::EntityBoundKind::MeshFallback => (0x90, 0x98, 0xA0),
+        psxed_ui::EntityBoundKind::SpawnPoint => (0x60, 0xE0, 0x80),
+        psxed_ui::EntityBoundKind::Light => (0xFF, 0xD8, 0x70),
+        psxed_ui::EntityBoundKind::Trigger => (0xC8, 0x80, 0xE0),
+        psxed_ui::EntityBoundKind::Portal => (0xFF, 0xB0, 0x60),
+        psxed_ui::EntityBoundKind::AudioSource => (0x70, 0xD8, 0xC0),
+    };
+    FaceOutlineStyle {
+        rgb,
+        thickness_px: 1,
+    }
+}
+
+/// Project the 8 corners of a world-space AABB and emit the 12
+/// edges as `push_screen_line` segments. Coordinates are stored
+/// `f32` in the bound; rounded to `i32` here because the GTE
+/// shim wants integer world coords.
+fn push_aabb_wireframe(
+    scratch: &mut PreviewScratch,
+    center: [f32; 3],
+    half_extents: [f32; 3],
+    style: FaceOutlineStyle,
+) {
+    let cx = center[0].round() as i32;
+    let cy = center[1].round() as i32;
+    let cz = center[2].round() as i32;
+    let hx = half_extents[0].round() as i32;
+    let hy = half_extents[1].round() as i32;
+    let hz = half_extents[2].round() as i32;
+    if hx <= 0 || hy <= 0 || hz <= 0 {
+        return;
+    }
+    let lo = [cx - hx, cy - hy, cz - hz];
+    let hi = [cx + hx, cy + hy, cz + hz];
+    // Corner index encoding: bit0 = X (lo/hi), bit1 = Y, bit2 = Z.
+    let corner = |i: usize| -> [i32; 3] {
+        [
+            if i & 1 != 0 { hi[0] } else { lo[0] },
+            if i & 2 != 0 { hi[1] } else { lo[1] },
+            if i & 4 != 0 { hi[2] } else { lo[2] },
+        ]
+    };
+    let p: [_; 8] = std::array::from_fn(|i| gte_scene::project_vertex(world_to_view(corner(i))));
+    // 12 edges of a box: 4 along X, 4 along Y, 4 along Z. Pairs
+    // of corners that differ in exactly one bit.
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1), (2, 3), (4, 5), (6, 7), // along X
+        (0, 2), (1, 3), (4, 6), (5, 7), // along Y
+        (0, 4), (1, 5), (2, 6), (3, 7), // along Z
+    ];
+    for (a, b) in EDGES {
+        if p[a].sz == 0 || p[b].sz == 0 {
+            continue;
+        }
+        push_screen_line(scratch, p[a], p[b], style);
+    }
+}
+
+/// Draw a forward-pointing arrow from the bound centre out
+/// past the front face, indicating where the entity faces.
+/// Length scales with the bound's horizontal extent so big
+/// models get a visible arrow and tiny markers don't grow
+/// horns.
+fn push_facing_arrow(
+    scratch: &mut PreviewScratch,
+    center: [f32; 3],
+    half_extents: [f32; 3],
+    yaw_degrees: f32,
+    style: FaceOutlineStyle,
+) {
+    let yaw_q12 = yaw_to_q12(yaw_degrees);
+    let s = psx_gte::transform::sin_1_3_12(yaw_q12) as i32;
+    let c = psx_gte::transform::cos_1_3_12(yaw_q12) as i32;
+    // Arrow length = bound's horizontal half-extent + a small
+    // overshoot so the head sits clearly outside the box.
+    let reach = (half_extents[0].max(half_extents[2]) * 1.5).max(96.0) as i32;
+    let cx = center[0].round() as i32;
+    let cy = center[1].round() as i32;
+    let cz = center[2].round() as i32;
+    let tip = [cx + ((s * reach) >> 12), cy, cz + ((c * reach) >> 12)];
+    let p_origin = gte_scene::project_vertex(world_to_view([cx, cy, cz]));
+    let p_tip = gte_scene::project_vertex(world_to_view(tip));
+    if p_origin.sz != 0 && p_tip.sz != 0 {
+        push_screen_line(scratch, p_origin, p_tip, style);
+    }
+}
+
 /// Project a horizontal `segments`-sided polygon at world
 /// `center` with `radius` into screen space and emit one
 /// `push_screen_line` per edge. Used for light radius gizmos
@@ -1470,8 +1784,8 @@ fn synth(sx: i16, sy: i16, sz: u16) -> psx_gte::scene::Projected {
 /// transform-only nodes).
 fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
     match kind {
-        NodeKind::SpawnPoint { player: true } => Some((0x60, 0xE0, 0x80)),
-        NodeKind::SpawnPoint { player: false } => Some((0x60, 0xB8, 0xF0)),
+        NodeKind::SpawnPoint { player: true, .. } => Some((0x60, 0xE0, 0x80)),
+        NodeKind::SpawnPoint { player: false, .. } => Some((0x60, 0xB8, 0xF0)),
         NodeKind::MeshInstance { .. } => Some((0xC0, 0xC8, 0xD0)),
         NodeKind::Light { .. } => Some((0xFF, 0xD8, 0x70)),
         NodeKind::Trigger { .. } => Some((0xC8, 0x80, 0xE0)),

@@ -201,6 +201,8 @@ impl Graphics {
         hovered_primitive: Option<psxed_ui::Selection>,
         selected_primitive: Option<psxed_ui::Selection>,
         paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
+        entity_bounds: &[psxed_ui::EntityBounds],
+        hovered_entity_node: Option<psxed_project::NodeId>,
     ) {
         self.editor_textures.refresh(project, project_root);
         self.editor_textures.refresh_models(project, project_root);
@@ -212,6 +214,8 @@ impl Graphics {
             hovered_primitive,
             selected_primitive,
             paint_target_preview,
+            entity_bounds,
+            hovered_entity_node,
             &self.editor_textures,
         );
         self.editor_hw_renderer.render_frame(

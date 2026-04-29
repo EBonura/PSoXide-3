@@ -127,6 +127,23 @@ The Place tool's `ModelInstance` mode creates a
 Per-instance `animation_clip: Option<u16>` overrides the model
 default — `None` inherits.
 
+Once placed, a model instance carries a 3D selection bound the
+user can click in the viewport to select the node and drag to
+move it on the room's XZ plane. The bound's size comes from the
+parsed `Model` bounds when available, so big models get a big
+hitbox and small ones don't intercept clicks they shouldn't.
+See [`docs/editor-architecture.md`](editor-architecture.md) §
+"Entity selection + 3D move" for the picker priority and drag
+semantics.
+
+A Model can also drive a `Character` resource — the gameplay
+metadata layer that names which clips fill the idle / walk /
+run / turn roles and pins capsule + camera defaults. Once
+assigned to the Player Spawn, that Character renders at the
+spawn in the editor preview and is what the user controls
+inside editor-playtest. See
+[`docs/playable-character.md`](playable-character.md).
+
 ## How models flow into editor-playtest
 
 The playtest cook (`psxed_project::playtest::build_package`)

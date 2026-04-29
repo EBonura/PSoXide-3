@@ -1056,6 +1056,87 @@ impl ModelResource {
     }
 }
 
+/// Gameplay metadata layered on top of a Model. The Model owns
+/// the `.psxmdl` / `.psxt` / `.psxanim` artifacts; the Character
+/// names which clips fill the idle / walk / run / turn roles
+/// and pins the controller's capsule + camera defaults.
+///
+/// Authoring may leave the model unset (the resource still
+/// validates to support partial setup); a Character assigned to
+/// the player spawn must resolve to a Model with valid idle and
+/// walk clips at cook time.
+///
+/// Engine units throughout — same convention used by the rest
+/// of the runtime (`sector_size = 1024`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CharacterResource {
+    /// Backing model. `None` is allowed during authoring;
+    /// validated at cook time when assigned to the player.
+    #[serde(default)]
+    pub model: Option<ResourceId>,
+    /// Index into the model's clip list — played when the
+    /// character has no movement input. Required for the player.
+    #[serde(default)]
+    pub idle_clip: Option<u16>,
+    /// Index into the model's clip list — played while walking.
+    /// Required for the player.
+    #[serde(default)]
+    pub walk_clip: Option<u16>,
+    /// Index into the model's clip list — optional run clip.
+    #[serde(default)]
+    pub run_clip: Option<u16>,
+    /// Index into the model's clip list — optional turn clip.
+    #[serde(default)]
+    pub turn_clip: Option<u16>,
+    /// Capsule radius (engine units). Used by collision +
+    /// editor preview gizmo.
+    pub radius: u16,
+    /// Capsule height (engine units).
+    pub height: u16,
+    /// Forward walk speed in engine units per frame at 60 Hz.
+    pub walk_speed: i32,
+    /// Forward run speed in engine units per frame at 60 Hz.
+    pub run_speed: i32,
+    /// Yaw rate the controller applies when turning.
+    pub turn_speed_degrees_per_second: u16,
+    /// Distance the third-person camera trails the character.
+    pub camera_distance: i32,
+    /// Camera vertical offset above the character origin.
+    pub camera_height: i32,
+    /// Vertical offset of the camera's look-at target above
+    /// the character origin (typically slightly above the head
+    /// for a comfortable framing).
+    pub camera_target_height: i32,
+}
+
+impl CharacterResource {
+    /// Sensible defaults for a humanoid third-person character.
+    /// Sized for the starter project's 1024-unit sector grid.
+    pub const fn defaults() -> Self {
+        Self {
+            model: None,
+            idle_clip: None,
+            walk_clip: None,
+            run_clip: None,
+            turn_clip: None,
+            radius: 192,
+            height: 1024,
+            walk_speed: 48,
+            run_speed: 96,
+            turn_speed_degrees_per_second: 180,
+            camera_distance: 2048,
+            camera_height: 1024,
+            camera_target_height: 768,
+        }
+    }
+}
+
+impl Default for CharacterResource {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
 /// Resource payloads available to editor scenes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourceData {
@@ -1102,6 +1183,11 @@ pub enum ResourceData {
         /// Project-relative audio path.
         source_path: String,
     },
+    /// Gameplay character — Model + role clip mapping +
+    /// capsule/camera defaults. Layered on top of a Model
+    /// resource; the player spawn references this to resolve
+    /// what to render and how the controller behaves.
+    Character(CharacterResource),
 }
 
 impl ResourceData {
@@ -1115,6 +1201,7 @@ impl ResourceData {
             Self::Scene { .. } => "Scene",
             Self::Script { .. } => "Script",
             Self::Audio { .. } => "Audio",
+            Self::Character(_) => "Character",
         }
     }
 }
@@ -1182,6 +1269,14 @@ pub enum NodeKind {
     SpawnPoint {
         /// Whether this is the player spawn.
         player: bool,
+        /// Character resource that drives this spawn. For the
+        /// player spawn this picks the player's model + role
+        /// clips + controller params. `None` lets the cook step
+        /// auto-pick a Character when exactly one exists, or
+        /// fail with a clear error otherwise. Non-player spawns
+        /// currently ignore this field.
+        #[serde(default)]
+        character: Option<ResourceId>,
     },
     /// Trigger volume marker.
     Trigger {
@@ -1867,7 +1962,14 @@ mod tests {
                 grid: WorldGrid::empty(2, 2, 1024),
             },
         );
-        let child = scene.add_node(room, "Spawn", NodeKind::SpawnPoint { player: true });
+        let child = scene.add_node(
+            room,
+            "Spawn",
+            NodeKind::SpawnPoint {
+                player: true,
+                character: None,
+            },
+        );
 
         assert_eq!(scene.node(child).and_then(|node| node.parent), Some(room));
         assert!(scene

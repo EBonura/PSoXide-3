@@ -94,11 +94,18 @@ From a fresh clone:
 
 ## Scope
 
-This is a vertical slice. It uses `.psxw` v1, has no collision,
-no portal traversal, no CD streaming, no enemies, no AI, no
-lights, and no entity scripting. Lights / Triggers / Portals /
-AudioSources surface as warnings during cook and are skipped
-from the runtime manifest.
+This is a vertical slice. It uses `.psxw` v1, has *coarse*
+sector-walkability collision, no portal traversal, no CD
+streaming, no enemies, no AI, and no entity scripting.
+Triggers / Portals / AudioSources surface as warnings during
+cook and are skipped from the runtime manifest.
+
+The runtime renders a player character at the spawn — driven
+by the Character resource the Player Spawn references. The
+camera follows behind, and D-pad input + CROSS toggles
+idle / walk / run animations on the character's authored
+clips. See [`docs/playable-character.md`](../../../docs/playable-character.md)
+for the full Character → cook → runtime contract.
 
 What it *does* render:
 

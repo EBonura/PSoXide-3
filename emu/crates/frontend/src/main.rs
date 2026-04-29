@@ -686,6 +686,9 @@ impl ApplicationHandler for Shell {
                 let editor_hover = state.editor.hovered_primitive();
                 let editor_selection = state.editor.selected_primitive();
                 let editor_paint_preview = state.editor.paint_target_preview();
+                let editor_active_room = state.editor.active_room_id();
+                let editor_entity_bounds = state.editor.collect_entity_bounds(editor_active_room);
+                let editor_hovered_entity = state.editor.hovered_entity_node();
                 gfx.render_editor_preview(
                     state.editor.project(),
                     editor_root,
@@ -694,6 +697,8 @@ impl ApplicationHandler for Shell {
                     editor_hover,
                     editor_selection,
                     editor_paint_preview,
+                    &editor_entity_bounds,
+                    editor_hovered_entity,
                 );
 
                 let vram_tex = gfx.vram_texture_id();

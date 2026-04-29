@@ -140,6 +140,14 @@ Selected lights draw a bright yellow radius ring at floor
 level; unselected lights draw a thin ring tinted by their
 authored colour.
 
+Each Light also carries a small selectable AABB at its
+position so the user can click it in the 3D viewport and drag
+it to move. The bound is intentionally small — a wide-radius
+light's ring would otherwise intercept every click in the
+room. See
+[`docs/editor-architecture.md`](editor-architecture.md) §
+"Entity selection + 3D move".
+
 ## Runtime playtest lighting
 
 `editor-playtest` accumulates lights at the **room centre** and

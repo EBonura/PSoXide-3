@@ -265,6 +265,58 @@ pub enum PlaytestEntityKind {
     StaticMesh,
 }
 
+/// Cooked character record. Mirrors
+/// [`psx_level::LevelCharacterRecord`] one-to-one — the writer
+/// emits the static slice from this struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaytestCharacter {
+    /// Source resource id (so the writer can dedupe + cross-link).
+    pub source_resource: ResourceId,
+    /// Index into [`PlaytestPackage::models`].
+    pub model: u16,
+    /// Idle clip index *within the model's clip slice*.
+    pub idle_clip: u16,
+    /// Walk clip index within the model's clip slice.
+    pub walk_clip: u16,
+    /// Optional run clip; `u16::MAX` (= `CHARACTER_CLIP_NONE`)
+    /// means "no run clip authored".
+    pub run_clip: u16,
+    /// Optional turn clip; same sentinel as `run_clip`.
+    pub turn_clip: u16,
+    /// Capsule radius in engine units.
+    pub radius: u16,
+    /// Capsule height in engine units.
+    pub height: u16,
+    /// Walk speed (engine units / 60 Hz frame).
+    pub walk_speed: i32,
+    /// Run speed (engine units / 60 Hz frame).
+    pub run_speed: i32,
+    /// Turn speed (degrees / second).
+    pub turn_speed_degrees_per_second: u16,
+    /// Camera follow distance (engine units).
+    pub camera_distance: i32,
+    /// Camera vertical offset above the character origin.
+    pub camera_height: i32,
+    /// Vertical offset of the camera's look-at target.
+    pub camera_target_height: i32,
+}
+
+/// Cooked player-controller record. Always paired with a
+/// [`PlaytestSpawn`] in the same package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaytestPlayerController {
+    /// Resolved spawn — same data the manifest's `PLAYER_SPAWN`
+    /// carries.
+    pub spawn: PlaytestSpawn,
+    /// Character index in [`PlaytestPackage::characters`].
+    pub character: u16,
+}
+
+/// Sentinel used in [`PlaytestCharacter::run_clip`] /
+/// [`PlaytestCharacter::turn_clip`] when the role wasn't
+/// authored. Mirrors [`psx_level::CHARACTER_CLIP_NONE`].
+pub const CHARACTER_CLIP_NONE: u16 = u16::MAX;
+
 /// One non-spawn entity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaytestEntity {
@@ -310,6 +362,16 @@ pub struct PlaytestPackage {
     pub lights: Vec<PlaytestLight>,
     /// Single player spawn — required.
     pub spawn: Option<PlaytestSpawn>,
+    /// Cooked Character resources used by player / future
+    /// gameplay. Currently only the player spawn references
+    /// these, but the slice ships in the manifest unconditionally
+    /// so the runtime can table-drive any future controllers.
+    pub characters: Vec<PlaytestCharacter>,
+    /// Resolved player controller — `Some` when a player spawn
+    /// was authored *and* a Character was assigned (or
+    /// auto-picked). The runtime falls back to a debug camera
+    /// when this is `None`.
+    pub player_controller: Option<PlaytestPlayerController>,
     /// Optional entity markers (legacy, non-Model MeshInstance).
     pub entities: Vec<PlaytestEntity>,
 }
@@ -593,10 +655,10 @@ pub fn build_package(
         let yaw = yaw_from_degrees(node.transform.rotation_degrees[1]);
 
         match &node.kind {
-            NodeKind::SpawnPoint { player: true } => {
+            NodeKind::SpawnPoint { player: true, .. } => {
                 player_spawns.push((node.id, node, room_index));
             }
-            NodeKind::SpawnPoint { player: false } => {
+            NodeKind::SpawnPoint { player: false, .. } => {
                 entities.push(PlaytestEntity {
                     room: room_index,
                     kind: PlaytestEntityKind::Marker,
@@ -777,6 +839,85 @@ pub fn build_package(
         }
     };
 
+    // Pass 4: resolve the player's Character, register its
+    // model (deduped against MeshInstance-bound models above),
+    // and emit a PlaytestCharacter + PlaytestPlayerController.
+    //
+    // Character resources unrelated to the player aren't cooked
+    // in this pass — only the player slot consumes them. Once
+    // enemies / NPCs surface, the same `register_model_for_instance`
+    // dedupe path handles their backing models too.
+    let mut characters: Vec<PlaytestCharacter> = Vec::new();
+    let player_controller = match (spawn, &player_spawns[..]) {
+        (Some(spawn_record), [(_, spawn_node, _)]) => {
+            let NodeKind::SpawnPoint { character, .. } = &spawn_node.kind else {
+                report.error("internal: player spawn node kind shifted under us");
+                return (None, report);
+            };
+            // Resolution: explicit assignment > sole Character
+            // resource > error. The "exactly one" rule keeps the
+            // starter project zero-config while still flagging
+            // ambiguity in projects with multiple Characters.
+            let resolved = match character {
+                Some(id) => Some(*id),
+                None => {
+                    let candidates: Vec<ResourceId> = project
+                        .resources
+                        .iter()
+                        .filter_map(|r| match &r.data {
+                            ResourceData::Character(_) => Some(r.id),
+                            _ => None,
+                        })
+                        .collect();
+                    match candidates.len() {
+                        1 => {
+                            report.warn(format!(
+                                "Player Spawn '{}' had no Character — auto-picked the only one defined",
+                                spawn_node.name,
+                            ));
+                            Some(candidates[0])
+                        }
+                        0 => {
+                            report.error(format!(
+                                "Player Spawn '{}' has no Character assigned and no Character resources exist",
+                                spawn_node.name
+                            ));
+                            None
+                        }
+                        n => {
+                            report.error(format!(
+                                "Player Spawn '{}' has no Character assigned and {n} Characters are defined — pick one explicitly",
+                                spawn_node.name
+                            ));
+                            None
+                        }
+                    }
+                }
+            };
+            match resolved.and_then(|id| {
+                cook_player_character(
+                    project,
+                    project_root,
+                    spawn_node,
+                    id,
+                    &mut assets,
+                    &mut models,
+                    &mut model_clips,
+                    &mut model_for_resource,
+                    &mut characters,
+                    &mut report,
+                )
+            }) {
+                Some(character_index) => Some(PlaytestPlayerController {
+                    spawn: spawn_record,
+                    character: character_index,
+                }),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+
     if !report.is_ok() {
         return (None, report);
     }
@@ -791,10 +932,188 @@ pub fn build_package(
             model_instances,
             lights,
             spawn,
+            characters,
+            player_controller,
             entities,
         }),
         report,
     )
+}
+
+/// Cook one Character resource into a [`PlaytestCharacter`],
+/// registering its backing model on first sight (deduped against
+/// MeshInstance placements). Validates clip indices land inside
+/// the resolved model's clip slice; the runtime trusts the
+/// contract.
+#[allow(clippy::too_many_arguments)]
+fn cook_player_character(
+    project: &ProjectDocument,
+    project_root: &Path,
+    spawn_node: &SceneNode,
+    character_id: ResourceId,
+    assets: &mut Vec<PlaytestAsset>,
+    models: &mut Vec<PlaytestModel>,
+    model_clips: &mut Vec<PlaytestModelClip>,
+    model_for_resource: &mut std::collections::HashMap<ResourceId, u16>,
+    characters: &mut Vec<PlaytestCharacter>,
+    report: &mut PlaytestValidationReport,
+) -> Option<u16> {
+    let resource = match project.resource(character_id) {
+        Some(r) => r,
+        None => {
+            report.error(format!(
+                "Player Spawn '{}' references Character #{} which doesn't exist",
+                spawn_node.name,
+                character_id.raw()
+            ));
+            return None;
+        }
+    };
+    let character = match &resource.data {
+        ResourceData::Character(c) => c,
+        _ => {
+            report.error(format!(
+                "Player Spawn '{}' references resource '{}' which is not a Character",
+                spawn_node.name, resource.name
+            ));
+            return None;
+        }
+    };
+
+    let model_resource_id = match character.model {
+        Some(id) => id,
+        None => {
+            report.error(format!(
+                "Character '{}' has no Model assigned — required for the player",
+                resource.name
+            ));
+            return None;
+        }
+    };
+    let model_index = register_model_for_instance(
+        project,
+        project_root,
+        model_resource_id,
+        assets,
+        models,
+        model_clips,
+        model_for_resource,
+        report,
+    )?;
+    let model = &models[model_index as usize];
+
+    let clip_count = model.clip_count;
+    let validate_required = |role: &str, slot: Option<u16>, report: &mut PlaytestValidationReport| -> Option<u16> {
+        match slot {
+            Some(idx) if idx < clip_count => Some(idx),
+            Some(idx) => {
+                report.error(format!(
+                    "Character '{}' {role} clip {idx} out of range ({clip_count} clips on model)",
+                    resource.name
+                ));
+                None
+            }
+            None => {
+                report.error(format!(
+                    "Character '{}' has no {role} clip assigned",
+                    resource.name
+                ));
+                None
+            }
+        }
+    };
+    let validate_optional = |role: &str, slot: Option<u16>, report: &mut PlaytestValidationReport| -> u16 {
+        match slot {
+            Some(idx) if idx < clip_count => idx,
+            Some(idx) => {
+                report.error(format!(
+                    "Character '{}' {role} clip {idx} out of range ({clip_count} clips on model)",
+                    resource.name
+                ));
+                CHARACTER_CLIP_NONE
+            }
+            None => CHARACTER_CLIP_NONE,
+        }
+    };
+    let idle_clip = validate_required("idle", character.idle_clip, report)?;
+    let walk_clip = validate_required("walk", character.walk_clip, report)?;
+    let run_clip = validate_optional("run", character.run_clip, report);
+    let turn_clip = validate_optional("turn", character.turn_clip, report);
+
+    if character.radius == 0 {
+        report.error(format!(
+            "Character '{}' radius must be > 0",
+            resource.name
+        ));
+        return None;
+    }
+    if character.height == 0 {
+        report.error(format!(
+            "Character '{}' height must be > 0",
+            resource.name
+        ));
+        return None;
+    }
+    if character.walk_speed <= 0 {
+        report.error(format!(
+            "Character '{}' walk_speed must be > 0",
+            resource.name
+        ));
+        return None;
+    }
+    if character.turn_speed_degrees_per_second == 0 {
+        report.error(format!(
+            "Character '{}' turn_speed must be > 0",
+            resource.name
+        ));
+        return None;
+    }
+    if character.camera_distance <= 0 {
+        report.error(format!(
+            "Character '{}' camera_distance must be > 0",
+            resource.name
+        ));
+        return None;
+    }
+    if character.camera_height < 0 || character.camera_target_height < 0 {
+        report.error(format!(
+            "Character '{}' camera offsets must be >= 0",
+            resource.name
+        ));
+        return None;
+    }
+
+    if run_clip == CHARACTER_CLIP_NONE {
+        report.warn(format!(
+            "Character '{}' has no run clip — runtime will fall back to walk for run input",
+            resource.name
+        ));
+    }
+    if turn_clip == CHARACTER_CLIP_NONE {
+        report.warn(format!(
+            "Character '{}' has no turn clip",
+            resource.name
+        ));
+    }
+
+    let character_index = u16::try_from(characters.len()).unwrap_or(u16::MAX);
+    characters.push(PlaytestCharacter {
+        source_resource: character_id,
+        model: model_index,
+        idle_clip,
+        walk_clip,
+        run_clip,
+        turn_clip,
+        radius: character.radius,
+        height: character.height,
+        walk_speed: character.walk_speed,
+        run_speed: character.run_speed,
+        turn_speed_degrees_per_second: character.turn_speed_degrees_per_second,
+        camera_distance: character.camera_distance,
+        camera_height: character.camera_height,
+        camera_target_height: character.camera_target_height,
+    });
+    Some(character_index)
 }
 
 /// Register a `ResourceData::Model` into the playtest package
@@ -1353,6 +1672,53 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n\n");
 
+    out.push_str("/// Cooked Character resources — gameplay metadata layered on top of MODELS.\n");
+    out.push_str("pub static CHARACTERS: &[LevelCharacterRecord] = &[\n");
+    for character in &package.characters {
+        let clip_or_none = |slot: u16| -> String {
+            if slot == CHARACTER_CLIP_NONE {
+                "CHARACTER_CLIP_NONE".to_string()
+            } else {
+                format!("{slot}")
+            }
+        };
+        let _ = writeln!(
+            out,
+            "    LevelCharacterRecord {{ model: {}, idle_clip: {}, walk_clip: {}, run_clip: {}, turn_clip: {}, radius: {}, height: {}, walk_speed: {}, run_speed: {}, turn_speed_degrees_per_second: {}, camera_distance: {}, camera_height: {}, camera_target_height: {}, flags: 0 }},",
+            character.model,
+            character.idle_clip,
+            character.walk_clip,
+            clip_or_none(character.run_clip),
+            clip_or_none(character.turn_clip),
+            character.radius,
+            character.height,
+            character.walk_speed,
+            character.run_speed,
+            character.turn_speed_degrees_per_second,
+            character.camera_distance,
+            character.camera_height,
+            character.camera_target_height,
+        );
+    }
+    out.push_str("];\n\n");
+
+    match package.player_controller {
+        Some(pc) => {
+            let _ = writeln!(
+                out,
+                "/// Player controller — spawn + Character that drives the player.\npub static PLAYER_CONTROLLER: Option<PlayerControllerRecord> = Some(PlayerControllerRecord {{ spawn: PlayerSpawnRecord {{ room: {}, x: {}, y: {}, z: {}, yaw: {}, flags: {} }}, character: {}, flags: 0 }});",
+                pc.spawn.room, pc.spawn.x, pc.spawn.y, pc.spawn.z, pc.spawn.yaw, pc.spawn.flags, pc.character,
+            );
+        }
+        None => {
+            out.push_str(
+                "/// Player controller — `None` means no playable character was authored.\n\
+                pub static PLAYER_CONTROLLER: Option<PlayerControllerRecord> = None;\n",
+            );
+        }
+    }
+    out.push('\n');
+
     out.push_str("/// Entity markers (legacy MeshInstance with no Model resource).\n");
     out.push_str("pub static ENTITIES: &[EntityRecord] = &[\n");
     for entity in &package.entities {
@@ -1414,14 +1780,17 @@ const MANIFEST_HEADER: &str = "\
 use psx_level::{
     AssetId,
     AssetKind,
+    CHARACTER_CLIP_NONE,
     EntityKind,
     EntityRecord,
     LevelAssetRecord,
+    LevelCharacterRecord,
     LevelMaterialRecord,
     LevelModelClipRecord,
     LevelModelInstanceRecord,
     LevelModelRecord,
     LevelRoomRecord,
+    PlayerControllerRecord,
     PlayerSpawnRecord,
     PointLightRecord,
     RoomResidencyRecord,
@@ -1589,7 +1958,7 @@ mod tests {
         let has_player_spawn = scene
             .nodes()
             .iter()
-            .any(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true }));
+            .any(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true, .. }));
         assert!(has_room, "starter must contain a Room");
         assert!(has_player_spawn, "starter must contain a player SpawnPoint");
         project
@@ -1604,6 +1973,204 @@ mod tests {
         assert_eq!(package.rooms.len(), 1);
         assert_eq!(package.room_asset_count(), 1);
         assert!(package.spawn.is_some());
+    }
+
+    #[test]
+    fn starter_project_emits_player_controller_and_character() {
+        let project = project_with_one_room();
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.expect("package returned on ok report");
+        assert_eq!(
+            package.characters.len(),
+            1,
+            "starter ships exactly one Character (Wraith Hero)"
+        );
+        let pc = package.player_controller.expect("player controller emitted");
+        assert_eq!(pc.character, 0);
+        assert_eq!(pc.spawn, package.spawn.unwrap());
+        let character = &package.characters[0];
+        // Wraith model: idle at index 3, walking at index 7.
+        assert_eq!(character.idle_clip, 3);
+        assert_eq!(character.walk_clip, 7);
+        // Run is `running` clip (4); turn is unset.
+        assert_eq!(character.run_clip, 4);
+        assert_eq!(character.turn_clip, CHARACTER_CLIP_NONE);
+    }
+
+    #[test]
+    fn player_character_model_is_deduplicated_with_placed_meshinstance() {
+        // Starter includes both a Wraith MeshInstance (id 6 in
+        // the scene) and a Wraith-Hero Character resource — they
+        // share the same Model resource. The cooker must register
+        // the model once (in `models`), not twice.
+        let project = project_with_one_room();
+        let (package, _report) = build_package(&project, &starter_project_root());
+        let package = package.expect("starter cooks");
+        assert_eq!(
+            package.models.len(),
+            1,
+            "shared model should be registered once across MeshInstance + Character"
+        );
+        // Player character + placed instance both reference model index 0.
+        assert_eq!(package.characters[0].model, 0);
+        assert!(package
+            .model_instances
+            .iter()
+            .any(|inst| inst.model == 0));
+    }
+
+    #[test]
+    fn rendered_manifest_includes_characters_and_player_controller() {
+        let project = project_with_one_room();
+        let (package, _) = build_package(&project, &starter_project_root());
+        let manifest = render_manifest_source(&package.unwrap());
+        assert!(manifest.contains("pub static CHARACTERS:"));
+        assert!(manifest.contains("LevelCharacterRecord"));
+        assert!(manifest.contains("pub static PLAYER_CONTROLLER:"));
+        assert!(manifest.contains("Some(PlayerControllerRecord"));
+        assert!(manifest.contains("CHARACTER_CLIP_NONE"));
+    }
+
+    #[test]
+    fn player_spawn_with_invalid_idle_clip_fails_validation() {
+        let mut project = project_with_one_room();
+        let scene = project.active_scene();
+        let character_id = scene
+            .nodes()
+            .iter()
+            .find_map(|_| {
+                project.resources.iter().find_map(|r| match &r.data {
+                    crate::ResourceData::Character(_) => Some(r.id),
+                    _ => None,
+                })
+            })
+            .expect("starter has a Character");
+        // Bump idle clip past the model's clip count so cook
+        // validation must reject.
+        if let Some(resource) = project.resource_mut(character_id) {
+            if let crate::ResourceData::Character(c) = &mut resource.data {
+                c.idle_clip = Some(99);
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(package.is_none());
+        assert!(report.errors.iter().any(|e| e.contains("idle clip 99")));
+    }
+
+    #[test]
+    fn player_spawn_without_character_assignment_auto_picks_when_one_exists() {
+        // Starter has exactly one Character. Clear the spawn's
+        // explicit reference; cooker should auto-pick + warn.
+        let mut project = project_with_one_room();
+        let scene = project.active_scene();
+        let spawn_id = scene
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true, .. }))
+            .map(|n| n.id)
+            .expect("starter has player spawn");
+        if let Some(node) = project.active_scene_mut().node_mut(spawn_id) {
+            if let NodeKind::SpawnPoint { character, .. } = &mut node.kind {
+                *character = None;
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        let package = package.expect("auto-pick should succeed");
+        assert!(package.player_controller.is_some());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("auto-picked")));
+    }
+
+    #[test]
+    fn character_with_zero_radius_fails_validation() {
+        let mut project = project_with_one_room();
+        let character_id = project
+            .resources
+            .iter()
+            .find_map(|r| match &r.data {
+                crate::ResourceData::Character(_) => Some(r.id),
+                _ => None,
+            })
+            .expect("starter has a Character");
+        if let Some(resource) = project.resource_mut(character_id) {
+            if let crate::ResourceData::Character(c) = &mut resource.data {
+                c.radius = 0;
+            }
+        }
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(package.is_none());
+        assert!(report.errors.iter().any(|e| e.contains("radius must be > 0")));
+    }
+
+    #[test]
+    fn legacy_spawn_without_character_field_still_loads() {
+        // Older project.ron files lacked `character` on
+        // SpawnPoint. `#[serde(default)]` should fill it with
+        // `None` so they keep deserializing.
+        let ron = r#"(
+            name: "Legacy",
+            scenes: [(
+                name: "Main",
+                root: (1),
+                next_node_id: 3,
+                nodes: [
+                    (id: (1), name: "Root", kind: Node3D, transform: (translation: (0.0, 0.0, 0.0), rotation_degrees: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)), parent: None, children: [(2)]),
+                    (id: (2), name: "Spawn", kind: SpawnPoint(player: true), transform: (translation: (0.0, 0.0, 0.0), rotation_degrees: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)), parent: Some((1)), children: []),
+                ],
+            )],
+            resources: [],
+            next_resource_id: 1,
+        )"#;
+        let project = ProjectDocument::from_ron_str(ron).expect("legacy spawn deserializes");
+        let scene = project.active_scene();
+        let spawn = scene
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true, .. }))
+            .expect("spawn round-tripped");
+        if let NodeKind::SpawnPoint { character, .. } = &spawn.kind {
+            assert!(character.is_none(), "missing field should default to None");
+        }
+    }
+
+    #[test]
+    fn character_resource_roundtrips_through_ron() {
+        use crate::CharacterResource;
+        let mut project = ProjectDocument::starter();
+        let id = project.add_resource(
+            "Test Character",
+            crate::ResourceData::Character(CharacterResource {
+                model: None,
+                idle_clip: Some(0),
+                walk_clip: Some(1),
+                run_clip: None,
+                turn_clip: None,
+                radius: 200,
+                height: 1024,
+                walk_speed: 50,
+                run_speed: 100,
+                turn_speed_degrees_per_second: 240,
+                camera_distance: 1500,
+                camera_height: 800,
+                camera_target_height: 600,
+            }),
+        );
+        let serialized = project.to_ron_string().expect("serializes");
+        let reloaded = ProjectDocument::from_ron_str(&serialized).expect("deserializes");
+        let resource = reloaded.resource(id).expect("character preserved");
+        match &resource.data {
+            crate::ResourceData::Character(c) => {
+                assert_eq!(c.idle_clip, Some(0));
+                assert_eq!(c.walk_clip, Some(1));
+                assert_eq!(c.radius, 200);
+                assert_eq!(c.walk_speed, 50);
+                assert_eq!(c.camera_target_height, 600);
+            }
+            _ => panic!("character resource lost its variant after round-trip"),
+        }
     }
 
     #[test]
@@ -1699,12 +2266,15 @@ mod tests {
         let ids: Vec<NodeId> = scene
             .nodes()
             .iter()
-            .filter(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true }))
+            .filter(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true, .. }))
             .map(|n| n.id)
             .collect();
         for id in ids {
             if let Some(node) = scene.node_mut(id) {
-                node.kind = NodeKind::SpawnPoint { player: false };
+                node.kind = NodeKind::SpawnPoint {
+                    player: false,
+                    character: None,
+                };
             }
         }
         let (package, report) = build_package(&project, &starter_project_root());
@@ -1722,7 +2292,14 @@ mod tests {
             .find(|n| matches!(n.kind, NodeKind::Room { .. }))
             .map(|n| n.id)
             .expect("starter has a room");
-        scene.add_node(room_id, "Spawn 2", NodeKind::SpawnPoint { player: true });
+        scene.add_node(
+            room_id,
+            "Spawn 2",
+            NodeKind::SpawnPoint {
+                player: true,
+                character: None,
+            },
+        );
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(package.is_none());
         assert!(report.errors.iter().any(|e| e.contains("exactly one")));
@@ -2279,7 +2856,7 @@ mod tests {
             let spawn = scene
                 .nodes()
                 .iter()
-                .find(|n| matches!(n.kind, crate::NodeKind::SpawnPoint { player: true }))
+                .find(|n| matches!(n.kind, crate::NodeKind::SpawnPoint { player: true, .. }))
                 .expect("starter has a player spawn");
             (room.id, spawn.id)
         };
@@ -2326,7 +2903,10 @@ mod tests {
         let entity_id = scene.add_node(
             room_id,
             "Marker",
-            crate::NodeKind::SpawnPoint { player: false },
+            crate::NodeKind::SpawnPoint {
+                player: false,
+                character: None,
+            },
         );
         if let Some(node) = scene.node_mut(entity_id) {
             node.transform.translation = [1.0, 0.0, -1.0];

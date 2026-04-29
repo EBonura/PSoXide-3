@@ -313,6 +313,74 @@ pub struct PointLightRecord {
     pub flags: u16,
 }
 
+/// Sentinel for optional [`LevelCharacterRecord`] clip slots
+/// (`run_clip` / `turn_clip`). The runtime treats this as
+/// "no clip authored for this role" and falls back to walk /
+/// idle as appropriate.
+pub const CHARACTER_CLIP_NONE: u16 = u16::MAX;
+
+/// Gameplay character — backing model + role-clip mapping +
+/// capsule / camera / controller defaults. Layered on top of
+/// a [`LevelModelRecord`]; the player spawn references one of
+/// these via [`PlayerControllerRecord::character`] to resolve
+/// what to render and how the controller behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelCharacterRecord {
+    /// Index into [`LevelModelRecord`] this character renders
+    /// as. The cooker guarantees this resolves; runtime trusts
+    /// the contract.
+    pub model: u16,
+    /// Idle clip index *within the model's clip slice*. The
+    /// cooker rejects characters whose idle clip is out of
+    /// range — runtime never has to fall back to bind pose.
+    pub idle_clip: u16,
+    /// Walk clip index within the model's clip slice. Required
+    /// (same validation as `idle_clip`).
+    pub walk_clip: u16,
+    /// Optional run clip index. [`CHARACTER_CLIP_NONE`] means
+    /// "no run clip authored — runtime should fall back to
+    /// `walk_clip` when the controller wants to run".
+    pub run_clip: u16,
+    /// Optional turn clip index. Same sentinel as `run_clip`.
+    pub turn_clip: u16,
+    /// Capsule radius in engine units. Used by collision +
+    /// any future debug draw.
+    pub radius: u16,
+    /// Capsule height in engine units.
+    pub height: u16,
+    /// Forward walk speed (engine units per 60 Hz frame).
+    pub walk_speed: i32,
+    /// Forward run speed (engine units per 60 Hz frame).
+    pub run_speed: i32,
+    /// Yaw rate the controller applies when turning.
+    pub turn_speed_degrees_per_second: u16,
+    /// Distance the third-person camera trails the character.
+    pub camera_distance: i32,
+    /// Camera vertical offset above the character origin.
+    pub camera_height: i32,
+    /// Vertical offset of the camera's look-at target above
+    /// the character origin.
+    pub camera_target_height: i32,
+    /// Reserved.
+    pub flags: u16,
+}
+
+/// Player-controller record: which spawn the player starts at
+/// and which character drives them. Generated as a single
+/// optional record in the manifest — `Some` when a player
+/// spawn was authored, `None` for headless / preview manifests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerControllerRecord {
+    /// Resolved spawn — same struct the manifest already emits
+    /// as a top-level `PLAYER_SPAWN`. Embedded here so the
+    /// runtime can look at one record to bring up the player.
+    pub spawn: PlayerSpawnRecord,
+    /// Index into [`LevelCharacterRecord`] driving the player.
+    pub character: u16,
+    /// Reserved.
+    pub flags: u16,
+}
+
 /// Linear scan over the master asset table. `O(n)` is fine for
 /// the asset counts this pass targets (few rooms × handful of
 /// textures); a binary search lands when manifests grow.

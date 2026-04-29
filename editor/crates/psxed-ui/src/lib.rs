@@ -120,6 +120,14 @@ pub struct EditorWorkspace {
     /// `snap(pre_y + delta)` — clean snapping with no error
     /// accumulation.
     primitive_drag: Option<PrimitiveDrag>,
+    /// Hovered entity bound under the cursor (Select tool
+    /// only). Drives the entity-bounds highlight overlay and
+    /// the click→select fast path.
+    hovered_entity_node: Option<NodeId>,
+    /// Active 3D node-drag stroke. Set when the user
+    /// presses on an entity bound; updated each frame the
+    /// pointer moves while held; cleared on release.
+    node_drag: Option<NodeDrag>,
     /// What the next paint click would target. Cell variant fires
     /// for floor / ceiling / erase / place; Wall variant fires for
     /// PaintWall. World-cell coords let the preview track cells
@@ -235,6 +243,24 @@ struct PsxtStats {
     pixel_bytes: u32,
     clut_bytes: u32,
     file_bytes: u32,
+}
+
+/// Counts shown in the Cook & Play readiness status line.
+/// Built once per cook from the validated package; stays in
+/// the editor crate (not psxed-project) because the status
+/// string is editor-facing UI text.
+struct PackageSummary {
+    rooms: usize,
+    assets: usize,
+    textures: usize,
+    materials: usize,
+    models: usize,
+    characters: usize,
+    lights: usize,
+    entities: usize,
+    /// Display name of the player's resolved Character, or
+    /// `None` when no player controller was emitted.
+    player_character: Option<String>,
 }
 
 /// Per-stamp paint dedupe key. Two paint events with equal stamps
@@ -447,6 +473,218 @@ impl Selection {
     }
 }
 
+/// Kind label for an [`EntityBounds`]. Drives picking
+/// priorities and per-kind gizmo rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityBoundKind {
+    /// Model-backed `MeshInstance` with parsed model bounds.
+    Model,
+    /// Legacy / unbound `MeshInstance` — fallback box.
+    MeshFallback,
+    /// `SpawnPoint` (player or non-player).
+    SpawnPoint,
+    /// `Light`. Marker box only — radius ring is drawn
+    /// separately so a wide-radius light doesn't intercept
+    /// every click in the room.
+    Light,
+    /// `Trigger`.
+    Trigger,
+    /// `Portal`.
+    Portal,
+    /// `AudioSource`. Marker box only.
+    AudioSource,
+}
+
+/// World-space AABB for one selectable scene entity.
+/// Coordinates use the same convention everything else in
+/// the editor preview uses: `((editor.x + width/2) * S,
+/// editor.y * S, (editor.z + depth/2) * S)` for entities
+/// under a Room.
+#[derive(Debug, Clone, Copy)]
+pub struct EntityBounds {
+    /// Owning scene-tree node id.
+    pub node: NodeId,
+    /// Enclosing Room id, if any. Used to filter picking to
+    /// the active room.
+    pub room: Option<NodeId>,
+    /// Bound class for visual styling + picking priority.
+    pub kind: EntityBoundKind,
+    /// World-space AABB centre.
+    pub center: [f32; 3],
+    /// World-space half-extents along X / Y / Z. Always
+    /// positive.
+    pub half_extents: [f32; 3],
+    /// Authored Y rotation in degrees. Stored on the bound
+    /// so the renderer can draw a facing arrow without
+    /// re-walking the scene tree.
+    pub yaw_degrees: f32,
+}
+
+/// Result of a successful entity-bound pick.
+#[derive(Debug, Clone, Copy)]
+pub struct EntityBoundHit {
+    /// Hit node.
+    pub node: NodeId,
+    /// Distance from the ray origin to the first hit slab,
+    /// in world units. Used to compare against grid hits and
+    /// other entity hits.
+    pub distance: f32,
+    /// World-space hit point along the ray.
+    pub point: [f32; 3],
+    /// Bounds that produced the hit.
+    pub bounds: EntityBounds,
+}
+
+/// Slab-intersection ray-vs-AABB. Returns the smallest
+/// non-negative `t` for which `origin + t * dir` lands on
+/// the box surface (or inside it).
+///
+/// * `dir` is *not* required to be unit length; the returned
+///   `t` is in the same units as `dir`. When the editor uses
+///   normalized rays (`camera_ray_for_pointer`), `t` lands in
+///   world units.
+/// * Box must have positive `half_extents`. Zero-extent boxes
+///   never hit.
+/// * Rays starting *inside* the box return `t = 0` so callers
+///   can still pick something they're standing on.
+pub fn ray_intersects_aabb(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    center: [f32; 3],
+    half_extents: [f32; 3],
+) -> Option<f32> {
+    let mut t_min = f32::NEG_INFINITY;
+    let mut t_max = f32::INFINITY;
+    for axis in 0..3 {
+        let half = half_extents[axis];
+        if half <= 0.0 {
+            return None;
+        }
+        let lo = center[axis] - half;
+        let hi = center[axis] + half;
+        let o = origin[axis];
+        let d = dir[axis];
+        if d.abs() < 1e-6 {
+            // Ray parallel to this axis — only hits if origin
+            // is between the slabs.
+            if o < lo || o > hi {
+                return None;
+            }
+        } else {
+            let inv = 1.0 / d;
+            let t1 = (lo - o) * inv;
+            let t2 = (hi - o) * inv;
+            let (t_near, t_far) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+            if t_near > t_min {
+                t_min = t_near;
+            }
+            if t_far < t_max {
+                t_max = t_far;
+            }
+            if t_min > t_max {
+                return None;
+            }
+        }
+    }
+    if t_max < 0.0 {
+        return None;
+    }
+    Some(if t_min < 0.0 { 0.0 } else { t_min })
+}
+
+/// Intersect a ray with the horizontal plane `y = plane_y`.
+/// Used by the entity-drag path to project mouse-move into
+/// world-space on the same plane the entity lives on.
+/// Returns `None` for parallel rays or hits behind the camera.
+pub fn ray_intersects_horizontal_plane(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    plane_y: f32,
+) -> Option<[f32; 3]> {
+    if dir[1].abs() < 1e-6 {
+        return None;
+    }
+    let t = (plane_y - origin[1]) / dir[1];
+    if t < 0.0 {
+        return None;
+    }
+    Some([origin[0] + dir[0] * t, plane_y, origin[2] + dir[2] * t])
+}
+
+#[cfg(test)]
+mod entity_bounds_tests {
+    use super::ray_intersects_aabb as ray_aabb;
+    use super::ray_intersects_horizontal_plane as ray_plane;
+
+    #[test]
+    fn ray_aabb_hits_centred_box() {
+        // Ray along +Z toward origin AABB at distance 10.
+        let t = ray_aabb([0.0, 0.0, -10.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert!(t.is_some());
+        // Hit should land on the near slab at t = 9.
+        assert!((t.unwrap() - 9.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ray_aabb_misses_offset_box() {
+        // Box offset to +X by 100 — a +Z ray at origin misses.
+        let t = ray_aabb([0.0, 0.0, -10.0], [0.0, 0.0, 1.0], [100.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert!(t.is_none());
+    }
+
+    #[test]
+    fn ray_aabb_origin_inside_box_returns_zero() {
+        let t = ray_aabb([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        assert_eq!(t, Some(0.0));
+    }
+
+    #[test]
+    fn ray_aabb_zero_extent_never_hits() {
+        let t = ray_aabb([0.0, 0.0, -10.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]);
+        assert!(t.is_none());
+    }
+
+    #[test]
+    fn ray_aabb_ray_parallel_to_slab() {
+        // Ray on the X axis at Y=10, box at Y=0. Parallel +X
+        // ray never enters the Y slab so it must miss.
+        let t = ray_aabb([0.0, 10.0, 0.0], [1.0, 0.0, 0.0], [50.0, 0.0, 0.0], [5.0, 5.0, 5.0]);
+        assert!(t.is_none());
+    }
+
+    #[test]
+    fn ray_aabb_nearest_of_two_boxes() {
+        // Two co-axial boxes; near box at z=10, far box at
+        // z=50. Nearest t corresponds to the near box.
+        let near = ray_aabb([0.0, 0.0, -10.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let far = ray_aabb([0.0, 0.0, -10.0], [0.0, 0.0, 1.0], [0.0, 0.0, 50.0], [1.0, 1.0, 1.0]);
+        assert!(near.unwrap() < far.unwrap());
+    }
+
+    #[test]
+    fn ray_plane_hits_horizontal_plane_below() {
+        // Camera 100 above origin looking down → +Z forward,
+        // -Y up. Hit floor plane y=0 at t=100.
+        let p = ray_plane([0.0, 100.0, 0.0], [0.0, -1.0, 0.0], 0.0);
+        assert!(p.is_some());
+        let p = p.unwrap();
+        assert!((p[1] - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ray_plane_misses_when_parallel() {
+        let p = ray_plane([0.0, 100.0, 0.0], [1.0, 0.0, 0.0], 0.0);
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn ray_plane_misses_when_behind_camera() {
+        // Ray points away from the plane.
+        let p = ray_plane([0.0, 100.0, 0.0], [0.0, 1.0, 0.0], 0.0);
+        assert!(p.is_none());
+    }
+}
+
 /// Three-mode selection switch — Blender-style. `Face` keeps
 /// the existing whole-face semantics; `Edge` and `Vertex` pick
 /// finer primitives via local-UV math on the picked face.
@@ -497,6 +735,35 @@ struct PrimitiveDrag {
     /// a non-zero quantum delta, so a press-without-drag (a
     /// pure click) leaves the undo stack alone.
     snapshot_pushed: bool,
+}
+
+/// Active node-drag stroke. Set on press over an entity
+/// bound, updated each frame the pointer moves with primary
+/// held, cleared on release. The drag is constrained to the
+/// horizontal plane the node sits on so X/Z editing is the
+/// only motion — Y stays editable via the inspector.
+#[derive(Debug, Clone)]
+struct NodeDrag {
+    /// The node being dragged.
+    node: NodeId,
+    /// Editor-space translation when the drag started. The
+    /// per-frame update writes `start + delta` so floating
+    /// rounding errors don't accumulate.
+    start_translation: [f32; 3],
+    /// World-space hit point on the node's drag plane at
+    /// drag start. Subsequent ray hits on the same plane
+    /// yield a delta to add to `start_translation`.
+    start_world_hit: [f32; 3],
+    /// Plane Y in world units — locked to the node's current
+    /// world Y at drag start.
+    drag_plane_y: f32,
+    /// `true` once `push_undo` has fired for this stroke.
+    /// Pure clicks (press without movement) leave the undo
+    /// stack untouched.
+    snapshot_pushed: bool,
+    /// Cached enclosing room id so per-frame updates don't
+    /// re-walk the scene tree.
+    room: Option<NodeId>,
 }
 
 /// Resolved physical vertex: every face-corner that currently
@@ -598,6 +865,7 @@ enum ResourceFilter {
     Texture,
     Material,
     Model,
+    Character,
     Mesh,
     Room,
     Other,
@@ -610,6 +878,7 @@ impl ResourceFilter {
             Self::Texture => "Texture",
             Self::Material => "Material",
             Self::Model => "Model",
+            Self::Character => "Character",
             Self::Mesh => "Mesh",
             Self::Room => "Room",
             Self::Other => "Other",
@@ -622,6 +891,7 @@ impl ResourceFilter {
             Self::Texture => icons::PALETTE,
             Self::Material => icons::BLEND,
             Self::Model => icons::BOX,
+            Self::Character => icons::MAP_PIN,
             Self::Mesh => icons::BOX,
             Self::Room => icons::GRID,
             Self::Other => icons::FILE,
@@ -634,6 +904,7 @@ impl ResourceFilter {
             Self::Texture => matches!(data, ResourceData::Texture { .. }),
             Self::Material => matches!(data, ResourceData::Material(_)),
             Self::Model => matches!(data, ResourceData::Model(_)),
+            Self::Character => matches!(data, ResourceData::Character(_)),
             Self::Mesh => matches!(data, ResourceData::Mesh { .. }),
             Self::Room => matches!(data, ResourceData::Scene { .. }),
             Self::Other => matches!(
@@ -798,6 +1069,8 @@ impl EditorWorkspace {
             hovered_primitive: None,
             selected_primitive: None,
             primitive_drag: None,
+            hovered_entity_node: None,
+            node_drag: None,
             paint_target_preview: None,
             last_paint_stamp: None,
             renaming: None,
@@ -1035,6 +1308,7 @@ impl EditorWorkspace {
     /// up to the caller — the editor doesn't spawn child
     /// processes from this path; instead the status string
     /// hands back the exact command to run.
+    #[allow(clippy::too_many_arguments)]
     pub fn cook_playtest_to_disk(&self) -> Result<String, String> {
         let dir = psxed_project::playtest::default_generated_dir();
         // Re-run build_package up front to grab the asset/material
@@ -1043,14 +1317,23 @@ impl EditorWorkspace {
         // compared to the IO it saves a step later.
         let (package, _report) =
             psxed_project::playtest::build_package(&self.project, &self.project_dir);
-        let summary = package.as_ref().map(|p| {
-            (
-                p.rooms.len(),
-                p.assets.len(),
-                p.texture_asset_count(),
-                p.materials.len(),
-                p.entities.len(),
-            )
+        let summary = package.as_ref().map(|p| PackageSummary {
+            rooms: p.rooms.len(),
+            assets: p.assets.len(),
+            textures: p.texture_asset_count(),
+            materials: p.materials.len(),
+            models: p.models.len(),
+            characters: p.characters.len(),
+            lights: p.lights.len(),
+            entities: p.entities.len(),
+            player_character: p
+                .player_controller
+                .and_then(|pc| p.characters.get(pc.character as usize))
+                .and_then(|c| {
+                    self.project
+                        .resource(c.source_resource)
+                        .map(|r| r.name.clone())
+                }),
         });
 
         let report = psxed_project::playtest::cook_to_dir(
@@ -1071,21 +1354,35 @@ impl EditorWorkspace {
             format!(" ({} warning{})", report.warnings.len(),
                 if report.warnings.len() == 1 { "" } else { "s" })
         };
-        let counts = summary.map(|(rooms, assets, textures, materials, entities)| {
-            format!(
-                " — {} room{}, {} asset{}, {} texture{}, {} material{}, {} entit{}",
-                rooms,
-                if rooms == 1 { "" } else { "s" },
-                assets,
-                if assets == 1 { "" } else { "s" },
-                textures,
-                if textures == 1 { "" } else { "s" },
-                materials,
-                if materials == 1 { "" } else { "s" },
-                entities,
-                if entities == 1 { "y" } else { "ies" },
-            )
-        }).unwrap_or_default();
+        let counts = summary
+            .as_ref()
+            .map(|s| {
+                let player_blurb = match s.player_character.as_deref() {
+                    Some(name) => format!(", player: {name}"),
+                    None => ", no player".to_string(),
+                };
+                format!(
+                    " — {} room{}, {} model{}, {} character{}{}, {} light{}, {} asset{}, {} texture{}, {} material{}, {} entit{}",
+                    s.rooms,
+                    if s.rooms == 1 { "" } else { "s" },
+                    s.models,
+                    if s.models == 1 { "" } else { "s" },
+                    s.characters,
+                    if s.characters == 1 { "" } else { "s" },
+                    player_blurb,
+                    s.lights,
+                    if s.lights == 1 { "" } else { "s" },
+                    s.assets,
+                    if s.assets == 1 { "" } else { "s" },
+                    s.textures,
+                    if s.textures == 1 { "" } else { "s" },
+                    s.materials,
+                    if s.materials == 1 { "" } else { "s" },
+                    s.entities,
+                    if s.entities == 1 { "y" } else { "ies" },
+                )
+            })
+            .unwrap_or_default();
         Ok(format!(
             "Playtest cooked → {}{}{}",
             dir.display(),
@@ -1423,26 +1720,68 @@ impl EditorWorkspace {
             self.last_paint_stamp = None;
         }
 
-        // Select-tool drag-translate: press on any primitive
-        // (selected or not) arms a vertical-move stroke. Pure
-        // clicks (press without movement) just promote the
-        // hovered primitive to the selection — no undo entry,
-        // no mutation. The first drag frame that crosses a
-        // quantum lazy-pushes undo so a press-and-release
-        // doesn't leave a stale snapshot behind.
+        // Hover-track entity bounds in Select mode so the
+        // overlay can highlight the bound under the cursor
+        // before the user clicks.
+        if matches!(self.active_tool, ViewTool::Select) {
+            self.hovered_entity_node = response
+                .hover_pos()
+                .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()))
+                .map(|hit| hit.node);
+        } else {
+            self.hovered_entity_node = None;
+        }
+
+        // Select-tool drag-translate. Two distinct drag flows:
+        //   1. Entity bound under cursor → start `node_drag`,
+        //      move the node on its X/Z plane.
+        //   2. Otherwise (face / edge / vertex hit, or empty)
+        //      fall back to the existing primitive vertical
+        //      drag.
+        // Pure clicks (press without movement) just promote
+        // the hovered target to the selection — no undo
+        // entry, no mutation. The first drag frame that
+        // crosses a threshold lazy-pushes undo so a
+        // press-and-release doesn't leave a stale snapshot.
         if matches!(self.active_tool, ViewTool::Select) {
             if response.drag_started_by(egui::PointerButton::Primary) {
-                self.begin_primitive_drag();
+                let entity_hit = response
+                    .interact_pointer_pos()
+                    .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()));
+                if let Some(hit) = entity_hit {
+                    self.begin_node_drag(hit, rect);
+                } else {
+                    self.begin_primitive_drag();
+                }
             }
             if response.dragged_by(egui::PointerButton::Primary) {
-                let dy = response.drag_delta().y;
-                self.update_primitive_drag(dy);
+                if self.node_drag.is_some() {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        self.update_node_drag(rect, p);
+                    }
+                } else {
+                    let dy = response.drag_delta().y;
+                    self.update_primitive_drag(dy);
+                }
             }
             if response.drag_stopped_by(egui::PointerButton::Primary) {
-                self.end_primitive_drag();
+                if self.node_drag.is_some() {
+                    self.end_node_drag();
+                } else {
+                    self.end_primitive_drag();
+                }
             }
             if response.clicked_by(egui::PointerButton::Primary) {
-                self.commit_face_selection();
+                // Entity click takes priority over face click —
+                // matches the drag flow above.
+                let entity_hit = response
+                    .interact_pointer_pos()
+                    .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()));
+                if let Some(hit) = entity_hit {
+                    self.commit_node_selection(hit.node);
+                } else {
+                    self.commit_face_selection();
+                }
             }
         } else {
             let primary_active = response.clicked_by(egui::PointerButton::Primary)
@@ -1521,6 +1860,14 @@ impl EditorWorkspace {
     /// commit to.
     pub fn paint_target_preview(&self) -> Option<PaintTargetPreview> {
         self.paint_target_preview
+    }
+
+    /// Scene node whose 3D bounding box currently sits under
+    /// the pointer (Select tool only). Frontend reads it each
+    /// frame so the editor preview can highlight the box and
+    /// the click handler can promote it to a selection.
+    pub fn hovered_entity_node(&self) -> Option<NodeId> {
+        self.hovered_entity_node
     }
 
     /// Commit the most recent hover-tracked face to `selected_face`.
@@ -1747,6 +2094,120 @@ impl EditorWorkspace {
     /// its material so the resource panel surfaces it without a
     /// second click. Edge / vertex modes don't pre-load — the
     /// inspector renders directly from the selection.
+    /// Promote `node` to the active selected node, clearing
+    /// any grid primitive selection. Mirrors `commit_face_selection`
+    /// for entity bounds — keeps the inspector and scene tree
+    /// in sync with the viewport click.
+    fn commit_node_selection(&mut self, node: NodeId) {
+        self.selected_node = node;
+        self.selected_primitive = None;
+        self.selected_resource = None;
+        let scene = self.project.active_scene();
+        if let Some(n) = scene.node(node) {
+            self.status = format!("Selected {} '{}'", n.kind.label(), n.name);
+        } else {
+            self.status = format!("Selected node #{}", node.raw());
+        }
+    }
+
+    /// Start a node-drag stroke. The pointer landed on
+    /// `hit.bounds`; lock the drag plane to the node's current
+    /// world Y, snapshot the start translation, and select the
+    /// node so subsequent UI updates show the right inspector.
+    /// Undo is lazy — only pushed once the user actually moves.
+    fn begin_node_drag(&mut self, hit: EntityBoundHit, _rect: egui::Rect) {
+        // Promote selection so the inspector lands on the
+        // dragged node.
+        self.commit_node_selection(hit.node);
+        let scene = self.project.active_scene();
+        let Some(node) = scene.node(hit.node) else {
+            return;
+        };
+        // Lock the drag plane to the node's *current* world Y
+        // — that way the cursor stays attached to the bound
+        // even if the camera angle changes mid-drag.
+        let drag_plane_y = hit.bounds.center[1];
+        self.node_drag = Some(NodeDrag {
+            node: hit.node,
+            start_translation: node.transform.translation,
+            start_world_hit: hit.point,
+            drag_plane_y,
+            snapshot_pushed: false,
+            room: hit.bounds.room,
+        });
+    }
+
+    /// Per-frame node-drag update. Re-cast the current pointer
+    /// onto the locked drag plane, compute the world delta from
+    /// the start hit, project that delta back into editor-space
+    /// (sectors), and write `start + delta` to the node's
+    /// translation. Pushes undo lazily on the first
+    /// non-zero-delta frame.
+    fn update_node_drag(&mut self, rect: egui::Rect, pointer: egui::Pos2) {
+        let Some(drag) = self.node_drag.as_ref() else {
+            return;
+        };
+        let plane_y = drag.drag_plane_y;
+        let node_id = drag.node;
+        let start_translation = drag.start_translation;
+        let start_world_hit = drag.start_world_hit;
+        let room_id = drag.room;
+        let already_snapshotted = drag.snapshot_pushed;
+
+        let Some((origin, dir)) = self.camera_ray_for_pointer(rect, pointer) else {
+            return;
+        };
+        let Some(world_hit) = ray_intersects_horizontal_plane(origin, dir, plane_y) else {
+            return;
+        };
+        // Convert the world-space delta into editor-space
+        // (sectors) using the room's `sector_size`. Without an
+        // enclosing Room, fall back to a 1:1 conversion so
+        // global nodes still drag.
+        let scene = self.project.active_scene();
+        let sector_size = room_id
+            .and_then(|id| scene.node(id))
+            .and_then(|n| match &n.kind {
+                NodeKind::Room { grid } => Some(grid.sector_size as f32),
+                _ => None,
+            })
+            .unwrap_or(1.0);
+        let delta_world = [
+            world_hit[0] - start_world_hit[0],
+            world_hit[2] - start_world_hit[2],
+        ];
+        let new_translation = [
+            start_translation[0] + delta_world[0] / sector_size,
+            start_translation[1],
+            start_translation[2] + delta_world[1] / sector_size,
+        ];
+
+        // Lazy undo: first non-zero delta pushes one snapshot.
+        if !already_snapshotted
+            && (delta_world[0].abs() > f32::EPSILON || delta_world[1].abs() > f32::EPSILON)
+        {
+            self.push_undo();
+            if let Some(d) = self.node_drag.as_mut() {
+                d.snapshot_pushed = true;
+            }
+        }
+
+        if let Some(node) = self.project.active_scene_mut().node_mut(node_id) {
+            node.transform.translation = new_translation;
+            self.dirty = true;
+        }
+        self.status = format!(
+            "Drag node — ({:.2}, {:.2})",
+            new_translation[0], new_translation[2]
+        );
+    }
+
+    /// End the active node-drag stroke. Idempotent if no drag
+    /// is in flight.
+    fn end_node_drag(&mut self) {
+        self.node_drag = None;
+    }
+
     fn commit_face_selection(&mut self) {
         match self.hovered_primitive {
             Some(selection) => {
@@ -2017,23 +2478,32 @@ impl EditorWorkspace {
                 let stale: Vec<NodeId> = scene
                     .nodes()
                     .iter()
-                    .filter(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true }))
+                    .filter(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true, .. }))
                     .map(|n| n.id)
                     .collect();
                 for id in stale {
                     if let Some(node) = scene.node_mut(id) {
-                        node.kind = NodeKind::SpawnPoint { player: false };
+                        node.kind = NodeKind::SpawnPoint {
+                            player: false,
+                            character: None,
+                        };
                     }
                 }
             }
             let (default_name, node_kind): (String, NodeKind) = match kind {
                 PlaceKind::PlayerSpawn => (
                     "Player Spawn".to_string(),
-                    NodeKind::SpawnPoint { player: true },
+                    NodeKind::SpawnPoint {
+                        player: true,
+                        character: None,
+                    },
                 ),
                 PlaceKind::SpawnMarker => (
                     "Spawn".to_string(),
-                    NodeKind::SpawnPoint { player: false },
+                    NodeKind::SpawnPoint {
+                        player: false,
+                        character: None,
+                    },
                 ),
                 PlaceKind::ModelInstance => {
                     // Resolve which Model resource to bind. Order:
@@ -3186,6 +3656,7 @@ impl EditorWorkspace {
                 let material_options = self.project.material_options();
                 let room_options = collect_room_options(&self.project);
                 let model_options = collect_model_options(&self.project);
+                let character_options = collect_character_options(&self.project);
                 let selected = self.selected_node;
                 let active_room = self.active_room_id();
                 let selected_sector = self.selected_sector;
@@ -3245,6 +3716,7 @@ impl EditorWorkspace {
                                 &material_options,
                                 &room_options,
                                 &model_options,
+                                &character_options,
                                 &mut nav_target,
                             );
                         });
@@ -3796,6 +4268,11 @@ impl EditorWorkspace {
                 _ => None,
             })
             .collect();
+        // Snapshot Model resources + their clip names so the
+        // Character inspector can populate model + clip pickers
+        // without borrowing `self.project` while the mutable
+        // borrow on `resource_mut` is live.
+        let character_ctx = build_character_editor_context(&self.project);
 
         // Build the breadcrumb before the mutable borrow on
         // `resource_mut` — we need other resources by id to
@@ -3874,6 +4351,9 @@ impl EditorWorkspace {
             }
             ResourceData::Model(model) => {
                 changed |= draw_model_resource_editor(ui, model, &project_root, preview_thumb);
+            }
+            ResourceData::Character(character) => {
+                changed |= draw_character_resource_editor(ui, character, &character_ctx);
             }
             ResourceData::Mesh { source_path }
             | ResourceData::Scene { source_path }
@@ -4450,11 +4930,107 @@ impl EditorWorkspace {
     /// Resolve the Room node that owns the current selection, if any.
     ///
     /// Order: selected face's room → climb the selected node's
+    /// Walk the active scene and collect a selectable AABB for
+    /// every entity-kind node — every node that's neither the
+    /// scene root, nor a structural Node/World, nor a Room.
+    ///
+    /// `room_filter` confines the walk to descendants of one
+    /// Room (Some(id)) or includes everything (None). The 3D
+    /// click handler uses Some(active_room) so a click in the
+    /// active room can't pick lights from another room.
+    pub fn collect_entity_bounds(&self, room_filter: Option<NodeId>) -> Vec<EntityBounds> {
+        let scene = self.project.active_scene();
+        let mut out = Vec::new();
+        for node in scene.nodes() {
+            if node.id == scene.root {
+                continue;
+            }
+            // Find this node's enclosing Room.
+            let enclosing_room = enclosing_room_id(scene, node.id);
+            if let (Some(want), Some(actual)) = (room_filter, enclosing_room) {
+                if want != actual {
+                    continue;
+                }
+            }
+            let Some((kind, half_extents)) = entity_bound_kind_and_size(self, node) else {
+                continue;
+            };
+            // World position. Entities under a Room use the
+            // canonical room-local convention so bounds line up
+            // with the rendered marker / model exactly.
+            let center_world = match enclosing_room.and_then(|id| scene.node(id)) {
+                Some(room_node) => match &room_node.kind {
+                    NodeKind::Room { grid } => {
+                        let pos = node.transform.translation;
+                        let xz = grid.editor_to_room_local([pos[0], pos[2]]);
+                        [
+                            xz[0],
+                            pos[1] * grid.sector_size as f32 + half_extents[1],
+                            xz[2],
+                        ]
+                    }
+                    _ => continue,
+                },
+                None => {
+                    // No enclosing Room — node lives in raw
+                    // world space. Use translation directly so
+                    // the bound at least lands somewhere
+                    // pickable.
+                    let p = node.transform.translation;
+                    [p[0], p[1] + half_extents[1], p[2]]
+                }
+            };
+            out.push(EntityBounds {
+                node: node.id,
+                room: enclosing_room,
+                kind,
+                center: center_world,
+                half_extents,
+                yaw_degrees: node.transform.rotation_degrees[1],
+            });
+        }
+        out
+    }
+
+    /// Pick the nearest entity bound under the camera ray.
+    /// Returns the `EntityBoundHit` plus its world distance —
+    /// the 3D click handler compares this against grid hits to
+    /// pick whichever is closer.
+    pub fn pick_entity_bound(
+        &self,
+        rect: egui::Rect,
+        pointer: egui::Pos2,
+        room_filter: Option<NodeId>,
+    ) -> Option<EntityBoundHit> {
+        let (origin, dir) = self.camera_ray_for_pointer(rect, pointer)?;
+        let bounds = self.collect_entity_bounds(room_filter);
+        let mut best: Option<EntityBoundHit> = None;
+        for b in &bounds {
+            let Some(t) = ray_intersects_aabb(origin, dir, b.center, b.half_extents) else {
+                continue;
+            };
+            if best.as_ref().is_some_and(|h| h.distance <= t) {
+                continue;
+            }
+            best = Some(EntityBoundHit {
+                node: b.node,
+                distance: t,
+                point: [
+                    origin[0] + dir[0] * t,
+                    origin[1] + dir[1] * t,
+                    origin[2] + dir[2] * t,
+                ],
+                bounds: *b,
+            });
+        }
+        best
+    }
+
     /// parent chain → fall back to the active scene's first Room.
     /// The fallback keeps paint tools enabled even when the
     /// selection sits outside the scene tree (e.g. a face the user
     /// just picked, which clears `selected_node` to ROOT).
-    fn active_room_id(&self) -> Option<NodeId> {
+    pub fn active_room_id(&self) -> Option<NodeId> {
         if let Some(selection) = self.selected_primitive {
             return Some(selection.room());
         }
@@ -4915,6 +5491,7 @@ fn draw_node_kind_editor(
     material_options: &[(ResourceId, String)],
     room_options: &[(NodeId, String)],
     model_options: &[(ResourceId, String, Vec<String>)],
+    character_options: &[(ResourceId, String)],
     nav_target: &mut Option<ResourceId>,
 ) -> bool {
     let mut changed = false;
@@ -5140,10 +5717,13 @@ fn draw_node_kind_editor(
                 );
             }
         }
-        NodeKind::SpawnPoint { player } => {
+        NodeKind::SpawnPoint { player, character } => {
             changed |= ui
                 .checkbox(player, icons::label(icons::MAP_PIN, "Player spawn"))
                 .changed();
+            if *player {
+                changed |= draw_character_selector(ui, character_options, character);
+            }
         }
         NodeKind::Trigger { trigger_id } => {
             ui.horizontal(|ui| {
@@ -5846,6 +6426,354 @@ fn material_texture_picker(
     changed
 }
 
+/// Snapshot of every Model resource and its clip names. Built
+/// before the mutable borrow on a Resource so the Character
+/// inspector can populate model + clip dropdowns without
+/// fighting the live `&mut CharacterResource`.
+struct CharacterEditorContext {
+    /// `(model id, model display name, clip names in order)`.
+    models: Vec<(ResourceId, String, Vec<String>)>,
+}
+
+fn build_character_editor_context(project: &ProjectDocument) -> CharacterEditorContext {
+    CharacterEditorContext {
+        models: collect_model_options(project),
+    }
+}
+
+/// Inspector body for `ResourceData::Character`. Combines a
+/// model picker, four role-clip pickers (idle / walk / run /
+/// turn), capsule sizes, controller speed, and camera params.
+/// `Auto Assign Clips By Name` walks the bound model's clip
+/// list and matches `idle` / `walk` / `run` / `turn` substrings
+/// — case-insensitive — into role slots.
+fn draw_character_resource_editor(
+    ui: &mut egui::Ui,
+    character: &mut psxed_project::CharacterResource,
+    ctx: &CharacterEditorContext,
+) -> bool {
+    let mut changed = false;
+
+    // Resolve the bound model + clip list (if any). Used
+    // throughout the inspector to surface clip names instead of
+    // raw indices.
+    let bound = character
+        .model
+        .and_then(|id| ctx.models.iter().find(|(mid, _, _)| *mid == id));
+
+    egui::CollapsingHeader::new(icons::label(icons::BOX, "Model"))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Model");
+                let preview = bound
+                    .map(|(_, name, _)| name.as_str())
+                    .unwrap_or("(none)");
+                egui::ComboBox::from_id_salt("character-model-picker")
+                    .selected_text(preview)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(character.model.is_none(), "(none)")
+                            .clicked()
+                        {
+                            character.model = None;
+                            changed = true;
+                        }
+                        for (id, name, _) in &ctx.models {
+                            if ui
+                                .selectable_label(character.model == Some(*id), name)
+                                .clicked()
+                            {
+                                character.model = Some(*id);
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            if character.model.is_some() && bound.is_none() {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Bound model resource is missing.",
+                );
+            }
+        });
+
+    egui::CollapsingHeader::new(icons::label(icons::PALETTE, "Animation roles"))
+        .default_open(true)
+        .show(ui, |ui| {
+            let clips: &[String] = bound.map(|(_, _, c)| c.as_slice()).unwrap_or(&[]);
+            if bound.is_none() {
+                ui.colored_label(
+                    STUDIO_TEXT_WEAK,
+                    "Pick a Model to surface its clip list.",
+                );
+            }
+            changed |= clip_role_picker(ui, "Idle", "character-clip-idle", &mut character.idle_clip, clips);
+            changed |= clip_role_picker(ui, "Walk", "character-clip-walk", &mut character.walk_clip, clips);
+            changed |= clip_role_picker(ui, "Run", "character-clip-run", &mut character.run_clip, clips);
+            changed |= clip_role_picker(ui, "Turn", "character-clip-turn", &mut character.turn_clip, clips);
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let auto_enabled = !clips.is_empty();
+                if ui
+                    .add_enabled(
+                        auto_enabled,
+                        egui::Button::new(icons::label(icons::SCAN, "Auto Assign Clips By Name")),
+                    )
+                    .on_hover_text(
+                        "Match clip names against idle/walk/run/turn substrings (case-insensitive).",
+                    )
+                    .clicked()
+                {
+                    let before = (
+                        character.idle_clip,
+                        character.walk_clip,
+                        character.run_clip,
+                        character.turn_clip,
+                    );
+                    auto_assign_character_clips(character, clips);
+                    if (
+                        character.idle_clip,
+                        character.walk_clip,
+                        character.run_clip,
+                        character.turn_clip,
+                    ) != before
+                    {
+                        changed = true;
+                    }
+                }
+            });
+
+            // Inline warnings: required roles missing, or slot
+            // points past end of the model's clip list.
+            let warn_idx = |label: &str, slot: Option<u16>| -> Option<String> {
+                let idx = slot?;
+                if (idx as usize) >= clips.len() {
+                    Some(format!(
+                        "{label} clip index {idx} exceeds model's clip list ({} clips).",
+                        clips.len()
+                    ))
+                } else {
+                    None
+                }
+            };
+            for warning in [
+                warn_idx("Idle", character.idle_clip),
+                warn_idx("Walk", character.walk_clip),
+                warn_idx("Run", character.run_clip),
+                warn_idx("Turn", character.turn_clip),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                ui.colored_label(Color32::from_rgb(220, 160, 80), warning);
+            }
+            if character.model.is_some() && character.idle_clip.is_none() {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Idle clip is required for the player character.",
+                );
+            }
+            if character.model.is_some() && character.walk_clip.is_none() {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Walk clip is required for the player character.",
+                );
+            }
+        });
+
+    egui::CollapsingHeader::new(icons::label(icons::SCAN, "Capsule"))
+        .default_open(false)
+        .show(ui, |ui| {
+            changed |= drag_u16(ui, "Radius", &mut character.radius, 1, 4096);
+            changed |= drag_u16(ui, "Height", &mut character.height, 1, 8192);
+        });
+
+    egui::CollapsingHeader::new(icons::label(icons::LAYERS, "Controller"))
+        .default_open(false)
+        .show(ui, |ui| {
+            changed |= drag_i32(ui, "Walk speed", &mut character.walk_speed, 1, 1024);
+            changed |= drag_i32(ui, "Run speed", &mut character.run_speed, 1, 2048);
+            changed |= drag_u16(
+                ui,
+                "Turn speed (deg/s)",
+                &mut character.turn_speed_degrees_per_second,
+                1,
+                720,
+            );
+        });
+
+    egui::CollapsingHeader::new(icons::label(icons::GRID, "Camera"))
+        .default_open(false)
+        .show(ui, |ui| {
+            changed |= drag_i32(ui, "Distance", &mut character.camera_distance, 1, 16384);
+            changed |= drag_i32(ui, "Height", &mut character.camera_height, 0, 16384);
+            changed |= drag_i32(ui, "Target height", &mut character.camera_target_height, 0, 16384);
+        });
+
+    changed
+}
+
+/// Helper: clip dropdown for one animation role. Renders the
+/// clip's display name, falls back to "(none)" when unset, and
+/// flags out-of-range indices in red.
+fn clip_role_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    id_salt: &str,
+    slot: &mut Option<u16>,
+    clips: &[String],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let preview = match *slot {
+            Some(idx) => clips
+                .get(idx as usize)
+                .cloned()
+                .unwrap_or_else(|| format!("#{idx} (missing)")),
+            None => "(none)".to_string(),
+        };
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(slot.is_none(), "(none)").clicked() {
+                    *slot = None;
+                    changed = true;
+                }
+                for (idx, name) in clips.iter().enumerate() {
+                    let label = format!("{idx}: {name}");
+                    if ui
+                        .selectable_label(*slot == Some(idx as u16), label)
+                        .clicked()
+                    {
+                        *slot = Some(idx as u16);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    changed
+}
+
+/// Heuristic clip-by-name auto-assignment. Case-insensitive
+/// substring match. Leaves missing roles unset so the validation
+/// warnings still fire.
+fn auto_assign_character_clips(
+    character: &mut psxed_project::CharacterResource,
+    clips: &[String],
+) {
+    let lower: Vec<String> = clips.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let find = |needle: &str| -> Option<u16> {
+        lower
+            .iter()
+            .position(|name| name.contains(needle))
+            .map(|i| i as u16)
+    };
+    if let Some(i) = find("idle") {
+        character.idle_clip = Some(i);
+    }
+    if let Some(i) = find("walk") {
+        character.walk_clip = Some(i);
+    }
+    if let Some(i) = find("run") {
+        character.run_clip = Some(i);
+    }
+    if let Some(i) = find("turn") {
+        character.turn_clip = Some(i);
+    }
+}
+
+/// Player-spawn inspector helper: pick which Character drives
+/// this spawn. `(none)` lets the cook step auto-pick when
+/// exactly one Character exists.
+fn draw_character_selector(
+    ui: &mut egui::Ui,
+    options: &[(ResourceId, String)],
+    current: &mut Option<ResourceId>,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Character");
+        let preview = current
+            .and_then(|id| options.iter().find(|(rid, _)| *rid == id).map(|(_, n)| n.as_str()))
+            .unwrap_or("(none)");
+        egui::ComboBox::from_id_salt("player-spawn-character-picker")
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "(none)").clicked() {
+                    *current = None;
+                    changed = true;
+                }
+                for (id, name) in options {
+                    if ui
+                        .selectable_label(*current == Some(*id), name)
+                        .clicked()
+                    {
+                        *current = Some(*id);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    if let Some(id) = *current {
+        if !options.iter().any(|(rid, _)| *rid == id) {
+            ui.colored_label(
+                Color32::from_rgb(220, 120, 100),
+                "Selected Character resource is missing.",
+            );
+        }
+    } else if options.is_empty() {
+        ui.colored_label(
+            STUDIO_TEXT_WEAK,
+            "No Character resources defined. Cook will fail unless one is added.",
+        );
+    } else if options.len() > 1 {
+        ui.colored_label(
+            STUDIO_TEXT_WEAK,
+            "Multiple Characters available — pick one explicitly to avoid Cook failures.",
+        );
+    } else {
+        ui.colored_label(
+            STUDIO_TEXT_WEAK,
+            format!("Cook will auto-select \"{}\" — only one Character defined.", options[0].1),
+        );
+    }
+    changed
+}
+
+fn drag_u16(ui: &mut egui::Ui, label: &str, value: &mut u16, min: u16, max: u16) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let mut v = *value as i64;
+        if ui
+            .add(egui::DragValue::new(&mut v).range(min as i64..=max as i64))
+            .changed()
+        {
+            *value = v.clamp(min as i64, max as i64) as u16;
+            changed = true;
+        }
+    });
+    changed
+}
+
+fn drag_i32(ui: &mut egui::Ui, label: &str, value: &mut i32, min: i32, max: i32) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if ui
+            .add(egui::DragValue::new(value).range(min..=max))
+            .changed()
+        {
+            *value = (*value).clamp(min, max);
+            changed = true;
+        }
+    });
+    changed
+}
+
 fn human_bytes(n: u32) -> String {
     if n < 1024 {
         format!("{} B", n)
@@ -6180,7 +7108,13 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 8] {
                 radius: 4.0,
             },
         ),
-        ("SpawnPoint", NodeKind::SpawnPoint { player: false }),
+        (
+            "SpawnPoint",
+            NodeKind::SpawnPoint {
+                player: false,
+                character: None,
+            },
+        ),
         (
             "Trigger",
             NodeKind::Trigger {
@@ -6331,6 +7265,7 @@ fn resource_file_name(resource: &Resource) -> String {
         }
         ResourceData::Material(_) => cooked_name(&resource.name, "", "mat"),
         ResourceData::Model(model) => cooked_name(&resource.name, &model.model_path, "psxmdl"),
+        ResourceData::Character(_) => cooked_name(&resource.name, "", "char"),
         ResourceData::Mesh { source_path } => cooked_name(&resource.name, source_path, "psxmesh"),
         ResourceData::Scene { source_path } => cooked_name(&resource.name, source_path, "room"),
         ResourceData::Script { source_path } => cooked_name(&resource.name, source_path, "script"),
@@ -6362,10 +7297,11 @@ fn snake_name(name: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
-fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize); 6] {
+fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize); 7] {
     let mut texture = 0;
     let mut material = 0;
     let mut model = 0;
+    let mut character = 0;
     let mut mesh = 0;
     let mut room = 0;
     let mut other = 0;
@@ -6374,6 +7310,7 @@ fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize)
             ResourceData::Texture { .. } => texture += 1,
             ResourceData::Material(_) => material += 1,
             ResourceData::Model(_) => model += 1,
+            ResourceData::Character(_) => character += 1,
             ResourceData::Mesh { .. } => mesh += 1,
             ResourceData::Scene { .. } => room += 1,
             ResourceData::Script { .. } | ResourceData::Audio { .. } => other += 1,
@@ -6383,6 +7320,7 @@ fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize)
         (ResourceFilter::Texture, texture),
         (ResourceFilter::Material, material),
         (ResourceFilter::Model, model),
+        (ResourceFilter::Character, character),
         (ResourceFilter::Mesh, mesh),
         (ResourceFilter::Room, room),
         (ResourceFilter::Other, other),
@@ -6410,7 +7348,7 @@ fn resource_source_path(resource: &Resource) -> Option<&str> {
         | ResourceData::Scene { source_path }
         | ResourceData::Script { source_path }
         | ResourceData::Audio { source_path } => Some(source_path.as_str()),
-        ResourceData::Material(_) => None,
+        ResourceData::Material(_) | ResourceData::Character(_) => None,
     }
 }
 
@@ -6419,6 +7357,7 @@ fn resource_lucide_icon(data: &ResourceData) -> char {
         ResourceData::Texture { .. } => icons::PALETTE,
         ResourceData::Material(_) => icons::BLEND,
         ResourceData::Model(_) => icons::BOX,
+        ResourceData::Character(_) => icons::MAP_PIN,
         ResourceData::Mesh { .. } => icons::BOX,
         ResourceData::Scene { .. } => icons::GRID,
         ResourceData::Script { .. } => icons::FILE,
@@ -6435,6 +7374,7 @@ fn resource_lucide_color(data: &ResourceData, selected: bool) -> Color32 {
         ResourceData::Texture { .. } => Color32::from_rgb(163, 182, 198),
         ResourceData::Material(_) => Color32::from_rgb(208, 112, 162),
         ResourceData::Model(_) => Color32::from_rgb(186, 178, 124),
+        ResourceData::Character(_) => Color32::from_rgb(120, 220, 148),
         ResourceData::Mesh { .. } => Color32::from_rgb(156, 174, 190),
         ResourceData::Scene { .. } => Color32::from_rgb(209, 118, 71),
         ResourceData::Script { .. } => Color32::from_rgb(188, 176, 104),
@@ -6801,6 +7741,7 @@ fn resource_preview_color(resource: &Resource) -> Color32 {
             ResourceData::Texture { .. } => Color32::from_rgb(92, 116, 140),
             ResourceData::Material(_) => Color32::from_rgb(120, 92, 135),
             ResourceData::Model(_) => Color32::from_rgb(140, 124, 96),
+            ResourceData::Character(_) => Color32::from_rgb(96, 144, 110),
             ResourceData::Mesh { .. } => Color32::from_rgb(110, 120, 130),
             ResourceData::Scene { .. } => Color32::from_rgb(92, 130, 106),
             ResourceData::Script { .. } => Color32::from_rgb(128, 126, 80),
@@ -6814,6 +7755,7 @@ fn resource_detail(resource: &Resource) -> &'static str {
         ResourceData::Texture { .. } => "Texture - 4bpp",
         ResourceData::Material(_) => "Material - 4bpp",
         ResourceData::Model(_) => "Model",
+        ResourceData::Character(_) => "Character",
         ResourceData::Mesh { .. } => "Mesh",
         ResourceData::Scene { .. } => "Room",
         ResourceData::Script { .. } => "Script",
@@ -8519,6 +9461,68 @@ fn workspace_root_dir() -> PathBuf {
         .join("..")
 }
 
+/// Walk parent links until a `NodeKind::Room` is found.
+/// Returns its `NodeId` or `None` if `node_id` lives outside
+/// any Room.
+fn enclosing_room_id(scene: &psxed_project::Scene, node_id: NodeId) -> Option<NodeId> {
+    let mut current = scene.node(node_id)?.parent;
+    while let Some(parent_id) = current {
+        let parent = scene.node(parent_id)?;
+        if matches!(parent.kind, NodeKind::Room { .. }) {
+            return Some(parent_id);
+        }
+        current = parent.parent;
+    }
+    None
+}
+
+/// Per-kind half-extents in world units. Picked so:
+/// - bounds are big enough to click reliably at typical
+///   editor zoom levels,
+/// - small enough that a Light or AudioSource doesn't block
+///   selection of nearby grid faces,
+/// - distinct enough to read at a glance.
+///
+/// `None` for node kinds that don't get a 3D bound (Room,
+/// World, Node, Node3D — the structural / non-spatial ones).
+fn entity_bound_kind_and_size(
+    workspace: &EditorWorkspace,
+    node: &psxed_project::SceneNode,
+) -> Option<(EntityBoundKind, [f32; 3])> {
+    match &node.kind {
+        NodeKind::Room { .. } | NodeKind::World | NodeKind::Node | NodeKind::Node3D => None,
+        NodeKind::MeshInstance { mesh, .. } => {
+            // Model-backed instance: scale the bound to the
+            // model's `world_height` so a Wraith reads as a
+            // standing humanoid box, not a marker cube. Falls
+            // back to a fixed mesh box for unbound instances.
+            if let Some(id) = mesh {
+                if let Some(resource) = workspace.project.resource(*id) {
+                    if let psxed_project::ResourceData::Model(model) = &resource.data {
+                        let h = (model.world_height as f32).max(256.0);
+                        let half_h = h * 0.5;
+                        // Square footprint sized as roughly
+                        // a third of the model height — wide
+                        // enough to click, tight enough that
+                        // adjacent models don't overlap.
+                        let half_xz = (h / 3.0).max(192.0);
+                        return Some((
+                            EntityBoundKind::Model,
+                            [half_xz, half_h, half_xz],
+                        ));
+                    }
+                }
+            }
+            Some((EntityBoundKind::MeshFallback, [256.0, 256.0, 256.0]))
+        }
+        NodeKind::SpawnPoint { .. } => Some((EntityBoundKind::SpawnPoint, [128.0, 256.0, 128.0])),
+        NodeKind::Light { .. } => Some((EntityBoundKind::Light, [128.0, 128.0, 128.0])),
+        NodeKind::Trigger { .. } => Some((EntityBoundKind::Trigger, [256.0, 256.0, 256.0])),
+        NodeKind::Portal { .. } => Some((EntityBoundKind::Portal, [256.0, 256.0, 64.0])),
+        NodeKind::AudioSource { .. } => Some((EntityBoundKind::AudioSource, [128.0, 128.0, 128.0])),
+    }
+}
+
 fn collect_room_options(project: &ProjectDocument) -> Vec<(NodeId, String)> {
     project
         .active_scene()
@@ -8542,6 +9546,19 @@ fn collect_model_options(project: &ProjectDocument) -> Vec<(ResourceId, String, 
                 r.name.clone(),
                 m.clips.iter().map(|c| c.name.clone()).collect(),
             )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect every Character resource as `(id, name)`. The
+/// player-spawn inspector uses this to populate its picker.
+fn collect_character_options(project: &ProjectDocument) -> Vec<(ResourceId, String)> {
+    project
+        .resources
+        .iter()
+        .filter_map(|r| match &r.data {
+            ResourceData::Character(_) => Some((r.id, r.name.clone())),
             _ => None,
         })
         .collect()
@@ -9064,6 +10081,60 @@ mod tests {
         assert!((node.transform.translation[0] - (start[0] + 1.0)).abs() < 0.001);
         assert!((node.transform.translation[2] - (start[2] + 0.5)).abs() < 0.001);
         assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn collect_entity_bounds_covers_starter_scene_entities() {
+        let workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let bounds = workspace.collect_entity_bounds(workspace.active_room_id());
+        assert!(
+            !bounds.is_empty(),
+            "starter scene should expose at least one selectable entity bound"
+        );
+        let scene = workspace.project.active_scene();
+        // Player Spawn always exists in the starter project; its
+        // bound should land in the active Room with a positive
+        // half-extent on every axis.
+        let spawn = scene
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::SpawnPoint { .. }))
+            .expect("starter has a SpawnPoint");
+        let spawn_bound = bounds
+            .iter()
+            .find(|b| b.node == spawn.id)
+            .expect("SpawnPoint bound was emitted");
+        assert!(matches!(
+            spawn_bound.kind,
+            EntityBoundKind::SpawnPoint
+        ));
+        assert!(spawn_bound.half_extents[0] > 0.0);
+        assert!(spawn_bound.half_extents[1] > 0.0);
+        assert!(spawn_bound.half_extents[2] > 0.0);
+    }
+
+    #[test]
+    fn pick_entity_bound_returns_node_when_ray_hits_centre() {
+        let workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let bounds = workspace.collect_entity_bounds(workspace.active_room_id());
+        let target = bounds
+            .iter()
+            .find(|b| matches!(b.kind, EntityBoundKind::SpawnPoint))
+            .copied()
+            .expect("starter SpawnPoint produces a bound");
+        // Cast a ray straight at the bound's centre from far
+        // outside it; ray_intersects_aabb is the primitive
+        // pick_entity_bound calls into.
+        let origin = [
+            target.center[0] - 4096.0,
+            target.center[1],
+            target.center[2],
+        ];
+        let dir = [1.0, 0.0, 0.0];
+        let t = ray_intersects_aabb(origin, dir, target.center, target.half_extents);
+        assert!(t.is_some(), "ray straight at bound centre must hit");
     }
 
     #[test]
