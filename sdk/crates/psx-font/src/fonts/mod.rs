@@ -9,16 +9,16 @@
 
 /// Built-in font: `basic` (U+0000..U+007F, 128 glyphs).
 pub mod basic;
-/// Built-in font: `ext_latin` (U+00A0..U+00FF, 96 glyphs).
-pub mod ext_latin;
-/// Built-in font: `boxdraw` (U+2500..U+257F, 128 glyphs).
-pub mod boxdraw;
 /// Built-in font: `basic_8x16` (U+0000..U+007F, 128 glyphs).
 pub mod basic_8x16;
+/// Built-in font: `boxdraw` (U+2500..U+257F, 128 glyphs).
+pub mod boxdraw;
+/// Built-in font: `ext_latin` (U+00A0..U+00FF, 96 glyphs).
+pub mod ext_latin;
 
 // Flat re-exports so call sites read as
 // `psx_font::fonts::BASIC` etc.
 pub use basic::BASIC;
-pub use ext_latin::EXT_LATIN;
-pub use boxdraw::BOXDRAW;
 pub use basic_8x16::BASIC_8X16;
+pub use boxdraw::BOXDRAW;
+pub use ext_latin::EXT_LATIN;

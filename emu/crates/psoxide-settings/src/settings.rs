@@ -125,7 +125,7 @@ pub struct Paths {
 /// because the loader materialises bindings from the RON file at
 /// runtime — a borrow couldn't satisfy serde's lifetime. In-flight
 /// cost at keypress is one `String::eq` per binding; negligible.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum InputBinding {
     /// A named key (ArrowUp, Enter, Escape, …). The frontend
     /// translates this into its key enum at input-event time.
@@ -135,13 +135,8 @@ pub enum InputBinding {
     /// Explicitly unbound — renders as blank in the UI. Useful for
     /// defaulting some pad buttons to "not yet assigned" without
     /// forcing a real key.
+    #[default]
     Unbound,
-}
-
-impl Default for InputBinding {
-    fn default() -> Self {
-        Self::Unbound
-    }
 }
 
 impl InputBinding {

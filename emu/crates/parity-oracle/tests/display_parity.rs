@@ -304,7 +304,7 @@ fn run_parity_suite(suite: &str, disc_path: Option<&str>, checkpoints: &[Checkpo
     let mut f = fs::File::create(&summary).expect("create summary");
     writeln!(f, "Parity suite: {}", suite).unwrap();
     writeln!(f, "Disc: {}", disc_path.unwrap_or("<none>")).unwrap();
-    writeln!(f, "").unwrap();
+    writeln!(f).unwrap();
     writeln!(
         f,
         "{:<20} {:>10} {:>10} {:>8} {:>7}  size_ok  first_diff",
@@ -334,7 +334,7 @@ fn run_parity_suite(suite: &str, disc_path: Option<&str>, checkpoints: &[Checkpo
         )
         .unwrap();
     }
-    writeln!(f, "").unwrap();
+    writeln!(f).unwrap();
     for r in &results {
         writeln!(
             f,

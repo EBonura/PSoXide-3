@@ -24,13 +24,21 @@ impl FrameBuffer {
     /// Create a framebuffer for the given active display size. Buffer
     /// A lives at VRAM Y=0, buffer B at Y=`height`.
     pub const fn new(width: u16, height: u16) -> Self {
-        Self { width, height, drawing: 0 }
+        Self {
+            width,
+            height,
+            drawing: 0,
+        }
     }
 
     /// Y-coordinate of buffer `idx` in VRAM.
     #[inline]
     pub const fn buffer_y(&self, idx: u8) -> u16 {
-        if idx == 0 { 0 } else { self.height }
+        if idx == 0 {
+            0
+        } else {
+            self.height
+        }
     }
 
     /// Push a display-start command for the buffer we're NOT currently
@@ -54,6 +62,14 @@ impl FrameBuffer {
 
     /// Clear the back-buffer (the one currently being drawn to) to `(r, g, b)`.
     pub fn clear(&self, r: u8, g: u8, b: u8) {
-        super::fill_rect(0, self.buffer_y(self.drawing), self.width, self.height, r, g, b);
+        super::fill_rect(
+            0,
+            self.buffer_y(self.drawing),
+            self.width,
+            self.height,
+            r,
+            g,
+            b,
+        );
     }
 }

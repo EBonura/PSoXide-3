@@ -132,7 +132,7 @@ impl Angle {
     /// a rotation-matrix constructor — `angle.as_q16() as u16` looks
     /// like it should work and will produce chaotic flips instead.
     pub const fn rotate_y_arg(self) -> u16 {
-        (self.0 >> 8) as u16
+        self.0 >> 8
     }
 
     /// Convert to the u16 that [`psx_math::sincos::sin_q12`] and

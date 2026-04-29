@@ -52,7 +52,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-use psx_io::spu::{SPU_BASE, SPUCNT, SPUSTAT};
+use psx_io::spu::{SPUCNT, SPUSTAT, SPU_BASE};
 
 pub mod tones;
 
@@ -265,12 +265,10 @@ pub struct SpuAddr(u32);
 impl SpuAddr {
     /// Build from a byte offset into SPU RAM. Panics if `addr`
     /// isn't a multiple of 8.
+    #[allow(clippy::manual_is_multiple_of)]
     pub const fn new(addr: u32) -> Self {
         assert!(addr % 8 == 0, "SpuAddr: addr must be multiple of 8");
-        assert!(
-            addr < 512 * 1024,
-            "SpuAddr: past end of 512 KiB SPU RAM",
-        );
+        assert!(addr < 512 * 1024, "SpuAddr: past end of 512 KiB SPU RAM",);
         Self(addr)
     }
 
@@ -490,7 +488,7 @@ pub fn set_main_volume(left: Volume, right: Volume) {
 /// 5. Wait for the transfer to drain (SPUSTAT bit 7 = transfer busy).
 pub fn upload_adpcm(dest: SpuAddr, bytes: &[u8]) {
     assert!(
-        bytes.len() % 2 == 0,
+        bytes.len().is_multiple_of(2),
         "upload_adpcm: byte slice must be a multiple of 2",
     );
     // Halt any in-flight transfer.

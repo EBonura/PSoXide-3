@@ -116,9 +116,8 @@ fn main() {
     let cmd_hist = bus.cdrom.command_histogram();
     println!();
     println!("command histogram:");
-    for i in 0..32 {
-        let c = cmd_hist[i];
-        if c > 0 {
+    for (i, c) in cmd_hist.iter().enumerate().take(32) {
+        if *c > 0 {
             println!("  0x{i:02X}: {c}");
         }
     }

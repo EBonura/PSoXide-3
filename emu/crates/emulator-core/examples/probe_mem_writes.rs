@@ -34,7 +34,6 @@ fn main() {
     }
     let target_addr: u32 = args
         .first()
-        .as_deref()
         .map(|s| parse_hex(s))
         .expect("usage: probe_mem_writes <addr> <up_to_step>");
     let up_to_step: u64 = args

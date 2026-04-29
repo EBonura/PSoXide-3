@@ -199,15 +199,7 @@ impl<const N: usize> ParticlePool<N> {
             let g = ((p.g as u16 * scale) / denom) as u8;
             let b = ((p.b as u16 * scale) / denom) as u8;
             let size = if (p.ttl as u16) * 2 > denom { 3 } else { 2 };
-            rects[written] = RectFlat::new(
-                p.x + shake.0,
-                p.y + shake.1,
-                size,
-                size,
-                r,
-                g,
-                b,
-            );
+            rects[written] = RectFlat::new(p.x + shake.0, p.y + shake.1, size, size, r, g, b);
             ot.add(z as usize, &mut rects[written], RectFlat::WORDS);
             written += 1;
         }
@@ -288,8 +280,8 @@ mod tests {
         pool.particles[0] = Particle {
             x: 10,
             y: 20,
-            vx: 32,  // Q4.4 = 2 px/frame
-            vy: 16,  // Q4.4 = 1 px/frame
+            vx: 32, // Q4.4 = 2 px/frame
+            vy: 16, // Q4.4 = 1 px/frame
             r: 0,
             g: 0,
             b: 0,

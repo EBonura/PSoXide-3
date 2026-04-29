@@ -189,8 +189,7 @@ fn bench_rasterizer_textured_quad() {
                                                       // Seed VRAM with random texels so sampling does work.
     for y in 0..256u16 {
         for x in 0..64u16 {
-            gpu.vram
-                .set_pixel(x, y, ((x as u16) ^ (y as u16)).wrapping_mul(0xACE1));
+            gpu.vram.set_pixel(x, y, (x ^ y).wrapping_mul(0xACE1));
         }
     }
     bench("1000 textured quads, 64x64 each, sampled 4bpp", 50, || {
@@ -201,13 +200,13 @@ fn bench_rasterizer_textured_quad() {
             let y1 = y0 + 63;
             gpu.gp0_push(0x2C808080); // 0x2C textured quad, raw flag set
             gpu.gp0_push((y0 as u32) << 16 | x0 as u32); // v0
-            gpu.gp0_push(0x0001_0000 | 0x0000); // uv0 + clut(=0x0001)
+            gpu.gp0_push(0x0001_0000); // uv0 + clut(=0x0001)
             gpu.gp0_push((y0 as u32) << 16 | x1 as u32); // v1
             gpu.gp0_push(0x0008_0000 | 0x003F); // uv1 + tpage
             gpu.gp0_push((y1 as u32) << 16 | x0 as u32); // v2
-            gpu.gp0_push(0x0000_0000 | 0x3F00); // uv2
+            gpu.gp0_push(0x3F00); // uv2
             gpu.gp0_push((y1 as u32) << 16 | x1 as u32); // v3
-            gpu.gp0_push(0x0000_0000 | 0x3F3F); // uv3
+            gpu.gp0_push(0x3F3F); // uv3
         }
     });
     eprintln!();

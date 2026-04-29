@@ -60,7 +60,7 @@ fn main() {
             "  bit0 sync_en={}  bit3 reset_at_target={}  bit4 irq_on_target={}  \
              bit5 irq_on_wrap={}  bit6 repeat={}  bit10 irq_active_low={}  \
              bit11 reached_target={}  bit12 reached_wrap={}",
-            (mode >> 0) & 1,
+            mode & 1,
             (mode >> 3) & 1,
             (mode >> 4) & 1,
             (mode >> 5) & 1,

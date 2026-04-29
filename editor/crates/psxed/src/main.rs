@@ -388,8 +388,7 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
         Vec::with_capacity(package.clips.len());
     for clip in &package.clips {
         let path = out_dir.join(format!("{name}_{}.psxanim", clip.sanitized_name));
-        std::fs::write(&path, &clip.bytes)
-            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        std::fs::write(&path, &clip.bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
         clip_paths.push((path, clip));
     }
 

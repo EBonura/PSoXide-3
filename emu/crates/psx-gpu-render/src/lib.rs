@@ -549,7 +549,7 @@ impl HwRenderer {
 }
 
 fn is_vram_image_op(entry: &GpuCmdLogEntry) -> bool {
-    matches!(entry.opcode, 0x80..=0x9F | 0xA0..=0xBF)
+    matches!(entry.opcode, 0x80..=0xBF)
 }
 
 fn bgr15_to_rgba8(pixel: u16) -> [u8; 4] {

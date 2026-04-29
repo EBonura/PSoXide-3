@@ -78,7 +78,7 @@ Splitting into separate workspaces lets the SDK target `mipsel-sony-psx` with `b
 ### Requirements
 
 - Rust stable (for `emu/` and root)
-- A PS1 BIOS image at `PSOXIDE_BIOS` (default: `/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN`)
+- A PS1 BIOS image configured in `settings.ron` or via `PSOXIDE_BIOS`
 - [PCSX-Redux](https://github.com/grumpycoders/pcsx-redux) built from source for parity testing (with patched-in `stepIn` / `runExecute` / `setQuietPauseResume` Lua bindings)
 
 ### Common commands

@@ -15,6 +15,22 @@ use crate::{
     MAX_WALL_STACK,
 };
 
+mod coords;
+mod encode;
+mod materials;
+mod validation;
+
+use coords::{
+    runtime_horizontal_heights, runtime_horizontal_split, runtime_wall_direction,
+    runtime_wall_heights,
+};
+use encode::encode_cooked_world_grid_psxw;
+use materials::material_slot;
+use validation::{
+    validate_grid_budget, validate_grid_shape, validate_no_duplicate_walls,
+    validate_quantized_heights, validate_wall_heights,
+};
+
 /// Authored grid face referenced by a cooker diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorldGridFaceKind {
@@ -378,13 +394,13 @@ pub struct CookedGridVerticalFace {
 /// Cooked wall lists for one sector.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CookedGridWalls {
-    /// Walls on the north edge.
+    /// Walls on the runtime north edge (`.psxw` North = -Z).
     pub north: Vec<CookedGridVerticalFace>,
-    /// Walls on the east edge.
+    /// Walls on the runtime east edge.
     pub east: Vec<CookedGridVerticalFace>,
-    /// Walls on the south edge.
+    /// Walls on the runtime south edge (`.psxw` South = +Z).
     pub south: Vec<CookedGridVerticalFace>,
-    /// Walls on the west edge.
+    /// Walls on the runtime west edge.
     pub west: Vec<CookedGridVerticalFace>,
     /// Diagonal NW-SE walls.
     pub north_west_south_east: Vec<CookedGridVerticalFace>,
@@ -441,6 +457,22 @@ impl CookedWorldGrid {
         self.sectors.iter().flatten().count()
     }
 
+    /// Number of cooked wall records across all sectors.
+    pub fn wall_count(&self) -> u16 {
+        self.sectors
+            .iter()
+            .flatten()
+            .map(|sector| {
+                sector.walls.north.len()
+                    + sector.walls.east.len()
+                    + sector.walls.south.len()
+                    + sector.walls.west.len()
+                    + sector.walls.north_west_south_east.len()
+                    + sector.walls.north_east_south_west.len()
+            })
+            .sum::<usize>() as u16
+    }
+
     /// Encode this cooked grid into the `.psxw` byte layout.
     pub fn to_psxw_bytes(&self) -> Result<Vec<u8>, WorldGridCookError> {
         encode_cooked_world_grid_psxw(self)
@@ -491,237 +523,6 @@ pub fn encode_world_grid_psxw(
     grid: &WorldGrid,
 ) -> Result<Vec<u8>, WorldGridCookError> {
     cook_world_grid(project, grid)?.to_psxw_bytes()
-}
-
-fn validate_grid_shape(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
-    if grid.sector_size != world::SECTOR_SIZE {
-        return Err(WorldGridCookError::UnsupportedSectorSize {
-            expected: world::SECTOR_SIZE,
-            actual: grid.sector_size,
-        });
-    }
-    if grid.width == 0 || grid.depth == 0 {
-        return Err(WorldGridCookError::InvalidDimensions {
-            width: grid.width,
-            depth: grid.depth,
-        });
-    }
-    let expected = grid.width as usize * grid.depth as usize;
-    if grid.sectors.len() != expected {
-        return Err(WorldGridCookError::SectorStorageLenMismatch {
-            expected,
-            actual: grid.sectors.len(),
-        });
-    }
-    Ok(())
-}
-
-/// Enforce the runtime caps the inspector surfaces. Cooker and
-/// inspector now share `WorldGridBudget::over_budget` semantics:
-/// what the editor warned about will fail at cook time.
-fn validate_grid_budget(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
-    if grid.width > MAX_ROOM_WIDTH {
-        return Err(WorldGridCookError::RoomDimensionExceeded {
-            axis: 'X',
-            value: grid.width,
-            limit: MAX_ROOM_WIDTH,
-        });
-    }
-    if grid.depth > MAX_ROOM_DEPTH {
-        return Err(WorldGridCookError::RoomDimensionExceeded {
-            axis: 'Z',
-            value: grid.depth,
-            limit: MAX_ROOM_DEPTH,
-        });
-    }
-    // Per-edge wall stack — caught at the source rather than
-    // after wall records have been laid out, so the error
-    // message points at the authored sector.
-    for x in 0..grid.width {
-        for z in 0..grid.depth {
-            let Some(sector) = grid.sector(x, z) else {
-                continue;
-            };
-            for direction in [
-                GridDirection::North,
-                GridDirection::East,
-                GridDirection::South,
-                GridDirection::West,
-            ] {
-                let count = sector.walls.get(direction).len();
-                if count > MAX_WALL_STACK as usize {
-                    return Err(WorldGridCookError::WallStackExceeded {
-                        x,
-                        z,
-                        direction,
-                        count,
-                        limit: MAX_WALL_STACK as usize,
-                    });
-                }
-            }
-        }
-    }
-    let budget = grid.budget();
-    if budget.triangles > MAX_ROOM_TRIANGLES {
-        return Err(WorldGridCookError::RoomTriangleBudgetExceeded {
-            triangles: budget.triangles,
-            limit: MAX_ROOM_TRIANGLES,
-        });
-    }
-    if budget.psxw_v1_bytes > MAX_ROOM_BYTES {
-        return Err(WorldGridCookError::RoomByteBudgetExceeded {
-            bytes: budget.psxw_v1_bytes,
-            limit: MAX_ROOM_BYTES,
-        });
-    }
-    Ok(())
-}
-
-/// Reject duplicate physical walls. The wall between cells
-/// `(x, z)` and `(x+1, z)` is the same vertical face whether
-/// it's authored as `East(x, z)` or `West(x+1, z)`. Authoring
-/// both would double-render and double-collide, so the cooker
-/// fails loud and points at both cells. A future "low-index-
-/// cell wins" normalization pass is fine but should be an
-/// explicit, opted-in cooker step.
-fn validate_no_duplicate_walls(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
-    use std::collections::HashMap;
-
-    // Each entry: which (x, z, dir) was the first to claim a
-    // given physical edge. Diagonals don't share with anyone
-    // (and the cooker rejects them anyway via cook_walls), so
-    // they don't enter the map.
-    let mut claims: HashMap<PhysicalEdge, (u16, u16, GridDirection)> = HashMap::new();
-    for x in 0..grid.width {
-        for z in 0..grid.depth {
-            let Some(sector) = grid.sector(x, z) else {
-                continue;
-            };
-            for direction in [
-                GridDirection::North,
-                GridDirection::East,
-                GridDirection::South,
-                GridDirection::West,
-            ] {
-                if sector.walls.get(direction).is_empty() {
-                    continue;
-                }
-                let Some(edge) = canonical_edge(x, z, direction) else {
-                    continue;
-                };
-                if let Some(&(other_x, other_z, other_direction)) = claims.get(&edge) {
-                    return Err(WorldGridCookError::DuplicatePhysicalWall {
-                        x,
-                        z,
-                        direction,
-                        other_x,
-                        other_z,
-                        other_direction,
-                    });
-                }
-                claims.insert(edge, (x, z, direction));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The vertical face between two cells, addressed canonically
-/// so opposing-cell descriptions collide on insert.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PhysicalEdge {
-    x: i32,
-    z: i32,
-    axis: EdgeAxis,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum EdgeAxis {
-    /// Edge runs north-south (separates two cells across the X
-    /// axis): West / East walls land here.
-    NorthSouth,
-    /// Edge runs east-west (separates across Z): North / South
-    /// walls land here.
-    EastWest,
-}
-
-fn canonical_edge(x: u16, z: u16, dir: GridDirection) -> Option<PhysicalEdge> {
-    match dir {
-        GridDirection::North => Some(PhysicalEdge {
-            x: x as i32,
-            z: z as i32,
-            axis: EdgeAxis::EastWest,
-        }),
-        GridDirection::South => Some(PhysicalEdge {
-            x: x as i32,
-            z: z as i32 + 1,
-            axis: EdgeAxis::EastWest,
-        }),
-        GridDirection::West => Some(PhysicalEdge {
-            x: x as i32,
-            z: z as i32,
-            axis: EdgeAxis::NorthSouth,
-        }),
-        GridDirection::East => Some(PhysicalEdge {
-            x: x as i32 + 1,
-            z: z as i32,
-            axis: EdgeAxis::NorthSouth,
-        }),
-        GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => None,
-    }
-}
-
-/// Reject any authored vertex height that isn't a multiple of
-/// [`HEIGHT_QUANTUM`]. The editor snaps every drag through
-/// `snap_height`, so values that survive to here come from
-/// programmatic writes, hand-edited RON, or projects authored
-/// before the quantum landed. Catching them at cook time keeps
-/// the runtime free of jitter the snap was meant to remove.
-fn validate_quantized_heights(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
-    for x in 0..grid.width {
-        for z in 0..grid.depth {
-            let Some(sector) = grid.sector(x, z) else {
-                continue;
-            };
-            if let Some(face) = &sector.floor {
-                check_face_heights(x, z, WorldGridFaceKind::Floor, &face.heights)?;
-            }
-            if let Some(face) = &sector.ceiling {
-                check_face_heights(x, z, WorldGridFaceKind::Ceiling, &face.heights)?;
-            }
-            for direction in [
-                GridDirection::North,
-                GridDirection::East,
-                GridDirection::South,
-                GridDirection::West,
-            ] {
-                for wall in sector.walls.get(direction) {
-                    check_face_heights(x, z, WorldGridFaceKind::Wall(direction), &wall.heights)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn check_face_heights(
-    x: u16,
-    z: u16,
-    face: WorldGridFaceKind,
-    heights: &[i32; 4],
-) -> Result<(), WorldGridCookError> {
-    for &h in heights {
-        if h % HEIGHT_QUANTUM != 0 {
-            return Err(WorldGridCookError::HeightNotQuantized {
-                x,
-                z,
-                face,
-                value: h,
-                quantum: HEIGHT_QUANTUM,
-            });
-        }
-    }
-    Ok(())
 }
 
 fn cook_sector(
@@ -812,8 +613,8 @@ fn cook_horizontal_face(
         return Err(WorldGridCookError::TriangleFaceNotSupported { x, z, face: kind });
     }
     Ok(CookedGridHorizontalFace {
-        heights: face.heights,
-        split: face.split,
+        heights: runtime_horizontal_heights(face.heights),
+        split: runtime_horizontal_split(face.split),
         material: material_slot(
             project,
             face.material,
@@ -840,10 +641,7 @@ fn cook_walls(
     // (so authoring + serialization works), but render / pick /
     // collision aren't consistent yet — better to refuse to
     // cook than ship half-supported geometry.
-    for direction in [
-        GridDirection::NorthWestSouthEast,
-        GridDirection::NorthEastSouthWest,
-    ] {
+    for direction in GridDirection::DIAGONAL {
         if !walls.get(direction).is_empty() {
             return Err(WorldGridCookError::UnsupportedDiagonalWall { x, z, direction });
         }
@@ -853,12 +651,7 @@ fn cook_walls(
     // already rejected upstream by `validate_no_duplicate_walls`
     // — by the time we reach this loop the grid is guaranteed
     // to claim each physical edge from at most one side.
-    for direction in [
-        GridDirection::North,
-        GridDirection::East,
-        GridDirection::South,
-        GridDirection::West,
-    ] {
+    for direction in GridDirection::CARDINAL {
         for wall in walls.get(direction) {
             if wall.is_triangle() {
                 return Err(WorldGridCookError::TriangleFaceNotSupported {
@@ -877,254 +670,17 @@ fn cook_walls(
                 materials,
                 material_slots,
             )?;
-            cooked.get_mut(direction).push(CookedGridVerticalFace {
-                heights: wall.heights,
-                material,
-                solid: wall.solid,
-            });
+            let runtime_direction = runtime_wall_direction(direction);
+            cooked
+                .get_mut(runtime_direction)
+                .push(CookedGridVerticalFace {
+                    heights: runtime_wall_heights(wall.heights),
+                    material,
+                    solid: wall.solid,
+                });
         }
     }
     Ok(cooked)
-}
-
-fn validate_wall_heights(
-    wall: &GridVerticalFace,
-    x: u16,
-    z: u16,
-    direction: GridDirection,
-) -> Result<(), WorldGridCookError> {
-    let left_valid = wall.heights[world::WALL_TOP_LEFT] >= wall.heights[world::WALL_BOTTOM_LEFT];
-    let right_valid = wall.heights[world::WALL_TOP_RIGHT] >= wall.heights[world::WALL_BOTTOM_RIGHT];
-    if left_valid && right_valid {
-        Ok(())
-    } else {
-        Err(WorldGridCookError::InvalidWallHeights {
-            x,
-            z,
-            direction,
-            heights: wall.heights,
-        })
-    }
-}
-
-fn material_slot(
-    project: &ProjectDocument,
-    material: Option<ResourceId>,
-    x: u16,
-    z: u16,
-    face: WorldGridFaceKind,
-    materials: &mut Vec<CookedWorldMaterial>,
-    material_slots: &mut HashMap<ResourceId, u16>,
-) -> Result<u16, WorldGridCookError> {
-    let id = material.ok_or(WorldGridCookError::UnassignedMaterial { x, z, face })?;
-    if let Some(slot) = material_slots.get(&id).copied() {
-        return Ok(slot);
-    }
-
-    let resource = project
-        .resources
-        .iter()
-        .find(|resource| resource.id == id)
-        .ok_or(WorldGridCookError::MissingMaterial { id })?;
-    let ResourceData::Material(material) = &resource.data else {
-        return Err(WorldGridCookError::ResourceIsNotMaterial { id });
-    };
-    if materials.len() >= u16::MAX as usize {
-        return Err(WorldGridCookError::TooManyMaterials {
-            count: materials.len() + 1,
-        });
-    }
-
-    let slot = materials.len() as u16;
-    materials.push(CookedWorldMaterial::from_resource(slot, id, material));
-    material_slots.insert(id, slot);
-    Ok(slot)
-}
-
-fn encode_cooked_world_grid_psxw(cooked: &CookedWorldGrid) -> Result<Vec<u8>, WorldGridCookError> {
-    if cooked.sectors.len() > u16::MAX as usize {
-        return Err(WorldGridCookError::TooManySectors {
-            count: cooked.sectors.len(),
-        });
-    }
-    if cooked.materials.len() > u16::MAX as usize {
-        return Err(WorldGridCookError::TooManyMaterials {
-            count: cooked.materials.len(),
-        });
-    }
-
-    let mut sector_records = Vec::with_capacity(cooked.sectors.len() * world::SectorRecord::SIZE);
-    let mut wall_records = Vec::new();
-
-    for sector in &cooked.sectors {
-        let first_wall_index = wall_records.len() / world::WallRecord::SIZE;
-        let first_wall = checked_u16(
-            first_wall_index,
-            WorldGridCookError::TooManyWalls {
-                count: first_wall_index,
-            },
-        )?;
-        let wall_start = wall_records.len() / world::WallRecord::SIZE;
-        if let Some(sector) = sector {
-            encode_sector_walls(sector, &mut wall_records)?;
-        }
-        let wall_end = wall_records.len() / world::WallRecord::SIZE;
-        let wall_count = checked_u16(
-            wall_end - wall_start,
-            WorldGridCookError::TooManyWalls {
-                count: wall_end - wall_start,
-            },
-        )?;
-        encode_sector_record(sector.as_ref(), first_wall, wall_count, &mut sector_records);
-    }
-
-    let wall_record_count = wall_records.len() / world::WallRecord::SIZE;
-
-    let payload_len = world::WorldHeader::SIZE + sector_records.len() + wall_records.len();
-    if payload_len > u32::MAX as usize {
-        return Err(WorldGridCookError::EncodedWorldTooLarge { bytes: payload_len });
-    }
-
-    let mut out = Vec::with_capacity(psxed_format::AssetHeader::SIZE + payload_len);
-    out.extend_from_slice(&world::MAGIC);
-    out.extend_from_slice(&world::VERSION.to_le_bytes());
-    out.extend_from_slice(&world::flags::RESERVED.to_le_bytes());
-    out.extend_from_slice(&(payload_len as u32).to_le_bytes());
-
-    out.extend_from_slice(&cooked.width.to_le_bytes());
-    out.extend_from_slice(&cooked.depth.to_le_bytes());
-    out.extend_from_slice(&cooked.sector_size.to_le_bytes());
-    out.extend_from_slice(&(cooked.sectors.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(cooked.materials.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(wall_record_count as u16).to_le_bytes());
-    out.extend_from_slice(&cooked.ambient_color);
-    out.push(if cooked.fog_enabled {
-        world::world_flags::FOG_ENABLED
-    } else {
-        0
-    });
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&sector_records);
-    out.extend_from_slice(&wall_records);
-    Ok(out)
-}
-
-fn checked_u16(value: usize, error: WorldGridCookError) -> Result<u16, WorldGridCookError> {
-    if value > u16::MAX as usize {
-        Err(error)
-    } else {
-        Ok(value as u16)
-    }
-}
-
-fn encode_sector_record(
-    sector: Option<&CookedGridSector>,
-    first_wall: u16,
-    wall_count: u16,
-    out: &mut Vec<u8>,
-) {
-    let mut flags = 0u8;
-    let mut floor_split = world::split::NORTH_WEST_SOUTH_EAST;
-    let mut ceiling_split = world::split::NORTH_WEST_SOUTH_EAST;
-    let mut floor_material = world::NO_MATERIAL;
-    let mut ceiling_material = world::NO_MATERIAL;
-    let mut floor_heights = [0; 4];
-    let mut ceiling_heights = [0; 4];
-
-    if let Some(sector) = sector {
-        if let Some(floor) = sector.floor {
-            flags |= world::sector_flags::HAS_FLOOR;
-            if floor.walkable {
-                flags |= world::sector_flags::FLOOR_WALKABLE;
-            }
-            floor_split = split_id(floor.split);
-            floor_material = floor.material;
-            floor_heights = floor.heights;
-        }
-        if let Some(ceiling) = sector.ceiling {
-            flags |= world::sector_flags::HAS_CEILING;
-            if ceiling.walkable {
-                flags |= world::sector_flags::CEILING_WALKABLE;
-            }
-            ceiling_split = split_id(ceiling.split);
-            ceiling_material = ceiling.material;
-            ceiling_heights = ceiling.heights;
-        }
-    }
-
-    out.push(flags);
-    out.push(floor_split);
-    out.push(ceiling_split);
-    out.push(0);
-    out.extend_from_slice(&floor_material.to_le_bytes());
-    out.extend_from_slice(&ceiling_material.to_le_bytes());
-    out.extend_from_slice(&first_wall.to_le_bytes());
-    out.extend_from_slice(&wall_count.to_le_bytes());
-    for height in floor_heights {
-        out.extend_from_slice(&height.to_le_bytes());
-    }
-    for height in ceiling_heights {
-        out.extend_from_slice(&height.to_le_bytes());
-    }
-}
-
-fn encode_sector_walls(
-    sector: &CookedGridSector,
-    out: &mut Vec<u8>,
-) -> Result<(), WorldGridCookError> {
-    for (direction, walls) in [
-        (GridDirection::North, sector.walls.north.as_slice()),
-        (GridDirection::East, sector.walls.east.as_slice()),
-        (GridDirection::South, sector.walls.south.as_slice()),
-        (GridDirection::West, sector.walls.west.as_slice()),
-        (
-            GridDirection::NorthWestSouthEast,
-            sector.walls.north_west_south_east.as_slice(),
-        ),
-        (
-            GridDirection::NorthEastSouthWest,
-            sector.walls.north_east_south_west.as_slice(),
-        ),
-    ] {
-        for wall in walls {
-            if out.len() / world::WallRecord::SIZE >= u16::MAX as usize {
-                return Err(WorldGridCookError::TooManyWalls {
-                    count: (out.len() / world::WallRecord::SIZE) + 1,
-                });
-            }
-            out.push(direction_id(direction));
-            out.push(if wall.solid {
-                world::wall_flags::SOLID
-            } else {
-                0
-            });
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&wall.material.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            for height in wall.heights {
-                out.extend_from_slice(&height.to_le_bytes());
-            }
-        }
-    }
-    Ok(())
-}
-
-const fn split_id(split: GridSplit) -> u8 {
-    match split {
-        GridSplit::NorthWestSouthEast => world::split::NORTH_WEST_SOUTH_EAST,
-        GridSplit::NorthEastSouthWest => world::split::NORTH_EAST_SOUTH_WEST,
-    }
-}
-
-const fn direction_id(direction: GridDirection) -> u8 {
-    match direction {
-        GridDirection::North => world::direction::NORTH,
-        GridDirection::East => world::direction::EAST,
-        GridDirection::South => world::direction::SOUTH,
-        GridDirection::West => world::direction::WEST,
-        GridDirection::NorthWestSouthEast => world::direction::NORTH_WEST_SOUTH_EAST,
-        GridDirection::NorthEastSouthWest => world::direction::NORTH_EAST_SOUTH_WEST,
-    }
 }
 
 #[cfg(test)]
@@ -1144,6 +700,23 @@ mod tests {
             .expect("starter project should contain a room")
     }
 
+    fn first_floor_material(grid: &WorldGrid) -> ResourceId {
+        grid.sectors
+            .iter()
+            .flatten()
+            .find_map(|sector| sector.floor.as_ref()?.material)
+            .expect("starter floor has material")
+    }
+
+    fn first_populated_cooked_sector(cooked: &CookedWorldGrid) -> &CookedGridSector {
+        cooked
+            .sectors
+            .iter()
+            .flatten()
+            .next()
+            .expect("starter has populated sector")
+    }
+
     #[test]
     fn cooks_starter_grid_to_material_slots() {
         let project = ProjectDocument::starter();
@@ -1151,29 +724,76 @@ mod tests {
 
         let cooked = cook_world_grid(&project, &grid).unwrap();
 
-        assert_eq!(cooked.width, 3);
-        assert_eq!(cooked.depth, 3);
+        assert_eq!(cooked.width, grid.width);
+        assert_eq!(cooked.depth, grid.depth);
         assert_eq!(cooked.sector_size, world::SECTOR_SIZE);
-        assert_eq!(cooked.populated_sector_count(), 9);
+        assert_eq!(
+            cooked.populated_sector_count(),
+            grid.populated_sector_count()
+        );
         assert_eq!(cooked.materials.len(), 2);
         assert_eq!(cooked.materials[0].slot, 0);
         assert_eq!(cooked.materials[1].slot, 1);
-        assert!(cooked.sectors[0].as_ref().unwrap().floor.is_some());
-        assert_eq!(
-            cooked.sectors[0].as_ref().unwrap().floor.unwrap().material,
-            0
+        let first_sector = first_populated_cooked_sector(&cooked);
+        assert!(first_sector.floor.is_some());
+        assert_eq!(first_sector.floor.unwrap().material, 0);
+        let walls = &first_sector.walls;
+        let first_wall_material = [
+            walls.north.as_slice(),
+            walls.east.as_slice(),
+            walls.south.as_slice(),
+            walls.west.as_slice(),
+        ]
+        .into_iter()
+        .find_map(|walls| walls.first())
+        .map(|wall| wall.material);
+        assert_eq!(first_wall_material, Some(1));
+    }
+
+    #[test]
+    fn cook_flips_horizontal_faces_to_runtime_z_convention() {
+        let project = ProjectDocument::starter();
+        let material = first_floor_material(&starter_grid(&project));
+        let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
+        grid.set_floor(0, 0, 0, Some(material));
+        let floor = grid
+            .sector_mut(0, 0)
+            .and_then(|sector| sector.floor.as_mut())
+            .expect("floor exists");
+        floor.heights = [32, 64, 96, 128];
+        floor.split = GridSplit::NorthWestSouthEast;
+
+        let cooked = cook_world_grid(&project, &grid).unwrap();
+        let cooked_floor = cooked.sectors[0].as_ref().unwrap().floor.unwrap();
+
+        assert_eq!(cooked_floor.heights, [128, 96, 64, 32]);
+        assert_eq!(cooked_floor.split, GridSplit::NorthEastSouthWest);
+    }
+
+    #[test]
+    fn cook_flips_cardinal_walls_to_runtime_convention() {
+        let project = ProjectDocument::starter();
+        let material = first_floor_material(&starter_grid(&project));
+        let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
+        grid.add_wall(
+            0,
+            0,
+            GridDirection::North,
+            0,
+            world::SECTOR_SIZE,
+            Some(material),
         );
-        assert_eq!(
-            cooked.sectors[0]
-                .as_ref()
-                .unwrap()
-                .walls
-                .north
-                .first()
-                .unwrap()
-                .material,
-            1
-        );
+        let wall = grid
+            .sector_mut(0, 0)
+            .and_then(|sector| sector.walls.get_mut(GridDirection::North).first_mut())
+            .expect("north wall exists");
+        wall.heights = [32, 64, 96, 128];
+
+        let cooked = cook_world_grid(&project, &grid).unwrap();
+        let cooked_walls = &cooked.sectors[0].as_ref().unwrap().walls;
+
+        assert!(cooked_walls.north.is_empty());
+        assert_eq!(cooked_walls.south[0].heights, [64, 32, 128, 96]);
     }
 
     #[test]
@@ -1272,8 +892,22 @@ mod tests {
         assert_eq!(world.material_count() as usize, cooked.materials.len());
 
         // Sector (0,0) — the starter has a floor + perimeter walls
-        // here, so this exercises both decoded paths.
-        let sector = world.sector(0, 0).expect("starter (0,0) populated");
+        // in its first populated cell, so this exercises both
+        // decoded paths without assuming a fixed starter shape.
+        let (sx, sz, _) = cooked
+            .sectors
+            .iter()
+            .enumerate()
+            .find_map(|(index, sector)| {
+                let sector = sector.as_ref()?;
+                Some((
+                    (index / cooked.depth as usize) as u16,
+                    (index % cooked.depth as usize) as u16,
+                    sector,
+                ))
+            })
+            .expect("starter has populated sector");
+        let sector = world.sector(sx, sz).expect("starter sector populated");
         assert!(sector.has_floor());
         assert!(sector.wall_count() > 0);
     }
@@ -1325,7 +959,7 @@ mod tests {
     fn rejects_excessive_wall_stacks() {
         let project = ProjectDocument::starter();
         let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
-        for _ in 0..(MAX_WALL_STACK as usize + 1) {
+        for _ in 0..(MAX_WALL_STACK + 1) {
             grid.add_wall(0, 0, GridDirection::North, 0, world::SECTOR_SIZE, None);
         }
         match cook_world_grid(&project, &grid) {
@@ -1338,8 +972,8 @@ mod tests {
             }) => {
                 assert_eq!((x, z), (0, 0));
                 assert_eq!(direction, GridDirection::North);
-                assert_eq!(count, MAX_WALL_STACK as usize + 1);
-                assert_eq!(limit, MAX_WALL_STACK as usize);
+                assert_eq!(count, MAX_WALL_STACK + 1);
+                assert_eq!(limit, MAX_WALL_STACK);
             }
             other => panic!("expected WallStackExceeded, got {other:?}"),
         }
@@ -1368,6 +1002,34 @@ mod tests {
                 assert_eq!(
                     (other_x, other_z, other_direction),
                     (0, 0, GridDirection::East)
+                );
+            }
+            other => panic!("expected DuplicatePhysicalWall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_physical_walls_on_editor_north_south_edges() {
+        // Editor convention is North=+Z and South=-Z. These two
+        // authored records both claim the edge between rows 0 and 1.
+        let project = ProjectDocument::starter();
+        let mut grid = WorldGrid::empty(1, 2, world::SECTOR_SIZE);
+        grid.add_wall(0, 0, GridDirection::North, 0, world::SECTOR_SIZE, None);
+        grid.add_wall(0, 1, GridDirection::South, 0, world::SECTOR_SIZE, None);
+
+        match cook_world_grid(&project, &grid) {
+            Err(WorldGridCookError::DuplicatePhysicalWall {
+                x,
+                z,
+                direction,
+                other_x,
+                other_z,
+                other_direction,
+            }) => {
+                assert_eq!((x, z, direction), (0, 1, GridDirection::South));
+                assert_eq!(
+                    (other_x, other_z, other_direction),
+                    (0, 0, GridDirection::North)
                 );
             }
             other => panic!("expected DuplicatePhysicalWall, got {other:?}"),
@@ -1480,6 +1142,7 @@ mod tests {
     fn encodes_starter_grid_as_psxw_blob() {
         let project = ProjectDocument::starter();
         let grid = starter_grid(&project);
+        let cooked = cook_world_grid(&project, &grid).unwrap();
 
         let bytes = encode_world_grid_psxw(&project, &grid).unwrap();
 
@@ -1492,10 +1155,13 @@ mod tests {
         );
 
         let header = psxed_format::AssetHeader::SIZE;
-        assert_eq!(u16::from_le_bytes([bytes[header], bytes[header + 1]]), 3);
+        assert_eq!(
+            u16::from_le_bytes([bytes[header], bytes[header + 1]]),
+            grid.width
+        );
         assert_eq!(
             u16::from_le_bytes([bytes[header + 2], bytes[header + 3]]),
-            3
+            grid.depth
         );
         assert_eq!(
             i32::from_le_bytes([
@@ -1508,18 +1174,24 @@ mod tests {
         );
         assert_eq!(
             u16::from_le_bytes([bytes[header + 8], bytes[header + 9]]),
-            9
+            grid.width * grid.depth
         );
         assert_eq!(
             u16::from_le_bytes([bytes[header + 10], bytes[header + 11]]),
-            2
+            cooked.materials.len() as u16
         );
         assert_eq!(
             u16::from_le_bytes([bytes[header + 12], bytes[header + 13]]),
-            12
+            cooked.wall_count()
         );
 
-        let sector = header + world::WorldHeader::SIZE;
+        let first_sector_index = cooked
+            .sectors
+            .iter()
+            .position(|sector| sector.is_some())
+            .expect("starter has populated sector");
+        let sector =
+            header + world::WorldHeader::SIZE + first_sector_index * world::SectorRecord::SIZE;
         assert_eq!(
             bytes[sector],
             world::sector_flags::HAS_FLOOR | world::sector_flags::FLOOR_WALKABLE

@@ -41,10 +41,16 @@ use alloc::vec::Vec;
 /// One cooked sector = 2048 bytes of user data.
 pub const SECTOR_SIZE: usize = 2048;
 
-/// One raw CD-ROM sector = 2352 bytes (12 sync + 4 header + 8 subheader
-/// + 2048 user data + 280 EDC/ECC). PSoXide's emulator CDROM path
-/// expects raw sectors; external emulators accept either cooked .iso
-/// or raw .bin.
+/// One raw CD-ROM sector = 2352 bytes:
+///
+/// - 12 sync bytes
+/// - 4 header bytes
+/// - 8 subheader bytes
+/// - 2048 user-data bytes
+/// - 280 EDC/ECC bytes
+///
+/// PSoXide's emulator CDROM path expects raw sectors; external
+/// emulators accept either cooked .iso or raw .bin.
 pub const RAW_SECTOR_SIZE: usize = 2352;
 
 /// Fixed ISO 9660 date used for every volume / file timestamp. Games

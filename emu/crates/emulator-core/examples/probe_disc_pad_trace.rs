@@ -362,13 +362,15 @@ fn dump_trace(bus: &Bus) {
 
     let filtered: Vec<_> = entries
         .into_iter()
-        .filter(|e| match (e.addr - Sio0::BASE, e.kind) {
-            (0x0, MmioKind::R8 | MmioKind::R16 | MmioKind::R32) => true,
-            (0x0, MmioKind::W8 | MmioKind::W16 | MmioKind::W32) => true,
-            (0xA, MmioKind::W16 | MmioKind::W32) => true,
-            (0x8, MmioKind::W16 | MmioKind::W32) => true,
-            (0xE, MmioKind::W16 | MmioKind::W32) => true,
-            _ => false,
+        .filter(|e| {
+            matches!(
+                (e.addr - Sio0::BASE, e.kind),
+                (0x0, MmioKind::R8 | MmioKind::R16 | MmioKind::R32)
+                    | (0x0, MmioKind::W8 | MmioKind::W16 | MmioKind::W32)
+                    | (0xA, MmioKind::W16 | MmioKind::W32)
+                    | (0x8, MmioKind::W16 | MmioKind::W32)
+                    | (0xE, MmioKind::W16 | MmioKind::W32)
+            )
         })
         .collect();
     if filtered.is_empty() {

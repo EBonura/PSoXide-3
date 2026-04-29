@@ -34,6 +34,8 @@ use psoxide_settings::{
 };
 use psx_iso::{Disc, Exe};
 
+use crate::app::resolve_bios_path;
+
 /// Top-level argument parser. Passed to `clap::Parser::parse()`
 /// from `main.rs`.
 #[derive(Debug, Parser)]
@@ -250,7 +252,7 @@ fn cmd_list(paths: &ConfigPaths) -> Result<(), String> {
     }
     // Sort alphabetically by title for stable output.
     let mut sorted = lib.entries.clone();
-    sorted.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    sorted.sort_by_key(|a| a.title.to_lowercase());
     for e in &sorted {
         println!(
             "{:<16}  {:<10}  {:<7}  {:>8} MiB  {}",
@@ -285,14 +287,8 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
         }
     };
 
-    // BIOS: settings override if set, else env var, else DEFAULT.
-    let bios_path = if !settings.paths.bios.is_empty() {
-        PathBuf::from(&settings.paths.bios)
-    } else if let Ok(p) = std::env::var("PSOXIDE_BIOS") {
-        PathBuf::from(p)
-    } else {
-        PathBuf::from("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN")
-    };
+    // BIOS: settings override if set, else PSOXIDE_BIOS.
+    let bios_path = resolve_bios_path(&settings)?;
 
     let bios =
         std::fs::read(&bios_path).map_err(|e| format!("BIOS {}: {e}", bios_path.display()))?;

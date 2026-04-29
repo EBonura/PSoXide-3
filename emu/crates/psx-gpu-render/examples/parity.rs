@@ -185,7 +185,9 @@ fn main() {
     ));
     report.push_str(&format!("size:    {cpu_w}x{cpu_h} ({total_px} px)\n"));
     report.push_str(&format!("tolerance: {tolerance} LSB/channel\n"));
-    report.push_str(&format!("mismatched: {mismatched}/{total_px} ({mismatch_pct:.3}%)\n"));
+    report.push_str(&format!(
+        "mismatched: {mismatched}/{total_px} ({mismatch_pct:.3}%)\n"
+    ));
     report.push_str(&format!(
         "mean delta: r={mean_dr:.2} g={mean_dg:.2} b={mean_db:.2}\n"
     ));

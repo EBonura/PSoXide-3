@@ -48,6 +48,14 @@ use psx_level::{
 };
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
+mod input;
+mod overlay;
+mod vram_upload;
+
+use input::*;
+use overlay::*;
+use vram_upload::*;
+
 // Placeholder manifests reference unused statics; populated
 // manifests reference all of them. Quiet either side here.
 #[allow(dead_code, unused_imports)]
@@ -114,7 +122,7 @@ const CAMERA_YAW_STEP: u16 = 12;
 const MOVE_STICK_DEADZONE: i16 = 18;
 const STICK_MAX: i16 = 127;
 const CAMERA_STICK_DEADZONE: i16 = 18;
-const CAMERA_STICK_YAW_STEP: i16 = 24;
+const CAMERA_STICK_YAW_STEP: i16 = 42;
 const CAMERA_HEIGHT_STICK_STEP: i32 = 18;
 const CAMERA_HEIGHT_OFFSET_MIN: i32 = -512;
 const CAMERA_HEIGHT_OFFSET_MAX: i32 = 768;
@@ -826,149 +834,6 @@ impl Playtest {
     }
 }
 
-fn motor_input(ctx: &Ctx, camera_yaw_q12: u16) -> CharacterMotorInput {
-    let (strafe, forward) = local_move_axes(ctx);
-    let (move_x_q12, move_z_q12, walk) =
-        camera_relative_move_q12(strafe, forward, camera_yaw_q12);
-
-    CharacterMotorInput {
-        turn: 0,
-        walk,
-        move_x_q12,
-        move_z_q12,
-        sprint: ctx.is_held(RUN_BUTTON),
-        evade: false,
-    }
-}
-
-fn local_move_axes(ctx: &Ctx) -> (i16, i16) {
-    let (left_x, left_y) = ctx.pad.sticks.left_centered();
-    let stick_mag = isqrt(left_x as i64 * left_x as i64 + left_y as i64 * left_y as i64);
-    if stick_mag > MOVE_STICK_DEADZONE as i64 {
-        return (left_x.clamp(-STICK_MAX, STICK_MAX), (-left_y).clamp(-STICK_MAX, STICK_MAX));
-    }
-
-    let mut strafe = 0i16;
-    let mut forward = 0i16;
-    if ctx.is_held(button::RIGHT) {
-        strafe += STICK_MAX;
-    }
-    if ctx.is_held(button::LEFT) {
-        strafe -= STICK_MAX;
-    }
-    if ctx.is_held(button::UP) {
-        forward += STICK_MAX;
-    }
-    if ctx.is_held(button::DOWN) {
-        forward -= STICK_MAX;
-    }
-    (strafe, forward)
-}
-
-fn camera_relative_move_q12(
-    strafe: i16,
-    forward: i16,
-    camera_yaw_q12: u16,
-) -> (i16, i16, i8) {
-    let mag = isqrt(strafe as i64 * strafe as i64 + forward as i64 * forward as i64);
-    if mag <= MOVE_STICK_DEADZONE as i64 {
-        return (0, 0, 0);
-    }
-    let clamped_mag = mag.min(STICK_MAX as i64);
-    let scaled_mag_q12 =
-        ((clamped_mag - MOVE_STICK_DEADZONE as i64) * 4096)
-            / (STICK_MAX - MOVE_STICK_DEADZONE) as i64;
-    let local_strafe_q12 = (strafe as i64 * scaled_mag_q12 / mag) as i32;
-    let local_forward_q12 = (forward as i64 * scaled_mag_q12 / mag) as i32;
-
-    let forward_yaw = camera_yaw_q12.wrapping_add(HALF_TURN_Q12);
-    let right_yaw = forward_yaw.wrapping_sub(1024);
-    let world_x = (((sin_1_3_12(forward_yaw) as i32) * local_forward_q12)
-        + ((sin_1_3_12(right_yaw) as i32) * local_strafe_q12))
-        >> 12;
-    let world_z = (((cos_1_3_12(forward_yaw) as i32) * local_forward_q12)
-        + ((cos_1_3_12(right_yaw) as i32) * local_strafe_q12))
-        >> 12;
-    let walk = if forward < -MOVE_STICK_DEADZONE {
-        -1
-    } else if forward > MOVE_STICK_DEADZONE {
-        1
-    } else {
-        0
-    };
-    (clamp_i16(world_x), clamp_i16(world_z), walk)
-}
-
-fn player_anim_from_motor(anim: CharacterMotorAnim) -> PlayerAnim {
-    match anim {
-        CharacterMotorAnim::Idle => PlayerAnim::Idle,
-        CharacterMotorAnim::Walk => PlayerAnim::Walk,
-        CharacterMotorAnim::Run => PlayerAnim::Run,
-        CharacterMotorAnim::Roll => PlayerAnim::Run,
-        CharacterMotorAnim::Backstep => PlayerAnim::Walk,
-    }
-}
-
-fn camera_input(ctx: &Ctx) -> ThirdPersonCameraInput {
-    let (right_x, _) = ctx.pad.sticks.right_centered();
-    ThirdPersonCameraInput {
-        yaw_delta_q12: stick_to_yaw_delta(right_x),
-        recenter: ctx.is_held(button::L1),
-    }
-}
-
-fn stick_to_yaw_delta(axis: i16) -> i16 {
-    stick_axis_delta(axis, CAMERA_STICK_YAW_STEP)
-}
-
-fn stick_to_radius_delta(axis: i16) -> i32 {
-    stick_axis_delta(axis, CAMERA_RADIUS_STEP as i16) as i32
-}
-
-fn stick_to_height_delta(axis: i16) -> i32 {
-    stick_axis_delta(axis, CAMERA_HEIGHT_STICK_STEP as i16) as i32
-}
-
-fn stick_axis_delta(axis: i16, max_step: i16) -> i16 {
-    let magnitude = abs_i16(axis);
-    if magnitude <= CAMERA_STICK_DEADZONE {
-        return 0;
-    }
-    let sign = if axis < 0 { -1 } else { 1 };
-    let effective = magnitude.saturating_sub(CAMERA_STICK_DEADZONE) as i32;
-    let range = (STICK_MAX - CAMERA_STICK_DEADZONE) as i32;
-    (sign * effective * max_step as i32 / range) as i16
-}
-
-fn add_signed_q12(angle: u16, delta: i16) -> u16 {
-    ((angle as i32 + delta as i32) & 0x0FFF) as u16
-}
-
-fn clamp_i16(value: i32) -> i16 {
-    value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
-}
-
-fn abs_i16(value: i16) -> i16 {
-    if value == i16::MIN {
-        i16::MAX
-    } else if value < 0 {
-        -value
-    } else {
-        value
-    }
-}
-
-fn distance_xz_sq(a: WorldVertex, b: WorldVertex) -> i64 {
-    let dx = (a.x - b.x) as i64;
-    let dz = (a.z - b.z) as i64;
-    dx * dx + dz * dz
-}
-
-/// Render the player using the same `submit_textured_model`
-/// path placed model instances use. `clip_local` is an index
-/// into the Character's model's clip slice; the cooker
-/// validates it lands in-range before we get here.
-#[allow(clippy::too_many_arguments)]
 fn draw_player(
     character: RuntimeCharacter,
     x: i32,
@@ -1595,44 +1460,6 @@ fn draw_entity_markers(
     }
 }
 
-fn draw_analog_required_prompt(font: &FontAtlas) {
-    const BOX_X0: i16 = 32;
-    const BOX_Y0: i16 = (SCREEN_H - 64) / 2;
-    const BOX_X1: i16 = 288;
-    const BOX_Y1: i16 = BOX_Y0 + 64;
-    draw_quad_flat(
-        [
-            (BOX_X0, BOX_Y0),
-            (BOX_X1, BOX_Y0),
-            (BOX_X0, BOX_Y1),
-            (BOX_X1, BOX_Y1),
-        ],
-        18,
-        20,
-        28,
-    );
-    draw_quad_flat(
-        [
-            (BOX_X0 - 2, BOX_Y0 - 2),
-            (BOX_X1 + 2, BOX_Y0 - 2),
-            (BOX_X0 - 2, BOX_Y0),
-            (BOX_X1 + 2, BOX_Y0),
-        ],
-        120,
-        130,
-        160,
-    );
-    draw_centered_text(font, 104, "ANALOG MODE REQUIRED", (245, 245, 255));
-    draw_centered_text(font, 121, "TURN ON ANALOG MODE", (200, 220, 245));
-    draw_centered_text(font, 134, "TO START PLAYTEST", (200, 220, 245));
-}
-
-fn draw_centered_text(font: &FontAtlas, y: i16, text: &str, tint: (u8, u8, u8)) {
-    let width = font.text_width(text) as i16;
-    let x = (SCREEN_W - width) / 2;
-    font.draw_text(x, y, text, tint);
-}
-
 #[no_mangle]
 fn main() -> ! {
     let mut scene = Playtest::new();
@@ -1641,26 +1468,4 @@ fn main() -> ! {
         ..Config::default()
     };
     App::run(config, &mut scene);
-}
-
-/// Stamp the 0x8000 (semi-transparency-disable) bit on every
-/// non-zero CLUT entry so opaque textures don't accidentally
-/// trigger STP-bit blending.
-fn upload_clut(rect: VramRect, bytes: &[u8]) {
-    let mut marked = [0u8; 512];
-    if bytes.len() > marked.len() || !bytes.len().is_multiple_of(2) {
-        return;
-    }
-
-    let mut i = 0;
-    while i < bytes.len() {
-        let raw = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
-        let stamped = if raw == 0 { 0 } else { raw | 0x8000 };
-        let pair = stamped.to_le_bytes();
-        marked[i] = pair[0];
-        marked[i + 1] = pair[1];
-        i += 2;
-    }
-
-    upload_bytes(rect, &marked[..bytes.len()]);
 }

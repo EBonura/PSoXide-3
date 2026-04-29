@@ -143,7 +143,11 @@ fn main() {
         let gpu_h = fnv1a_64(bytemuck::cast_slice(&gpu_words));
         eprintln!(
             "[bisect] post-warmup: cpu=0x{cpu_h:016x} gpu=0x{gpu_h:016x} {}",
-            if cpu_h == gpu_h { "OK" } else { "ALREADY DIVERGED — narrow --steps" },
+            if cpu_h == gpu_h {
+                "OK"
+            } else {
+                "ALREADY DIVERGED — narrow --steps"
+            },
         );
         if cpu_h != gpu_h {
             std::process::exit(1);
@@ -268,9 +272,7 @@ fn main() {
             for (idx, c, g) in bad {
                 let x = idx % 1024;
                 let y = idx / 1024;
-                eprintln!(
-                    "    vram({x:>4},{y:>3}) cpu=0x{c:04x} gpu=0x{g:04x}",
-                );
+                eprintln!("    vram({x:>4},{y:>3}) cpu=0x{c:04x} gpu=0x{g:04x}",);
             }
             break;
         }
@@ -303,9 +305,7 @@ fn main() {
             } else {
                 format!("#{} (in window)", own)
             };
-            eprintln!(
-                "  vram({x:>4},{y:>3}) cpu=0x{c:04x} gpu=0x{g:04x} owner={own_str}",
-            );
+            eprintln!("  vram({x:>4},{y:>3}) cpu=0x{c:04x} gpu=0x{g:04x} owner={own_str}",);
         }
     }
 }

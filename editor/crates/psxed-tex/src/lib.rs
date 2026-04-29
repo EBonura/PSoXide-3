@@ -32,7 +32,7 @@
 //! std::fs::write("brick-wall.psxt", psxt).unwrap();
 //! ```
 
-use image::{DynamicImage, GenericImageView, imageops};
+use image::{imageops, DynamicImage, GenericImageView};
 use psxed_format::texture::{Depth, TextureHeader, MAGIC, VERSION};
 use psxed_format::AssetHeader;
 
@@ -103,22 +103,17 @@ pub struct Config {
 }
 
 /// How the cooker should handle source aspect vs target aspect.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub enum CropMode {
     /// Centre-crop to the largest square that fits — the default.
     /// Guarantees no aspect distortion for arbitrary-aspect sources.
+    #[default]
     CentreSquare,
     /// Use the caller-specified rect.
     Explicit(CropRect),
     /// No crop — resize-stretch the full source. Produces distorted
     /// output for non-square sources.
     None,
-}
-
-impl Default for CropMode {
-    fn default() -> Self {
-        CropMode::CentreSquare
-    }
 }
 
 /// Errors the cooker can surface.
@@ -210,10 +205,7 @@ fn encode_psxt(
 ) -> Result<Vec<u8>, Error> {
     // Collect pixels as RGB triples (alpha is dropped; the PSX mask
     // bit is a separate concern we don't expose yet).
-    let pixels: Vec<[u8; 3]> = img
-        .pixels()
-        .map(|p| [p[0], p[1], p[2]])
-        .collect();
+    let pixels: Vec<[u8; 3]> = img.pixels().map(|p| [p[0], p[1], p[2]]).collect();
 
     match depth {
         Depth::Bit4 | Depth::Bit8 => {
@@ -260,7 +252,7 @@ fn encode_psxt(
 /// sorts — so repeated builds produce byte-identical PSXT blobs.
 fn median_cut_quantize(pixels: &[[u8; 3]], n_entries: usize) -> (Vec<[u8; 3]>, Vec<u8>) {
     assert!(
-        n_entries.is_power_of_two() && n_entries >= 2 && n_entries <= 256,
+        n_entries.is_power_of_two() && (2..=256).contains(&n_entries),
         "n_entries must be a power of two in [2, 256]"
     );
 
@@ -340,11 +332,7 @@ fn widest_axis(b: &[[u8; 3]]) -> (usize, u32) {
         hi[1] as u32 - lo[1] as u32,
         hi[2] as u32 - lo[2] as u32,
     ];
-    let (i, &r) = ranges
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, r)| *r)
-        .unwrap();
+    let (i, &r) = ranges.iter().enumerate().max_by_key(|(_, r)| *r).unwrap();
     (i, r)
 }
 
@@ -527,8 +515,7 @@ mod tests {
     #[test]
     fn quantiser_exactly_n_entries_when_enough_colours() {
         // 16 distinct greys → median-cut should produce ~16 entries.
-        let pixels: Vec<[u8; 3]> =
-            (0..16).map(|i| [i * 16, i * 16, i * 16]).collect();
+        let pixels: Vec<[u8; 3]> = (0..16).map(|i| [i * 16, i * 16, i * 16]).collect();
         let (palette, indices) = median_cut_quantize(&pixels, 16);
         assert_eq!(palette.len(), 16);
         assert_eq!(indices.len(), 16);
@@ -544,10 +531,7 @@ mod tests {
         {
             let img = image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([255, 0, 0, 255]));
             image::DynamicImage::ImageRgba8(img)
-                .write_to(
-                    &mut std::io::Cursor::new(&mut buf),
-                    image::ImageFormat::Png,
-                )
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
                 .unwrap();
         }
         let cfg = Config {
@@ -567,8 +551,11 @@ mod tests {
         assert_eq!(u16::from_le_bytes([psxt[14], psxt[15]]), 4); // width
         assert_eq!(u16::from_le_bytes([psxt[16], psxt[17]]), 4); // height
         assert_eq!(u16::from_le_bytes([psxt[18], psxt[19]]), 16); // clut_entries
-        // pixel_bytes = halfwords_per_row(4bpp, 4) × height × 2 = 1 × 4 × 2 = 8
-        assert_eq!(u32::from_le_bytes([psxt[20], psxt[21], psxt[22], psxt[23]]), 8);
+                                                                  // pixel_bytes = halfwords_per_row(4bpp, 4) × height × 2 = 1 × 4 × 2 = 8
+        assert_eq!(
+            u32::from_le_bytes([psxt[20], psxt[21], psxt[22], psxt[23]]),
+            8
+        );
         // clut_bytes = 16 × 2 = 32
         assert_eq!(
             u32::from_le_bytes([psxt[24], psxt[25], psxt[26], psxt[27]]),

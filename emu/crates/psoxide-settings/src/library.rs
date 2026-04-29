@@ -991,11 +991,7 @@ mod tests {
              got entries: {:?}",
             lib.entries.iter().map(|e| &e.path).collect::<Vec<_>>(),
         );
-        assert!(lib.entries[0]
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map_or(false, |n| n == "hello-tri.exe"),);
+        assert!(lib.entries[0].path.file_name().and_then(|n| n.to_str()) == Some("hello-tri.exe"),);
     }
 
     #[test]

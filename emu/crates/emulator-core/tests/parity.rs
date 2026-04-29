@@ -226,23 +226,23 @@ fn first_divergence(
                 ));
             }
         }
-        for r in 0..32 {
+        for (r, name) in COP2_DATA_NAMES.iter().enumerate() {
             if us.cop2_data[r] != them.cop2_data[r] {
                 lines.push(format!(
                     "  cop2d[{r:<2}] {name:<5}: ours=0x{:08x}  theirs=0x{:08x}",
                     us.cop2_data[r],
                     them.cop2_data[r],
-                    name = COP2_DATA_NAMES[r],
+                    name = name,
                 ));
             }
         }
-        for r in 0..32 {
+        for (r, name) in COP2_CTL_NAMES.iter().enumerate() {
             if us.cop2_ctl[r] != them.cop2_ctl[r] {
                 lines.push(format!(
                     "  cop2c[{r:<2}] {name:<7}: ours=0x{:08x}  theirs=0x{:08x}",
                     us.cop2_ctl[r],
                     them.cop2_ctl[r],
-                    name = COP2_CTL_NAMES[r],
+                    name = name,
                 ));
             }
         }

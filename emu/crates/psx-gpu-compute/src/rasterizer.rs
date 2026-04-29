@@ -1726,6 +1726,12 @@ fn _phantom_zeroable<T: Zeroable + Pod>() -> T {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::manual_range_contains,
+        clippy::too_many_arguments,
+        clippy::unnecessary_cast
+    )]
+
     use super::*;
     use emulator_core::Gpu;
 

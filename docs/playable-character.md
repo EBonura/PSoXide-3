@@ -126,16 +126,11 @@ player at startup:
 
 Per-frame update:
 
-- D-pad LEFT / RIGHT: yaw player at `turn_speed`.
-- D-pad UP / DOWN: walk forward / back at `walk_speed`.
-- CROSS held while moving forward: switch to `run_speed` while
-  stamina is available. If the
-  character has a run clip, `Run` animation; otherwise the
-  walk animation plays at run speed.
-- CIRCLE pressed: start an evasive roll; CIRCLE while backing up
-  starts a shorter backstep. These expose motor flags for
-  invulnerability / recovery, while reusing existing walk/run clips
-  until authored evade clips exist.
+- Left stick, or D-pad as fallback: camera-relative movement.
+- No movement: `Idle` animation.
+- Normal movement: `Walk` animation at `walk_speed`.
+- CIRCLE held while moving: `Run` animation at `run_speed`. If the
+  character has no run clip, the walk animation plays at run speed.
 - SELECT: toggle a free-orbit debug camera.
 - Right stick: manual third-person camera orbit when the pad is in
   analog mode.
@@ -154,7 +149,7 @@ floor — coarse but enough to keep the player inside the room until
 proper capsule sliding lands. The committed Y position follows the
 sampled floor height under the player's root.
 
-Animation state: `Idle` / `Walk` / `Run` / `Roll` / `Backstep`.
+Animation state for editor-playtest is currently `Idle` / `Walk` / `Run`.
 State changes reset the animation phase so transitions don't pop
 into the middle of a clip.
 

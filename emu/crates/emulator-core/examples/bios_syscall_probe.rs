@@ -150,7 +150,7 @@ fn main() {
             .filter(|(_, &c)| c > 0)
             .map(|(i, &c)| (i as u8, c))
             .collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        pairs.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
         let total: u64 = pairs.iter().map(|(_, c)| c).sum();
         println!("{}-functions ({total} calls):", labels[t]);
         for (op, c) in pairs.iter().take(20) {

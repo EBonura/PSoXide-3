@@ -40,6 +40,8 @@
 //! - Per vertex: 2 MTC2 + 1 RTPS + 2 MTC2 + 1 MTC2 + 1 NCCS + 3
 //!   MFC2 ≈ 10 GTE ops, ~30-40 cycles total.
 
+#![allow(clippy::needless_range_loop)]
+
 use crate::math::{Mat3I16, Vec3I16, Vec3I32};
 use crate::scene;
 use crate::{mfc2, mtc2, ops};
@@ -143,11 +145,7 @@ impl LightRig {
         scene::load_light_colour_matrix(&lcm);
 
         // BK: ambient term.
-        scene::load_background_colour(Vec3I32::new(
-            self.ambient.0,
-            self.ambient.1,
-            self.ambient.2,
-        ));
+        scene::load_background_colour(Vec3I32::new(self.ambient.0, self.ambient.1, self.ambient.2));
     }
 
     /// Return a new rig with every light's direction rotated into
@@ -404,11 +402,7 @@ fn unpack_projected(sxy: u32, sz: u16, rgb: u32) -> ProjectedLit {
 ///   ([`scene::set_projection_plane`], [`scene::set_screen_offset`])
 /// - Light rig loaded ([`LightRig::load`], with `for_object`
 ///   applied so lights are in the same frame as the normal)
-pub fn project_lit(
-    vert: Vec3I16,
-    normal: Vec3I16,
-    material: (u8, u8, u8),
-) -> ProjectedLit {
+pub fn project_lit(vert: Vec3I16, normal: Vec3I16, material: (u8, u8, u8)) -> ProjectedLit {
     // --- Position: RTPS ---
     mtc2!(0, vert.xy_packed());
     mtc2!(1, vert.z_packed());
@@ -441,4 +435,3 @@ pub fn project_lit(
         b: ((lit >> 16) & 0xFF) as u8,
     }
 }
-

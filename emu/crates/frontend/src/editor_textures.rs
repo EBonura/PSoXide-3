@@ -164,7 +164,11 @@ impl EditorTextures {
                 continue;
             };
             let signature = texture_path(project, material).unwrap_or_default();
-            if self.cache.get(&resource.id).is_some_and(|entry| entry.signature == signature) {
+            if self
+                .cache
+                .get(&resource.id)
+                .is_some_and(|entry| entry.signature == signature)
+            {
                 continue;
             }
             if self.next_tpage > 15 || self.next_clut_x + 16 > VRAM_WIDTH as u16 {
@@ -174,13 +178,8 @@ impl EditorTextures {
             let slot = self
                 .upload_real_psxt(&signature, project_root)
                 .unwrap_or_else(|| self.upload_procedural(&resource.name));
-            self.cache.insert(
-                resource.id,
-                CacheEntry {
-                    slot,
-                    signature,
-                },
-            );
+            self.cache
+                .insert(resource.id, CacheEntry { slot, signature });
         }
     }
 
@@ -227,9 +226,8 @@ impl EditorTextures {
             for hw in 0..halfwords_per_row {
                 let off = (row * halfwords_per_row + hw) * 2;
                 let word = u16::from_le_bytes([pixel_bytes[off], pixel_bytes[off + 1]]);
-                let vram_idx = (tpage_y as usize + row) * VRAM_WIDTH as usize
-                    + tpage_x as usize
-                    + hw;
+                let vram_idx =
+                    (tpage_y as usize + row) * VRAM_WIDTH as usize + tpage_x as usize + hw;
                 self.vram[vram_idx] = word;
             }
         }
@@ -256,8 +254,7 @@ impl EditorTextures {
                 // black. Mirroring keeps editor + runtime visuals
                 // identical.
                 let marked = if raw == 0 { 0 } else { raw | 0x8000 };
-                let vram_idx =
-                    (clut_y as usize) * VRAM_WIDTH as usize + clut_x as usize + i;
+                let vram_idx = (clut_y as usize) * VRAM_WIDTH as usize + clut_x as usize + i;
                 self.vram[vram_idx] = marked;
             }
         }
@@ -305,14 +302,12 @@ impl EditorTextures {
         let halfwords_per_row = 16usize;
         for row in 0..64usize {
             for hw in 0..halfwords_per_row {
-                let p0 = pixels[row * 64 + hw * 4 + 0] & 0x0F;
+                let p0 = pixels[row * 64 + hw * 4] & 0x0F;
                 let p1 = pixels[row * 64 + hw * 4 + 1] & 0x0F;
                 let p2 = pixels[row * 64 + hw * 4 + 2] & 0x0F;
                 let p3 = pixels[row * 64 + hw * 4 + 3] & 0x0F;
-                let word = (p0 as u16)
-                    | ((p1 as u16) << 4)
-                    | ((p2 as u16) << 8)
-                    | ((p3 as u16) << 12);
+                let word =
+                    (p0 as u16) | ((p1 as u16) << 4) | ((p2 as u16) << 8) | ((p3 as u16) << 12);
                 let vram_idx =
                     (tpage_y as usize + row) * VRAM_WIDTH as usize + tpage_x as usize + hw;
                 self.vram[vram_idx] = word;
@@ -359,10 +354,8 @@ impl EditorTextures {
                 self.model_cache.remove(&resource.id);
                 continue;
             };
-            self.model_cache.insert(
-                resource.id,
-                ModelAtlasCacheEntry { slot, signature },
-            );
+            self.model_cache
+                .insert(resource.id, ModelAtlasCacheEntry { slot, signature });
         }
     }
 
@@ -402,7 +395,7 @@ impl EditorTextures {
             return None;
         }
         let aligned_tpage_x = align_up_to(self.next_model_tpage_x, HALFWORDS_PER_TPAGE);
-        if aligned_tpage_x as u32 + HALFWORDS_PER_TPAGE as u32 > VRAM_WIDTH as u32 {
+        if aligned_tpage_x as u32 + HALFWORDS_PER_TPAGE as u32 > VRAM_WIDTH {
             return None;
         }
         if self.next_model_clut_y as usize >= VRAM_HEIGHT as usize {
@@ -420,9 +413,8 @@ impl EditorTextures {
             for hw in 0..halfwords_per_row as usize {
                 let off = (row * halfwords_per_row as usize + hw) * 2;
                 let word = u16::from_le_bytes([pixel_bytes[off], pixel_bytes[off + 1]]);
-                let vram_idx = (tpage_y as usize + row) * VRAM_WIDTH as usize
-                    + tpage_x as usize
-                    + hw;
+                let vram_idx =
+                    (tpage_y as usize + row) * VRAM_WIDTH as usize + tpage_x as usize + hw;
                 self.vram[vram_idx] = word;
             }
         }
@@ -532,10 +524,8 @@ fn brick_pattern() -> ProceduralTexture {
         for x in 0..64 {
             let local_y = y % 8;
             let local_x = (x + row_offset) % 16;
-            let nibble = if local_y == 0 || local_y == 7 {
-                0 // horizontal mortar
-            } else if local_x == 0 || local_x == 15 {
-                0 // vertical mortar
+            let nibble = if local_y == 0 || local_y == 7 || local_x == 0 || local_x == 15 {
+                0 // mortar
             } else if local_y == 1 || local_x == 1 || local_x == 14 {
                 2 // brick edge shadow
             } else if local_y == 6 {

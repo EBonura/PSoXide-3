@@ -19,6 +19,8 @@
 //! - Vectors: **1.3.12** `i16`; accumulator outputs are `i32` in MAC
 //!   or `i16` in IR post-saturation.
 
+#![allow(clippy::needless_range_loop)]
+
 use crate::math::{Mat3I16, Vec3I16};
 
 /// Quarter-sine table — 65 entries (indices 0..=64) covering angles

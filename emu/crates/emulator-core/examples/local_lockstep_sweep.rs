@@ -623,6 +623,7 @@ fn compare_visual(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_framebuffers(
     ours: &[u8],
     ow: u32,
@@ -721,11 +722,7 @@ fn parse_screenshot_meta(meta: &str) -> (u32, u32, u32, usize) {
 
 fn bytes_per_pixel(bytes: &[u8], w: u32, h: u32) -> usize {
     let pixels = w as usize * h as usize;
-    if pixels == 0 {
-        1
-    } else {
-        (bytes.len() / pixels).max(1)
-    }
+    bytes.len().checked_div(pixels).unwrap_or(0).max(1)
 }
 
 fn write_mask_ppm(
@@ -875,7 +872,7 @@ fn write_index_summary(cfg: &Config, results: &[GameResult]) {
     let mut file = fs::File::create(&path).expect("create index summary");
     writeln!(file, "steps: {}", cfg.steps).unwrap();
     writeln!(file, "interval: {}", cfg.interval).unwrap();
-    writeln!(file, "").unwrap();
+    writeln!(file).unwrap();
     writeln!(file, "{:<44} {:<6} {:<6} disc", "game", "cpu", "visual").unwrap();
     for r in results {
         writeln!(

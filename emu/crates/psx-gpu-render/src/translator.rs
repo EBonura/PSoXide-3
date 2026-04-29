@@ -866,6 +866,7 @@ impl Translator {
         self.push_tri(v10, v11, v01, color, kind);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_tex_rect(
         &mut self,
         cmd: u32,

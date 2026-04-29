@@ -490,7 +490,7 @@ fn stage_row(ui: &mut egui::Ui, label: &str, ms: f32, max_ms: f32) {
             .size(theme::FONT_SIZE_SMALL),
     );
 
-    let width = ui.available_width().min(240.0).max(80.0);
+    let width = ui.available_width().clamp(80.0, 240.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 9.0), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, theme::WIDGET_BG);

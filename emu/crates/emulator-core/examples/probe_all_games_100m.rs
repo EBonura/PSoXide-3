@@ -66,8 +66,8 @@ fn main() {
     );
     println!();
     println!(
-        "{:<14} {:>14} {:>20}  {}",
-        "game", "our_cycles", "display_hash", "match"
+        "{:<14} {:>14} {:>20}  match",
+        "game", "our_cycles", "display_hash"
     );
     println!("{}", "-".repeat(80));
     let mut all_pass = true;
@@ -75,10 +75,7 @@ fn main() {
         let mut bus = Bus::new(bios.clone()).expect("bus");
         if !disc_path.is_empty() {
             if !std::path::Path::new(disc_path).exists() {
-                println!(
-                    "{:<14} {:>14} {:>20}  {}",
-                    name, "-", "MISSING DISC", "skip"
-                );
+                println!("{:<14} {:>14} {:>20}  skip", name, "-", "MISSING DISC");
                 continue;
             }
             let disc = std::fs::read(disc_path).expect("disc readable");

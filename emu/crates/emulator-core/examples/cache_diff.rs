@@ -21,9 +21,9 @@ fn read_record(r: &mut BufReader<File>, idx: u64) -> (u64, u32, u32, [u32; 32]) 
     let pc = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let instr = u32::from_le_bytes(buf[12..16].try_into().unwrap());
     let mut gprs = [0u32; 32];
-    for i in 0..32 {
+    for (i, gpr) in gprs.iter_mut().enumerate() {
         let o = 16 + i * 4;
-        gprs[i] = u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+        *gpr = u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
     }
     (tick, pc, instr, gprs)
 }

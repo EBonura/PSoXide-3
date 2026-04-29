@@ -1,0 +1,191 @@
+//! Binary `.psxw` encoding for cooked world grids.
+
+use super::*;
+
+pub(super) fn encode_cooked_world_grid_psxw(
+    cooked: &CookedWorldGrid,
+) -> Result<Vec<u8>, WorldGridCookError> {
+    if cooked.sectors.len() > u16::MAX as usize {
+        return Err(WorldGridCookError::TooManySectors {
+            count: cooked.sectors.len(),
+        });
+    }
+    if cooked.materials.len() > u16::MAX as usize {
+        return Err(WorldGridCookError::TooManyMaterials {
+            count: cooked.materials.len(),
+        });
+    }
+
+    let mut sector_records = Vec::with_capacity(cooked.sectors.len() * world::SectorRecord::SIZE);
+    let mut wall_records = Vec::new();
+
+    for sector in &cooked.sectors {
+        let first_wall_index = wall_records.len() / world::WallRecord::SIZE;
+        let first_wall = checked_u16(
+            first_wall_index,
+            WorldGridCookError::TooManyWalls {
+                count: first_wall_index,
+            },
+        )?;
+        let wall_start = wall_records.len() / world::WallRecord::SIZE;
+        if let Some(sector) = sector {
+            encode_sector_walls(sector, &mut wall_records)?;
+        }
+        let wall_end = wall_records.len() / world::WallRecord::SIZE;
+        let wall_count = checked_u16(
+            wall_end - wall_start,
+            WorldGridCookError::TooManyWalls {
+                count: wall_end - wall_start,
+            },
+        )?;
+        encode_sector_record(sector.as_ref(), first_wall, wall_count, &mut sector_records);
+    }
+
+    let wall_record_count = wall_records.len() / world::WallRecord::SIZE;
+
+    let payload_len = world::WorldHeader::SIZE + sector_records.len() + wall_records.len();
+    if payload_len > u32::MAX as usize {
+        return Err(WorldGridCookError::EncodedWorldTooLarge { bytes: payload_len });
+    }
+
+    let mut out = Vec::with_capacity(psxed_format::AssetHeader::SIZE + payload_len);
+    out.extend_from_slice(&world::MAGIC);
+    out.extend_from_slice(&world::VERSION.to_le_bytes());
+    out.extend_from_slice(&world::flags::RESERVED.to_le_bytes());
+    out.extend_from_slice(&(payload_len as u32).to_le_bytes());
+
+    out.extend_from_slice(&cooked.width.to_le_bytes());
+    out.extend_from_slice(&cooked.depth.to_le_bytes());
+    out.extend_from_slice(&cooked.sector_size.to_le_bytes());
+    out.extend_from_slice(&(cooked.sectors.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(cooked.materials.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(wall_record_count as u16).to_le_bytes());
+    out.extend_from_slice(&cooked.ambient_color);
+    out.push(if cooked.fog_enabled {
+        world::world_flags::FOG_ENABLED
+    } else {
+        0
+    });
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&sector_records);
+    out.extend_from_slice(&wall_records);
+    Ok(out)
+}
+
+fn checked_u16(value: usize, error: WorldGridCookError) -> Result<u16, WorldGridCookError> {
+    if value > u16::MAX as usize {
+        Err(error)
+    } else {
+        Ok(value as u16)
+    }
+}
+
+fn encode_sector_record(
+    sector: Option<&CookedGridSector>,
+    first_wall: u16,
+    wall_count: u16,
+    out: &mut Vec<u8>,
+) {
+    let mut flags = 0u8;
+    let mut floor_split = world::split::NORTH_WEST_SOUTH_EAST;
+    let mut ceiling_split = world::split::NORTH_WEST_SOUTH_EAST;
+    let mut floor_material = world::NO_MATERIAL;
+    let mut ceiling_material = world::NO_MATERIAL;
+    let mut floor_heights = [0; 4];
+    let mut ceiling_heights = [0; 4];
+
+    if let Some(sector) = sector {
+        if let Some(floor) = sector.floor {
+            flags |= world::sector_flags::HAS_FLOOR;
+            if floor.walkable {
+                flags |= world::sector_flags::FLOOR_WALKABLE;
+            }
+            floor_split = split_id(floor.split);
+            floor_material = floor.material;
+            floor_heights = floor.heights;
+        }
+        if let Some(ceiling) = sector.ceiling {
+            flags |= world::sector_flags::HAS_CEILING;
+            if ceiling.walkable {
+                flags |= world::sector_flags::CEILING_WALKABLE;
+            }
+            ceiling_split = split_id(ceiling.split);
+            ceiling_material = ceiling.material;
+            ceiling_heights = ceiling.heights;
+        }
+    }
+
+    out.push(flags);
+    out.push(floor_split);
+    out.push(ceiling_split);
+    out.push(0);
+    out.extend_from_slice(&floor_material.to_le_bytes());
+    out.extend_from_slice(&ceiling_material.to_le_bytes());
+    out.extend_from_slice(&first_wall.to_le_bytes());
+    out.extend_from_slice(&wall_count.to_le_bytes());
+    for height in floor_heights {
+        out.extend_from_slice(&height.to_le_bytes());
+    }
+    for height in ceiling_heights {
+        out.extend_from_slice(&height.to_le_bytes());
+    }
+}
+
+fn encode_sector_walls(
+    sector: &CookedGridSector,
+    out: &mut Vec<u8>,
+) -> Result<(), WorldGridCookError> {
+    for (direction, walls) in [
+        (GridDirection::North, sector.walls.north.as_slice()),
+        (GridDirection::East, sector.walls.east.as_slice()),
+        (GridDirection::South, sector.walls.south.as_slice()),
+        (GridDirection::West, sector.walls.west.as_slice()),
+        (
+            GridDirection::NorthWestSouthEast,
+            sector.walls.north_west_south_east.as_slice(),
+        ),
+        (
+            GridDirection::NorthEastSouthWest,
+            sector.walls.north_east_south_west.as_slice(),
+        ),
+    ] {
+        for wall in walls {
+            if out.len() / world::WallRecord::SIZE >= u16::MAX as usize {
+                return Err(WorldGridCookError::TooManyWalls {
+                    count: (out.len() / world::WallRecord::SIZE) + 1,
+                });
+            }
+            out.push(direction_id(direction));
+            out.push(if wall.solid {
+                world::wall_flags::SOLID
+            } else {
+                0
+            });
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&wall.material.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            for height in wall.heights {
+                out.extend_from_slice(&height.to_le_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+const fn split_id(split: GridSplit) -> u8 {
+    match split {
+        GridSplit::NorthWestSouthEast => world::split::NORTH_WEST_SOUTH_EAST,
+        GridSplit::NorthEastSouthWest => world::split::NORTH_EAST_SOUTH_WEST,
+    }
+}
+
+const fn direction_id(direction: GridDirection) -> u8 {
+    match direction {
+        GridDirection::North => world::direction::NORTH,
+        GridDirection::East => world::direction::EAST,
+        GridDirection::South => world::direction::SOUTH,
+        GridDirection::West => world::direction::WEST,
+        GridDirection::NorthWestSouthEast => world::direction::NORTH_WEST_SOUTH_EAST,
+        GridDirection::NorthEastSouthWest => world::direction::NORTH_EAST_SOUTH_WEST,
+    }
+}

@@ -329,6 +329,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::collapsible_match)]
 fn print_entry(entry: &GpuCmdLogEntry) {
     let opcode = entry.opcode;
     let opname = match opcode {

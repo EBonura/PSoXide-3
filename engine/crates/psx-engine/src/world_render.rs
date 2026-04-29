@@ -166,6 +166,7 @@ pub fn draw_room<const OT: usize>(
 /// diagonal); `1` swaps to NE→SW so an authored sector with a
 /// rotated split renders the same triangulation the cooker +
 /// collision view see.
+#[allow(clippy::too_many_arguments)]
 fn emit_floor<const OT: usize>(
     sx: u16,
     sz: u16,
@@ -203,6 +204,7 @@ fn emit_floor<const OT: usize>(
 /// regardless of winding orientation. Once the cooker emits
 /// inward-facing winding consistently, this can flip to
 /// `CullMode::Back` for free.
+#[allow(clippy::too_many_arguments)]
 fn emit_ceiling<const OT: usize>(
     sx: u16,
     sz: u16,
@@ -239,6 +241,7 @@ fn emit_ceiling<const OT: usize>(
 /// the cell's edge endpoints by direction. Diagonal directions
 /// (4 / 5) silently drop — the cooker rejects them, so they
 /// shouldn't appear, but skipping is cheaper than panicking.
+#[allow(clippy::too_many_arguments)]
 fn emit_wall<const OT: usize>(
     sx: u16,
     sz: u16,
@@ -295,6 +298,7 @@ fn emit_wall<const OT: usize>(
 /// `submit_textured_quad` 0–2 diagonal. Walls always use this
 /// path because their geometry is rectangular and carries no
 /// authored split metadata.
+#[allow(clippy::too_many_arguments)]
 fn submit_quad<const OT: usize>(
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
@@ -392,6 +396,17 @@ const fn split_triangles(split: u8) -> [(usize, usize, usize); 2] {
     }
 }
 
+/// World-space bounds of a sector cell rooted at world `(0, 0)`.
+/// Returns `(x0, x1, z0, z1)` so individual quads can pick the
+/// corners they need by index.
+const fn cell_bounds(sx: u16, sz: u16, sector_size: i32) -> (i32, i32, i32, i32) {
+    let x0 = (sx as i32) * sector_size;
+    let x1 = ((sx as i32) + 1) * sector_size;
+    let z0 = (sz as i32) * sector_size;
+    let z1 = ((sz as i32) + 1) * sector_size;
+    (x0, x1, z0, z1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,15 +479,4 @@ mod tests {
             assert!(seen.iter().all(|&v| v), "split {split} misses a corner");
         }
     }
-}
-
-/// World-space bounds of a sector cell rooted at world `(0, 0)`.
-/// Returns `(x0, x1, z0, z1)` so individual quads can pick the
-/// corners they need by index.
-const fn cell_bounds(sx: u16, sz: u16, sector_size: i32) -> (i32, i32, i32, i32) {
-    let x0 = (sx as i32) * sector_size;
-    let x1 = ((sx as i32) + 1) * sector_size;
-    let z0 = (sz as i32) * sector_size;
-    let z1 = ((sz as i32) + 1) * sector_size;
-    (x0, x1, z0, z1)
 }

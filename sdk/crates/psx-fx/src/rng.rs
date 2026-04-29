@@ -21,6 +21,7 @@ impl LcgRng {
     /// One LCG step. Multiplier + increment are `glibc`'s constants.
     /// Returns the fresh internal state.
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> u32 {
         self.0 = self.0.wrapping_mul(1_103_515_245).wrapping_add(12345);
         self.0
@@ -61,7 +62,7 @@ mod tests {
         let mut rng = LcgRng::new(0xBEEF_0042);
         for _ in 0..10_000 {
             let v = rng.signed(40);
-            assert!(v >= -42 && v <= 40, "out of range: {v}");
+            assert!((-42..=40).contains(&v), "out of range: {v}");
         }
     }
 

@@ -514,13 +514,11 @@ impl Mdec {
                     }
                 }
             }
-            0x6 => {
+            0x6 if self.expected_param_words > 0 => {
                 // Cosine table — discard.
-                if self.expected_param_words > 0 {
-                    self.expected_param_words -= 1;
-                    if self.expected_param_words == 0 {
-                        self.reg1 &= !MDEC1_BUSY;
-                    }
+                self.expected_param_words -= 1;
+                if self.expected_param_words == 0 {
+                    self.reg1 &= !MDEC1_BUSY;
                 }
             }
             _ => {}
@@ -561,7 +559,7 @@ impl Mdec {
         // how many params we've seen so far. params_seen is just a
         // counter; we track quant progress separately via
         // `expected_param_words` going from 32 → 0.
-        let total_expected = (self.reg0 & 0xFFFF) as u32;
+        let total_expected = self.reg0 & 0xFFFF;
         let words_delivered = (total_expected - self.expected_param_words) as usize;
         for (byte_index, &b) in bytes.iter().enumerate() {
             let pos = words_delivered * 4 + byte_index;
@@ -782,9 +780,9 @@ fn idct(block: &mut [i32; DSIZE2], used_col: i32) {
         let tmp5 = muls(z11 - z13, fix_1_414213562()) - tmp6;
         let tmp4 = scale(z12 * fix_1_082392200() - z5, AAN_CONST_BITS) + tmp5;
 
-        block[0 * DSIZE + i] = tmp0 + tmp7;
+        block[i] = tmp0 + tmp7;
         block[7 * DSIZE + i] = tmp0 - tmp7;
-        block[1 * DSIZE + i] = tmp1 + tmp6;
+        block[DSIZE + i] = tmp1 + tmp6;
         block[6 * DSIZE + i] = tmp1 - tmp6;
         block[2 * DSIZE + i] = tmp2 + tmp5;
         block[5 * DSIZE + i] = tmp2 - tmp5;
@@ -823,7 +821,7 @@ fn idct(block: &mut [i32; DSIZE2], used_col: i32) {
             let tmp5 = muls(z11 - z13, fix_1_414213562()) - tmp6;
             let tmp4 = scale(z12 * fix_1_082392200() - z5, AAN_CONST_BITS) + tmp5;
 
-            block[base + 0] = tmp0 + tmp7;
+            block[base] = tmp0 + tmp7;
             block[base + 7] = tmp0 - tmp7;
             block[base + 1] = tmp1 + tmp6;
             block[base + 6] = tmp1 - tmp6;
@@ -974,7 +972,7 @@ fn yuv_to_rgb24(
                     let r = clamp8(scale8(y_val + r_contrib));
                     let g = clamp8(scale8(y_val + g_contrib));
                     let b = clamp8(scale8(y_val + b_contrib));
-                    image[pixel_idx + 0] = r as u8;
+                    image[pixel_idx] = r as u8;
                     image[pixel_idx + 1] = g as u8;
                     image[pixel_idx + 2] = b as u8;
                 }
@@ -1116,7 +1114,7 @@ mod tests {
         assert_eq!(rle_run(word2), 5);
         assert_eq!(rle_val(word2), 31);
         // Negative value: low 10 bits = 0x3FF = -1 signed.
-        let word3 = (0u16 << 10) | 0x03FF;
+        let word3 = 0x03FF;
         assert_eq!(rle_val(word3), -1);
         // Unused variable so compiler is happy.
         let _ = rle_run(word);

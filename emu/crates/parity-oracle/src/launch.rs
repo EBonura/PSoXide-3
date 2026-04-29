@@ -457,6 +457,7 @@ impl ReduxProcess {
     /// on Redux's side. `base_mask` is the always-held mask and
     /// `pulses` is a list of `(mask, start_vblank, frames)` tuples
     /// combined with it while the given VBlank window is active.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_checkpoint_pad<F>(
         &mut self,
         n: u64,

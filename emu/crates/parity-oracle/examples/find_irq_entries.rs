@@ -31,8 +31,7 @@ fn main() {
         println!("--- IRQ entry at step {start} ---");
         let lo = start.saturating_sub(2);
         let hi = (start + 10).min(records.len() - 1);
-        for i in lo..=hi {
-            let r = &records[i];
+        for (i, r) in records.iter().enumerate().take(hi + 1).skip(lo) {
             let mark = if i == start { ">>>" } else { "   " };
             println!(
                 "{mark} step={i:>9}  cyc={:>10}  pc=0x{:08x}  instr=0x{:08x}",

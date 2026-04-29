@@ -186,13 +186,7 @@ impl VramGpu {
     }
 
     /// Read a sub-rect back as `Vec<u16>` (length `w*h`, row-major).
-    pub fn download_rect(
-        &self,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-    ) -> Result<Vec<u16>, VramGpuError> {
+    pub fn download_rect(&self, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u16>, VramGpuError> {
         check_rect(x, y, w, h)?;
 
         // Copy the requested rect (one row at a time) into a packed

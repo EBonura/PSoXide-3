@@ -19,6 +19,8 @@
 //! Reference: nocash PSX-SPX, section "GTE Coprocessor". Cross-checked
 //! against PCSX-Redux's `gte.cc` interpreter.
 
+#![allow(clippy::needless_range_loop)]
+
 use core::cmp;
 
 /// One of the 11 documented GTE function opcodes that needs its raw
@@ -1244,9 +1246,9 @@ impl Gte {
     /// Pull MAC1/2/3 into a saturated RGB and push onto the colour FIFO.
     /// `code` is taken from the current RGBC.
     fn push_color_from_mac(&mut self, _cmd: Cmd) {
-        let r = self.saturate_color((self.mac[0] >> 4) as i32, flag::COLOR_R_SAT);
-        let g = self.saturate_color((self.mac[1] >> 4) as i32, flag::COLOR_G_SAT);
-        let b = self.saturate_color((self.mac[2] >> 4) as i32, flag::COLOR_B_SAT);
+        let r = self.saturate_color(self.mac[0] >> 4, flag::COLOR_R_SAT);
+        let g = self.saturate_color(self.mac[1] >> 4, flag::COLOR_G_SAT);
+        let b = self.saturate_color(self.mac[2] >> 4, flag::COLOR_B_SAT);
         let code = self.rgbc[3];
         self.rgb_fifo[0] = self.rgb_fifo[1];
         self.rgb_fifo[1] = self.rgb_fifo[2];
@@ -1559,8 +1561,8 @@ mod tests {
         //   (1<<19) | (1<<10) | (2<<17) | (1<<15) | (0<<13) | 0x12
         let instr = (1u32 << 19) | (1 << 10) | (2 << 17) | (1 << 15) | 0x12;
         let cmd = Cmd::decode(instr);
-        assert_eq!(cmd.sf, true);
-        assert_eq!(cmd.lm, true);
+        assert!(cmd.sf);
+        assert!(cmd.lm);
         assert_eq!(cmd.mx, 2);
         assert_eq!(cmd.vx, 1);
         assert_eq!(cmd.cv, 0);
@@ -1743,7 +1745,7 @@ mod tests {
         g.write_data(9, 0); // R=0
         g.write_data(10, 0xF80); // G=0x1F (max)
         g.write_data(11, 0x780); // B=0x0F
-        assert_eq!(g.read_data(29), (0x0F << 10) | (0x1F << 5) | 0);
+        assert_eq!(g.read_data(29), (0x0F << 10) | (0x1F << 5));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! the register addresses from `psx-hw`. Each helper commits exactly
 //! one MMIO access; higher-level SDK code composes them into commands.
 
-use psx_hw::gpu::{GP0, GP1, GPUREAD, GPUSTAT, GpuStat};
+use psx_hw::gpu::{GpuStat, GP0, GP1, GPUREAD, GPUSTAT};
 
 /// Push a command or data word to `GP0`. Named `write_gp0` (not just
 /// `gp0`) so it doesn't collide with the `psx_hw::gpu::gp0` module

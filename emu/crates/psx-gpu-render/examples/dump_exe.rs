@@ -26,7 +26,10 @@ fn main() {
     let bios = PathBuf::from(&args[1]);
     let exe_path = PathBuf::from(&args[2]);
     let out = PathBuf::from(&args[3]);
-    let steps: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
+    let steps: u64 = args
+        .get(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5_000_000);
 
     let bios_bytes = std::fs::read(&bios).expect("read BIOS");
     let mut bus = Bus::new(bios_bytes).expect("BIOS rejected");
@@ -115,7 +118,10 @@ fn main() {
         display.width as u32 * s,
         display.height as u32 * s,
     );
-    eprintln!("[dump_exe] rendered display sub-rect {w}x{h}, {} bytes", rgba.len());
+    eprintln!(
+        "[dump_exe] rendered display sub-rect {w}x{h}, {} bytes",
+        rgba.len()
+    );
 
     use std::io::Write;
     let mut f = std::fs::File::create(&out).expect("create output");

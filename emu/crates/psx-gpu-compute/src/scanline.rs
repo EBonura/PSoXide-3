@@ -441,7 +441,15 @@ mod tests {
 
     #[test]
     fn split_round_trip() {
-        for v in [0i64, 1, -1, 0x1234_5678_9ABC, -0x1234_5678_9ABC, i64::MAX, i64::MIN + 1] {
+        for v in [
+            0i64,
+            1,
+            -1,
+            0x1234_5678_9ABC,
+            -0x1234_5678_9ABC,
+            i64::MAX,
+            i64::MIN + 1,
+        ] {
             let (hi, lo) = split_i64(v);
             let reconstructed = ((hi as i64) << 32) | (lo as i64);
             assert_eq!(reconstructed, v, "split_i64({v}) round-trip");

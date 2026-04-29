@@ -206,7 +206,10 @@ fn main() {
     eprintln!("[bench] === Ratio ===");
     let ratio = gpu_t.as_secs_f64() / cpu_t.as_secs_f64();
     if ratio < 1.0 {
-        eprintln!("  GPU compute is {:.2}x FASTER than CPU rasterizer", 1.0 / ratio);
+        eprintln!(
+            "  GPU compute is {:.2}x FASTER than CPU rasterizer",
+            1.0 / ratio
+        );
     } else {
         eprintln!("  GPU compute is {:.2}x SLOWER than CPU rasterizer", ratio);
     }

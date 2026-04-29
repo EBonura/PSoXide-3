@@ -12,6 +12,12 @@ use thiserror::Error;
 use crate::bus::Bus;
 use psx_gte_core::Gte;
 
+mod branch;
+mod timing;
+
+use branch::branch_target;
+use timing::cycle_cost;
+
 /// Errors raised during instruction execution.
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum ExecutionError {
@@ -1605,17 +1611,6 @@ impl Cpu {
 /// more (MULT ≈ 7–13, DIV ≈ 36, memory stalls by region) and Redux
 /// models a handful of those in its accurate mode; when our parity
 /// probes reveal a divergence where the extra cycles matter, specific
-/// opcodes pick up their costs here.
-///
-/// Keeping this equal to Redux's `BIAS` is what makes Phase 4b's
-/// VBlank scheduler line up on the same instruction as Redux — and
-/// thus preserves parity once it turns on.
-const BIAS: u32 = 2;
-
-fn cycle_cost(_instr: u32) -> u32 {
-    BIAS
-}
-
 /// MIPS R3000 exception codes (CAUSE.ExcCode). Only the ones we
 /// actively raise are listed; the rest arrive as they're implemented.
 #[repr(u8)]
@@ -1645,15 +1640,6 @@ impl Default for Cpu {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Target address for a conditional branch. The 16-bit immediate is
-/// sign-extended and shifted left by 2, then added to the delay slot's
-/// PC (`pc + 4`).
-fn branch_target(pc: u32, instr: u32) -> u32 {
-    let offset = (instr as i16) as i32;
-    let delay_slot_pc = pc.wrapping_add(4);
-    delay_slot_pc.wrapping_add((offset << 2) as u32)
 }
 
 #[cfg(test)]
@@ -2133,6 +2119,6 @@ mod tests {
         // the alignment check, so a trapping LW should bill only
         // the BIAS cycle for the instruction itself (= 2).
         let (_cpu, bus) = step_one_load_store(0x8C89_0001, 0xBFC0_0000);
-        assert_eq!(bus.cycles(), BIAS as u64);
+        assert_eq!(bus.cycles(), cycle_cost(0) as u64);
     }
 }

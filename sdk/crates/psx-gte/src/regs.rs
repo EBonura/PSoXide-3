@@ -216,7 +216,7 @@ mod tests {
         // COP2 prefix = 0x12 << 26 = 0x4800_0000.
         // MFC2: rs=0; MTC2: rs=4; CFC2: rs=2; CTC2: rs=6.
         // All macros pin rt=$8 which contributes `8 << 16 = 0x0008_0000`.
-        assert_eq!(0x4808_0000u32, (0x12u32 << 26) | (0 << 21) | (8 << 16));
+        assert_eq!(0x4808_0000u32, (0x12u32 << 26) | (8 << 16));
         assert_eq!(0x4888_0000u32, (0x12u32 << 26) | (4 << 21) | (8 << 16));
         assert_eq!(0x4848_0000u32, (0x12u32 << 26) | (2 << 21) | (8 << 16));
         assert_eq!(0x48C8_0000u32, (0x12u32 << 26) | (6 << 21) | (8 << 16));

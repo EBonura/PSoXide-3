@@ -137,7 +137,14 @@ impl MonoTri {
     /// Opaque triangle — the simplest case. No mask handling, no
     /// blending. Bounding box is computed automatically.
     pub fn opaque(v0: (i32, i32), v1: (i32, i32), v2: (i32, i32), color_bgr15: u16) -> Self {
-        Self::new(v0, v1, v2, color_bgr15, PrimFlags::empty(), BlendMode::Average)
+        Self::new(
+            v0,
+            v1,
+            v2,
+            color_bgr15,
+            PrimFlags::empty(),
+            BlendMode::Average,
+        )
     }
 
     /// Full constructor — set any combination of [`PrimFlags`] and
@@ -221,8 +228,8 @@ impl Tpage {
 
 /// Textured flat-shaded triangle (`GP0 0x24..=0x27`). Three vertices
 /// + three (U, V) texture coordinates + a per-primitive tint + a
-/// CLUT location. The tpage state lives in the separate [`Tpage`]
-/// uniform so multiple textured primitives in a batch can share it.
+///   CLUT location. The tpage state lives in the separate [`Tpage`]
+///   uniform so multiple textured primitives in a batch can share it.
 ///
 /// WGSL counterpart in `shaders/tex_tri.wgsl`.
 #[repr(C)]
@@ -275,8 +282,7 @@ impl TexTri {
         let max_x = v0.0.max(v1.0).max(v2.0);
         let max_y = v0.1.max(v1.1).max(v2.1);
         let pack_uv = |u: u8, v: u8| (u as u32) | ((v as u32) << 8);
-        let pack_tint =
-            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        let pack_tint = |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
         Self {
             v0: [v0.0, v0.1],
             v1: [v1.0, v1.1],
@@ -324,13 +330,7 @@ impl MonoRect {
     /// Opaque rectangle — no semi-trans, no mask. Width / height of
     /// zero are dropped (the dispatcher handles this).
     pub fn opaque(xy: (i32, i32), wh: (u32, u32), color_bgr15: u16) -> Self {
-        Self::new(
-            xy,
-            wh,
-            color_bgr15,
-            PrimFlags::empty(),
-            BlendMode::Average,
-        )
+        Self::new(xy, wh, color_bgr15, PrimFlags::empty(), BlendMode::Average)
     }
 
     pub fn new(
@@ -389,8 +389,7 @@ impl TexRect {
         blend_mode: BlendMode,
     ) -> Self {
         let pack_uv = |u: u8, v: u8| (u as u32) | ((v as u32) << 8);
-        let pack_tint =
-            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        let pack_tint = |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
         Self {
             xy: [xy.0, xy.1],
             wh: [wh.0, wh.1],
@@ -430,6 +429,7 @@ pub struct ShadedTri {
 }
 
 impl ShadedTri {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         v0: (i32, i32),
         v1: (i32, i32),
@@ -444,8 +444,7 @@ impl ShadedTri {
         let min_y = v0.1.min(v1.1).min(v2.1);
         let max_x = v0.0.max(v1.0).max(v2.0);
         let max_y = v0.1.max(v1.1).max(v2.1);
-        let pack_rgb =
-            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        let pack_rgb = |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
         Self {
             v0: [v0.0, v0.1],
             v1: [v1.0, v1.1],
@@ -521,8 +520,7 @@ impl ShadedTexTri {
         let max_x = v0.0.max(v1.0).max(v2.0);
         let max_y = v0.1.max(v1.1).max(v2.1);
         let pack_uv = |u: u8, v: u8| (u as u32) | ((v as u32) << 8);
-        let pack_rgb =
-            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        let pack_rgb = |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
         Self {
             v0: [v0.0, v0.1],
             v1: [v1.0, v1.1],
@@ -608,8 +606,7 @@ impl TexQuadBilinear {
         blend_mode: BlendMode,
     ) -> Self {
         let pack_uv = |u: u8, v: u8| (u as u32) | ((v as u32) << 8);
-        let pack_tint =
-            |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        let pack_tint = |r: u8, g: u8, b: u8| (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
         Self {
             v0: [v0.0, v0.1],
             v1: [v1.0, v1.1],
@@ -630,12 +627,7 @@ impl TexQuadBilinear {
     /// axis-aligned shape the CPU's fast path expects. Vertex order
     /// (top-left, top-right, bottom-left, bottom-right) is what the
     /// CPU's check assumes — see `Gpu::draw_textured_quad`.
-    pub fn is_axis_aligned(
-        v0: (i32, i32),
-        v1: (i32, i32),
-        v2: (i32, i32),
-        v3: (i32, i32),
-    ) -> bool {
+    pub fn is_axis_aligned(v0: (i32, i32), v1: (i32, i32), v2: (i32, i32), v3: (i32, i32)) -> bool {
         v0.1 == v1.1 && v2.1 == v3.1 && v0.0 == v2.0 && v1.0 == v3.0
     }
 
@@ -824,9 +816,14 @@ mod tests {
     #[test]
     fn tex_tri_packs_uv_in_low_high_bytes() {
         let t = TexTri::new(
-            (0, 0), (10, 0), (0, 10),
-            (0x12, 0x34), (0x56, 0x78), (0x9A, 0xBC),
-            0, 0,
+            (0, 0),
+            (10, 0),
+            (0, 10),
+            (0x12, 0x34),
+            (0x56, 0x78),
+            (0x9A, 0xBC),
+            0,
+            0,
             (0x80, 0x80, 0x80),
             PrimFlags::empty(),
             BlendMode::Average,

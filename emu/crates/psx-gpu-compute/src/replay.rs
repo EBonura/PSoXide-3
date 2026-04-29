@@ -111,17 +111,19 @@ impl ComputeBackend {
         // We slice CPU words row-by-row so partial-row wraps work.
         let mut buf = Vec::with_capacity((w * h) as usize);
         for row in 0..h {
-            let py = (y + row) & (vram::VRAM_HEIGHT as u32 - 1);
+            let py = (y + row) & (vram::VRAM_HEIGHT - 1);
             for col in 0..w {
-                let px = (x + col) & (vram::VRAM_WIDTH as u32 - 1);
-                buf.push(cpu_words[(py * vram::VRAM_WIDTH as u32 + px) as usize]);
+                let px = (x + col) & (vram::VRAM_WIDTH - 1);
+                buf.push(cpu_words[(py * vram::VRAM_WIDTH + px) as usize]);
             }
         }
-        let _ = self.vram.upload_rect(x & (vram::VRAM_WIDTH as u32 - 1),
-                                       y & (vram::VRAM_HEIGHT as u32 - 1),
-                                       w.min(vram::VRAM_WIDTH as u32),
-                                       h.min(vram::VRAM_HEIGHT as u32),
-                                       &buf);
+        let _ = self.vram.upload_rect(
+            x & (vram::VRAM_WIDTH - 1),
+            y & (vram::VRAM_HEIGHT - 1),
+            w.min(vram::VRAM_WIDTH),
+            h.min(vram::VRAM_HEIGHT),
+            &buf,
+        );
     }
 
     /// Replay one GP0 packet captured by `enable_pixel_tracer` on
@@ -375,11 +377,13 @@ impl ComputeBackend {
         let uv2 = decode_uv(fifo[6]);
         let tint = decode_tint(cmd & 0x00FF_FFFF);
         let (flags, mode) = self.tex_flags_and_mode(cmd);
-        let tri = TexTri::new(
-            v0, v1, v2, uv0, uv1, uv2, clut_x, clut_y, tint, flags, mode,
+        let tri = TexTri::new(v0, v1, v2, uv0, uv1, uv2, clut_x, clut_y, tint, flags, mode);
+        self.rasterizer.dispatch_tex_tri_scanline(
+            &self.vram,
+            &tri,
+            &self.state.tpage,
+            &self.state.draw_area,
         );
-        self.rasterizer
-            .dispatch_tex_tri_scanline(&self.vram, &tri, &self.state.tpage, &self.state.draw_area);
     }
 
     fn handle_tex_quad(&mut self, fifo: &[u32]) {
@@ -421,16 +425,20 @@ impl ComputeBackend {
 
         // Non-axis-aligned: fall back to the same triangle split
         // the CPU uses (v1, v3, v2) then (v0, v1, v2).
-        let t1 = TexTri::new(
-            v1, v3, v2, uv1, uv3, uv2, clut_x, clut_y, tint, flags, mode,
+        let t1 = TexTri::new(v1, v3, v2, uv1, uv3, uv2, clut_x, clut_y, tint, flags, mode);
+        let t2 = TexTri::new(v0, v1, v2, uv0, uv1, uv2, clut_x, clut_y, tint, flags, mode);
+        self.rasterizer.dispatch_tex_tri_scanline(
+            &self.vram,
+            &t1,
+            &self.state.tpage,
+            &self.state.draw_area,
         );
-        let t2 = TexTri::new(
-            v0, v1, v2, uv0, uv1, uv2, clut_x, clut_y, tint, flags, mode,
+        self.rasterizer.dispatch_tex_tri_scanline(
+            &self.vram,
+            &t2,
+            &self.state.tpage,
+            &self.state.draw_area,
         );
-        self.rasterizer
-            .dispatch_tex_tri_scanline(&self.vram, &t1, &self.state.tpage, &self.state.draw_area);
-        self.rasterizer
-            .dispatch_tex_tri_scanline(&self.vram, &t2, &self.state.tpage, &self.state.draw_area);
     }
 
     // ========== Shaded triangle / quad ==========
@@ -559,8 +567,8 @@ impl ComputeBackend {
         let pos = fifo[1];
         let xy = decode_vertex(&self.state, pos);
         let size = fifo[2];
-        let w = (size & 0xFFFF) as u32;
-        let h = ((size >> 16) & 0xFFFF) as u32;
+        let w = size & 0xFFFF;
+        let h = (size >> 16) & 0xFFFF;
         let (flags, mode) = self.rect_flags_and_mode(cmd);
         let rect = MonoRect::new(xy, (w, h), color, flags, mode);
         self.rasterizer
@@ -600,13 +608,17 @@ impl ComputeBackend {
         let uv = decode_uv(fifo[2]);
         let (clut_x, clut_y) = decode_clut(fifo[2]);
         let size = fifo[3];
-        let w = (size & 0xFFFF) as u32;
-        let h = ((size >> 16) & 0xFFFF) as u32;
+        let w = size & 0xFFFF;
+        let h = (size >> 16) & 0xFFFF;
         let tint = decode_tint(cmd & 0x00FF_FFFF);
         let (flags, mode) = self.tex_rect_flags_and_mode(cmd);
         let rect = TexRect::new(xy, (w, h), uv, clut_x, clut_y, tint, flags, mode);
-        self.rasterizer
-            .dispatch_tex_rect(&self.vram, &rect, &self.state.tpage, &self.state.draw_area);
+        self.rasterizer.dispatch_tex_rect(
+            &self.vram,
+            &rect,
+            &self.state.tpage,
+            &self.state.draw_area,
+        );
     }
 
     fn handle_tex_rect_fixed(&mut self, fifo: &[u32], w: u32, h: u32) {
@@ -620,8 +632,12 @@ impl ComputeBackend {
         let tint = decode_tint(cmd & 0x00FF_FFFF);
         let (flags, mode) = self.tex_rect_flags_and_mode(cmd);
         let rect = TexRect::new(xy, (w, h), uv, clut_x, clut_y, tint, flags, mode);
-        self.rasterizer
-            .dispatch_tex_rect(&self.vram, &rect, &self.state.tpage, &self.state.draw_area);
+        self.rasterizer.dispatch_tex_rect(
+            &self.vram,
+            &rect,
+            &self.state.tpage,
+            &self.state.draw_area,
+        );
     }
 
     // ========== VRAM-to-VRAM copy ==========

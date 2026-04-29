@@ -96,7 +96,7 @@ fn decode_mips(instr: u32) -> String {
             0x08 => format!("jr $r{rs}"),
             0x09 => format!("jalr $r{rs}"),
             0x0C => format!("syscall 0x{:x}", (instr >> 6) & 0xFFFFF),
-            0x0D => format!("break"),
+            0x0D => "break".to_string(),
             0x21 => format!("addu $r{rd},$r{rs},$r{rt}"),
             0x23 => format!("subu $r{rd},$r{rs},$r{rt}"),
             0x24 => format!("and $r{rd},$r{rs},$r{rt}"),

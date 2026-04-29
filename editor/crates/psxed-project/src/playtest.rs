@@ -29,426 +29,29 @@
 //! independently of where bytes live.
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::world_cook::{cook_world_grid, CookedWorldMaterial, WorldGridCookError};
-use crate::{
-    ModelResource, NodeId, NodeKind, ProjectDocument, Resource, ResourceData, ResourceId,
-    SceneNode, WorldGrid,
+use crate::{NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId, SceneNode, WorldGrid};
+
+mod assets;
+mod manifest;
+mod schema;
+
+use assets::{
+    expect_room_material_depth, find_resource, load_texture_bytes, resolve_path,
+    sanitise_model_dirname,
 };
 
-/// Generated subdirectory inside the playtest example that
-/// receives `level_manifest.rs` + `rooms/` + `textures/`. Stable
-/// so the example's `include!` paths don't move.
-pub const GENERATED_DIRNAME: &str = "generated";
-
-/// Filename of the generated Rust-source manifest the example
-/// `include!`s.
-pub const MANIFEST_FILENAME: &str = "level_manifest.rs";
-
-/// Subdirectory inside `generated/` that holds cooked `.psxw`
-/// blobs.
-pub const ROOMS_DIRNAME: &str = "rooms";
-
-/// Subdirectory inside `generated/` that holds copied `.psxt`
-/// texture blobs.
-pub const TEXTURES_DIRNAME: &str = "textures";
-
-/// Subdirectory inside `generated/` that holds per-model
-/// folders (`model_NNN/`) carrying mesh + atlas + animation
-/// blobs. One subfolder per unique [`ResourceData::Model`]
-/// referenced by any placed [`NodeKind::MeshInstance`].
-pub const MODELS_DIRNAME: &str = "models";
-
-/// Coarse asset class — mirrors [`psx_level::AssetKind`] but
-/// stays host-side `String`/`Vec` friendly. Converted to the
-/// runtime enum at write time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlaytestAssetKind {
-    /// Cooked `.psxw` room blob.
-    RoomWorld,
-    /// Cooked `.psxt` texture blob (room atlas or model atlas).
-    Texture,
-    /// Cooked `.psxmdl` mesh blob.
-    ModelMesh,
-    /// Cooked `.psxanim` skeletal animation clip.
-    ModelAnimation,
-}
-
-/// One asset destined for the master table. Owns its bytes so
-/// callers can write them out to the generated tree without
-/// reaching back into the project.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaytestAsset {
-    /// Asset class — drives extension + loader.
-    pub kind: PlaytestAssetKind,
-    /// Backing payload.
-    pub bytes: Vec<u8>,
-    /// Filename inside the kind's subdirectory (e.g.
-    /// `room_000.psxw`). Stable across runs because asset order
-    /// is deterministic.
-    pub filename: String,
-    /// Diagnostic label — display name of the source resource
-    /// or room. Surfaces in cook reports and stays out of the
-    /// runtime contract.
-    pub source_label: String,
-}
-
-/// One room's residency-aware record. Carries indices into
-/// [`PlaytestPackage::assets`] and [`PlaytestPackage::materials`]
-/// so the writer can resolve `AssetId`s deterministically.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaytestRoom {
-    /// Display name lifted from the editor scene tree.
-    pub name: String,
-    /// Index into [`PlaytestPackage::assets`] of the room's
-    /// `RoomWorld` asset.
-    pub world_asset_index: usize,
-    /// Editor-side `WorldGrid::origin[0]` (diagnostic only).
-    pub origin_x: i32,
-    /// Editor-side `WorldGrid::origin[1]`.
-    pub origin_z: i32,
-    /// Engine units per sector.
-    pub sector_size: i32,
-    /// First index into [`PlaytestPackage::materials`] for this
-    /// room's slice.
-    pub material_first: u16,
-    /// Number of material records in the slice. Matches the
-    /// cooked `.psxw`'s material count exactly.
-    pub material_count: u16,
-}
-
-/// One material slot binding. Lifted from
-/// [`CookedWorldMaterial`] and pinned to its owning room.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaytestMaterial {
-    /// Owning room index in [`PlaytestPackage::rooms`].
-    pub room: u16,
-    /// Cooked-world local material slot — matches the slot value
-    /// stored in the `.psxw`.
-    pub local_slot: u16,
-    /// Index into [`PlaytestPackage::assets`] of the texture
-    /// asset bound at this slot.
-    pub texture_asset_index: usize,
-    /// Per-material modulation tint.
-    pub tint_rgb: [u8; 3],
-}
-
-/// One animation clip bound to a [`PlaytestModel`]. Carries
-/// pre-resolved indices into the master asset table so the
-/// writer can emit `LevelModelClipRecord`s without re-walking
-/// the project.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaytestModelClip {
-    /// Owning model index in [`PlaytestPackage::models`].
-    pub model: u16,
-    /// Display name surfaced in debug HUDs.
-    pub name: String,
-    /// Index into [`PlaytestPackage::assets`] of the cooked
-    /// `.psxanim` blob.
-    pub animation_asset_index: usize,
-}
-
-/// One cooked PSX model included in the playtest package. A
-/// [`ResourceData::Model`] referenced by any placed instance is
-/// promoted into one `PlaytestModel`; multiple instances share
-/// the same record (deduplicated by source `ResourceId`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaytestModel {
-    /// Display name lifted from the editor resource.
-    pub name: String,
-    /// Source resource id — used to deduplicate instances and
-    /// to resolve per-instance clip overrides back to clip
-    /// indices within this model's slice.
-    pub source_resource: ResourceId,
-    /// Index into [`PlaytestPackage::assets`] of the cooked
-    /// `.psxmdl` blob.
-    pub mesh_asset_index: usize,
-    /// Index into [`PlaytestPackage::assets`] of the atlas
-    /// `.psxt` blob. Always `Some` for placed models — the
-    /// playtest cooker rejects instances of models without an
-    /// atlas. Kept as `Option` so the schema can later carry
-    /// untextured author-time bundles unchanged.
-    pub texture_asset_index: Option<usize>,
-    /// First index into [`PlaytestPackage::model_clips`] for
-    /// this model's clip slice.
-    pub clip_first: u16,
-    /// Number of clips in this model's slice. Matches the
-    /// editor resource's clip count exactly.
-    pub clip_count: u16,
-    /// Default clip index *within this model's slice*.
-    /// Cooker validation guarantees this is `< clip_count`,
-    /// so the runtime always has a clip to play.
-    pub default_clip: u16,
-    /// World-space height (engine units) — propagated from the
-    /// editor resource.
-    pub world_height: u16,
-}
-
-/// One placed model instance. Coordinates are room-local
-/// engine units (the same space cooked rooms live in).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaytestModelInstance {
-    /// Owning room index in [`PlaytestPackage::rooms`].
-    pub room: u16,
-    /// Model index in [`PlaytestPackage::models`].
-    pub model: u16,
-    /// Per-instance clip override, or [`MODEL_CLIP_INHERIT`]
-    /// to use the model's `default_clip`.
-    pub clip: u16,
-    /// Room-local X.
-    pub x: i32,
-    /// Y.
-    pub y: i32,
-    /// Room-local Z.
-    pub z: i32,
-    /// Yaw, PSX angle units.
-    pub yaw: i16,
-    /// Reserved.
-    pub flags: u16,
-}
-
-/// Sentinel for [`PlaytestModelInstance::clip`] meaning
-/// "inherit model default" — same value as
-/// [`psx_level::MODEL_CLIP_INHERIT`].
-pub const MODEL_CLIP_INHERIT: u16 = 0xFFFF;
-
-/// One placed point light, room-local engine units. Mirrors
-/// [`psx_level::PointLightRecord`] one-for-one — intensity is
-/// already quantised to Q8.8 so the cook output is a direct
-/// copy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaytestLight {
-    /// Room index in [`PlaytestPackage::rooms`].
-    pub room: u16,
-    /// Room-local X.
-    pub x: i32,
-    /// Y.
-    pub y: i32,
-    /// Room-local Z.
-    pub z: i32,
-    /// Cutoff distance in engine units. Cooker rejects `0`.
-    pub radius: u16,
-    /// Brightness multiplier in Q8.8 (`256` = 1.0). Derived
-    /// from the editor's `f32` intensity at cook time.
-    pub intensity_q8: u16,
-    /// 8-bit RGB tint.
-    pub color: [u8; 3],
-}
-
-/// Player spawn record. Coordinates are room-local engine units
-/// (the same space the cooked `.psxw` lives in — array-rooted at
-/// world `(0, 0)`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaytestSpawn {
-    /// Room index in [`PlaytestPackage::rooms`].
-    pub room: u16,
-    /// Room-local X.
-    pub x: i32,
-    /// Y.
-    pub y: i32,
-    /// Room-local Z.
-    pub z: i32,
-    /// Yaw in PSX angle units.
-    pub yaw: i16,
-    /// Reserved flags. Bit 0 = "spawn enabled".
-    pub flags: u16,
-}
-
-/// Coarse runtime kind for [`PlaytestEntity`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlaytestEntityKind {
-    /// Visual marker (debug cube).
-    Marker,
-    /// Static mesh instance pinned by `resource_slot`.
-    StaticMesh,
-}
-
-/// Cooked character record. Mirrors
-/// [`psx_level::LevelCharacterRecord`] one-to-one — the writer
-/// emits the static slice from this struct.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaytestCharacter {
-    /// Source resource id (so the writer can dedupe + cross-link).
-    pub source_resource: ResourceId,
-    /// Index into [`PlaytestPackage::models`].
-    pub model: u16,
-    /// Idle clip index *within the model's clip slice*.
-    pub idle_clip: u16,
-    /// Walk clip index within the model's clip slice.
-    pub walk_clip: u16,
-    /// Optional run clip; `u16::MAX` (= `CHARACTER_CLIP_NONE`)
-    /// means "no run clip authored".
-    pub run_clip: u16,
-    /// Optional turn clip; same sentinel as `run_clip`.
-    pub turn_clip: u16,
-    /// Capsule radius in engine units.
-    pub radius: u16,
-    /// Capsule height in engine units.
-    pub height: u16,
-    /// Walk speed (engine units / 60 Hz frame).
-    pub walk_speed: i32,
-    /// Run speed (engine units / 60 Hz frame).
-    pub run_speed: i32,
-    /// Turn speed (degrees / second).
-    pub turn_speed_degrees_per_second: u16,
-    /// Camera follow distance (engine units).
-    pub camera_distance: i32,
-    /// Camera vertical offset above the character origin.
-    pub camera_height: i32,
-    /// Vertical offset of the camera's look-at target.
-    pub camera_target_height: i32,
-}
-
-/// Cooked player-controller record. Always paired with a
-/// [`PlaytestSpawn`] in the same package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaytestPlayerController {
-    /// Resolved spawn — same data the manifest's `PLAYER_SPAWN`
-    /// carries.
-    pub spawn: PlaytestSpawn,
-    /// Character index in [`PlaytestPackage::characters`].
-    pub character: u16,
-}
-
-/// Sentinel used in [`PlaytestCharacter::run_clip`] /
-/// [`PlaytestCharacter::turn_clip`] when the role wasn't
-/// authored. Mirrors [`psx_level::CHARACTER_CLIP_NONE`].
-pub const CHARACTER_CLIP_NONE: u16 = u16::MAX;
-
-/// One non-spawn entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaytestEntity {
-    /// Owning room index.
-    pub room: u16,
-    /// Entity kind.
-    pub kind: PlaytestEntityKind,
-    /// Room-local X.
-    pub x: i32,
-    /// Y.
-    pub y: i32,
-    /// Room-local Z.
-    pub z: i32,
-    /// Yaw, PSX angle units.
-    pub yaw: i16,
-    /// Resource slot (0 if unused).
-    pub resource_slot: u16,
-    /// Reserved flags.
-    pub flags: u16,
-}
-
-/// Cooked playtest scene, ready to write to disk. Holds
-/// everything the generated manifest needs to render: assets,
-/// per-room metadata, per-room material slices, models, model
-/// instances, and residency.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PlaytestPackage {
-    /// Master asset table — rooms first, then room textures,
-    /// then per-model assets (mesh + atlas + clips), in
-    /// deterministic order.
-    pub assets: Vec<PlaytestAsset>,
-    /// Cooked rooms with material-slice metadata.
-    pub rooms: Vec<PlaytestRoom>,
-    /// Material records ordered as `(room, local_slot)`.
-    pub materials: Vec<PlaytestMaterial>,
-    /// Cooked model bundles, deduplicated across instances.
-    pub models: Vec<PlaytestModel>,
-    /// Per-model clip records ordered as `(model, clip_index)`.
-    pub model_clips: Vec<PlaytestModelClip>,
-    /// Placed model instances, room-local coordinates.
-    pub model_instances: Vec<PlaytestModelInstance>,
-    /// Placed point lights, room-local coordinates.
-    pub lights: Vec<PlaytestLight>,
-    /// Single player spawn — required.
-    pub spawn: Option<PlaytestSpawn>,
-    /// Cooked Character resources used by player / future
-    /// gameplay. Currently only the player spawn references
-    /// these, but the slice ships in the manifest unconditionally
-    /// so the runtime can table-drive any future controllers.
-    pub characters: Vec<PlaytestCharacter>,
-    /// Resolved player controller — `Some` when a player spawn
-    /// was authored *and* a Character was assigned (or
-    /// auto-picked). The runtime falls back to a debug camera
-    /// when this is `None`.
-    pub player_controller: Option<PlaytestPlayerController>,
-    /// Optional entity markers (legacy, non-Model MeshInstance).
-    pub entities: Vec<PlaytestEntity>,
-}
-
-impl PlaytestPackage {
-    /// Number of `RoomWorld` entries in [`Self::assets`].
-    pub fn room_asset_count(&self) -> usize {
-        self.assets
-            .iter()
-            .filter(|a| a.kind == PlaytestAssetKind::RoomWorld)
-            .count()
-    }
-
-    /// Number of `Texture` entries in [`Self::assets`].
-    pub fn texture_asset_count(&self) -> usize {
-        self.assets
-            .iter()
-            .filter(|a| a.kind == PlaytestAssetKind::Texture)
-            .count()
-    }
-
-    /// Number of `ModelMesh` entries in [`Self::assets`].
-    pub fn model_mesh_asset_count(&self) -> usize {
-        self.assets
-            .iter()
-            .filter(|a| a.kind == PlaytestAssetKind::ModelMesh)
-            .count()
-    }
-
-    /// Number of `ModelAnimation` entries in [`Self::assets`].
-    pub fn model_animation_asset_count(&self) -> usize {
-        self.assets
-            .iter()
-            .filter(|a| a.kind == PlaytestAssetKind::ModelAnimation)
-            .count()
-    }
-}
-
-/// Outcome of validating a project for playtest. Errors block
-/// cooking; warnings are surfaced but not fatal.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PlaytestValidationReport {
-    /// Hard errors. Embedded Play must refuse to launch when this
-    /// list is non-empty.
-    pub errors: Vec<String>,
-    /// Soft warnings. Surface in the editor status line but
-    /// don't block cooking.
-    pub warnings: Vec<String>,
-}
-
-impl PlaytestValidationReport {
-    /// `true` when there are zero hard errors.
-    pub fn is_ok(&self) -> bool {
-        self.errors.is_empty()
-    }
-
-    fn error(&mut self, msg: impl Into<String>) {
-        self.errors.push(msg.into());
-    }
-
-    fn warn(&mut self, msg: impl Into<String>) {
-        self.warnings.push(msg.into());
-    }
-}
+pub use manifest::{cook_to_dir, default_generated_dir, render_manifest_source, write_package};
+pub use schema::*;
 
 /// Build a playtest package from `project`. Validates the scene
 /// tree, cooks every Room with non-empty geometry, resolves
-/// material textures (loading bytes through `project_root` for
-/// path-relative resources), and assigns the player spawn.
+/// material textures through `project_root`, and assigns the
+/// player spawn.
 ///
-/// `project_root` anchors relative texture `psxt_path`s. Pass
-/// the project's directory; absolute paths short-circuit through
-/// the resolver unchanged.
-///
-/// On any validation error the returned package is `None`. Cooked
-/// artifacts only land on disk via [`write_package`] / [`cook_to_dir`]
-/// when validation passes — partial writes never happen.
+/// On any validation error the returned package is `None`.
 pub fn build_package(
     project: &ProjectDocument,
     project_root: &Path,
@@ -710,7 +313,7 @@ pub fn build_package(
                     let model = &models[model_index as usize];
                     let clip = match *animation_clip {
                         Some(idx) => {
-                            if (idx as u16) >= model.clip_count {
+                            if idx >= model.clip_count {
                                 report.error(format!(
                                     "MeshInstance '{}' clip override {idx} out of range (model has {})",
                                     node.name, model.clip_count
@@ -894,26 +497,25 @@ pub fn build_package(
                     }
                 }
             };
-            match resolved.and_then(|id| {
-                cook_player_character(
-                    project,
-                    project_root,
-                    spawn_node,
-                    id,
-                    &mut assets,
-                    &mut models,
-                    &mut model_clips,
-                    &mut model_for_resource,
-                    &mut characters,
-                    &mut report,
-                )
-            }) {
-                Some(character_index) => Some(PlaytestPlayerController {
+            resolved
+                .and_then(|id| {
+                    cook_player_character(
+                        project,
+                        project_root,
+                        spawn_node,
+                        id,
+                        &mut assets,
+                        &mut models,
+                        &mut model_clips,
+                        &mut model_for_resource,
+                        &mut characters,
+                        &mut report,
+                    )
+                })
+                .map(|character_index| PlaytestPlayerController {
                     spawn: spawn_record,
                     character: character_index,
-                }),
-                None => None,
-            }
+                })
         }
         _ => None,
     };
@@ -1116,6 +718,7 @@ fn cook_player_character(
 /// Failures (missing files, invalid blobs, joint-count
 /// mismatches) push to `report.errors` and return `None`; the
 /// caller turns that into a hard cook failure.
+#[allow(clippy::too_many_arguments)]
 fn register_model_for_instance(
     project: &ProjectDocument,
     project_root: &Path,
@@ -1333,614 +936,6 @@ fn register_model_for_instance(
 
 /// Resolve a path the same way the texture loader does so the
 /// model writer / runtime stay in lockstep.
-fn resolve_path(stored: &str, project_root: &Path) -> PathBuf {
-    if Path::new(stored).is_absolute() {
-        PathBuf::from(stored)
-    } else {
-        project_root.join(stored)
-    }
-}
-
-/// Strip a free-form name down to a filesystem-safe stem.
-fn sanitise_model_dirname(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut last_was_sep = false;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_was_sep = false;
-        } else if !last_was_sep {
-            out.push('_');
-            last_was_sep = true;
-        }
-    }
-    let trimmed = out.trim_matches('_').to_string();
-    if trimmed.is_empty() {
-        "model".to_string()
-    } else {
-        trimmed
-    }
-}
-
-/// Suppress the legacy unused-`ModelResource` import once
-/// build_package no longer references the type. Kept here so
-/// downstream consumers can still reach it via a single module
-/// path.
-#[allow(dead_code)]
-fn _model_resource_re_export(_: &ModelResource) {}
-
-/// Write `package` and the generated manifest to `generated_dir`.
-/// Creates `generated_dir/rooms/` and `generated_dir/textures/`,
-/// strips any stale `.psxw` / `.psxt` files inside them, and
-/// writes the manifest source last (so a half-failed write
-/// doesn't leave a manifest pointing at missing files).
-pub fn write_package(package: &PlaytestPackage, generated_dir: &Path) -> std::io::Result<()> {
-    let rooms_dir = generated_dir.join(ROOMS_DIRNAME);
-    let textures_dir = generated_dir.join(TEXTURES_DIRNAME);
-    let models_dir = generated_dir.join(MODELS_DIRNAME);
-    std::fs::create_dir_all(&rooms_dir)?;
-    std::fs::create_dir_all(&textures_dir)?;
-    std::fs::create_dir_all(&models_dir)?;
-    purge_directory_files(&rooms_dir, "psxw")?;
-    purge_directory_files(&textures_dir, "psxt")?;
-    // Models live in per-model subfolders so the recursive
-    // purge needs to traverse one level deeper than rooms /
-    // textures.
-    purge_models_dir(&models_dir)?;
-
-    for asset in &package.assets {
-        // ModelMesh / ModelAnimation / model-folder Texture
-        // asset filenames already include their `models/...`
-        // subpath; rooms + room-only textures stay flat in
-        // their respective dirs.
-        let target = match asset.kind {
-            PlaytestAssetKind::RoomWorld => rooms_dir.join(&asset.filename),
-            PlaytestAssetKind::Texture if asset.filename.contains('/') => {
-                generated_dir.join(&asset.filename)
-            }
-            PlaytestAssetKind::Texture => textures_dir.join(&asset.filename),
-            PlaytestAssetKind::ModelMesh | PlaytestAssetKind::ModelAnimation => {
-                generated_dir.join(&asset.filename)
-            }
-        };
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&target, &asset.bytes)?;
-    }
-
-    let manifest = render_manifest_source(package);
-    std::fs::write(generated_dir.join(MANIFEST_FILENAME), manifest)?;
-    Ok(())
-}
-
-/// Render `package` as a Rust source string the runtime example
-/// can `include!`. Imports types from `psx_level` rather than
-/// re-defining them so the writer here and the reader there
-/// stay in lockstep.
-pub fn render_manifest_source(package: &PlaytestPackage) -> String {
-    let mut out = String::new();
-    out.push_str(MANIFEST_HEADER);
-
-    // Emit one named static per asset so the include_bytes! call
-    // sites are easy to grep for. Asset records reference these
-    // statics so the slice is still constructible at compile time.
-    for (i, asset) in package.assets.iter().enumerate() {
-        let include_path = match asset.kind {
-            PlaytestAssetKind::RoomWorld => format!("{ROOMS_DIRNAME}/{}", asset.filename),
-            PlaytestAssetKind::Texture if asset.filename.contains('/') => asset.filename.clone(),
-            PlaytestAssetKind::Texture => format!("{TEXTURES_DIRNAME}/{}", asset.filename),
-            PlaytestAssetKind::ModelMesh | PlaytestAssetKind::ModelAnimation => {
-                asset.filename.clone()
-            }
-        };
-        let _ = writeln!(
-            out,
-            "/// {} — {}",
-            asset_static_name(asset, i),
-            asset.source_label,
-        );
-        let _ = writeln!(
-            out,
-            "pub static {}: &[u8] = include_bytes!(\"{include_path}\");",
-            asset_static_name(asset, i),
-        );
-    }
-    out.push('\n');
-
-    out.push_str("/// Master asset table.\n");
-    out.push_str("pub static ASSETS: &[LevelAssetRecord] = &[\n");
-    for (i, asset) in package.assets.iter().enumerate() {
-        let kind = match asset.kind {
-            PlaytestAssetKind::RoomWorld => "AssetKind::RoomWorld",
-            PlaytestAssetKind::Texture => "AssetKind::Texture",
-            PlaytestAssetKind::ModelMesh => "AssetKind::ModelMesh",
-            PlaytestAssetKind::ModelAnimation => "AssetKind::ModelAnimation",
-        };
-        let static_name = asset_static_name(asset, i);
-        let vram_bytes = match asset.kind {
-            PlaytestAssetKind::RoomWorld
-            | PlaytestAssetKind::ModelMesh
-            | PlaytestAssetKind::ModelAnimation => 0,
-            // Heuristic: the upload cost is the texture's byte
-            // length. Future loaders may compute a tighter
-            // figure — for now this is the conservative bound
-            // the residency budget has to honour.
-            PlaytestAssetKind::Texture => asset.bytes.len(),
-        };
-        let _ = writeln!(
-            out,
-            "    LevelAssetRecord {{ id: AssetId({i}), kind: {kind}, bytes: {static_name}, ram_bytes: {static_name}.len() as u32, vram_bytes: {vram_bytes}, flags: 0 }},"
-        );
-    }
-    out.push_str("];\n\n");
-
-    out.push_str("/// Per-room material bindings — slot the `.psxw` stores → texture asset.\n");
-    out.push_str("pub static MATERIALS: &[LevelMaterialRecord] = &[\n");
-    for material in &package.materials {
-        let _ = writeln!(
-            out,
-            "    LevelMaterialRecord {{ room: {}, local_slot: {}, texture_asset: AssetId({}), tint_rgb: [{}, {}, {}], flags: 0 }},",
-            material.room,
-            material.local_slot,
-            material.texture_asset_index,
-            material.tint_rgb[0],
-            material.tint_rgb[1],
-            material.tint_rgb[2],
-        );
-    }
-    out.push_str("];\n\n");
-
-    out.push_str("/// Rooms with material-slice metadata.\n");
-    out.push_str("pub static ROOMS: &[LevelRoomRecord] = &[\n");
-    for room in &package.rooms {
-        let _ = writeln!(
-            out,
-            "    LevelRoomRecord {{ name: {:?}, world_asset: AssetId({}), origin_x: {}, origin_z: {}, sector_size: {}, material_first: {}, material_count: {}, flags: 0 }},",
-            room.name,
-            room.world_asset_index,
-            room.origin_x,
-            room.origin_z,
-            room.sector_size,
-            room.material_first,
-            room.material_count,
-        );
-    }
-    out.push_str("];\n\n");
-
-    // Per-room residency: required RAM = the room's world
-    // asset + every model mesh + every animation clip
-    // referenced by an instance OR by the player character in
-    // this room; required VRAM = every distinct texture asset
-    // (room materials + model atlases) referenced by this room.
-    for (i, room) in package.rooms.iter().enumerate() {
-        let first = room.material_first as usize;
-        let count = room.material_count as usize;
-        let mut required_vram: Vec<usize> = Vec::with_capacity(count);
-        for material in &package.materials[first..first + count] {
-            if !required_vram.contains(&material.texture_asset_index) {
-                required_vram.push(material.texture_asset_index);
-            }
-        }
-        let mut required_ram: Vec<usize> = vec![room.world_asset_index];
-
-        // Models the room references — placed MeshInstance
-        // bindings *plus* the player controller's character
-        // when its spawn lives in this room. The player's
-        // model is residency-required even when it's never
-        // placed as a regular MeshInstance; otherwise the
-        // runtime would render the player from un-resident
-        // bytes the moment the room loads.
-        let i_u16 = i as u16;
-        let mut seen_models: Vec<u16> = Vec::new();
-        for inst in &package.model_instances {
-            if inst.room != i_u16 || seen_models.contains(&inst.model) {
-                continue;
-            }
-            seen_models.push(inst.model);
-            include_model_in_residency(package, inst.model, &mut required_ram, &mut required_vram);
-        }
-        if let Some(pc) = package.player_controller {
-            if pc.spawn.room == i_u16 {
-                let model = package.characters[pc.character as usize].model;
-                if !seen_models.contains(&model) {
-                    seen_models.push(model);
-                    include_model_in_residency(
-                        package,
-                        model,
-                        &mut required_ram,
-                        &mut required_vram,
-                    );
-                }
-            }
-        }
-
-        let _ = writeln!(out, "/// Room {i} required RAM assets.");
-        out.push_str(&format!(
-            "pub static ROOM_{i}_REQUIRED_RAM: &[AssetId] = &["
-        ));
-        for (j, idx) in required_ram.iter().enumerate() {
-            if j > 0 {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "AssetId({idx})");
-        }
-        out.push_str("];\n");
-        let _ = writeln!(out, "/// Room {i} required VRAM assets.");
-        out.push_str(&format!(
-            "pub static ROOM_{i}_REQUIRED_VRAM: &[AssetId] = &["
-        ));
-        for (j, idx) in required_vram.iter().enumerate() {
-            if j > 0 {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "AssetId({idx})");
-        }
-        out.push_str("];\n");
-    }
-    out.push('\n');
-
-    out.push_str("/// Per-room residency contract.\n");
-    out.push_str("pub static ROOM_RESIDENCY: &[RoomResidencyRecord] = &[\n");
-    for (i, _room) in package.rooms.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "    RoomResidencyRecord {{ room: {i}, required_ram: ROOM_{i}_REQUIRED_RAM, required_vram: ROOM_{i}_REQUIRED_VRAM, warm_ram: &[], warm_vram: &[] }},",
-        );
-    }
-    out.push_str("];\n\n");
-
-    let spawn = package.spawn.unwrap_or(PlaytestSpawn {
-        room: 0,
-        x: 0,
-        y: 0,
-        z: 0,
-        yaw: 0,
-        flags: 0,
-    });
-    let _ = writeln!(
-        out,
-        "/// Player spawn.\npub static PLAYER_SPAWN: PlayerSpawnRecord = PlayerSpawnRecord {{ room: {}, x: {}, y: {}, z: {}, yaw: {}, flags: {} }};",
-        spawn.room, spawn.x, spawn.y, spawn.z, spawn.yaw, spawn.flags
-    );
-    out.push('\n');
-
-    // MODELS / MODEL_CLIPS / MODEL_INSTANCES — emitted as
-    // empty slices when there are no model instances, so the
-    // runtime always has something to walk.
-    out.push_str("/// Per-model clip records, ordered (model, clip).\n");
-    out.push_str("pub static MODEL_CLIPS: &[LevelModelClipRecord] = &[\n");
-    for clip in &package.model_clips {
-        let _ = writeln!(
-            out,
-            "    LevelModelClipRecord {{ model: {}, name: {:?}, animation_asset: AssetId({}) }},",
-            clip.model, clip.name, clip.animation_asset_index,
-        );
-    }
-    out.push_str("];\n\n");
-
-    out.push_str("/// Cooked models — instances reference these by index.\n");
-    out.push_str("pub static MODELS: &[LevelModelRecord] = &[\n");
-    for model in &package.models {
-        let texture = match model.texture_asset_index {
-            Some(idx) => format!("Some(AssetId({idx}))"),
-            None => "None".to_string(),
-        };
-        let _ = writeln!(
-            out,
-            "    LevelModelRecord {{ name: {:?}, mesh_asset: AssetId({}), texture_asset: {texture}, clip_first: {}, clip_count: {}, default_clip: {}, world_height: {}, flags: 0 }},",
-            model.name,
-            model.mesh_asset_index,
-            model.clip_first,
-            model.clip_count,
-            model.default_clip,
-            model.world_height,
-        );
-    }
-    out.push_str("];\n\n");
-
-    out.push_str("/// Placed model instances, room-local coordinates.\n");
-    out.push_str("pub static MODEL_INSTANCES: &[LevelModelInstanceRecord] = &[\n");
-    for inst in &package.model_instances {
-        let _ = writeln!(
-            out,
-            "    LevelModelInstanceRecord {{ room: {}, model: {}, clip: {}, x: {}, y: {}, z: {}, yaw: {}, flags: {} }},",
-            inst.room, inst.model, inst.clip, inst.x, inst.y, inst.z, inst.yaw, inst.flags,
-        );
-    }
-    out.push_str("];\n\n");
-
-    out.push_str("/// Placed point lights, room-local coordinates.\n");
-    out.push_str("pub static LIGHTS: &[PointLightRecord] = &[\n");
-    for light in &package.lights {
-        let _ = writeln!(
-            out,
-            "    PointLightRecord {{ room: {}, x: {}, y: {}, z: {}, radius: {}, intensity_q8: {}, color: [{}, {}, {}], flags: 0 }},",
-            light.room,
-            light.x,
-            light.y,
-            light.z,
-            light.radius,
-            light.intensity_q8,
-            light.color[0],
-            light.color[1],
-            light.color[2],
-        );
-    }
-    out.push_str("];\n\n");
-
-    out.push_str("/// Cooked Character resources — gameplay metadata layered on top of MODELS.\n");
-    out.push_str("pub static CHARACTERS: &[LevelCharacterRecord] = &[\n");
-    for character in &package.characters {
-        let clip_or_none = |slot: u16| -> String {
-            if slot == CHARACTER_CLIP_NONE {
-                "CHARACTER_CLIP_NONE".to_string()
-            } else {
-                format!("{slot}")
-            }
-        };
-        let _ = writeln!(
-            out,
-            "    LevelCharacterRecord {{ model: {}, idle_clip: {}, walk_clip: {}, run_clip: {}, turn_clip: {}, radius: {}, height: {}, walk_speed: {}, run_speed: {}, turn_speed_degrees_per_second: {}, camera_distance: {}, camera_height: {}, camera_target_height: {}, flags: 0 }},",
-            character.model,
-            character.idle_clip,
-            character.walk_clip,
-            clip_or_none(character.run_clip),
-            clip_or_none(character.turn_clip),
-            character.radius,
-            character.height,
-            character.walk_speed,
-            character.run_speed,
-            character.turn_speed_degrees_per_second,
-            character.camera_distance,
-            character.camera_height,
-            character.camera_target_height,
-        );
-    }
-    out.push_str("];\n\n");
-
-    match package.player_controller {
-        Some(pc) => {
-            let _ = writeln!(
-                out,
-                "/// Player controller — spawn + Character that drives the player.\npub static PLAYER_CONTROLLER: Option<PlayerControllerRecord> = Some(PlayerControllerRecord {{ spawn: PlayerSpawnRecord {{ room: {}, x: {}, y: {}, z: {}, yaw: {}, flags: {} }}, character: {}, flags: 0 }});",
-                pc.spawn.room, pc.spawn.x, pc.spawn.y, pc.spawn.z, pc.spawn.yaw, pc.spawn.flags, pc.character,
-            );
-        }
-        None => {
-            out.push_str(
-                "/// Player controller — `None` means no playable character was authored.\n\
-                pub static PLAYER_CONTROLLER: Option<PlayerControllerRecord> = None;\n",
-            );
-        }
-    }
-    out.push('\n');
-
-    out.push_str("/// Entity markers (legacy MeshInstance with no Model resource).\n");
-    out.push_str("pub static ENTITIES: &[EntityRecord] = &[\n");
-    for entity in &package.entities {
-        let kind = match entity.kind {
-            PlaytestEntityKind::Marker => "EntityKind::Marker",
-            PlaytestEntityKind::StaticMesh => "EntityKind::StaticMesh",
-        };
-        let _ = writeln!(
-            out,
-            "    EntityRecord {{ room: {}, kind: {kind}, x: {}, y: {}, z: {}, yaw: {}, resource_slot: {}, flags: {} }},",
-            entity.room, entity.x, entity.y, entity.z, entity.yaw, entity.resource_slot, entity.flags
-        );
-    }
-    out.push_str("];\n");
-    out
-}
-
-/// Default destination for the playtest example's generated
-/// directory. Anchored at the editor crate's manifest dir so the
-/// dev workflow finds it regardless of cwd.
-pub fn default_generated_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("engine")
-        .join("examples")
-        .join("editor-playtest")
-        .join(GENERATED_DIRNAME)
-}
-
-/// One-shot cook + write entry point: validate, package, drop
-/// the result at `generated_dir`. Resolves relative texture
-/// paths through `project_root`. Returns the validation report;
-/// callers must check `report.is_ok()` before assuming the
-/// files were written.
-pub fn cook_to_dir(
-    project: &ProjectDocument,
-    project_root: &Path,
-    generated_dir: &Path,
-) -> std::io::Result<PlaytestValidationReport> {
-    let (package, report) = build_package(project, project_root);
-    if let Some(package) = package {
-        write_package(&package, generated_dir)?;
-    }
-    Ok(report)
-}
-
-/// Header emitted at the top of every generated manifest. The
-/// runtime example wraps the `include!` in a `mod generated`
-/// with `#[allow(dead_code)]` on the wrapper, so we don't
-/// repeat that here (would be an inner attribute on the wrong
-/// item).
-const MANIFEST_HEADER: &str = "\
-// Generated by `psxed_project::playtest::write_package` —
-// do not edit by hand. Regenerate with the editor's
-// Play action or the `cook-playtest` CLI.
-
-use psx_level::{
-    AssetId,
-    AssetKind,
-    CHARACTER_CLIP_NONE,
-    EntityKind,
-    EntityRecord,
-    LevelAssetRecord,
-    LevelCharacterRecord,
-    LevelMaterialRecord,
-    LevelModelClipRecord,
-    LevelModelInstanceRecord,
-    LevelModelRecord,
-    LevelRoomRecord,
-    PlayerControllerRecord,
-    PlayerSpawnRecord,
-    PointLightRecord,
-    RoomResidencyRecord,
-};
-
-";
-
-/// Add `model_index`'s mesh + atlas + every clip to a room's
-/// residency lists. Idempotent through the caller's seen-set
-/// — also dedupes within `required_ram` / `required_vram` so
-/// callers don't have to.
-///
-/// Pulled out so the per-room walk can register both placed
-/// MeshInstance models and the player character's model
-/// without duplicating bookkeeping. Without the player path,
-/// a Character whose backing model isn't also placed as a
-/// MeshInstance would be missing from residency entirely —
-/// the runtime would then render the player from un-resident
-/// bytes the moment the room loaded.
-fn include_model_in_residency(
-    package: &PlaytestPackage,
-    model_index: u16,
-    required_ram: &mut Vec<usize>,
-    required_vram: &mut Vec<usize>,
-) {
-    let Some(model) = package.models.get(model_index as usize) else {
-        return;
-    };
-    if !required_ram.contains(&model.mesh_asset_index) {
-        required_ram.push(model.mesh_asset_index);
-    }
-    if let Some(atlas) = model.texture_asset_index {
-        if !required_vram.contains(&atlas) {
-            required_vram.push(atlas);
-        }
-    }
-    let cf = model.clip_first as usize;
-    let cc = model.clip_count as usize;
-    if cf + cc > package.model_clips.len() {
-        return;
-    }
-    for clip in &package.model_clips[cf..cf + cc] {
-        if !required_ram.contains(&clip.animation_asset_index) {
-            required_ram.push(clip.animation_asset_index);
-        }
-    }
-}
-
-/// Resolve the per-asset `static` name for the include_bytes
-/// statement. Mirrors the filename so a reader can grep
-/// `ROOM_000_BYTES` and immediately know it points at
-/// `rooms/room_000.psxw`. The `_index` parameter is reserved
-/// for future asset kinds with no filename component.
-fn asset_static_name(asset: &PlaytestAsset, _index: usize) -> String {
-    let stem = Path::new(&asset.filename)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&asset.filename);
-    format!("{}_BYTES", stem.to_ascii_uppercase())
-}
-
-/// Find the resource record by id. Linear scan — resource
-/// counts in this project are small (a few materials + a few
-/// textures); a HashMap wrapper would buy nothing.
-fn find_resource(project: &ProjectDocument, id: ResourceId) -> Option<&Resource> {
-    project.resources.iter().find(|r| r.id == id)
-}
-
-/// Read the texture's `.psxt` bytes from disk. Resolves
-/// `psxt_path` first as-is (absolute paths), then relative to
-/// `project_root`. Returns a string error rather than `io::Error`
-/// so callers can prepend room/material context.
-/// Validate a room-material `.psxt` blob is 4bpp (16-entry
-/// CLUT). Both the editor preview material upload path and the
-/// runtime room material slots assume 4bpp; other depths
-/// render with wrong colours.
-fn expect_room_material_depth(resource: &Resource, bytes: &[u8]) -> Result<(), String> {
-    let texture = psx_asset::Texture::from_bytes(bytes)
-        .map_err(|e| format!("texture '{}' parse failed: {e:?}", resource.name))?;
-    if texture.clut_entries() != 16 {
-        return Err(format!(
-            "texture '{}' must be 4bpp (16-entry CLUT) for room materials; found {} entries",
-            resource.name,
-            texture.clut_entries(),
-        ));
-    }
-    Ok(())
-}
-
-fn load_texture_bytes(resource: &Resource, project_root: &Path) -> Result<Vec<u8>, String> {
-    let ResourceData::Texture { psxt_path } = &resource.data else {
-        return Err(format!(
-            "resource '{}' (#{}) is not a Texture",
-            resource.name,
-            resource.id.raw(),
-        ));
-    };
-    if psxt_path.is_empty() {
-        return Err(format!(
-            "texture resource '{}' has empty path",
-            resource.name
-        ));
-    }
-    let path = if Path::new(psxt_path).is_absolute() {
-        PathBuf::from(psxt_path)
-    } else {
-        project_root.join(psxt_path)
-    };
-    std::fs::read(&path).map_err(|e| {
-        format!(
-            "failed to read texture '{}' at {}: {e}",
-            resource.name,
-            path.display(),
-        )
-    })
-}
-
-/// Remove every file with extension `ext` directly inside `dir`.
-/// Used before writing fresh assets so stale `room_NNN.psxw` /
-/// `texture_NNN.psxt` files don't survive a rename / removal.
-fn purge_directory_files(dir: &Path, ext: &str) -> std::io::Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-            std::fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
-}
-
-/// Purge stale per-model subfolders inside `generated/models/`.
-/// Each cook re-creates `model_NNN_<safe>/` folders from scratch,
-/// so the simplest safe behaviour is to remove every immediate
-/// subdirectory before writing.
-fn purge_models_dir(dir: &Path) -> std::io::Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path)?;
-        }
-    }
-    Ok(())
-}
-
-/// Walk parent links until a Room node is reached.
 fn enclosing_room<'a>(
     scene: &'a crate::Scene,
     node: &'a SceneNode,
@@ -1960,11 +955,14 @@ fn enclosing_room<'a>(
 /// Convert a node's editor-space transform to room-local engine units.
 fn node_room_local_position(node: &SceneNode, grid: &WorldGrid) -> [i32; 3] {
     let s = grid.sector_size as f32;
-    let half_w = grid.width as f32 * 0.5;
-    let half_d = grid.depth as f32 * 0.5;
-    let x = (node.transform.translation[0] + half_w) * s;
+    // `.psxw` geometry is array-rooted at (0,0). Editor transforms
+    // are room-centre-relative, so the cooked local placement is the
+    // editor offset from the current array centre. `origin` cancels
+    // out here by design; it is emitted on LevelRoomRecord only as
+    // diagnostic editor metadata.
+    let x = (node.transform.translation[0] + grid.width as f32 * 0.5) * s;
     let y = node.transform.translation[1] * s;
-    let z = (node.transform.translation[2] + half_d) * s;
+    let z = (node.transform.translation[2] + grid.depth as f32 * 0.5) * s;
     [x as i32, y as i32, z as i32]
 }
 
@@ -2003,6 +1001,19 @@ mod tests {
         assert!(has_room, "starter must contain a Room");
         assert!(has_player_spawn, "starter must contain a player SpawnPoint");
         project
+    }
+
+    #[test]
+    fn tracked_editor_playtest_manifest_is_placeholder() {
+        let manifest = std::fs::read_to_string(default_generated_dir().join(MANIFEST_FILENAME))
+            .expect("read tracked editor-playtest manifest");
+        assert!(
+            !manifest.contains("include_bytes!"),
+            "tracked placeholder manifest must not reference ignored cooked blobs"
+        );
+        assert!(manifest.contains("pub static ASSETS: &[LevelAssetRecord] = &[];"));
+        assert!(manifest.contains("pub static ROOMS: &[LevelRoomRecord] = &[];"));
+        assert!(manifest.contains("pub static ROOM_RESIDENCY: &[RoomResidencyRecord] = &[];"));
     }
 
     #[test]
@@ -2337,7 +1348,7 @@ mod tests {
         let package = package.expect("starter cooks");
         assert_eq!(package.models.len(), 1);
         assert_eq!(package.model_instances.len(), 1);
-        assert!(package.model_clips.len() >= 1);
+        assert!(!package.model_clips.is_empty());
         assert_eq!(package.model_mesh_asset_count(), 1);
         assert_eq!(
             package.model_animation_asset_count(),
@@ -2568,12 +1579,7 @@ mod tests {
         if let Some(node) = scene.node_mut(room_id) {
             if let NodeKind::Room { grid } = &mut node.kind {
                 for sector in grid.sectors.iter_mut().flatten() {
-                    for dir in [
-                        crate::GridDirection::North,
-                        crate::GridDirection::East,
-                        crate::GridDirection::South,
-                        crate::GridDirection::West,
-                    ] {
+                    for dir in crate::GridDirection::CARDINAL {
                         for wall in sector.walls.get_mut(dir).iter_mut() {
                             wall.material = Some(new_material_id);
                         }

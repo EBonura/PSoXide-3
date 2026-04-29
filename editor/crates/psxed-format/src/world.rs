@@ -204,4 +204,3 @@ impl WallRecord {
     /// Size of one wall record in bytes.
     pub const SIZE: usize = core::mem::size_of::<Self>();
 }
-

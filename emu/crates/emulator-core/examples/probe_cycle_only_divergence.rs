@@ -71,8 +71,7 @@ fn main() {
                 // Also print last 5 records to see preceding instructions.
                 if i >= 5 {
                     println!("  preceding 5 instructions:");
-                    for k in (i - 5)..i {
-                        let r = &trace[k];
+                    for (k, r) in trace.iter().enumerate().take(i).skip(i - 5) {
                         println!(
                             "    step {k:>9}  tick={:>12}  pc=0x{:08x}  instr=0x{:08x}  op=0x{:02x}",
                             r.tick,

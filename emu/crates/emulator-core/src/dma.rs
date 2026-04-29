@@ -477,12 +477,12 @@ mod tests {
     #[test]
     fn dicr_w1c_clears_pending_flag() {
         let mut dma = Dma::new();
-        dma.write32(0x1F80_10F4, (1 << (16 + 0)) | (1 << 23));
+        dma.write32(0x1F80_10F4, (1 << 16) | (1 << 23));
         dma.notify_channel_done(0);
         assert!(dma.read32(0x1F80_10F4) & (1 << 24) != 0);
         // BIOS acks by writing 1 to the flag bit (along with re-asserting
         // the R/W enables, which the BIOS has been managing all along).
-        dma.write32(0x1F80_10F4, (1 << (16 + 0)) | (1 << 23) | (1 << 24));
+        dma.write32(0x1F80_10F4, (1 << 16) | (1 << 23) | (1 << 24));
         let dicr = dma.read32(0x1F80_10F4);
         assert_eq!(dicr & (1 << 24), 0, "flag cleared by W1C");
         assert_eq!(dicr & (1 << 31), 0, "master flag follows");

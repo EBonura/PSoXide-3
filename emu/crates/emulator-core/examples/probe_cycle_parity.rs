@@ -23,6 +23,8 @@
 use emulator_core::{Bus, Cpu};
 use psx_iso::Disc;
 
+type Scenario<'a> = (&'a str, Option<&'a str>, &'a [(u64, u64)]);
+
 fn main() {
     // Each scenario: (name, disc_path or None, (step, expected_redux_tick) list)
     //
@@ -33,7 +35,7 @@ fn main() {
     //
     // To add a new row: run `display_parity_at <steps> [disc]` and
     // copy the "reached tick=..." line.
-    let scenarios: &[(&str, Option<&str>, &[(u64, u64)])] = &[
+    let scenarios: &[Scenario<'_>] = &[
         (
             "bios",
             None,

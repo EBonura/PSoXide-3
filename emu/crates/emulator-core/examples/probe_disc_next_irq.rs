@@ -66,9 +66,9 @@ fn main() {
             }
             let pending = pre_istat & pre_imask;
             let mut which = Vec::new();
-            for bit in 0..irq_names.len() {
+            for (bit, name) in irq_names.iter().enumerate() {
                 if pending & (1 << bit) != 0 {
-                    which.push(irq_names[bit]);
+                    which.push(*name);
                 }
             }
             println!("next_irq_step    : {step_n}");

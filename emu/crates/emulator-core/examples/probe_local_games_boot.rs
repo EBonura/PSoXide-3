@@ -87,8 +87,8 @@ fn main() {
         bios_path.display()
     );
     println!(
-        "{:<42} {:>10} {:>12} {:>12} {:>10} {:>8} {:>8}  {}",
-        "game", "signal", "pc", "hash", "cdcmds", "drdy", "pops", "tail pcs"
+        "{:<42} {:>10} {:>12} {:>12} {:>10} {:>8} {:>8}  tail pcs",
+        "game", "signal", "pc", "hash", "cdcmds", "drdy", "pops"
     );
     println!("{}", "-".repeat(128));
 

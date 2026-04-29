@@ -1032,6 +1032,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
     /// yawed enemy / NPC) can pass that rotation here. Use
     /// `Mat3I16::IDENTITY` for unrotated instances — that's the
     /// existing showcase-model behaviour.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_textured_model(
         &mut self,
         triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -1051,9 +1052,12 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         load_world_projection_gte(camera.projection);
 
         let joint_count = (model.joint_count() as usize).min(joint_view_transforms.len());
-        for joint in 0..joint_count {
-            joint_view_transforms[joint] = match animation.pose_looped_q12(frame_q12, joint as u16)
-            {
+        for (joint, joint_view_transform) in joint_view_transforms
+            .iter_mut()
+            .enumerate()
+            .take(joint_count)
+        {
+            *joint_view_transform = match animation.pose_looped_q12(frame_q12, joint as u16) {
                 Some(pose) => {
                     let (rotation, translation) = textured_model_part_gte_transform(
                         camera,

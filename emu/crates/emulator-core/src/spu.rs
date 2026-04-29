@@ -22,20 +22,11 @@
 //!
 //! Pipeline per 44.1 kHz sample:
 //!
-//! 1. For each voice:
-//!    a. If envelope is in `Off`, contribute 0.
-//!    b. Advance ADPCM read position by `raw_pitch / 0x1000` of a
-//!       sample; when `sample_index` reaches 28, decode the next
-//!       16-byte ADPCM block into the sample buffer and update the
-//!       prev-sample history (`s_1`, `s_2`). Apply block flags
-//!       (loop-start / loop-end / loop-repeat). On loop-end with
-//!       repeat, jump to `loop_addr` or stop the voice.
-//!    c. Linearly interpolate between consecutive decoded samples
-//!       at the fractional position.
-//!    d. Advance ADSR envelope one sample; multiply interpolated
-//!       sample by envelope level (Q15).
-//!    e. Multiply by per-voice L / R volume (Q14 static, or
-//!       approximated sweep) to get per-channel contribution.
+//! 1. For each voice, skip `Off` envelopes, advance ADPCM read
+//!    position by `raw_pitch / 0x1000` of a sample, decode the next
+//!    16-byte ADPCM block when `sample_index` reaches 28, apply loop
+//!    flags, interpolate at the fractional position, advance ADSR,
+//!    then apply per-voice L/R volume.
 //! 2. Sum all 24 voices into `(sum_l, sum_r)`.
 //! 3. Feed EON-enabled voices and CD reverb input into the Neill/Redux
 //!    reverb network in SPU RAM.
@@ -53,6 +44,9 @@
 //! cycles.
 
 use crate::scheduler::{EventSlot, Scheduler};
+
+mod xa;
+pub use xa::{xa_decode_block, XaDecoderState};
 
 // ===============================================================
 //  Register addresses — voice bank + global + reverb config.
@@ -319,7 +313,7 @@ impl VolumeEnvelope {
             if raw & (1 << 12) != 0 {
                 vol ^= 0xFFFF;
             }
-            vol = (((vol & 0x7F) + 1) / 2) as i32;
+            vol = ((vol & 0x7F) + 1) / 2;
             if decreasing {
                 vol -= vol / 2;
             } else {
@@ -1980,98 +1974,6 @@ fn gauss_interpolate(samples: [i16; 4], frac: u32) -> i16 {
 //  XA ADPCM decoder.
 // ===============================================================
 
-/// Per-channel decoder history for XA ADPCM blocks. The filter
-/// uses the last two decoded samples (`y0` = most recent,
-/// `y1` = second-most-recent) as feedback. Callers hold one of
-/// these per stereo channel (or one total for mono).
-#[derive(Default, Clone, Debug)]
-pub struct XaDecoderState {
-    y0: i32,
-    y1: i32,
-}
-
-impl XaDecoderState {
-    /// Fresh decoder history — silence as prev samples.
-    pub fn new() -> Self {
-        Self { y0: 0, y1: 0 }
-    }
-
-    /// Reset history to silence between XA files.
-    pub fn reset(&mut self) {
-        self.y0 = 0;
-        self.y1 = 0;
-    }
-}
-
-/// XA ADPCM filter coefficients `k0, k1` in Q10 form. Four filter
-/// IDs match the real-hardware decode table. Pattern matches
-/// Redux's `decode_xa.cc::s_K0/s_K1` at `(1<<SHC = 1024)`.
-const XA_FILTER: [(i32, i32); 4] = [(0, 0), (960, 0), (1840, -832), (1568, -880)];
-
-/// Decode 28 ADPCM samples (one "sound unit") from an XA block.
-/// - `filter_range` — packed byte: high nibble = filter ID (0..=3,
-///   values >3 are reserved), low nibble = range (output shift).
-/// - `data` — seven 16-bit packed words, laid out exactly like
-///   Redux's `decode_xa.cc` before it calls `ADPCM_DecodeBlock16`.
-///   Each word carries four 4-bit samples.
-/// - `state` — in/out filter history; mutates across calls within a
-///   sound group.
-///
-/// Writes 28 output samples into `out[0], out[stride], out[2*stride], ...`.
-/// Stride = 2 for interleaved stereo, 1 for mono.
-pub fn xa_decode_block(
-    state: &mut XaDecoderState,
-    filter_range: u8,
-    data: &[u16],
-    out: &mut [i16],
-    stride: usize,
-) {
-    let filter_id = ((filter_range >> 4) & 0x0F).min(3) as usize;
-    let range = (filter_range & 0x0F) as u32;
-    let (k0, k1) = XA_FILTER[filter_id];
-    let mut y0 = state.y0;
-    let mut y1 = state.y1;
-
-    // Match Redux's `ADPCM_DecodeBlock16` exactly: unpack one packed
-    // 16-bit word into x0..x3 (high nibble first), run the IIR filter,
-    // clamp in Q4, then emit 16-bit PCM.
-    for (i, &word) in data.iter().take(7).enumerate() {
-        let expand = |shift: u32| -> i32 {
-            let nib = ((((word as u32) << shift) & 0xF000) as u16) as i16 as i32;
-            (nib >> range) << 4
-        };
-
-        let mut x3 = expand(0);
-        let mut x2 = expand(4);
-        let mut x1 = expand(8);
-        let mut x0 = expand(12);
-
-        x0 += (y0 * k0 + y1 * k1) >> 10;
-        y1 = y0;
-        y0 = x0;
-        x1 += (y0 * k0 + y1 * k1) >> 10;
-        y1 = y0;
-        y0 = x1;
-        x2 += (y0 * k0 + y1 * k1) >> 10;
-        y1 = y0;
-        y0 = x2;
-        x3 += (y0 * k0 + y1 * k1) >> 10;
-        y1 = y0;
-        y0 = x3;
-
-        let decoded = [x0, x1, x2, x3];
-        for (n, &sample) in decoded.iter().enumerate() {
-            let clamped = sample.clamp(-32768 << 4, 32767 << 4);
-            let idx = (i * 4 + n) * stride;
-            if idx < out.len() {
-                out[idx] = (clamped >> 4) as i16;
-            }
-        }
-    }
-    state.y0 = y0;
-    state.y1 = y1;
-}
-
 // ===============================================================
 //  Helpers.
 // ===============================================================
@@ -2096,10 +1998,10 @@ fn decode_voice(phys: u32) -> Option<(usize, u32)> {
 fn read_adpcm_block(ram: &[u16], addr: u32) -> [u8; ADPCM_BLOCK_BYTES] {
     let mut out = [0u8; ADPCM_BLOCK_BYTES];
     let base = (addr & (SPU_RAM_BYTES as u32 - 1)) as usize;
-    for i in 0..ADPCM_BLOCK_BYTES {
+    for (i, out_byte) in out.iter_mut().enumerate().take(ADPCM_BLOCK_BYTES) {
         let byte_addr = (base + i) & (SPU_RAM_BYTES - 1);
         let halfword = ram[byte_addr >> 1];
-        out[i] = if byte_addr & 1 == 0 {
+        *out_byte = if byte_addr & 1 == 0 {
             halfword as u8
         } else {
             (halfword >> 8) as u8
@@ -2643,9 +2545,9 @@ mod tests {
         block[1] = 0x02; // flag 2 = repeat
                          // Loop this one block for the first 0x1000 bytes of RAM.
         for base in (0..0x1000).step_by(16) {
-            for i in 0..16 {
+            for (i, block_byte) in block.iter().enumerate() {
                 let idx = (base + i) / 2;
-                let byte = block[i] as u16;
+                let byte = *block_byte as u16;
                 if (base + i) & 1 == 0 {
                     s.ram[idx] = (s.ram[idx] & 0xFF00) | byte;
                 } else {

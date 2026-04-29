@@ -751,9 +751,9 @@ impl BoundsAccumulator {
             return;
         }
         self.any = true;
-        for axis in 0..3 {
-            self.min[axis] = self.min[axis].min(p[axis]);
-            self.max[axis] = self.max[axis].max(p[axis]);
+        for (axis, value) in p.iter().copied().enumerate() {
+            self.min[axis] = self.min[axis].min(value);
+            self.max[axis] = self.max[axis].max(value);
         }
     }
 
@@ -768,6 +768,7 @@ impl BoundsAccumulator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_precision_bounds(
     document: &gltf::Document,
     buffers: &[gltf::buffer::Data],
@@ -1165,6 +1166,7 @@ fn compute_global_matrix(
     global
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cook_model_blob(
     source: &SkinnedSourceMesh,
     bounds: &ModelBounds,
@@ -1451,21 +1453,23 @@ fn cook_base_color_texture(
 }
 
 fn first_material_base_color(mesh: &gltf::Mesh<'_>) -> [u8; 4] {
-    for primitive in mesh.primitives() {
+    if let Some(primitive) = mesh.primitives().next() {
         let color = primitive
             .material()
             .pbr_metallic_roughness()
             .base_color_factor();
-        return [
+        [
             linear_to_u8(color[0]),
             linear_to_u8(color[1]),
             linear_to_u8(color[2]),
             linear_to_u8(color[3]),
-        ];
+        ]
+    } else {
+        [255, 255, 255, 255]
     }
-    [255, 255, 255, 255]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cook_all_animations(
     document: &gltf::Document,
     buffers: &[gltf::buffer::Data],
@@ -1511,6 +1515,7 @@ fn cook_all_animations(
     Ok(clips)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cook_animation_bytes(
     channels: &[AnimationChannel],
     parents: &[Option<usize>],
@@ -1731,9 +1736,9 @@ fn compose_trs(translation: [f32; 3], rotation: [f32; 4], scale: [f32; 3]) -> [[
 }
 
 fn append_pose_record(out: &mut Vec<u8>, skin_matrix: &[[f32; 4]; 4], bounds: &ModelBounds) {
-    for col in 0..3 {
-        for row in 0..3 {
-            append_i16(out, q12_i16(skin_matrix[col][row]));
+    for column in skin_matrix.iter().take(3) {
+        for value in column.iter().take(3) {
+            append_i16(out, q12_i16(*value));
         }
     }
     let center_in_pose = transform_point(skin_matrix, bounds.center);
@@ -1993,7 +1998,7 @@ mod tests {
     }
 
     fn padded(mut bytes: Vec<u8>, pad: u8) -> Vec<u8> {
-        while bytes.len() % 4 != 0 {
+        while !bytes.len().is_multiple_of(4) {
             bytes.push(pad);
         }
         bytes

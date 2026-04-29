@@ -27,9 +27,9 @@ use std::sync::Mutex;
 use emulator_core::gpu::GpuCmdLogEntry;
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::TriFlat;
+use psx_gpu::prim::TriTextured;
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
-use psx_gpu::prim::TriTextured;
 
 use psxed_project::{
     GridDirection, GridSplit, NodeKind, ProjectDocument, ResourceData, ResourceId, WorldGrid,
@@ -109,6 +109,7 @@ static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
 /// Returns an empty log if the project has no Rooms — the editor
 /// renderer will then paint a black panel, which is the correct "no
 /// scene to show" affordance.
+#[allow(clippy::too_many_arguments)]
 pub fn build_phase1_cmd_log(
     project: &ProjectDocument,
     camera: ViewportCameraState,
@@ -193,10 +194,8 @@ fn first_room_grid(
     };
     // Geometric centre in world coords accounts for `origin` so the
     // camera reframes naturally as the grid grows in any direction.
-    let center_x =
-        grid.origin[0] * grid.sector_size + (grid.width as i32 * grid.sector_size) / 2;
-    let center_z =
-        grid.origin[1] * grid.sector_size + (grid.depth as i32 * grid.sector_size) / 2;
+    let center_x = grid.origin[0] * grid.sector_size + (grid.width as i32 * grid.sector_size) / 2;
+    let center_z = grid.origin[1] * grid.sector_size + (grid.depth as i32 * grid.sector_size) / 2;
     Some((room.id, grid, [center_x, 0, center_z]))
 }
 
@@ -207,7 +206,7 @@ fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) -> psx_en
     // Orbit camera world position: target offset by radius along the
     // unit vector implied by yaw + pitch. Pitch positive = camera
     // raised above the target, looking down.
-    let r = camera.radius as i32;
+    let r = camera.radius;
     let cos_p = psx_gte::transform::cos_1_3_12(camera.pitch_q12) as i32;
     let sin_p = psx_gte::transform::sin_1_3_12(camera.pitch_q12) as i32;
     let cos_y = psx_gte::transform::cos_1_3_12(camera.yaw_q12) as i32;
@@ -256,19 +255,14 @@ fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) -> psx_en
     set_view_anchor(target);
     gte_scene::load_rotation(&view);
     gte_scene::load_translation(tr);
-    gte_scene::set_screen_offset((SCREEN_CX as i32) << 16, (SCREEN_CY as i32) << 16);
+    gte_scene::set_screen_offset(SCREEN_CX << 16, SCREEN_CY << 16);
     gte_scene::set_projection_plane(PROJ_H as u16);
 
     // Build a `WorldCamera` matching the same basis so the
     // model preview path can compose joint transforms with
     // `psx_engine::compute_joint_view_transform`.
     psx_engine::WorldCamera::from_basis(
-        psx_engine::WorldProjection::new(
-            SCREEN_CX as i16,
-            SCREEN_CY as i16,
-            PROJ_H as i32,
-            32,
-        ),
+        psx_engine::WorldProjection::new(SCREEN_CX as i16, SCREEN_CY as i16, PROJ_H, 32),
         psx_engine::WorldVertex::new(cam_x, cam_y, cam_z),
         sin_y,
         cos_y,
@@ -388,7 +382,8 @@ fn walk_room(
                     // Ceiling normal points down; flipping the winding
                     // keeps backface-cullers happy and pins the inside
                     // surface as the visible side once we add culling.
-                    /* flip_winding */ true,
+                    /* flip_winding */
+                    true,
                 );
             }
             for &(direction, edge) in &[
@@ -590,11 +585,7 @@ fn light_face(
     // modulate step expects: ambient = neutral 128 produces
     // unmodified base material; ambient < 128 produces a
     // dimmer surface; ambient > 128 brightens.
-    let mut light_rgb: [u32; 3] = [
-        ambient[0] as u32,
-        ambient[1] as u32,
-        ambient[2] as u32,
-    ];
+    let mut light_rgb: [u32; 3] = [ambient[0] as u32, ambient[1] as u32, ambient[2] as u32];
     for light in lights {
         let dx = (face_center[0] - light.position[0]) as i64;
         let dy = (face_center[1] - light.position[1]) as i64;
@@ -608,21 +599,21 @@ fn light_face(
         // means "at the centre".
         let d = isqrt_i64(d2);
         let weight_q8 = (((r - d) << 8) / r) as u32;
-        for c in 0..3 {
+        for (c, channel) in light_rgb.iter_mut().enumerate() {
             // weighted_color[c] = color[c] * intensity_q8 (up to
             // 255 * u16::MAX). One contribution lands as
             //   color * intensity * weight  → in 0..=255 typical
             //   = (weighted_color * weight_q8) >> 16
             let contrib = (light.weighted_color[c] as u64) * (weight_q8 as u64);
-            light_rgb[c] = light_rgb[c].saturating_add((contrib >> 16) as u32);
+            *channel = channel.saturating_add((contrib >> 16) as u32);
         }
     }
     // Saturate light_rgb at 255 before modulating. Guarantees
     // `base * light / 128` can't exceed `base * 2`, which the
     // 8-bit clamp catches.
-    for c in 0..3 {
-        if light_rgb[c] > LIGHTING_MAX {
-            light_rgb[c] = LIGHTING_MAX;
+    for channel in &mut light_rgb {
+        if *channel > LIGHTING_MAX {
+            *channel = LIGHTING_MAX;
         }
     }
     let modulate = |base: u8, light: u32| -> u8 {
@@ -742,9 +733,8 @@ fn push_horizontal_face(
         ),
     };
 
-    let triangle_contains = |members: [Corner; 3], target: Corner| -> bool {
-        members.iter().any(|c| *c == target)
-    };
+    let triangle_contains =
+        |members: [Corner; 3], target: Corner| -> bool { members.contains(&target) };
     let emit_triangle = |scratch: &mut PreviewScratch,
                          verts: [psx_gte::scene::Projected; 3],
                          uvs: [(u8, u8); 3]| {
@@ -860,9 +850,8 @@ fn push_wall_face(
         )
     };
 
-    let skip = |members: [WallCorner; 3]| -> bool {
-        dropped_corner.is_some_and(|c| members.iter().any(|m| *m == c))
-    };
+    let skip =
+        |members: [WallCorner; 3]| -> bool { dropped_corner.is_some_and(|c| members.contains(&c)) };
     if !skip(tri_a.2) {
         emit_face_tri(scratch, tri_a.0, tri_a.1, shade);
     }
@@ -1357,7 +1346,9 @@ fn floor_anchored_model_origin(
 ) -> psx_engine::WorldVertex {
     psx_engine::WorldVertex::new(
         origin.x,
-        origin.y.saturating_add(model_origin_floor_lift(world_height)),
+        origin
+            .y
+            .saturating_add(model_origin_floor_lift(world_height)),
         origin.z,
     )
 }
@@ -1384,11 +1375,7 @@ fn yaw_rotation_q12(yaw_q12: u16) -> Mat3I16 {
     let s = psx_gte::transform::sin_1_3_12(yaw_q12);
     let c = psx_gte::transform::cos_1_3_12(yaw_q12);
     Mat3I16 {
-        m: [
-            [c, 0, s],
-            [0, 0x1000, 0],
-            [-s, 0, c],
-        ],
+        m: [[c, 0, s], [0, 0x1000, 0], [-s, 0, c]],
     }
 }
 
@@ -1418,7 +1405,11 @@ fn draw_preview_model_instance(
     let joint_count = (instance.model.joint_count() as usize).min(PREVIEW_JOINT_CAP);
     let mut joint_view_transforms: [psx_engine::JointViewTransform; PREVIEW_JOINT_CAP] =
         [psx_engine::JointViewTransform::ZERO; PREVIEW_JOINT_CAP];
-    for joint in 0..joint_count {
+    for (joint, joint_view_transform) in joint_view_transforms
+        .iter_mut()
+        .enumerate()
+        .take(joint_count)
+    {
         if let Some(pose) = instance.animation.pose_looped_q12(frame_q12, joint as u16) {
             let (rotation, translation) = psx_engine::compute_joint_view_transform(
                 *camera,
@@ -1427,8 +1418,10 @@ fn draw_preview_model_instance(
                 local_to_world,
                 instance.origin,
             );
-            joint_view_transforms[joint] =
-                psx_engine::JointViewTransform { rotation, translation };
+            *joint_view_transform = psx_engine::JointViewTransform {
+                rotation,
+                translation,
+            };
         }
     }
 
@@ -1557,11 +1550,7 @@ fn walk_light_gizmos(
             // Tint the unlit ring toward the authored colour
             // so multiple lights in a room read at a glance.
             FaceOutlineStyle {
-                rgb: (
-                    color[0].max(0x40),
-                    color[1].max(0x40),
-                    color[2].max(0x40),
-                ),
+                rgb: (color[0].max(0x40), color[1].max(0x40), color[2].max(0x40)),
                 thickness_px: 1,
             }
         };
@@ -1605,13 +1594,7 @@ fn walk_entity_bounds(
                 | psxed_ui::EntityBoundKind::SpawnPoint
                 | psxed_ui::EntityBoundKind::MeshFallback
         ) {
-            push_facing_arrow(
-                scratch,
-                b.center,
-                b.half_extents,
-                b.yaw_degrees,
-                style,
-            );
+            push_facing_arrow(scratch, b.center, b.half_extents, b.yaw_degrees, style);
         }
     }
 }
@@ -1678,9 +1661,18 @@ fn push_aabb_wireframe(
     // 12 edges of a box: 4 along X, 4 along Y, 4 along Z. Pairs
     // of corners that differ in exactly one bit.
     const EDGES: [(usize, usize); 12] = [
-        (0, 1), (2, 3), (4, 5), (6, 7), // along X
-        (0, 2), (1, 3), (4, 6), (5, 7), // along Y
-        (0, 4), (1, 5), (2, 6), (3, 7), // along Z
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7), // along X
+        (0, 2),
+        (1, 3),
+        (4, 6),
+        (5, 7), // along Y
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7), // along Z
     ];
     for (a, b) in EDGES {
         if p[a].sz == 0 || p[b].sz == 0 {
@@ -1908,12 +1900,7 @@ fn push_paint_preview(
 /// space lines along the cell's edges, lifted slightly above
 /// `y = 0` so the strokes don't z-fight any existing floor at the
 /// same world position.
-fn push_cell_ghost_outline(
-    grid: &WorldGrid,
-    wcx: i32,
-    wcz: i32,
-    scratch: &mut PreviewScratch,
-) {
+fn push_cell_ghost_outline(grid: &WorldGrid, wcx: i32, wcz: i32, scratch: &mut PreviewScratch) {
     let s = grid.sector_size;
     let x0 = wcx * s;
     let x1 = x0 + s;
@@ -2107,10 +2094,7 @@ fn push_vertex_outline(
     }
 }
 
-fn edge_world_endpoints(
-    grid: &WorldGrid,
-    edge: psxed_ui::EdgeRef,
-) -> Option<([i32; 3], [i32; 3])> {
+fn edge_world_endpoints(grid: &WorldGrid, edge: psxed_ui::EdgeRef) -> Option<([i32; 3], [i32; 3])> {
     use psxed_ui::{EdgeAnchor, FaceCornerRef};
     let (a, b) = match edge.anchor {
         EdgeAnchor::Floor { sx, sz, dir } => (
@@ -2298,13 +2282,7 @@ fn push_face_outline(
 /// World-space (x, z) endpoints of a wall on the given cardinal
 /// edge — mirrors `push_wall_face` so picking, paint preview, and
 /// outline rendering all agree.
-fn wall_xy_for(
-    dir: GridDirection,
-    x0: i32,
-    x1: i32,
-    z0: i32,
-    z1: i32,
-) -> ((i32, i32), (i32, i32)) {
+fn wall_xy_for(dir: GridDirection, x0: i32, x1: i32, z0: i32, z1: i32) -> ((i32, i32), (i32, i32)) {
     match dir {
         GridDirection::North => ((x0, z1), (x1, z1)),
         GridDirection::East => ((x1, z1), (x1, z0)),
@@ -2391,11 +2369,7 @@ fn push_tri_at_slot(
     }
     let idx = scratch.used;
     scratch.tris[idx] = TriFlat::new(
-        [
-            (p[0].sx, p[0].sy),
-            (p[1].sx, p[1].sy),
-            (p[2].sx, p[2].sy),
-        ],
+        [(p[0].sx, p[0].sy), (p[1].sx, p[1].sy), (p[2].sx, p[2].sy)],
         rgb.0,
         rgb.1,
         rgb.2,
@@ -2403,9 +2377,11 @@ fn push_tri_at_slot(
     scratch.used = idx + 1;
     let packet_ptr: *mut TriFlat = &mut scratch.tris[idx];
     unsafe {
-        scratch
-            .ot
-            .insert(slot.min(OT_DEPTH - 1), packet_ptr.cast::<u32>(), TriFlat::WORDS);
+        scratch.ot.insert(
+            slot.min(OT_DEPTH - 1),
+            packet_ptr.cast::<u32>(),
+            TriFlat::WORDS,
+        );
     }
 }
 
@@ -2421,8 +2397,8 @@ fn push_clear(scratch: &mut PreviewScratch) {
     let color_word = 0x0200_0000_u32; // opcode 0x02, RGB = 0 (black)
     let xy_word = 0u32; // top-left at (0, 0)
     let wh_word = ((240u32) << 16) | 320u32; // pack_xy(320, 240)
-    // word[0] is rewritten by `OrderingTable::insert` with the
-    // chain tag — leave it at 0 here.
+                                             // word[0] is rewritten by `OrderingTable::insert` with the
+                                             // chain tag — leave it at 0 here.
     scratch.clear_packet[1] = color_word;
     scratch.clear_packet[2] = xy_word;
     scratch.clear_packet[3] = wh_word;
@@ -2467,11 +2443,7 @@ fn push_tex_tri(
     }
     let idx = scratch.tex_used;
     scratch.tex_tris[idx] = TriTextured::new(
-        [
-            (p[0].sx, p[0].sy),
-            (p[1].sx, p[1].sy),
-            (p[2].sx, p[2].sy),
-        ],
+        [(p[0].sx, p[0].sy), (p[1].sx, p[1].sy), (p[2].sx, p[2].sy)],
         uvs,
         slot.clut_word,
         slot.tpage_word,
@@ -2491,21 +2463,13 @@ fn push_tex_tri(
 /// Compose a [`TriFlat`] from three projected vertices, store it in
 /// the next slot of the static `tris` array, and link it into the
 /// OT keyed on average screen-space depth.
-fn push_tri(
-    scratch: &mut PreviewScratch,
-    p: [psx_gte::scene::Projected; 3],
-    rgb: (u8, u8, u8),
-) {
+fn push_tri(scratch: &mut PreviewScratch, p: [psx_gte::scene::Projected; 3], rgb: (u8, u8, u8)) {
     if scratch.used >= TRI_CAP {
         return;
     }
     let idx = scratch.used;
     scratch.tris[idx] = TriFlat::new(
-        [
-            (p[0].sx, p[0].sy),
-            (p[1].sx, p[1].sy),
-            (p[2].sx, p[2].sy),
-        ],
+        [(p[0].sx, p[0].sy), (p[1].sx, p[1].sy), (p[2].sx, p[2].sy)],
         rgb.0,
         rgb.1,
         rgb.2,
@@ -2618,12 +2582,7 @@ mod tests {
             radius: 100,
             weighted_color: [255 * 256, 255 * 256, 255 * 256],
         };
-        let lit = light_face(
-            flat(255, 255, 255),
-            [0, 0, 0],
-            &[l, l],
-            [128, 128, 128],
-        );
+        let lit = light_face(flat(255, 255, 255), [0, 0, 0], &[l, l], [128, 128, 128]);
         let (r, g, b) = unpack(lit);
         // Even with two saturating lights, output never
         // exceeds 255 per channel.

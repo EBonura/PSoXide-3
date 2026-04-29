@@ -527,7 +527,7 @@ mod tests {
         // in opcode byte.
         let tl = gp0::draw_area_top_left(10, 20);
         let br = gp0::draw_area_bottom_right(10, 20);
-        assert_eq!(tl & 0xFFFF_FFFF, 0xE300_0000 | 10 | (20 << 10));
-        assert_eq!(br & 0xFFFF_FFFF, 0xE400_0000 | 10 | (20 << 10));
+        assert_eq!(tl, 0xE300_0000 | 10 | (20 << 10));
+        assert_eq!(br, 0xE400_0000 | 10 | (20 << 10));
     }
 }

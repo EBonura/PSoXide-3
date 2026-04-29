@@ -758,13 +758,8 @@ impl DigitalPad {
             0x45 => match self.step {
                 2 => 0x01, // device class: DualShock
                 3 => 0x02, // number of analog param words
-                4 => {
-                    if self.mode_before_config == PadMode::Analog {
-                        0x01
-                    } else {
-                        0x00
-                    }
-                }
+                4 if self.mode_before_config == PadMode::Analog => 0x01,
+                4 => 0x00,
                 5 => 0x02, // analog mode activated
                 6 => 0x01, // rumble capable (stub)
                 _ => 0x00,
@@ -1774,7 +1769,7 @@ mod tests {
         let mut card = MemoryCard::new();
         // Write a frame of pattern data to frame 0.
         let pattern: Vec<u8> = (0..MEMCARD_FRAME_SIZE).map(|i| (i * 3) as u8).collect();
-        let checksum: u8 = pattern.iter().fold(0u8, |a, b| a ^ b) ^ 0x00 ^ 0x00;
+        let checksum: u8 = pattern.iter().fold(0u8, |a, b| a ^ b);
         // Protocol: 0x81, 'W' (0x57), 0x00, 0x00, MSB (0x00), LSB (0x00), data*128, checksum
         assert_eq!(card.exchange(0x81), (0xFF, true));
         assert_eq!(card.exchange(0x57), (0x08, true));

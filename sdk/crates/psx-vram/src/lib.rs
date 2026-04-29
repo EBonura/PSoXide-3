@@ -240,6 +240,7 @@ pub struct Tpage {
 impl Tpage {
     /// Build a Tpage. Compile-time assertion that `x` is a
     /// multiple of 64 and `y` is 0 or 256.
+    #[allow(clippy::manual_is_multiple_of)]
     pub const fn new(x: u16, y: u16, depth: TexDepth) -> Self {
         assert!(x % 64 == 0, "Tpage: x must be a multiple of 64");
         assert!(x < VRAM_WIDTH, "Tpage: x past VRAM");
@@ -323,6 +324,7 @@ pub struct Clut {
 
 impl Clut {
     /// Build a CLUT. `x` must be a multiple of 16; `y` is any row.
+    #[allow(clippy::manual_is_multiple_of)]
     pub const fn new(x: u16, y: u16) -> Self {
         assert!(x % 16 == 0, "Clut: x must be a multiple of 16");
         assert!(x < VRAM_WIDTH, "Clut: x past VRAM");
@@ -376,7 +378,7 @@ pub fn upload_16bpp(rect: VramRect, pixels: &[u16]) {
         expected,
     );
     assert!(
-        expected % 2 == 0,
+        expected.is_multiple_of(2),
         "upload_16bpp: odd pixel count ({expected}) not supported — caller should round up",
     );
 
@@ -414,7 +416,7 @@ pub fn upload_bytes(rect: VramRect, bytes: &[u8]) {
         expected,
     );
     assert!(
-        bytes.len() >= 4 && bytes.len() % 4 == 0,
+        bytes.len() >= 4 && bytes.len().is_multiple_of(4),
         "upload_bytes: byte count must be a positive multiple of 4"
     );
 

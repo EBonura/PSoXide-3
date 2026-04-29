@@ -75,13 +75,7 @@ mod tests {
         //   packet[0] = tag (set by `insert`)
         //   packet[1] = 0x20RRGGBB (opcode 0x20, mono triangle)
         //   packet[2..4] = vertex words
-        let mut packet: [u32; 5] = [
-            0,
-            0x2080_4020,
-            0x0001_0002,
-            0x0003_0004,
-            0x0005_0006,
-        ];
+        let mut packet: [u32; 5] = [0, 0x2080_4020, 0x0001_0002, 0x0003_0004, 0x0005_0006];
         unsafe {
             ot.insert(2, packet.as_mut_ptr(), 4);
         }
@@ -91,7 +85,10 @@ mod tests {
         let entry = &log[0];
         assert_eq!(entry.index, 0);
         assert_eq!(entry.opcode, 0x20);
-        assert_eq!(entry.fifo, vec![0x2080_4020, 0x0001_0002, 0x0003_0004, 0x0005_0006]);
+        assert_eq!(
+            entry.fifo,
+            vec![0x2080_4020, 0x0001_0002, 0x0003_0004, 0x0005_0006]
+        );
     }
 
     /// Two primitives in the same OT — the cmd-log preserves DMA

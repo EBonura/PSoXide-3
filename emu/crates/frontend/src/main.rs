@@ -16,6 +16,7 @@ mod disasm;
 mod editor_assets;
 mod editor_preview;
 mod editor_textures;
+mod embedded_playtest;
 mod gfx;
 mod icons;
 mod input;
@@ -377,18 +378,19 @@ impl ApplicationHandler for Shell {
                 // rasterizer's VRAM and the compute backend's. Only
                 // meaningful when the compute backend is active
                 // (i.e. `--gpu-compute` was passed). No-op otherwise.
-                if state == ElementState::Pressed && !repeat {
-                    if matches!(&logical_key, Key::Named(NamedKey::F12)) {
-                        self.display_gpu_compute = !self.display_gpu_compute;
-                        eprintln!(
-                            "[gpu-compute] display source: {}",
-                            if self.display_gpu_compute {
-                                "GPU compute"
-                            } else {
-                                "CPU rasterizer"
-                            }
-                        );
-                    }
+                if state == ElementState::Pressed
+                    && !repeat
+                    && matches!(&logical_key, Key::Named(NamedKey::F12))
+                {
+                    self.display_gpu_compute = !self.display_gpu_compute;
+                    eprintln!(
+                        "[gpu-compute] display source: {}",
+                        if self.display_gpu_compute {
+                            "GPU compute"
+                        } else {
+                            "CPU rasterizer"
+                        }
+                    );
                 }
                 gfx.window.request_redraw();
             }
@@ -913,8 +915,10 @@ mod tests {
 
     #[test]
     fn keyboard_mapping_honors_rebound_button() {
-        let mut bindings = PortBindings::default();
-        bindings.cross = InputBinding::Character('j');
+        let bindings = PortBindings {
+            cross: InputBinding::Character('j'),
+            ..PortBindings::default()
+        };
 
         assert_eq!(
             key_to_pad_button(&Key::Character("j".into()), &bindings),

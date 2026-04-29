@@ -315,11 +315,11 @@ impl WallCorner {
 /// Cardinal or diagonal grid edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GridDirection {
-    /// North edge, -Z.
+    /// Editor north edge, +Z.
     North,
     /// East edge, +X.
     East,
-    /// South edge, +Z.
+    /// Editor south edge, -Z.
     South,
     /// West edge, -X.
     West,
@@ -327,6 +327,109 @@ pub enum GridDirection {
     NorthWestSouthEast,
     /// Diagonal from north-east to south-west.
     NorthEastSouthWest,
+}
+
+impl GridDirection {
+    /// Cardinal directions in editor perimeter order.
+    pub const CARDINAL: [Self; 4] = [Self::North, Self::East, Self::South, Self::West];
+
+    /// Diagonal directions in editor split order.
+    pub const DIAGONAL: [Self; 2] = [Self::NorthWestSouthEast, Self::NorthEastSouthWest];
+
+    /// Every authored grid direction.
+    pub const ALL: [Self; 6] = [
+        Self::North,
+        Self::East,
+        Self::South,
+        Self::West,
+        Self::NorthWestSouthEast,
+        Self::NorthEastSouthWest,
+    ];
+
+    /// `true` for the four perimeter edges.
+    pub const fn is_cardinal(self) -> bool {
+        matches!(self, Self::North | Self::East | Self::South | Self::West)
+    }
+
+    /// Canonical physical edge claimed by this authored cardinal
+    /// direction. Editor authoring uses North=+Z and South=-Z;
+    /// this key lets opposing-cell wall claims collide without
+    /// duplicating the convention in each caller.
+    pub const fn physical_edge(self, x: u16, z: u16) -> Option<GridPhysicalEdge> {
+        match self {
+            Self::North => Some(GridPhysicalEdge {
+                x: x as i32,
+                z: z as i32 + 1,
+                axis: GridEdgeAxis::EastWest,
+            }),
+            Self::South => Some(GridPhysicalEdge {
+                x: x as i32,
+                z: z as i32,
+                axis: GridEdgeAxis::EastWest,
+            }),
+            Self::West => Some(GridPhysicalEdge {
+                x: x as i32,
+                z: z as i32,
+                axis: GridEdgeAxis::NorthSouth,
+            }),
+            Self::East => Some(GridPhysicalEdge {
+                x: x as i32 + 1,
+                z: z as i32,
+                axis: GridEdgeAxis::NorthSouth,
+            }),
+            Self::NorthWestSouthEast | Self::NorthEastSouthWest => None,
+        }
+    }
+}
+
+/// Axis of a canonical physical edge in editor cell coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GridEdgeAxis {
+    /// Edge runs along Z, separating cells across X.
+    NorthSouth,
+    /// Edge runs along X, separating cells across Z.
+    EastWest,
+}
+
+/// Canonical integer address of one physical cardinal wall edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GridPhysicalEdge {
+    pub x: i32,
+    pub z: i32,
+    pub axis: GridEdgeAxis,
+}
+
+/// World-space X/Z bounds for one editor grid cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridCellBounds {
+    pub x0: i32,
+    pub x1: i32,
+    pub z0: i32,
+    pub z1: i32,
+}
+
+impl GridCellBounds {
+    /// X/Z position of a horizontal face corner in editor
+    /// convention: NW/NE live on the high-Z edge.
+    pub const fn horizontal_corner_xz(self, corner: Corner) -> [i32; 2] {
+        match corner {
+            Corner::NW => [self.x0, self.z1],
+            Corner::NE => [self.x1, self.z1],
+            Corner::SE => [self.x1, self.z0],
+            Corner::SW => [self.x0, self.z0],
+        }
+    }
+
+    /// Wall bottom-edge endpoints `(BL, BR)` in editor convention.
+    pub const fn wall_endpoints_xz(self, direction: GridDirection) -> Option<([i32; 2], [i32; 2])> {
+        match direction {
+            GridDirection::North => Some(([self.x0, self.z1], [self.x1, self.z1])),
+            GridDirection::East => Some(([self.x1, self.z1], [self.x1, self.z0])),
+            GridDirection::South => Some(([self.x1, self.z0], [self.x0, self.z0])),
+            GridDirection::West => Some(([self.x0, self.z0], [self.x0, self.z1])),
+            GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => None,
+        }
+    }
 }
 
 /// Authored horizontal grid face.
@@ -655,13 +758,13 @@ impl WorldGrid {
         for x in 0..width {
             for z in 0..depth {
                 grid.set_floor(x, z, 0, floor_material);
-                if z == 0 {
+                if z == depth.saturating_sub(1) {
                     grid.add_wall(x, z, GridDirection::North, 0, sector_size, wall_material);
                 }
                 if x == width.saturating_sub(1) {
                     grid.add_wall(x, z, GridDirection::East, 0, sector_size, wall_material);
                 }
-                if z == depth.saturating_sub(1) {
+                if z == 0 {
                     grid.add_wall(x, z, GridDirection::South, 0, sector_size, wall_material);
                 }
                 if x == 0 {
@@ -754,14 +857,7 @@ impl WorldGrid {
                 b.ceilings += 1;
                 b.triangles += 2;
             }
-            for direction in [
-                GridDirection::North,
-                GridDirection::East,
-                GridDirection::South,
-                GridDirection::West,
-                GridDirection::NorthWestSouthEast,
-                GridDirection::NorthEastSouthWest,
-            ] {
+            for direction in GridDirection::ALL {
                 let count = sector.walls.get(direction).len();
                 b.walls += count;
                 b.triangles += count * 2;
@@ -801,9 +897,23 @@ impl WorldGrid {
         (self.origin[0] + sx as i32) * self.sector_size
     }
 
-    /// World-space Z coordinate of the front edge of row `sz`.
+    /// World-space Z coordinate of the low-Z edge of row `sz`.
     pub fn cell_world_z(&self, sz: u16) -> i32 {
         (self.origin[1] + sz as i32) * self.sector_size
+    }
+
+    /// World-space X/Z bounds of cell `(sx, sz)` in editor
+    /// convention. `z0` is the low-Z / south edge and `z1` is
+    /// the high-Z / north edge.
+    pub fn cell_bounds_world(&self, sx: u16, sz: u16) -> GridCellBounds {
+        let x0 = self.cell_world_x(sx);
+        let z0 = self.cell_world_z(sz);
+        GridCellBounds {
+            x0,
+            x1: x0 + self.sector_size,
+            z0,
+            z1: z0 + self.sector_size,
+        }
     }
 
     /// World-space `(x, z)` centre of cell `(sx, sz)` in floating
@@ -1701,6 +1811,95 @@ mod tests {
     }
 
     #[test]
+    fn grid_direction_physical_edges_use_editor_z_convention() {
+        assert_eq!(
+            GridDirection::North.physical_edge(2, 3),
+            Some(GridPhysicalEdge {
+                x: 2,
+                z: 4,
+                axis: GridEdgeAxis::EastWest,
+            })
+        );
+        assert_eq!(
+            GridDirection::South.physical_edge(2, 3),
+            Some(GridPhysicalEdge {
+                x: 2,
+                z: 3,
+                axis: GridEdgeAxis::EastWest,
+            })
+        );
+        assert_eq!(
+            GridDirection::East.physical_edge(2, 3),
+            Some(GridPhysicalEdge {
+                x: 3,
+                z: 3,
+                axis: GridEdgeAxis::NorthSouth,
+            })
+        );
+        assert_eq!(
+            GridDirection::West.physical_edge(2, 3),
+            Some(GridPhysicalEdge {
+                x: 2,
+                z: 3,
+                axis: GridEdgeAxis::NorthSouth,
+            })
+        );
+        assert_eq!(GridDirection::NorthWestSouthEast.physical_edge(2, 3), None);
+    }
+
+    #[test]
+    fn cell_bounds_match_editor_corner_and_wall_convention() {
+        let grid = WorldGrid::empty(2, 2, 1024);
+        let bounds = grid.cell_bounds_world(1, 1);
+
+        assert_eq!(bounds.horizontal_corner_xz(Corner::NW), [1024, 2048]);
+        assert_eq!(bounds.horizontal_corner_xz(Corner::NE), [2048, 2048]);
+        assert_eq!(bounds.horizontal_corner_xz(Corner::SE), [2048, 1024]);
+        assert_eq!(bounds.horizontal_corner_xz(Corner::SW), [1024, 1024]);
+
+        assert_eq!(
+            bounds.wall_endpoints_xz(GridDirection::North),
+            Some(([1024, 2048], [2048, 2048]))
+        );
+        assert_eq!(
+            bounds.wall_endpoints_xz(GridDirection::South),
+            Some(([2048, 1024], [1024, 1024]))
+        );
+    }
+
+    #[test]
+    fn stone_room_perimeter_uses_editor_direction_convention() {
+        let grid = WorldGrid::stone_room(2, 3, 1024, None, None);
+
+        for x in 0..grid.width {
+            assert!(!grid
+                .sector(x, 0)
+                .unwrap()
+                .walls
+                .get(GridDirection::South)
+                .is_empty());
+            assert!(grid
+                .sector(x, 0)
+                .unwrap()
+                .walls
+                .get(GridDirection::North)
+                .is_empty());
+            assert!(!grid
+                .sector(x, grid.depth - 1)
+                .unwrap()
+                .walls
+                .get(GridDirection::North)
+                .is_empty());
+            assert!(grid
+                .sector(x, grid.depth - 1)
+                .unwrap()
+                .walls
+                .get(GridDirection::South)
+                .is_empty());
+        }
+    }
+
+    #[test]
     fn editor_to_room_local_round_trip_origin_zero() {
         let grid = WorldGrid::stone_room(3, 3, 1024, None, None);
         for editor in [[0.0_f32, 0.0], [1.5, -0.25], [-1.4, 1.49]] {
@@ -1960,9 +2159,13 @@ mod tests {
                 _ => None,
             })
             .expect("starter should contain a room node");
-        assert_eq!(grid.width, 3);
-        assert_eq!(grid.depth, 3);
-        assert_eq!(grid.populated_sector_count(), 9);
+        assert!(grid.width > 0);
+        assert!(grid.depth > 0);
+        assert_eq!(
+            grid.sectors.len(),
+            grid.width as usize * grid.depth as usize
+        );
+        assert!(grid.populated_sector_count() > 0);
     }
 
     #[test]

@@ -32,6 +32,9 @@ use std::collections::VecDeque;
 
 use psx_iso::{bcd_to_bin, msf_to_lba, Disc};
 
+mod timing;
+use timing::*;
+
 /// Base MMIO address — the whole controller fits in 4 bytes at
 /// `0x1F80_1800..=0x1F80_1803`.
 pub const BASE: u32 = 0x1F80_1800;
@@ -124,42 +127,6 @@ pub mod drive_status_bit {
 const PARAM_FIFO_DEPTH: usize = 16;
 const RESPONSE_FIFO_DEPTH: usize = 16;
 
-/// Canonical cycle delays for command responses, transcribed from
-/// Redux's `core/cdrom.cc`. Exact match is the difference between
-/// our CDROM events landing on the same instructions as Redux's
-/// and silently scheduling them thousands of cycles apart — which
-/// compounds into full game-state divergence over tens of millions
-/// of instructions.
-///
-/// Redux cross-references (line numbers from the upstream file):
-///
-/// - `AddIrqQueue(m_cmd, 0x800)` — universal first-response delay
-///   (L1284). Every command's ack fires 2048 cycles after issue.
-/// - `AddIrqQueue(CdlID + 0x100, 20480)` — GetID second response,
-///   ~4.4 µs, observed across boot roms (L900). `CdlInit` (`0x1C`)
-///   uses the separate lid/rescan path instead of a second CDROM IRQ.
-/// - `AddIrqQueue(CdlReset + 0x100, 4100000)` — Reset (`0x0A`)
-///   completion. MGS polls this INT2 before it starts issuing reads.
-/// - `cdReadTime = psxClockSpeed / 75` — one PSX CD-frame period
-///   (L135). Redux schedules the first ReadN/ReadS sector at
-///   `cdReadTime` in double-speed mode, then chains steady-state
-///   sectors at `cdReadTime / 2` (single-speed uses 2x those delays).
-/// - `scheduleCDPlayIRQ(SEEK_DONE ? 0x800 : cdReadTime * 4)` —
-///   SeekL / SeekP second response (L875). If the target is already
-///   seeked, quick ack; otherwise a full seek-time equivalent.
-const FIRST_RESPONSE_CYCLES: u64 = 0x800; // 2048
-const IRQ_RESCHEDULE_CYCLES: u64 = 0x100;
-const GETID_SECOND_RESPONSE_CYCLES: u64 = 20_480;
-const RESET_SECOND_RESPONSE_CYCLES: u64 = 4_100_000;
-const SEEK_SECOND_RESPONSE_CYCLES: u64 = CD_READ_TIME * 4; // ≈ 1,806,336
-const PAUSE_COMPLETE_CYCLES_STANDBY: u64 = 7_000;
-const PAUSE_COMPLETE_CYCLES_ACTIVE: u64 = 1_000_000;
-const LID_BOOTSTRAP_CYCLES: u64 = 20_480;
-const LID_PREPARE_SPINUP_CYCLES: u64 = CD_READ_TIME * 150;
-const LID_PREPARE_SEEK_CYCLES: u64 = CD_READ_TIME * 26;
-/// PSX system clock / CD frames per second. `33_868_800 / 75`.
-/// Redux's `cdReadTime`.
-const CD_READ_TIME: u64 = 451_584;
 // Sector-read cycles are derived per-instance from the current mode
 // byte. The first sector after ReadN/ReadS is slower than the
 // steady-state stream; see `initial_sector_read_cycles` and
@@ -736,10 +703,8 @@ impl CdRom {
             }
             // 0x1F80_1803 idx=2/3 — audio volume matrix.
             (3, 2) => self.attenuator_left_to_right_t = value,
-            (3, 3) => {
-                if value & 0x20 != 0 {
-                    self.commit_attenuator();
-                }
+            (3, 3) if value & 0x20 != 0 => {
+                self.commit_attenuator();
             }
             _ => {}
         }
@@ -2163,9 +2128,9 @@ fn decode_xa_audio_sector(
                 (low_words, high_words)
             } else {
                 let mut words = [0u16; 7];
-                for k in 0..7 {
+                for (k, word) in words.iter_mut().enumerate() {
                     let base = k * 8 + unit;
-                    words[k] = data[base] as u16 | ((data[base + 4] as u16) << 8);
+                    *word = data[base] as u16 | ((data[base + 4] as u16) << 8);
                 }
                 (words, words)
             };

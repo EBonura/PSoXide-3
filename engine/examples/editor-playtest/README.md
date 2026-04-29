@@ -33,10 +33,12 @@ Materials are built from `MATERIALS` records — the runtime no
 longer hardcodes any starter texture binding; `local_slot →
 texture_asset` is the source of truth.
 
-The player starts at `generated::PLAYER_SPAWN`. D-pad
-LEFT/RIGHT yaws the player; UP/DOWN walks forward/back along
-the player's facing. SELECT toggles a free-orbit debug camera
-that pivots around the spawn point. No collision yet.
+The player starts at `generated::PLAYER_SPAWN`. Left stick
+drives camera-relative movement, with D-pad as a fallback.
+Circle held while moving runs. SELECT toggles a free-orbit
+debug camera. The third-person camera and coarse room collision
+consume the cooked grid so the play view matches the editor's
+authored room.
 
 ## Embedded Play
 
@@ -62,26 +64,29 @@ make build-editor-playtest
 ## Placeholder vs cooked manifest
 
 `generated/level_manifest.rs` is committed in a **placeholder**
-state: imports the `psx_level` schema, declares empty
-`ASSETS` / `MATERIALS` / `ROOMS` / `ROOM_RESIDENCY`. The EXE
-boots to a clear-coloured screen until a cook lands real data.
+state: imports the `psx_level` schema, declares empty asset /
+room / material / model / light / character slices, and contains
+no `include_bytes!` references. The EXE boots to a clear-coloured
+screen until a cook lands real data.
 
 Cooked outputs live alongside the manifest and are gitignored
 so cooks don't churn diffs:
 
 ```
 generated/
-  level_manifest.rs              tracked, placeholder state
-  rooms/                         tracked dir
+  level_manifest.rs              tracked placeholder
+  rooms/
     room_NNN.psxw                gitignored
-  textures/                      tracked dir
+  textures/
     texture_NNN.psxt             gitignored
+  models/
+    model_NNN_*/                 gitignored
 ```
 
 From a fresh clone:
 
-1. `make build-editor-playtest` — works, shows clear screen.
-2. Editor -> "Play" — your custom scene runs inside the editor
+1. `make build-editor-playtest` — works from the placeholder.
+2. Editor -> "Play" — cooks your current scene, builds, and runs inside the editor
    3D viewport until you press Stop.
 
 ## Scope

@@ -20,9 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{
-    ModelAnimationClip, ModelResource, ProjectDocument, ResourceData, ResourceId,
-};
+use crate::{ModelAnimationClip, ModelResource, ProjectDocument, ResourceData, ResourceId};
 
 /// Header-derived statistics about a `.psxmdl` blob, suitable
 /// for editor inspector display. Computed by walking the model
@@ -102,10 +100,11 @@ pub struct ModelTextureStats {
 /// every vertex once for the AABB; cheap relative to the rest
 /// of the editor's per-frame budget.
 pub fn model_stats_from_bytes(bytes: &[u8]) -> Result<ModelStats, ModelImportError> {
-    let model = psx_asset::Model::from_bytes(bytes).map_err(|e| ModelImportError::InvalidModel {
-        path: PathBuf::new(),
-        detail: format!("{:?}", e),
-    })?;
+    let model =
+        psx_asset::Model::from_bytes(bytes).map_err(|e| ModelImportError::InvalidModel {
+            path: PathBuf::new(),
+            detail: format!("{:?}", e),
+        })?;
 
     let mut max_part_vertices: u16 = 0;
     for i in 0..model.part_count() {
@@ -297,16 +296,12 @@ impl std::fmt::Display for ModelImportError {
             Self::NoModelFile(path) => {
                 write!(f, "no .psxmdl found in {}", path.display())
             }
-            Self::MultipleModelFiles { paths } => write!(
-                f,
-                "multiple .psxmdl files in bundle: {}",
-                paths_list(paths)
-            ),
-            Self::MultipleTextureFiles { paths } => write!(
-                f,
-                "multiple .psxt files in bundle: {}",
-                paths_list(paths)
-            ),
+            Self::MultipleModelFiles { paths } => {
+                write!(f, "multiple .psxmdl files in bundle: {}", paths_list(paths))
+            }
+            Self::MultipleTextureFiles { paths } => {
+                write!(f, "multiple .psxt files in bundle: {}", paths_list(paths))
+            }
             Self::InvalidModel { path, detail } => {
                 write!(f, "{}: invalid .psxmdl: {detail}", path.display())
             }
@@ -419,12 +414,11 @@ pub fn register_cooked_model_bundle(
         path: model_path.clone(),
         detail: e.to_string(),
     })?;
-    let model = psx_asset::Model::from_bytes(&model_bytes).map_err(|e| {
-        ModelImportError::InvalidModel {
+    let model =
+        psx_asset::Model::from_bytes(&model_bytes).map_err(|e| ModelImportError::InvalidModel {
             path: model_path.clone(),
             detail: format!("{:?}", e),
-        }
-    })?;
+        })?;
     let model_joint_count = model.joint_count();
 
     if let Some(tex) = &texture_path {
@@ -565,10 +559,7 @@ pub fn import_glb_model(
 /// `obsidian_wraith` produces clip names like `idle` rather than
 /// `obsidian_wraith_idle`.
 fn clip_name_from_path(path: &Path) -> String {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("clip");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
     // Bundle-prefix stripping: pick the longest known model
     // prefix that the stem starts with. This is heuristic — when
     // we don't recognise the prefix we keep the full stem so the
@@ -695,13 +686,8 @@ mod tests {
     fn registers_obsidian_wraith_bundle() {
         let mut project = ProjectDocument::starter();
         let dir = obsidian_wraith_dir();
-        let id = register_cooked_model_bundle(
-            &mut project,
-            &dir,
-            "Obsidian Wraith",
-            None,
-        )
-        .expect("bundle registers");
+        let id = register_cooked_model_bundle(&mut project, &dir, "Obsidian Wraith", None)
+            .expect("bundle registers");
         let resource = project.resource(id).expect("resource exists");
         let ResourceData::Model(model) = &resource.data else {
             panic!("expected Model resource, got {:?}", resource.data);

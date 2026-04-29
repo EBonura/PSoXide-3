@@ -177,7 +177,10 @@ fn main() {
     let total_per_frame_ms = total.as_secs_f64() * 1000.0 / f;
     eprintln!();
     if total_per_frame_ms <= budget_60fps {
-        eprintln!("  HEADROOM @ 60fps: {:.2} ms left", budget_60fps - total_per_frame_ms);
+        eprintln!(
+            "  HEADROOM @ 60fps: {:.2} ms left",
+            budget_60fps - total_per_frame_ms
+        );
     } else if total_per_frame_ms <= budget_30fps {
         eprintln!(
             "  60fps OVER by {:.2} ms; @30fps headroom: {:.2} ms",

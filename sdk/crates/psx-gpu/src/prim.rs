@@ -260,6 +260,7 @@ impl TriTextured {
 
     /// Build a textured triangle. `tint = (128, 128, 128)` leaves
     /// texels unmodulated.
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         verts: [(i16, i16); 3],
         uvs: [(u8, u8); 3],
@@ -450,6 +451,7 @@ impl Sprite {
     /// Build a textured sprite. `clut` is the CLUT register handle
     /// (`y << 6 | x >> 4`); `uv` is the 8-bit texcoord within the
     /// texture page.
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         x: i16,
         y: i16,

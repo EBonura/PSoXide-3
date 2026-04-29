@@ -198,6 +198,7 @@ impl Graphics {
     /// `TriFlat` packets to the renderer. The path is intentionally
     /// the same one PS1 runtime code follows — only the final DMA
     /// step is replaced by `build_cmd_log` + `render_frame`.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_editor_preview(
         &mut self,
         project: &psxed_project::ProjectDocument,

@@ -112,9 +112,7 @@ fn print_pixel_owner(bus: &Bus, x: u16, y: u16) {
     let vram_x = da.x + x;
     let vram_y = da.y + y;
     let pixel = bus.gpu.vram.get_pixel(vram_x, vram_y);
-    eprintln!(
-        "[trace-pixel] display=({x},{y}) vram=({vram_x},{vram_y}) pixel=0x{pixel:04x}"
-    );
+    eprintln!("[trace-pixel] display=({x},{y}) vram=({vram_x},{vram_y}) pixel=0x{pixel:04x}");
     let Some(entry) = bus.gpu.pixel_owner_at(vram_x, vram_y) else {
         eprintln!("[trace-pixel] no owner");
         return;

@@ -26,4 +26,3 @@ pub const TRIANGLE: &[u8; 16] = include_bytes!("../vendor/tone_triangle.adpcm");
 
 /// Sawtooth ramp. Bright, full-spectrum — good for chiptune leads.
 pub const SAWTOOTH: &[u8; 16] = include_bytes!("../vendor/tone_sawtooth.adpcm");
-

@@ -314,11 +314,12 @@ fn opcode_name(op: u8) -> &'static str {
     }
 }
 
+#[allow(clippy::collapsible_match)]
 fn decode_packet(op: u8, fifo: &[u32]) {
     // Decode the first-word tint and the primitive category so the
     // author can spot suspicious fields fast.
     let cmd = fifo.first().copied().unwrap_or(0);
-    let cmd_tint_r = (cmd >> 0) & 0xFF;
+    let cmd_tint_r = cmd & 0xFF;
     let cmd_tint_g = (cmd >> 8) & 0xFF;
     let cmd_tint_b = (cmd >> 16) & 0xFF;
     let raw_tex = cmd & (1 << 24) != 0; // bit 24 of cmd0
@@ -467,13 +468,15 @@ fn fmt_tpage(tpage: u32) -> String {
     let depth = match (tpage >> 7) & 3 {
         0 => "4bpp",
         1 => "8bpp",
-        2 | _ => "15bpp",
+        2 => "15bpp",
+        _ => "15bpp",
     };
     let blend = match (tpage >> 5) & 3 {
         0 => "avg",
         1 => "add",
         2 => "sub",
-        3 | _ => "quarter",
+        3 => "quarter",
+        _ => "quarter",
     };
     format!("({x}, {y}) {depth} blend={blend}")
 }

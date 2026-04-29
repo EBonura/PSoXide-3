@@ -90,11 +90,7 @@ impl Mat3I16 {
 
     /// Identity matrix scaled 1.0 in 1.3.12 (diagonal = 0x1000).
     pub const IDENTITY: Self = Self {
-        m: [
-            [0x1000, 0, 0],
-            [0, 0x1000, 0],
-            [0, 0, 0x1000],
-        ],
+        m: [[0x1000, 0, 0], [0, 0x1000, 0], [0, 0, 0x1000]],
     };
 
     /// Access a row.

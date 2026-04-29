@@ -6,7 +6,7 @@
 #[path = "support/disc.rs"]
 mod disc_support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use emulator_core::{Bus, Cpu};
@@ -38,7 +38,7 @@ fn main() {
     run_redux(start, &disc_path);
 }
 
-fn run_local(start: u64, disc_path: &PathBuf) {
+fn run_local(start: u64, disc_path: &Path) {
     eprintln!("[ours] running {start} folded user steps...");
     let t0 = Instant::now();
     let bios = std::fs::read(BIOS).expect("BIOS");
@@ -90,13 +90,13 @@ fn run_local(start: u64, disc_path: &PathBuf) {
     print_local_snapshot("after", &cpu, &mut bus);
 }
 
-fn run_redux(start: u64, disc_path: &PathBuf) {
+fn run_redux(start: u64, disc_path: &Path) {
     eprintln!("[redux] launching...");
     let bios = PathBuf::from(BIOS);
     let lua = OracleConfig::default_lua_dir().join("oracle.lua");
     let config = OracleConfig::new(bios, lua)
         .expect("Redux resolves")
-        .with_disc(disc_path.clone());
+        .with_disc(disc_path.to_path_buf());
     let mut redux = ReduxProcess::launch(&config).expect("Redux launches");
     redux.handshake(Duration::from_secs(30)).expect("handshake");
 

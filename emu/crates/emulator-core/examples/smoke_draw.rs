@@ -181,7 +181,7 @@ fn main() {
     // Top 10 PCs in the sampled window.
     println!("\n=== top PCs in last 1% of run ===");
     let mut top: Vec<(u32, u32)> = pc_hits.iter().map(|(k, v)| (*k, *v)).collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
     for (pc, count) in top.iter().take(10) {
         println!("  {pc:08x}: {count:>8} hits");
     }
@@ -363,7 +363,7 @@ fn main() {
                 *counts.entry(e.addr).or_insert(0) += 1;
             }
             let mut sorted: Vec<_> = counts.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
             println!("\n=== MMIO trace top-10 hot addresses ===");
             for (addr, hits) in sorted.iter().take(10) {
                 println!("  {addr:08x}: {hits} accesses");

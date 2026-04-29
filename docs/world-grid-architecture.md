@@ -110,6 +110,12 @@ Two lessons we deliberately ignore for now:
 The full TR-to-PSoXide name mapping (per future-format records) lives in
 `docs/world-format-roadmap.md`.
 
+The editor/runtime coordinate conversion is documented separately in
+[`docs/editor-runtime-coordinates.md`](editor-runtime-coordinates.md). In
+short: the editor preview treats North as `+Z`, while the runtime `.psxw`
+format treats North as `-Z`; `psxed_project::world_cook` is the single
+boundary that flips directions, corners, and split ids.
+
 ## Contract
 
 - Sector size is 1024 engine units. Non-1024 authored grids are rejected until
@@ -131,8 +137,9 @@ The full TR-to-PSoXide name mapping (per future-format records) lives in
   works, but render / pick / collision aren't consistent for diagonals yet.
 - **Wall ownership rule**: the physical wall between `(x, z)` and `(x+1, z)`
   is `East(x, z)` *and* `West(x+1, z)`. The editor's PaintWall stamps one
-  side; the cooker is responsible for normalizing duplicate opposing coplanar
-  walls (low-index-cell wins). Same for North / South.
+  side; if both opposing sides are authored, the cooker rejects the duplicate
+  physical wall so render and collision never double-count the same face. Same
+  for North / South.
 
 ## Room Budget
 

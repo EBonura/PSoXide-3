@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use emulator_core::{
     fast_boot_disc_with_hle, warm_bios_for_disc_fast_boot, Bus, Cpu, DISC_FAST_BOOT_WARMUP_STEPS,
@@ -16,6 +16,7 @@ use psx_iso::{Disc, Exe, SECTOR_BYTES};
 use psx_trace::InstructionRecord;
 use psxed_ui::{EditorPlaytestStatus, EditorWorkspace};
 
+use crate::embedded_playtest::EmbeddedPlaytestState;
 use crate::ui;
 use crate::ui::hud::HudState;
 use crate::ui::memory::MemoryView;
@@ -27,15 +28,11 @@ use crate::ui::menu::{LibraryItem as MenuLibraryItem, MenuState};
 /// registers side panel vertically.
 pub const EXEC_HISTORY_CAP: usize = 16;
 
-/// Default BIOS location. Matches the parity-test default so both
-/// tooling converges on the same image in a fresh checkout.
-const DEFAULT_BIOS: &str = "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN";
-
 /// Panels that can be shown/hidden via the Menu. The Menu *is* the
 /// library browser (Games / Examples columns), so we don't have
 /// a separate "library" panel — it's integrated into the shell
 /// the PSX way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PanelVisibility {
     /// CPU registers + exec history side panel.
     pub registers: bool,
@@ -47,34 +44,16 @@ pub struct PanelVisibility {
     pub profiler: bool,
 }
 
-impl Default for PanelVisibility {
-    fn default() -> Self {
-        Self {
-            // Debug panels collapsed on first run — the Menu is the
-            // primary surface a fresh user sees, not the internals.
-            registers: false,
-            memory: false,
-            vram: false,
-            profiler: false,
-        }
-    }
-}
-
 /// Hardware-renderer internal scale mode. Both modes use the same
 /// renderer; Native forces scale 1, Window chooses a larger scale
 /// from the framebuffer panel size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScaleMode {
     /// Internal scale chosen from the available framebuffer area.
+    #[default]
     Window,
     /// Internal scale 1, presented in the same framebuffer area.
     Native,
-}
-
-impl Default for ScaleMode {
-    fn default() -> Self {
-        Self::Window
-    }
 }
 
 /// Active host workspace.
@@ -172,24 +151,6 @@ pub struct AppState {
     pub audio_muted: bool,
 }
 
-/// Frontend-owned embedded editor playtest state.
-pub enum EmbeddedPlaytestState {
-    /// No embedded playtest is active.
-    Idle,
-    /// `make build-editor-playtest` is running in the background.
-    Building { child: Child },
-    /// The editor viewport is displaying the live emulator.
-    Running { input_captured: bool },
-    /// Last play attempt failed.
-    Failed,
-}
-
-impl Default for EmbeddedPlaytestState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
-
 impl Default for AppState {
     fn default() -> Self {
         Self::with_config_dir(None)
@@ -278,7 +239,7 @@ impl AppState {
         let mut out = Self {
             workspace: Workspace::Emulator,
             editor,
-            embedded_playtest: EmbeddedPlaytestState::Idle,
+            embedded_playtest: EmbeddedPlaytestState::default(),
             panels: PanelVisibility::default(),
             scale_mode: ScaleMode::default(),
             framebuffer_present_size_px: (320, 240),
@@ -343,7 +304,7 @@ impl AppState {
         if let Err(e) = self.flush_memcard_port1() {
             eprintln!("[frontend] memcard flush before launch: {e}");
         }
-        let bios_path = resolve_bios_path(&self.settings);
+        let bios_path = resolve_bios_path(&self.settings)?;
         let bios =
             std::fs::read(&bios_path).map_err(|e| format!("BIOS {}: {e}", bios_path.display()))?;
         let mut bus = Bus::new(bios).map_err(|e| format!("BIOS rejected: {e}"))?;
@@ -633,8 +594,8 @@ impl AppState {
         }
 
         // Pass 3: stable alphabetical order per column.
-        games.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-        examples.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        games.sort_by_key(|a| a.title.to_lowercase());
+        examples.sort_by_key(|a| a.title.to_lowercase());
         self.menu.set_library(&games, &examples);
     }
 
@@ -723,33 +684,18 @@ impl AppState {
 
     /// Editor-facing status mirror for the embedded play controls.
     pub fn editor_playtest_status(&self) -> EditorPlaytestStatus {
-        match &self.embedded_playtest {
-            EmbeddedPlaytestState::Idle => EditorPlaytestStatus::Idle,
-            EmbeddedPlaytestState::Building { .. } => EditorPlaytestStatus::Building,
-            EmbeddedPlaytestState::Running { input_captured } => EditorPlaytestStatus::Running {
-                input_captured: *input_captured,
-            },
-            EmbeddedPlaytestState::Failed => EditorPlaytestStatus::Failed,
-        }
+        self.embedded_playtest.editor_status()
     }
 
     /// True when the editor viewport is currently the live game.
     pub fn embedded_playtest_running(&self) -> bool {
-        matches!(
-            self.embedded_playtest,
-            EmbeddedPlaytestState::Running { .. }
-        )
+        self.embedded_playtest.is_running()
     }
 
     /// True when keyboard/gamepad input should be routed to the
     /// embedded game even though the editor workspace is visible.
     pub fn embedded_playtest_input_captured(&self) -> bool {
-        matches!(
-            self.embedded_playtest,
-            EmbeddedPlaytestState::Running {
-                input_captured: true
-            }
-        )
+        self.embedded_playtest.input_captured()
     }
 
     /// Cook the active editor project, then spawn the existing MIPS
@@ -762,7 +708,7 @@ impl AppState {
         if let Err(error) = self.save_editor_project() {
             let message = format!("Embedded Play failed: {error}");
             self.editor.set_status(message.clone());
-            self.embedded_playtest = EmbeddedPlaytestState::Failed;
+            self.embedded_playtest.fail();
             return;
         }
         let cook_status = match self.editor.cook_playtest_to_disk() {
@@ -770,7 +716,7 @@ impl AppState {
             Err(error) => {
                 let message = format!("Embedded Play cook failed: {error}");
                 self.editor.set_status(message.clone());
-                self.embedded_playtest = EmbeddedPlaytestState::Failed;
+                self.embedded_playtest.fail();
                 return;
             }
         };
@@ -786,13 +732,13 @@ impl AppState {
             .stderr(Stdio::null());
         match command.spawn() {
             Ok(child) => {
-                self.embedded_playtest = EmbeddedPlaytestState::Building { child };
+                self.embedded_playtest.start_building(child);
                 self.status_message_set("Building embedded playtest");
             }
             Err(error) => {
                 let message = format!("Embedded Play build failed: spawn make: {error}");
                 self.editor.set_status(message.clone());
-                self.embedded_playtest = EmbeddedPlaytestState::Failed;
+                self.embedded_playtest.fail();
             }
         }
     }
@@ -800,7 +746,7 @@ impl AppState {
     /// Poll the background build child and side-load the resulting
     /// editor-playtest EXE when the build succeeds.
     pub fn poll_embedded_playtest_build(&mut self) {
-        let EmbeddedPlaytestState::Building { child } = &mut self.embedded_playtest else {
+        let Some(child) = self.embedded_playtest.building_child_mut() else {
             return;
         };
         let status = match child.try_wait() {
@@ -809,7 +755,7 @@ impl AppState {
             Err(error) => {
                 let message = format!("Embedded Play build poll failed: {error}");
                 self.editor.set_status(message.clone());
-                self.embedded_playtest = EmbeddedPlaytestState::Failed;
+                self.embedded_playtest.fail();
                 return;
             }
         };
@@ -817,15 +763,13 @@ impl AppState {
         if !status.success() {
             let message = format!("Embedded Play build failed: {status}");
             self.editor.set_status(message.clone());
-            self.embedded_playtest = EmbeddedPlaytestState::Failed;
+            self.embedded_playtest.fail();
             return;
         }
 
         match self.load_embedded_playtest_exe() {
             Ok(()) => {
-                self.embedded_playtest = EmbeddedPlaytestState::Running {
-                    input_captured: true,
-                };
+                self.embedded_playtest.start_running(true);
                 self.running = true;
                 self.menu.open = false;
                 self.menu.sync_run_label(true);
@@ -836,7 +780,7 @@ impl AppState {
             Err(error) => {
                 let message = format!("Embedded Play load failed: {error}");
                 self.editor.set_status(message.clone());
-                self.embedded_playtest = EmbeddedPlaytestState::Failed;
+                self.embedded_playtest.fail();
             }
         }
     }
@@ -844,19 +788,18 @@ impl AppState {
     /// Stop embedded play mode and return the editor viewport to the
     /// authored 3D preview.
     pub fn stop_embedded_playtest(&mut self) {
-        if let EmbeddedPlaytestState::Building { child } = &mut self.embedded_playtest {
+        if let Some(mut child) = self.embedded_playtest.take_build_child() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        self.embedded_playtest = EmbeddedPlaytestState::Idle;
+        self.embedded_playtest.stop();
         self.running = false;
         self.menu.sync_run_label(false);
     }
 
     /// Capture input for the embedded game and resume emulation.
     pub fn capture_embedded_playtest_input(&mut self) {
-        if let EmbeddedPlaytestState::Running { input_captured } = &mut self.embedded_playtest {
-            *input_captured = true;
+        if self.embedded_playtest.capture_input() {
             self.running = true;
             self.menu.open = false;
             self.menu.sync_run_label(true);
@@ -866,8 +809,7 @@ impl AppState {
 
     /// Release input capture from the embedded game and pause it.
     pub fn release_embedded_playtest_input(&mut self) {
-        if let EmbeddedPlaytestState::Running { input_captured } = &mut self.embedded_playtest {
-            *input_captured = false;
+        if self.embedded_playtest.release_input() {
             self.running = false;
             self.menu.open = true;
             self.menu.sync_run_label(false);
@@ -894,7 +836,7 @@ impl AppState {
     }
 
     fn load_embedded_playtest_exe(&mut self) -> Result<(), String> {
-        let bios_path = resolve_bios_path(&self.settings);
+        let bios_path = resolve_bios_path(&self.settings)?;
         let bios =
             std::fs::read(&bios_path).map_err(|e| format!("BIOS {}: {e}", bios_path.display()))?;
         let mut bus = Bus::new(bios).map_err(|e| format!("BIOS rejected: {e}"))?;
@@ -1010,13 +952,16 @@ fn format_subtitle(e: &LibraryEntry) -> String {
     }
 }
 
-fn resolve_bios_path(settings: &Settings) -> PathBuf {
+pub(crate) fn resolve_bios_path(settings: &Settings) -> Result<PathBuf, String> {
     if !settings.paths.bios.is_empty() {
-        PathBuf::from(&settings.paths.bios)
+        Ok(PathBuf::from(&settings.paths.bios))
     } else if let Ok(p) = std::env::var("PSOXIDE_BIOS") {
-        PathBuf::from(p)
+        Ok(PathBuf::from(p))
     } else {
-        PathBuf::from(DEFAULT_BIOS)
+        Err(
+            "BIOS path is not configured. Set it in settings.ron or export PSOXIDE_BIOS."
+                .to_string(),
+        )
     }
 }
 
@@ -1159,7 +1104,13 @@ fn maybe_fast_boot_disc(
 }
 
 fn load_bus(settings: &Settings) -> Option<Bus> {
-    let path = resolve_bios_path(settings);
+    let path = match resolve_bios_path(settings) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("[frontend] {e}");
+            return None;
+        }
+    };
     let mut bus = match std::fs::read(&path) {
         Ok(bytes) => match Bus::new(bytes) {
             Ok(bus) => bus,

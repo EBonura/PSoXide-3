@@ -44,7 +44,7 @@
 //! - B = BIOS boots to shell (MAIN MENU / MEMORY CARD / CD PLAYER)
 //! - C = Homebrew SDK triangle renders (see `sdk/examples/hello-tri`)
 //! - D = BIOS disc-check passes (Crash Bandicoot) — licensed-disc
-//!       splash rendered; game boot-EXE load is still pending.
+//!   splash rendered; game boot-EXE load is still pending.
 
 use emulator_core::{Bus, Cpu};
 use psx_iso::Disc;

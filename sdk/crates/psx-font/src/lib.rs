@@ -92,7 +92,7 @@ use psx_gpu::{draw_quad_textured, draw_quad_textured_gouraud};
 use psx_hw::gpu::{pack_color, pack_texcoord, pack_vertex, pack_xy};
 use psx_io::gpu::{wait_cmd_ready, write_gp0};
 use psx_math::sincos;
-use psx_vram::{Clut, Color555, TexDepth, Tpage, VramRect, upload_16bpp, upload_clut};
+use psx_vram::{upload_16bpp, upload_clut, Clut, Color555, TexDepth, Tpage, VramRect};
 
 pub mod fonts;
 
@@ -166,7 +166,7 @@ impl BitmapFont {
     /// Derived from [`BitmapFont::glyph_w`] — 1 byte for ≤ 8-wide
     /// fonts, 2 bytes for 9..16-wide, etc.
     pub const fn row_bytes(&self) -> usize {
-        ((self.glyph_w as usize) + 7) / 8
+        (self.glyph_w as usize).div_ceil(8)
     }
 
     /// Total bitmap bytes per glyph.
@@ -268,7 +268,7 @@ impl FontAtlas {
 
         // Pack 1bpp source → 4bpp VRAM texture into a stack buffer.
         // Each 16-bit halfword holds 4 texels (nibble 0 = leftmost).
-        let halfwords_per_row = (atlas_w + 3) / 4;
+        let halfwords_per_row = atlas_w.div_ceil(4);
         let total_halfwords = halfwords_per_row as usize * atlas_h as usize;
         assert!(
             total_halfwords <= Self::MAX_PACK_HALFWORDS,
@@ -288,8 +288,7 @@ impl FontAtlas {
                     let x = base_x + col;
                     let y = base_y + row as u16;
                     // 4 texels per halfword; pick nibble by x & 3.
-                    let hw_idx = y as usize * halfwords_per_row as usize
-                        + (x as usize / 4);
+                    let hw_idx = y as usize * halfwords_per_row as usize + (x as usize / 4);
                     let nibble_shift = (x & 3) * 4;
                     packed[hw_idx] |= (bit as u16) << nibble_shift;
                 }
@@ -311,10 +310,7 @@ impl FontAtlas {
         // Upload 2-entry CLUT: idx 0 = transparent, idx 1 = white.
         // The white texel will be tinted per-draw_call via the
         // sprite's per-vertex colour (GP0 0x64 tint byte).
-        let clut_entries = [
-            Color555::TRANSPARENT,
-            Color555::rgb5(31, 31, 31),
-        ];
+        let clut_entries = [Color555::TRANSPARENT, Color555::rgb5(31, 31, 31)];
         upload_clut(clut, &clut_entries);
 
         let _ = tex_rect;
@@ -353,8 +349,8 @@ impl FontAtlas {
         let idx = (cp - first) as u16;
         let col = idx % self.glyphs_per_row;
         let row = idx / self.glyphs_per_row;
-        let u = (col as u16) * self.font.glyph_w as u16;
-        let v = (row as u16) * self.font.glyph_h as u16;
+        let u = col * self.font.glyph_w as u16;
+        let v = row * self.font.glyph_h as u16;
         Some((u as u8, v as u8))
     }
 
@@ -534,12 +530,7 @@ impl FontAtlas {
             let lx1 = lx0 + gw;
             let ly0 = origin_y;
             let ly1 = origin_y + gh;
-            let verts = [
-                rot(lx0, ly0),
-                rot(lx1, ly0),
-                rot(lx0, ly1),
-                rot(lx1, ly1),
-            ];
+            let verts = [rot(lx0, ly0), rot(lx1, ly0), rot(lx0, ly1), rot(lx1, ly1)];
             let uvs = [
                 (u, v),
                 (u + gw as u8, v),
@@ -662,6 +653,7 @@ impl FontAtlas {
     ///     (255, 220, 80), (200, 40, 20),
     /// );
     /// ```
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text_scaled_gradient(
         &self,
         x: i16,
@@ -736,8 +728,7 @@ mod tests {
         glyph_count: 2,
         bitmap: &[
             // 'A': row 0 = all pixels, row 1 = leftmost only
-            0xFF, 0x01,
-            // 'B': row 0 = alternating, row 1 = rightmost
+            0xFF, 0x01, // 'B': row 0 = alternating, row 1 = rightmost
             0x55, 0x80,
         ],
         advance_x: 8,

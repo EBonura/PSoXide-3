@@ -1,9 +1,13 @@
 # PSoXide development commands.
 #
-# Three Cargo workspaces:
-#   root - no_std shared crates (psx-hw, psx-iso, psx-trace)
-#   emu  - host-side emulator (emulator-core, frontend, parity-oracle)
-#   sdk  - MIPS target SDK (psx-io, psx-rt, psx-gpu, psx-pad, psx-sdk)
+# Cargo workspaces:
+#   root   - no_std shared crates (psx-hw, psx-iso, psx-trace)
+#   editor - host-side editor/content pipeline crates
+#   emu    - host-side emulator/frontend/parity crates
+#   engine - PSX runtime engine crates
+#   sdk    - MIPS target SDK crates
+#
+# Standalone tool crates live under tools/* and are gated explicitly.
 #
 # SDK examples live under sdk/examples/ and are compiled individually
 # with cargo build in their own directory so they can use their own
@@ -32,8 +36,8 @@ help:
 	@echo "PSoXide targets:"
 	@echo ""
 	@echo "  Emulator / host:"
-	@echo "    make check        - cargo check on root + emu + sdk workspaces"
-	@echo "    make test         - fast unit tests (both workspaces, excludes canaries)"
+	@echo "    make check        - cargo check on all workspaces and tools"
+	@echo "    make test         - fast unit tests (all workspaces/tools, excludes canaries)"
 	@echo "    make canaries     - commercial-game canary tests (Milestones D-K)"
 	@echo "    make fmt          - format all code"
 	@echo "    make lint         - clippy -D warnings"
@@ -89,12 +93,21 @@ run:
 
 check:
 	cargo check --workspace --all-features
+	cd editor && cargo check --workspace --all-features
 	cd emu && cargo check --workspace --all-features
+	cd engine && cargo check --workspace --all-features
 	cd sdk && cargo check --workspace --all-features
+	cd tools/mkisopsx && cargo check
+	cd tools/psx-exe-pack && cargo check
 
 test:
 	cargo test --workspace
+	cd editor && cargo test --workspace
 	cd emu && cargo test --workspace
+	cd engine && cargo test --workspace
+	cd sdk && cargo test --workspace
+	cd tools/mkisopsx && cargo test
+	cd tools/psx-exe-pack && cargo test
 
 canaries:
 	cargo test --workspace -- --ignored
@@ -102,16 +115,30 @@ canaries:
 
 fmt:
 	cargo fmt --all
+	cd editor && cargo fmt --all
 	cd emu && cargo fmt --all
+	cd engine && cargo fmt --all
+	cd sdk && cargo fmt --all
+	cd tools/mkisopsx && cargo fmt --all
+	cd tools/psx-exe-pack && cargo fmt --all
 
 lint:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cd editor && cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cd emu && cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cd engine && cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cd sdk && cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cd tools/mkisopsx && cargo clippy --all-targets --all-features -- -D warnings
+	cd tools/psx-exe-pack && cargo clippy --all-targets --all-features -- -D warnings
 
 clean:
 	cargo clean
+	cd editor && cargo clean
 	cd emu && cargo clean
+	cd engine && cargo clean
 	cd sdk && cargo clean
+	cd tools/mkisopsx && cargo clean
+	cd tools/psx-exe-pack && cargo clean
 	rm -rf build
 
 fetch-opcode:

@@ -158,8 +158,7 @@ impl EditorAssets {
                 .map(|slot| slot.signature() != &desired)
                 .unwrap_or(true);
             if needs_refresh {
-                self.meshes
-                    .insert(resource.id, load_or_fail(&abs, desired));
+                self.meshes.insert(resource.id, load_or_fail(&abs, desired));
             }
 
             // Clips. Each clip is independently keyed +
@@ -406,10 +405,7 @@ mod tests {
         await_next_mtime_tick();
         fs::write(dir.join("mesh.psxmdl"), b"v2-different-length").unwrap();
         assets.refresh(&project, &dir);
-        assert_eq!(
-            assets.mesh_bytes(model_id).unwrap(),
-            b"v2-different-length"
-        );
+        assert_eq!(assets.mesh_bytes(model_id).unwrap(), b"v2-different-length");
 
         // Same path, same length, fresh mtime. Catches the
         // "byte-length matches by coincidence" case the prior
@@ -417,10 +413,7 @@ mod tests {
         await_next_mtime_tick();
         fs::write(dir.join("mesh.psxmdl"), b"v3-different-length").unwrap();
         assets.refresh(&project, &dir);
-        assert_eq!(
-            assets.mesh_bytes(model_id).unwrap(),
-            b"v3-different-length"
-        );
+        assert_eq!(assets.mesh_bytes(model_id).unwrap(), b"v3-different-length");
 
         let _ = fs::remove_dir_all(dir);
     }

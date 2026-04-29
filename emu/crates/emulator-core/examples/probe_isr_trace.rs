@@ -193,9 +193,9 @@ fn main() {
             ];
             let pending = pre_istat & pre_imask;
             let mut which = vec![];
-            for b in 0..11 {
+            for (b, name) in names.iter().enumerate() {
                 if pending & (1 << b) != 0 {
-                    which.push(names[b]);
+                    which.push(*name);
                 }
             }
             eprintln!(

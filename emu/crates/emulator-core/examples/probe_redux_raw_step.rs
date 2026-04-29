@@ -100,9 +100,6 @@ fn main() {
 }
 
 fn parse_raw_pc(line: &str) -> Option<u32> {
-    for part in line.split_whitespace() {
-        let value = part.strip_prefix("pc=")?;
-        return value.parse::<u32>().ok();
-    }
-    None
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix("pc=")?.parse::<u32>().ok())
 }

@@ -35,9 +35,10 @@ pub enum GridDirection {
 }
 
 /// Diagonal split used for a quad face.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GridSplit {
     /// Split from north-west to south-east.
+    #[default]
     NorthWestSouthEast,
     /// Split from north-east to south-west.
     NorthEastSouthWest,
@@ -58,12 +59,6 @@ impl GridSplit {
             Self::NorthWestSouthEast => [0, 2, 3],
             Self::NorthEastSouthWest => [1, 2, 3],
         }
-    }
-}
-
-impl Default for GridSplit {
-    fn default() -> Self {
-        Self::NorthWestSouthEast
     }
 }
 

@@ -228,7 +228,10 @@ mod host_smoke {
         let projected = project_vertex(Vec3I16::new(0, 0, 1024));
         assert_eq!(projected.sx, 160);
         assert_eq!(projected.sy, 120);
-        assert!(projected.sz > 0, "near-plane vertex must yield non-zero depth");
+        assert!(
+            projected.sz > 0,
+            "near-plane vertex must yield non-zero depth"
+        );
     }
 
     #[test]

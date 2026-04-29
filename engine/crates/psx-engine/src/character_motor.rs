@@ -444,10 +444,10 @@ impl CharacterMotorState {
         if speed == 0 {
             return (false, false);
         }
-        let dx = ((move_x_q12 as i64 * speed as i64) >> 12)
-            .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-        let dz = ((move_z_q12 as i64 * speed as i64) >> 12)
-            .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        let dx = ((move_x_q12 as i64 * speed as i64) >> 12).clamp(i32::MIN as i64, i32::MAX as i64)
+            as i32;
+        let dz = ((move_z_q12 as i64 * speed as i64) >> 12).clamp(i32::MIN as i64, i32::MAX as i64)
+            as i32;
         if dx == 0 && dz == 0 {
             return (false, false);
         }
@@ -484,6 +484,7 @@ impl CharacterMotorState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn frame(
         &self,
         anim: CharacterMotorAnim,
@@ -612,7 +613,11 @@ fn yaw_from_vector_q12(dx: i32, dz: i32) -> u16 {
         1024 - ((az as i64 * 512) / ax.max(1) as i64) as i32
     };
     let angle = if dz >= 0 {
-        if dx >= 0 { base } else { 4096 - base }
+        if dx >= 0 {
+            base
+        } else {
+            4096 - base
+        }
     } else if dx >= 0 {
         2048 - base
     } else {

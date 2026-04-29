@@ -50,7 +50,7 @@ fn main() {
 
     println!("Total GPU commands: {}", bus.gpu.cmd_log.len());
     println!();
-    println!("{:>5}  {:>8}  {}", "op", "count", "name");
+    println!("{:>5}  {:>8}  name", "op", "count");
     println!("{}", "-".repeat(60));
     for (op, count) in &hist {
         println!("0x{op:02x}  {count:>8}  {}", opcode_name(*op));

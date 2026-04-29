@@ -16,6 +16,10 @@ use crate::sio::Sio0;
 use crate::spu::Spu;
 use crate::timers::Timers;
 
+mod timing;
+
+use timing::*;
+
 /// Physical address of `I_STAT` (interrupt status / ack register).
 const IRQ_STAT_ADDR: u32 = 0x1F80_1070;
 /// Physical address of `I_MASK` (interrupt enable register).
@@ -135,94 +139,6 @@ pub struct Bus {
     /// `probe_dma_schedules` example flips it on.
     dma_log_enabled: bool,
     dma_log: Vec<(String, u64, u64, u64)>,
-}
-
-// --- Video-timing constants ---
-//
-// Match Redux's `psxcounters.cc` math exactly so VBlank fires at the
-// same cycle — and therefore at the same instruction — on both sides.
-//
-//   HSync period   = psxClockSpeed / (FrameRate × HSyncTotal)
-//   NTSC: 33_868_800 / (60 × 263) = 2146 cycles/HSync,  564_398 cyc/frame
-//   PAL : 33_868_800 / (50 × 314) = 2157 cycles/HSync,  677_343 cyc/frame
-//
-// `FIRST_VBLANK_CYCLE` is derived from the per-region VBlank-start
-// scanline × HSync; kept as NTSC default to preserve existing parity
-// tests. PAL builds call [`Bus::set_pal_mode`] before running, which
-// re-seeds the VBlank scheduler and updates the tick-rate knobs.
-
-const HSYNC_CYCLES_NTSC: u64 = 2146;
-#[allow(dead_code)]
-const HSYNC_TOTAL_NTSC: u64 = 263;
-const VBLANK_START_SCANLINE_NTSC: u64 = 243;
-const FIRST_VBLANK_CYCLE_NTSC: u64 = HSYNC_CYCLES_NTSC * VBLANK_START_SCANLINE_NTSC;
-const VBLANK_PERIOD_CYCLES_NTSC: u64 = HSYNC_CYCLES_NTSC * HSYNC_TOTAL_NTSC;
-
-const HSYNC_CYCLES_PAL: u64 = 2157;
-#[allow(dead_code)]
-const HSYNC_TOTAL_PAL: u64 = 314;
-const VBLANK_START_SCANLINE_PAL: u64 = 256;
-const FIRST_VBLANK_CYCLE_PAL: u64 = HSYNC_CYCLES_PAL * VBLANK_START_SCANLINE_PAL;
-const VBLANK_PERIOD_CYCLES_PAL: u64 = HSYNC_CYCLES_PAL * HSYNC_TOTAL_PAL;
-
-// NTSC first-VBlank constant kept for the default scheduler seed.
-// PAL switch re-seeds via [`Bus::set_pal_mode`].
-const FIRST_VBLANK_CYCLE: u64 = FIRST_VBLANK_CYCLE_NTSC;
-#[allow(dead_code)]
-const VBLANK_PERIOD_CYCLES: u64 = VBLANK_PERIOD_CYCLES_NTSC;
-
-#[derive(Clone, Copy)]
-struct VideoTiming {
-    hsync: u64,
-    period: u64,
-    start_scanline: u64,
-    total_scanlines: u64,
-}
-
-fn current_video_params(hsync: u64, period: u64) -> Option<VideoTiming> {
-    if period == hsync.saturating_mul(HSYNC_TOTAL_NTSC) {
-        Some(VideoTiming {
-            hsync,
-            period,
-            start_scanline: VBLANK_START_SCANLINE_NTSC,
-            total_scanlines: HSYNC_TOTAL_NTSC,
-        })
-    } else if period == hsync.saturating_mul(HSYNC_TOTAL_PAL) {
-        Some(VideoTiming {
-            hsync,
-            period,
-            start_scanline: VBLANK_START_SCANLINE_PAL,
-            total_scanlines: HSYNC_TOTAL_PAL,
-        })
-    } else {
-        None
-    }
-}
-
-fn estimate_current_scanline(
-    now: u64,
-    next_vblank: u64,
-    period: u64,
-    hsync: u64,
-    start_scanline: u64,
-    total_scanlines: u64,
-) -> u64 {
-    let previous_vblank = previous_vblank_target(now, next_vblank, period);
-    let since_previous = now.saturating_sub(previous_vblank);
-    (start_scanline + since_previous / hsync.max(1)) % total_scanlines.max(1)
-}
-
-fn estimate_scanline_phase(now: u64, next_vblank: u64, period: u64, hsync: u64) -> u64 {
-    let previous_vblank = previous_vblank_target(now, next_vblank, period);
-    now.saturating_sub(previous_vblank) % hsync.max(1)
-}
-
-fn previous_vblank_target(now: u64, mut next_vblank: u64, period: u64) -> u64 {
-    let period = period.max(1);
-    while next_vblank > now {
-        next_vblank = next_vblank.saturating_sub(period);
-    }
-    next_vblank
 }
 
 impl Bus {
@@ -420,7 +336,7 @@ impl Bus {
     /// games can poll for button state. Convenience: most single-player
     /// games use port 1 only.
     pub fn attach_digital_pad_port1(&mut self) {
-        let old = std::mem::replace(self.sio0.port1_mut(), crate::pad::PortDevice::empty());
+        let old = std::mem::take(self.sio0.port1_mut());
         let memcard = old.into_memcard();
         let mut device = crate::pad::PortDevice::empty().with_pad(crate::pad::DigitalPad::new());
         if let Some(card) = memcard {
@@ -446,8 +362,7 @@ impl Bus {
             crate::pad::MemoryCard::new()
         };
         // Preserve any existing pad.
-        let pad =
-            std::mem::replace(self.sio0.port1_mut(), crate::pad::PortDevice::empty()).into_pad();
+        let pad = std::mem::take(self.sio0.port1_mut()).into_pad();
         let mut device = crate::pad::PortDevice::empty().with_memcard(card);
         if let Some(p) = pad {
             device = device.with_pad(p);
@@ -554,7 +469,7 @@ impl Bus {
     /// SIO0 already multiplexes port 1 / port 2 internally via
     /// the CTRL.SLOT bit — games switch between them per poll.
     pub fn attach_digital_pad_port2(&mut self) {
-        let old = std::mem::replace(self.sio0.port2_mut(), crate::pad::PortDevice::empty());
+        let old = std::mem::take(self.sio0.port2_mut());
         let memcard = old.into_memcard();
         let mut device = crate::pad::PortDevice::empty().with_pad(crate::pad::DigitalPad::new());
         if let Some(card) = memcard {
@@ -571,8 +486,7 @@ impl Bus {
         } else {
             crate::pad::MemoryCard::new()
         };
-        let pad =
-            std::mem::replace(self.sio0.port2_mut(), crate::pad::PortDevice::empty()).into_pad();
+        let pad = std::mem::take(self.sio0.port2_mut()).into_pad();
         let mut device = crate::pad::PortDevice::empty().with_memcard(card);
         if let Some(p) = pad {
             device = device.with_pad(p);
@@ -2527,7 +2441,7 @@ mod tests {
     }
 
     fn enable_mdec_dma(bus: &mut Bus) {
-        bus.dma.dpcr = (1 << (0 * 4 + 3)) | (1 << (1 * 4 + 3));
+        bus.dma.dpcr = (1 << 3) | (1 << 7);
     }
 
     fn seed_one_macroblock_decode(bus: &mut Bus) {

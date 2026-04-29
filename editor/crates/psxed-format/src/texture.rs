@@ -129,6 +129,6 @@ impl TextureHeader {
     /// still uses 2 halfwords per row.
     pub const fn halfwords_per_row(depth: Depth, width_px: u16) -> u16 {
         let per_hw = depth.texels_per_halfword();
-        (width_px + per_hw - 1) / per_hw
+        width_px.div_ceil(per_hw)
     }
 }
