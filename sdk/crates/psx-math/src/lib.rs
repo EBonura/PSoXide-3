@@ -10,22 +10,22 @@
 //!
 //! ## What's here today
 //!
-//! - [`sincos`] — Q0.12 angle type + 256-entry Q1.12 sine LUT +
+//! - [`sincos`] -- Q0.12 angle type + 256-entry Q1.12 sine LUT +
 //!   interpolated `sin_q12` / `cos_q12` lookups.
 //!
 //! ## What's planned (same crate, future modules)
 //!
-//! - `fixed` — Q3.12 and Q16.16 wrappers with operator overloads
+//! - `fixed` -- Q3.12 and Q16.16 wrappers with operator overloads
 //!   and saturating / wrapping arithmetic.
-//! - `vec` — `Vec2` / `Vec3` over integer and fixed-point types
+//! - `vec` -- `Vec2` / `Vec3` over integer and fixed-point types
 //!   with dot / cross / length² / normalise.
-//! - `mat` — 2×2 / 3×3 / GTE-shape matrices, chosen to match how
+//! - `mat` -- 2×2 / 3×3 / GTE-shape matrices, chosen to match how
 //!   the GTE's `RTPS` / `MVMVA` instructions consume data.
-//! - `ease` — sinusoidal / quadratic / cubic easing helpers for
+//! - `ease` -- sinusoidal / quadratic / cubic easing helpers for
 //!   timeline animation.
-//! - `lerp` — generic linear interpolation.
+//! - `lerp` -- generic linear interpolation.
 //!
-//! These modules land as concrete consumer code needs them — no
+//! These modules land as concrete consumer code needs them -- no
 //! premature abstractions. The crate ships empty apart from the
 //! documented scope so reviewers can see where new primitives
 //! should go.
@@ -36,9 +36,9 @@
 //! signed integer. Arithmetic rules:
 //!
 //! - Add / sub: same as ordinary integer add / sub.
-//! - Multiply: `(a * b) >> n` — two Q_._n values produce a Q_._2n
+//! - Multiply: `(a * b) >> n` -- two Q_._n values produce a Q_._2n
 //!   intermediate that must be shifted back.
-//! - Divide: `(a << n) / b` — scale up the numerator by `n` bits
+//! - Divide: `(a << n) / b` -- scale up the numerator by `n` bits
 //!   first so the quotient is in Qm.n.
 //!
 //! Conventions the PS1 SDK uses:
@@ -54,7 +54,7 @@
 //!   Used by `psx-font`'s affine matrices today; planned as a
 //!   proper `Mat2` type here.
 //! - **Q16.16 positions** (future): `i32` in `±32767` with 16
-//!   fractional bits — standard precision for sub-pixel
+//!   fractional bits -- standard precision for sub-pixel
 //!   positions, accumulated velocities, etc.
 
 #![no_std]
@@ -65,5 +65,5 @@ pub mod sincos;
 
 // Re-export the most common symbols at the crate root so users
 // can `use psx_math::{sin_q12, cos_q12}` without reaching through
-// the submodule — these are the hot-loop primitives.
+// the submodule -- these are the hot-loop primitives.
 pub use sincos::{cos_q12, sin_q12, SIN_TABLE};

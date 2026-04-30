@@ -2,7 +2,7 @@
 //! the example can `include_bytes!` it at compile time.
 //!
 //! Also pins the slot-ordering invariant the runtime side bakes
-//! in — slot 0 must be the floor material, slot 1 the brick-wall
+//! in -- slot 0 must be the floor material, slot 1 the brick-wall
 //! material. If a future cooker reshape flips the order, this
 //! build fails loud and the runtime swap is a one-line patch.
 

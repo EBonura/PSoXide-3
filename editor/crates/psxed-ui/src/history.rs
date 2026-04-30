@@ -1,6 +1,6 @@
 //! Snapshot-based undo / redo for the editor workspace.
 //!
-//! Each entry is a full [`ProjectDocument`] clone — for
+//! Each entry is a full [`ProjectDocument`] clone -- for
 //! hand-authored level data the snapshots are cheap and avoid
 //! the command-pattern bookkeeping that operation-based undo
 //! demands. Capacity is bounded so a long edit session can't
@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use psxed_project::ProjectDocument;
 
 /// Maximum number of snapshots retained on either the undo or
-/// the redo stack. Hitting the cap drops the oldest entry —
+/// the redo stack. Hitting the cap drops the oldest entry --
 /// matches IDE-style "you can always undo a few steps but the
 /// stack stays bounded" behaviour.
 pub const UNDO_CAPACITY: usize = 64;
@@ -29,7 +29,7 @@ pub(crate) struct UndoStack {
 
 impl UndoStack {
     /// Push the *pre-mutation* `snapshot` onto the undo stack
-    /// and clear the redo stack — any new edit forks history.
+    /// and clear the redo stack -- any new edit forks history.
     pub(crate) fn record(&mut self, snapshot: ProjectDocument) {
         if self.undo.len() == UNDO_CAPACITY {
             self.undo.pop_front();
@@ -78,7 +78,7 @@ mod tests {
         stack.record(doc("v1"));
         let restored = stack.undo(doc("v2")).expect("undo entry exists");
         assert_eq!(restored.name, "v1");
-        // Live state moved onto the redo stack — redo should
+        // Live state moved onto the redo stack -- redo should
         // hand it back.
         let redone = stack.redo(doc("v1")).expect("redo entry exists");
         assert_eq!(redone.name, "v2");
@@ -89,7 +89,7 @@ mod tests {
         let mut stack = UndoStack::default();
         stack.record(doc("v1"));
         let _ = stack.undo(doc("v2"));
-        // A new edit *after* an undo forks history — redo
+        // A new edit *after* an undo forks history -- redo
         // should yield nothing.
         stack.record(doc("v2'"));
         assert!(stack.redo(doc("live")).is_none());
@@ -101,7 +101,7 @@ mod tests {
         for i in 0..(UNDO_CAPACITY + 5) {
             stack.record(doc(&format!("v{i}")));
         }
-        // Drain the stack — the first entry should be
+        // Drain the stack -- the first entry should be
         // `v5` (oldest 5 dropped).
         let mut last = None;
         while let Some(prev) = stack.undo(doc("live")) {

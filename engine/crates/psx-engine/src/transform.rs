@@ -4,8 +4,8 @@
 //!
 //! The SDK's [`psx_gte::math`] types are **register-shaped**: they
 //! pack into the exact 16-bit and 32-bit slots the GTE's MTC2 and
-//! CTC2 opcodes expect. That's the right shape for the SDK — a thin
-//! hardware wrapper — but it leaves the engine with a "one type,
+//! CTC2 opcodes expect. That's the right shape for the SDK -- a thin
+//! hardware wrapper -- but it leaves the engine with a "one type,
 //! many meanings" problem:
 //!
 //! - [`psx_gte::math::Vec3I16`] is used for mesh-local vertices **and**
@@ -23,9 +23,9 @@
 //! This module introduces two engine-level types that shift those
 //! concerns back into the type system:
 //!
-//! - [`Vec3World`] — a position in **world space**, Q19.12. Cannot be
+//! - [`Vec3World`] -- a position in **world space**, Q19.12. Cannot be
 //!   mixed up with a mesh-local `Vec3I16` or a GTE colour register.
-//! - [`ActorTransform`] — a pose for one "actor" (game object) — its
+//! - [`ActorTransform`] -- a pose for one "actor" (game object) -- its
 //!   world-space position, rotation, and uniform scale. A single
 //!   [`ActorTransform::load_gte`] call composes them into the
 //!   rotation + translation control-register writes the GTE needs
@@ -48,7 +48,7 @@
 //! `ActorTransform::scale` is a **uniform** Q3.12 factor. `0x1000`
 //! is 1.0× (identity); `0x0800` halves mesh size, `0x2000` doubles
 //! it, and so on. Non-uniform (per-axis) scale is deliberately out
-//! of scope — every engine example that's wanted scale so far has
+//! of scope -- every engine example that's wanted scale so far has
 //! wanted it uniform, and folding per-axis scale into the rotation
 //! matrix interacts badly with normal transforms (distorts
 //! lighting). If a non-uniform case comes up later, we add it; in
@@ -58,7 +58,7 @@ use psx_gte::math::{Mat3I16, Vec3I32};
 use psx_gte::scene;
 
 /// A position in world space. Stored as raw Q19.12 per-axis `i32`
-/// — the same representation the GTE's translation register (TR,
+/// -- the same representation the GTE's translation register (TR,
 /// control-register slots 5..=7) expects, so `load_gte` forwards
 /// them unchanged.
 ///
@@ -66,7 +66,7 @@ use psx_gte::scene;
 ///
 /// The engine adopts the GTE's native "Q3.12 unit" as its world
 /// unit: `1.0` in world space is `0x1000` in the stored `i32`.
-/// Mesh vertices in `Vec3I16` coords use the same scale — a cube
+/// Mesh vertices in `Vec3I16` coords use the same scale -- a cube
 /// mesh whose corners are at `±0x0800` is a 1.0-unit cube, which
 /// means an `ActorTransform` placing it at
 /// `Vec3World::from_units(3, 0, 10)` puts its centre at world
@@ -74,10 +74,10 @@ use psx_gte::scene;
 ///
 /// # Range
 ///
-/// `i32` gives ±524,288 world units comfortably — well past any
+/// `i32` gives ±524,288 world units comfortably -- well past any
 /// scene a PSX game would actually render, and a big headroom
 /// over the GTE's internal 16-bit vertex inputs (which is why
-/// meshes still use `Vec3I16` — they live in local space where
+/// meshes still use `Vec3I16` -- they live in local space where
 /// ±8.0 units is plenty).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Hash)]
 #[repr(C)]
@@ -115,7 +115,7 @@ impl Vec3World {
         Vec3World { x, y, z }
     }
 
-    /// Drop into the GTE's native `Vec3I32` register-shape — what
+    /// Drop into the GTE's native `Vec3I32` register-shape -- what
     /// [`psx_gte::scene::load_translation`] wants. Zero-cost.
     #[inline]
     pub const fn as_gte_translation(self) -> Vec3I32 {
@@ -142,13 +142,13 @@ impl Vec3World {
 /// One `load_gte` call per actor, then drive the mesh through the
 /// GTE as normal. The scale folds into the rotation matrix before
 /// upload, so the projection pipeline runs at normal RTPS cost
-/// — no per-vertex multiply overhead.
+/// -- no per-vertex multiply overhead.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ActorTransform {
     /// World-space position.
     pub position: Vec3World,
     /// Rotation about the actor's local origin. Q3.12 rotation
-    /// matrix — composable through [`Mat3I16::mul`] when building
+    /// matrix -- composable through [`Mat3I16::mul`] when building
     /// multi-axis tumbles on the way in.
     pub rotation: Mat3I16,
     /// Uniform scale, Q3.12. `0x1000` = 1.0× (identity). The
@@ -159,7 +159,7 @@ pub struct ActorTransform {
 }
 
 impl ActorTransform {
-    /// Identity pose — origin, identity rotation, 1.0× scale.
+    /// Identity pose -- origin, identity rotation, 1.0× scale.
     /// Equivalent to "draw the mesh exactly as authored, in world
     /// space at the origin".
     pub const IDENTITY: ActorTransform = ActorTransform {
@@ -199,12 +199,12 @@ impl ActorTransform {
         self
     }
 
-    /// The rotation matrix after folding in the uniform scale — the
+    /// The rotation matrix after folding in the uniform scale -- the
     /// exact matrix [`load_gte`][Self::load_gte] will upload to the
     /// GTE's RT control registers.
     ///
     /// Exposed for callers that also need to do CPU-side transform
-    /// math alongside the GTE pipeline — e.g. a CPU point-light
+    /// math alongside the GTE pipeline -- e.g. a CPU point-light
     /// shader computing world-space positions via the same scaled
     /// rotation the GTE uses. Reusing this accessor guarantees the
     /// CPU and GTE paths see bit-identical matrices.
@@ -233,7 +233,7 @@ impl ActorTransform {
 ///
 /// Rotation matrices have `|cell|` in `[0, 0x1000]`; scale factors
 /// up to `0x8000` (8.0×) keep the product within `i16`. Anything
-/// larger saturates — callers who need huge scale should split
+/// larger saturates -- callers who need huge scale should split
 /// into a mesh-local pre-scale and a smaller runtime factor.
 ///
 /// Exposed at module-level (not via `impl Mat3I16`) deliberately:
@@ -307,7 +307,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ActorTransform — builder
+    // ActorTransform -- builder
     // ------------------------------------------------------------------
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
             .with_rotation(rot)
             .with_scale_q12(0x0800);
         // `scaled_rotation` must return exactly what `load_gte`
-        // would upload — i.e. the same byte output the old hand-
+        // would upload -- i.e. the same byte output the old hand-
         // rolled `scale_mat` helpers produced.
         assert_eq!(t.scaled_rotation(), scale_mat_uniform(&rot, 0x0800));
     }
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn actor_transform_scaled_rotation_identity_scale_noop() {
         // A scale of 1.0× must leave the rotation matrix bytewise
-        // unchanged — critical for the showcase-3d migration where
+        // unchanged -- critical for the showcase-3d migration where
         // meshes don't use scale but still go through `load_gte`.
         let rot = Mat3I16::rotate_z(96);
         let t = ActorTransform::at(Vec3World::ZERO).with_rotation(rot);
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn scale_mat_uniform_double_grows_diagonal() {
         let out = scale_mat_uniform(&Mat3I16::IDENTITY, 0x2000);
-        // 0x1000 × 0x2000 >> 12 = 0x2000 — still in i16 range.
+        // 0x1000 × 0x2000 >> 12 = 0x2000 -- still in i16 range.
         assert_eq!(out.m[0][0], 0x2000);
         assert_eq!(out.m[1][1], 0x2000);
         assert_eq!(out.m[2][2], 0x2000);
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn scale_mat_uniform_saturates_without_wrapping() {
-        // 0x1000 × 0x1_0000 >> 12 = 0x1_0000 — one above i16::MAX.
+        // 0x1000 × 0x1_0000 >> 12 = 0x1_0000 -- one above i16::MAX.
         // The clamp must prevent a wrap-around sign flip that would
         // silently mirror the actor.
         let out = scale_mat_uniform(&Mat3I16::IDENTITY, 0x1_0000);

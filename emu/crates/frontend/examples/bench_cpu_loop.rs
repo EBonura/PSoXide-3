@@ -8,9 +8,9 @@
 //!   1. Run the CPU emulator forward by `--cycles-per-frame`
 //!      cycles. This is the "everything inside emulator-core":
 //!      MIPS interpreter, bus, DMA, CDROM, SPU, GPU CPU rasterizer.
-//!   2. Convert the full 1024×512 VRAM to RGBA8 — what the
+//!   2. Convert the full 1024×512 VRAM to RGBA8 -- what the
 //!      frontend does for the VRAM viewer panel.
-//!   3. Convert the active display rect to RGBA8 — what the
+//!   3. Convert the active display rect to RGBA8 -- what the
 //!      frontend does for the central framebuffer panel.
 //!
 //! The bench skips the wgpu texture-upload + present steps because
@@ -139,7 +139,7 @@ fn main() {
 
     for _ in 0..args.frames {
         // Phase 1: CPU emulation. Includes the CPU rasterizer that
-        // produces VRAM pixels — the dominant cost when GP0 is hot.
+        // produces VRAM pixels -- the dominant cost when GP0 is hot.
         let t = Instant::now();
         for _ in 0..args.cycles_per_frame {
             if cpu.step(&mut bus).is_err() {
@@ -149,7 +149,7 @@ fn main() {
         t_emu += t.elapsed();
 
         // Count this frame's draws so we can attribute back. The
-        // tracer's owner buffer needs resetting too — its
+        // tracer's owner buffer needs resetting too -- its
         // `current_cmd_index` would otherwise drift past u32::MAX.
         let log = std::mem::take(&mut bus.gpu.cmd_log);
         total_packets += log.len() as u64;
@@ -161,7 +161,7 @@ fn main() {
         // Gpu after syncing its VRAM, so the in-context CPU
         // rasterizer cost is timed in isolation.
         if let Some(shadow) = shadow_gpu.as_mut() {
-            // Sync VRAM via per-pixel writes — there's no public
+            // Sync VRAM via per-pixel writes -- there's no public
             // bulk-set on `Vram`, but 1024×512 set_pixel calls is
             // ~0.5 ms here, accounted for separately so it doesn't
             // pollute the rasterizer number.
@@ -174,7 +174,7 @@ fn main() {
             }
             t_shadow_sync += t.elapsed();
 
-            // Replay this frame's packets — state setters in the
+            // Replay this frame's packets -- state setters in the
             // log re-establish draw_area / tpage / mask flags on
             // the shadow before each frame's draws, which is what
             // most PSX games do every frame anyway.

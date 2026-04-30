@@ -2,7 +2,7 @@
 //! backwards through the cmd_log to find the MOST RECENT
 //! 0xE1 (draw_mode), 0xE2 (tex_window), 0xE5 (draw_offset),
 //! 0xE6 (mask_bits) that was in effect. Tells us the exact GPU
-//! state at the moment the glyph draw fires — so we can
+//! state at the moment the glyph draw fires -- so we can
 //! reproduce the failing draw in isolation.
 
 use emulator_core::{Bus, Cpu};

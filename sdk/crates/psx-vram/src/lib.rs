@@ -8,22 +8,22 @@
 //!
 //! ## What's here
 //!
-//! - [`Color555`] — a 15bpp BGR pixel. Constructed via
+//! - [`Color555`] -- a 15bpp BGR pixel. Constructed via
 //!   [`Color555::rgb8`] (`u8` RGB → 5-bit truncation), or
 //!   [`Color555::rgb5`] (already 5-bit), or the `const` raw
 //!   constructor [`Color555::raw`].
-//! - [`VramRect`] — an `(x, y, w, h)` in VRAM pixels with const
+//! - [`VramRect`] -- an `(x, y, w, h)` in VRAM pixels with const
 //!   validation of the bounds. Can't construct one that would
 //!   overflow VRAM.
-//! - [`Tpage`] — a texture-page handle. Const constructor
+//! - [`Tpage`] -- a texture-page handle. Const constructor
 //!   enforces the PSX alignment rules (`x % 64 == 0`, `y ∈ {0, 256}`),
 //!   knows its bit-depth, and emits the GP0(E1h) draw-mode word
 //!   or the 16-bit tpage field embedded in textured-rect UV words.
-//! - [`Clut`] — a CLUT handle. `x % 16 == 0`, `y ∈ 0..512`. Emits
+//! - [`Clut`] -- a CLUT handle. `x % 16 == 0`, `y ∈ 0..512`. Emits
 //!   the 16-bit clut field for UV words. 4bpp and 8bpp CLUTs are
-//!   the same underlying type — the calling primitive's tpage
+//!   the same underlying type -- the calling primitive's tpage
 //!   picks which entry count it uses.
-//! - [`upload_16bpp`] — safe upload wrapper: checks `pixels.len()`
+//! - [`upload_16bpp`] -- safe upload wrapper: checks `pixels.len()`
 //!   matches `rect.w * rect.h`, packs to GP0 0xA0 + word stream.
 //!
 //! ## What's NOT here (yet)
@@ -51,7 +51,7 @@
 //! wrap (wrap, not truncate) on the real DMA controller if you
 //! oversize them. Getting any of these wrong in PsyQ silently
 //! corrupts VRAM. Const-validating them at construction means
-//! the bug can't compile — which is the whole point of writing
+//! the bug can't compile -- which is the whole point of writing
 //! a Rust SDK instead of a C one.
 
 #![no_std]
@@ -81,7 +81,7 @@ pub const VRAM_HEIGHT: u16 = 512;
 ///
 /// The mask bit is bit 15; [`Color555::rgb8`] constructs with the
 /// mask bit clear (most common). The "transparency" that games rely
-/// on for CLUT sprites is `Color555::raw(0)` — PSX treats an
+/// on for CLUT sprites is `Color555::raw(0)` -- PSX treats an
 /// all-zero texel as transparent in direct-color mode.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 #[repr(transparent)]
@@ -93,7 +93,7 @@ impl Color555 {
     pub const TRANSPARENT: Self = Self(0);
     /// Opaque black with mask bit clear.
     pub const BLACK: Self = Self(0);
-    /// Opaque white — all five bits set in each channel.
+    /// Opaque white -- all five bits set in each channel.
     pub const WHITE: Self = Self(0x7FFF);
 
     /// Build a color from 8-bit channels, truncating the low 3 bits
@@ -130,7 +130,7 @@ impl Color555 {
     }
 
     /// Set the mask bit (bit 15). Matters when `GP0 0xE6` has
-    /// "check mask on draw" enabled — writes are skipped where
+    /// "check mask on draw" enabled -- writes are skipped where
     /// existing mask is set. Games use this for UI overlays.
     pub const fn with_mask_bit(self) -> Self {
         Self(self.0 | 0x8000)
@@ -144,7 +144,7 @@ impl Color555 {
 /// An `(x, y, w, h)` rectangle in VRAM coordinates.
 ///
 /// Construction asserts the rect fits in VRAM. Subsequent code can
-/// pass `VramRect` around without re-checking — it's by-construction
+/// pass `VramRect` around without re-checking -- it's by-construction
 /// safe.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VramRect {
@@ -186,7 +186,7 @@ impl VramRect {
 // Tpage + Clut
 // ======================================================================
 
-/// Texture color depth — the last field of GP0(E1h) and bits 7..8
+/// Texture color depth -- the last field of GP0(E1h) and bits 7..8
 /// of a primitive's tpage word.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -288,7 +288,7 @@ impl Tpage {
     /// ```
     ///
     /// `semi_trans` picks the GPU blend mode when a texel's mask
-    /// bit is set. 0 is "0.5·bg + 0.5·fg" — the most common.
+    /// bit is set. 0 is "0.5·bg + 0.5·fg" -- the most common.
     pub const fn uv_tpage_word(self, semi_trans: u8) -> u16 {
         assert!(semi_trans < 4, "semi_trans must be 0..4");
         let tpx = (self.x / 64) & 0xF;
@@ -313,7 +313,7 @@ impl Tpage {
     }
 }
 
-/// A CLUT slot — 16 consecutive halfwords at `(x, y)` for 4bpp, or
+/// A CLUT slot -- 16 consecutive halfwords at `(x, y)` for 4bpp, or
 /// 256 consecutive halfwords for 8bpp. Const constructor asserts
 /// the 16-pixel X alignment hardware requires.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -360,7 +360,7 @@ impl Clut {
 // ======================================================================
 
 /// Upload raw 16bpp halfwords into a VRAM rect via GP0 0xA0 + word
-/// stream. Checks that `pixels.len() * 2 == rect.w * rect.h` — one
+/// stream. Checks that `pixels.len() * 2 == rect.w * rect.h` -- one
 /// halfword per pixel, and the FIFO ships 32-bit words containing
 /// two halfwords each. Odd pixel counts (which round up on
 /// hardware) panic because they're rarely what the caller wanted.
@@ -399,7 +399,7 @@ pub fn upload_16bpp(rect: VramRect, pixels: &[u16]) {
 
 /// Upload raw byte-stream pixel data, interpreted as halfwords in
 /// little-endian order. Same semantics as [`upload_16bpp`] but
-/// accepts a `&[u8]` — useful when the data comes from
+/// accepts a `&[u8]` -- useful when the data comes from
 /// `include_bytes!` of a cooked asset blob, where the returned
 /// byte array has alignment 1 and a direct `&[u16]` reinterpret
 /// would be undefined behaviour.
@@ -424,7 +424,7 @@ pub fn upload_bytes(rect: VramRect, bytes: &[u8]) {
     write_gp0(gp0::COPY_CPU_TO_VRAM);
     write_gp0(pack_xy(rect.x, rect.y));
     write_gp0(pack_xy(rect.w, rect.h));
-    // Two halfwords per FIFO word, low half first — matches
+    // Two halfwords per FIFO word, low half first -- matches
     // upload_16bpp's packing convention.
     let mut i = 0;
     while i + 3 < bytes.len() {
@@ -435,7 +435,7 @@ pub fn upload_bytes(rect: VramRect, bytes: &[u8]) {
     }
 }
 
-/// Upload typed [`Color555`] pixels — sugar over [`upload_16bpp`]
+/// Upload typed [`Color555`] pixels -- sugar over [`upload_16bpp`]
 /// for direct-color textures.
 pub fn upload_15bpp(rect: VramRect, pixels: &[Color555]) {
     let as_u16: &[u16] = unsafe {
@@ -446,7 +446,7 @@ pub fn upload_15bpp(rect: VramRect, pixels: &[Color555]) {
     upload_16bpp(rect, as_u16);
 }
 
-/// Upload a CLUT — a row of [`Color555`]s at `clut`. The caller
+/// Upload a CLUT -- a row of [`Color555`]s at `clut`. The caller
 /// picks the width: 16 entries for 4bpp, 256 for 8bpp. Asserts
 /// the CLUT fits in VRAM width and the slice length matches.
 pub fn upload_clut(clut: Clut, entries: &[Color555]) {

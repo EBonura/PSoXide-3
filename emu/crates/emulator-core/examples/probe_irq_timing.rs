@@ -1,5 +1,5 @@
 //! Show our emulator's instruction flow + IRQ state in a narrow
-//! window around step 19474543 — where the 20M parity test
+//! window around step 19474543 -- where the 20M parity test
 //! diverges on `$r26`. Prints every step's PC, instr, cycles,
 //! and IRQ-controller state so we can line up against Redux's
 //! cached trace and see who fires an IRQ differently.

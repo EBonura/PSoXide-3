@@ -15,7 +15,7 @@
 //! PS1 discs place their data area starting at LBA `0x0000`, which
 //! corresponds to MSF `00:02:00` (after the 2-second pre-gap).
 //! `Disc::read_sector_raw` here treats LBA 0 as byte offset 0 of the
-//! BIN — adequate for hand-assembled homebrew images. CUE-aware
+//! BIN -- adequate for hand-assembled homebrew images. CUE-aware
 //! handling (pre-gap skipping, multi-track) lands when a real
 //! commercial disc boots.
 //!
@@ -36,7 +36,7 @@ pub use boot::{load_boot_exe_from_disc, BootError, BootExe};
 pub use exe::{Exe, ExeError, EXE_HEADER_BYTES};
 pub use iso9660::{default_system_cnf, IsoBuilder, IsoFile};
 
-/// One raw CD-ROM sector — always 2352 bytes on a PS1 disc regardless
+/// One raw CD-ROM sector -- always 2352 bytes on a PS1 disc regardless
 /// of track mode.
 pub const SECTOR_BYTES: usize = 2352;
 /// Byte offset of the 2048-byte user-data region within a Mode-2
@@ -260,7 +260,7 @@ pub fn bcd_to_bin(bcd: u8) -> u8 {
 }
 
 /// Pack a binary 0..=99 value into a BCD byte. Values above 99
-/// clamp to 99 — hardware drops the high bits rather than
+/// clamp to 99 -- hardware drops the high bits rather than
 /// corrupting the low nibble.
 pub fn bin_to_bcd(v: u8) -> u8 {
     let v = v.min(99);

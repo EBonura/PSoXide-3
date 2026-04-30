@@ -32,7 +32,7 @@ pub struct OrderingTable<const N: usize> {
 
 impl<const N: usize> OrderingTable<N> {
     /// Create a table with every slot being a chain terminator.
-    /// Call [`clear`](Self::clear) before submitting — that wires
+    /// Call [`clear`](Self::clear) before submitting -- that wires
     /// up the inter-slot chain so DMA walks across all `N` slots.
     pub const fn new() -> Self {
         Self {
@@ -103,7 +103,7 @@ impl<const N: usize> OrderingTable<N> {
     ///
     /// # Safety
     /// Every chained packet must be live for the lifetime of the
-    /// returned iterator — exactly the same invariant `submit()`
+    /// returned iterator -- exactly the same invariant `submit()`
     /// requires. Primitives produced by [`crate::prim::*`] paired with
     /// a `PrimitiveArena` satisfy this; bespoke chains must guarantee
     /// the same.
@@ -113,7 +113,7 @@ impl<const N: usize> OrderingTable<N> {
         // because RAM is 2 MB and packet pointers can omit the high
         // byte. On host the same masking still recovers the address
         // because all OT-chained primitives live in the same arena
-        // whose pointer fits in 24 bits relative to a stable base —
+        // whose pointer fits in 24 bits relative to a stable base --
         // [`PrimitiveArena`] enforces that.
         OtPacketIter {
             next: self.entries[N - 1] & 0x00FF_FFFF,
@@ -137,7 +137,7 @@ impl Iterator for OtPacketIter {
     type Item = (*const u32, u8);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Walk the chain, skipping empty stepping-stones — OT slots
+        // Walk the chain, skipping empty stepping-stones -- OT slots
         // that hold `words=0` because they were never targeted by an
         // `insert`. The DMA hardware silently no-ops through those
         // and only forwards entries with actual packet data, so this
@@ -177,7 +177,7 @@ mod tests {
     fn iter_packets_walks_a_single_inserted_primitive() {
         let mut ot: OrderingTable<8> = OrderingTable::new();
         ot.clear();
-        // Packet layout: [tag, w0, w1, w2] — 3 data words after the tag.
+        // Packet layout: [tag, w0, w1, w2] -- 3 data words after the tag.
         let mut packet: [u32; 4] = [0; 4];
         packet[1] = 0xAAAA_BBBB;
         packet[2] = 0xCCCC_DDDD;
@@ -193,7 +193,7 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
-    /// Two primitives in different slots — chain walks both; later
+    /// Two primitives in different slots -- chain walks both; later
     /// inserts (lower slot) come first because `clear()` chains
     /// high-to-low and the DMA head is `[N-1]`.
     #[test]
@@ -211,7 +211,7 @@ mod tests {
 
         let mut iter = unsafe { ot.iter_packets() };
         // DMA walker starts at [N-1] = [7] and chains down to [0].
-        // b lives in slot 5, a in slot 2 — both should appear, b first.
+        // b lives in slot 5, a in slot 2 -- both should appear, b first.
         let first = iter.next().expect("first entry").0 as usize;
         let second = iter.next().expect("second entry").0 as usize;
         assert!(iter.next().is_none());

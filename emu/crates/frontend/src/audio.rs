@@ -1,4 +1,4 @@
-//! Host-side audio output — cpal output stream fed by a lock-free
+//! Host-side audio output -- cpal output stream fed by a lock-free
 //! ring buffer whose producer is the emulation thread.
 //!
 //! Design:
@@ -12,7 +12,7 @@
 //!   blocking (audio underrun → brief pop, no deadlock).
 //! - The ring buffer is a [`std::sync::Mutex<VecDeque<(i16, i16)>>`].
 //!   Not lock-free but cheap at audio-block granularity (512-sample
-//!   blocks × ~86 blocks/sec = 172 locks/sec — negligible).
+//!   blocks × ~86 blocks/sec = 172 locks/sec -- negligible).
 //!
 //! We keep the cpal host + stream + config alive inside [`AudioOut`].
 //! Dropping the struct stops the stream.
@@ -24,7 +24,7 @@ use std::sync::{
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-/// Target sample rate — PSX SPU native rate. Host may negotiate up
+/// Target sample rate -- PSX SPU native rate. Host may negotiate up
 /// (48 kHz is common); cpal handles any rate we ask for or tells us
 /// the default.
 const TARGET_SAMPLE_RATE: u32 = 44_100;
@@ -43,7 +43,7 @@ type VolumeControl = Arc<AtomicU32>;
 /// audio thread) and exposes the producer handle to the shell's
 /// per-frame SPU drain.
 pub struct AudioOut {
-    /// Sample producer — the shell clones this to push drained
+    /// Sample producer -- the shell clones this to push drained
     /// SPU samples after each CPU frame.
     queue: SampleQueue,
     /// Kept alive so the cpal stream keeps running. Dropping it
@@ -63,7 +63,7 @@ pub struct AudioOut {
 impl AudioOut {
     /// Spin up the host audio stream. Returns `None` when no output
     /// device is available (headless CI, WSL without PulseAudio).
-    /// The shell treats `None` as "audio silenced" — emulation
+    /// The shell treats `None` as "audio silenced" -- emulation
     /// still runs, you just don't hear anything.
     pub fn open() -> Option<Self> {
         let host = cpal::default_host();
@@ -152,7 +152,7 @@ impl AudioOut {
                     )
                     .ok()?
             }
-            // Other formats (U16, etc.) — not common on modern
+            // Other formats (U16, etc.) -- not common on modern
             // hosts; gracefully fail and let the shell run silent.
             _ => return None,
         };
@@ -168,7 +168,7 @@ impl AudioOut {
 
     /// Push drained SPU samples into the ring. The shell calls this
     /// after each `run_spu_samples` pump. Discards oldest samples
-    /// when the queue grows past a ~0.5-second backlog — prevents
+    /// when the queue grows past a ~0.5-second backlog -- prevents
     /// unbounded growth when the emulator runs faster than real time
     /// (fast-forward, rewind).
     pub fn push_samples(&self, samples: &[(i16, i16)]) {
@@ -183,7 +183,7 @@ impl AudioOut {
         q.extend(samples.iter().copied());
     }
 
-    /// Host's negotiated sample rate. Diagnostic — shown in the
+    /// Host's negotiated sample rate. Diagnostic -- shown in the
     /// HUD so users can confirm audio is actually running.
     pub fn host_sample_rate(&self) -> u32 {
         self.host_sample_rate
@@ -195,7 +195,7 @@ impl AudioOut {
             .store(volume.clamp(0.0, 1.5).to_bits(), Ordering::Relaxed);
     }
 
-    /// Current queue depth in stereo samples. Diagnostic — very
+    /// Current queue depth in stereo samples. Diagnostic -- very
     /// high values mean the CPU is overrunning real-time; very low
     /// means we're starving the callback.
     pub fn queue_len(&self) -> usize {

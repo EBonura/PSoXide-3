@@ -27,7 +27,7 @@
 //! ## Why split like this
 //!
 //! Keeping the low-level constructors in `psx-hw` means the same
-//! encoding is shared with the emulator's GPU decoder — both sides
+//! encoding is shared with the emulator's GPU decoder -- both sides
 //! can't drift out of sync on command layout. `psx-gpu` adds the
 //! thin ergonomic layer: `wait_cmd_ready()` + `write_gp0()`
 //! sequencing, typed depth enums, vertex/UV packing.
@@ -68,7 +68,7 @@ pub struct Resolution {
 }
 
 impl Resolution {
-    /// 320×240 — the default for most PS1 games.
+    /// 320×240 -- the default for most PS1 games.
     pub const R320X240: Self = Self {
         width: 320,
         height: 240,
@@ -88,7 +88,7 @@ impl Resolution {
         width: 640,
         height: 240,
     };
-    /// 320×256 — PAL's natural vertical resolution.
+    /// 320×256 -- PAL's natural vertical resolution.
     pub const R320X256: Self = Self {
         width: 320,
         height: 256,
@@ -113,7 +113,7 @@ pub fn init(mode: VideoMode, res: Resolution) {
     write_gp1(gp1::display_mode(hres_field, vres_field, pal, false, false));
 
     // Horizontal & vertical display windows. Values below match the
-    // standard PSX output (NTSC 260h..C60h, PAL similar) — tweaking
+    // standard PSX output (NTSC 260h..C60h, PAL similar) -- tweaking
     // them shifts the picture on the TV but not the VRAM layout.
     let h_start = 0x260;
     let h_end = h_start + (res.width as u32) * 8;
@@ -174,7 +174,7 @@ pub fn set_draw_area(x0: u16, y0: u16, x1: u16, y1: u16) {
     write_gp0(gp0::draw_area_bottom_right(x1 as u32, y1 as u32));
 }
 
-/// Set the drawing offset — added to every vertex by the GPU.
+/// Set the drawing offset -- added to every vertex by the GPU.
 /// Use this to position a coordinate system at the top-left of your
 /// back-buffer.
 pub fn set_draw_offset(x: i16, y: i16) {
@@ -218,7 +218,7 @@ pub fn draw_tri_gouraud(verts: [(i16, i16); 3], colors: [(u8, u8, u8); 3]) {
 
 /// Draw a single monochrome line from `(x0, y0)` to `(x1, y1)`
 /// via GP0 0x40 (single mono line, 3 words). The GPU's line
-/// rasteriser handles diagonal paths correctly — unlike building
+/// rasteriser handles diagonal paths correctly -- unlike building
 /// a line out of `fill_rect` calls, which the PSX fill-rect
 /// primitive (GP0 0x02) rounds to 16-pixel X boundaries and
 /// produces blocky staircase output.
@@ -257,16 +257,16 @@ pub fn draw_quad_flat(verts: [(i16, i16); 4], r: u8, g: u8, b: u8) {
 /// Draw a textured quad (GP0 0x2C, 9 words) with a single tint.
 ///
 /// Vertex order is the PSX fan convention:
-/// - `verts[0]`, `uvs[0]` — top-left
-/// - `verts[1]`, `uvs[1]` — top-right
-/// - `verts[2]`, `uvs[2]` — bottom-left
-/// - `verts[3]`, `uvs[3]` — bottom-right
+/// - `verts[0]`, `uvs[0]` -- top-left
+/// - `verts[1]`, `uvs[1]` -- top-right
+/// - `verts[2]`, `uvs[2]` -- bottom-left
+/// - `verts[3]`, `uvs[3]` -- bottom-right
 ///
 /// The GPU raster treats `(v0, v1, v2)` as one triangle and
 /// `(v1, v2, v3)` as the other. Non-rectangular quads shear /
 /// rotate / skew by tweaking vertex positions; UV interpolation
 /// across the destination is perspective-incorrect (this is a
-/// known PSX quirk — fine for text, jitters at grazing angles).
+/// known PSX quirk -- fine for text, jitters at grazing angles).
 ///
 /// `tint = (128, 128, 128)` leaves texels unmodulated. PSX tint
 /// math is `output = texel * tint / 128`, so any value below 128
@@ -321,7 +321,7 @@ pub fn draw_quad_textured_material(
 /// The four `colors` align with the four vertices.
 ///
 /// Per-vertex colour is a plain RGB tint, same `output = texel *
-/// color / 128` scaling as the flat version — (128, 128, 128) is
+/// color / 128` scaling as the flat version -- (128, 128, 128) is
 /// "unmodulated".
 pub fn draw_quad_textured_gouraud(
     verts: [(i16, i16); 4],
@@ -388,7 +388,7 @@ pub fn draw_sprite_material(
 }
 
 /// Upload raw 16bpp pixels from CPU memory into a VRAM rectangle.
-/// Used for font glyphs, sprites, and CLUTs — the standard
+/// Used for font glyphs, sprites, and CLUTs -- the standard
 /// "CPU→VRAM transfer" pipe (GP0 0xA0 + pixel words).
 ///
 /// Length of `pixels` must equal `w * h / 2` words (two 16bpp

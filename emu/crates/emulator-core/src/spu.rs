@@ -1,8 +1,8 @@
-//! SPU — Sound Processing Unit.
+//! SPU -- Sound Processing Unit.
 //!
 //! The SPU is a 24-voice ADPCM sample engine with per-voice ADSR
 //! envelopes, pitch-controlled playback, a 512 KiB sample RAM, and
-//! stereo output mixed at 44.1 kHz. This module is the real thing —
+//! stereo output mixed at 44.1 kHz. This module is the real thing --
 //! ADPCM decode, voice state machine, ADSR, stereo mixing. What's
 //! explicitly **not** modelled yet (each a follow-up session):
 //!
@@ -49,7 +49,7 @@ mod xa;
 pub use xa::{xa_decode_block, XaDecoderState};
 
 // ===============================================================
-//  Register addresses — voice bank + global + reverb config.
+//  Register addresses -- voice bank + global + reverb config.
 // ===============================================================
 
 /// Base of the SPU MMIO window. 512 bytes total spanning voice bank,
@@ -113,7 +113,7 @@ const SPUCNT_CD_REVERB_ENABLE: u16 = 1 << 2;
 const SPUCNT_REVERB_MASTER_ENABLE: u16 = 1 << 7;
 /// SPUCNT bit 14: 0 = muted, 1 = unmuted.
 const SPUCNT_UNMUTE: u16 = 1 << 14;
-/// Data transfer control (typically 0x0004 — 4-bit transfer step).
+/// Data transfer control (typically 0x0004 -- 4-bit transfer step).
 pub const TRANSFER_CTRL: u32 = 0x1F80_1DAC;
 /// SPU status register.
 pub const SPUSTAT: u32 = 0x1F80_1DAE;
@@ -144,9 +144,9 @@ mod voice_offset {
     pub const PITCH: u32 = 0x4;
     /// +6..7 ADPCM start address (in 8-byte units; <<3 = byte addr).
     pub const START_ADDR: u32 = 0x6;
-    /// +8..9 ADSR config low — attack mode + rate + decay rate + sustain level.
+    /// +8..9 ADSR config low -- attack mode + rate + decay rate + sustain level.
     pub const ADSR_LO: u32 = 0x8;
-    /// +A..B ADSR config high — sustain mode + sustain rate + release mode + release rate.
+    /// +A..B ADSR config high -- sustain mode + sustain rate + release mode + release rate.
     pub const ADSR_HI: u32 = 0xA;
     /// +C..D Current ADSR volume (read-only; returns current envelope level).
     pub const ADSR_CURRENT: u32 = 0xC;
@@ -187,11 +187,11 @@ const OUTPUT_BUFFER_CAP: usize = 44100 * 2; // 2 seconds of stereo samples
 /// Applied as `fa = raw + (s_1 * f[0] + s_2 * f[1]) >> 6` during block decode.
 /// Filters 0..4 are the canonical set used by the real hardware; filters 5..15
 /// use the same coefficients (SPU-SPX notes that only the lower 3 bits of the
-/// predictor field matter, so 0..7 clamp to 0..4 — we clamp explicitly).
+/// predictor field matter, so 0..7 clamp to 0..4 -- we clamp explicitly).
 const ADPCM_FILTER_TABLE: [(i32, i32); 5] = [(0, 0), (60, 0), (115, -52), (98, -55), (122, -60)];
 
 // ===============================================================
-//  ADSR envelope rate tables — port of Redux's `EnvelopeTables`.
+//  ADSR envelope rate tables -- port of Redux's `EnvelopeTables`.
 // ===============================================================
 
 /// Envelope tick-period denominator for each rate (0..=127).
@@ -241,7 +241,7 @@ enum AdsrPhase {
     Release,
 }
 
-/// Decoded ADSR configuration — parsed from the 32-bit `(adsr_lo | adsr_hi<<16)`
+/// Decoded ADSR configuration -- parsed from the 32-bit `(adsr_lo | adsr_hi<<16)`
 /// register pair. We decode once at write time and stash the bit-fields so the
 /// hot path (envelope tick per sample) is pure arithmetic.
 #[derive(Copy, Clone, Debug, Default)]
@@ -341,7 +341,7 @@ impl VolumeEnvelope {
     /// for `write`-decoded registers.
     fn tick(&mut self) {}
 
-    /// Read-back value — always returns the raw register the CPU
+    /// Read-back value -- always returns the raw register the CPU
     /// wrote, not the animated current level.
     fn reg_read(&self) -> u16 {
         self.raw
@@ -349,7 +349,7 @@ impl VolumeEnvelope {
 }
 
 /// Per-voice runtime state. Holds decode buffers, ADSR envelope,
-/// volumes, and loop pointers. Kept plain (no padding or SIMD) —
+/// volumes, and loop pointers. Kept plain (no padding or SIMD) --
 /// 24 copies of this struct live in `Spu::voices` and mix together on
 /// each sample.
 #[derive(Clone, Debug)]
@@ -410,7 +410,7 @@ struct Voice {
     /// Next insertion slot in `interp_ring`. Also the logical
     /// "oldest sample" index when reading the Gaussian window.
     interp_pos: usize,
-    /// Previous two decoded samples — ADPCM filter history. Preserved
+    /// Previous two decoded samples -- ADPCM filter history. Preserved
     /// across block boundaries; reset on KON.
     s_1: i32,
     s_2: i32,
@@ -473,7 +473,7 @@ impl Voice {
         self.last_sample = 0;
     }
 
-    /// Trigger release phase on KOFF — envelope drops toward zero at
+    /// Trigger release phase on KOFF -- envelope drops toward zero at
     /// the configured release rate. Voice stays audible until envelope
     /// reaches 0, then moves to `Off`.
     fn key_off(&mut self) {
@@ -548,7 +548,7 @@ impl Voice {
         if self.envelope < 0 {
             self.envelope = 0;
         }
-        // Sustain level target: (sustain_level + 1) * 0x800 — but the
+        // Sustain level target: (sustain_level + 1) * 0x800 -- but the
         // Redux check uses the high nibble of envelope directly, which
         // is simpler and matches hardware.
         if ((self.envelope >> 11) & 0xF) <= self.adsr.sustain_level {
@@ -560,7 +560,7 @@ impl Voice {
     fn step_sustain(&mut self) -> i32 {
         let mut rate = self.adsr.sustain_rate;
         if self.adsr.sustain_increase {
-            // Rising sustain — matches Attack structurally.
+            // Rising sustain -- matches Attack structurally.
             if self.adsr.sustain_exp && self.envelope >= 0x6000 {
                 rate = (rate + 8).min(127);
             }
@@ -574,7 +574,7 @@ impl Voice {
                 self.envelope = 0x7FFF;
             }
         } else {
-            // Falling sustain — structurally like Release but without
+            // Falling sustain -- structurally like Release but without
             // the voice-off transition.
             let denom = envelope_denominator(rate as usize);
             self.envelope_sub += 1;
@@ -750,12 +750,12 @@ pub struct Spu {
     /// Reverb cursor / wet-output history.
     reverb: ReverbState,
 
-    /// KON last-written register value — echoed back on reads so the
+    /// KON last-written register value -- echoed back on reads so the
     /// BIOS's round-trip verification sees consistency. Real hardware
     /// latches the write into the register and acts on it one sample
     /// later; we decouple into a separate pending bitmap below.
     kon_raw: u32,
-    /// KON pending bitmap — set by software writes, consumed by the
+    /// KON pending bitmap -- set by software writes, consumed by the
     /// sample tick (voices start on their next tick to match hardware's
     /// one-sample KON latency). Drained via `mem::take` each sample.
     kon_pending: u32,
@@ -771,7 +771,7 @@ pub struct Spu {
     noise_on: u32,
     /// Reverb enable bitmap per voice.
     reverb_on: u32,
-    /// ENDX latch — each voice sets its bit when an ADPCM block with
+    /// ENDX latch -- each voice sets its bit when an ADPCM block with
     /// flag-1 (loop-end) was decoded. Software reads + write-1-to-clears.
     endx_latched: u32,
 
@@ -783,7 +783,7 @@ pub struct Spu {
     /// [`Spu::drain_audio`]. Oldest-sample-dropped when cap exceeded.
     audio_out: std::collections::VecDeque<(i16, i16)>,
 
-    /// CD audio input queue — stereo samples fed by the CDROM
+    /// CD audio input queue -- stereo samples fed by the CDROM
     /// controller during CD-DA or XA ADPCM playback. The SPU's
     /// `tick_sample` path drains one sample per output sample and
     /// mixes it via `CD_VOL_L/R` into the main output. When the
@@ -795,9 +795,9 @@ pub struct Spu {
     /// Absolute cycle count at which we last produced an audio sample.
     /// Used to catch up when the scheduler delivers a burst of ticks.
     last_sample_cycle: u64,
-    /// Total samples produced since reset — diagnostic counter.
+    /// Total samples produced since reset -- diagnostic counter.
     samples_produced: u64,
-    /// SPU IRQ pending flag — bus drains this to decide whether to
+    /// SPU IRQ pending flag -- bus drains this to decide whether to
     /// raise `IrqSource::Spu`. Set when an enabled IRQ-addr match
     /// occurs on a voice's read pointer or the transfer-FIFO write.
     irq_pending: bool,
@@ -809,7 +809,7 @@ pub struct Spu {
     noise_val: i16,
     /// Sub-sample counter for the noise clock. The noise shift
     /// register advances every `2^shift` SPU samples scaled by
-    /// the noise step field — matching PSX-SPX's "noise rate"
+    /// the noise step field -- matching PSX-SPX's "noise rate"
     /// table. Simplified here to a cycle counter that rolls over
     /// based on SPUCNT bits 8-13.
     noise_counter: u32,
@@ -868,7 +868,7 @@ impl Spu {
             last_sample_cycle: 0,
             samples_produced: 0,
             irq_pending: false,
-            // Redux/hardware reset value — must be non-zero or the
+            // Redux/hardware reset value -- must be non-zero or the
             // LFSR's NoiseWaveAdd lookup is stuck at index 0 forever.
             noise_val: 1,
             noise_counter: 0,
@@ -886,14 +886,14 @@ impl Spu {
     /// counter; whenever it crosses the threshold the LFSR shifts
     /// left and feeds in the new low bit from `NoiseWaveAdd[(val>>10) & 63]`.
     fn noise_tick(&mut self) {
-        // Hardware "form" table — bit pattern injected into the
+        // Hardware "form" table -- bit pattern injected into the
         // LFSR low bit when it shifts.
         const NOISE_WAVE_ADD: [u8; 64] = [
             1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0,
             1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1,
             1, 0, 1, 0, 0, 1,
         ];
-        // Hardware "fraction" table — sub-sample increment per
+        // Hardware "fraction" table -- sub-sample increment per
         // step value (low 2 bits of clock); index 4 is the
         // wraparound threshold.
         const NOISE_FREQ_ADD: [u32; 5] = [0, 84, 140, 180, 210];
@@ -920,7 +920,7 @@ impl Spu {
         }
     }
 
-    /// Enqueue a batch of stereo samples from the CDROM — either
+    /// Enqueue a batch of stereo samples from the CDROM -- either
     /// CD-DA (Red Book) or decoded XA ADPCM. Consumed one sample
     /// per SPU output sample during `tick_sample`. Scaled by
     /// `CD_VOL_L/R` before mix. Caps at ~0.5 s of queued audio to
@@ -950,7 +950,7 @@ impl Spu {
     }
 
     /// Schedule the first SPU sample tick. Bus calls this once during
-    /// construction — subsequent reschedules happen inside the drain
+    /// construction -- subsequent reschedules happen inside the drain
     /// handler. We tick every [`SAMPLE_CYCLES`] cycles.
     pub fn seed_scheduler(scheduler: &mut Scheduler, now: u64) {
         scheduler.schedule(EventSlot::SpuAsync, now, SAMPLE_CYCLES);
@@ -1001,7 +1001,7 @@ impl Spu {
     }
 
     // ============================================================
-    //  Register access — byte / halfword / word, with cycle context.
+    //  Register access -- byte / halfword / word, with cycle context.
     // ============================================================
 
     /// 8-bit read. Pulls the right byte out of the underlying 16-bit
@@ -1040,7 +1040,7 @@ impl Spu {
         lo | (hi << 16)
     }
 
-    /// 16-bit read (no cycle context — used by legacy callers; all
+    /// 16-bit read (no cycle context -- used by legacy callers; all
     /// registers we care about are cycle-independent).
     pub fn read16(&self, phys: u32) -> u16 {
         self.read16_at(phys, 0)
@@ -1130,7 +1130,7 @@ impl Spu {
             TRANSFER_FIFO => self.transfer_fifo_write(value),
             SPUCNT => self.write_spucnt(value),
             TRANSFER_CTRL => self.transfer_ctrl = value,
-            SPUSTAT => { /* read-only — writes dropped */ }
+            SPUSTAT => { /* read-only -- writes dropped */ }
             CD_VOL_L => self.cd_vol_l.write_signed_q15(value),
             CD_VOL_R => self.cd_vol_r.write_signed_q15(value),
             EXT_VOL_L => self.ext_vol_l.write_signed_q15(value),
@@ -1143,7 +1143,7 @@ impl Spu {
         }
     }
 
-    /// 32-bit write — splits into two halfword writes.
+    /// 32-bit write -- splits into two halfword writes.
     pub fn write32(&mut self, phys: u32, value: u32) {
         self.write32_at(phys, value, 0);
     }
@@ -1182,7 +1182,7 @@ impl Spu {
         if (prev & (1 << 6)) != 0 && (value & (1 << 6)) == 0 {
             self.spustat &= !(1 << 6);
         }
-        // Manual-write mode (bits 5..4 == 1) — transfer FIFO writes
+        // Manual-write mode (bits 5..4 == 1) -- transfer FIFO writes
         // go straight into SPU RAM at `transfer_addr`. Nothing to do
         // here proactively; the FIFO write path reads SPUCNT.
     }
@@ -1208,7 +1208,7 @@ impl Spu {
                 //
                 // Real hardware advances this register over time,
                 // and our full ADSR machine does produce correct
-                // envelope values internally — but exposing them
+                // envelope values internally -- but exposing them
                 // here would break the Redux parity contract.
                 // Revisit once the Redux oracle is taught to pump
                 // its SPU thread synchronously.
@@ -1252,12 +1252,12 @@ impl Spu {
 
     fn queue_kon(&mut self, mask: u16, shift: u32) {
         let bits = (mask as u32) << shift;
-        // Raw register — reads echo this back verbatim. Whole-half
+        // Raw register -- reads echo this back verbatim. Whole-half
         // overwrite semantics: writing KON_LO replaces the low 16 bits,
         // KON_HI replaces the high 16 bits.
         let clear_mask = !(0xFFFFu32 << shift);
         self.kon_raw = (self.kon_raw & clear_mask) | bits;
-        // Pending bitmap — OR-accumulates so multiple writes before a
+        // Pending bitmap -- OR-accumulates so multiple writes before a
         // sample tick all fire.
         self.kon_pending |= bits;
         // A fresh KON clears the ENDX bits for those voices.
@@ -1272,7 +1272,7 @@ impl Spu {
     }
 
     // ============================================================
-    //  Data transfer FIFO — software-driven SPU RAM access.
+    //  Data transfer FIFO -- software-driven SPU RAM access.
     // ============================================================
 
     fn transfer_fifo_write(&mut self, value: u16) {
@@ -1288,7 +1288,7 @@ impl Spu {
 
     fn transfer_fifo_read(&self) -> u16 {
         // Real hardware post-increments the transfer address on reads
-        // too — but reads can't come from `&self`. We return the value
+        // too -- but reads can't come from `&self`. We return the value
         // at the current address and let a caller (`peek_transfer_fifo`)
         // do the increment if they want. For a const-read, this is
         // enough: writes are the common case.
@@ -1301,7 +1301,7 @@ impl Spu {
             return;
         }
         // IRQ fires when the transfer pointer reaches the IRQ address
-        // (within a 2-byte window — IRQ_ADDR granularity is 8 bytes
+        // (within a 2-byte window -- IRQ_ADDR granularity is 8 bytes
         // after the <<3 decode, so any write into that 8-byte range
         // triggers).
         let irq = self.irq_addr & !0x7;
@@ -1313,7 +1313,7 @@ impl Spu {
     }
 
     // ============================================================
-    //  DMA — SPU channel 4.
+    //  DMA -- SPU channel 4.
     // ============================================================
 
     /// Stream halfwords from main RAM into SPU RAM at the current
@@ -1343,7 +1343,7 @@ impl Spu {
     }
 
     // ============================================================
-    //  Reverb — Neill/Redux work-area network.
+    //  Reverb -- Neill/Redux work-area network.
     // ============================================================
 
     fn reverb_base_halfword(&self) -> u32 {
@@ -1546,19 +1546,19 @@ impl Spu {
     }
 
     // ============================================================
-    //  Per-sample tick — called from the bus scheduler.
+    //  Per-sample tick -- called from the bus scheduler.
     // ============================================================
 
     /// Produce one stereo sample's worth of audio. Called from the bus
     /// each time `EventSlot::SpuAsync` fires. Returns the number of
-    /// samples produced (currently always 1 — future batching could
+    /// samples produced (currently always 1 -- future batching could
     /// amortise voice-state fetches across several samples).
     pub fn tick_sample(&mut self, now: u64) -> usize {
         self.last_sample_cycle = now;
         // 1. Apply pending KON / KOFF.
         self.apply_kon_koff();
 
-        // 1b. Advance noise generator — one LFSR-step pass per
+        // 1b. Advance noise generator -- one LFSR-step pass per
         //     sample (the noise_tick's internal counter gates
         //     actual register updates).
         self.noise_tick();
@@ -1584,7 +1584,7 @@ impl Spu {
         //    stereo contribution. Modulator voices (the N-1 voice when
         //    PMon bit N is set) update `last_sample` for the modulated
         //    voice's FMod read, but their own L/R contribution is
-        //    **suppressed** from the audible mix — matches Redux's
+        //    **suppressed** from the audible mix -- matches Redux's
         //    `if (FMod == 2) iFMod[ns] = sval; else { SSumL/R += ... }`
         //    branch (`spu.cc:689`).
         let mut sum_l: i32 = 0;
@@ -1607,10 +1607,10 @@ impl Spu {
         // 3. Mix CD audio input at CD_VOL_L/R. Source is the CDROM's
         //    CD-DA sample stream or the decoded XA-ADPCM payload,
         //    both fed via [`Spu::feed_cd_audio`]. When the queue is
-        //    empty, CD contribution is zero — matches real hardware
+        //    empty, CD contribution is zero -- matches real hardware
         //    where "no CD playing" means no CD input signal.
         if let Some((cd_l, cd_r)) = self.cd_audio_in.pop_front() {
-            // CD_VOL regs are Q15 signed — range -0x8000..=0x7FFF.
+            // CD_VOL regs are Q15 signed -- range -0x8000..=0x7FFF.
             // `>> 15` brings them back to i16 scale. Always consume
             // the stream so timing stays live while muted/disabled;
             // only route it into the mixer when SPUCNT bit 0 is set.
@@ -1822,17 +1822,17 @@ impl Spu {
         let next_addr = (current + block_bytes) & (SPU_RAM_BYTES as u32 - 1);
 
         // Handle ADPCM block flags:
-        //   bit 0 (flag 1) — end of sample: jump to loop_addr on next
+        //   bit 0 (flag 1) -- end of sample: jump to loop_addr on next
         //     block (if flag 2 is set) or stop the voice (flag 2 clear).
-        //   bit 1 (flag 2) — repeat: suppresses stop on flag 1.
-        //   bit 2 (flag 4) — loop-start: updates loop_addr to this
+        //   bit 1 (flag 2) -- repeat: suppresses stop on flag 1.
+        //   bit 2 (flag 4) -- loop-start: updates loop_addr to this
         //     block's address (unless software has locked it via
         //     REPEAT_ADDR write).
         if flags & 0x4 != 0 && !voice.loop_addr_locked {
             voice.loop_addr = current;
         }
         if flags & 0x1 != 0 {
-            // End of sample — latch ENDX.
+            // End of sample -- latch ENDX.
             self.endx_latched |= 1 << v;
             let voice = &mut self.voices[v];
             if flags == 0x3 {
@@ -1841,7 +1841,7 @@ impl Spu {
                 voice.current_addr = voice.loop_addr;
                 voice.stop_after_block = false;
             } else {
-                // One-shot done — keep this decoded block audible and
+                // One-shot done -- keep this decoded block audible and
                 // stop only when playback reaches the next block
                 // boundary. Redux marks the next source pointer as a
                 // sentinel and turns the voice off on the following
@@ -1863,7 +1863,7 @@ impl Spu {
 /// 1024-entry Gaussian interpolation coefficient table, logged from
 /// a real PS1 SPU and also matching SPC700 curves. Pulled verbatim
 /// from PCSX-Redux's `src/spu/gauss.h`. Indexed by
-/// `(sample_pos >> 6) & ~3` + {0,1,2,3} — four coefficients per
+/// `(sample_pos >> 6) & ~3` + {0,1,2,3} -- four coefficients per
 /// fractional position. Values are 11-bit; product with an i16
 /// sample fits in i32 and needs an `& !2047` mask to match the
 /// hardware's 11-bit accumulator granularity.
@@ -2138,7 +2138,7 @@ mod tests {
         // Real hardware: KON/KOFF reads return what was written, even
         // after the SPU has consumed the pending bits internally. The
         // BIOS's SPU-init probe writes 0xFFFF to KOFF then reads it
-        // back — we must echo the written value.
+        // back -- we must echo the written value.
         let mut s = Spu::new();
         s.write16(KON_LO, 0xFFFF);
         s.write16(KON_HI, 0x00FF);
@@ -2429,7 +2429,7 @@ mod tests {
         s.voices[0].adsr.attack_rate = 0;
         s.voices[0].adsr.attack_exp = false;
         s.voices[0].phase = AdsrPhase::Attack;
-        // Force envelope near max and step once — should transition.
+        // Force envelope near max and step once -- should transition.
         s.voices[0].envelope = 0x7FFE;
         s.voices[0].step_envelope();
         assert_eq!(s.voices[0].envelope, 0x7FFF);
@@ -2862,7 +2862,7 @@ mod tests {
 
     #[test]
     fn gaussian_interp_nonzero_input_produces_output() {
-        // All four samples at max positive — output should be non-
+        // All four samples at max positive -- output should be non-
         // zero and in range.
         let out = gauss_interpolate([0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF], 0x800);
         assert!(out > 0);
@@ -2943,7 +2943,7 @@ mod tests {
     fn noise_seed_is_one() {
         // The LFSR feedback table NoiseWaveAdd[0] = 1, so a zero
         // seed would still flip the low bit on first step. But
-        // hardware/Redux start at 1 — keep the same so traces
+        // hardware/Redux start at 1 -- keep the same so traces
         // line up if/when we wire SPU into the parity oracle.
         let s = Spu::new();
         assert_eq!(s.noise_val, 1);
@@ -2972,7 +2972,7 @@ mod tests {
         s.write16(SPUCNT, 0x0000); // shift = 0
         let v0 = s.noise_val;
         s.noise_tick();
-        // Single tick adds 0x10000 < 0x8000_0000 — no shift.
+        // Single tick adds 0x10000 < 0x8000_0000 -- no shift.
         assert_eq!(s.noise_val, v0);
     }
 
@@ -3000,7 +3000,7 @@ mod tests {
             s.voices[v].phase = AdsrPhase::Sustain;
             s.voices[v].envelope = 0x7FFF;
             s.voices[v].last_sample = 0x4000;
-            // Block decode of zeros — voice mixes its envelope * sample.
+            // Block decode of zeros -- voice mixes its envelope * sample.
             s.voices[v].sample_buf = [0x4000; ADPCM_SAMPLES_PER_BLOCK];
             s.voices[v].sample_index = 0;
         }
@@ -3020,7 +3020,7 @@ mod tests {
             (r as i32) < voice_only * 3 / 2,
             "voice 0 leaked into R: r={r}"
         );
-        // And greater than zero — voice 1 still played.
+        // And greater than zero -- voice 1 still played.
         assert!(l > 0);
         assert!(r > 0);
     }

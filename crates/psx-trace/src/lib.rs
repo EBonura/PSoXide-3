@@ -8,7 +8,7 @@
 //! development outweighs the size overhead. Every field can be inspected
 //! with `jq`, diffs are line-oriented, and Redux's Lua has a JSON
 //! encoder built in. When trace volume becomes prohibitive we can add
-//! a compact binary encoding alongside this one — the struct shape
+//! a compact binary encoding alongside this one -- the struct shape
 //! stays canonical.
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
@@ -46,7 +46,7 @@ pub struct InstructionRecord {
 }
 
 /// Default helper for `[u32; 32]` so older JSONL records (pre-v2)
-/// deserialize without the COP2 arrays — they show up as all-zero,
+/// deserialize without the COP2 arrays -- they show up as all-zero,
 /// which the parity comparator can treat as "no COP2 information
 /// available for this record". Lets us inspect a stray v1 JSONL line
 /// without crashing, even though normal cache invalidation throws v1
@@ -127,7 +127,7 @@ mod tests {
     fn v1_record_without_cop2_fields_parses_with_zero_defaults() {
         // Pre-v2 records didn't carry cop2_data/cop2_ctl. The serde
         // defaults must let the new schema parse them so a v1 cache
-        // can be inspected after upgrade — even though normal cache
+        // can be inspected after upgrade -- even though normal cache
         // invalidation throws v1 caches away by file-format version.
         let v1 = r#"{"tick":1,"pc":0,"instr":0,"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
         let parsed = InstructionRecord::from_json_line(v1).unwrap();

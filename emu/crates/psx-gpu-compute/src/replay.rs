@@ -1,11 +1,11 @@
-//! Phase C — wire `psx-gpu-compute` into the frontend as a parallel
+//! Phase C -- wire `psx-gpu-compute` into the frontend as a parallel
 //! rendering backend.
 //!
 //! Strategy: each frame the frontend drains the CPU rasterizer's
 //! `cmd_log` (already populated by `enable_pixel_tracer`), replays
 //! every GP0 packet through this backend's compute dispatchers, and
 //! downloads the resulting VRAM for display. The CPU rasterizer
-//! remains the source of truth — its VRAM is uploaded into the
+//! remains the source of truth -- its VRAM is uploaded into the
 //! compute backend at frame start so VRAM uploads / VRAM-to-VRAM
 //! copies / FMV writes are reflected. The compute path then redraws
 //! the frame's GP0 packets on top.
@@ -16,9 +16,9 @@
 //! don't accumulate. Behind the runtime `--gpu-compute` flag.
 //!
 //! What's NOT handled here yet
-//!   - Lines / polylines (`0x40..=0x5F`) — rare in real games; skip.
-//!   - GP1 commands — display-mode state, not rendering.
-//!   - VRAM-to-CPU readback (`0xC0..=0xDF`) — game-side reads, no
+//!   - Lines / polylines (`0x40..=0x5F`) -- rare in real games; skip.
+//!   - GP1 commands -- display-mode state, not rendering.
+//!   - VRAM-to-CPU readback (`0xC0..=0xDF`) -- game-side reads, no
 //!     visible output.
 
 use std::sync::Arc;
@@ -36,7 +36,7 @@ use crate::primitive::{
 use crate::rasterizer::Rasterizer;
 use crate::vram::{self, VramGpu};
 
-/// Compute backend — owns `VramGpu` + `Rasterizer` plus the replay
+/// Compute backend -- owns `VramGpu` + `Rasterizer` plus the replay
 /// state needed to interpret each GP0 packet.
 pub struct ComputeBackend {
     vram: VramGpu,
@@ -49,7 +49,7 @@ pub struct ComputeBackend {
 
 impl ComputeBackend {
     /// Build the backend on a fresh headless wgpu adapter. The
-    /// frontend uses this when `--gpu-compute` is enabled — sharing
+    /// frontend uses this when `--gpu-compute` is enabled -- sharing
     /// the main `Graphics` device would need an `Arc<Device>`
     /// refactor through the whole gfx layer, and the per-frame VRAM
     /// bounce already goes through CPU memory so a separate adapter
@@ -65,7 +65,7 @@ impl ComputeBackend {
         }
     }
 
-    /// Build on top of an existing wgpu device — useful for tests
+    /// Build on top of an existing wgpu device -- useful for tests
     /// or for a future zero-bounce display path where compute and
     /// display share the same adapter.
     #[allow(dead_code)]
@@ -90,7 +90,7 @@ impl ComputeBackend {
     }
 
     /// Read back the GPU VRAM for display. Slow per-frame
-    /// (1 MiB GPU→CPU bounce) — acceptable for an opt-in shadow
+    /// (1 MiB GPU→CPU bounce) -- acceptable for an opt-in shadow
     /// renderer. A future optimisation would render directly into
     /// the egui texture without the CPU round-trip.
     pub fn download_vram(&self) -> Vec<u16> {
@@ -99,7 +99,7 @@ impl ComputeBackend {
 
     /// Lift a sub-rectangle of CPU VRAM into GPU VRAM. The bisector
     /// uses this to apply CPU-to-VRAM uploads and FillRects whose
-    /// pixel data isn't in the cmd_log proper — it streams via
+    /// pixel data isn't in the cmd_log proper -- it streams via
     /// `ingest_vram_upload_word` on the bus side. Production replay
     /// (frontend / replay_disc) doesn't need this because it
     /// `sync_vram_from_cpu`s the full VRAM at frame boundaries.
@@ -177,7 +177,7 @@ impl ComputeBackend {
             0x80..=0x9F => self.handle_vram_copy(fifo),
 
             // CPU-to-VRAM upload (0xA0..=0xBF): the cmd packet is
-            // 3 words but the pixel data isn't in cmd_log — it
+            // 3 words but the pixel data isn't in cmd_log -- it
             // streams via `ingest_vram_upload_word` which doesn't
             // record. We rely on `sync_vram_from_cpu` at frame
             // start to pick up the data. Nothing to dispatch here.
@@ -227,7 +227,7 @@ impl ComputeBackend {
     }
 
     fn handle_e2(&mut self, fifo: &[u32]) {
-        // GP0 0xE2 — texture window. Per PSX-SPX, the host stores
+        // GP0 0xE2 -- texture window. Per PSX-SPX, the host stores
         // mask×8 / offset×8 (pre-multiplied for the rasterizer).
         if fifo.is_empty() {
             return;

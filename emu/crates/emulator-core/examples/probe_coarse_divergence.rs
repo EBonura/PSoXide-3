@@ -2,7 +2,7 @@
 //! trace (14 GiB for 100 M steps, ~40 min of Redux runtime), sample
 //! `{step, tick, pc}` every `INTERVAL` user-side steps and compare.
 //! Finds the first divergence to within an `INTERVAL`-step window in
-//! ~30 s — a 70–80× speedup over the full trace cache.
+//! ~30 s -- a 70–80× speedup over the full trace cache.
 //!
 //! Usage:
 //!
@@ -11,7 +11,7 @@
 //! ```
 //!
 //! Once the window is identified, `probe_cycle_first_divergence`
-//! (full-trace mode) can zero in on the exact instruction — but only
+//! (full-trace mode) can zero in on the exact instruction -- but only
 //! needs to trace `INTERVAL` records (~250 KiB, ~0.3 s), not the
 //! full run.
 
@@ -88,7 +88,7 @@ fn main() {
     }
     let mut our_checks: Vec<(u64, u64, u32)> = Vec::with_capacity((n / interval) as usize);
     for step in 1..=n {
-        // ISR fold — match Redux's user-side step counting.
+        // ISR fold -- match Redux's user-side step counting.
         let was_in_isr = cpu.in_isr();
         cpu.step(&mut bus).expect("step");
         if wants_pad {

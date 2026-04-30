@@ -1,5 +1,5 @@
 //! Produce aggregated parity records up to a target index, then
-//! dump state. Matches `our_trace` in tests/parity.rs exactly —
+//! dump state. Matches `our_trace` in tests/parity.rs exactly --
 //! outer iteration = 1 record; inside each, any ISR body is
 //! drained synchronously and its final gprs replace the record's.
 

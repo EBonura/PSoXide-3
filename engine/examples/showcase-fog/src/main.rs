@@ -1,4 +1,4 @@
-//! `showcase-fog` — the full PS1-commercial GTE + textured-poly
+//! `showcase-fog` -- the full PS1-commercial GTE + textured-poly
 //! pipeline in one demo.
 //!
 //! Every frame, for every triangle, the GTE executes:
@@ -11,14 +11,14 @@
 //! The three NCDS-produced per-vertex colours become the per-vertex
 //! *tint* on a **textured Gouraud** triangle (GP0 0x34), so the GPU
 //! multiplies each sampled texel by its interpolated NCDS colour.
-//! Result: textures that properly light and fog — near walls show
-//! crisp brick, far walls dissolve into the fog colour — the
+//! Result: textures that properly light and fog -- near walls show
+//! crisp brick, far walls dissolve into the fog colour -- the
 //! Silent-Hill-era look achieved through hardware ops only.
 //!
 //! # Scene
 //!
 //! A square corridor receding into the distance. 16 rings of wall
-//! segments — ceiling / floor / left / right — scroll slowly toward
+//! segments -- ceiling / floor / left / right -- scroll slowly toward
 //! the camera and wrap once per segment. Lighting is ambient-only so
 //! the texture tiling and fog gradient stay easy to judge.
 //!
@@ -37,13 +37,13 @@
 //!
 //! # Triangle budget
 //!
-//! 15 ring-gaps × 4 walls × 2 tris = **120 triangles / frame** —
+//! 15 ring-gaps × 4 walls × 2 tris = **120 triangles / frame** --
 //! each a `TriTexturedGouraud` (9 data words per primitive).
 //!
 //! Ported to `psx-engine` in Phase 3e. The `Scene` struct (renamed
 //! to `Corridor` to avoid collision with the engine trait) now
 //! holds the per-frame counters inline instead of a `static mut`
-//! god-object. Ring-Z / primitive-arena statics remain — they need
+//! god-object. Ring-Z / primitive-arena statics remain -- they need
 //! fixed bus addresses for DMA, which is exactly what `static mut`
 //! gives for free.
 
@@ -115,22 +115,22 @@ const RING_SPACING: i32 = (FAR_CAM_Z - NEAR_CAM_Z) / (RING_GAPS as i32);
 // Fog parameters
 // ----------------------------------------------------------------------
 
-/// Fog colour. Near-black — critical, because `TriTexturedGouraud`
+/// Fog colour. Near-black -- critical, because `TriTexturedGouraud`
 /// uses **multiplicative** tint (`final = texel × tint / 128`), not
 /// additive blending toward a target colour. If FC were a bright
 /// blue, full-fog tint `(0x20, 0x40, 0xA0)` multiplied with a
 /// bright brick texel `(0xE0, 0x60, 0x20)` would give a **dark
-/// brown-grey**, not fog blue — so the BG quad (at pure fog blue)
+/// brown-grey**, not fog blue -- so the BG quad (at pure fog blue)
 /// and the far-wall pixels wouldn't match, and a hard seam
 /// appeared at the vanishing point.
 ///
 /// With FC near black, "full fog" = "near black", and brick × near
-/// black = also near black — so far walls blend seamlessly into
+/// black = also near black -- so far walls blend seamlessly into
 /// the black BG. Classic "tunnel fades into darkness" fog, as used
 /// in Silent Hill caves, Wipeout night tunnels, etc.
 ///
 /// A tiny blue tint keeps the darkness from reading as "scene
-/// turned off" — gives it atmospheric depth.
+/// turned off" -- gives it atmospheric depth.
 const FOG_FC: Vec3I32 = Vec3I32::new(0x0040, 0x0060, 0x00C0);
 
 const FOG_CLEAR: (u8, u8, u8) = (
@@ -166,14 +166,14 @@ const ZSF4: i16 = 0x0400;
 
 /// Purely-ambient light rig. No directional lights, no orbit.
 ///
-/// The demo's point is to isolate the **fog** effect — every
+/// The demo's point is to isolate the **fog** effect -- every
 /// pixel's colour is driven by (material × ambient × fog), with
 /// no orbiting highlight to compete for the eye's attention.
 /// Adding directional lighting made the scene read as "randomly
 /// lit walls" rather than "foggy corridor". Pure ambient + fog
 /// reads unambiguously as atmospheric depth.
 ///
-/// NCDS still runs on every vertex — it just computes the
+/// NCDS still runs on every vertex -- it just computes the
 /// "lit" term as ambient-only (no directional contribution),
 /// then layers the depth-cue blend on top. The full
 /// RTPS → NCDS → NCLIP → AVSZ3 pipeline is still exercised.
@@ -190,13 +190,13 @@ const BASE_RIG: LightRig = LightRig::new(
 // Textures
 // ----------------------------------------------------------------------
 
-/// Shared tpage for both textures — X=640 sits past the 640-wide
+/// Shared tpage for both textures -- X=640 sits past the 640-wide
 /// double-buffered framebuffer region (two 320×240 buffers at
 /// Y=0..240 and 240..480). One 4bpp tpage holds up to 256 texels
 /// per row, so both 64×64 textures fit side-by-side.
 const TEX_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
 
-/// Brick wall — ceilings + left/right walls.
+/// Brick wall -- ceilings + left/right walls.
 static BRICK_BLOB: &[u8] = include_bytes!("../../../../assets/textures/brick-wall.psxt");
 /// Cobblestone floor.
 static FLOOR_BLOB: &[u8] = include_bytes!("../../../../assets/textures/floor.psxt");
@@ -249,25 +249,25 @@ struct Wall {
 }
 
 const WALLS: [Wall; 4] = [
-    // Ceiling — brick overhead.
+    // Ceiling -- brick overhead.
     Wall {
         corners: [(-CORR_HALF_W, -CORR_HALF_H), (CORR_HALF_W, -CORR_HALF_H)],
         normal: Vec3I16::new(0, 0x1000, 0),
         tex: WallTex::Brick,
     },
-    // Floor — cobblestone.
+    // Floor -- cobblestone.
     Wall {
         corners: [(CORR_HALF_W, CORR_HALF_H), (-CORR_HALF_W, CORR_HALF_H)],
         normal: Vec3I16::new(0, -0x1000, 0),
         tex: WallTex::Floor,
     },
-    // Left wall — brick.
+    // Left wall -- brick.
     Wall {
         corners: [(-CORR_HALF_W, CORR_HALF_H), (-CORR_HALF_W, -CORR_HALF_H)],
         normal: Vec3I16::new(0x1000, 0, 0),
         tex: WallTex::Brick,
     },
-    // Right wall — brick.
+    // Right wall -- brick.
     Wall {
         corners: [(CORR_HALF_W, -CORR_HALF_H), (CORR_HALF_W, CORR_HALF_H)],
         normal: Vec3I16::new(-0x1000, 0, 0),
@@ -282,7 +282,7 @@ const WALLS: [Wall; 4] = [
 const MAX_TRIS: usize = (NUM_RINGS - 1) * 4 * 2;
 
 /// OT + primitive backing storage in `.bss`. These stay `static mut`
-/// because DMA walks them by physical bus address — the linker
+/// because DMA walks them by physical bus address -- the linker
 /// picks a stable address once, and the walker follows
 /// tag->next-addr pointers the scene builds up each frame.
 static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
@@ -325,7 +325,7 @@ const FONT_CLUT: Clut = Clut::new(320, 256);
 // ----------------------------------------------------------------------
 
 /// Renamed from the pre-engine `Scene` struct to avoid name
-/// collision with [`psx_engine::Scene`] — this is *our* scene
+/// collision with [`psx_engine::Scene`] -- this is *our* scene
 /// type; the trait is what the engine calls back into.
 struct Corridor {
     font: Option<FontAtlas>,
@@ -356,7 +356,7 @@ impl Scene for Corridor {
     fn init(&mut self, _ctx: &mut Ctx) {
         // GTE one-time setup. The scene-wide screen offset, proj
         // plane, AVSZ weights, far-colour, and depth-cue constants
-        // never change across frames — load them once.
+        // never change across frames -- load them once.
         scene::set_screen_offset((SCREEN_W as i32 / 2) << 16, (SCREEN_H as i32 / 2) << 16);
         scene::set_projection_plane(PROJ_H);
         scene::set_avsz_weights(ZSF3, ZSF4);
@@ -436,7 +436,7 @@ impl Corridor {
         let mut tris = unsafe { PrimitiveArena::new(&mut TRIS) };
         let mut backgrounds = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut BG_QUAD)) };
 
-        // --- Background — solid fog-colour quad behind everything. ---
+        // --- Background -- solid fog-colour quad behind everything. ---
         let Some(bg) = backgrounds.push(QuadGouraud::new(
             [(0, 0), (SCREEN_W, 0), (0, SCREEN_H), (SCREEN_W, SCREEN_H)],
             [FOG_CLEAR, FOG_CLEAR, FOG_CLEAR, FOG_CLEAR],
@@ -446,7 +446,7 @@ impl Corridor {
         ot.add_packet(OT_DEPTH - 1, bg);
 
         // --- Scene setup for this frame ---
-        // Static light rig — no orbit, no directional lighting. Just
+        // Static light rig -- no orbit, no directional lighting. Just
         // ambient + fog produces the entire colour variation on screen.
         scene::load_rotation(&Mat3I16::IDENTITY);
         scene::load_translation(Vec3I32::new(0, 0, 0));
@@ -457,7 +457,7 @@ impl Corridor {
         let tpage_word = TEX_TPAGE.uv_tpage_word(0);
 
         // Material `(128, 128, 128)` makes NCDS produce "identity" vertex
-        // tints at full light — the textured-Gouraud primitive's
+        // tints at full light -- the textured-Gouraud primitive's
         // tint-multiply then passes texels unmodulated. At deep fog the
         // NCDS vertex tint approaches FC (fog colour), darkening and
         // blue-shifting texels so the far end fades into the clear.
@@ -485,7 +485,7 @@ impl Corridor {
                 let u_hi = u_lo + 63;
                 let clut_word = wall.tex.clut_word();
 
-                // UV per corner — same mapping regardless of wall
+                // UV per corner -- same mapping regardless of wall
                 // orientation, because the cooker's centre-square
                 // crop means the texture has no "up" direction:
                 //   a → (u_lo, 0)     near left/top

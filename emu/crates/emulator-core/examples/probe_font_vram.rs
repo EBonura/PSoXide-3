@@ -4,7 +4,7 @@
 //!   CLUT (512, 304)
 //!
 //! If the CLUT is all zeros, every texel resolves to transparent
-//! and the text renders invisibly — that's what probe_banner_order
+//! and the text renders invisibly -- that's what probe_banner_order
 //! turned up as the likely cause of the blank bar.
 //!
 //! Output: pixel values at those locations, plus non-zero counts.

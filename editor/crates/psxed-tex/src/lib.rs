@@ -6,7 +6,7 @@
 //!    supports; we compile in PNG + JPG + BMP).
 //! 2. **Crop** to an optional sub-rectangle of the source.
 //! 3. **Resample** to the target texel dimensions. Uses Lanczos3
-//!    for downscale — the PSX-era "bilinear" look but with less
+//!    for downscale -- the PSX-era "bilinear" look but with less
 //!    ringing.
 //! 4. **Quantise** to `N` colours via median-cut, producing a
 //!    palette + per-pixel index table.
@@ -51,7 +51,7 @@ pub struct CropRect {
 
 impl CropRect {
     /// Compute the centred square crop of a `src_w × src_h` image
-    /// — the largest square that fits, positioned in the middle.
+    /// -- the largest square that fits, positioned in the middle.
     /// Used as the default when the caller hasn't specified an
     /// explicit crop, so arbitrary-aspect sources don't get
     /// distorted by the resize step.
@@ -105,13 +105,13 @@ pub struct Config {
 /// How the cooker should handle source aspect vs target aspect.
 #[derive(Copy, Clone, Debug, Default)]
 pub enum CropMode {
-    /// Centre-crop to the largest square that fits — the default.
+    /// Centre-crop to the largest square that fits -- the default.
     /// Guarantees no aspect distortion for arbitrary-aspect sources.
     #[default]
     CentreSquare,
     /// Use the caller-specified rect.
     Explicit(CropRect),
-    /// No crop — resize-stretch the full source. Produces distorted
+    /// No crop -- resize-stretch the full source. Produces distorted
     /// output for non-square sources.
     None,
 }
@@ -194,7 +194,7 @@ fn resize(img: &DynamicImage, w: u32, h: u32, r: Resampler) -> image::RgbaImage 
     img.resize_exact(w, h, filter).to_rgba8()
 }
 
-/// Heart of the pipeline — take a resized RgbaImage and emit the
+/// Heart of the pipeline -- take a resized RgbaImage and emit the
 /// full PSXT blob (12-byte AssetHeader + 16-byte TextureHeader +
 /// pixel block + CLUT block).
 fn encode_psxt(
@@ -223,7 +223,7 @@ fn encode_psxt(
             ))
         }
         Depth::Bit15 => {
-            // Direct colour — each pixel becomes one Color555 halfword.
+            // Direct colour -- each pixel becomes one Color555 halfword.
             let pixel_halfwords: Vec<u16> = pixels
                 .iter()
                 .map(|rgb| rgb_to_555(rgb[0], rgb[1], rgb[2]))
@@ -248,8 +248,8 @@ fn encode_psxt(
 /// longest channel's median until we have `n_entries` boxes. Each
 /// box contributes its per-channel mean as the final palette entry.
 ///
-/// Output is deterministic for a given input — `BTreeMap` + stable
-/// sorts — so repeated builds produce byte-identical PSXT blobs.
+/// Output is deterministic for a given input -- `BTreeMap` + stable
+/// sorts -- so repeated builds produce byte-identical PSXT blobs.
 fn median_cut_quantize(pixels: &[[u8; 3]], n_entries: usize) -> (Vec<[u8; 3]>, Vec<u8>) {
     assert!(
         n_entries.is_power_of_two() && (2..=256).contains(&n_entries),
@@ -275,7 +275,7 @@ fn median_cut_quantize(pixels: &[[u8; 3]], n_entries: usize) -> (Vec<[u8; 3]>, V
             .unwrap_or_else(|| {
                 // Can't split any further (every box has <2 colours).
                 // Pad with duplicates of existing entries to hit
-                // n_entries — quantiser caller expects exactly that count.
+                // n_entries -- quantiser caller expects exactly that count.
                 (0, 0)
             });
 
@@ -337,7 +337,7 @@ fn widest_axis(b: &[[u8; 3]]) -> (usize, u32) {
 }
 
 /// Linear scan of palette, squared-distance metric. `256 * 64 ≈
-/// 16K ops per image — fast enough that we don't need a kd-tree
+/// 16K ops per image -- fast enough that we don't need a kd-tree
 /// for texture sizes the PSX can actually use.
 fn nearest_index(p: &[u8; 3], palette: &[[u8; 3]]) -> u8 {
     let mut best = 0u8;
@@ -391,7 +391,7 @@ fn pack_indices(indices: &[u8], width: u16, height: u16, depth: Depth) -> Vec<u1
 }
 
 /// Encode a palette as RGB555 halfwords. If `entries < n_entries`
-/// (rare — only on inputs with <16 unique colours), pad with zero
+/// (rare -- only on inputs with <16 unique colours), pad with zero
 /// entries to hit the required CLUT row width.
 fn encode_clut(palette: &[[u8; 3]], n_entries: usize) -> Vec<u16> {
     let mut out = Vec::with_capacity(n_entries);
@@ -405,7 +405,7 @@ fn encode_clut(palette: &[[u8; 3]], n_entries: usize) -> Vec<u16> {
 }
 
 /// 8-bit per channel RGB → PSX 5-5-5 + mask bit. Low 5 bits = red,
-/// next 5 = green, next 5 = blue, bit 15 = mask (kept zero here —
+/// next 5 = green, next 5 = blue, bit 15 = mask (kept zero here --
 /// masks are a render-time concern, not asset-time).
 fn rgb_to_555(r: u8, g: u8, b: u8) -> u16 {
     let r5 = (r as u16 >> 3) & 0x1F;
@@ -432,7 +432,7 @@ fn assemble_blob(
     // AssetHeader.
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // flags — reserved
+    out.extend_from_slice(&0u16.to_le_bytes()); // flags -- reserved
     out.extend_from_slice(&payload_len.to_le_bytes());
     // TextureHeader.
     out.push(depth as u8);
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn end_to_end_encoded_blob_roundtrips_via_header_offsets() {
-        // Small synthetic PNG — solid red 4×4.
+        // Small synthetic PNG -- solid red 4×4.
         let mut buf = Vec::new();
         {
             let img = image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([255, 0, 0, 255]));

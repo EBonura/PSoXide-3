@@ -4,7 +4,7 @@
 //! (the wgpu render-pipeline backend that runs alongside the
 //! compute backend) can reuse the exact same vertex/UV/tint/CLUT
 //! decoding and the exact same `ReplayState` rules. Two backends
-//! reading the same `cmd_log` MUST decode it identically — keeping
+//! reading the same `cmd_log` MUST decode it identically -- keeping
 //! the helpers here is the single point that guarantees that.
 //!
 //! Public API:
@@ -12,7 +12,7 @@
 //!   / draw-offset / mask / dither / flip flags, mirroring the
 //!   `emulator-core::Gpu` fields the CPU rasterizer reads.
 //! - [`decode_vertex`], [`decode_uv`], [`decode_clut`], [`decode_tint`],
-//!   [`rgb24_to_bgr15`]: pure decoders — the per-word arithmetic
+//!   [`rgb24_to_bgr15`]: pure decoders -- the per-word arithmetic
 //!   each opcode performs to extract its parameters.
 //! - [`apply_primitive_tpage`]: per-primitive tpage word ingestion
 //!   (UV1's high half on textured primitives).
@@ -107,7 +107,7 @@ pub fn is_raw_texture(cmd: u32) -> bool {
     (cmd >> 24) & 1 != 0
 }
 
-/// `prim_is_semi_trans` — bit 1 of the opcode byte (cmd word bit 25).
+/// `prim_is_semi_trans` -- bit 1 of the opcode byte (cmd word bit 25).
 #[inline]
 pub fn is_semi_trans(cmd: u32) -> bool {
     (cmd >> 25) & 1 != 0
@@ -183,7 +183,7 @@ pub fn apply_primitive_tpage(state: &mut ReplayState, uv_word: u32) {
     state.tex_blend_mode = decode_blend_mode(tpage >> 5);
     // CPU `apply_primitive_tpage` also OR-folds dither_enabled
     // (`tpage |= 0x200` if dither was on globally). We mirror by
-    // leaving `state.dither` as-is — dither only flips off via a
+    // leaving `state.dither` as-is -- dither only flips off via a
     // GP0 0xE1, not a primitive's tpage word.
 }
 

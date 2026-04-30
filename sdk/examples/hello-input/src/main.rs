@@ -1,4 +1,4 @@
-//! `hello-input` — poll the port-1 pad every frame and
+//! `hello-input` -- poll the port-1 pad every frame and
 //! paint the screen with feedback that reacts to the user's input.
 //!
 //! Proves two pipelines end-to-end:
@@ -79,7 +79,7 @@ fn main() {
             b = 32;
         }
 
-        // Background — clear the back buffer.
+        // Background -- clear the back buffer.
         fb.clear(r, g, b);
 
         // Face buttons paint a coloured triangle in the centre of
@@ -100,14 +100,14 @@ fn main() {
 }
 
 /// Paint the name of every held button down the top-left of the
-/// screen. One line per button — 8 px tall, so 14 buttons fits
+/// screen. One line per button -- 8 px tall, so 14 buttons fits
 /// comfortably inside 240 px of vertical room with a 2px gap.
 fn draw_button_labels(font: &FontAtlas, pad: ButtonState) {
-    // Header, unconditional — sanity check that the font is alive
+    // Header, unconditional -- sanity check that the font is alive
     // even when no key is pressed.
     font.draw_text(4, 4, "HELD:", (0x80, 0x80, 0x80));
 
-    // (button mask, label, tint) — tints match the triangle colours
+    // (button mask, label, tint) -- tints match the triangle colours
     // where applicable so the label lines up visually with the
     // on-screen primitive.
     let rows: &[(u16, &str, (u8, u8, u8))] = &[
@@ -184,7 +184,7 @@ fn draw_pad_status(font: &FontAtlas, state: PadState) {
     }
 }
 
-/// `0x1234` as a 6-char string — `'0'`, `'x'`, then 4 uppercase hex
+/// `0x1234` as a 6-char string -- `'0'`, `'x'`, then 4 uppercase hex
 /// digits, written into a stack buffer. no_std-friendly (no alloc).
 fn hex_u16(v: u16) -> HexU16 {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -226,7 +226,7 @@ impl core::ops::Deref for HexU8 {
 }
 
 /// Owning newtype around a 6-byte hex buffer so `as_str` borrows
-/// from `self` — avoids dangling-slice pitfalls with stack arrays.
+/// from `self` -- avoids dangling-slice pitfalls with stack arrays.
 struct HexU16([u8; 6]);
 impl HexU16 {
     fn as_str(&self) -> &str {

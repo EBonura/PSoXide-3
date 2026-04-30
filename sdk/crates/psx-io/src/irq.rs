@@ -1,10 +1,10 @@
 //! Interrupt controller (I_STAT / I_MASK) MMIO.
 
-/// `I_STAT` — pending interrupt set. Write-to-ack: writing 0 to a bit
+/// `I_STAT` -- pending interrupt set. Write-to-ack: writing 0 to a bit
 /// clears it (writing 1 preserves).
 pub const I_STAT: u32 = 0x1F80_1070;
 
-/// `I_MASK` — interrupt enable set. Straight write.
+/// `I_MASK` -- interrupt enable set. Straight write.
 pub const I_MASK: u32 = 0x1F80_1074;
 
 /// Source bits inside `I_STAT` / `I_MASK`.
@@ -45,7 +45,7 @@ pub fn mask() -> u32 {
     unsafe { crate::read32(I_MASK) }
 }
 
-/// Acknowledge pending bits by writing `!(bits)` — the hardware
+/// Acknowledge pending bits by writing `!(bits)` -- the hardware
 /// AND-accumulates, so any bit left 1 in the written value is
 /// preserved, any bit that was 0 is cleared.
 #[inline(always)]

@@ -1,10 +1,10 @@
-//! Unified event scheduler — port of Redux's
+//! Unified event scheduler -- port of Redux's
 //! `m_regs.interrupt` + `m_regs.intTargets` + `lowestTarget` from
 //! `src/core/r3000a.h::scheduleInterrupt`.
 //!
 //! Background: every subsystem that needs to fire an IRQ "N cycles
-//! from now" — CDROM command acks, GPU DMA completions, SPU async,
-//! MDEC decode finish, etc. — registers an event with this
+//! from now" -- CDROM command acks, GPU DMA completions, SPU async,
+//! MDEC decode finish, etc. -- registers an event with this
 //! scheduler. On every branchTest-equivalent (end of each CPU
 //! delay-slot retirement in `Cpu::step`) we ask the scheduler which
 //! slots are due and dispatch their handlers.
@@ -20,14 +20,14 @@
 //! Design decisions:
 //!
 //! - **Fixed-slot enum, not a binary heap.** Redux has exactly 14
-//!   interrupt slots — each a singleton (at most one outstanding
+//!   interrupt slots -- each a singleton (at most one outstanding
 //!   event per subsystem-event-kind). We follow suit: `targets[16]`
 //!   indexed by [`EventSlot`], + one `u32` bitmap of active slots.
 //!   Enumerating the handful of active slots on each tick is
 //!   O(popcount), cheaper than a heap insert/pop once you amortise
 //!   across many schedule-and-cancel sequences.
 //! - **`lowest_target` cache.** Early-exit for the common case
-//!   where nothing's due — callers can skip the slot walk entirely
+//!   where nothing's due -- callers can skip the slot walk entirely
 //!   with a single comparison.
 //! - **No handler callbacks stored here.** Redux uses C++ function
 //!   pointers; we keep the data pure and dispatch in [`Bus`] via a
@@ -39,7 +39,7 @@
 /// discriminants are the bit positions in [`Scheduler::active`] so
 /// a slot index is `slot as u32`.
 ///
-/// Subsystems currently don't use any of these — they still run
+/// Subsystems currently don't use any of these -- they still run
 /// their own timers. The names / indices are stable so migrations
 /// in future sessions don't churn identifiers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -73,7 +73,7 @@ pub enum EventSlot {
     CdrLid = 12,
     /// SPU async (periodic mix callback).
     SpuAsync = 13,
-    /// VBlank — not a Redux slot (Redux drives VBlank off its counter
+    /// VBlank -- not a Redux slot (Redux drives VBlank off its counter
     /// base-rate), but we wire it here so our existing VBlank
     /// scheduler can migrate in a later session without adding a
     /// sibling queue.
@@ -110,7 +110,7 @@ impl EventSlot {
         })
     }
 
-    /// Bitmap position — `1 << self.bit()` gives the mask.
+    /// Bitmap position -- `1 << self.bit()` gives the mask.
     #[inline]
     pub fn bit(self) -> u32 {
         self as u32
@@ -119,7 +119,7 @@ impl EventSlot {
 
 /// Singleton-per-slot event scheduler. Each slot may hold at most
 /// one outstanding event; re-scheduling the same slot replaces the
-/// previous deadline (matches Redux's behaviour — see
+/// previous deadline (matches Redux's behaviour -- see
 /// `scheduleInterrupt` which unconditionally overwrites
 /// `m_regs.intTargets[interrupt]`).
 pub struct Scheduler {
@@ -128,12 +128,12 @@ pub struct Scheduler {
     targets: [u64; SLOT_COUNT],
     /// Bitmap of currently-pending slots.
     active: u32,
-    /// Smallest `targets[i]` among active slots — cached so the
+    /// Smallest `targets[i]` among active slots -- cached so the
     /// common "nothing's due" path is one compare, not a walk.
     /// `u64::MAX` when no slot is active.
     lowest_target: u64,
     /// Cumulative count of [`Scheduler::schedule`] calls. Diagnostic
-    /// only — lets tests + the probe CLI see how busy the queue has
+    /// only -- lets tests + the probe CLI see how busy the queue has
     /// been without inspecting handler counts per subsystem.
     total_scheduled: u64,
     /// Cumulative count of [`Scheduler::take_due`] returns that
@@ -238,12 +238,12 @@ impl Scheduler {
     /// nothing's due. Callers invoke this in a loop to drain every
     /// due event on each tick; the returned target is what a
     /// periodic handler (VBlank, SPU async) uses to reschedule its
-    /// *next* event — scheduling from `now` instead would drift the
+    /// *next* event -- scheduling from `now` instead would drift the
     /// period every time the drain lagged the target.
     ///
     /// Returning slots in earliest-target order (not lowest-bit
     /// order) matches Redux's `branchTest`, which uses
-    /// `lowestTarget` to pick the next event — important when two
+    /// `lowestTarget` to pick the next event -- important when two
     /// events share a target cycle and the handlers interact.
     pub fn take_due(&mut self, now: u64) -> Option<(EventSlot, u64)> {
         // Redux's `branchTest` only enters the per-slot walk when
@@ -331,7 +331,7 @@ impl Scheduler {
     }
 
     /// Next scheduled target across all active slots. `u64::MAX` if
-    /// nothing's pending. Matches Redux's `m_regs.lowestTarget` —
+    /// nothing's pending. Matches Redux's `m_regs.lowestTarget` --
     /// handy for a future "fast-forward to next event" optimisation
     /// in the step loop.
     #[inline]
@@ -498,7 +498,7 @@ mod tests {
         let third = s.take_due(101);
         assert!(first.is_some() && second.is_some());
         assert!(third.is_none());
-        // Order is irrelevant — both should have fired, and both
+        // Order is irrelevant -- both should have fired, and both
         // should report target 100.
         let mut fired = [first.unwrap().0, second.unwrap().0];
         fired.sort_by_key(|s| s.bit());

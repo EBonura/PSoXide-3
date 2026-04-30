@@ -2,20 +2,20 @@
 //!
 //! One crate, two types, three steps:
 //!
-//! 1. Declare (or pick) a [`BitmapFont`] — a `static` descriptor
+//! 1. Declare (or pick) a [`BitmapFont`] -- a `static` descriptor
 //!    that carries glyph dimensions, a 1-bit-per-pixel bitmap, and
 //!    layout metadata (advance, line height, bit order). The
 //!    built-in fonts in [`fonts`] cover Public-Domain IBM-VGA-style
 //!    8×8 for ASCII / Latin-1 / box-drawing.
 //!
-//! 2. Upload it into VRAM once with [`FontAtlas::upload`] — the
+//! 2. Upload it into VRAM once with [`FontAtlas::upload`] -- the
 //!    crate picks a sensible atlas layout, expands the 1bpp source
 //!    into a 4bpp CLUT texture, uploads that + a two-entry CLUT
 //!    (transparent + white), and returns a handle.
 //!
 //! 3. Call one of the [`FontAtlas`] draw methods every frame. The
 //!    same atlas supports both the fast rectangle path and the
-//!    flexible quad path — choose based on what the call needs.
+//!    flexible quad path -- choose based on what the call needs.
 //!
 //! ## Draw-path cheat sheet
 //!
@@ -34,7 +34,7 @@
 //! (credit crawls, RPG dialogue walls) and doesn't for a HUD of a
 //! few dozen glyphs. Callers pick consciously.
 //!
-//! All methods share the same atlas and CLUT — no duplicate VRAM.
+//! All methods share the same atlas and CLUT -- no duplicate VRAM.
 //! `draw_text_*` variants can freely mix in one frame, and tints
 //! compose with the PSX per-texel multiplier (`output = texel *
 //! tint / 128`).
@@ -50,7 +50,7 @@
 //!   atlas fits within its tpage.
 //! - **Upload buffer**: the stack-only scratch buffer inside
 //!   [`FontAtlas::upload`] is sized for ~128 glyphs of 8×8. Larger
-//!   fonts will want a const-generic buffer — a planned follow-up;
+//!   fonts will want a const-generic buffer -- a planned follow-up;
 //!   panics today if the atlas overflows.
 //!
 //! ## Why 4bpp and not 15bpp direct
@@ -65,7 +65,7 @@
 //!
 //! - `draw_text` / `draw_text_scaled` / `draw_text_gradient`:
 //!   `(x, y)` is the **top-left** of the string's first glyph.
-//! - `draw_text_rotated`: `(cx, cy)` is the rotation **pivot** —
+//! - `draw_text_rotated`: `(cx, cy)` is the rotation **pivot** --
 //!   the centre of the baseline. Positive angles rotate
 //!   counter-clockwise in screen coords.
 //! - `draw_text_affine`: `origin` is the point the 2×2 transform
@@ -76,10 +76,10 @@
 //!
 //! Rotation uses a Q0.12 angle: `u16` in `[0, 4096)` mapping to
 //! `[0°, 360°)`. Sin/cos come from the shared SDK sin LUT in
-//! [`psx_math::sincos`] — see that crate for the precision /
+//! [`psx_math::sincos`] -- see that crate for the precision /
 //! Q-format specifics.
 //!
-//! Affine matrices are Q3.12 — `i16` with 12 fractional bits, so
+//! Affine matrices are Q3.12 -- `i16` with 12 fractional bits, so
 //! `4096` = 1.0, `-4096` = -1.0, `8192` = 2.0, and the usable
 //! range is `±7.999…`. That's enough headroom for any visually
 //! reasonable 2×2 transform a bitmap font would want.
@@ -97,7 +97,7 @@ use psx_vram::{upload_16bpp, upload_clut, Clut, Color555, TexDepth, Tpage, VramR
 pub mod fonts;
 
 // ======================================================================
-// BitmapFont — the static descriptor
+// BitmapFont -- the static descriptor
 // ======================================================================
 
 /// Bit-packing convention within each bitmap byte.
@@ -121,7 +121,7 @@ pub enum BitOrder {
 ///
 /// All fields are compile-time constants so fonts can live in
 /// `.rodata` and a `BitmapFont` value can be declared as a `const`
-/// right next to its bitmap. The type stays size-agnostic — 6×8,
+/// right next to its bitmap. The type stays size-agnostic -- 6×8,
 /// 8×8, 8×16, 12×16 all work; the uploader reads `glyph_w` /
 /// `glyph_h` and lays out the atlas from there.
 ///
@@ -133,7 +133,7 @@ pub enum BitOrder {
 /// (i.e., byte 0 covers columns 0..=7, byte 1 covers columns
 /// 8..=15, regardless of [`BitOrder`] within each byte).
 ///
-/// The `first_char` / `glyph_count` window is a codepoint range —
+/// The `first_char` / `glyph_count` window is a codepoint range --
 /// code `c` is looked up at offset `c - first_char` in the bitmap
 /// as long as `first_char <= c < first_char + glyph_count`.
 /// Anything outside falls back to the missing-glyph box.
@@ -163,7 +163,7 @@ pub struct BitmapFont {
 
 impl BitmapFont {
     /// Bytes per row of a single glyph in the source bitmap.
-    /// Derived from [`BitmapFont::glyph_w`] — 1 byte for ≤ 8-wide
+    /// Derived from [`BitmapFont::glyph_w`] -- 1 byte for ≤ 8-wide
     /// fonts, 2 bytes for 9..16-wide, etc.
     pub const fn row_bytes(&self) -> usize {
         (self.glyph_w as usize).div_ceil(8)
@@ -175,7 +175,7 @@ impl BitmapFont {
     }
 
     /// Fetch row `r` of glyph `i` as 4 bytes LSB-packed little-
-    /// endian — the row comes out as a `u32` with pixel 0 in bit
+    /// endian -- the row comes out as a `u32` with pixel 0 in bit
     /// 0, pixel 1 in bit 1, … up to pixel 31 (enough for any
     /// realistic cell width). Handles [`BitOrder`] normalisation
     /// in one place so callers don't have to branch.
@@ -195,7 +195,7 @@ impl BitmapFont {
 }
 
 // ======================================================================
-// FontAtlas — the VRAM handle
+// FontAtlas -- the VRAM handle
 // ======================================================================
 
 /// A [`BitmapFont`] installed in VRAM and ready to draw from.
@@ -227,19 +227,19 @@ impl FontAtlas {
     /// - 128 glyphs at 8×16  (4096 hw)
     /// - 64 glyphs  at 16×16 (4096 hw)
     /// - 128 glyphs at 12×16 (5040 hw)
-    /// - 128 glyphs at 16×16 (8192 hw) — the largest supported
+    /// - 128 glyphs at 16×16 (8192 hw) -- the largest supported
     ///
     /// 16 KiB transient stack usage at boot is fine on a 2 MiB
     /// PS1 (typical stack budget is 32-64 KiB, and `upload` is
     /// called once before the main loop). Fonts larger than 16×16
-    /// would need a bump — open an issue, we'll add a
+    /// would need a bump -- open an issue, we'll add a
     /// const-generic variant.
     const MAX_PACK_HALFWORDS: usize = 8192;
 
     /// Upload `font` as a 4bpp CLUT texture at `tpage`, with a
     /// 2-entry CLUT (transparent, white) at `clut`.
     ///
-    /// The caller picks the tpage / clut locations — typically
+    /// The caller picks the tpage / clut locations -- typically
     /// `Tpage::new(768, 0, TexDepth::Bit4)` for the standard
     /// off-display region, and a `Clut::new(768, 480)` for the
     /// CLUT row. Both must live inside VRAM and not overlap the
@@ -303,7 +303,7 @@ impl FontAtlas {
         // the GPU doesn't inspect bits inside words.
         //
         // VRAM rect semantics expose the *halfword* footprint when
-        // depth is 4bpp — so width is `atlas_w / 4`, not `atlas_w`.
+        // depth is 4bpp -- so width is `atlas_w / 4`, not `atlas_w`.
         let vram_rect = VramRect::new(tpage.x(), tpage.y(), halfwords_per_row, atlas_h);
         upload_16bpp(vram_rect, &packed[..total_halfwords]);
 
@@ -360,19 +360,19 @@ impl FontAtlas {
     /// recolours every glyph via the PSX per-texel multiplier
     /// (`output = texel * tint / 128`).
     ///
-    /// **Fast path** — uses textured rectangles (GP0 0x64, 4 words
+    /// **Fast path** -- uses textured rectangles (GP0 0x64, 4 words
     /// per glyph). For any transform or per-vertex colour needs,
     /// reach for [`Self::draw_text_scaled`], [`Self::draw_text_rotated`],
     /// [`Self::draw_text_affine`], or [`Self::draw_text_gradient`].
     ///
-    /// Characters outside the font's codepoint range are skipped —
+    /// Characters outside the font's codepoint range are skipped --
     /// they still advance the cursor so the rest of the string
     /// lines up as the caller intended. Iteration is per-`char`,
     /// so any `&str` is valid input; a Latin-1 atlas with
     /// `first_char = 0xA0` picks up `é`, `ü`, etc. automatically.
     ///
     /// Sets the GP0(0xE1) draw-mode tpage to our atlas once at the
-    /// start of the call — if the caller was rendering with a
+    /// start of the call -- if the caller was rendering with a
     /// different tpage, they'll need to re-apply theirs after
     /// draw_text returns.
     ///
@@ -399,11 +399,11 @@ impl FontAtlas {
             wait_cmd_ready();
             // GP0 0x64 = variable-size textured rectangle, no blend,
             // opaque. First word: 0x64_BB_GG_RR (color is the tint
-            // multiplier — NOT a fill colour: CLUT index 1's white
+            // multiplier -- NOT a fill colour: CLUT index 1's white
             // texel gets modulated by this).
             write_gp0(0x6400_0000 | pack_color(tint.0, tint.1, tint.2));
             write_gp0(pack_vertex(cursor_x, y));
-            // Second word packs (U, V, CLUT) — our `pack_texcoord`
+            // Second word packs (U, V, CLUT) -- our `pack_texcoord`
             // takes (u, v, extra) where `extra` is the CLUT field
             // (high halfword). The tpage is implied by the current
             // draw mode.
@@ -417,10 +417,10 @@ impl FontAtlas {
 
     /// Draw `text` at screen-space `(x, y)` scaled by `(scale_x,
     /// scale_y)`. `scale=(1, 1)` matches [`Self::draw_text`]'s
-    /// output, but via the quad path instead of the rect path —
+    /// output, but via the quad path instead of the rect path --
     /// so prefer `draw_text` for native-size.
     ///
-    /// **Quad path** — uses textured quads (GP0 0x2C, 9 words per
+    /// **Quad path** -- uses textured quads (GP0 0x2C, 9 words per
     /// glyph). PSX samples textures with nearest-neighbour, so
     /// integer scales (2×, 3×, 4×) produce crisp pixel-doubled
     /// output. Non-integer scales are supported but smear the
@@ -474,12 +474,12 @@ impl FontAtlas {
 
     /// Draw `text` rotated around the pivot `(cx, cy)` by
     /// `angle_q12` (Q0.12, one revolution = 4096). The string is
-    /// centred on the pivot at angle 0 — its natural extent is
+    /// centred on the pivot at angle 0 -- its natural extent is
     /// `text_width × glyph_h`, anchored so `(cx, cy)` sits at the
     /// centre of the baseline.
     ///
-    /// **Quad path** — 9 GP0 words per glyph. Sin/cos come from a
-    /// compact 256-entry Q1.12 table ([`sincos`]), good to ~1.4° —
+    /// **Quad path** -- 9 GP0 words per glyph. Sin/cos come from a
+    /// compact 256-entry Q1.12 table ([`sincos`]), good to ~1.4° --
     /// imperceptible at 8px glyph scale.
     ///
     /// See crate-level docs for the Q0.12 angle convention.
@@ -504,7 +504,7 @@ impl FontAtlas {
         let gh = font.glyph_h as i32;
         let advance = font.advance_x as i32;
         let total_w = (text.chars().count() as i32) * advance;
-        // Centre the string on the pivot — baseline (top edge of
+        // Centre the string on the pivot -- baseline (top edge of
         // first glyph) is `gh/2` above the pivot so that the glyph
         // midline runs through `(cx, cy)`.
         let origin_x = -total_w / 2;
@@ -543,17 +543,17 @@ impl FontAtlas {
 
     /// Draw `text` through an arbitrary 2×2 affine transform.
     ///
-    /// The matrix `m` is Q3.12 fixed-point — `m = [[4096, 0], [0,
+    /// The matrix `m` is Q3.12 fixed-point -- `m = [[4096, 0], [0,
     /// 4096]]` is the identity (native size, axis-aligned). Each
     /// glyph's local corner `(lx, ly)` maps onto screen space as
     /// `(origin.0 + (m[0][0]*lx + m[0][1]*ly) >> 12,
     ///   origin.1 + (m[1][0]*lx + m[1][1]*ly) >> 12)`.
     ///
     /// Covers rotation, non-uniform scale, shear, reflection, and
-    /// any combination — the other quad-path methods are all
+    /// any combination -- the other quad-path methods are all
     /// specializations of this one.
     ///
-    /// **Quad path** — 9 GP0 words per glyph.
+    /// **Quad path** -- 9 GP0 words per glyph.
     ///
     /// # Example: horizontal shear
     ///
@@ -609,7 +609,7 @@ impl FontAtlas {
     /// `bottom`. The GPU gouraud-interpolates down each glyph,
     /// producing a smooth vertical gradient across the whole line.
     ///
-    /// **Gouraud quad path** — 12 GP0 words per glyph (GP0 0x3C).
+    /// **Gouraud quad path** -- 12 GP0 words per glyph (GP0 0x3C).
     /// Use when you want a rainbow title, a torch-lit dialogue
     /// box, or any per-vertex colour effect; prefer the single-
     /// tint [`Self::draw_text`] otherwise.
@@ -637,7 +637,7 @@ impl FontAtlas {
 
     /// Draw `text` with a top-to-bottom gradient, scaled by
     /// `(scale_x, scale_y)`. Combines [`Self::draw_text_scaled`]
-    /// and [`Self::draw_text_gradient`] in one draw — a 3× title
+    /// and [`Self::draw_text_gradient`] in one draw -- a 3× title
     /// with a fire-colour sweep costs the same 12 words per glyph
     /// as a 1× gradient.
     ///
@@ -703,7 +703,7 @@ impl FontAtlas {
         self.font
     }
 
-    /// Tpage the atlas is installed at — useful if the caller wants
+    /// Tpage the atlas is installed at -- useful if the caller wants
     /// to restore it after drawing with a different tpage. Always
     /// 4bpp, always inside a valid VRAM page-aligned slot.
     pub fn tpage(&self) -> Tpage {
@@ -712,7 +712,7 @@ impl FontAtlas {
 }
 
 // ======================================================================
-// Tests (host-side — pure data-transform checks)
+// Tests (host-side -- pure data-transform checks)
 // ======================================================================
 
 #[cfg(test)]

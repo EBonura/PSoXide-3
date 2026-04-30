@@ -1,7 +1,7 @@
 # Level residency
 
 How rooms, materials, and texture assets reach RAM and VRAM at
-runtime — the contract between the editor's playtest compiler
+runtime -- the contract between the editor's playtest compiler
 and the runtime example.
 
 ## Current pass: granular residency, embedded backing store
@@ -39,7 +39,7 @@ When the backing store changes, the contract doesn't.
 
 `engine/crates/psx-level` is a tiny `no_std` crate that defines
 the records the editor compiler writes and the runtime example
-reads. Every record is `&'static`-borrowing — nothing
+reads. Every record is `&'static`-borrowing -- nothing
 allocates, everything pins to literal data.
 
 | Record                  | Purpose                                        |
@@ -61,20 +61,20 @@ writer + reader for them both ship in the same pass.
 The editor's playtest compiler walks the project's scene tree
 once and emits:
 
-1. **Cooked rooms** — `cook_world_grid` produces a
+1. **Cooked rooms** -- `cook_world_grid` produces a
    `CookedWorldGrid` per Room node. Bytes get written to
    `generated/rooms/room_NNN.psxw`; a `LevelAssetRecord` of
    kind `RoomWorld` is added to `ASSETS`.
-2. **Texture assets** — for each cooked material slot, the
+2. **Texture assets** -- for each cooked material slot, the
    writer resolves the material's texture, dedupes by
    `ResourceId`, copies the `.psxt` bytes into
    `generated/textures/texture_NNN.psxt`, and adds a
    `LevelAssetRecord` of kind `Texture`.
-3. **Material records** — `LevelMaterialRecord`s pinned to
+3. **Material records** -- `LevelMaterialRecord`s pinned to
    `(room, local_slot)`, ordered by slot. Each room's
    `material_first..material_count` slice covers exactly its
    cooked material count.
-4. **Residency records** — `ROOM_RESIDENCY` lists required RAM
+4. **Residency records** -- `ROOM_RESIDENCY` lists required RAM
    (the room's world asset) and required VRAM (the texture
    assets the room's materials reference, deduplicated).
 
@@ -113,7 +113,7 @@ draw_room(runtime_room.render(), &materials, &camera, options, ...);
 `ResidencyManager<RAM_CAP, VRAM_CAP>` is a no-alloc fixed-size
 tracker. RAM membership is logical (every asset is
 `include_bytes!`-resident from program start), but VRAM
-membership is meaningful — each texture uploads once, and
+membership is meaningful -- each texture uploads once, and
 subsequent room loads see them already-resident.
 
 ## Future backing stores
@@ -136,14 +136,14 @@ won't change `ROOM_RESIDENCY`'s semantics.
 
 ## Out of scope (deliberate)
 
-- **CD streaming** — no I/O, no async, no scheduler.
-- **Runtime baking** — farfield impostors are an offline-baked
+- **CD streaming** -- no I/O, no async, no scheduler.
+- **Runtime baking** -- farfield impostors are an offline-baked
   asset class. Render-to-texture from the runtime is not
   planned.
-- **Portals / PVS** — adjacency / visibility computation is the
+- **Portals / PVS** -- adjacency / visibility computation is the
   job of a future cooker pass; the residency lists this pass
   emits don't include warm preload hints yet.
-- **Actors / lights / audio / scripts** — separate asset
+- **Actors / lights / audio / scripts** -- separate asset
   kinds, separate writers, separate readers.
 
 The schema enforces that policy: a record type only exists

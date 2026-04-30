@@ -2,7 +2,7 @@
 //!
 //! At this stage the core exposes just enough to load a BIOS, seat a
 //! CPU at the reset vector, and fetch its first instruction. No
-//! execution yet — this is the thin wire along which the rest of the
+//! execution yet -- this is the thin wire along which the rest of the
 //! emulator will be strung.
 
 #![deny(unsafe_op_in_unsafe_fn)]

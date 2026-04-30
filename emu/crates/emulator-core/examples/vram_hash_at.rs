@@ -41,7 +41,7 @@ fn main() {
         eprintln!("[vram_hash_at] stopped at step {at}/{n}");
     }
 
-    // Full 1 MiB VRAM hash (self-regression only — determinism check).
+    // Full 1 MiB VRAM hash (self-regression only -- determinism check).
     let mut h = 0xCBF2_9CE4_8422_2325u64;
     for &w in bus.gpu.vram.words() {
         for b in w.to_le_bytes() {
@@ -50,7 +50,7 @@ fn main() {
         }
     }
     let nz = bus.gpu.vram.words().iter().filter(|&&w| w != 0).count();
-    // Visible-display-area hash — this is what's comparable against
+    // Visible-display-area hash -- this is what's comparable against
     // Redux's `PCSX.GPU.takeScreenShot()` via the oracle's
     // `vram_hash` command, and therefore the one that verifies we
     // render the same pixels as Redux (not just that we're

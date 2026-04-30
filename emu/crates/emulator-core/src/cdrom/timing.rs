@@ -5,18 +5,18 @@
 ///
 /// Redux cross-references (line numbers from the upstream file):
 ///
-/// - `AddIrqQueue(m_cmd, 0x800)` — universal first-response delay
+/// - `AddIrqQueue(m_cmd, 0x800)` -- universal first-response delay
 ///   (L1284). Every command's ack fires 2048 cycles after issue.
-/// - `AddIrqQueue(CdlID + 0x100, 20480)` — GetID second response,
+/// - `AddIrqQueue(CdlID + 0x100, 20480)` -- GetID second response,
 ///   ~4.4 µs, observed across boot roms (L900). `CdlInit` (`0x1C`)
 ///   uses the separate lid/rescan path instead of a second CDROM IRQ.
-/// - `AddIrqQueue(CdlReset + 0x100, 4100000)` — Reset (`0x0A`)
+/// - `AddIrqQueue(CdlReset + 0x100, 4100000)` -- Reset (`0x0A`)
 ///   completion. MGS polls this INT2 before it starts issuing reads.
-/// - `cdReadTime = psxClockSpeed / 75` — one PSX CD-frame period
+/// - `cdReadTime = psxClockSpeed / 75` -- one PSX CD-frame period
 ///   (L135). Redux schedules the first ReadN/ReadS sector at
 ///   `cdReadTime` in double-speed mode, then chains steady-state
 ///   sectors at `cdReadTime / 2` (single-speed uses 2x those delays).
-/// - `scheduleCDPlayIRQ(SEEK_DONE ? 0x800 : cdReadTime * 4)` —
+/// - `scheduleCDPlayIRQ(SEEK_DONE ? 0x800 : cdReadTime * 4)` --
 ///   SeekL / SeekP second response (L875). If the target is already
 ///   seeked, quick ack; otherwise a full seek-time equivalent.
 pub(super) const FIRST_RESPONSE_CYCLES: u64 = 0x800; // 2048

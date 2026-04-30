@@ -1,6 +1,6 @@
 //! Top-level application state and UI orchestration.
 //!
-//! Owns the emulator state (currently just a `Cpu` + `Bus` — VRAM will
+//! Owns the emulator state (currently just a `Cpu` + `Bus` -- VRAM will
 //! join once the GPU subsystem lands) and drives the per-frame UI build.
 
 use std::collections::{BTreeSet, VecDeque};
@@ -23,14 +23,14 @@ use crate::ui::memory::MemoryView;
 use crate::ui::menu::{LibraryItem as MenuLibraryItem, MenuState};
 
 /// Ring-buffer capacity for the execution-history panel. 16 rows is
-/// the "what just ran" context window — enough to spot a tight loop
+/// the "what just ran" context window -- enough to spot a tight loop
 /// or trace a branch without the history section taking over the
 /// registers side panel vertically.
 pub const EXEC_HISTORY_CAP: usize = 16;
 
 /// Panels that can be shown/hidden via the Menu. The Menu *is* the
 /// library browser (Games / Examples columns), so we don't have
-/// a separate "library" panel — it's integrated into the shell
+/// a separate "library" panel -- it's integrated into the shell
 /// the PSX way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PanelVisibility {
@@ -72,7 +72,7 @@ impl Workspace {
     }
 }
 
-/// Top-level app state. Owns the emulator state directly — no Arc/Mutex,
+/// Top-level app state. Owns the emulator state directly -- no Arc/Mutex,
 /// single-threaded, UI reads state in-place per frame.
 pub struct AppState {
     /// Active host workspace.
@@ -83,7 +83,7 @@ pub struct AppState {
     /// In-process playtest launched from the editor viewport.
     pub embedded_playtest: EmbeddedPlaytestState,
     pub panels: PanelVisibility,
-    /// Framebuffer mode — shared HW renderer at native scale vs
+    /// Framebuffer mode -- shared HW renderer at native scale vs
     /// window-fitted high resolution. Toggled via the debug toolbar.
     pub scale_mode: ScaleMode,
     /// Physical pixel size used by the central framebuffer on the
@@ -140,7 +140,7 @@ pub struct AppState {
     /// = no game loaded yet (initial state on first run, also after
     /// "Reset" with no last-loaded game).
     pub current_game: Option<LibraryEntry>,
-    /// Short-lived status line — shows "Launched Crash Bandicoot",
+    /// Short-lived status line -- shows "Launched Crash Bandicoot",
     /// "Scan complete: 54 games", etc. Displayed beneath the
     /// library panel; cleared after a few frames.
     pub status_message: Option<(String, f32)>,
@@ -166,7 +166,7 @@ impl AppState {
         // Resolve the config directory up-front. In production this
         // lives under ~/Library/Application Support/PSoXide
         // (macOS) etc; if the OS won't give us one we degrade to a
-        // tempdir-rooted view so the app still runs — just without
+        // tempdir-rooted view so the app still runs -- just without
         // persistence.
         let paths = match override_dir {
             Some(p) => ConfigPaths::rooted(p),
@@ -268,7 +268,7 @@ impl AppState {
         // earlier version of the scanner before the deps/ filter
         // landed) get purged. `scan_roots` is mtime-cached for
         // already-seen files, so the cost is bounded by
-        // "number of files that changed since last scan" — cheap
+        // "number of files that changed since last scan" -- cheap
         // on every boot.
         //
         // Scoped to "SDK dir exists" so an end-user install without
@@ -299,7 +299,7 @@ impl AppState {
     /// point); the user clicks Run to start stepping.
     pub fn launch_entry(&mut self, entry: &LibraryEntry) -> Result<(), String> {
         // Flush the outgoing game's memcard before we discard its
-        // Bus state. Silently log on failure — we'd rather launch
+        // Bus state. Silently log on failure -- we'd rather launch
         // the new game than refuse because of a stale save.
         if let Err(e) = self.flush_memcard_port1() {
             eprintln!("[frontend] memcard flush before launch: {e}");
@@ -324,7 +324,7 @@ impl AppState {
                 // + cold-init state aren't populated when we jump
                 // straight to the EXE entry instead of the reset
                 // vector. Previously gated on
-                // `settings.emulator.hle_bios_for_side_load` — the
+                // `settings.emulator.hle_bios_for_side_load` -- the
                 // gate stayed on `false` (derived Default) for
                 // users with a pre-existing settings.ron, which
                 // made EXEs launched from the Menu render blank
@@ -388,9 +388,9 @@ impl AppState {
             }
         }
 
-        // Swap everything at once — no half-loaded state. Start in
+        // Swap everything at once -- no half-loaded state. Start in
         // the running state so the user sees the game boot
-        // immediately when they hit Enter in the Menu — matches a real
+        // immediately when they hit Enter in the Menu -- matches a real
         // PS1 where selecting a disc and pressing X fires it right up.
         // The Menu's caller (`apply_menu_action::LaunchGame`) closes
         // the overlay so the game is actually visible.
@@ -424,10 +424,10 @@ impl AppState {
     /// Walk the configured library root(s) and update the cache.
     /// Scans TWO roots in one pass:
     ///
-    /// 1. `settings.paths.game_library` — user's retail-disc folder.
+    /// 1. `settings.paths.game_library` -- user's retail-disc folder.
     /// 2. `settings.paths.sdk_examples` (or auto-detected
     ///    `build/examples/mipsel-sony-psx/release/` under the repo
-    ///    root) — `.exe` homebrew built by `make examples`.
+    ///    root) -- `.exe` homebrew built by `make examples`.
     ///
     /// Either can be missing without erroring. If neither yields
     /// entries, the Menu's columns show the "No … found" placeholder
@@ -490,7 +490,7 @@ impl AppState {
     /// one; otherwise walks up from the frontend crate's source
     /// directory (`CARGO_MANIFEST_DIR`) to the repo root and joins
     /// the canonical build-output path. Returns `None` when the
-    /// resolver can't place the repo root — in which case scanning
+    /// resolver can't place the repo root -- in which case scanning
     /// proceeds with only the game-library root.
     fn resolve_sdk_examples_dir(&self) -> Option<PathBuf> {
         if !self.settings.paths.sdk_examples.is_empty() {
@@ -562,7 +562,7 @@ impl AppState {
             }
 
             match e.kind {
-                // CUEs are never shown directly — their BIN is.
+                // CUEs are never shown directly -- their BIN is.
                 GameKind::DiscCue => continue,
                 GameKind::DiscBin | GameKind::DiscIso => {
                     // If a CUE owns this BIN, use the CUE's
@@ -1009,7 +1009,7 @@ pub fn step_one_frame(state: &mut AppState) -> StepFrameReport {
         return StepFrameReport::default();
     };
 
-    // Only fill `exec_history` when the registers panel is open —
+    // Only fill `exec_history` when the registers panel is open --
     // otherwise the 404-byte `InstructionRecord` per step is pure
     // overhead. The panel is closed by default on first run, so
     // most users get the fast `step()` path automatically.
@@ -1025,7 +1025,7 @@ pub fn step_one_frame(state: &mut AppState) -> StepFrameReport {
             break;
         }
         // Breakpoint check happens BEFORE stepping so the paused PC
-        // is the BP address itself — the instruction at that PC has
+        // is the BP address itself -- the instruction at that PC has
         // not yet executed.
         if state.breakpoints.contains(&state.cpu.pc()) {
             state.running = false;
@@ -1126,7 +1126,7 @@ fn load_bus(settings: &Settings) -> Option<Bus> {
         }
     };
 
-    // Optional disc. Absence is not an error — BIOS boots fine without
+    // Optional disc. Absence is not an error -- BIOS boots fine without
     // one and just sits on the "insert disc" screen. Presence wires the
     // bytes into the CD-ROM controller's tray so `CdlGetID` / `CdlReadN`
     // return real data once the BIOS/game asks.

@@ -1,6 +1,6 @@
 //! Bump allocator gated behind the `alloc` feature.
 //!
-//! A tiny `GlobalAlloc` that never frees — fine for PS1 homebrew that
+//! A tiny `GlobalAlloc` that never frees -- fine for PS1 homebrew that
 //! uses a permanent arena for assets and scratch buffers. Replace
 //! with a real allocator (`linked_list_allocator`, `talc`, …) when the
 //! engine needs deallocation.
@@ -20,7 +20,7 @@ struct BumpState {
 }
 
 // Single-threaded environment (interrupts masked during alloc, no
-// SMP on PS1) — `Sync` is sound for the bump allocator.
+// SMP on PS1) -- `Sync` is sound for the bump allocator.
 unsafe impl Sync for BumpAllocator {}
 
 unsafe impl GlobalAlloc for BumpAllocator {
@@ -40,7 +40,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
     }
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocator — nothing to release until a full reset.
+        // Bump allocator -- nothing to release until a full reset.
     }
 }
 

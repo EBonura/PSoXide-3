@@ -9,7 +9,7 @@ pub struct XaDecoderState {
 }
 
 impl XaDecoderState {
-    /// Fresh decoder history — silence as prev samples.
+    /// Fresh decoder history -- silence as prev samples.
     pub fn new() -> Self {
         Self { y0: 0, y1: 0 }
     }
@@ -27,12 +27,12 @@ impl XaDecoderState {
 const XA_FILTER: [(i32, i32); 4] = [(0, 0), (960, 0), (1840, -832), (1568, -880)];
 
 /// Decode 28 ADPCM samples (one "sound unit") from an XA block.
-/// - `filter_range` — packed byte: high nibble = filter ID (0..=3,
+/// - `filter_range` -- packed byte: high nibble = filter ID (0..=3,
 ///   values >3 are reserved), low nibble = range (output shift).
-/// - `data` — seven 16-bit packed words, laid out exactly like
+/// - `data` -- seven 16-bit packed words, laid out exactly like
 ///   Redux's `decode_xa.cc` before it calls `ADPCM_DecodeBlock16`.
 ///   Each word carries four 4-bit samples.
-/// - `state` — in/out filter history; mutates across calls within a
+/// - `state` -- in/out filter history; mutates across calls within a
 ///   sound group.
 ///
 /// Writes 28 output samples into `out[0], out[stride], out[2*stride], ...`.

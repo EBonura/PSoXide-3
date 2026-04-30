@@ -82,7 +82,7 @@ pub fn build_package(
     // First-use order is deterministic because we walk rooms +
     // material slots in deterministic order and assign the
     // texture's compact "texture index" via `texture_asset_for_resource.len()`
-    // at first insertion (never removed). HashMap is fine — we
+    // at first insertion (never removed). HashMap is fine -- we
     // only use it for presence tests.
     let mut texture_asset_for_resource: std::collections::HashMap<ResourceId, usize> =
         std::collections::HashMap::new();
@@ -175,7 +175,7 @@ pub fn build_package(
                             return (None, report);
                         }
                     };
-                    // Room materials must be 4bpp (16-entry CLUT) —
+                    // Room materials must be 4bpp (16-entry CLUT) --
                     // both the editor preview's material upload
                     // path and the runtime room material slots
                     // assume the 4bpp tpage layout. Loud failure
@@ -355,7 +355,7 @@ pub fn build_package(
                 radius,
             } => {
                 // Reject obviously broken lights at cook time
-                // — radius 0 contributes nothing, negative
+                // -- radius 0 contributes nothing, negative
                 // intensity is meaningless. Clamp the rest into
                 // the wire format's u16 ranges.
                 if *radius <= 0.0 {
@@ -372,7 +372,7 @@ pub fn build_package(
                     ));
                     return (None, report);
                 }
-                // Editor radius is in *sector units* — convert
+                // Editor radius is in *sector units* -- convert
                 // to world units (engine units) at cook time so
                 // the runtime record stays in one canonical
                 // unit regardless of the room's `sector_size`.
@@ -447,7 +447,7 @@ pub fn build_package(
     // and emit a PlaytestCharacter + PlaytestPlayerController.
     //
     // Character resources unrelated to the player aren't cooked
-    // in this pass — only the player slot consumes them. Once
+    // in this pass -- only the player slot consumes them. Once
     // enemies / NPCs surface, the same `register_model_for_instance`
     // dedupe path handles their backing models too.
     let mut characters: Vec<PlaytestCharacter> = Vec::new();
@@ -745,7 +745,7 @@ fn register_model_for_instance(
     // (the runtime renders textured) and at least one clip
     // (the runtime renders animated). Bind-pose / untextured
     // rendering would need engine-side work the current pass
-    // doesn't ship — fail loud at cook so the editor surfaces
+    // doesn't ship -- fail loud at cook so the editor surfaces
     // it rather than silently dropping the instance at runtime.
     if model.texture_path.is_none() {
         report.error(format!(
@@ -822,7 +822,7 @@ fn register_model_for_instance(
                 return None;
             }
         };
-        // Model atlases must be 8bpp (256-entry CLUT) — the
+        // Model atlases must be 8bpp (256-entry CLUT) -- the
         // runtime model atlas region uses an 8bpp tpage and a
         // 256-entry CLUT row per atlas. Other depths render with
         // wrong colours, so reject loud at cook time.
@@ -846,7 +846,7 @@ fn register_model_for_instance(
         None
     };
 
-    // Clip assets — one .psxanim per clip, validated for joint
+    // Clip assets -- one .psxanim per clip, validated for joint
     // parity. Clips ordered as authored in the resource.
     let clip_first = u16::try_from(model_clips.len()).unwrap_or(u16::MAX);
     for (i, clip) in model.clips.iter().enumerate() {
@@ -1055,7 +1055,7 @@ mod tests {
     #[test]
     fn player_character_model_is_deduplicated_with_placed_meshinstance() {
         // Starter includes both a Wraith MeshInstance (id 6 in
-        // the scene) and a Wraith-Hero Character resource — they
+        // the scene) and a Wraith-Hero Character resource -- they
         // share the same Model resource. The cooker must register
         // the model once (in `models`), not twice.
         let project = project_with_one_room();
@@ -1093,14 +1093,14 @@ mod tests {
         assert!(report.is_ok(), "errors: {:?}", report.errors);
         let package = package.expect("package returned on ok report");
         // Only the player path should have registered the Wraith
-        // — there's no MeshInstance left to pull it in.
+        // -- there's no MeshInstance left to pull it in.
         assert!(package.model_instances.is_empty());
         assert_eq!(package.models.len(), 1);
         assert_eq!(package.characters.len(), 1);
 
         let manifest = render_manifest_source(&package);
         // Asset indexes for the Wraith mesh, atlas, and clips
-        // come straight from `package.assets` — every one of
+        // come straight from `package.assets` -- every one of
         // them must show up in ROOM_0_REQUIRED_RAM/VRAM.
         let wraith = &package.models[0];
         let mesh_token = format!("AssetId({})", wraith.mesh_asset_index);
@@ -1135,7 +1135,7 @@ mod tests {
         // Starter's Wraith is referenced twice: by the placed
         // MeshInstance *and* by the Character. Each asset still
         // shows up exactly once in the manifest's residency
-        // slice — the player path mustn't double-add.
+        // slice -- the player path mustn't double-add.
         let project = project_with_one_room();
         let (package, _) = build_package(&project, &starter_project_root());
         let package = package.expect("starter cooks");
@@ -1501,7 +1501,7 @@ mod tests {
             .expect("room blob written");
         assert_eq!(&blob[0..4], b"PSXW");
 
-        // Texture blobs landed too — the starter has 2.
+        // Texture blobs landed too -- the starter has 2.
         assert!(dir
             .join(TEXTURES_DIRNAME)
             .join("texture_000.psxt")
@@ -1593,7 +1593,7 @@ mod tests {
         let package = package.expect("cooks");
         // 2 distinct material slots both reference the same
         // texture (room material dedup); the model atlas adds
-        // one more texture so the total is 2 — what we're
+        // one more texture so the total is 2 -- what we're
         // testing here is that walls don't double-count their
         // shared floor texture, not the absolute count.
         assert_eq!(package.materials.len(), 2);
@@ -1860,7 +1860,7 @@ mod tests {
     #[test]
     fn missing_default_clip_resolves_to_clip_zero() {
         // A model with `default_clip: None` plus a populated
-        // clip list should cook fine — runtime gets clip 0 as
+        // clip list should cook fine -- runtime gets clip 0 as
         // the resolved default. No bind-pose sentinel.
         let mut project = ProjectDocument::starter();
         for resource in project.resources.iter_mut() {

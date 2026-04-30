@@ -1,4 +1,4 @@
-//! Menu overlay — launcher menu ported from psoxide-1.
+//! Menu overlay -- launcher menu ported from psoxide-1.
 //!
 //! Horizontal animated category icons with a vertical item list beneath
 //! the active category. Drawn via `egui::Painter` on a middle layer so
@@ -7,7 +7,7 @@
 //! Navigation: arrows + Enter + Escape (gamepad will land when the
 //! input subsystem does). Escape also toggles the overlay open/closed.
 //!
-//! Phase 1e ships three categories — Game / Debug / System. Games,
+//! Phase 1e ships three categories -- Game / Debug / System. Games,
 //! Examples, Save States, Video, Input gain their sections as the
 //! corresponding subsystems come online.
 
@@ -25,12 +25,12 @@ const ITEM_GAP: f32 = 2.0;
 const ANIM_SPEED: f32 = 10.0;
 
 /// A menu action the Menu emits when the user confirms an item. The
-/// app layer interprets these — Menu stays stateless about the
+/// app layer interprets these -- Menu stays stateless about the
 /// emulator.
 ///
 /// Note: dropped `Copy` in favour of `Clone` to carry the
 /// game-ID payload on `LaunchGame`. The dispatch cost is one
-/// `String::clone` per selection — negligible.
+/// `String::clone` per selection -- negligible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuAction {
     /// Toggle between continuous-run and paused.
@@ -82,12 +82,12 @@ pub struct MenuInput {
 /// One row inside a category. Labels + values are `String` so we
 /// can populate them from library entries at runtime (titles,
 /// region tags, sizes). Static strings like "Run" / "Pause" also
-/// fit the same shape at a small allocation cost — the whole
+/// fit the same shape at a small allocation cost -- the whole
 /// category tree is rebuilt at most a few times a session.
 struct MenuItem {
     label: String,
     action: MenuAction,
-    /// Optional right-aligned subtitle — used for region tags
+    /// Optional right-aligned subtitle -- used for region tags
     /// ("NTSC-U"), file sizes, and keyboard shortcut hints.
     value: Option<String>,
 }
@@ -123,7 +123,7 @@ impl Default for MenuState {
     }
 }
 
-/// An entry passed into the Menu from the library layer — minimal
+/// An entry passed into the Menu from the library layer -- minimal
 /// subset of [`psoxide_settings::LibraryEntry`] the Menu needs to
 /// render an item (title + id for dispatch + region/size as the
 /// right-aligned value). Kept separate so the Menu module stays
@@ -134,7 +134,7 @@ pub struct LibraryItem {
     /// Stable game ID (16-hex-char fingerprint). Payload of
     /// [`MenuAction::LaunchGame`] when the user confirms.
     pub id: String,
-    /// Main label — typically the PVD volume identifier or the
+    /// Main label -- typically the PVD volume identifier or the
     /// file stem.
     pub title: String,
     /// Right-aligned subtitle, e.g. "NTSC-U · 602 MiB".
@@ -147,10 +147,10 @@ impl MenuState {
     }
 
     pub fn with_running(running: bool) -> Self {
-        // Boot categories with the library sections empty — they
+        // Boot categories with the library sections empty -- they
         // get filled by `set_library` once AppState loads the
         // cached entries. A fresh install sees placeholder "No
-        // games found — run Refresh library" rows.
+        // games found -- run Refresh library" rows.
         let categories = vec![
             build_games_category(&[]),
             build_examples_category(&[]),
@@ -277,7 +277,7 @@ impl MenuState {
             self.category_index -= 1;
             self.item_index = 0;
             // Snap the scroll so the new category's list shows from
-            // the top — matches the Menu convention. The target for
+            // the top -- matches the Menu convention. The target for
             // next frame will be 0.0 regardless; this avoids an
             // awkward animation from mid-list in the previous
             // category to top of the new one.
@@ -311,7 +311,7 @@ impl MenuState {
         None
     }
 
-    /// Public reader for the currently-selected item's action —
+    /// Public reader for the currently-selected item's action --
     /// tests use it to assert the menu is populated correctly
     /// without driving input events.
     #[cfg(test)]
@@ -323,7 +323,7 @@ impl MenuState {
             .map(|i| &i.action)
     }
 
-    /// Current category name — also exposed for test assertions.
+    /// Current category name -- also exposed for test assertions.
     #[cfg(test)]
     pub fn current_category(&self) -> Option<&'static str> {
         self.categories.get(self.category_index).map(|c| c.name)
@@ -420,7 +420,7 @@ impl MenuState {
         // Matches the console Menu behaviour.
         //
         // For very short lists (num_items ≤ visible_rows) the target
-        // is 0 — nothing to scroll.
+        // is 0 -- nothing to scroll.
         let num_items = cat.items.len();
         let edge_margin: usize = if visible_rows >= 5 { 2 } else { 1 };
         let target_scroll = if num_items <= visible_rows {
@@ -444,7 +444,7 @@ impl MenuState {
 
         // Ease `scroll_y` toward the target using the same
         // `ANIM_SPEED * dt` blend that drives the horizontal
-        // category slide — so navigation feels uniform between
+        // category slide -- so navigation feels uniform between
         // axes. Snap when we're within a pixel of the target.
         self.scroll_y += (target_scroll - self.scroll_y) * ANIM_SPEED * dt;
         if (self.scroll_y - target_scroll).abs() * row_stride < 0.5 {
@@ -569,7 +569,7 @@ fn build_games_category(games: &[LibraryItem]) -> Category {
                 },
             });
         }
-        // Always offer a rescan at the end of the Games list —
+        // Always offer a rescan at the end of the Games list --
         // matches menu UX where "Refresh" sits below the
         // scrollable section.
         items.push(MenuItem {
@@ -639,7 +639,7 @@ fn build_create_category(editor_open: bool) -> Category {
 }
 
 /// The System category holds emulator-wide actions: run/pause,
-/// step, reset. Renamed from "Game" — on the PSX-style Menu, the
+/// step, reset. Renamed from "Game" -- on the PSX-style Menu, the
 /// Game column holds games, System holds controls. Matches
 /// menu convention.
 fn build_system_category(running: bool) -> Category {
@@ -672,7 +672,7 @@ fn build_system_category(running: bool) -> Category {
     }
 }
 
-/// Debug utilities — panel toggles + VRAM test pattern.
+/// Debug utilities -- panel toggles + VRAM test pattern.
 fn build_debug_category() -> Category {
     Category {
         name: "Debug",
@@ -825,7 +825,7 @@ mod tests {
         s.update(&right); // System
         s.update(&right); // Debug
         s.update(&right); // Quit
-        s.update(&right); // past end — should clamp
+        s.update(&right); // past end -- should clamp
         assert_eq!(s.current_category(), Some("Quit"));
         let left = MenuInput {
             left: true,

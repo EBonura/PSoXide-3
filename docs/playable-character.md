@@ -35,7 +35,7 @@ at runtime.
 3. **Assign idle + walk clips**: required for the player.
    Optional: run, turn. The "Auto Assign Clips By Name"
    button matches `idle` / `walk` / `run` / `turn` substrings
-   case-insensitively against clip names — works when the
+   case-insensitively against clip names -- works when the
    source bundle uses conventional naming.
 4. **Wire the spawn**: select the Player Spawn node; the
    inspector shows a Character dropdown when `player == true`.
@@ -94,7 +94,7 @@ where `u16::MAX` (= `CHARACTER_CLIP_NONE`) means "no clip
 authored for this role".
 
 `PlayerControllerRecord` carries the resolved `PlayerSpawnRecord`
-and a Character index — one record per cooked package.
+and a Character index -- one record per cooked package.
 
 Models that drive a Character are deduplicated against placed
 `MeshInstance` references: a project where the same Wraith model
@@ -107,7 +107,7 @@ The 3D viewport renders the character at the Player Spawn,
 animated with its idle clip, using the same model render path
 placed model instances follow. If the spawn has no Character
 assigned and exactly one Character exists project-wide, the
-preview falls back to that Character — matching the cooker's
+preview falls back to that Character -- matching the cooker's
 auto-pick rule. Spawn selection / drag still operates on the
 SpawnPoint node.
 
@@ -145,7 +145,7 @@ Movement is owned by `psx_engine::CharacterMotorState`: game or AI
 code feeds abstract intent (`turn`, `walk`, `sprint`, `evade`), and
 the motor advances position / yaw / stamina / action state. Movement
 is rejected when the destination capsule sample has no walkable
-floor — coarse but enough to keep the player inside the room until
+floor -- coarse but enough to keep the player inside the room until
 proper capsule sliding lands. The committed Y position follows the
 sampled floor height under the player's root.
 
@@ -214,17 +214,17 @@ These are natural follow-ups once the base controller settles.
 
 ## See also
 
-- `editor/crates/psxed-project/src/lib.rs` — `CharacterResource`,
+- `editor/crates/psxed-project/src/lib.rs` -- `CharacterResource`,
   `ResourceData::Character`, `NodeKind::SpawnPoint::character`.
-- `editor/crates/psxed-project/src/playtest.rs` — cook-side
+- `editor/crates/psxed-project/src/playtest.rs` -- cook-side
   `PlaytestCharacter` + `PlaytestPlayerController` + validation.
-- `engine/crates/psx-level/src/lib.rs` — wire structs.
-- `engine/examples/editor-playtest/src/main.rs` — runtime
+- `engine/crates/psx-level/src/lib.rs` -- wire structs.
+- `engine/examples/editor-playtest/src/main.rs` -- runtime
   `RuntimeCharacter`, `PlayerAnim`, `draw_player`,
   `Playtest::can_stand_at`.
-- `emu/crates/frontend/src/editor_preview.rs` —
+- `emu/crates/frontend/src/editor_preview.rs` --
   `walk_player_spawn_preview` for the editor 3D viewport.
-- [`docs/editor-model-authoring.md`](editor-model-authoring.md) —
+- [`docs/editor-model-authoring.md`](editor-model-authoring.md) --
   Model resource shape (Characters layer on top of these).
-- [`docs/editor-architecture.md`](editor-architecture.md) —
+- [`docs/editor-architecture.md`](editor-architecture.md) --
   scene tree, selection, drag.

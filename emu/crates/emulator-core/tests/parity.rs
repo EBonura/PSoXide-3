@@ -31,13 +31,13 @@ fn bios_path() -> PathBuf {
 /// opcode the emulator doesn't yet decode.
 ///
 /// IRQ-handler bodies are aggregated into the pre-IRQ record only
-/// for *clean* IRQ entries — i.e. when we weren't already in any
+/// for *clean* IRQ entries -- i.e. when we weren't already in any
 /// exception handler before the step. This mirrors Redux's
 /// `debug.cc:235` early-return which triggers iff
 /// `!m_wasInISR && m_inISR && cause == 0`. Syscalls (cause=8) are
 /// recorded per-instruction, and IRQs taken from inside a syscall
 /// handler or immediately after an RFE (`was_in_isr` true) are
-/// also per-instruction — Redux's trace shows them as distinct
+/// also per-instruction -- Redux's trace shows them as distinct
 /// 2-3-cycle steps rather than the 2000+-cycle collapsed jumps.
 fn our_trace(
     bios: Vec<u8>,
@@ -64,7 +64,7 @@ fn our_trace(
                     Ok(r) => {
                         // Fold post-IRQ state forward as if the
                         // handler ran atomically. COP2 must come
-                        // along too — a GTE op tucked inside an
+                        // along too -- a GTE op tucked inside an
                         // IRQ handler is rare on real games but
                         // the BIOS does poke COP0/MTC2-style ops
                         // during init, and dropping the snapshot
@@ -104,7 +104,7 @@ fn redux_trace(n: u32) -> Vec<InstructionRecord> {
 /// second. See [`parity_oracle::cache`] for the file format.
 ///
 /// `PSOXIDE_PARITY_NO_CACHE=1` forces a fresh Redux run even when
-/// a cache exists — useful when tweaking the oracle Lua script.
+/// a cache exists -- useful when tweaking the oracle Lua script.
 fn redux_trace_cached(n: usize) -> Vec<InstructionRecord> {
     let bios_bytes = fs::read(bios_path()).expect("BIOS readable");
     let dir = cache::default_dir();
@@ -160,7 +160,7 @@ const COP2_CTL_NAMES: [&str; 32] = [
 /// Compare trace by trace. Return the index of the first mismatch,
 /// if any.
 ///
-/// Ignores `tick` — see notes in the top-of-file comment of the
+/// Ignores `tick` -- see notes in the top-of-file comment of the
 /// `InstructionRecord` and the session README about why.
 fn first_divergence(
     ours: &[InstructionRecord],
@@ -366,7 +366,7 @@ fn first_ten_million_steps_match_redux() {
 
 // Binary-search rungs between 10M and 50M. Once a 50M (or longer)
 // cache exists, these all resolve in ~1s instead of re-invoking
-// Redux — handy for localising a divergence without rebuilding
+// Redux -- handy for localising a divergence without rebuilding
 // the whole trace.
 
 #[test]
@@ -387,7 +387,7 @@ fn first_forty_million_steps_match_redux() {
     assert_parity_for_steps(40_000_000);
 }
 
-/// Probe past the next expected blocker — the BIOS reaches state 25
+/// Probe past the next expected blocker -- the BIOS reaches state 25
 /// of the CDROM-init state machine around step 99M. Use this to find
 /// what diverges next, then absorb into the ladder.
 #[test]

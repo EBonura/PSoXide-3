@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "PSoXide emulator core: CPU, bus, and peripherals. No UI, no window — pure state machine."
+description = "PSoXide emulator core: CPU, bus, and peripherals. No UI, no window -- pure state machine."
 
 [dependencies]
 psx-hw       = { workspace = true }
@@ -21,12 +21,12 @@ psoxide-settings = { workspace = true }
 [features]
 default = []
 # Record every MMIO read/write in a bounded ring buffer on the Bus.
-# Off by default — see `mmio_trace.rs` for why it's compile-time gated.
+# Off by default -- see `mmio_trace.rs` for why it's compile-time gated.
 trace-mmio = []
 # Snapshot all 64 GTE registers into every InstructionRecord. Required
 # by the parity tests, ~zero-cost when off (snapshot fn returns zeros
 # and gets inlined out). Leaving this on in `make run` regresses CPU
-# perf by ~30% — caught when the frontend got slow after this snapshot
+# perf by ~30% -- caught when the frontend got slow after this snapshot
 # work landed.
 trace-cop2 = []
 

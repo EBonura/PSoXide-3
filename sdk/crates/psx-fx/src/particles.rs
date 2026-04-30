@@ -8,7 +8,7 @@
 //! - Render as `RectFlat`s into an ordering table, with colour
 //!   and size tapering as TTL approaches zero.
 //!
-//! Const-generic pool size — each consumer picks what fits its
+//! Const-generic pool size -- each consumer picks what fits its
 //! scene budget:
 //!
 //! ```ignore
@@ -26,7 +26,7 @@ use crate::rng::LcgRng;
 /// One live particle.
 ///
 /// Positions are in screen-space pixels (i16). Velocities are
-/// Q4.4 sub-pixel — `vx = 32` means 2 px / frame. That keeps
+/// Q4.4 sub-pixel -- `vx = 32` means 2 px / frame. That keeps
 /// enough resolution for slow drift + fast bursts out of the
 /// same i16 channel.
 #[derive(Copy, Clone, Debug)]
@@ -39,7 +39,7 @@ pub struct Particle {
     pub vx: i16,
     /// Velocity along y, Q4.4 pixels/frame. Positive = downward.
     pub vy: i16,
-    /// Colour at spawn — the renderer scales this by
+    /// Colour at spawn -- the renderer scales this by
     /// `ttl / spawn_ttl` for a fade-out.
     pub r: u8,
     /// Green at spawn.
@@ -78,7 +78,7 @@ impl Particle {
 /// Fixed-capacity pool of `N` particles.
 ///
 /// Uses a linear search for free slots on spawn. `N` up to ~128
-/// is comfortably fast on a 33 MHz MIPS — if you're routinely
+/// is comfortably fast on a 33 MHz MIPS -- if you're routinely
 /// saturating a 256+ pool you want a proper object pool with a
 /// free-list, which lives at the engine layer.
 pub struct ParticlePool<const N: usize> {
@@ -142,7 +142,7 @@ impl<const N: usize> ParticlePool<N> {
     /// One simulation step for every live particle:
     /// - Position += velocity (Q4.4 integrated as `>> 4`).
     /// - `vy += gravity` (Q4.4, so 1 = 0.0625 px/frame² falling).
-    /// - `ttl -= 1` — particle expires when it hits zero.
+    /// - `ttl -= 1` -- particle expires when it hits zero.
     pub fn update(&mut self, gravity: i16) {
         for p in self.particles.iter_mut() {
             if p.ttl == 0 {
@@ -168,7 +168,7 @@ impl<const N: usize> ParticlePool<N> {
     ///
     /// `rects` must have space for all live particles; the function
     /// writes starting at index 0 and returns the number of rects
-    /// used — callers typically track a running `idx` and advance
+    /// used -- callers typically track a running `idx` and advance
     /// it by this value.
     ///
     /// `shake` is a per-frame vertex offset applied uniformly to
@@ -206,7 +206,7 @@ impl<const N: usize> ParticlePool<N> {
         written
     }
 
-    /// How many slots currently hold live particles. O(N) scan —
+    /// How many slots currently hold live particles. O(N) scan --
     /// useful for debugging budgets + tests, not hot-path code.
     pub fn live_count(&self) -> usize {
         self.particles.iter().filter(|p| p.ttl != 0).count()

@@ -1,4 +1,4 @@
-//! PSX hardware renderer — wgpu render pipeline that draws each
+//! PSX hardware renderer -- wgpu render pipeline that draws each
 //! GP0 primitive at the internal-resolution multiple of native PSX
 //! VRAM, producing fractional upscaling for free.
 //!
@@ -8,7 +8,7 @@
 //! texture (S = internal-resolution multiplier). PSX vertex coords
 //! map directly into this VRAM space; the display shown to the user
 //! is just a sub-rect read of the texture (the PSX `display_area`,
-//! scaled by S). This mirrors real hardware — the GPU draws into
+//! scaled by S). This mirrors real hardware -- the GPU draws into
 //! persistent VRAM and the CRT scans out a window of it.
 //!
 //! Consequences:
@@ -23,14 +23,14 @@
 //! - **One pipeline for everything.** The vertex shader divides by
 //!   constant `(1024, 512)` regardless of S. The wgpu viewport
 //!   tracks the texture's pixel dims, so density follows S
-//!   automatically — no shader maths changes when S does.
+//!   automatically -- no shader maths changes when S does.
 //!
 //! ## Sibling crates
 //!
-//! - `psx-gpu-compute` — compute-shader rasterizer that matches the
+//! - `psx-gpu-compute` -- compute-shader rasterizer that matches the
 //!   CPU rasterizer pixel-for-pixel; the parity oracle for the
 //!   shared decode path (`psx-gpu-compute::decode`).
-//! - `emulator-core` — owns `Gpu` (CPU rasterizer + VRAM + cmd_log)
+//! - `emulator-core` -- owns `Gpu` (CPU rasterizer + VRAM + cmd_log)
 //!   and `Bus`.
 
 pub mod from_ot;
@@ -50,7 +50,7 @@ use emulator_core::Gpu;
 /// target. The frontend creates one, calls [`HwRenderer::render_frame`]
 /// each frame, and the egui central panel reads
 /// [`HwRenderer::texture_id`] (paired with the display-area UV
-/// sub-rect — the renderer doesn't care about display size, only
+/// sub-rect -- the renderer doesn't care about display size, only
 /// the PSX-VRAM space the primitives live in).
 ///
 /// `wgpu::Device` and `wgpu::Queue` are internally reference-counted
@@ -80,7 +80,7 @@ pub enum ScaleMode {
 }
 
 impl HwRenderer {
-    /// Live constructor — registers the target with `egui_renderer`
+    /// Live constructor -- registers the target with `egui_renderer`
     /// so the central panel can paint it. Initial scale = 1; bump
     /// it via [`HwRenderer::set_internal_scale`] on toggle/resize.
     pub fn new(
@@ -99,7 +99,7 @@ impl HwRenderer {
         }
     }
 
-    /// Headless constructor — no surface, no egui registration.
+    /// Headless constructor -- no surface, no egui registration.
     /// Used by the parity harness and any CLI dump path.
     pub fn new_headless(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let pipeline = HwPipeline::new(&device);
@@ -143,7 +143,7 @@ impl HwRenderer {
 
     /// Reallocate the target to the requested internal scale. Cheap
     /// when unchanged. Reallocation clears the new texture to opaque
-    /// black; in-flight VRAM contents are lost — frontend may want
+    /// black; in-flight VRAM contents are lost -- frontend may want
     /// to flush a fresh full-frame redraw after toggling.
     pub fn set_internal_scale(
         &mut self,
@@ -155,7 +155,7 @@ impl HwRenderer {
     }
 
     /// Render one frame's `cmd_log` into the persistent VRAM target.
-    /// Always loads the existing texture — never clears — so PSX
+    /// Always loads the existing texture -- never clears -- so PSX
     /// VRAM-style persistence holds across frames. `vram_words` is
     /// the CPU rasterizer's VRAM (post-frame) which the fragment
     /// shader reads for textured primitives.
@@ -201,7 +201,7 @@ impl HwRenderer {
                     view: self.target.view(),
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // PSX VRAM is persistent — never clear.
+                        // PSX VRAM is persistent -- never clear.
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
@@ -475,7 +475,7 @@ impl HwRenderer {
     /// Synchronously read back the entire VRAM-shaped target as
     /// tightly-packed RGBA8 (sRGB color space, since `TARGET_FORMAT`
     /// is `Rgba8UnormSrgb`). Issues a blocking `device.poll(Wait)`
-    /// — for headless/parity use, never the per-frame loop.
+    /// -- for headless/parity use, never the per-frame loop.
     pub fn read_pixels_rgba8(&self) -> (u32, u32, Vec<u8>) {
         let (w, h) = self.target.size();
         self.read_subrect_rgba8(0, 0, w, h)

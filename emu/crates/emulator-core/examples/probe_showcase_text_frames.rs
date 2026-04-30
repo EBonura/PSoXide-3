@@ -1,7 +1,7 @@
 //! Side-load showcase-text and dump several frames to PPM.
 //!
 //! Renders frames where the rotation demo is at visually-
-//! different angles (frames 3, 10, 25, 42) — 42 is approximately
+//! different angles (frames 3, 10, 25, 42) -- 42 is approximately
 //! one full rotation at the showcase's 96 Q0.12 units/frame, so
 //! frame 42 should look nearly identical to frame 0 for the
 //! rotation component while the rest of the frame stays stable.

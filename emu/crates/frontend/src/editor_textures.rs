@@ -9,7 +9,7 @@
 //! Why procedural: real cooked textures from project PNGs land later
 //! once the editor's asset pipeline is hooked up end-to-end. Until
 //! then the preview already needs *something* in each material's
-//! tpage so the texture-tint render path is exercised — and for the
+//! tpage so the texture-tint render path is exercised -- and for the
 //! Sims-style build flow, "stone-vs-brick-vs-wood" patterns convey
 //! material identity better than flat colours.
 //!
@@ -17,7 +17,7 @@
 //!
 //! ```text
 //!   y = 0      ▶ 320×240 frame buffer (sub-rect the editor paints)
-//!   y = 0      ▶ tpages 5..15  — 4bpp 64×64 textures, one per material
+//!   y = 0      ▶ tpages 5..15  -- 4bpp 64×64 textures, one per material
 //!                packed left-to-right starting at x = 320
 //!   y = 480    ▶ CLUT row, 16 halfwords per palette
 //! ```
@@ -38,7 +38,7 @@ pub struct MaterialSlot {
     /// Packed `uv_clut_word` value the prim format wants in vertex
     /// 0's UV high half.
     pub clut_word: u16,
-    /// Texture dimensions in texels — handy for UV computation.
+    /// Texture dimensions in texels -- handy for UV computation.
     pub width: u8,
     pub height: u8,
 }
@@ -53,7 +53,7 @@ struct CacheEntry {
     slot: MaterialSlot,
     /// Path of the `.psxt` resource that produced this slot. Empty
     /// string when the material has no texture or the file couldn't
-    /// be read — then the slot holds a procedural fallback pattern.
+    /// be read -- then the slot holds a procedural fallback pattern.
     signature: String,
 }
 
@@ -62,13 +62,13 @@ struct CacheEntry {
 ///
 /// VRAM regions:
 ///
-/// * `y = 0`,  tpages 0..4   — framebuffer (editor paints x=0..320).
-/// * `y = 0`,  tpages 5..15  — 4bpp room material textures, 64×64
+/// * `y = 0`,  tpages 0..4   -- framebuffer (editor paints x=0..320).
+/// * `y = 0`,  tpages 5..15  -- 4bpp room material textures, 64×64
 ///   each, packed left-to-right.
-/// * `y = 256`, tpage row 1   — 8bpp model atlases, packed
+/// * `y = 256`, tpage row 1   -- 8bpp model atlases, packed
 ///   left-to-right by halfwords. Disjoint from the room region.
-/// * `y = 480`                — 4bpp CLUTs, 16 halfwords each.
-/// * `y = 481..`              — 8bpp CLUTs, 256 halfwords each.
+/// * `y = 480`                -- 4bpp CLUTs, 16 halfwords each.
+/// * `y = 481..`              -- 8bpp CLUTs, 256 halfwords each.
 ///
 /// Each Model resource maps to one cache entry keyed by its
 /// `ResourceId`; same for Material resources. The two halves of
@@ -101,7 +101,7 @@ pub struct EditorTextures {
 struct ModelAtlasCacheEntry {
     slot: MaterialSlot,
     /// Atlas path that produced this slot; empty when the model
-    /// has no atlas (no slot is uploaded in that case — entry
+    /// has no atlas (no slot is uploaded in that case -- entry
     /// just records the empty signature so we don't re-walk).
     signature: String,
 }
@@ -187,7 +187,7 @@ impl EditorTextures {
     /// tpage / CLUT slot. Returns `None` if the path is empty, the
     /// file can't be read, the blob fails to parse, or the depth
     /// is unsupported by the editor preview path (only 4bpp + 8bpp
-    /// indexed for now — the runtime supports 15bpp but editor's
+    /// indexed for now -- the runtime supports 15bpp but editor's
     /// procedural fallback covers any holes).
     fn upload_real_psxt(&mut self, path: &str, project_root: &Path) -> Option<MaterialSlot> {
         if path.is_empty() {
@@ -213,7 +213,7 @@ impl EditorTextures {
 
         // Pixel halfwords: copy raw little-endian bytes from
         // `pixel_bytes` into VRAM. The runtime path's
-        // `psx_vram::upload_bytes` does the same — we mirror it on
+        // `psx_vram::upload_bytes` does the same -- we mirror it on
         // host because the editor's `HwRenderer` reads VRAM as
         // halfwords through `R16Uint`.
         let halfwords_per_row = texture.halfwords_per_row() as usize;
@@ -272,7 +272,7 @@ impl EditorTextures {
 
     /// Stamp a name-keyed procedural pattern (brick / stone / wood /
     /// metal / glass / default checker) into the next free slot.
-    /// Always returns a valid slot — assumes the caller already
+    /// Always returns a valid slot -- assumes the caller already
     /// confirmed there's room.
     fn upload_procedural(&mut self, material_name: &str) -> MaterialSlot {
         let pattern = pattern_for_name(material_name);
@@ -367,7 +367,7 @@ impl EditorTextures {
         let bytes = std::fs::read(abs).ok()?;
         let texture = Texture::from_bytes(&bytes).ok()?;
         if texture.clut_entries() != 256 {
-            // Only 8bpp atlases supported in this region — 4bpp
+            // Only 8bpp atlases supported in this region -- 4bpp
             // model atlases would belong in the room-material
             // path which we leave alone here.
             return None;
@@ -390,7 +390,7 @@ impl EditorTextures {
         // current Wraith / Hooded Wretch atlases match).
         const HALFWORDS_PER_TPAGE: u16 = 64;
         if halfwords_per_row > HALFWORDS_PER_TPAGE {
-            // Wider than one tpage column — not addressable
+            // Wider than one tpage column -- not addressable
             // from a single primitive.
             return None;
         }
@@ -448,7 +448,7 @@ impl EditorTextures {
 
         // Advance to the next aligned slot. Each atlas consumes
         // one 64-halfword tpage column regardless of actual
-        // halfword stride — even a 32-halfword (64-pixel) atlas
+        // halfword stride -- even a 32-halfword (64-pixel) atlas
         // burns a whole column to keep the tpage_index math
         // self-contained.
         self.next_model_tpage_x = aligned_tpage_x.saturating_add(HALFWORDS_PER_TPAGE);
@@ -578,7 +578,7 @@ fn stone_pattern() -> ProceduralTexture {
             } else if lx == 15 || ly == 15 {
                 3 // highlight on the opposite edge
             } else {
-                // Speckle the interior so it's not flat — pseudo-
+                // Speckle the interior so it's not flat -- pseudo-
                 // random nibble derived from coords stays stable.
                 let h = ((x as u32).wrapping_mul(73) ^ (y as u32).wrapping_mul(151)) & 0x07;
                 if h < 2 {
@@ -625,7 +625,7 @@ fn glass_pattern() -> ProceduralTexture {
             let dx = (x as i32) - 32;
             let dy = (y as i32) - 32;
             let r = (dx * dx + dy * dy) as u32;
-            // Shade by distance to centre — soft cyan disc-like glow.
+            // Shade by distance to centre -- soft cyan disc-like glow.
             let nibble = (12u32.saturating_sub(r / 96)).min(12) as u8;
             pixels[y * 64 + x] = nibble;
         }
@@ -665,7 +665,7 @@ fn wood_pattern() -> ProceduralTexture {
             let nibble = if in_plank_y == 0 {
                 0 // plank seam
             } else {
-                // Grain — pseudo-random nibble per (plank, x); same
+                // Grain -- pseudo-random nibble per (plank, x); same
                 // x in same plank gives same value so vertical lines.
                 let seed = (plank as u32).wrapping_mul(31).wrapping_add(x as u32);
                 let h = (seed.wrapping_mul(2654435761) >> 28) as u8;
@@ -772,7 +772,7 @@ fn pack_tpage_word(tpage_index: u16, tpage_y_block: u16) -> u16 {
     (tpage_index & 0xF) | (tpage_y_block << 4) | (semi_trans << 5) | (depth << 7)
 }
 
-/// Same as `pack_tpage_word` but with the 8bpp depth bit set —
+/// Same as `pack_tpage_word` but with the 8bpp depth bit set --
 /// used for model atlas slots which always live in the 8bpp
 /// model VRAM region.
 fn pack_8bpp_tpage_word(tpage_index: u16, tpage_y_block: u16) -> u16 {
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(align_up_to(65, 64), 128);
         assert_eq!(align_up_to(127, 64), 128);
         assert_eq!(align_up_to(128, 64), 128);
-        // Boundary 0 is a no-op (defensive — the allocator
+        // Boundary 0 is a no-op (defensive -- the allocator
         // only ever passes 64).
         assert_eq!(align_up_to(33, 0), 33);
     }

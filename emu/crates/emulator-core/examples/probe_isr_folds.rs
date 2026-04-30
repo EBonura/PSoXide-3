@@ -100,7 +100,7 @@ fn main() {
 
     let mut redux_folds: Vec<(u64, u64, u64)> = Vec::new();
     let mut prev = if trace.is_empty() { 0 } else { trace[0].tick };
-    // We want Redux's tick BEFORE the first trace step — that's
+    // We want Redux's tick BEFORE the first trace step -- that's
     // "our_tick_at_start" which is known from ours since both
     // emulators are in lockstep at that point.
     // Skip the first; can't compute delta without prior.

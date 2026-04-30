@@ -5,7 +5,7 @@
 //!
 //! The goal is to turn "pixel (210, 26) at step 900M differs from
 //! Redux by a few shading units" into "command 52731 was a textured-
-//! Gouraud triangle with CLUT at X,Y and tint RGB X,Y,Z" — so the
+//! Gouraud triangle with CLUT at X,Y and tint RGB X,Y,Z" -- so the
 //! divergence can be traced to a specific input rather than guessed
 //! at from the resulting pixel color.
 //!
@@ -16,7 +16,7 @@
 //! cargo run -p emulator-core --example probe_pixel_trace --release -- 900000000 210 26
 //! ```
 //!
-//! The coordinates are in DISPLAY space (not VRAM) — they're shifted
+//! The coordinates are in DISPLAY space (not VRAM) -- they're shifted
 //! into VRAM via the current `display_area()` before lookup.
 
 #[path = "support/disc.rs"]
@@ -103,7 +103,7 @@ fn main() {
         }
     }
 
-    // Also dump the 5 commands before and after — useful when the
+    // Also dump the 5 commands before and after -- useful when the
     // divergence is actually a neighbour's bleed / overwrite.
     let owner_idx = bus
         .gpu
@@ -113,7 +113,7 @@ fn main() {
         println!();
         println!("--- Nearby commands (opcode + first FIFO word) ---");
         // Widened from 5 to 40 so we can see whether text / logo
-        // primitives follow the bar background — if they do, we're
+        // primitives follow the bar background -- if they do, we're
         // drawing them but getting the blend wrong; if they don't,
         // the game code never issued them.
         let lo = (idx - 5).max(0);
@@ -130,7 +130,7 @@ fn main() {
             );
         }
         // Also scan AHEAD for any primitives that should draw ON TOP
-        // of this pixel's triangle — they'd cover our bar with the
+        // of this pixel's triangle -- they'd cover our bar with the
         // "NAUGHTY DOG" logo / Crash portrait. If none exist, the
         // game code never emitted them (CPU-side bug). If they
         // exist but we got nothing visible, the renderer is
@@ -144,7 +144,7 @@ fn main() {
             let e = &bus.gpu.cmd_log[i as usize];
             *histogram.entry(e.opcode).or_insert(0) += 1;
             if !matches!(e.opcode, 0x30..=0x33 | 0x38..=0x3B) {
-                // Non-shaded-tri/quad — log the first 10 of these.
+                // Non-shaded-tri/quad -- log the first 10 of these.
                 if non_shaded_tri_count < 10 {
                     println!(
                         "    idx={:>7}  op=0x{:02x}  word[0]=0x{:08x}  ({})",
@@ -165,7 +165,7 @@ fn main() {
 
         // Walk backwards from the owning draw to find the most-recent
         // state packet of each type. This reconstructs the exact GPU
-        // state in effect when the draw happened — essential context
+        // state in effect when the draw happened -- essential context
         // for reproducing the draw in isolation.
         println!();
         println!("--- GPU state context at owning draw ---");
@@ -418,7 +418,7 @@ fn decode_packet(op: u8, fifo: &[u32]) {
             }
         }
         0x38..=0x3B => {
-            // Shaded quad: 8 words — same pattern as shaded tri, 4 vtx.
+            // Shaded quad: 8 words -- same pattern as shaded tri, 4 vtx.
             if fifo.len() >= 8 {
                 for i in 0..4 {
                     let (c, v) = if i == 0 {

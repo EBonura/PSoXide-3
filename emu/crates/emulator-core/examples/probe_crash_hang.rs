@@ -1,7 +1,7 @@
 //! Boot Crash Bandicoot end-to-end with SPU pumping and report
 //! where the CPU spends its time. If execution hangs on a tight
 //! loop (the "stops after PS logo" symptom), this shows the hot
-//! PC range — usually the game is polling an MMIO register we're
+//! PC range -- usually the game is polling an MMIO register we're
 //! returning the wrong value for.
 //!
 //! Usage:

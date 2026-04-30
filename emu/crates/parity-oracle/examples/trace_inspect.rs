@@ -1,6 +1,6 @@
 //! Dump cached Redux trace records around a specific step. Used to
 //! understand what Redux was doing a few instructions before a
-//! parity divergence surfaces — registers, PC, instructions.
+//! parity divergence surfaces -- registers, PC, instructions.
 //!
 //! ```bash
 //! cargo run --example trace_inspect --release -- 19258368 20

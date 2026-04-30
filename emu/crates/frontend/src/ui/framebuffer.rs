@@ -14,7 +14,7 @@ const DEFAULT_FB_HEIGHT: f32 = 240.0;
 
 /// CRT display aspect ratio for NTSC. The visible area is 4:3
 /// regardless of which horizontal-resolution mode the game picks
-/// (256/320/368/384/512/640) — a 512×240 frame is supposed to
+/// (256/320/368/384/512/640) -- a 512×240 frame is supposed to
 /// squash horizontally on a real CRT, not stretch into 16:9.
 const CRT_ASPECT: f32 = 4.0 / 3.0;
 

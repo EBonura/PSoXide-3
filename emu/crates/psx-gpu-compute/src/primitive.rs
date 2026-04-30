@@ -8,7 +8,7 @@
 use bytemuck::{Pod, Zeroable};
 
 /// Drawing-area clip rectangle that the rasterizer applies to every
-/// primitive. Inclusive on all four sides — matches the CPU rasterizer
+/// primitive. Inclusive on all four sides -- matches the CPU rasterizer
 /// (`draw_area_left..=draw_area_right`, `draw_area_top..=draw_area_bottom`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -30,7 +30,7 @@ impl DrawArea {
     }
 }
 
-/// PSX semi-transparency mode — wire-compatible with the values the
+/// PSX semi-transparency mode -- wire-compatible with the values the
 /// CPU rasterizer's `BlendMode` enum decodes from GP0 0xE1 / tpage
 /// bits 5-6. The shader expects the encoded `u32` form below; the
 /// `as u32` cast on the enum gives the right value automatically.
@@ -74,7 +74,7 @@ bitflags::bitflags! {
         /// written pixel.
         const MASK_SET = 1 << 2;
         /// Raw-texture primitive (cmd-bit-0 set). Skip the per-pixel
-        /// `modulate_tint` step — the texel is written through as-is.
+        /// `modulate_tint` step -- the texel is written through as-is.
         /// Equivalent to passing `RAW_TEXTURE_TINT = (0x80,0x80,0x80)`
         /// to `modulate_tint`, which is the identity case, but the
         /// shader skips the multiply for clarity and a tiny perf win.
@@ -124,7 +124,7 @@ pub struct MonoTri {
     pub bbox_min: [i32; 2],
     pub bbox_max: [i32; 2],
     /// 15-bit BGR color in the low 16 bits; bit 15 is interpreted by
-    /// the shader the same way the CPU rasterizer does — for an
+    /// the shader the same way the CPU rasterizer does -- for an
     /// opaque mono primitive it ends up in the output pixel
     /// regardless (`(r as u16) | (g << 5) | (b << 10) | (fg & 0x8000)`).
     pub color: u32,
@@ -134,7 +134,7 @@ pub struct MonoTri {
 }
 
 impl MonoTri {
-    /// Opaque triangle — the simplest case. No mask handling, no
+    /// Opaque triangle -- the simplest case. No mask handling, no
     /// blending. Bounding box is computed automatically.
     pub fn opaque(v0: (i32, i32), v1: (i32, i32), v2: (i32, i32), color_bgr15: u16) -> Self {
         Self::new(
@@ -147,7 +147,7 @@ impl MonoTri {
         )
     }
 
-    /// Full constructor — set any combination of [`PrimFlags`] and
+    /// Full constructor -- set any combination of [`PrimFlags`] and
     /// pick a [`BlendMode`] (only used when `SEMI_TRANS` is set).
     pub fn new(
         v0: (i32, i32),
@@ -327,7 +327,7 @@ pub struct MonoRect {
 }
 
 impl MonoRect {
-    /// Opaque rectangle — no semi-trans, no mask. Width / height of
+    /// Opaque rectangle -- no semi-trans, no mask. Width / height of
     /// zero are dropped (the dispatcher handles this).
     pub fn opaque(xy: (i32, i32), wh: (u32, u32), color_bgr15: u16) -> Self {
         Self::new(xy, wh, color_bgr15, PrimFlags::empty(), BlendMode::Average)
@@ -352,7 +352,7 @@ impl MonoRect {
 
 /// Textured rectangle (`GP0 0x64..=0x67`, plus fixed-size variants).
 /// Direct (U, V) blit from the active tpage with optional X/Y flip
-/// from GP0 0xE1 bits 12/13. Tile coords step linearly — no UV
+/// from GP0 0xE1 bits 12/13. Tile coords step linearly -- no UV
 /// interpolation, so parity vs the CPU rasterizer is bit-exact.
 ///
 /// WGSL counterpart in `shaders/tex_rect.wgsl`.
@@ -361,7 +361,7 @@ impl MonoRect {
 pub struct TexRect {
     pub xy: [i32; 2],
     pub wh: [u32; 2],
-    /// `u_base | (v_base << 8)` — the top-left UV (or bottom-right
+    /// `u_base | (v_base << 8)` -- the top-left UV (or bottom-right
     /// if FLIP_X / FLIP_Y are set, since the flip happens *around*
     /// the base).
     pub uv: u32,
@@ -369,7 +369,7 @@ pub struct TexRect {
     pub clut_y: u32,
     pub tint: u32,
     /// PrimFlags + (BlendMode << 8). FLIP_X / FLIP_Y are extra bits
-    /// in the same field — see [`PrimFlags`].
+    /// in the same field -- see [`PrimFlags`].
     pub flags: u32,
     /// Padding to bring the struct to 48 bytes (16-byte aligned for
     /// uniform buffers). Pinned by `tex_rect_struct_pinned_at_48`.
@@ -473,7 +473,7 @@ impl ShadedTri {
 /// UV + per-vertex 24-bit tint. Texture is sampled per pixel, then
 /// modulated by the barycentrically-interpolated tint. With dither
 /// enabled the modulation runs in 8-bit space and dithers down to
-/// 5-bit BGR15 — matches `emulator-core::modulate_tint_dithered`.
+/// 5-bit BGR15 -- matches `emulator-core::modulate_tint_dithered`.
 ///
 /// WGSL counterpart in `shaders/shaded_tex_tri.wgsl`.
 #[repr(C)]
@@ -626,7 +626,7 @@ impl TexQuadBilinear {
     /// Test whether a 4-vertex textured quad's geometry matches the
     /// axis-aligned shape the CPU's fast path expects. Vertex order
     /// (top-left, top-right, bottom-left, bottom-right) is what the
-    /// CPU's check assumes — see `Gpu::draw_textured_quad`.
+    /// CPU's check assumes -- see `Gpu::draw_textured_quad`.
     pub fn is_axis_aligned(v0: (i32, i32), v1: (i32, i32), v2: (i32, i32), v3: (i32, i32)) -> bool {
         v0.1 == v1.1 && v2.1 == v3.1 && v0.0 == v2.0 && v1.0 == v3.0
     }
@@ -652,7 +652,7 @@ impl TexQuadBilinear {
 /// Quick fill (`GP0 0x02`). Writes a single 15bpp colour into a
 /// rectangle, ignoring drawing-area, drawing-offset, mask-check,
 /// mask-set, and semi-trans. The hardware clamps `x`/`w` to 16-pixel
-/// alignment — the host should mask before constructing this.
+/// alignment -- the host should mask before constructing this.
 ///
 /// WGSL counterpart in `shaders/fill.wgsl`.
 #[repr(C)]
@@ -662,7 +662,7 @@ pub struct Fill {
     pub xy: [u32; 2],
     /// Size, w in [0..1023] aligned to 16, h in [0..511].
     pub wh: [u32; 2],
-    /// 15bpp BGR colour. Bit 15 is written as-is — caller must
+    /// 15bpp BGR colour. Bit 15 is written as-is -- caller must
     /// mask if they need the bit clear.
     pub color: u32,
     pub _pad: [u32; 3],
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn tex_tri_struct_is_16_byte_aligned_and_pinned() {
-        // Pin the struct size — if it ever changes, the WGSL struct
+        // Pin the struct size -- if it ever changes, the WGSL struct
         // in tex_tri.wgsl needs an explicit update.
         assert_eq!(std::mem::size_of::<TexTri>() % 16, 0);
         assert_eq!(std::mem::size_of::<TexTri>(), 80);
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn shaded_tex_tri_struct_pinned_at_80() {
-        // Same 80-byte size as TexTri — they pack the same fields
+        // Same 80-byte size as TexTri -- they pack the same fields
         // count: positions + bbox + 3 colours + 3 UVs + flags +
         // clut + 1 pad = 80.
         assert_eq!(std::mem::size_of::<ShadedTexTri>() % 16, 0);

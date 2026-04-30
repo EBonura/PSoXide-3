@@ -1,4 +1,4 @@
-//! GTE — Geometry Transformation Engine (COP2).
+//! GTE -- Geometry Transformation Engine (COP2).
 //!
 //! 32 data registers + 32 control registers, all in fixed-point.
 //! Vertices and matrix elements are signed 1.3.12 (`i16` × 1/4096);
@@ -12,7 +12,7 @@
 //! geometry that would otherwise wrap or clip incorrectly.
 //!
 //! The division used by `RTPS`/`RTPT` is the documented unsigned
-//! Newton-Raphson iteration off a 257-entry seed table — keeping the
+//! Newton-Raphson iteration off a 257-entry seed table -- keeping the
 //! exact PSX algorithm matters because games consume the resulting
 //! `SX2`/`SY2` values directly and any drift moves vertices on screen.
 //!
@@ -28,10 +28,10 @@ use core::cmp;
 /// `cv`). Stored only so call sites read as data, never as parsing.
 #[derive(Copy, Clone)]
 struct Cmd {
-    /// `sf` — fraction shift. `false` = no shift, `true` = shift the
+    /// `sf` -- fraction shift. `false` = no shift, `true` = shift the
     /// 44-bit MAC result right arithmetically by 12 before truncating.
     sf: bool,
-    /// `lm` — IR1..3 saturation lower bound. `false` = -0x8000,
+    /// `lm` -- IR1..3 saturation lower bound. `false` = -0x8000,
     /// `true` = 0. Used by NCDS / CC / etc. to clamp negative
     /// intermediate components into the unsigned color range.
     lm: bool,
@@ -98,40 +98,40 @@ mod flag {
 /// pack and unpack these into 32-bit views.
 pub struct Gte {
     // Data registers ----------------------------------------------------
-    /// V0, V1, V2 — input vertex vectors (X, Y, Z), signed 1.3.12.
+    /// V0, V1, V2 -- input vertex vectors (X, Y, Z), signed 1.3.12.
     v: [[i16; 3]; 3],
-    /// RGBC — packed [R, G, B, CODE]. CODE is the texpage / blending
+    /// RGBC -- packed [R, G, B, CODE]. CODE is the texpage / blending
     /// hint; preserved through color-FIFO pushes.
     rgbc: [u8; 4],
-    /// OTZ — average Z written by AVSZ3/AVSZ4, unsigned 16-bit.
+    /// OTZ -- average Z written by AVSZ3/AVSZ4, unsigned 16-bit.
     otz: u16,
-    /// IR0 — scalar accumulator written by INTPL/DPCS/RTPS. Saturates
+    /// IR0 -- scalar accumulator written by INTPL/DPCS/RTPS. Saturates
     /// to 0..0x1000.
     ir0: i16,
-    /// IR1, IR2, IR3 — vector accumulators. Saturate to ±0x7FFF
+    /// IR1, IR2, IR3 -- vector accumulators. Saturate to ±0x7FFF
     /// (lm=0) or 0..0x7FFF (lm=1).
     ir: [i16; 3],
-    /// SXY FIFO — three slots of (SX, SY) ∈ -1024..1023, plus a
+    /// SXY FIFO -- three slots of (SX, SY) ∈ -1024..1023, plus a
     /// virtual "P" slot at index 3 that aliases SXY2 on read and
     /// rotates the FIFO on write.
     sxy: [[i16; 2]; 3],
-    /// SZ FIFO — four slots of unsigned 16-bit Z. New Z values land
+    /// SZ FIFO -- four slots of unsigned 16-bit Z. New Z values land
     /// at SZ3 and shift the prior contents toward SZ0.
     sz: [u16; 4],
-    /// RGB FIFO — three slots of [R, G, B, CODE]. RTPS-family ops
+    /// RGB FIFO -- three slots of [R, G, B, CODE]. RTPS-family ops
     /// push the latest RGBC through here.
     rgb_fifo: [[u8; 4]; 3],
     /// Reserved word at data-reg 23. Round-trips writes (some games
     /// cache values here knowing the PS1 leaves it untouched).
     res1: u32,
-    /// MAC0 — scalar 32-bit accumulator (e.g. perspective math).
+    /// MAC0 -- scalar 32-bit accumulator (e.g. perspective math).
     mac0: i32,
-    /// MAC1, MAC2, MAC3 — 32-bit truncations of the 44-bit vector
+    /// MAC1, MAC2, MAC3 -- 32-bit truncations of the 44-bit vector
     /// accumulators.
     mac: [i32; 3],
-    /// LZCS / LZCR — leading-zero counter input / result. Writing
+    /// LZCS / LZCR -- leading-zero counter input / result. Writing
     /// LZCS recomputes LZCR; reads of LZCR return the cached value.
-    /// At reset both are zero — LZCR is *not* eagerly seeded to 32
+    /// At reset both are zero -- LZCR is *not* eagerly seeded to 32
     /// (the canonical lzcnt of LZCS=0). Real software always writes
     /// LZCS before reading LZCR, but the parity oracle (PCSX-Redux)
     /// snapshots raw register storage which is `memset(0)` on boot,
@@ -148,7 +148,7 @@ pub struct Gte {
     light: [[i16; 3]; 3],
     /// Background color BK = (RBK, GBK, BBK), signed 19.12. Stored as
     /// 32-bit but only 32 bits round-trip; the documented field width
-    /// is "any" — the constraint comes from the math (44-bit MAC).
+    /// is "any" -- the constraint comes from the math (44-bit MAC).
     bg_color: [i32; 3],
     /// Light-color matrix LCM, signed 1.3.12.
     light_color: [[i16; 3]; 3],
@@ -158,17 +158,17 @@ pub struct Gte {
     ofx: i32,
     /// Screen-offset Y, signed 15.16.
     ofy: i32,
-    /// H — projection plane distance. Unsigned 16-bit; consumed by the
+    /// H -- projection plane distance. Unsigned 16-bit; consumed by the
     /// RTPS divisor.
     h: u16,
-    /// DQA — depth-cue interpolation coefficient A, signed 7.8.
+    /// DQA -- depth-cue interpolation coefficient A, signed 7.8.
     dqa: i16,
-    /// DQB — depth-cue interpolation bias B, signed 7.24.
+    /// DQB -- depth-cue interpolation bias B, signed 7.24.
     dqb: i32,
-    /// ZSF3, ZSF4 — averaging weights for AVSZ3/AVSZ4, signed 0.12.
+    /// ZSF3, ZSF4 -- averaging weights for AVSZ3/AVSZ4, signed 0.12.
     zsf3: i16,
     zsf4: i16,
-    /// FLAG — error/saturation bits. Bit 31 is the OR of [`flag::ERROR_MASK`].
+    /// FLAG -- error/saturation bits. Bit 31 is the OR of [`flag::ERROR_MASK`].
     flag: u32,
     /// Diagnostic command counter. This deliberately does not drive
     /// timing yet; it lets frontends report GTE pressure separately
@@ -226,7 +226,7 @@ fn gte_command_cycles(opcode: u8) -> Option<u8> {
 }
 
 impl Gte {
-    /// Construct a freshly-reset GTE — all registers cleared. Real
+    /// Construct a freshly-reset GTE -- all registers cleared. Real
     /// hardware powers on with garbage, but the BIOS zeroes the lot
     /// before first use, so we save a redundant write by starting
     /// clean.
@@ -292,7 +292,7 @@ impl Gte {
             11 => sign_extend_16(self.ir[2]),
             12 => pack_xy_i16(self.sxy[0][0], self.sxy[0][1]),
             13 => pack_xy_i16(self.sxy[1][0], self.sxy[1][1]),
-            // SXY2 and SXYP both read SXY2 — only their write semantics
+            // SXY2 and SXYP both read SXY2 -- only their write semantics
             // differ.
             14 | 15 => pack_xy_i16(self.sxy[2][0], self.sxy[2][1]),
             16 => self.sz[0] as u32,
@@ -355,7 +355,7 @@ impl Gte {
                 let (x, y) = unpack_xy_i16(value);
                 self.sxy[2] = [x, y];
             }
-            // SXYP — push: SXY1 → SXY0, SXY2 → SXY1, value → SXY2.
+            // SXYP -- push: SXY1 → SXY0, SXY2 → SXY1, value → SXY2.
             15 => {
                 let (x, y) = unpack_xy_i16(value);
                 self.sxy[0] = self.sxy[1];
@@ -374,7 +374,7 @@ impl Gte {
             25 => self.mac[0] = value as i32,
             26 => self.mac[1] = value as i32,
             27 => self.mac[2] = value as i32,
-            // IRGB write — unpack 5:5:5 and replicate into IR1..3 with
+            // IRGB write -- unpack 5:5:5 and replicate into IR1..3 with
             // each component shifted up by 7 (so 5-bit 31 → 0xF80).
             28 => {
                 let r = (value & 0x1F) as i16;
@@ -521,7 +521,7 @@ impl Gte {
 
     /// Execute one COP2 function. `instr` is the full 32-bit
     /// instruction word so we can pull `sf`/`lm`/`mx`/`vx`/`cv`.
-    /// Unrecognised commands return without updating state — real
+    /// Unrecognised commands return without updating state -- real
     /// hardware decodes them as nops, which matches what we observe
     /// in PCSX-Redux's interpreter.
     pub fn execute(&mut self, instr: u32) {
@@ -560,7 +560,7 @@ impl Gte {
             0x3F => self.op_ncct(cmd),
             _ => {
                 // Real GTE silently ignores undefined commands. We
-                // mirror that — the BIOS shouldn't issue any but
+                // mirror that -- the BIOS shouldn't issue any but
                 // games occasionally encode trailing instruction words
                 // with stray COP2 patterns.
             }
@@ -572,7 +572,7 @@ impl Gte {
     // Operations
     // ------------------------------------------------------------------
 
-    /// `RTPS` — perspective transformation of `V[idx]`. When `last` is
+    /// `RTPS` -- perspective transformation of `V[idx]`. When `last` is
     /// true, also updates IR0/MAC0 from DQA/DQB (so `RTPT` can call
     /// this for the first two vertices with `last=false`).
     fn op_rtps(&mut self, cmd: Cmd, idx: usize, last: bool) {
@@ -589,7 +589,7 @@ impl Gte {
         self.ir[0] = self.saturate_ir(1, mac1, cmd.lm);
         self.ir[1] = self.saturate_ir(2, mac2, cmd.lm);
         // IR3 quirk: the saturation flag is checked against the
-        // pre-shift value when sf=0 — same value, but using a
+        // pre-shift value when sf=0 -- same value, but using a
         // different lm choice (always lm=false). The IR3 storage
         // itself uses cmd.lm. Matches Redux.
         let ir3_flag_value = if cmd.sf {
@@ -636,14 +636,14 @@ impl Gte {
         }
     }
 
-    /// `RTPT` — perspective transform of all three vectors.
+    /// `RTPT` -- perspective transform of all three vectors.
     fn op_rtpt(&mut self, cmd: Cmd) {
         self.op_rtps(cmd, 0, false);
         self.op_rtps(cmd, 1, false);
         self.op_rtps(cmd, 2, true);
     }
 
-    /// `NCLIP` — normal clipping. Computes the Z component of the
+    /// `NCLIP` -- normal clipping. Computes the Z component of the
     /// cross-product `(SXY1 - SXY0) × (SXY2 - SXY0)` to determine
     /// front/back facing.
     ///
@@ -659,7 +659,7 @@ impl Gte {
         self.mac0 = self.check_mac0(result);
     }
 
-    /// `OP` — outer product of IR vector with the diagonal of the
+    /// `OP` -- outer product of IR vector with the diagonal of the
     /// rotation matrix. Produces a vector cross-product variant used
     /// for normal generation.
     fn op_op(&mut self, cmd: Cmd) {
@@ -681,7 +681,7 @@ impl Gte {
         self.ir[2] = self.saturate_ir(3, self.mac[2], cmd.lm);
     }
 
-    /// `MVMVA` — multiply matrix by vector and add translation. Both
+    /// `MVMVA` -- multiply matrix by vector and add translation. Both
     /// the matrix, the vector, and the translation are selected by
     /// command bits.
     fn op_mvmva(&mut self, cmd: Cmd) {
@@ -730,7 +730,7 @@ impl Gte {
         }
     }
 
-    /// `SQR` — square the IR vector. `MAC = IR * IR`, IR = saturate(MAC).
+    /// `SQR` -- square the IR vector. `MAC = IR * IR`, IR = saturate(MAC).
     fn op_sqr(&mut self, cmd: Cmd) {
         let sf = cmd.shift();
         for i in 0..3 {
@@ -741,7 +741,7 @@ impl Gte {
         }
     }
 
-    /// `AVSZ3` — average of three Z values in the FIFO. `OTZ = ZSF3 *
+    /// `AVSZ3` -- average of three Z values in the FIFO. `OTZ = ZSF3 *
     /// (SZ1 + SZ2 + SZ3) >> 12`, saturated to 0..0xFFFF.
     fn op_avsz3(&mut self) {
         let sum = (self.sz[1] as i64) + (self.sz[2] as i64) + (self.sz[3] as i64);
@@ -750,7 +750,7 @@ impl Gte {
         self.otz = self.saturate_otz(mac0 >> 12);
     }
 
-    /// `AVSZ4` — average of all four Z values. Same shape as AVSZ3.
+    /// `AVSZ4` -- average of all four Z values. Same shape as AVSZ3.
     fn op_avsz4(&mut self) {
         let sum =
             (self.sz[0] as i64) + (self.sz[1] as i64) + (self.sz[2] as i64) + (self.sz[3] as i64);
@@ -759,7 +759,7 @@ impl Gte {
         self.otz = self.saturate_otz(mac0 >> 12);
     }
 
-    /// `DPCS` — depth-cue colour single. Interpolates the current RGBC
+    /// `DPCS` -- depth-cue colour single. Interpolates the current RGBC
     /// toward the far colour using IR0 as the blend factor. `is_dpct`
     /// distinguishes the variant that pushes RGB FIFO state instead of
     /// reading from RGBC.
@@ -794,7 +794,7 @@ impl Gte {
         self.push_color_from_mac(cmd);
     }
 
-    /// `DPCT` — depth cue triple: DPCS run three times against the
+    /// `DPCT` -- depth cue triple: DPCS run three times against the
     /// RGB FIFO.
     fn op_dpct(&mut self, cmd: Cmd) {
         for _ in 0..3 {
@@ -802,7 +802,7 @@ impl Gte {
         }
     }
 
-    /// `INTPL` — interpolate IR vector toward FC by IR0.
+    /// `INTPL` -- interpolate IR vector toward FC by IR0.
     fn op_intpl(&mut self, cmd: Cmd) {
         let sf = cmd.shift();
         let fc = self.far_color;
@@ -821,11 +821,11 @@ impl Gte {
         self.push_color_from_mac(cmd);
     }
 
-    /// `NCS` — normal colour single. Lights `V[idx]` against the LLM,
+    /// `NCS` -- normal colour single. Lights `V[idx]` against the LLM,
     /// then colours via LCM. Unlike NCCS/NCDS/CC, this opcode does
     /// not modulate the result by RGBC.
     ///
-    /// Stage 1 formula per PSX-SPX: `MAC = (LLM × V) >> (sf×12)` —
+    /// Stage 1 formula per PSX-SPX: `MAC = (LLM × V) >> (sf×12)` --
     /// *no* BK bias. (The previous implementation added BK in both
     /// stages and overcounted the bias.) Stage 2 is where BK bias
     /// belongs: `MAC = (BK<<12 + LCM × IR) >> (sf×12)`.
@@ -855,17 +855,17 @@ impl Gte {
         self.push_color_from_mac(cmd);
     }
 
-    /// `NCT` — NCS for V0, V1, V2.
+    /// `NCT` -- NCS for V0, V1, V2.
     fn op_nct(&mut self, cmd: Cmd) {
         for i in 0..3 {
             self.op_ncs(cmd, i);
         }
     }
 
-    /// `NCDS` — normal colour depth-cue single. Like NCS but with the
+    /// `NCDS` -- normal colour depth-cue single. Like NCS but with the
     /// final colour interpolated toward FC by IR0.
     ///
-    /// Stage-1 BK bias removed — see [`Gte::op_ncs`] for the rationale.
+    /// Stage-1 BK bias removed -- see [`Gte::op_ncs`] for the rationale.
     fn op_ncds(&mut self, cmd: Cmd, idx: usize) {
         let sf = cmd.shift();
         let v = self.v[idx];
@@ -907,17 +907,17 @@ impl Gte {
         self.push_color_from_mac(cmd);
     }
 
-    /// `NCDT` — NCDS for V0, V1, V2.
+    /// `NCDT` -- NCDS for V0, V1, V2.
     fn op_ncdt(&mut self, cmd: Cmd) {
         for i in 0..3 {
             self.op_ncds(cmd, i);
         }
     }
 
-    /// `NCCS` — normal colour single (no depth cue, but colour multiplied
+    /// `NCCS` -- normal colour single (no depth cue, but colour multiplied
     /// against the input RGBC).
     ///
-    /// Stage-1 BK bias removed — see [`Gte::op_ncs`] for the rationale.
+    /// Stage-1 BK bias removed -- see [`Gte::op_ncs`] for the rationale.
     fn op_nccs(&mut self, cmd: Cmd, idx: usize) {
         let sf = cmd.shift();
         let v = self.v[idx];
@@ -958,7 +958,7 @@ impl Gte {
         }
     }
 
-    /// `CC` — colour-colour: blend RGBC against IR using the LCM and
+    /// `CC` -- colour-colour: blend RGBC against IR using the LCM and
     /// background-colour bias.
     fn op_cc(&mut self, cmd: Cmd) {
         let sf = cmd.shift();
@@ -985,7 +985,7 @@ impl Gte {
         self.push_color_from_mac(cmd);
     }
 
-    /// `CDP` — colour depth-queue: same as CC but with FC interpolation.
+    /// `CDP` -- colour depth-queue: same as CC but with FC interpolation.
     fn op_cdp(&mut self, cmd: Cmd) {
         let sf = cmd.shift();
         let n = self.ir;
@@ -1017,7 +1017,7 @@ impl Gte {
         self.push_color_from_mac(cmd);
     }
 
-    /// `DCPL` — depth-cue color light. Interpolate `RGBC * IR` toward
+    /// `DCPL` -- depth-cue color light. Interpolate `RGBC * IR` toward
     /// FC by IR0, with no LCM stage.
     fn op_dcpl(&mut self, cmd: Cmd) {
         let sf = cmd.shift();
@@ -1041,7 +1041,7 @@ impl Gte {
         self.push_color_from_mac(cmd);
     }
 
-    /// `GPF` — general-purpose interpolation. `MAC = IR * IR0`, then
+    /// `GPF` -- general-purpose interpolation. `MAC = IR * IR0`, then
     /// IR/RGB push.
     fn op_gpf(&mut self, cmd: Cmd) {
         let sf = cmd.shift();
@@ -1053,7 +1053,7 @@ impl Gte {
         self.push_color_from_mac(cmd);
     }
 
-    /// `GPL` — general-purpose interpolation with base. `MAC = MAC + IR * IR0`.
+    /// `GPL` -- general-purpose interpolation with base. `MAC = MAC + IR * IR0`.
     fn op_gpl(&mut self, cmd: Cmd) {
         let sf = cmd.shift();
         for i in 0..3 {
@@ -1142,7 +1142,7 @@ impl Gte {
         sat as i16
     }
 
-    /// Like [`saturate_ir`] but only sets the flag — does not store.
+    /// Like [`saturate_ir`] but only sets the flag -- does not store.
     /// Used when the flag for one IR slot needs to reflect a different
     /// value than the one stored (RTPS IR3 quirk, MVMVA-FC quirk).
     fn saturate_ir_flag_only(&mut self, idx: u8, value: i32, lm: bool) -> i16 {
@@ -1301,7 +1301,7 @@ impl Gte {
             2 => self.light_color,
             // mx=3 is the documented "garbage matrix" (PSX-SPX: GTE
             // Opcodes Summary). Row 0 col 2 is **IR0** (data reg 8),
-            // not IR1 — catching this was why `mvmva_mx3_garbage_matrix`
+            // not IR1 -- catching this was why `mvmva_mx3_garbage_matrix`
             // got added. Rows 1 and 2 replicate RT[0][2] and RT[1][1]
             // across all three columns.
             _ => {
@@ -1451,7 +1451,7 @@ mod tests {
         g.write_data(12, pack_xy_i16(1, 2)); // SXY0
         g.write_data(13, pack_xy_i16(3, 4)); // SXY1
         g.write_data(14, pack_xy_i16(5, 6)); // SXY2
-        g.write_data(15, pack_xy_i16(7, 8)); // SXYP — pushes
+        g.write_data(15, pack_xy_i16(7, 8)); // SXYP -- pushes
         assert_eq!(g.read_data(12), pack_xy_i16(3, 4));
         assert_eq!(g.read_data(13), pack_xy_i16(5, 6));
         assert_eq!(g.read_data(14), pack_xy_i16(7, 8));
@@ -1463,7 +1463,7 @@ mod tests {
         g.write_data(30, 0x0000_FFFF);
         assert_eq!(g.read_data(31), 16);
         g.write_data(30, 0xFFFF_0000);
-        // Negative — count of leading 1-bits.
+        // Negative -- count of leading 1-bits.
         assert_eq!(g.read_data(31), 16);
         g.write_data(30, 0);
         assert_eq!(g.read_data(31), 32);
@@ -1525,7 +1525,7 @@ mod tests {
         g.write_data(17, 0x0100); // SZ1
         g.write_data(18, 0x0200); // SZ2
         g.write_data(19, 0x0300); // SZ3
-                                  // ZSF3 = 0x555 — close enough to 0x1000/3 to land OTZ near the
+                                  // ZSF3 = 0x555 -- close enough to 0x1000/3 to land OTZ near the
                                   // simple arithmetic mean.
         g.write_control(29, 0x0555);
         g.execute(0x2D); // AVSZ3
@@ -1584,7 +1584,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Broader known-value fixtures — verify arithmetic for the ops games
+    // Broader known-value fixtures -- verify arithmetic for the ops games
     // use most, plus the register-view edge cases. Every expected number
     // below comes from hand-computed PSX-SPX math on small inputs; if one
     // of these fires it means a refactor has drifted the implementation.
@@ -1602,7 +1602,7 @@ mod tests {
     }
 
     /// GTE command-word builder: COP2 functions leave the high bits
-    /// alone — only sf/lm/mx/vx/cv/opcode matter. Keeps test instructions
+    /// alone -- only sf/lm/mx/vx/cv/opcode matter. Keeps test instructions
     /// readable next to their intent.
     fn cmd_word(sf: bool, lm: bool, mx: u8, vx: u8, cv: u8, opcode: u8) -> u32 {
         ((sf as u32) << 19)
@@ -1616,7 +1616,7 @@ mod tests {
     #[test]
     fn rtps_with_h_zero_projects_to_screen_offset() {
         // With H=0 the divisor collapses to 0, so the projected X/Y are
-        // just OFX>>16 and OFY>>16 — a crisp fixture for checking every
+        // just OFX>>16 and OFY>>16 -- a crisp fixture for checking every
         // RTPS side-effect (MAC1/2/3, IR1/2/3, SZ push, SXY push, MAC0,
         // IR0) without the Newton-Raphson divider in the way.
         let mut g = Gte::new();
@@ -1928,7 +1928,7 @@ mod tests {
 
     #[test]
     fn color_fifo_push_order_across_three_ops() {
-        // Three GPFs with distinct IR vectors — after three pushes,
+        // Three GPFs with distinct IR vectors -- after three pushes,
         // slot 0 holds the oldest, slot 2 the newest.
         let mut g = Gte::new();
         g.write_data(8, 0x1000); // IR0 = 1.0
@@ -1981,13 +1981,13 @@ mod tests {
     #[test]
     fn rtps_unr_table_index_256_is_not_aliased() {
         // Regression: when the normalised SZ3 lands in {0xFFFE, 0xFFFF}
-        // the UNR-table index is 256 — the upper bound of the
+        // the UNR-table index is 256 -- the upper bound of the
         // 257-entry table. A defensive `& 0xFF` mask on the index
         // aliased it to 0, swapping the smallest reciprocal multiplier
         // (table[256]=0x00 → u=0x101) for the largest
         // (table[0]=0xFF → u=0x200). The resulting divisor was about
         // 2000× too small, which collapses the projected vertex
-        // toward (OFX>>16, OFY>>16) — visually "triangles exploding
+        // toward (OFX>>16, OFY>>16) -- visually "triangles exploding
         // to the screen centre". Pin the boundary so the mask can't
         // sneak back in.
         let mut g = Gte::new();
@@ -2049,7 +2049,7 @@ mod tests {
     fn mvmva_mx3_uses_garbage_matrix() {
         // mx=3 builds a junk matrix from RGBC, IR0, RT[0][2] and RT[1][1]
         // per PSX-SPX. Row 0 col 2 is specifically *IR0* (data reg 8),
-        // not IR1 — pinning that here so a refactor can't re-introduce
+        // not IR1 -- pinning that here so a refactor can't re-introduce
         // the IR1-vs-IR0 confusion.
         let mut g = Gte::new();
         g.write_data(6, 0x0000_0010); // RGBC.r = 0x10
@@ -2072,7 +2072,7 @@ mod tests {
 
     #[test]
     fn mvmva_vx3_uses_ir_as_vector() {
-        // vx=3 substitutes [IR1, IR2, IR3] for the multiplied vector —
+        // vx=3 substitutes [IR1, IR2, IR3] for the multiplied vector --
         // used by the lighting chain when colors feed back into geometry.
         let mut g = Gte::new();
         install_identity_rotation(&mut g);

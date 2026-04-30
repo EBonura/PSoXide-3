@@ -4,7 +4,7 @@
 //! primitives (textured_rect / textured_tri) that would draw the
 //! NAUGHTY DOG logo text? If zero such commands over the whole
 //! boot, the CPU is never executing the logo-draw routine at all
-//! — a game-state / IRQ-timing divergence.
+//! -- a game-state / IRQ-timing divergence.
 //!
 //! ```bash
 //! cargo run -p emulator-core --example probe_all_gpu_cmds --release
@@ -56,7 +56,7 @@ fn main() {
         println!("0x{op:02x}  {count:>8}  {}", opcode_name(*op));
     }
 
-    // Specifically call out texture-related commands — those are
+    // Specifically call out texture-related commands -- those are
     // the ones that'd draw the NAUGHTY DOG logo text.
     let textured = [
         0x24u8, 0x25, 0x26, 0x27, 0x2c, 0x2d, 0x2e, 0x2f, 0x34, 0x35, 0x36, 0x37, 0x3c, 0x3d, 0x3e,

@@ -1,10 +1,10 @@
-//! `editor-playtest` — render a level cooked from the editor.
+//! `editor-playtest` -- render a level cooked from the editor.
 //!
 //! Loads `generated/level_manifest.rs` (a Rust source file the
 //! editor's playtest compiler produces via
 //! [`psxed_project::playtest::write_package`]) containing:
 //!
-//! * a master [`LevelAssetRecord`] table — every cooked
+//! * a master [`LevelAssetRecord`] table -- every cooked
 //!   `.psxw` room blob and `.psxt` texture blob is a record;
 //! * per-room [`LevelMaterialRecord`]s mapping each cooked
 //!   local material slot to a texture asset id;
@@ -16,12 +16,12 @@
 //! uploads its texture assets through a tiny no-alloc
 //! [`ResidencyManager`], builds a `TextureMaterial` table from
 //! the room's material slice, and renders. No hardcoded starter
-//! textures — the asset table is the source of truth.
+//! textures -- the asset table is the source of truth.
 //!
 //! Controls (free-orbit toggled with SELECT):
-//! * Left stick / D-pad — camera-relative movement.
-//! * Right stick        — camera yaw; vertical adjusts camera height.
-//! * CIRCLE            — run while moving.
+//! * Left stick / D-pad -- camera-relative movement.
+//! * Right stick        -- camera yaw; vertical adjusts camera height.
+//! * CIRCLE            -- run while moving.
 
 #![no_std]
 #![no_main]
@@ -134,7 +134,7 @@ const SOFT_LOCK_BREAK_RANGE: i32 = 3840;
 
 const HALF_TURN_Q12: u16 = 2048;
 /// Fallback follow camera params used when no PLAYER_CONTROLLER
-/// was authored — matches the prior debug behaviour.
+/// was authored -- matches the prior debug behaviour.
 const FOLLOW_RADIUS_DEFAULT: i32 = 1400;
 const FOLLOW_HEIGHT_DEFAULT: i32 = 700;
 const FOLLOW_TARGET_HEIGHT_DEFAULT: i32 = 0;
@@ -169,13 +169,13 @@ const MAX_RESIDENT_VRAM_ASSETS: usize = 32;
 /// Sized to the largest part vertex count we expect; instances
 /// over this cap drop their over-budget triangles graceful.
 const MODEL_VERTEX_CAP: usize = 1024;
-/// Joint-transform scratch — all biped rigs we currently cook
+/// Joint-transform scratch -- all biped rigs we currently cook
 /// fit comfortably in 32.
 const JOINT_CAP: usize = 32;
 /// Cap on placed model instances rendered per frame.
 const MAX_MODEL_INSTANCES: usize = 16;
 
-/// Marker visualization tuning. Markers are debug stubs — keep
+/// Marker visualization tuning. Markers are debug stubs -- keep
 /// them visible at orbit-camera scales without dominating the
 /// scene.
 const MARKER_HALF: i32 = 96;
@@ -201,7 +201,7 @@ static mut MODEL_VERTICES: [ProjectedTexturedVertex; MODEL_VERTEX_CAP] =
 static mut JOINT_VIEW_TRANSFORMS: [JointViewTransform; JOINT_CAP] =
     [JointViewTransform::ZERO; JOINT_CAP];
 
-/// Residency manager — tracks which AssetIds are RAM/VRAM
+/// Residency manager -- tracks which AssetIds are RAM/VRAM
 /// resident across frames. Static so it survives across the
 /// `Scene::init` → `Scene::render` boundary.
 static mut RESIDENCY: ResidencyManager<MAX_RESIDENT_RAM_ASSETS, MAX_RESIDENT_VRAM_ASSETS> =
@@ -246,7 +246,7 @@ enum PlayerAnim {
     Run,
 }
 
-/// Runtime view of the cooked LevelCharacterRecord — the same
+/// Runtime view of the cooked LevelCharacterRecord -- the same
 /// fields, decoded into runtime-friendly types. Resolved once
 /// at init time so per-frame movement / animation / camera code
 /// doesn't keep re-resolving the manifest.
@@ -256,10 +256,10 @@ struct RuntimeCharacter {
     model: u16,
     idle_clip: u16,
     walk_clip: u16,
-    /// Optional run clip — `CHARACTER_CLIP_NONE` when unset.
+    /// Optional run clip -- `CHARACTER_CLIP_NONE` when unset.
     /// Runtime falls back to `walk_clip` for run input.
     run_clip: u16,
-    /// Optional turn clip (currently unused at runtime — turn
+    /// Optional turn clip (currently unused at runtime -- turn
     /// is folded into idle with yaw input).
     _turn_clip: u16,
     /// Capsule radius for collision. Engine units.
@@ -345,14 +345,14 @@ struct Playtest {
     material_count: usize,
     /// Player locomotion state: position, yaw, stamina, and evade actions.
     motor: CharacterMotorState,
-    /// Resolved Character driving the player — `None` when no
+    /// Resolved Character driving the player -- `None` when no
     /// `PLAYER_CONTROLLER` was authored. Falls back to the
     /// pre-character debug controls in that case.
     character: Option<RuntimeCharacter>,
     /// Current animation state. Source of truth for which clip
     /// `draw_player` plays each frame.
     anim_state: PlayerAnim,
-    /// Tick the current animation started at — used to phase
+    /// Tick the current animation started at -- used to phase
     /// the loop relative to clip switches so transitions don't
     /// pop into the middle of the new clip.
     anim_start_tick: u32,
@@ -420,7 +420,7 @@ impl Scene for Playtest {
         // include_bytes!-resident from process start), but we
         // still tick them through the manager so the change-set
         // counts are honest. Required VRAM assets we'll need
-        // textures for — actual uploads happen below.
+        // textures for -- actual uploads happen below.
         let residency_record = ROOM_RESIDENCY
             .iter()
             .find(|r| r.room == 0)
@@ -440,7 +440,7 @@ impl Scene for Playtest {
         // (uploading on first sight), then build the
         // TextureMaterial referencing the slot's CLUT/tpage.
         // Pass parsed room dimensions through so room-level
-        // lighting samples the *actual* room centre — not the
+        // lighting samples the *actual* room centre -- not the
         // authored origin, which would land outside the room
         // on any non-1×1 grid.
         let room_dims = self
@@ -568,7 +568,7 @@ impl Scene for Playtest {
         if let Some(room) = self.room {
             // Pack the materials slice down to a contiguous
             // `&[TextureMaterial]` indexed by local_slot. Slots
-            // that didn't resolve become a sentinel material —
+            // that didn't resolve become a sentinel material --
             // visually obvious without crashing the renderer.
             let mut bound: [TextureMaterial; MAX_ROOM_MATERIALS] =
                 [TextureMaterial::opaque(0, TPAGE_WORD, (0x80, 0x80, 0x80)); MAX_ROOM_MATERIALS];
@@ -609,7 +609,7 @@ impl Scene for Playtest {
             // Player draws on top of model instances. Same
             // `submit_textured_model` path; the scene-tree
             // duplicate (Wraith MeshInstance at room centre)
-            // is the *placement preview* — the active player
+            // is the *placement preview* -- the active player
             // is the one driven by PLAYER_CONTROLLER and lives
             // at the player position.
             if let Some(character) = self.character {
@@ -930,7 +930,7 @@ fn draw_player(
 /// resolve each material's texture asset, and build a
 /// TextureMaterial in `out` indexed by `local_slot`. Each
 /// texture asset is uploaded at most once across the program
-/// lifetime — the residency manager + VRAM_SLOTS tracks who's
+/// lifetime -- the residency manager + VRAM_SLOTS tracks who's
 /// already up.
 ///
 /// Returns the highest `local_slot + 1` so the caller knows the
@@ -970,7 +970,7 @@ fn build_room_materials(
 
     // Compute a single room-center light contribution and
     // modulate every material tint by it. Per-face lighting
-    // would need a draw_room change — for this pass we ship
+    // would need a draw_room change -- for this pass we ship
     // room-level lighting that honours light colour /
     // intensity / radius without a renderer rewrite. The
     // editor preview does per-face lighting so authors still
@@ -1023,7 +1023,7 @@ fn room_center_world(room: &LevelRoomRecord, dims: RoomDims) -> [i32; 3] {
 
 /// Walk every `LIGHTS` record for `room_index` and accumulate
 /// `(R, G, B)` brightness contributions at `world_center`. Each
-/// channel returned is in 0..=ROOM_LIGHT_MAX_Q8 — neutral light
+/// channel returned is in 0..=ROOM_LIGHT_MAX_Q8 -- neutral light
 /// produces 128 (matching `tint_rgb`'s neutral value); bright
 /// lights get a little headroom without crushing authored textures
 /// to white.
@@ -1078,7 +1078,7 @@ fn modulate_tint(base: [u8; 3], factor: (u32, u32, u32)) -> (u8, u8, u8) {
     )
 }
 
-/// Simple integer square root for `i64` — same shape as the
+/// Simple integer square root for `i64` -- same shape as the
 /// host editor's helper; needed because `f32` would drag in
 /// libm on the no_std target.
 fn isqrt(value: i64) -> i64 {
@@ -1108,7 +1108,7 @@ fn isqrt(value: i64) -> i64 {
 /// Returns `None` if the texture parse fails or the VRAM table
 /// is full.
 /// Look up the VRAM slot a previously-uploaded asset occupies.
-/// VRAM_SLOTS is the source of truth — `RESIDENCY` only tracks
+/// VRAM_SLOTS is the source of truth -- `RESIDENCY` only tracks
 /// the *contract*, which is pre-marked by `ensure_room_resident`
 /// before any actual upload runs.
 fn find_vram_slot(asset_id: AssetId) -> Option<VramSlot> {
@@ -1122,7 +1122,7 @@ fn find_vram_slot(asset_id: AssetId) -> Option<VramSlot> {
 
 fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<VramSlot> {
     // VRAM_SLOTS is the source of truth for "have we actually
-    // uploaded this asset". `RESIDENCY` is the *contract* — it's
+    // uploaded this asset". `RESIDENCY` is the *contract* -- it's
     // pre-marked by `ensure_room_resident` before any upload runs,
     // so reading it here would falsely report assets as uploaded
     // and skip the upload entirely.
@@ -1206,7 +1206,7 @@ fn ensure_model_atlas_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<
     }
     let texture = Texture::from_bytes(asset_bytes).ok()?;
     if texture.clut_entries() != 256 {
-        // Only 8bpp atlases supported — 4bpp model atlases
+        // Only 8bpp atlases supported -- 4bpp model atlases
         // would round-trip through `ensure_texture_uploaded`.
         return None;
     }
@@ -1287,7 +1287,7 @@ fn draw_model_instances(
         };
 
         // Atlas: cooker validation guarantees `texture_asset` is
-        // `Some` for every placed model — runtime treats a `None`
+        // `Some` for every placed model -- runtime treats a `None`
         // as a stale manifest and skips rather than crashing.
         let atlas_slot = match model_record.texture_asset {
             Some(id) => match find_asset_of_kind(ASSETS, id, AssetKind::Texture) {
@@ -1318,7 +1318,7 @@ fn draw_model_instances(
             inst.clip
         };
         if clip_local >= model_record.clip_count {
-            // Defensive — cooker guarantees this won't happen.
+            // Defensive -- cooker guarantees this won't happen.
             continue;
         }
         let global = (model_record.clip_first + clip_local) as usize;
@@ -1364,7 +1364,7 @@ fn draw_model_instances(
 }
 
 /// Rotation matrix around the world Y axis for `yaw` in PSX
-/// angle units (`0..4096` = full turn). Q12 fixed-point — drop
+/// angle units (`0..4096` = full turn). Q12 fixed-point -- drop
 /// straight into `submit_textured_model`'s `instance_rotation`.
 fn yaw_rotation_matrix(yaw: u16) -> Mat3I16 {
     let s = sin_1_3_12(yaw);

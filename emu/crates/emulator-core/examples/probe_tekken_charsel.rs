@@ -3,7 +3,7 @@
 //! enough to iterate on rendering bugs that only manifest deep into
 //! gameplay (the user's reported "garbled portraits" bug).
 //!
-//! The probe doesn't try to read game memory to detect the screen —
+//! The probe doesn't try to read game memory to detect the screen --
 //! it just runs for `--steps` user-instructions and dumps PPMs every
 //! `--dump-every` cycles so a human can scrub through them.
 //!

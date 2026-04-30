@@ -5,32 +5,32 @@ manifest → editor 3D viewport + editor-playtest runtime.
 
 ## Scope of this pass
 
-- **Dynamic point lights** — radius, intensity, RGB tint.
+- **Dynamic point lights** -- radius, intensity, RGB tint.
 - **No shadows.**
 - **No baked lightmaps.**
-- **No model lighting yet** — runtime lights affect room
+- **No model lighting yet** -- runtime lights affect room
   surfaces only. The editor preview applies per-face lighting
   to room surfaces; placed model instances render at full
   brightness regardless of nearby lights.
-- **Per-light enclosing room** — lights belong to the room
+- **Per-light enclosing room** -- lights belong to the room
   whose subtree they're authored under. Lights outside any
   Room are dropped at cook time.
 
 ## Authoring
 
-Place a `NodeKind::Light` *under* a Room subtree — lights
+Place a `NodeKind::Light` *under* a Room subtree -- lights
 authored outside any Room are dropped at cook time, and the
 editor preview filters them per-room so they only affect
 their enclosing room. Each Light: Inspector
 exposes:
 
-- **Color** — 8-bit RGB.
-- **Intensity** — `f32` multiplier, `0..4` range with a quick
+- **Color** -- 8-bit RGB.
+- **Intensity** -- `f32` multiplier, `0..4` range with a quick
   warning above 4.0 (the bright-sun preset hits 2.0).
-- **Radius** — `f32` in *sector units*. `1.0` = one sector, so
+- **Radius** -- `f32` in *sector units*. `1.0` = one sector, so
   in a 1024-engine-unit world a radius of 4.0 reaches 4096
   engine units. Cooker rejects `radius <= 0`.
-- **Presets** — `Torch` / `Room fill` / `Bright sun` buttons
+- **Presets** -- `Torch` / `Room fill` / `Bright sun` buttons
   set sensible starting values for each light type.
 
 The inspector surfaces inline warnings when:
@@ -97,7 +97,7 @@ Both editor and runtime use the same **PSX-neutral light scale**:
 ```text
 light_rgb in 0..=255 per channel:
   0    pitch black
-  128  neutral — material renders at its base brightness
+  128  neutral -- material renders at its base brightness
   255  saturating overbright
 
 final_rgb = clamp(base_rgb * light_rgb / 128, 0, 255)
@@ -122,7 +122,7 @@ accumulation:
 
 1. `walk_room` calls `collect_preview_lights(project, room_id, grid)`
    once per frame. Lights are filtered to the *enclosing* Room
-   — a Light authored under Room A never lights Room B's
+   -- a Light authored under Room A never lights Room B's
    surfaces.
 2. Each light's `color × intensity_q8` is pre-multiplied into
    `u32` channels.
@@ -142,7 +142,7 @@ authored colour.
 
 Each Light also carries a small selectable AABB at its
 position so the user can click it in the 3D viewport and drag
-it to move. The bound is intentionally small — a wide-radius
+it to move. The bound is intentionally small -- a wide-radius
 light's ring would otherwise intercept every click in the
 room. See
 [`docs/editor-architecture.md`](editor-architecture.md) §
@@ -165,7 +165,7 @@ This is room-level "ambient" rather than per-face:
 
 Per-face runtime lighting would need `draw_room` to take a
 lights slice and accumulate per-emitted-triangle. That's a
-deliberate follow-up — this pass keeps the engine API stable
+deliberate follow-up -- this pass keeps the engine API stable
 while still giving authors visible feedback for radius /
 intensity / colour at runtime. The editor preview is where
 authors tune lights with full spatial accuracy.
@@ -196,11 +196,11 @@ Warnings (soft):
 
 ## See also
 
-- `editor/crates/psxed-project/src/playtest.rs` — cook side.
-- `engine/crates/psx-level/src/lib.rs` — schema.
-- `emu/crates/frontend/src/editor_preview.rs` —
+- `editor/crates/psxed-project/src/playtest.rs` -- cook side.
+- `engine/crates/psx-level/src/lib.rs` -- schema.
+- `emu/crates/frontend/src/editor_preview.rs` --
   `walk_light_gizmos`, `collect_preview_lights`, `light_face`.
-- `engine/examples/editor-playtest/src/main.rs` —
+- `engine/examples/editor-playtest/src/main.rs` --
   `accumulate_room_light`, `modulate_tint`.
-- `docs/editor-model-authoring.md` — model authoring (lights
+- `docs/editor-model-authoring.md` -- model authoring (lights
   do not yet apply to models).

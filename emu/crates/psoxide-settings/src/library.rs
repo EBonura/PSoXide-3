@@ -1,4 +1,4 @@
-//! Scanned game library — discovery, metadata extraction, and
+//! Scanned game library -- discovery, metadata extraction, and
 //! on-disk cache.
 //!
 //! The scanner walks a configured root directory and classifies
@@ -7,20 +7,20 @@
 //! cheap-to-read metadata so the UI can show a useful label
 //! without running the emulator:
 //!
-//! - **Title** — from the ISO9660 Primary Volume Descriptor's
+//! - **Title** -- from the ISO9660 Primary Volume Descriptor's
 //!   *volume identifier* field (for BIN/ISO), or the file stem
 //!   (for EXE / anything we can't parse).
-//! - **Region** — inferred from the PSX license-text sector at
+//! - **Region** -- inferred from the PSX license-text sector at
 //!   LBA 4 (`Licensed by Sony Computer Entertainment America /
 //!   Europe / Japan`).
-//! - **Stable ID** — a 16-hex-char FNV-1a-64 fingerprint over the
+//! - **Stable ID** -- a 16-hex-char FNV-1a-64 fingerprint over the
 //!   license text + PVD identifier bytes. Same disc → same ID
 //!   regardless of filename, so renaming a BIN doesn't orphan
 //!   its savestates.
 //!
 //! Results are cached in `library.ron` alongside the source file's
 //! last-modified time. A subsequent scan skips re-parsing files
-//! whose mtime hasn't changed — fast startup even with a big
+//! whose mtime hasn't changed -- fast startup even with a big
 //! library.
 //!
 //! Parsing is best-effort: any file that errors out surfaces as
@@ -38,15 +38,15 @@ use thiserror::Error;
 
 use crate::LIBRARY_VERSION;
 
-/// Discovered game category. Drives the UI grid — disc images,
+/// Discovered game category. Drives the UI grid -- disc images,
 /// homebrew, unknown/diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GameKind {
     /// A full PSX disc image in raw 2352-byte-per-sector format.
     DiscBin,
     /// An ISO9660 image (2048 bytes per sector, no raw subchannel).
-    /// We don't *boot* these yet — the CD controller expects BIN
-    /// sector layout — but they show up in the library so the user
+    /// We don't *boot* these yet -- the CD controller expects BIN
+    /// sector layout -- but they show up in the library so the user
     /// can see them.
     DiscIso,
     /// A `.cue` playlist pointing at one or more BIN files.
@@ -70,7 +70,7 @@ pub enum Region {
     Pal,
     /// NTSC-J (Japan + Asia).
     NtscJ,
-    /// License text not recognised — either a pre-release / unlicensed
+    /// License text not recognised -- either a pre-release / unlicensed
     /// disc, or our heuristic missed it.
     Unknown,
 }
@@ -86,9 +86,9 @@ pub struct LibraryEntry {
     /// Absolute path to the underlying file. Relative paths inside
     /// `library.ron` would be fragile across working directories.
     pub path: PathBuf,
-    /// Classification — what kind of file this is.
+    /// Classification -- what kind of file this is.
     pub kind: GameKind,
-    /// Human-readable display name — prefer the PVD volume
+    /// Human-readable display name -- prefer the PVD volume
     /// identifier if present, else the file stem.
     pub title: String,
     /// Region code, best-effort.
@@ -98,9 +98,9 @@ pub struct LibraryEntry {
     pub size: u64,
     /// File mtime (UNIX epoch seconds) captured at scan time.
     /// The next scan skips the parse step if the mtime hasn't
-    /// moved — huge startup win for big libraries.
+    /// moved -- huge startup win for big libraries.
     pub mtime: u64,
-    /// Optional free-text diagnostic — carries the "why" when
+    /// Optional free-text diagnostic -- carries the "why" when
     /// `kind == Unknown`, or any notable warning for other kinds.
     pub diagnostic: Option<String>,
 }
@@ -113,7 +113,7 @@ pub struct Library {
     /// regenerated on next scan.
     #[serde(default = "default_library_version")]
     pub version: u32,
-    /// Discovered entries. Order is file-system walk order — UI
+    /// Discovered entries. Order is file-system walk order -- UI
     /// sorts at display time.
     #[serde(default)]
     pub entries: Vec<LibraryEntry>,
@@ -136,7 +136,7 @@ pub enum LibraryError {
         source: io::Error,
     },
     /// Cache file couldn't be parsed. The scanner treats this as
-    /// "regenerate from scratch" and logs — no crash.
+    /// "regenerate from scratch" and logs -- no crash.
     #[error("library parse error at {path}: {source}")]
     Parse {
         /// The file we were parsing.
@@ -153,7 +153,7 @@ pub enum LibraryError {
 impl Library {
     /// Load `library.ron` from `path`. Missing file / wrong version
     /// / corrupt file all return an empty [`Library`] rather than
-    /// erroring — the scanner will rebuild it. This keeps a
+    /// erroring -- the scanner will rebuild it. This keeps a
     /// first-run UX of "just works."
     pub fn load_or_empty(path: &Path) -> Self {
         match Self::load(path) {
@@ -165,7 +165,7 @@ impl Library {
         }
     }
 
-    /// Strict load — propagates parse errors. Used in tests and by
+    /// Strict load -- propagates parse errors. Used in tests and by
     /// diagnostics that want to distinguish "missing" from
     /// "corrupt." Most production code wants [`load_or_empty`].
     pub fn load(path: &Path) -> Result<Self, LibraryError> {
@@ -357,7 +357,7 @@ impl Library {
 }
 
 /// Classify a file by extension only. Returns `None` for files we
-/// don't care about (images, archives, etc). Keeps `scan()` cheap —
+/// don't care about (images, archives, etc). Keeps `scan()` cheap --
 /// we only hit the disk to parse files we'll actually show.
 fn classify(path: &Path) -> Option<GameKind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -371,7 +371,7 @@ fn classify(path: &Path) -> Option<GameKind> {
 }
 
 /// Directory names the recursive walker skips. Primarily cargo's
-/// per-target build-tree siblings — if the user points a library
+/// per-target build-tree siblings -- if the user points a library
 /// scanner at a cargo target-dir (the SDK-examples dir is exactly
 /// this case), we'd otherwise surface every intermediate
 /// `hello_tri-<hash>.exe` living under `deps/` as a separate
@@ -380,10 +380,10 @@ fn classify(path: &Path) -> Option<GameKind> {
 ///
 /// Also kept short because a false positive (user has a folder
 /// legitimately named `deps/`) is strictly worse than scanning
-/// through it — keep the list tight and explainable.
+/// through it -- keep the list tight and explainable.
 const SKIP_DIRS: &[&str] = &["deps", "incremental", "build"];
 
-/// Recursive directory walk. Returns a flat list of file paths —
+/// Recursive directory walk. Returns a flat list of file paths --
 /// a full-blown `WalkDir` dep feels over-engineered for a few
 /// dozen lines of plain `read_dir`. Skips directories in
 /// [`SKIP_DIRS`] and anything starting with `.`, so cargo's
@@ -402,7 +402,7 @@ fn walk(root: &Path) -> Vec<PathBuf> {
                 // (`.fingerprint/`, dotfiles). Using `file_name()`
                 // rather than full-path matching means a user's
                 // real `deps/` folder anywhere in the walk is also
-                // skipped — an acceptable trade for keeping the
+                // skipped -- an acceptable trade for keeping the
                 // scanner noise-free when rooted at a cargo
                 // target-dir like `build/examples/.../release/`.
                 let skip = p
@@ -421,7 +421,7 @@ fn walk(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Parse one file into a `LibraryEntry`. Uses cheap heuristics —
+/// Parse one file into a `LibraryEntry`. Uses cheap heuristics --
 /// read one or two well-known sectors and the file stem. Never
 /// loads the whole file (Crash Bandicoot is 600 MiB; scanning
 /// wouldn't finish).
@@ -443,7 +443,7 @@ fn parse_entry(path: &Path, kind: GameKind, size: u64, mtime: u64) -> LibraryEnt
             size,
             mtime,
             // ISO parsing shares the PVD path with BIN once we
-            // handle 2048-byte sectors — just not today.
+            // handle 2048-byte sectors -- just not today.
             diagnostic: Some("ISO sector-size parsing not yet implemented".into()),
         },
         GameKind::DiscCue => parse_cue(path, size, mtime, &fallback_title),
@@ -516,7 +516,7 @@ fn parse_bin(path: &Path, size: u64, mtime: u64, fallback_title: &str) -> Librar
         parts.push(&bytes[..bytes.len().min(256)]);
     }
     if let Some(ref bytes) = pvd_user {
-        // Volume identifier region — stable across burns.
+        // Volume identifier region -- stable across burns.
         parts.push(&bytes[40..bytes.len().min(72)]);
     }
     if parts.is_empty() {
@@ -561,7 +561,7 @@ fn parse_cue(path: &Path, size: u64, mtime: u64, fallback_title: &str) -> Librar
     entry
 }
 
-/// Cheap region heuristic — look for any of the three canonical
+/// Cheap region heuristic -- look for any of the three canonical
 /// license strings anywhere in LBA 4's user data. The BIOS checks
 /// for these too; if none match, we say `Unknown` rather than
 /// guess.
@@ -791,7 +791,7 @@ pub fn primary_bin_from_cue(cue_path: &Path) -> Option<PathBuf> {
 }
 
 /// FNV-1a-64 over any number of input slices, rendered as a
-/// 16-hex-char string. Same algorithm the parity-cache uses — no
+/// 16-hex-char string. Same algorithm the parity-cache uses -- no
 /// adversarial input, just a stable fingerprint.
 fn fingerprint(parts: &[&[u8]]) -> String {
     let mut h = 0xCBF2_9CE4_8422_2325u64;
@@ -914,7 +914,7 @@ mod tests {
 
     #[test]
     fn pvd_volume_identifier_rejects_non_pvd_sector() {
-        // Zero sector isn't a PVD — type byte is 0.
+        // Zero sector isn't a PVD -- type byte is 0.
         let zeros = vec![0u8; 2048];
         assert_eq!(pvd_volume_identifier(&zeros), None);
     }
@@ -930,7 +930,7 @@ mod tests {
         assert_eq!(changed, 2);
         assert_eq!(lib.entries.len(), 2);
 
-        // Second scan — no files changed, so nothing should be
+        // Second scan -- no files changed, so nothing should be
         // re-parsed.
         let changed2 = lib.scan(tmp.path()).unwrap();
         assert_eq!(changed2, 0);
@@ -959,13 +959,13 @@ mod tests {
         // build-output tree (`build/examples/mipsel-sony-psx/release/`),
         // cargo's `deps/` subdirectory contains intermediate
         // `<crate>-<hash>.exe` artifacts. Those used to surface as
-        // separate library entries — the user saw both
+        // separate library entries -- the user saw both
         // `hello-tri` and `hello_tri-<hash>` in the Examples column.
         //
         // Fix is in `walk()`: skip `deps/`, `incremental/`, `build/`,
         // and any hidden dir. This test nails down the invariant.
         let tmp = TempDir::new().unwrap();
-        // Main release output — the file the user should see.
+        // Main release output -- the file the user should see.
         std::fs::write(tmp.path().join("hello-tri.exe"), b"final").unwrap();
         // Cargo's intermediate layout next to it.
         let deps = tmp.path().join("deps");
@@ -1034,7 +1034,7 @@ mod tests {
     fn primary_bin_from_cue_extracts_first_file_line() {
         let tmp = TempDir::new().unwrap();
         let cue_path = tmp.path().join("game.cue");
-        // Realistic multi-track PSX CUE — the data track is track 1.
+        // Realistic multi-track PSX CUE -- the data track is track 1.
         std::fs::write(
             &cue_path,
             concat!(

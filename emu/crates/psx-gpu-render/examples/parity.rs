@@ -1,4 +1,4 @@
-//! Visual parity harness — compare CPU rasterizer vs HW renderer
+//! Visual parity harness -- compare CPU rasterizer vs HW renderer
 //! pixel-for-pixel on the active display rect after running an EXE
 //! for N CPU steps.
 //!
@@ -12,11 +12,11 @@
 //!   parity <BIOS> <EXE> <STEPS> [OUT_DIR] [TOLERANCE]
 //!
 //! Outputs in OUT_DIR (default: /tmp/psx-parity):
-//!   cpu.ppm     — CPU rasterizer's display rect, RGBA8 → P6 PPM
-//!   hw.ppm      — HW renderer's output, same shape, same encoding
-//!   diff.ppm    — greyscale: black = pixel matches within TOLERANCE,
+//!   cpu.ppm     -- CPU rasterizer's display rect, RGBA8 → P6 PPM
+//!   hw.ppm      -- HW renderer's output, same shape, same encoding
+//!   diff.ppm    -- greyscale: black = pixel matches within TOLERANCE,
 //!                 white = mismatch (intensity = max channel delta)
-//!   report.txt  — pixel counts, mismatch %, opcode histogram
+//!   report.txt  -- pixel counts, mismatch %, opcode histogram
 //!
 //! Exit code: 0 if mismatch <= 1.0% of pixels, else 1.
 //!
@@ -109,7 +109,7 @@ fn main() {
     let vram_words: Vec<u16> = bus.gpu.vram.words().to_vec();
     hw.render_frame(&bus.gpu, &bus.gpu.cmd_log, &vram_words);
     // Extract just the display sub-rect from the VRAM-shaped target
-    // — that's what the user sees on screen, and what the CPU
+    // -- that's what the user sees on screen, and what the CPU
     // `display_rgba8()` returns. At Native scale (S=1) the sub-rect
     // pixel dims equal the display rect dims, so they directly
     // pixel-compare.

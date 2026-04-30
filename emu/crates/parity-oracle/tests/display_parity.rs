@@ -12,11 +12,11 @@
 //! 3. Byte-compare the two framebuffers; `% diverging` must stay
 //!    below the checkpoint's threshold.
 //! 4. On failure, emit three PPMs to `target/parity-report/`:
-//!      - `<name>_ours.ppm`  — our framebuffer
-//!      - `<name>_redux.ppm` — redux framebuffer
-//!      - `<name>_mask.ppm`  — red pixels where we diverge
+//!      - `<name>_ours.ppm`  -- our framebuffer
+//!      - `<name>_redux.ppm` -- redux framebuffer
+//!      - `<name>_mask.ppm`  -- red pixels where we diverge
 //!
-//! The threshold is NOT zero — PSX rasterizer edge ties and dither
+//! The threshold is NOT zero -- PSX rasterizer edge ties and dither
 //! patterns produce a few hundred pixel diffs that are not bugs per
 //! se, just implementation-choice differences. The threshold gives
 //! us a ceiling to catch *regressions* (things getting WORSE).
@@ -28,9 +28,9 @@
 //! ```
 //!
 //! Individual tests (each is `#[ignore]` because Redux takes minutes):
-//! - `parity_bios_boot` — 50M/100M/200M/500M, no disc
-//! - `parity_crash_boot` — 100M/200M/400M/600M, Crash Bandicoot disc
-//! - `parity_tekken_boot` — 100M/300M/500M/800M, Tekken 3 disc
+//! - `parity_bios_boot` -- 50M/100M/200M/500M, no disc
+//! - `parity_crash_boot` -- 100M/200M/400M/600M, Crash Bandicoot disc
+//! - `parity_tekken_boot` -- 100M/300M/500M/800M, Tekken 3 disc
 
 use std::fs;
 use std::io::Write;
@@ -53,7 +53,7 @@ const MGS_DISC: &str =
 const RE2_DISC: &str =
     "/Users/ebonura/Downloads/ps1 games/Resident Evil 2 - Dual Shock Ver. (USA) (Disc 1)/Resident Evil 2 - Dual Shock Ver. (USA) (Disc 1) (Track 1).bin";
 // The WipEout rips have a quirky double-nested directory layout
-// from their CDRomance source — the inner `(v1.1) (Track 01).bin`
+// from their CDRomance source -- the inner `(v1.1) (Track 01).bin`
 // is the data track. Keeping the full path here (rather than
 // resolving via `.cue`) because our oracle reads raw BIN.
 const WIPEOUT1_DISC: &str =
@@ -77,7 +77,7 @@ struct Checkpoint {
     /// Max % of display bytes that may differ before this checkpoint
     /// fails. Tuned per-checkpoint because different scenes have
     /// different rasterizer/dither surfaces. `100.0` effectively
-    /// disables the ceiling — use it for new checkpoints where we're
+    /// disables the ceiling -- use it for new checkpoints where we're
     /// still learning the baseline.
     max_diverge_pct: f64,
 }
@@ -92,7 +92,7 @@ struct CheckpointResult {
     diverge_pct: f64,
     first_diff: Option<(u32, u32)>,
     diff_bytes: usize,
-    /// Number of bytes actually compared — usually `w*h*2`, smaller
+    /// Number of bytes actually compared -- usually `w*h*2`, smaller
     /// when sizes disagree and we compare overlap only. Retained for
     /// the summary file even though the panic message doesn't need it.
     #[allow(dead_code)]
@@ -117,7 +117,7 @@ fn report_dir() -> PathBuf {
 
 /// Drive a single Redux process through the given schedule, compare
 /// to ours at each stop, and dump the report. Panics if any
-/// checkpoint exceeds its threshold — exactly what we want out of
+/// checkpoint exceeds its threshold -- exactly what we want out of
 /// a regression test.
 fn run_parity_suite(suite: &str, disc_path: Option<&str>, checkpoints: &[Checkpoint]) {
     assert!(!checkpoints.is_empty());
@@ -163,7 +163,7 @@ fn run_parity_suite(suite: &str, disc_path: Option<&str>, checkpoints: &[Checkpo
     let mut cpu = Cpu::new();
 
     let mut cursor_steps: u64 = 0;
-    // SPU pump cadence — mirrors the frontend's per-frame cadence so
+    // SPU pump cadence -- mirrors the frontend's per-frame cadence so
     // the SPU's time-dependent state (voice envelopes, ADSR, reverb)
     // is exercised. Without this the SPU never runs and divergences
     // that only manifest under active audio generation get masked.
@@ -205,7 +205,7 @@ fn run_parity_suite(suite: &str, disc_path: Option<&str>, checkpoints: &[Checkpo
         assert_eq!(our_bytes.len(), our_len);
 
         // --- Compare. Mismatched dimensions are a separate class
-        //     of failure — we still dump PPMs so the author can see
+        //     of failure -- we still dump PPMs so the author can see
         //     what went wrong.
         let (diff_bytes, first_diff, compared) = if (rw, rh) == (our_w, our_h) {
             byte_compare(&our_bytes, &redux_bytes, rw)
@@ -345,7 +345,7 @@ fn run_parity_suite(suite: &str, disc_path: Option<&str>, checkpoints: &[Checkpo
     }
     eprintln!("[parity/{}] report: {}", suite, report.display());
 
-    // Enforce thresholds — collect ALL failures before panicking so
+    // Enforce thresholds -- collect ALL failures before panicking so
     // the author gets the full picture, not just the first bad one.
     let mut failures: Vec<String> = Vec::new();
     for r in &results {
@@ -445,7 +445,7 @@ fn byte_compare(a: &[u8], b: &[u8], width: u32) -> (usize, Option<(u32, u32)>, u
 }
 
 /// Extract the visible display area as raw 15bpp little-endian
-/// bytes in scanline order — matches what Redux's `screenshot_save`
+/// bytes in scanline order -- matches what Redux's `screenshot_save`
 /// emits.
 fn read_display_bytes(bus: &Bus, w: u32, h: u32) -> Vec<u8> {
     let da = bus.gpu.display_area();
@@ -513,7 +513,7 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 // Actual test schedules
 // =========================================================================
 
-/// BIOS-only boot — no disc inserted. Progresses through the Sony
+/// BIOS-only boot -- no disc inserted. Progresses through the Sony
 /// logo gradient (100M), holds stably on the logo (200M), transitions
 /// to the shell (500M).
 ///
@@ -550,7 +550,7 @@ fn parity_bios_boot() {
     run_parity_suite("bios", None, &schedule);
 }
 
-/// Crash Bandicoot — stresses the full BIOS → disc-handoff → game-
+/// Crash Bandicoot -- stresses the full BIOS → disc-handoff → game-
 /// boot path that the user reports is *visually broken*. The target
 /// the user set is "strive for 0% divergence across the entirety of
 /// Crash 1 execution." We achieve that byte-for-byte at the Sony
@@ -588,7 +588,7 @@ fn parity_crash_boot() {
     run_parity_suite("crash", Some(CRASH_DISC), &schedule);
 }
 
-/// Tekken 3 — secondary disc canary. Holds stably on the red-
+/// Tekken 3 -- secondary disc canary. Holds stably on the red-
 /// PlayStation "Licensed by SCEA" screen rather than progressing
 /// into gameplay, so later checkpoints stay visually identical
 /// (good signal that the renderer is deterministic).
@@ -622,13 +622,13 @@ fn parity_tekken_boot() {
 
 // ===================================================================
 // Parity-at-100M (Sony logo) for every game. At 100M steps, the
-// emulator has only finished the BIOS's logo phase — disc hasn't
+// emulator has only finished the BIOS's logo phase -- disc hasn't
 // been booted yet, so CPU timing drift is ~1% and the frame is
 // deterministic. This is where we can meaningfully demand 0%
 // pixel parity for any game.
 //
 // For later checkpoints (disc boot, title screen, gameplay),
-// CPU cycle drift dominates — at Crash 900M we're -6% off
+// CPU cycle drift dominates -- at Crash 900M we're -6% off
 // Redux's tick count, so even with a pixel-exact renderer, the
 // game is at a slightly different animation frame than Redux.
 // Those checkpoints need cycle-accurate emulation work first.
@@ -636,7 +636,7 @@ fn parity_tekken_boot() {
 
 fn sony_logo_schedule() -> &'static [Checkpoint] {
     // Static schedule reused across every game's Sony-logo test.
-    // Budget is pinned tight (0.05%) — the renderer is pixel-
+    // Budget is pinned tight (0.05%) -- the renderer is pixel-
     // exact here, so any divergence implies a CPU/memory-timing
     // regression worth diagnosing.
     &[Checkpoint {

@@ -1,6 +1,6 @@
 //! Deterministic linear-congruential PRNG.
 //!
-//! Not cryptographically interesting — perfect for sprinkling
+//! Not cryptographically interesting -- perfect for sprinkling
 //! variability across particle velocity / enemy-shot cadence /
 //! any "looks random but must replay identically" effect. The
 //! constants match the venerable `glibc` LCG, which has
@@ -37,7 +37,7 @@ impl LcgRng {
         (raw - 16) * range / 16
     }
 
-    /// Current internal state — useful if a caller wants to save /
+    /// Current internal state -- useful if a caller wants to save /
     /// restore the RNG across reset boundaries.
     pub const fn state(self) -> u32 {
         self.0

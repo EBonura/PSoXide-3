@@ -3,12 +3,12 @@
 //! Each `.psxw` blob is a fixed-size grid room: a world header, one
 //! sector record per grid cell, then a compact wall table referenced
 //! by sectors. Only `VERSION = 1` is emitted by the cooker and
-//! accepted by the runtime parser — every public record below is
+//! accepted by the runtime parser -- every public record below is
 //! part of that single live contract.
 //!
 //! # Active format (VERSION = 1)
 //!
-//! - `[i32; 4]` heights per face — 16 B per height set
+//! - `[i32; 4]` heights per face -- 16 B per height set
 //! - 44 B sector record, 24 B wall record
 //! - No embedded material table; slot ids resolve via an external
 //!   bank that the caller (engine / playtest manifest) supplies

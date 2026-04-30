@@ -3,7 +3,7 @@
 The active world wire format is **VERSION = 1**. It's the only
 shape `psxed-project` cooks and the only shape
 `psx_asset::World::from_bytes` accepts. The compact format
-sketched below is **not in `psxed-format`** as Rust types — it
+sketched below is **not in `psxed-format`** as Rust types -- it
 lives here, in docs, until both producer and consumer support
 it together.
 
@@ -21,7 +21,7 @@ runtime. Speculative records that meet none of those points
 clutter that contract and trick callers into thinking a future
 format already works. They go in this doc instead.
 
-## Active format — VERSION 1
+## Active format -- VERSION 1
 
 ```
 AssetHeader               12 B
@@ -32,7 +32,7 @@ WallRecord[]              24 B each, wall_count records
 
 Properties:
 
-- Floor / ceiling / wall heights are `[i32; 4]` per face — 16 B
+- Floor / ceiling / wall heights are `[i32; 4]` per face -- 16 B
   per height set.
 - A sector record exists for **every** cell, populated or not.
   The runtime parser rejects a blob when
@@ -48,23 +48,23 @@ format.
 
 ## Future compact format
 
-The goals — driven by PSX RAM budget, not aesthetics:
+The goals -- driven by PSX RAM budget, not aesthetics:
 
-- Room-local `[i16; 4]` heights — 8 B per set instead of 16.
+- Room-local `[i16; 4]` heights -- 8 B per set instead of 16.
 - 28 B sector record (down from 44).
 - 12 B wall record (down from 24).
 - Embedded material table or explicit material-bank reference,
   so a `.psxw` is self-resolving.
 - FloorData-style sparse sector logic stream for triggers /
   slopes / portals (Tomb Raider's idea).
-- Explicit portal records — one for visibility (between rooms)
+- Explicit portal records -- one for visibility (between rooms)
   and one for traversal (per sector: wall / pit / sky).
 
 The reduction targets give roughly:
 
 | Record       | v1     | future | savings |
 | ------------ | ------ | ------ | ------- |
-| WorldHeader  |  20 B  |  20 B  |   —     |
+| WorldHeader  |  20 B  |  20 B  |   --     |
 | Sector       |  44 B  |  28 B  | 36 %    |
 | Wall         |  24 B  |  12 B  | 50 %    |
 
@@ -136,7 +136,7 @@ because the constraints are similar. Mapping:
 | TR concept                                  | PSoXide                                      |
 | ------------------------------------------- | -------------------------------------------- |
 | `tr_room`                                   | one `.psxw` blob, `RuntimeRoom<'a>`          |
-| `tr_room_data` (vertex / face arrays)       | not yet emitted — render path WIP            |
+| `tr_room_data` (vertex / face arrays)       | not yet emitted -- render path WIP            |
 | `tr_room_sector` (4 B floor/ceiling heights)| compact sector record (target 28 B)          |
 | FloorData stream (triggers / slopes)        | sparse sector logic stream (compact only)    |
 | `tr_room_portal` (visibility)               | room portal record (compact only)            |
@@ -152,7 +152,7 @@ because the constraints are similar. Mapping:
 3. Add public Rust types for the new records to `psxed-format`
    only after the round-trip test passes.
 4. Keep the v1 parser path until at least one cooker still emits
-   v1 — version negotiation should be explicit, not implicit.
+   v1 -- version negotiation should be explicit, not implicit.
 5. Retire v1 only after the editor stops emitting it.
 
 Until step 3 lands, this document is the contract.

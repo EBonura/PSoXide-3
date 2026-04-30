@@ -47,7 +47,7 @@ const GOURAUD_COMMAND_NONE: u16 = u16::MAX;
 /// Both triangles share the `0`–`2` diagonal so the union covers
 /// the whole quad with no overlap. A pre-history version split
 /// the second triangle as `(2, 1, 3)`, which uses the OTHER
-/// diagonal — the two halves overlap at the `1`–`2` edge and
+/// diagonal -- the two halves overlap at the `1`–`2` edge and
 /// leave a triangular hole near corner `3`. That manifested as
 /// the "black triangular gaps" floor-rendering bug. Centralised
 /// here so every quad-submitting path uses the same split.
@@ -839,7 +839,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
     /// and sorted textured triangles.
     ///
     /// Corners arrive in perimeter order `[0, 1, 2, 3]`. Triangles
-    /// are split along the `0`–`2` diagonal — see
+    /// are split along the `0`–`2` diagonal -- see
     /// [`TEXTURED_QUAD_TRIANGLES`] for why the alternate split is
     /// wrong.
     pub fn submit_textured_quad(
@@ -1030,7 +1030,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
     /// matrix and the camera view matrix, so callers placing the
     /// model in a world with a non-identity orientation (e.g. a
     /// yawed enemy / NPC) can pass that rotation here. Use
-    /// `Mat3I16::IDENTITY` for unrotated instances — that's the
+    /// `Mat3I16::IDENTITY` for unrotated instances -- that's the
     /// existing showcase-model behaviour.
     #[allow(clippy::too_many_arguments)]
     pub fn submit_textured_model(
@@ -1764,7 +1764,7 @@ fn textured_model_part_gte_transform(
     let rotation = mat3_mul_q12(&view, &oriented);
 
     // Pose translation needs the same instance rotation before
-    // it lands at world space — otherwise a yawed model's joints
+    // it lands at world space -- otherwise a yawed model's joints
     // would translate along model-local axes rather than world
     // axes.
     let scaled_pose_translation = Vec3I32::new(
@@ -1918,7 +1918,7 @@ fn cpu_project_gte_view(view: ViewVertex, projection: WorldProjection) -> Option
 /// 256-step linear blend between two view-space positions.
 ///
 /// `t` is the cooked blend byte: `0` returns `a` exactly, `255` returns
-/// (255 a + 1 b) / 256 — close enough to `b` for skin-deform purposes
+/// (255 a + 1 b) / 256 -- close enough to `b` for skin-deform purposes
 /// and avoids the expensive divide-by-255 a true unit lerp would cost.
 #[inline]
 fn lerp_view_vertex(a: ViewVertex, b: ViewVertex, t: u8) -> ViewVertex {
@@ -2310,7 +2310,7 @@ mod tests {
             assert!(tri.contains(&2), "{tri:?} missing corner 2");
         }
         // All four corners must appear at least once across the
-        // two triangles — otherwise some part of the quad is
+        // two triangles -- otherwise some part of the quad is
         // never drawn.
         for corner in 0..4 {
             assert!(
@@ -2332,7 +2332,7 @@ mod tests {
     ///
     /// both generated triangles must have the same signed-area
     /// orientation. If they don't, one of them is flipped and a
-    /// `CullMode::Back` pass would reject one half — which is
+    /// `CullMode::Back` pass would reject one half -- which is
     /// exactly how the old buggy split looked: half the quad
     /// rendered, half disappeared.
     #[test]
@@ -2340,7 +2340,7 @@ mod tests {
         // Screen-space corners as if the renderer just projected
         // a unit-aligned floor quad. Y grows downward in PSX
         // screen space, but the sign of the cross product is
-        // what we're checking — the absolute orientation
+        // what we're checking -- the absolute orientation
         // doesn't matter.
         let v: [(i32, i32); 4] = [(0, 0), (10, 0), (10, 10), (0, 10)];
         let signed_area = |a: (i32, i32), b: (i32, i32), c: (i32, i32)| -> i32 {

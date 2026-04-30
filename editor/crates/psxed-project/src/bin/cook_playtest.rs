@@ -8,8 +8,8 @@
 //! full GUI.
 //!
 //! Usage:
-//!   cook-playtest                     — cook the embedded starter
-//!   cook-playtest <project.ron>       — cook the named project
+//!   cook-playtest                     -- cook the embedded starter
+//!   cook-playtest <project.ron>       -- cook the named project
 //!
 //! Exit codes: 0 success, 1 on validation errors, 2 on I/O.
 

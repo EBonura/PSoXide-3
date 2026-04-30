@@ -14,7 +14,7 @@
 //!   (4096-per-revolution). A full turn is `0x1000`.
 //!
 //! Both are `u16`. Passing one to the other compiles cleanly and
-//! produces catastrophic flickering — exactly the bug that sank
+//! produces catastrophic flickering -- exactly the bug that sank
 //! an early showcase-fog iteration. The fix there was an
 //! after-the-fact audit; the fix *here* is to refuse to let
 //! `u16`-shaped code hand angles to the SDK directly.
@@ -42,7 +42,7 @@
 //!   `sin_q12` expects. Converting explicitly at the call site
 //!   makes the unit hop visible in reviews.
 
-/// Fixed-point angle, Q0.16 — one revolution = `0x10000`, which
+/// Fixed-point angle, Q0.16 -- one revolution = `0x10000`, which
 /// wraps to `0x0000`. See [module docs](crate::angle) for the
 /// rationale.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
@@ -65,7 +65,7 @@ impl Angle {
         Angle(q16)
     }
 
-    /// Build from a Q0.16 value — alias of [`Angle::from_raw_q16`]
+    /// Build from a Q0.16 value -- alias of [`Angle::from_raw_q16`]
     /// that reads nicely when you already think in turns:
     /// `Angle::from_turns_q16(0x4000)` = quarter turn.
     pub const fn from_turns_q16(q16: u16) -> Angle {
@@ -88,7 +88,7 @@ impl Angle {
     /// `frames` frames. `frames = 60` at 60 fps = one turn per
     /// second; `frames = 256` = about four seconds.
     ///
-    /// Returns [`Angle::ZERO`] if `frames == 0` — no divide by zero,
+    /// Returns [`Angle::ZERO`] if `frames == 0` -- no divide by zero,
     /// no rotation.
     pub const fn per_frames(frames: u32) -> Angle {
         if frames == 0 {
@@ -104,7 +104,7 @@ impl Angle {
     }
 
     /// Add another angle, wrapping on overflow (every operation on
-    /// `Angle` wraps — that's the whole point of a normalised
+    /// `Angle` wraps -- that's the whole point of a normalised
     /// representation).
     pub const fn add(self, other: Angle) -> Angle {
         Angle(self.0.wrapping_add(other.0))
@@ -129,7 +129,7 @@ impl Angle {
     /// is all the sin/cos LUT uses anyway.
     ///
     /// Calling this is the only *correct* way to feed an `Angle` to
-    /// a rotation-matrix constructor — `angle.as_q16() as u16` looks
+    /// a rotation-matrix constructor -- `angle.as_q16() as u16` looks
     /// like it should work and will produce chaotic flips instead.
     pub const fn rotate_y_arg(self) -> u16 {
         self.0 >> 8

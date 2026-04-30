@@ -3,7 +3,7 @@
 //! `ctc2!` / `mtc2!` macro in `psx-gte::regs` actually placing the
 //! value in `$t0` ($8) before the instruction executes? If the asm
 //! block's `in("$8")` doesn't route through to the GTE (for whatever
-//! reason — LLVM optimisation, macro bug, register-allocation
+//! reason -- LLVM optimisation, macro bug, register-allocation
 //! quirk), the emulator will see CTC2 $8, rd where $8 still has
 //! whatever was there from the previous instruction.
 //!

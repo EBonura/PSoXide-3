@@ -1,6 +1,6 @@
 //! Scan the cached Redux trace for entries to the general exception
 //! handler (PC = 0x80000080) to verify whether Redux's oracle records
-//! handler-body instructions or skips them — which determines whether
+//! handler-body instructions or skips them -- which determines whether
 //! our parity harness needs to aggregate them.
 
 use parity_oracle::cache;

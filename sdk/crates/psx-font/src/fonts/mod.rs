@@ -1,4 +1,4 @@
-//! Built-in fonts — all Public Domain.
+//! Built-in fonts -- all Public Domain.
 //!
 //! Mostly from dhepper/font8x8 (8×8 monochrome) plus the
 //! canonical IBM VGA 8×16 BIOS font for the heading tier.

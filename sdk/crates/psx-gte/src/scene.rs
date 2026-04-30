@@ -3,7 +3,7 @@
 //! The register macros in [`regs`][crate::regs] are the only thing
 //! that actually touches the GTE; everything here is a convenience
 //! layer that bundles the ~8 writes a typical 3D frame needs into
-//! named functions. All functions are safe — the macros they wrap
+//! named functions. All functions are safe -- the macros they wrap
 //! already contain the `unsafe { asm! }` internally, and there's
 //! nothing we can do with a bad matrix value that would be undefined
 //! behaviour (worst case: the projected vertex is garbage).
@@ -27,7 +27,7 @@ use crate::ops;
 use crate::regs::pack_xy;
 use crate::{cfc2, ctc2, mfc2, mtc2};
 
-/// Result of a single perspective-projected vertex — screen-space
+/// Result of a single perspective-projected vertex -- screen-space
 /// (x, y) in pixels plus the MAC3 depth used for ordering-table
 /// inserts. `Projected` is `Copy` + trivially packed so the caller
 /// can collect per-vertex results into an array and rasterise later.
@@ -91,7 +91,7 @@ pub fn load_far_colour(c: Vec3I32) {
     ctc2!(23, c.z as u32);
 }
 
-/// Set OFX and OFY (control 24, 25) — the screen-space offsets applied
+/// Set OFX and OFY (control 24, 25) -- the screen-space offsets applied
 /// post-divide. Values are 15.16 fixed point; `160 << 16` = 160.0 px.
 pub fn set_screen_offset(ofx_15_16: i32, ofy_15_16: i32) {
     ctc2!(24, ofx_15_16 as u32);
@@ -139,7 +139,7 @@ pub fn project_vertex(v: Vec3I16) -> Projected {
     }
 }
 
-/// Project three vertices as a batch via RTPT — one GTE call, three
+/// Project three vertices as a batch via RTPT -- one GTE call, three
 /// results out of the SXY FIFO + SZ FIFO. Slightly faster than three
 /// successive [`project_vertex`] calls because RTPT shares setup.
 ///
@@ -183,10 +183,10 @@ pub fn project_triangle(v0: Vec3I16, v1: Vec3I16, v2: Vec3I16) -> [Projected; 3]
 }
 
 /// Read the last three projected Z values and compute their average
-/// via AVSZ3 (weighted by ZSF3). Returns OTZ — the depth key most
+/// via AVSZ3 (weighted by ZSF3). Returns OTZ -- the depth key most
 /// renderers use for ordering-table inserts.
 pub fn average_z_triangle() -> u16 {
-    // SAFETY: no input registers to prepare — AVSZ3 reads SZ1..SZ3
+    // SAFETY: no input registers to prepare -- AVSZ3 reads SZ1..SZ3
     // which were populated by the most recent RTPT / project_triangle.
     unsafe { ops::avsz3() };
     mfc2!(7) as u16
@@ -222,7 +222,7 @@ mod host_smoke {
     fn rtps_through_host_shim_projects_an_in_front_vertex() {
         host::reset();
         install_identity();
-        // V0 = (0, 0, 1024) — straight ahead, depth 1024. With H=200
+        // V0 = (0, 0, 1024) -- straight ahead, depth 1024. With H=200
         // the GTE divides 200/sz3 (≈0x4000/sz3 internally), giving an
         // X/Y near the screen offset for a vertex at the origin.
         let projected = project_vertex(Vec3I16::new(0, 0, 1024));

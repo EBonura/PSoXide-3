@@ -20,7 +20,7 @@ fn main() {
     bus.cdrom.insert_disc(Some(Disc::from_bin(disc)));
     let mut cpu = Cpu::new();
 
-    // Run to just before step 31139234 — using ISR-folded step
+    // Run to just before step 31139234 -- using ISR-folded step
     // indexing to match probe_cycle_first_divergence. When we enter
     // an ISR, we keep calling `cpu.step` until we're out, all
     // counted as a single folded step.
@@ -56,7 +56,7 @@ fn main() {
         let pre_vbt = bus.scheduler.target(EventSlot::VBlank);
         let pre_istat = bus.irq().stat();
         let pre_pc = cpu.pc();
-        // Step with fold — if ISR fires during this step, consume
+        // Step with fold -- if ISR fires during this step, consume
         // the whole handler as one folded step.
         let was_in_isr = cpu.in_isr();
         cpu.step(&mut bus).expect("step");

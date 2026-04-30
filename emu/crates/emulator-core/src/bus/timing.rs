@@ -3,7 +3,7 @@
 // --- Video-timing constants ---
 //
 // Match Redux's `psxcounters.cc` math exactly so VBlank fires at the
-// same cycle — and therefore at the same instruction — on both sides.
+// same cycle -- and therefore at the same instruction -- on both sides.
 //
 //   HSync period   = psxClockSpeed / (FrameRate × HSyncTotal)
 //   NTSC: 33_868_800 / (60 × 263) = 2146 cycles/HSync,  564_398 cyc/frame

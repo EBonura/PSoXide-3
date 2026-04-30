@@ -3,7 +3,7 @@
 //!
 //! # Model
 //!
-//! Each [`Light`] is a *directional* light — a direction vector
+//! Each [`Light`] is a *directional* light -- a direction vector
 //! + an RGB intensity. The PSX GTE evaluates lighting as:
 //!
 //! ```text
@@ -20,7 +20,7 @@
 //!   weighted by the corresponding dot-product magnitudes).
 //! - `BK` (background colour, 3×i32): ambient term added
 //!   before the material multiply.
-//! - `RGBC` (data reg 6): per-vertex material / palette tint —
+//! - `RGBC` (data reg 6): per-vertex material / palette tint --
 //!   the GTE multiplies the lit colour by this before emitting.
 //!
 //! # Object-local vs world-space lights
@@ -36,7 +36,7 @@
 //!
 //! - Rig upload (`load`): ~20 CTC2 writes per frame (cheap).
 //! - Per-object rotate: 9 integer multiplies × 3 lights = 27 mul
-//!   + 9 adds on the CPU — still cheap next to projection cost.
+//!   + 9 adds on the CPU -- still cheap next to projection cost.
 //! - Per vertex: 2 MTC2 + 1 RTPS + 2 MTC2 + 1 MTC2 + 1 NCCS + 3
 //!   MFC2 ≈ 10 GTE ops, ~30-40 cycles total.
 
@@ -61,7 +61,7 @@ pub struct Light {
 }
 
 impl Light {
-    /// Convenience constructor for a "warm-white at 75%" feel —
+    /// Convenience constructor for a "warm-white at 75%" feel --
     /// useful while prototyping light rigs.
     pub const fn warm_white_at(direction: Vec3I16) -> Self {
         Self {
@@ -70,7 +70,7 @@ impl Light {
         }
     }
 
-    /// "Cool fill" preset — bluish, dimmer, useful as a
+    /// "Cool fill" preset -- bluish, dimmer, useful as a
     /// secondary / rim light.
     pub const fn cool_fill_at(direction: Vec3I16) -> Self {
         Self {
@@ -79,7 +79,7 @@ impl Light {
         }
     }
 
-    /// Null light — contributes nothing. Use as a filler for
+    /// Null light -- contributes nothing. Use as a filler for
     /// unused slots in a rig.
     pub const OFF: Self = Self {
         direction: Vec3I16::ZERO,
@@ -87,7 +87,7 @@ impl Light {
     };
 }
 
-/// A rig of up to **3** directional lights — the maximum the
+/// A rig of up to **3** directional lights -- the maximum the
 /// PSX GTE supports natively.
 #[derive(Copy, Clone, Debug)]
 pub struct LightRig {
@@ -152,7 +152,7 @@ impl LightRig {
     /// the frame in which `rotation` is the object's local → world
     /// transform. I.e., if you pass the same `Mat3I16` you pass to
     /// [`scene::load_rotation`] for RTPS, the returned rig is in
-    /// object-local space — correct for feeding LLM when lighting
+    /// object-local space -- correct for feeding LLM when lighting
     /// mesh vertices that are themselves in local space.
     ///
     /// Math: world_vert = R × local_vert, so local = R⁻¹ × world,
@@ -191,7 +191,7 @@ impl LightRig {
     /// Return a new rig with every light's direction rotated by
     /// `rotation` (direct `R × dir`, not the transpose).
     ///
-    /// Used to animate world-space lights over time — e.g. an
+    /// Used to animate world-space lights over time -- e.g. an
     /// orbiting key light. Compose this BEFORE [`for_object`] so
     /// the per-object transpose applies on top of the animation.
     pub fn rotated(&self, rotation: &Mat3I16) -> LightRig {
@@ -253,11 +253,11 @@ pub struct FoggedTri {
     /// The three vertices in draw-order, each carrying its own
     /// projected position and lit+fogged colour.
     pub verts: [ProjectedLit; 3],
-    /// AVSZ3 result — ZSF3-weighted average of the three projected
+    /// AVSZ3 result -- ZSF3-weighted average of the three projected
     /// Z values. Commercial games scale this into an OT slot so
     /// nearer triangles sort in front.
     pub otz: u16,
-    /// `true` if MAC0 from NCLIP came out positive — the triangle
+    /// `true` if MAC0 from NCLIP came out positive -- the triangle
     /// is front-facing and should be drawn. `false` = back-face,
     /// skip.
     pub front_facing: bool,
@@ -271,7 +271,7 @@ pub struct FoggedTri {
 /// # Why per-vertex, not batched
 ///
 /// `RTPT + NCDT` is faster (4 GTE ops vs 8) but produces **uniform**
-/// fog across each triangle — `RTPT` only writes `IR0` for the last
+/// fog across each triangle -- `RTPT` only writes `IR0` for the last
 /// vertex, and `NCDT` then reuses that single `IR0` for each
 /// vertex's stage-3 blend. The visible result is stepped shading:
 /// every triangle has one flat fog tint, and seams between
@@ -290,16 +290,16 @@ pub struct FoggedTri {
 ///
 /// For each vertex `i = 0, 1, 2`:
 ///   1. Load `verts[i]` into V0.
-///   2. `RTPS` — projects V0, pushes SXY + SZ FIFOs, sets `IR0`
+///   2. `RTPS` -- projects V0, pushes SXY + SZ FIFOs, sets `IR0`
 ///      from DQA/DQB × the perspective divisor.
-///   3. Load `normals[i]` into V0 (overwriting the position —
+///   3. Load `normals[i]` into V0 (overwriting the position --
 ///      `RTPS` already consumed it).
-///   4. `NCDS` — computes lit + fogged colour using the current
+///   4. `NCDS` -- computes lit + fogged colour using the current
 ///      `IR0`, pushes RGB FIFO.
 ///
 /// After the loop:
-///   5. `NCLIP` — reads SXY0/1/2 from the FIFO, flags back-face.
-///   6. `AVSZ3` — reads SZ1/2/3, computes the OT-slot key.
+///   5. `NCLIP` -- reads SXY0/1/2 from the FIFO, flags back-face.
+///   6. `AVSZ3` -- reads SZ1/2/3, computes the OT-slot key.
 ///
 /// `NCDS` doesn't touch the SXY or SZ FIFOs, so they still hold
 /// the three per-vertex projection results when NCLIP and AVSZ3
@@ -320,7 +320,7 @@ pub fn project_triangle_fogged(
     normals: [Vec3I16; 3],
     material: (u8, u8, u8),
 ) -> FoggedTri {
-    // Material goes into RGBC once — NCDS reads RGBC on every call
+    // Material goes into RGBC once -- NCDS reads RGBC on every call
     // and it doesn't change per-vertex.
     let rgbc = (material.0 as u32) | ((material.1 as u32) << 8) | ((material.2 as u32) << 16);
     mtc2!(6, rgbc);
@@ -370,7 +370,7 @@ pub fn project_triangle_fogged(
     }
 }
 
-/// Shared unpack — turns raw SXY / SZ / RGB register reads into a
+/// Shared unpack -- turns raw SXY / SZ / RGB register reads into a
 /// [`ProjectedLit`]. Factored out so both the per-vertex and batch
 /// paths agree on byte/field layout.
 #[inline]
@@ -390,7 +390,7 @@ fn unpack_projected(sxy: u32, sz: u16, rgb: u32) -> ProjectedLit {
 /// Does RTPS on `vert` + NCCS on `normal`, with a per-vertex
 /// `material` RGB loaded into RGBC (data reg 6) to modulate the
 /// GTE's lit output. Pass `(128, 128, 128)` as material for
-/// "unmodulated" behaviour — the lit colour comes through as the
+/// "unmodulated" behaviour -- the lit colour comes through as the
 /// light rig + ambient dictate.
 ///
 /// Prerequisites (caller's responsibility, as with
@@ -414,7 +414,7 @@ pub fn project_lit(vert: Vec3I16, normal: Vec3I16, material: (u8, u8, u8)) -> Pr
     // --- Lighting: NCCS ---
     mtc2!(0, normal.xy_packed());
     mtc2!(1, normal.z_packed());
-    // RGBC layout (data reg 6): 0x00CC_BBGG_RR — low 8 bits R,
+    // RGBC layout (data reg 6): 0x00CC_BBGG_RR -- low 8 bits R,
     // next 8 G, next 8 B, top 8 "CODE" (GPU command byte, used by
     // some prim ops; 0 for our purposes).
     let rgbc = (material.0 as u32) | ((material.1 as u32) << 8) | ((material.2 as u32) << 16);

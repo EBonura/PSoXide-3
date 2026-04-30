@@ -6,7 +6,7 @@
 //! (state setters + draws + bulk writes), then replay that log
 //! through both paths against a fresh VRAM and time only the
 //! replay loop. CPU-to-VRAM uploads (0xA0..=0xBF) are skipped on
-//! both sides because their pixel data isn't in cmd_log — the GPU
+//! both sides because their pixel data isn't in cmd_log -- the GPU
 //! compute backend already short-circuits them, and we mirror that
 //! on the CPU side so the comparison stays apples-to-apples.
 //!
@@ -82,7 +82,7 @@ fn capture_cmd_log(
         }
         cursor += n;
         // Drain so cmd_log doesn't grow without bound between
-        // its `pixel_owner` resets — we fold each chunk into our
+        // its `pixel_owner` resets -- we fold each chunk into our
         // accumulator with re-numbered indices later if needed.
         let log = std::mem::take(&mut bus.gpu.cmd_log);
         accumulated.extend(log);
@@ -125,7 +125,7 @@ fn capture_cmd_log(
 }
 
 /// Replay `log` onto a fresh CPU `Gpu` instance, timed. CPU-to-VRAM
-/// uploads (0xA0..=0xBF) are skipped — their pixel data lives
+/// uploads (0xA0..=0xBF) are skipped -- their pixel data lives
 /// outside the cmd_log so re-playing the 3-word header would just
 /// stick the GPU in a half-completed transfer state. Mirrors what
 /// the GPU compute path does for parity, so the comparison is fair.

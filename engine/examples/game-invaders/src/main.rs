@@ -1,4 +1,4 @@
-//! `invaders` — mini-game #3, ported to the `psx-engine`
+//! `invaders` -- mini-game #3, ported to the `psx-engine`
 //! Scene/App framework.
 //!
 //! Classic Space Invaders: 5×10 marching alien grid that speeds
@@ -238,7 +238,7 @@ impl Invaders {
         }
     }
 
-    /// CROSS fires a single bullet. Classic Invaders cadence — can't spam.
+    /// CROSS fires a single bullet. Classic Invaders cadence -- can't spam.
     fn handle_player_shot(&mut self, ctx: &Ctx) {
         if ctx.is_held(button::CROSS) && !self.player_bullet.alive {
             self.player_bullet = Bullet {
@@ -540,7 +540,7 @@ impl Invaders {
 
         let (shake_dx, shake_dy) = self.shake.tick();
 
-        // Slot 7 (back) — gradient background.
+        // Slot 7 (back) -- gradient background.
         *bg = QuadGouraud::new(
             [
                 (0, 0),
@@ -552,7 +552,7 @@ impl Invaders {
         );
         ot.add(7, bg, QuadGouraud::WORDS);
 
-        // Slot 5 — aliens.
+        // Slot 5 -- aliens.
         let mut idx = 0;
         for row in 0..ROWS {
             let (r, gc, b) = ROW_COLORS[row];
@@ -575,7 +575,7 @@ impl Invaders {
             }
         }
 
-        // Slot 3 — particles. Reserve 6 trailing slots for
+        // Slot 3 -- particles. Reserve 6 trailing slots for
         // bullets + ship.
         let particle_budget = rects.len().saturating_sub(idx + 6);
         let wrote = self.particles.render_into_ot(
@@ -586,7 +586,7 @@ impl Invaders {
         );
         idx += wrote;
 
-        // Slot 2 — enemy bombs.
+        // Slot 2 -- enemy bombs.
         for bomb in &self.enemy_bombs {
             if !bomb.alive {
                 continue;
@@ -604,7 +604,7 @@ impl Invaders {
             idx += 1;
         }
 
-        // Slot 1 — player bullet.
+        // Slot 1 -- player bullet.
         if self.player_bullet.alive {
             rects[idx] = RectFlat::new(
                 self.player_bullet.x + shake_dx,
@@ -619,7 +619,7 @@ impl Invaders {
             idx += 1;
         }
 
-        // Slot 0 (front) — the ship. Flash uses the engine's
+        // Slot 0 (front) -- the ship. Flash uses the engine's
         // frame counter for the bit-2 strobe.
         let (sr, sg, sb) = if self.ship_flash_frames > 0 && (frame & 2 != 0) {
             (255, 200, 80)

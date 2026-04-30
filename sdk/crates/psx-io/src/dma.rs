@@ -1,8 +1,8 @@
 //! DMA controller MMIO.
 //!
 //! The PS1 has 7 DMA channels (MDEC-in, MDEC-out, GPU, CD-ROM, SPU,
-//! PIO, OTC). Each channel has three registers — `MADR` (memory
-//! address), `BCR` (block count), `CHCR` (control) — at fixed
+//! PIO, OTC). Each channel has three registers -- `MADR` (memory
+//! address), `BCR` (block count), `CHCR` (control) -- at fixed
 //! 16-byte strides starting at `0x1F80_1080`. Plus global `DPCR`
 //! (priority/enable) at `0x1F80_10F0` and `DICR` (IRQ) at `0x1F80_10F4`.
 
@@ -53,23 +53,23 @@ const CHCR_OFF: u32 = 0x8;
 
 // --- CHCR bits used by SDK callers -----------------------------------------
 
-/// CHCR.0 — direction: 0 = device→RAM, 1 = RAM→device.
+/// CHCR.0 -- direction: 0 = device→RAM, 1 = RAM→device.
 pub const CHCR_TO_DEVICE: u32 = 1 << 0;
-/// CHCR.1 — step: 0 = +4 MADR, 1 = -4 MADR.
+/// CHCR.1 -- step: 0 = +4 MADR, 1 = -4 MADR.
 pub const CHCR_STEP_BACKWARD: u32 = 1 << 1;
-/// CHCR.8 — chopping enable (DMA yields for CPU periodically).
+/// CHCR.8 -- chopping enable (DMA yields for CPU periodically).
 pub const CHCR_CHOPPING_ENABLE: u32 = 1 << 8;
 
-/// CHCR.9..10 — sync mode: manual (0), block (1), linked-list (2).
+/// CHCR.9..10 -- sync mode: manual (0), block (1), linked-list (2).
 pub const CHCR_SYNC_MANUAL: u32 = 0 << 9;
 /// Block-mode sync: BCR = block-count × block-size (in words).
 pub const CHCR_SYNC_BLOCK: u32 = 1 << 9;
 /// Linked-list sync: walks a chain of packet headers in RAM.
 pub const CHCR_SYNC_LINKED: u32 = 2 << 9;
 
-/// CHCR.24 — start the transfer (busy while set).
+/// CHCR.24 -- start the transfer (busy while set).
 pub const CHCR_START: u32 = 1 << 24;
-/// CHCR.28 — manual-mode trigger (self-clears when transfer begins).
+/// CHCR.28 -- manual-mode trigger (self-clears when transfer begins).
 pub const CHCR_TRIGGER: u32 = 1 << 28;
 
 // --- Register access helpers ----------------------------------------------

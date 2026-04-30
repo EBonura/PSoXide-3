@@ -10,9 +10,9 @@
 //!     payload_len = everything after the header
 //!
 //!   MeshHeader (8 bytes)
-//!     vert_count  u16 LE  — number of vertex entries
-//!     face_count  u16 LE  — number of triangle entries
-//!     _reserved   u32     — kept zero, for future use
+//!     vert_count  u16 LE  -- number of vertex entries
+//!     face_count  u16 LE  -- number of triangle entries
+//!     _reserved   u32     -- kept zero, for future use
 //!
 //!   Vertex table: vert_count × 6 bytes
 //!     x: i16 LE  (Q3.12 fixed-point)
@@ -52,12 +52,12 @@ pub const VERSION: u16 = 2;
 pub mod flags {
     /// Face-colour table is present after the index table.
     pub const HAS_FACE_COLORS: u16 = 1 << 0;
-    /// Per-vertex normal table is present — enables GTE-lit or
+    /// Per-vertex normal table is present -- enables GTE-lit or
     /// CPU-lit rendering paths. Values are Q3.12 unit vectors.
     pub const HAS_NORMALS: u16 = 1 << 1;
     // Reserved bits:
-    //   2 — HAS_UVS         (future: per-vertex UV for textured meshes)
-    //   3 — HAS_VERT_COLORS (future: baked per-vertex Gouraud colours)
+    //   2 -- HAS_UVS         (future: per-vertex UV for textured meshes)
+    //   3 -- HAS_VERT_COLORS (future: baked per-vertex Gouraud colours)
 }
 
 /// Byte layout of the mesh payload header that immediately

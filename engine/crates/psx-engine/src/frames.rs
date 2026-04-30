@@ -6,19 +6,19 @@
 //! timer (`frame & N` for periodic strobes), as a seed for
 //! per-frame variation, as input to the engine's [`Angle`][crate::Angle]
 //! math. Each call site wants a `u32` back, but *what the counter
-//! measures* should be explicit — is this a visible frame, a
+//! measures* should be explicit -- is this a visible frame, a
 //! simulation step, an SPU sample?
 //!
 //! Two distinct counters show up at different scales:
 //!
-//! - **[`Frames`]** — visible frames since boot. Ticks once per
+//! - **[`Frames`]** -- visible frames since boot. Ticks once per
 //!   end-of-loop in `App::run`. Wraps at `u32::MAX` (≈828 days at
-//!   60 fps — not a real concern, but well-defined).
+//!   60 fps -- not a real concern, but well-defined).
 //!
-//! - **[`Ticks`]** — SPU-audio-rate counter (44100 Hz). Wraps at
+//! - **[`Ticks`]** -- SPU-audio-rate counter (44100 Hz). Wraps at
 //!   `u32::MAX` = ~27 hours of uptime, comfortably past any
 //!   session length. Staying `u32` matches the R3000A's native
-//!   word size — a `u64` would force every arithmetic op to be
+//!   word size -- a `u64` would force every arithmetic op to be
 //!   synthesised as two 32-bit half-ops with carry, roughly 3-4×
 //!   cost with zero practical benefit at PSX timescales.
 //!
@@ -34,7 +34,7 @@
 //! increments. So on the very first frame, both callbacks see
 //! `Frames::ZERO`; on the second, `Frames(1)`. This is distinct
 //! from the "increment at start of update" convention some pre-
-//! engine games used (notably `game-invaders`) — their frame-0
+//! engine games used (notably `game-invaders`) -- their frame-0
 //! was our frame-1. Net behaviour is identical apart from a
 //! one-frame phase shift.
 
@@ -47,14 +47,14 @@ impl Frames {
     /// this value on the first iteration of the main loop.
     pub const ZERO: Frames = Frames(0);
 
-    /// Raw `u32` constructor — use for test fixtures or when
+    /// Raw `u32` constructor -- use for test fixtures or when
     /// bridging to an external frame count.
     pub const fn from_u32(n: u32) -> Frames {
         Frames(n)
     }
 
     /// Unwrap to the underlying `u32`. Use at call sites that
-    /// need bare arithmetic — `frame.as_u32() % 40`, etc.
+    /// need bare arithmetic -- `frame.as_u32() % 40`, etc.
     pub const fn as_u32(self) -> u32 {
         self.0
     }
@@ -70,14 +70,14 @@ impl Frames {
         Frames(self.0.wrapping_add(n))
     }
 
-    /// Read a specific bit of the underlying counter — useful for
+    /// Read a specific bit of the underlying counter -- useful for
     /// strobe effects (`frames.bit(1)` flips every frame).
     #[inline]
     pub const fn bit(self, index: u8) -> bool {
         (self.0 >> index) & 1 != 0
     }
 
-    /// `true` when the counter is divisible by `n` — shorthand
+    /// `true` when the counter is divisible by `n` -- shorthand
     /// for "every `n`th frame" cadences. `Frames::ZERO` satisfies
     /// this for any `n ≥ 1`.
     #[inline]
@@ -88,7 +88,7 @@ impl Frames {
 
 /// SPU-audio-rate tick counter.
 ///
-/// `u32` at 44100 Hz wraps after ~27 hours of uptime — comfortably
+/// `u32` at 44100 Hz wraps after ~27 hours of uptime -- comfortably
 /// past any real session. The R3000A has 32-bit native registers;
 /// a `u64` counter would force every arithmetic op to be
 /// synthesised as an add-with-carry pair, 3-4× the instruction

@@ -1,4 +1,4 @@
-//! GTE (COP2) — Geometry Transformation Engine.
+//! GTE (COP2) -- Geometry Transformation Engine.
 //!
 //! Not a memory-mapped device. Accessed via MIPS COP2 instructions
 //! (`MTC2`, `MFC2`, `CTC2`, `CFC2`, and the `COP2` command opcodes).

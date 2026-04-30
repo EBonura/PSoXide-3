@@ -2,13 +2,13 @@
 //!
 //! Turns SPU-programming-by-magic-numbers into typed primitives:
 //!
-//! - [`Voice`] — typed voice index in `0..24`.
-//! - [`Pitch`] — Q5.12 sample-rate multiplier; `Pitch::UNITY` =
+//! - [`Voice`] -- typed voice index in `0..24`.
+//! - [`Pitch`] -- Q5.12 sample-rate multiplier; `Pitch::UNITY` =
 //!   44100 Hz (one sample per SPU tick).
-//! - [`Volume`] — per-voice / main-output 15-bit signed linear gain.
-//! - [`Adsr`] — typed envelope descriptor; builds the two-word SPU
+//! - [`Volume`] -- per-voice / main-output 15-bit signed linear gain.
+//! - [`Adsr`] -- typed envelope descriptor; builds the two-word SPU
 //!   envelope register pair.
-//! - [`SpuAddr`] — 8-byte-aligned SPU RAM pointer (the only shape
+//! - [`SpuAddr`] -- 8-byte-aligned SPU RAM pointer (the only shape
 //!   voice-start / loop / transfer registers accept).
 //!
 //! Typical boot sequence:
@@ -31,7 +31,7 @@
 //!   byte-stream upload path, ADSR encoding helpers, sample-start
 //!   address alignment.
 //! - **Doesn't own (yet)**: ADPCM encoder (ship pre-baked samples
-//!   instead — see `vendor/tone_*.adpcm`), XA-ADPCM / CD-audio
+//!   instead -- see `vendor/tone_*.adpcm`), XA-ADPCM / CD-audio
 //!   streaming, reverb preset tables, DMA-based sample upload.
 //!   Those land as the ladder pulls them in.
 //!
@@ -57,13 +57,13 @@ use psx_io::spu::{SPUCNT, SPUSTAT, SPU_BASE};
 pub mod tones;
 
 // ======================================================================
-// MMIO helpers — hand-rolled volatile access at fixed SPU offsets
+// MMIO helpers -- hand-rolled volatile access at fixed SPU offsets
 // ======================================================================
 
 /// Raw MMIO write of a 16-bit SPU register.
 ///
 /// Every SPU register is 16-bit (the controller doesn't care about
-/// higher-width accesses — the lower half is what matters). We go
+/// higher-width accesses -- the lower half is what matters). We go
 /// through a volatile pointer so the compiler can't reorder writes
 /// across register boundaries.
 #[inline]
@@ -127,7 +127,7 @@ const TRANSFER_CTRL: u32 = 0x1F80_1DAC;
 ///
 /// Call once at boot before any voice operations.
 pub fn init() {
-    // Silence everything immediately — key_off on all 24 voices
+    // Silence everything immediately -- key_off on all 24 voices
     // before we touch any other state, so nothing glitches audibly
     // on cold boot.
     write_reg16(KEY_OFF_LO, 0xFFFF);
@@ -152,13 +152,13 @@ pub fn init() {
     write_reg16(NOISE_LO, 0);
     write_reg16(NOISE_HI, 0);
 
-    // Main volume to max — per-voice volume still controls the mix.
+    // Main volume to max -- per-voice volume still controls the mix.
     write_reg16(MAIN_VOL_LEFT, Volume::MAX.0 as u16);
     write_reg16(MAIN_VOL_RIGHT, Volume::MAX.0 as u16);
 
     // SPUCNT: bit 15 = SPU enable, bit 14 = mute OFF (i.e. audible),
     // everything else zero. Writing in that order matches PSX-SPX's
-    // recommendation — enable-then-unmute avoids a click.
+    // recommendation -- enable-then-unmute avoids a click.
     write_reg16(SPUCNT, 0x8000); // enabled, muted
     wait_spu_status(0x0000); // wait for SPUSTAT to stabilise
     write_reg16(SPUCNT, 0xC000); // enabled + unmuted
@@ -200,7 +200,7 @@ impl Volume {
 
     /// Build from a normalized float-ish 0.0..=1.0 value without
     /// actually using floats (since we're `no_std`, no FPU). `num`
-    /// and `den` are integer — `Volume::linear(3, 4)` is 0.75.
+    /// and `den` are integer -- `Volume::linear(3, 4)` is 0.75.
     pub const fn linear(num: u16, den: u16) -> Self {
         let v = ((Self::MAX.0 as u32) * (num as u32)) / (den as u32);
         Self(v as i16)
@@ -221,11 +221,11 @@ impl Default for Volume {
 pub struct Pitch(u16);
 
 impl Pitch {
-    /// `0x1000` — play at the sample's native 44100 Hz rate.
+    /// `0x1000` -- play at the sample's native 44100 Hz rate.
     pub const UNITY: Self = Self(0x1000);
-    /// `0x0800` — one octave below recorded rate.
+    /// `0x0800` -- one octave below recorded rate.
     pub const OCTAVE_DOWN: Self = Self(0x0800);
-    /// `0x2000` — one octave above recorded rate.
+    /// `0x2000` -- one octave above recorded rate.
     pub const OCTAVE_UP: Self = Self(0x2000);
     /// Hardware cap (14-bit field). Higher values clamp.
     pub const MAX: Self = Self(0x3FFF);
@@ -319,7 +319,7 @@ pub struct Adsr {
 }
 
 impl Adsr {
-    /// Reasonable generic tone envelope — fast attack, short decay
+    /// Reasonable generic tone envelope -- fast attack, short decay
     /// to half-sustain, mid-long release. Audible and "square-ish."
     pub const fn default_tone() -> Self {
         // Attack shift = 0x7F (~0.5s to full), decay shift = 0xA,
@@ -337,7 +337,7 @@ impl Adsr {
         }
     }
 
-    /// Very short percussive envelope — for blips, UI clicks, hit
+    /// Very short percussive envelope -- for blips, UI clicks, hit
     /// SFX. Snappy attack, almost immediate release.
     pub const fn percussive() -> Self {
         Self {
@@ -350,7 +350,7 @@ impl Adsr {
         }
     }
 
-    /// Silent / "no envelope" — voice stays at key-on volume until
+    /// Silent / "no envelope" -- voice stays at key-on volume until
     /// key-off. Useful as a placeholder while iterating.
     pub const fn passthrough() -> Self {
         Self { lower: 0, upper: 0 }
@@ -448,7 +448,7 @@ impl Voice {
         write_reg16(KEY_ON_HI, (mask >> 16) as u16);
     }
 
-    /// Stop the voices whose bits are set in `mask` — fires the
+    /// Stop the voices whose bits are set in `mask` -- fires the
     /// release phase of the ADSR.
     pub fn key_off(mask: u32) {
         write_reg16(KEY_OFF_LO, mask as u16);
@@ -471,7 +471,7 @@ pub fn set_main_volume(left: Volume, right: Volume) {
 // ======================================================================
 
 /// Upload ADPCM sample bytes to SPU RAM via the manual-transfer
-/// (PIO) path. Slow — one halfword per write — but simple and
+/// (PIO) path. Slow -- one halfword per write -- but simple and
 /// doesn't need DMA setup. Games that upload many megabytes of
 /// samples at boot use DMA; for per-frame SFX uploads of a few
 /// KB, this is fine.

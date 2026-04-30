@@ -1049,7 +1049,7 @@ fn dominant_vertex_joint(joints: [u16; 4], weights: [f32; 4]) -> u16 {
 /// to whichever bone owns the **majority** of its three corners.
 ///
 /// On a 2-1 split the majority vertex pair wins, leaving the third
-/// corner as the only "pulled" vertex bound to a foreign bone — much
+/// corner as the only "pulled" vertex bound to a foreign bone -- much
 /// less visible than the previous face-level binding, which could
 /// pull all three corners together. On a 3-way disagreement we fall
 /// back to summed-weight scoring so the choice still reflects the
@@ -1341,7 +1341,7 @@ fn encode_model_vertex(
 ///
 /// `weight1 / (weight0 + weight1)` smaller than this contributes a
 /// blend so subtle the runtime CPU path costs more than the visual
-/// difference — better to stay on the single-bone GTE fast path.
+/// difference -- better to stay on the single-bone GTE fast path.
 const BLEND_DROP_THRESHOLD: f32 = 0.04;
 
 /// Pick the secondary bone + blend byte for a vertex, given the part
@@ -1352,7 +1352,7 @@ const BLEND_DROP_THRESHOLD: f32 = 0.04;
 /// is the strongest of:
 ///
 /// * the vertex's own dominant bone, when the part's bone differs (a
-///   "pulled" vertex on the wrong side of a seam — pulling it back
+///   "pulled" vertex on the wrong side of a seam -- pulling it back
 ///   toward its natural bone removes the gap);
 /// * otherwise the next-highest-weight bone after `primary_joint`.
 fn blend_slot_for_vertex(vertex: SourceVertex, primary_joint: u16) -> (u8, u8) {

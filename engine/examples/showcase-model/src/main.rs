@@ -1,10 +1,10 @@
-//! `showcase-model` — animated-model demo with model + clip cycling.
+//! `showcase-model` -- animated-model demo with model + clip cycling.
 //!
 //! Loads two cooked models that share the same Meshy biped rig, plus
 //! every cooked `.psxanim` clip for each. The camera spherically
 //! orbits the active model; D-pad rotates, Triangle/Cross dolly, and
 //! Square/Circle step through the active model's clip set. Select
-//! swaps between the two characters — texture is re-uploaded into
+//! swaps between the two characters -- texture is re-uploaded into
 //! the same VRAM slot, animation phase resets so the new clip starts
 //! cleanly. An overlay draws the active model name, the current clip
 //! name, and a one-line control reminder.
@@ -40,7 +40,7 @@ struct ModelEntry {
 /// Both models share the Meshy biped rig (24 joints, identical
 /// hierarchy and bind pose), so a single cooked clip set animates
 /// either character. We cook the eight clips off the obsidian glb
-/// because that's the drop with the full move list — the hooded
+/// because that's the drop with the full move list -- the hooded
 /// wretch glb only ships running and walking.
 ///
 /// The source export's animation names are offset from the actual

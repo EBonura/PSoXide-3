@@ -1,6 +1,6 @@
 //! Run the emulator with a disc until CPU step errors, then dump
 //! the last N instructions that retired + key register state.
-//! Helps trace "where did the game jump into unmapped memory" —
+//! Helps trace "where did the game jump into unmapped memory" --
 //! the jump target is usually somewhere near the last few retired
 //! instructions, either via a GTE MFC2 to a pointer-sized register
 //! or a DMA completion that corrupted RAM.

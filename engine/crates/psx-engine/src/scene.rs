@@ -7,7 +7,7 @@
 //! helpers), the render-frame counter, engine time, and a
 //! [`FrameBuffer`] ready to draw into.
 //!
-//! The split into `update` + `render` is cosmetic — both get the
+//! The split into `update` + `render` is cosmetic -- both get the
 //! same `Ctx`. Keeping them separate reads better and makes it easy
 //! to add determinism/replay hooks later (record `Ctx.pad` during
 //! update, replay without re-rendering, etc).
@@ -36,7 +36,7 @@ pub struct Ctx {
     pub time: EngineTime,
     /// Port-1 pad state this frame.
     pub pad: PadState,
-    /// Port-1 pad state last frame — used by [`Ctx::just_pressed`]
+    /// Port-1 pad state last frame -- used by [`Ctx::just_pressed`]
     /// to distinguish "newly pressed this frame" from "held across
     /// multiple frames".
     pub pad_prev: PadState,

@@ -1,6 +1,6 @@
 //! Lucide icon codepoints (subset used by PSoXide UI).
 //!
-//! Keep this file small — add codepoints only when a panel actually uses
+//! Keep this file small -- add codepoints only when a panel actually uses
 //! them. The full Lucide set is in `assets/fonts/lucide.ttf`.
 
 #![allow(dead_code)]
@@ -32,16 +32,16 @@ pub const VOLUME_X: char = '\u{e1ac}';
 pub const EYE: char = '\u{e0ba}';
 pub const EYE_OFF: char = '\u{e0bb}';
 
-/// Power-off / quit icon — used for the rightmost Menu category
+/// Power-off / quit icon -- used for the rightmost Menu category
 /// so "close the app" has its own place instead of hiding inside
 /// Debug.
 pub const POWER: char = '\u{e13e}';
-/// Folder icon — Examples category badge (SDK homebrew feels
+/// Folder icon -- Examples category badge (SDK homebrew feels
 /// more like "scroll through a folder" than "spin a disc").
 pub const FOLDER: char = '\u{e0d8}';
-/// Refresh/rotate icon — rescan-library action.
+/// Refresh/rotate icon -- rescan-library action.
 pub const ROTATE_CCW: char = '\u{e144}';
-/// Disc icon — Games category badge.
+/// Disc icon -- Games category badge.
 pub const DISC: char = '\u{e528}';
 
 /// Lucide FontId at a given size.

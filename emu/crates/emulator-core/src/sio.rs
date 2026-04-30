@@ -1,4 +1,4 @@
-//! SIO0 — controller / memory-card serial port.
+//! SIO0 -- controller / memory-card serial port.
 //!
 //! Register map at `0x1F80_1040`:
 //!   +0  `SIO0_DATA`  TX/RX FIFO (8-bit; reads may be accessed as wider)
@@ -7,17 +7,10 @@
 //!   +A  `SIO0_CTRL`  control (16-bit)
 //!   +E  `SIO0_BAUD`  baud divisor (16-bit)
 //!
-//! This implementation models the common cold-boot case where no
-//! controller and no memory-card are connected to either port. Every
-//! byte the CPU writes to `DATA` transmits instantly, the TX-ready
-//! status bits are always set, and no device ever answers, so the
-//! RX FIFO stays empty and `/ACK` never goes low. The BIOS's
-//! controller-poll path uses this to conclude "no pad present" after
-//! one address byte and move on — enough to unblock the boot
-//! spin-wait on `SIO0_STAT & 1`.
-//!
-//! Real controller / memcard protocols (packet framing, slot select,
-//! IRQ7 on ACK, DSR timing) land when we emulate an attached device.
+//! The core default has a digital controller and memory card on port 1,
+//! plus a memory card on port 2. Frontend launches replace the card
+//! backing with the per-game save file, while parity probes use the
+//! same fresh-card default as Redux's portable profile.
 
 mod stat_bit {
     pub const TX_READY_1: u32 = 1 << 0;
@@ -30,7 +23,7 @@ mod stat_bit {
 }
 
 mod ctrl_bit {
-    /// bit 1 — drive `/JOYN` output. Transitioning high-to-low is how
+    /// bit 1 -- drive `/JOYN` output. Transitioning high-to-low is how
     /// the CPU "selects" the device at the start of a transfer; going
     /// low-to-high deselects and resets the device state machine.
     pub const JOYN_OUTPUT: u16 = 1 << 1;
@@ -38,9 +31,9 @@ mod ctrl_bit {
     pub const ACK: u16 = 1 << 4;
     /// Write-1 to soft-reset the port.
     pub const RESET: u16 = 1 << 6;
-    /// bit 12 — enable IRQ7 generation from controller ACK pulses.
+    /// bit 12 -- enable IRQ7 generation from controller ACK pulses.
     pub const ACK_IRQ_ENABLE: u16 = 1 << 12;
-    /// bit 13 — port / slot select (0 = JOY1, 1 = JOY2).
+    /// bit 13 -- port / slot select (0 = JOY1, 1 = JOY2).
     pub const SLOT: u16 = 1 << 13;
 }
 
@@ -58,10 +51,12 @@ mod offset {
 /// Serial-transfer time for one byte when BAUD is zero. Matches the
 /// BIOS's common `0x88 * 8 = 1088`-cycle setup.
 const DEFAULT_TRANSFER_TICKS: u64 = 1088;
-/// Delay from RX-byte delivery to `/ACK` for a controller.
-const PAD_ACK_DELAY_TICKS: u64 = 450;
-/// Memory cards answer faster than pads.
-const MEMCARD_ACK_DELAY_TICKS: u64 = 170;
+/// Legacy pad ACK pulse width. The data byte itself is made available
+/// synchronously like Redux; the delayed event represents the IRQ/ACK
+/// edge, not byte delivery.
+const PAD_ACK_DELAY_TICKS: u64 = 0;
+/// Memory cards share the same SIO baud-clocked IRQ timing in Redux.
+const MEMCARD_ACK_DELAY_TICKS: u64 = 0;
 /// `/ACK` is a pulse, not a sticky level.
 const ACK_PULSE_TICKS: u64 = 100;
 
@@ -87,22 +82,20 @@ pub struct Sio0 {
     /// Sticky SIO IRQ bit exposed in `STAT` bit 9. Writing CTRL.ACK
     /// clears it; the bus-level interrupt controller is separate.
     irq_latched: bool,
-    /// Byte currently in flight on the serial wire. Becomes visible
-    /// in `rx` only once the transfer phase completes.
+    /// Last byte produced by the selected device. Redux makes the
+    /// byte visible in DATA immediately; this copy is retained for the
+    /// older transfer-deadline scaffolding and diagnostics.
     pending_rx: u8,
-    /// One-byte TX holding register. `STAT.TX_READY_1` reflects
-    /// whether this slot is free, while `STAT.TX_READY_2` stays low
-    /// until the currently active byte clears the shifter and any
-    /// pending ACK delay for the previous byte has expired.
+    /// Legacy one-byte TX holding register. The Redux-aligned path
+    /// currently accepts DATA writes synchronously, so this remains
+    /// empty unless the older deadline path is re-enabled.
     queued_tx: Option<u8>,
-    /// Whether the current byte will be followed by an ACK pulse.
+    /// Whether the current byte will be followed by a delayed SIO
+    /// event.
     pending_ack: bool,
-    /// Current byte transfer occupies the wire. A queued follow-up
-    /// byte can launch as soon as this shifter phase completes even
-    /// if the previous byte's ACK pulse has not fired yet.
+    /// Legacy shifter state for the older delayed-byte path.
     transfer_busy: bool,
-    /// Transfer phase is done and we're waiting for the ACK delay to
-    /// expire.
+    /// Legacy wait state for the older delayed-byte path.
     awaiting_ack: bool,
     /// Absolute cycle at which the current byte transfer completes.
     transfer_deadline: Option<u64>,
@@ -128,14 +121,11 @@ impl Sio0 {
     /// Size of the register window (`DATA..=BAUD` plus padding).
     pub const SIZE: u32 = 0x10;
 
-    /// All registers zero, port 1 pre-populated with a digital pad,
-    /// port 2 left empty. Matches the "controller is plugged in,
-    /// nothing in slot 2" default most games assume on boot — the
-    /// same default our frontend wires up when the user runs a
-    /// disc. Without this, `set_port1_buttons` was a silent no-op
-    /// (no `DigitalPad` to route the button mask to) and every
-    /// game's SIO poll returned 0xFF regardless of what the player
-    /// pressed on the keyboard or host gamepad.
+    /// All registers zero, port 1 pre-populated with a digital pad and
+    /// a fresh memory card, port 2 with a fresh memory card. The
+    /// frontend replaces port 1's card backing on game launch; keeping
+    /// a default card here matches Redux's portable startup profile
+    /// and lets BIOS/game card probes observe an inserted card.
     pub fn new() -> Self {
         Self {
             mode: 0,
@@ -168,7 +158,7 @@ impl Sio0 {
         &self.port1
     }
 
-    /// Mutable access to port 1 — lets higher layers swap a
+    /// Mutable access to port 1 -- lets higher layers swap a
     /// memory card in while keeping the pad attached.
     pub fn port1_mut(&mut self) -> &mut crate::pad::PortDevice {
         &mut self.port1
@@ -298,8 +288,9 @@ impl Sio0 {
         (Self::BASE..Self::BASE + Self::SIZE).contains(&phys)
     }
 
-    /// `SIO0_STAT`. TX is never busy (no clock simulation); RX-not-empty
-    /// tracks whether a response byte is waiting.
+    /// `SIO0_STAT`. Redux completes byte exchange synchronously; the
+    /// baud-clocked delay is for the later SIO IRQ event, not DATA
+    /// visibility.
     fn stat(&self) -> u32 {
         let mut s = 0;
         if self.queued_tx.is_none() {
@@ -321,7 +312,7 @@ impl Sio0 {
     }
 
     /// Pop the RX slot, returning 0xFF when empty. Used by all three
-    /// widths of DATA read — the real chip zero-extends on the bus.
+    /// widths of DATA read -- the real chip zero-extends on the bus.
     fn pop_rx(&mut self) -> u8 {
         self.rx.take().unwrap_or(0xFF)
     }
@@ -430,12 +421,6 @@ impl Sio0 {
     /// selected device (if any) returns its RX byte and whether it
     /// wants another round (pulls `/DSR` low → IRQ7 armed).
     fn write_data_at(&mut self, value: u8, now: u64) {
-        if self.transfer_busy {
-            if self.queued_tx.is_none() {
-                self.queued_tx = Some(value);
-            }
-            return;
-        }
         self.start_transfer_at(value, now, true);
     }
 
@@ -461,8 +446,15 @@ impl Sio0 {
         self.pending_rx = rx;
         self.pending_ack = ack;
         self.ack_delay_ticks = ack_delay_ticks;
-        self.transfer_busy = true;
-        self.transfer_deadline = Some(now.saturating_add(self.transfer_ticks()));
+        self.rx = Some(rx);
+        self.transfer_busy = false;
+        self.awaiting_ack = false;
+        self.transfer_deadline = None;
+        self.ack_deadline = if ack && self.ctrl & ctrl_bit::ACK_IRQ_ENABLE != 0 {
+            Some(now.saturating_add(self.transfer_ticks()).saturating_add(ack_delay_ticks))
+        } else {
+            None
+        };
     }
 
     /// Device selected by the current `CTRL.SLOT` bit.
@@ -607,7 +599,7 @@ mod tests {
 
     #[test]
     fn tx_fills_rx_with_ff_and_sets_stat_bit() {
-        // Test the no-device path explicitly — with the default pad
+        // Test the no-device path explicitly -- with the default pad
         // attached, TX 0x01 would select the pad and return the
         // dummy select-byte response.
         let mut sio = Sio0::new();
@@ -747,13 +739,17 @@ mod tests {
         );
 
         sio.write8(Sio0::BASE, 0x01);
-        sio.tick(DEFAULT_TRANSFER_TICKS);
 
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
+        assert_ne!(
+            stat & stat_bit::RX_NOT_EMPTY,
+            0,
+            "Redux makes the response byte visible immediately"
+        );
         assert_eq!(
             stat & stat_bit::ACK_INPUT,
             0,
-            "ACK must wait for the ACK phase"
+            "ACK must wait for the delayed SIO event"
         );
         assert_eq!(stat & stat_bit::IRQ, 0, "IRQ bit must stay low until ACK");
         assert!(
@@ -761,7 +757,14 @@ mod tests {
             "bus IRQ should not fire before ACK"
         );
 
-        sio.tick(DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);
+        sio.tick(DEFAULT_TRANSFER_TICKS - 1);
+        assert_eq!(
+            sio.read32(Sio0::BASE + 0x4).unwrap() & stat_bit::IRQ,
+            0,
+            "IRQ must not fire before the Redux baud-clocked delay"
+        );
+
+        sio.tick(DEFAULT_TRANSFER_TICKS);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
         assert_ne!(stat & stat_bit::ACK_INPUT, 0, "ACK input should be visible");
         assert_ne!(stat & stat_bit::IRQ, 0, "STAT IRQ bit should latch");
@@ -785,7 +788,11 @@ mod tests {
         sio.tick(DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);
 
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_ne!(stat & stat_bit::ACK_INPUT, 0, "ACK input should be visible");
+        assert_eq!(
+            stat & stat_bit::ACK_INPUT,
+            0,
+            "without ACK IRQ enable, no delayed ACK event is scheduled"
+        );
         assert_eq!(
             stat & stat_bit::IRQ,
             0,
@@ -866,41 +873,49 @@ mod tests {
     }
 
     #[test]
-    fn transfer_busy_holds_tx_ready_low_until_ack_phase_finishes() {
+    fn redux_style_transmit_keeps_tx_ready_high_while_irq_is_delayed() {
         use crate::pad::{DigitalPad, PortDevice};
 
         let mut sio = Sio0::new();
         sio.attach_port1(PortDevice::empty().with_pad(DigitalPad::new()));
-        sio.write16(Sio0::BASE + 0xA, ctrl_bit::JOYN_OUTPUT);
+        sio.write16(
+            Sio0::BASE + 0xA,
+            ctrl_bit::JOYN_OUTPUT | ctrl_bit::ACK_IRQ_ENABLE,
+        );
         sio.write16(Sio0::BASE + 0xE, 0x0088);
 
         sio.write8_at(Sio0::BASE, 0x01, 10);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_eq!(
+        assert_ne!(
             stat & stat_bit::TX_READY_2,
             0,
-            "transfer should drop TX_READY_2"
+            "Redux completes the byte synchronously and keeps TX_READY_2 high"
+        );
+        assert_ne!(
+            stat & stat_bit::RX_NOT_EMPTY,
+            0,
+            "response byte should be readable immediately"
+        );
+
+        sio.tick(10 + 0x88 * 8 - 1);
+        let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
+        assert_eq!(
+            stat & stat_bit::IRQ,
+            0,
+            "only the SIO IRQ edge is delayed"
         );
 
         sio.tick(10 + 0x88 * 8);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_eq!(
-            stat & stat_bit::TX_READY_2,
-            0,
-            "ACK wait should still look busy"
-        );
-
-        sio.tick(10 + 0x88 * 8 + PAD_ACK_DELAY_TICKS);
-        let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
         assert_ne!(
-            stat & stat_bit::TX_READY_2,
+            stat & stat_bit::IRQ,
             0,
-            "port should go ready after ACK"
+            "IRQ should latch at the Redux baud-clocked deadline"
         );
     }
 
     #[test]
-    fn tx_ready_1_stays_high_until_the_single_byte_queue_is_full() {
+    fn tx_ready_1_stays_high_across_successive_synchronous_writes() {
         use crate::pad::{DigitalPad, PortDevice};
 
         let mut sio = Sio0::new();
@@ -912,53 +927,58 @@ mod tests {
         assert_ne!(
             stat & stat_bit::TX_READY_1,
             0,
-            "queue slot should stay free during first byte"
+            "TX_READY_1 should stay set after synchronous select byte"
         );
+        assert_eq!(sio.pop_rx(), 0xFF);
 
         sio.write8_at(Sio0::BASE, 0x42, 11);
-        let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_eq!(
-            stat & stat_bit::TX_READY_1,
-            0,
-            "second write should fill the one-byte queue"
-        );
-
-        sio.tick(10 + DEFAULT_TRANSFER_TICKS);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
         assert_ne!(
             stat & stat_bit::TX_READY_1,
             0,
-            "queued byte should launch as soon as the shifter is free"
+            "second write should not fill a deferred TX queue"
+        );
+        assert_eq!(sio.pop_rx(), 0x41);
+        assert_ne!(
+            sio.read32(Sio0::BASE + 0x4).unwrap() & stat_bit::TX_READY_1,
+            0,
+            "TX_READY_1 remains high after DATA is consumed"
         );
     }
 
     #[test]
-    fn queued_byte_starts_before_the_previous_ack_delay_finishes() {
+    fn successive_writes_advance_pad_state_synchronously() {
         use crate::pad::{DigitalPad, PortDevice};
 
         let mut sio = Sio0::new();
         sio.attach_port1(PortDevice::empty().with_pad(DigitalPad::new()));
-        sio.write16(Sio0::BASE + 0xA, ctrl_bit::JOYN_OUTPUT);
+        sio.write16(
+            Sio0::BASE + 0xA,
+            ctrl_bit::JOYN_OUTPUT | ctrl_bit::ACK_IRQ_ENABLE,
+        );
 
         sio.write8_at(Sio0::BASE, 0x01, 10);
-        sio.write8_at(Sio0::BASE, 0x42, 11);
-
-        sio.tick(10 + DEFAULT_TRANSFER_TICKS);
-        assert_eq!(sio.pop_rx(), 0xFF, "select byte should complete on time");
-        assert!(
-            sio.transfer_busy,
-            "queued second byte should have started immediately after the first transfer"
-        );
-        assert!(
-            sio.awaiting_ack,
-            "the first byte should still be waiting to pulse ACK"
-        );
-
-        sio.tick(10 + DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS - 1);
         assert_eq!(
-            sio.read32(Sio0::BASE + 0x4).unwrap() & stat_bit::ACK_INPUT,
-            0,
-            "ACK should still wait for its own delay even while the next byte is in flight"
+            sio.pop_rx(),
+            0xFF,
+            "select byte response should be available before the IRQ event"
+        );
+        assert_eq!(
+            sio.debug_ack_deadline(),
+            Some(10 + DEFAULT_TRANSFER_TICKS),
+            "first byte should still schedule a delayed SIO event"
+        );
+
+        sio.write8_at(Sio0::BASE, 0x42, 11);
+        assert_eq!(
+            sio.pop_rx(),
+            0x41,
+            "command byte response should also be immediate"
+        );
+        assert_eq!(
+            sio.debug_ack_deadline(),
+            Some(11 + DEFAULT_TRANSFER_TICKS),
+            "new synchronous byte should replace the next delayed IRQ deadline"
         );
     }
 
@@ -968,7 +988,10 @@ mod tests {
 
         let mut sio = Sio0::new();
         sio.attach_port1(PortDevice::empty().with_pad(DigitalPad::new()));
-        sio.write16(Sio0::BASE + 0xA, ctrl_bit::JOYN_OUTPUT);
+        sio.write16(
+            Sio0::BASE + 0xA,
+            ctrl_bit::JOYN_OUTPUT | ctrl_bit::ACK_IRQ_ENABLE,
+        );
 
         sio.write8_at(Sio0::BASE, 0x01, 100);
         sio.tick(100 + DEFAULT_TRANSFER_TICKS + PAD_ACK_DELAY_TICKS);

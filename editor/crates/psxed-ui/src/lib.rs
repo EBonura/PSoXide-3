@@ -90,7 +90,7 @@ pub struct EditorWorkspace {
     /// primitive in Select mode, mutated by every drag frame, and
     /// cleared on release. Records pre-drag heights of every
     /// physical vertex involved so the apply step is
-    /// `snap(pre_y + delta)` — clean snapping with no error
+    /// `snap(pre_y + delta)` -- clean snapping with no error
     /// accumulation.
     primitive_drag: Option<PrimitiveDrag>,
     /// Hovered entity bound under the cursor (Select tool
@@ -104,7 +104,7 @@ pub struct EditorWorkspace {
     /// What the next paint click would target. Cell variant fires
     /// for floor / ceiling / erase / place; Wall variant fires for
     /// PaintWall. World-cell coords let the preview track cells
-    /// outside the current grid bounds — the renderer outlines
+    /// outside the current grid bounds -- the renderer outlines
     /// them as ghosts at the world position the auto-grow would
     /// place them.
     paint_target_preview: Option<PaintTargetPreview>,
@@ -135,7 +135,7 @@ pub struct EditorWorkspace {
     place_kind: PlaceKind,
     /// Material the next Floor / Wall / Ceiling paint will use, when
     /// set. `None` means "fall back to the name-based heuristic
-    /// (`floor → first 'floor' material, brick → first 'brick' …`)" —
+    /// (`floor → first 'floor' material, brick → first 'brick' …`)" --
     /// which is also what fresh projects start with so painting works
     /// before any material is hand-picked.
     brush_material: Option<ResourceId>,
@@ -169,7 +169,7 @@ pub struct EditorWorkspace {
 
 /// One cached `.psxt` thumbnail plus the metadata the inspector
 /// reads off the same parse. `signature` is the path the handle was
-/// built from — when the user retypes the path on a Texture
+/// built from -- when the user retypes the path on a Texture
 /// resource, the signature mismatches and the cache rebuilds.
 struct ThumbnailEntry {
     signature: String,
@@ -185,7 +185,7 @@ struct ThumbnailEntry {
 struct PsxtStats {
     width: u16,
     height: u16,
-    /// 4, 8, or 15 — mirrors `psxed_format::texture::Depth`'s
+    /// 4, 8, or 15 -- mirrors `psxed_format::texture::Depth`'s
     /// numeric form.
     depth_bits: u8,
     /// 16 for 4bpp, 256 for 8bpp, 0 for 15bpp.
@@ -214,7 +214,7 @@ struct PackageSummary {
 }
 
 /// Per-stamp paint dedupe key. Two paint events with equal stamps
-/// are considered redundant during a single drag — typically the
+/// are considered redundant during a single drag -- typically the
 /// second is dropped. Edge / stack components let PaintWall stamp
 /// multiple edges of the same cell without dwelling on one
 /// re-firing the same wall.
@@ -229,18 +229,18 @@ struct PaintStamp {
 }
 
 /// What the next paint click would target. Carries world-cell
-/// coordinates (which can be negative — outside the current grid)
+/// coordinates (which can be negative -- outside the current grid)
 /// so the renderer can preview cells the next click would auto-
 /// create. Stays populated for any paint tool, mirroring the
 /// dispatch so what you preview is what you'll paint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaintTargetPreview {
-    /// Floor / ceiling / erase / place — outlines the cell.
+    /// Floor / ceiling / erase / place -- outlines the cell.
     Cell {
         world_cell_x: i32,
         world_cell_z: i32,
     },
-    /// PaintWall — outlines the wall on the targeted edge of the
+    /// PaintWall -- outlines the wall on the targeted edge of the
     /// cell. `stack` is the next-free wall slot index for that
     /// edge, used by the renderer to position the ghost above any
     /// existing walls.
@@ -255,7 +255,7 @@ pub enum PaintTargetPreview {
 /// One pickable surface on the active Room's grid. Floors and
 /// ceilings are addressed by sector; walls add a cardinal direction
 /// plus a stack index (a single edge can hold multiple stacked walls
-/// — windows / arches — and each is independently selectable).
+/// -- windows / arches -- and each is independently selectable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaceKind {
     Floor,
@@ -315,7 +315,7 @@ pub enum FaceCornerRef {
     },
 }
 
-/// Vertex in a `Selection`. Carries the *seed* corner — the one
+/// Vertex in a `Selection`. Carries the *seed* corner -- the one
 /// the user actually clicked. Resolve to a `PhysicalVertex` to
 /// get every coincident face-corner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,11 +432,11 @@ impl Selection {
 pub enum EntityBoundKind {
     /// Model-backed `MeshInstance` with parsed model bounds.
     Model,
-    /// Legacy / unbound `MeshInstance` — fallback box.
+    /// Legacy / unbound `MeshInstance` -- fallback box.
     MeshFallback,
     /// `SpawnPoint` (player or non-player).
     SpawnPoint,
-    /// `Light`. Marker box only — radius ring is drawn
+    /// `Light`. Marker box only -- radius ring is drawn
     /// separately so a wide-radius light doesn't intercept
     /// every click in the room.
     Light,
@@ -518,7 +518,7 @@ pub fn ray_intersects_aabb(
         let o = origin[axis];
         let d = dir[axis];
         if d.abs() < 1e-6 {
-            // Ray parallel to this axis — only hits if origin
+            // Ray parallel to this axis -- only hits if origin
             // is between the slabs.
             if o < lo || o > hi {
                 return None;
@@ -585,7 +585,7 @@ mod entity_bounds_tests {
 
     #[test]
     fn ray_aabb_misses_offset_box() {
-        // Box offset to +X by 100 — a +Z ray at origin misses.
+        // Box offset to +X by 100 -- a +Z ray at origin misses.
         let t = ray_aabb(
             [0.0, 0.0, -10.0],
             [0.0, 0.0, 1.0],
@@ -673,7 +673,7 @@ mod entity_bounds_tests {
     }
 }
 
-/// Three-mode selection switch — Blender-style. `Face` keeps
+/// Three-mode selection switch -- Blender-style. `Face` keeps
 /// the existing whole-face semantics; `Edge` and `Vertex` pick
 /// finer primitives via local-UV math on the picked face.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -699,10 +699,10 @@ impl SelectionMode {
 /// pointer moves until release.
 #[derive(Debug, Clone)]
 struct PrimitiveDrag {
-    /// What's being dragged — used to refresh the visual outline
+    /// What's being dragged -- used to refresh the visual outline
     /// while the geometry under it shifts.
     target: Selection,
-    /// Physical vertices to translate — typically 1 (Vertex
+    /// Physical vertices to translate -- typically 1 (Vertex
     /// mode), 2 (Edge mode), or 4 (Face mode). Each entry
     /// carries every coincident face-corner so a single drag
     /// applies through the universal-coincidence resolver
@@ -710,7 +710,7 @@ struct PrimitiveDrag {
     vertices: Vec<PhysicalVertex>,
     /// Pre-drag Y of each entry in `vertices`, in the same
     /// order. Apply step is `snap(pre_y + total_delta_world)`
-    /// for every vertex — single source of truth for the new
+    /// for every vertex -- single source of truth for the new
     /// height, no accumulator drift.
     pre_drag_ys: Vec<i32>,
     /// Total mouse-Y travel since drag-start, in screen pixels.
@@ -729,7 +729,7 @@ struct PrimitiveDrag {
 /// bound, updated each frame the pointer moves with primary
 /// held, cleared on release. The drag is constrained to the
 /// horizontal plane the node sits on so X/Z editing is the
-/// only motion — Y stays editable via the inspector.
+/// only motion -- Y stays editable via the inspector.
 #[derive(Debug, Clone)]
 struct NodeDrag {
     /// The node being dragged.
@@ -742,7 +742,7 @@ struct NodeDrag {
     /// drag start. Subsequent ray hits on the same plane
     /// yield a delta to add to `start_translation`.
     start_world_hit: [f32; 3],
-    /// Plane Y in world units — locked to the node's current
+    /// Plane Y in world units -- locked to the node's current
     /// world Y at drag start.
     drag_plane_y: f32,
     /// `true` once `push_undo` has fired for this stroke.
@@ -785,7 +785,7 @@ pub struct ViewportCameraState {
 enum ViewTool {
     /// Click to select; press-and-drag on a selected primitive
     /// (face / edge / vertex) translates it vertically in the
-    /// 3D viewport. No separate "Move" tool — the same gesture
+    /// 3D viewport. No separate "Move" tool -- the same gesture
     /// handles both select and move.
     Select,
     /// Paint a floor onto the sector under the cursor (Room context).
@@ -805,7 +805,7 @@ enum ViewTool {
 /// `NodeKind` produced by a Place click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaceKind {
-    /// `SpawnPoint { player: true }` — the editor enforces
+    /// `SpawnPoint { player: true }` -- the editor enforces
     /// uniqueness by demoting existing player spawns to
     /// generic spawns at place time.
     PlayerSpawn,
@@ -833,7 +833,7 @@ impl PlaceKind {
 
 impl ViewTool {
     /// `true` when the tool only makes sense once a Room is the
-    /// active context — viewport clicks should be suppressed
+    /// active context -- viewport clicks should be suppressed
     /// otherwise so we don't paint into thin air.
     const fn requires_room_context(self) -> bool {
         matches!(
@@ -901,7 +901,7 @@ impl ResourceFilter {
 
 impl EditorWorkspace {
     /// Open the project at `dir`. Errors when `dir/project.ron` is
-    /// missing or malformed — the frontend wraps the error and falls
+    /// missing or malformed -- the frontend wraps the error and falls
     /// back to the default project so a real load failure surfaces
     /// in the status bar instead of silently spawning a fresh
     /// starter (which masked the path-resolution bug previously).
@@ -979,7 +979,7 @@ impl EditorWorkspace {
         &self.project_dir
     }
 
-    /// Directory project-relative resource paths resolve against —
+    /// Directory project-relative resource paths resolve against --
     /// always the project's own directory now that every project
     /// owns one. No cwd fallback.
     pub fn project_root(&self) -> &Path {
@@ -1013,7 +1013,7 @@ impl EditorWorkspace {
 
     /// Re-read `<project_dir>/project.ron` from disk, discarding
     /// in-memory edits. Surfaces a load error in the status bar
-    /// rather than failing — the user can still keep editing the
+    /// rather than failing -- the user can still keep editing the
     /// in-memory state.
     pub fn reload(&mut self) {
         let path = self.project_dir.join("project.ron");
@@ -1067,7 +1067,7 @@ impl EditorWorkspace {
 
     /// Select the first Room in the active scene if one exists.
     /// Default state is `selected_node = ROOT`, which leaves the
-    /// inspector empty and gates the paint tools — selecting a
+    /// inspector empty and gates the paint tools -- selecting a
     /// concrete Room straight after construction or load makes the
     /// editor immediately useful for the common case (one Room per
     /// project).
@@ -1167,7 +1167,7 @@ impl EditorWorkspace {
     /// every populated Room into `rooms/room_NNN.psxw`, and
     /// writes a fresh `level_manifest.rs`. Returns a status
     /// string suitable for `self.status`. The "& Play" half is
-    /// up to the caller — the editor doesn't spawn child
+    /// up to the caller -- the editor doesn't spawn child
     /// processes from this path; instead the status string
     /// hands back the exact command to run.
     #[allow(clippy::too_many_arguments)]
@@ -1366,7 +1366,7 @@ impl EditorWorkspace {
         }
     }
 
-    /// 3D viewport body — paints the HwRenderer texture into the
+    /// 3D viewport body -- paints the HwRenderer texture into the
     /// central area's working space and turns pointer input into
     /// orbit-camera updates. Called from `draw_viewport` when the
     /// user has toggled the 2D / 3D switch on the toolbar to 3D.
@@ -1396,7 +1396,7 @@ impl EditorWorkspace {
             ui.allocate_exact_size(egui::Vec2::new(w, h), egui::Sense::click_and_drag());
 
         // Sims-style: primary button always belongs to the active
-        // tool — click-and-drag floors / walls / entities into the
+        // tool -- click-and-drag floors / walls / entities into the
         // world. Camera orbit lives on middle / secondary so the
         // user can reframe mid-edit without giving up the tool.
         if response.dragged_by(egui::PointerButton::Middle)
@@ -1453,7 +1453,7 @@ impl EditorWorkspace {
         // Hover-track via the unified selection. `pick_primitive`
         // (added below) maps the same face-hit to a finer
         // primitive when the selection mode demands one. For now
-        // the hover always carries a `Selection::Face` — the
+        // the hover always carries a `Selection::Face` -- the
         // hover preview ignores edge / vertex modes until the
         // mode-aware pick replaces this line.
         self.hovered_primitive =
@@ -1498,7 +1498,7 @@ impl EditorWorkspace {
         //      fall back to the existing primitive vertical
         //      drag.
         // Pure clicks (press without movement) just promote
-        // the hovered target to the selection — no undo
+        // the hovered target to the selection -- no undo
         // entry, no mutation. The first drag frame that
         // crosses a threshold lazy-pushes undo so a
         // press-and-release doesn't leave a stale snapshot.
@@ -1531,7 +1531,7 @@ impl EditorWorkspace {
                 }
             }
             if response.clicked_by(egui::PointerButton::Primary) {
-                // Entity click takes priority over face click —
+                // Entity click takes priority over face click --
                 // matches the drag flow above.
                 let entity_hit = response
                     .interact_pointer_pos()
@@ -1571,7 +1571,7 @@ impl EditorWorkspace {
             .paint_at(ui, rect);
     }
 
-    /// Play-mode 3D body — paints the live emulator framebuffer into
+    /// Play-mode 3D body -- paints the live emulator framebuffer into
     /// the viewport and suppresses all authoring hit-testing.
     fn draw_viewport_3d_play_body(
         &mut self,
@@ -1643,7 +1643,7 @@ impl EditorWorkspace {
     }
 
     /// Primitive under the 3D pointer when the Select tool is
-    /// active — face / edge / vertex of a floor, wall, or
+    /// active -- face / edge / vertex of a floor, wall, or
     /// ceiling on the active Room. Frontend reads this every
     /// frame to draw a light hover outline.
     pub fn hovered_primitive(&self) -> Option<Selection> {
@@ -1689,7 +1689,7 @@ impl EditorWorkspace {
     /// which material is on the picked surface.
     /// Resolve what the next paint click would target. World-cell
     /// coords (which can be negative) let the preview track cells
-    /// outside the current grid — exactly the cases `auto-grow`
+    /// outside the current grid -- exactly the cases `auto-grow`
     /// would rescue at click time. Mirrors `run_paint_action` /
     /// `ensure_cell_in_grid` so what you preview is what you'll
     /// paint.
@@ -1702,7 +1702,7 @@ impl EditorWorkspace {
         let grid = self.room_grid_view(room_id)?;
         let is_paint_wall = matches!(self.active_tool, ViewTool::PaintWall);
 
-        // Cursor over an existing wall while PaintWall is active —
+        // Cursor over an existing wall while PaintWall is active --
         // the click would replace that exact wall, so preview it
         // directly with its array-derived world cell.
         if is_paint_wall {
@@ -1746,7 +1746,7 @@ impl EditorWorkspace {
         };
 
         if is_paint_wall {
-            // Cell centre in raw world units — the inferred edge
+            // Cell centre in raw world units -- the inferred edge
             // matches the dispatch's `run_paint_action` because
             // both use the same axis convention.
             let s = grid.sector_size as f32;
@@ -1755,7 +1755,7 @@ impl EditorWorkspace {
             let dir =
                 edge_from_world_offset(hit_world[0] - cell_center_x, hit_world[2] - cell_center_z);
             // Stack index points just past any existing walls on
-            // that edge — `add_wall` will append there.
+            // that edge -- `add_wall` will append there.
             let stack = grid
                 .world_cell_to_array(world_cell_x, world_cell_z)
                 .and_then(|(sx, sz)| grid.sector(sx, sz))
@@ -1776,7 +1776,7 @@ impl EditorWorkspace {
     }
 
     /// Press on a primitive: select it AND arm a drag. The
-    /// drag itself doesn't apply any height change yet — that
+    /// drag itself doesn't apply any height change yet -- that
     /// happens in `update_primitive_drag` once the pointer
     /// actually moves. A pure click (no movement) flows through
     /// `commit_face_selection` and never touches `primitive_drag`.
@@ -1798,7 +1798,7 @@ impl EditorWorkspace {
 
         // Resolve the physical vertices the drag will translate
         // and snapshot their pre-drag Ys. For Face / Edge this
-        // is up to 4 / 2 entries — the universal-coincidence
+        // is up to 4 / 2 entries -- the universal-coincidence
         // resolver fans each out to all face-corners that share
         // the world point, so the drag itself only walks this
         // small list.
@@ -1832,15 +1832,15 @@ impl EditorWorkspace {
         if dy_pixels.abs() < f32::EPSILON {
             return;
         }
-        // Pixels per HEIGHT_QUANTUM step — drag 8 px to advance
+        // Pixels per HEIGHT_QUANTUM step -- drag 8 px to advance
         // one quantum. With HEIGHT_QUANTUM = 32 and a 1024-unit
         // sector, one full sector of height takes 256 pixels of
-        // mouse travel — comfortable for the orbit-cam panel.
+        // mouse travel -- comfortable for the orbit-cam panel.
         const PIXELS_PER_QUANTUM: f32 = 8.0;
         let Some(drag) = self.primitive_drag.as_mut() else {
             return;
         };
-        // Screen +Y is down; world +Y is up — invert.
+        // Screen +Y is down; world +Y is up -- invert.
         drag.accumulated_pixel_dy -= dy_pixels;
         let total_quanta = (drag.accumulated_pixel_dy / PIXELS_PER_QUANTUM).round() as i32;
         let world_delta = total_quanta * HEIGHT_QUANTUM;
@@ -1848,7 +1848,7 @@ impl EditorWorkspace {
         if world_delta == 0 && !drag.snapshot_pushed {
             return;
         }
-        // Lazy undo snapshot — captures pre-drag state once,
+        // Lazy undo snapshot -- captures pre-drag state once,
         // never on a press-without-movement.
         if !drag.snapshot_pushed {
             drag.snapshot_pushed = true;
@@ -1901,11 +1901,11 @@ impl EditorWorkspace {
     /// Promote the hovered primitive to a selection. When the
     /// hover is a face, also pre-load `selected_resource` with
     /// its material so the resource panel surfaces it without a
-    /// second click. Edge / vertex modes don't pre-load — the
+    /// second click. Edge / vertex modes don't pre-load -- the
     /// inspector renders directly from the selection.
     /// Promote `node` to the active selected node, clearing
     /// any grid primitive selection. Mirrors `commit_face_selection`
-    /// for entity bounds — keeps the inspector and scene tree
+    /// for entity bounds -- keeps the inspector and scene tree
     /// in sync with the viewport click.
     fn commit_node_selection(&mut self, node: NodeId) {
         self.selected_node = node;
@@ -1923,7 +1923,7 @@ impl EditorWorkspace {
     /// `hit.bounds`; lock the drag plane to the node's current
     /// world Y, snapshot the start translation, and select the
     /// node so subsequent UI updates show the right inspector.
-    /// Undo is lazy — only pushed once the user actually moves.
+    /// Undo is lazy -- only pushed once the user actually moves.
     fn begin_node_drag(&mut self, hit: EntityBoundHit, _rect: egui::Rect) {
         // Promote selection so the inspector lands on the
         // dragged node.
@@ -1933,7 +1933,7 @@ impl EditorWorkspace {
             return;
         };
         // Lock the drag plane to the node's *current* world Y
-        // — that way the cursor stays attached to the bound
+        // -- that way the cursor stays attached to the bound
         // even if the camera angle changes mid-drag.
         let drag_plane_y = hit.bounds.center[1];
         self.node_drag = Some(NodeDrag {
@@ -2038,7 +2038,7 @@ impl EditorWorkspace {
     }
 
     /// 3D paint / move click handler. `face_hit` is the ray-test
-    /// result (`pick_face_with_hit`) — preferred because it
+    /// result (`pick_face_with_hit`) -- preferred because it
     /// reflects the actual face under the cursor. `ground_hit` is
     /// the floor-plane fallback for empty cells where no face
     /// exists to hover.
@@ -2066,7 +2066,7 @@ impl EditorWorkspace {
                 };
                 // Click outside the existing grid? Auto-grow on
                 // paint/place clicks so the user can extend a room
-                // by stamping a floor in empty space — Sims-style.
+                // by stamping a floor in empty space -- Sims-style.
                 // Move just bails (it never made sense for it to
                 // grow the room).
                 let cell = if paint_tool {
@@ -2096,7 +2096,7 @@ impl EditorWorkspace {
     /// records the targeted edge + stack so dragging across edges
     /// of the same cell stamps each one (different stamps), but
     /// dwelling on the same edge during drag dedupes (same stamp).
-    /// Other tools key on cell + tool only — drag-restamping a
+    /// Other tools key on cell + tool only -- drag-restamping a
     /// floor with the same material is a no-op anyway.
     fn paint_stamp_for(
         &self,
@@ -2155,7 +2155,7 @@ impl EditorWorkspace {
             return None;
         };
         // `world` here is already in editor-cell units (sector-units,
-        // room-centre-relative — the 2D viewport's native space).
+        // room-centre-relative -- the 2D viewport's native space).
         // Route through the canonical helper so this stays exactly
         // inverse to `world_to_sector`'s lookup.
         let editor_to_world = grid.editor_to_world_cells(world);
@@ -2266,7 +2266,7 @@ impl EditorWorkspace {
                 .map(|grid| grid.room_local_to_editor(hit_world))
                 .unwrap_or([0.0, 0.0]);
             let kind = self.place_kind;
-            // Player Spawn is exclusive — demote any existing
+            // Player Spawn is exclusive -- demote any existing
             // player spawns so the cooker sees exactly one.
             if matches!(kind, PlaceKind::PlayerSpawn) {
                 let scene = self.project.active_scene_mut();
@@ -2303,8 +2303,8 @@ impl EditorWorkspace {
                 PlaceKind::ModelInstance => {
                     // Resolve which Model resource to bind. Order:
                     // (a) user has a Model selected in the resource
-                    //     panel — use it; (b) exactly one Model
-                    //     resource exists project-wide — auto-pick;
+                    //     panel -- use it; (b) exactly one Model
+                    //     resource exists project-wide -- auto-pick;
                     //     (c) refuse with an actionable status.
                     match self.resolve_place_model_resource() {
                         Ok((model_id, name)) => (
@@ -2327,7 +2327,7 @@ impl EditorWorkspace {
                         color: [255, 240, 200],
                         intensity: 1.0,
                         // Sectors. Matches the Add Child default
-                        // and the Room-fill preset — covers a
+                        // and the Room-fill preset -- covers a
                         // typical 4×4 sector room.
                         radius: 4.0,
                     },
@@ -2532,7 +2532,7 @@ impl EditorWorkspace {
         let sin_y = psx_gte::transform::sin_1_3_12(yaw) as f32 / 4096.0;
         // Geometric centre in world coords. Editor `(0, 0)` is the
         // room centre by definition, so `editor_to_room_local`
-        // delivers the right point — origin-aware via the canonical
+        // delivers the right point -- origin-aware via the canonical
         // helper, no ad-hoc multiplication at this call site.
         let target_world = grid.editor_to_room_local([0.0, 0.0]);
         let cam_pos = [
@@ -2555,8 +2555,8 @@ impl EditorWorkspace {
         // 160/320 = 0.5 horizontally, 120/320 = 0.375 vertically.
         // Hardcoding 0.5 for both (the previous shape) over-shoots
         // the vertical ray angle by exactly the 4:3 aspect ratio,
-        // which is why floor picking worked but walls — whose Y
-        // range is narrow — never got hit.
+        // which is why floor picking worked but walls -- whose Y
+        // range is narrow -- never got hit.
         let half_fov_x: f32 = 0.5;
         let half_fov_y: f32 = 0.5 * 240.0 / 320.0;
         let dir = normalize3([
@@ -2649,7 +2649,7 @@ impl EditorWorkspace {
     }
 
     /// Four world-space corners of `face` in canonical
-    /// perimeter order — `[NW, NE, SE, SW]` for floors / ceilings,
+    /// perimeter order -- `[NW, NE, SE, SW]` for floors / ceilings,
     /// `[BL, BR, TR, TL]` for walls. Returns `None` if the face
     /// no longer exists (cell out of bounds, geometry missing).
     fn face_world_corners(&self, face: FaceRef) -> Option<[[f32; 3]; 4]> {
@@ -2823,7 +2823,7 @@ impl EditorWorkspace {
 
         // Geometric centre in world coords. Editor `(0, 0)` is the
         // room centre by definition, so `editor_to_room_local`
-        // delivers the right point — origin-aware via the canonical
+        // delivers the right point -- origin-aware via the canonical
         // helper, no ad-hoc multiplication at this call site.
         let target_world = grid.editor_to_room_local([0.0, 0.0]);
         let cam_pos = [
@@ -2900,7 +2900,7 @@ impl EditorWorkspace {
             self.do_undo();
         }
 
-        // F2 / Delete only fire when no widget owns focus — so they
+        // F2 / Delete only fire when no widget owns focus -- so they
         // don't fight TextEdit content while the user is typing.
         let focus_taken = ctx.memory(|m| m.focused().is_some());
         if !focus_taken {
@@ -2974,7 +2974,7 @@ impl EditorWorkspace {
             (Some(s), m) if Self::matches_mode(s, m) => Some(s),
             _ => None,
         };
-        // Clear the hover too — its mode is the old one, and
+        // Clear the hover too -- its mode is the old one, and
         // the next mouse-move re-pick will repopulate under the
         // new mode anyway.
         self.hovered_primitive = None;
@@ -3030,7 +3030,7 @@ impl EditorWorkspace {
                 self.selected_node = id;
                 self.selected_resource = None;
                 self.renaming = None;
-                // No-op when `id` isn't a Room — keeps the camera
+                // No-op when `id` isn't a Room -- keeps the camera
                 // put while the user clicks through entity nodes.
                 self.frame_3d_on_room(id);
             }
@@ -3385,7 +3385,7 @@ impl EditorWorkspace {
                 ui.separator();
 
                 // Selection priority: primitive (Select tool's
-                // product — face, edge, or vertex) → resource
+                // product -- face, edge, or vertex) → resource
                 // (clicked in the bottom panel) → node (scene
                 // tree row). The primitive branch wins because
                 // it's the active edit target during paint and
@@ -3476,7 +3476,7 @@ impl EditorWorkspace {
                 // Phase 2: per-sector inspector. Owns its own borrow of the
                 // project so it can edit the active Room's grid.
                 if let Some(room_id) = active_room {
-                    // Room budget panel — same data the cooker
+                    // Room budget panel -- same data the cooker
                     // uses, surfaced here so authors notice when
                     // they're approaching the PSX cap before cook
                     // time refuses the room.
@@ -3611,7 +3611,7 @@ impl EditorWorkspace {
     /// Select tool. Surfaces material picker, height fields, and a
     /// preview thumbnail of the linked texture so the user can
     /// retarget materials without opening the resources panel.
-    /// Edge inspector — height of both endpoint vertices, with
+    /// Edge inspector -- height of both endpoint vertices, with
     /// a "Both" toggle for paired drag. Each endpoint resolves
     /// through `physical_vertex` so a height edit propagates to
     /// every face-corner sharing that physical point.
@@ -3691,7 +3691,7 @@ impl EditorWorkspace {
         self.mark_dirty();
     }
 
-    /// Vertex inspector — one Y handle for the whole
+    /// Vertex inspector -- one Y handle for the whole
     /// physical-vertex group. Lists every member so the user
     /// sees what will move; a `Break` button raises the seed
     /// alone by `HEIGHT_QUANTUM` so the user can split a shared
@@ -3763,7 +3763,7 @@ impl EditorWorkspace {
         } else if break_clicked {
             self.push_undo();
             let new_y = snap_height(physical.world[1] + HEIGHT_QUANTUM);
-            // Apply only to the seed — the rest of the group
+            // Apply only to the seed -- the rest of the group
             // stays put, so they cease being coincident.
             let seed = vertex.anchor.as_face_corner();
             let scene = self.project.active_scene_mut();
@@ -4017,7 +4017,7 @@ impl EditorWorkspace {
         let character_ctx = build_character_editor_context(&self.project);
 
         // Build the breadcrumb before the mutable borrow on
-        // `resource_mut` — we need other resources by id to
+        // `resource_mut` -- we need other resources by id to
         // resolve the material → texture link.
         let crumbs = self.resource_breadcrumb(id);
 
@@ -4123,7 +4123,7 @@ impl EditorWorkspace {
         // Refresh PSXT thumbnail handles up-front so the resource
         // cards rendered below have something to blit instead of the
         // name-keyword procedural fallback. Cheap when nothing's
-        // changed — the signature cache short-circuits per-resource.
+        // changed -- the signature cache short-circuits per-resource.
         self.refresh_texture_thumbs(ctx);
         egui::TopBottomPanel::bottom("psxed_content_browser")
             .resizable(true)
@@ -4205,7 +4205,7 @@ impl EditorWorkspace {
         let mut alive: Vec<ResourceId> = Vec::new();
         for resource in self.project.resources.iter() {
             // Texture resources point straight at a `.psxt`;
-            // Model resources have a `texture_path` field — both
+            // Model resources have a `texture_path` field -- both
             // share the same on-disk format and decoder, so the
             // thumbnail cache treats them uniformly.
             let psxt_path: &str = match &resource.data {
@@ -4252,7 +4252,7 @@ impl EditorWorkspace {
                 },
             );
         }
-        // Drop entries for Texture resources that no longer exist —
+        // Drop entries for Texture resources that no longer exist --
         // keeps the cache from growing across delete + re-add.
         self.texture_thumbs.retain(|id, _| alive.contains(id));
     }
@@ -4578,7 +4578,7 @@ impl EditorWorkspace {
     /// brick → "brick" material`); picking a specific entry pins
     /// every Floor / Wall / Ceiling stroke to that material.
     /// Toolbar selector for the Place tool's node kind. Shown
-    /// only while `active_tool == Place` — otherwise the brush
+    /// only while `active_tool == Place` -- otherwise the brush
     /// material picker takes the same slot.
     /// Toolbar selector for the Select tool's primitive mode.
     /// Visible only while `active_tool == Select`. Mirrors the
@@ -4625,7 +4625,7 @@ impl EditorWorkspace {
     /// should bind to. Returns `(id, default_node_name)` on
     /// success or an actionable status message on failure. The
     /// caller renders the failure into `self.status` and skips
-    /// the place altogether — never silently substitutes a
+    /// the place altogether -- never silently substitutes a
     /// generic marker.
     fn resolve_place_model_resource(&self) -> Result<(ResourceId, String), String> {
         // (a) Selected resource is a Model? Use it.
@@ -4680,7 +4680,7 @@ impl EditorWorkspace {
     ///
     /// Order: selected face's room → climb the selected node's
     /// Walk the active scene and collect a selectable AABB for
-    /// every entity-kind node — every node that's neither the
+    /// every entity-kind node -- every node that's neither the
     /// scene root, nor a structural Node/World, nor a Room.
     ///
     /// `room_filter` confines the walk to descendants of one
@@ -4721,7 +4721,7 @@ impl EditorWorkspace {
                     _ => continue,
                 },
                 None => {
-                    // No enclosing Room — node lives in raw
+                    // No enclosing Room -- node lives in raw
                     // world space. Use translation directly so
                     // the bound at least lands somewhere
                     // pickable.
@@ -4742,7 +4742,7 @@ impl EditorWorkspace {
     }
 
     /// Pick the nearest entity bound under the camera ray.
-    /// Returns the `EntityBoundHit` plus its world distance —
+    /// Returns the `EntityBoundHit` plus its world distance --
     /// the 3D click handler compares this against grid hits to
     /// pick whichever is closer.
     pub fn pick_entity_bound(
@@ -4820,7 +4820,7 @@ impl EditorWorkspace {
     /// Default material id for a brushed surface, picked by name from
     /// the project's material list. The cooker rejects unassigned
     /// surfaces, so authors are expected to wire real materials in
-    /// resources before serious painting — this fallback at least
+    /// resources before serious painting -- this fallback at least
     /// keeps the brush usable while iterating.
     fn default_brush_material(&self, needle: &str) -> Option<ResourceId> {
         let lower = needle.to_ascii_lowercase();
@@ -5101,8 +5101,8 @@ impl EditorWorkspace {
     }
 
     /// Snapshot the current project before a discrete mutation.
-    /// Call once per user action — paint click, place, add/delete
-    /// node, etc — so each undo step matches one author intent.
+    /// Call once per user action -- paint click, place, add/delete
+    /// node, etc -- so each undo step matches one author intent.
     fn push_undo(&mut self) {
         self.history.record(self.project.clone());
     }
@@ -5326,7 +5326,7 @@ fn draw_node_kind_editor(
             ui.separator();
             // Same `material_picker` the face inspector uses, so
             // the `→` jump button is available here too. (Models
-            // ignore this field — material is baked into .psxmdl.)
+            // ignore this field -- material is baked into .psxmdl.)
             changed |= material_picker(ui, "Material", material, material_options, nav_target);
 
             // Animation clip override. When the bound mesh is a
@@ -5416,7 +5416,7 @@ fn draw_node_kind_editor(
                         .text(icons::label(icons::WAYPOINT, "Radius (sectors)")),
                 )
                 .changed();
-            // Quick presets — author-friendly starting points;
+            // Quick presets -- author-friendly starting points;
             // the user can still drag the sliders below.
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Preset").color(STUDIO_TEXT_WEAK));
@@ -5439,7 +5439,7 @@ fn draw_node_kind_editor(
                     changed = true;
                 }
             });
-            // Validation warnings — match what the playtest cooker
+            // Validation warnings -- match what the playtest cooker
             // refuses, so authors see the issue before they cook.
             if *radius <= 0.0 {
                 ui.colored_label(
@@ -5708,7 +5708,7 @@ fn draw_psxt_preview_block(ui: &mut egui::Ui, thumb: Option<(egui::TextureId, Ps
     ui.add_space(6.0);
 }
 
-/// Tabular `key — value` rows summarizing a `.psxt`. Mirrors the
+/// Tabular `key -- value` rows summarizing a `.psxt`. Mirrors the
 /// fields the cooker writes so authors can sanity-check that their
 /// material's texture lines up with the dimensions they expect.
 fn draw_psxt_stats(ui: &mut egui::Ui, stats: PsxtStats) {
@@ -5925,7 +5925,7 @@ fn draw_model_resource_editor(
                 }
                 // Inline per-clip stats: parse on the fly. Joint
                 // mismatch is the most actionable thing to surface
-                // — the cooker rejects the bundle if it persists.
+                // -- the cooker rejects the bundle if it persists.
                 if let Some(model_stats) = &model_stats {
                     let clip_path = psxed_project::model_import::resolve_path(
                         &clip.psxanim_path,
@@ -6079,7 +6079,7 @@ fn clip_picker(
 /// One segment of the inspector breadcrumb.
 ///
 /// Rendered as plain bold text when `nav` is `None` (the current
-/// view, no click target) or as a clickable link otherwise — a
+/// view, no click target) or as a clickable link otherwise -- a
 /// click fires the deferred jump-to that the inspector applies
 /// once its mutable borrows release.
 struct BreadcrumbCrumb {
@@ -6102,7 +6102,7 @@ fn draw_breadcrumb(
             }
             match crumb.nav {
                 None => {
-                    // Current view — non-interactive, slightly
+                    // Current view -- non-interactive, slightly
                     // brighter so the eye lands on "where I am".
                     ui.label(RichText::new(&crumb.label).strong());
                 }
@@ -6187,7 +6187,7 @@ fn build_character_editor_context(project: &ProjectDocument) -> CharacterEditorC
 /// turn), capsule sizes, controller speed, and camera params.
 /// `Auto Assign Clips By Name` walks the bound model's clip
 /// list and matches `idle` / `walk` / `run` / `turn` substrings
-/// — case-insensitive — into role slots.
+/// -- case-insensitive -- into role slots.
 fn draw_character_resource_editor(
     ui: &mut egui::Ui,
     character: &mut psxed_project::CharacterResource,
@@ -6858,7 +6858,7 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 8] {
                 color: [255, 240, 200],
                 intensity: 1.0,
                 // Sectors. Matches the Place tool default and
-                // the Torch/Room fill presets — historically
+                // the Torch/Room fill presets -- historically
                 // this was 4096.0 (4096 sectors!) which lit
                 // every room from across the world.
                 radius: 4.0,
@@ -7366,7 +7366,7 @@ fn decode_psxt_thumbnail(bytes: &[u8]) -> Option<(ColorImage, PsxtStats)> {
     let height = u8::try_from(texture.height()).ok()?;
     let clut_entries = texture.clut_entries() as usize;
     if clut_entries != 16 && clut_entries != 256 {
-        // 15bpp / unexpected CLUT count — fall through.
+        // 15bpp / unexpected CLUT count -- fall through.
         return None;
     }
     let clut_bytes = texture.clut_bytes();
@@ -8272,7 +8272,7 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// (user selected a face or edge). `Triangulated` => one corner
 /// was dropped and the face is still alive as a triangle.
 /// `Missing` => the face / sector wasn't where the selection
-/// thought it was (stale state) — caller should leave things
+/// thought it was (stale state) -- caller should leave things
 /// alone.
 enum DeleteOutcome {
     Removed(&'static str),
@@ -8737,7 +8737,7 @@ fn wall_face_world_corners(
 }
 
 /// Universal coincidence resolver. Returns the physical vertex
-/// containing `seed` — every face-corner whose current world
+/// containing `seed` -- every face-corner whose current world
 /// position equals the seed's world position. Walks every
 /// floor / ceiling / wall corner in the grid (`O(faces × 4)`,
 /// runs in microseconds for 32×32 rooms).
@@ -8853,7 +8853,7 @@ pub fn edge_endpoints(grid: &WorldGrid, edge: EdgeRef) -> Option<(PhysicalVertex
 }
 
 /// Endpoint face-corners of `edge` as `(start, end)`. Order
-/// matches the perimeter walk used elsewhere — north = NW→NE,
+/// matches the perimeter walk used elsewhere -- north = NW→NE,
 /// east = NE→SE, etc.
 fn edge_endpoint_corners(edge: EdgeRef) -> (FaceCornerRef, FaceCornerRef) {
     match edge.anchor {
@@ -8905,7 +8905,7 @@ const fn floor_edge_endpoints(dir: GridDirection) -> (Corner, Corner) {
         GridDirection::East => (Corner::NE, Corner::SE),
         GridDirection::South => (Corner::SE, Corner::SW),
         GridDirection::West => (Corner::SW, Corner::NW),
-        // Diagonals — pick the two corners on the diagonal so
+        // Diagonals -- pick the two corners on the diagonal so
         // the inspector can at least show something. Picker
         // doesn't produce these because the cooker rejects
         // diagonal walls.
@@ -8946,7 +8946,7 @@ fn face_corner_label(corner: FaceCornerRef) -> String {
 }
 
 /// Apply a new Y to every member of `vertex`. X / Z are
-/// preserved by construction — `face_corner_world` returns the
+/// preserved by construction -- `face_corner_world` returns the
 /// current `(X, Y, Z)` and we only ever rewrite the corner's
 /// height array entry.
 pub fn apply_vertex_height(grid: &mut WorldGrid, vertex: &PhysicalVertex, new_y: i32) {
@@ -9013,7 +9013,7 @@ fn horizontal_triangles(
 }
 
 /// Wall-quad triangle decomposition. The diagonal flips when
-/// the dropped corner sits on the BL-TR line — `BL` / `TR`
+/// the dropped corner sits on the BL-TR line -- `BL` / `TR`
 /// trigger the BR-TL diagonal.
 type WallTri = ([f32; 3], [f32; 3], [f32; 3], [WallCorner; 3]);
 fn wall_triangles(
@@ -9039,7 +9039,7 @@ fn wall_triangles(
 
 /// Index of the corner closest (3D distance) to `hit` among
 /// the four `corners`. Caller is responsible for the corner
-/// ordering convention — `[NW, NE, SE, SW]` for floors /
+/// ordering convention -- `[NW, NE, SE, SW]` for floors /
 /// ceilings, `[BL, BR, TR, TL]` for walls.
 fn closest_corner_idx(corners: &[[f32; 3]; 4], hit: [f32; 3]) -> usize {
     let mut best = 0usize;
@@ -9134,7 +9134,7 @@ const fn wall_edge_idx(idx: usize) -> WallEdge {
 /// Möller–Trumbore ray-triangle intersection. Returns the ray
 /// parameter `t` of the front-side hit, or `None` for misses /
 /// back-face hits / degenerate triangles. Front-side only because
-/// the editor draws every face once per OT slot — picking the back
+/// the editor draws every face once per OT slot -- picking the back
 /// of a wall would land on the *opposite* room's geometry, which
 /// reads as a bug to the user.
 fn ray_triangle(
@@ -9214,7 +9214,7 @@ fn enclosing_room_id(scene: &psxed_project::Scene, node_id: NodeId) -> Option<No
 /// - distinct enough to read at a glance.
 ///
 /// `None` for node kinds that don't get a 3D bound (Room,
-/// World, Node, Node3D — the structural / non-spatial ones).
+/// World, Node, Node3D -- the structural / non-spatial ones).
 fn entity_bound_kind_and_size(
     workspace: &EditorWorkspace,
     node: &psxed_project::SceneNode,
@@ -9232,7 +9232,7 @@ fn entity_bound_kind_and_size(
                         let h = (model.world_height as f32).max(256.0);
                         let half_h = h * 0.5;
                         // Square footprint sized as roughly
-                        // a third of the model height — wide
+                        // a third of the model height -- wide
                         // enough to click, tight enough that
                         // adjacent models don't overlap.
                         let half_xz = (h / 3.0).max(192.0);
@@ -9470,7 +9470,7 @@ fn draw_sector_inspector(
 ///
 /// PSX rooms commonly stack walls to model windows / arches: one
 /// wall from `0..window_bottom`, another from `window_top..ceiling`.
-/// The data model already allows N walls per edge — this UI surfaces
+/// The data model already allows N walls per edge -- this UI surfaces
 /// it. Each wall row carries its own `[bottom, top]` and material;
 /// `+` adds a new wall on top of the previous one (or `0..ceil` for
 /// the first), `×` removes that row.
@@ -9553,8 +9553,8 @@ fn wall_stack_row(
 ///
 /// Renders one DragValue when the four corners agree (the common
 /// "flat floor" case) and switches to a 2×2 grid of independent
-/// DragValues — laid out NW-NE / SW-SE so the on-screen position
-/// matches the world-space corner — once the heights diverge or
+/// DragValues -- laid out NW-NE / SW-SE so the on-screen position
+/// matches the world-space corner -- once the heights diverge or
 /// the user clicks the "Slope" toggle. Returns `true` whenever any
 /// corner changed so the caller can mark the project dirty.
 fn height_row(label: &str, heights: &mut [i32; 4], ui: &mut egui::Ui) -> bool {
@@ -9571,7 +9571,7 @@ fn height_row(label: &str, heights: &mut [i32; 4], ui: &mut egui::Ui) -> bool {
             && !sloped
         {
             // Collapse back to the NW value so the floor is flat
-            // again — predictable, matches how `flat()` builds.
+            // again -- predictable, matches how `flat()` builds.
             heights[1] = heights[0];
             heights[2] = heights[0];
             heights[3] = heights[0];
@@ -9585,7 +9585,7 @@ fn height_row(label: &str, heights: &mut [i32; 4], ui: &mut egui::Ui) -> bool {
     // 0 → 32 → 64 → … without intermediate noise.
     if sloped {
         // 2×2 grid: NW NE on top row (z+), SW SE on bottom (z−).
-        // The order in `heights` is [NW, NE, SE, SW] — index map:
+        // The order in `heights` is [NW, NE, SE, SW] -- index map:
         //   top row: [0]=NW, [1]=NE
         //   bottom:  [3]=SW, [2]=SE
         egui::Grid::new(format!("{label}-corners"))

@@ -26,7 +26,7 @@ fn main() {
     bus.set_dma_log_enabled(true);
     let mut cpu = Cpu::new();
 
-    // Run to 19_480_000 — past the first cycle divergence at 19474544.
+    // Run to 19_480_000 -- past the first cycle divergence at 19474544.
     for _ in 0..19_480_000u64 {
         if cpu.step(&mut bus).is_err() {
             break;

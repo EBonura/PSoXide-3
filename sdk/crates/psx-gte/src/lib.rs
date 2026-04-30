@@ -1,4 +1,4 @@
-//! GTE (COP2) access — PS1 Geometry Transformation Engine.
+//! GTE (COP2) access -- PS1 Geometry Transformation Engine.
 //!
 //! The GTE isn't memory-mapped. It's MIPS coprocessor 2, accessed via
 //! a dedicated instruction class (`MTC2`/`MFC2`/`CTC2`/`CFC2` to move
@@ -18,7 +18,7 @@
 //!   a single 4-byte `.word`. On host they dispatch to a per-thread
 //!   software GTE living in [`host`].
 //!
-//! All function-op wrappers are `unsafe fn` — they assume the caller
+//! All function-op wrappers are `unsafe fn` -- they assume the caller
 //! has loaded the required input registers via the register macros.
 //!
 //! # Same simulation, two backends

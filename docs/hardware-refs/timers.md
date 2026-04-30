@@ -14,7 +14,7 @@ Three counters with identical three-register shape at stride 0x10.
 
 Accessible as 16- or 32-bit; upper bits read as 0. Writes at
 `byte` granularity are possible on hardware but our Bus routes
-these through the echo buffer (not likely to matter — all
+these through the echo buffer (not likely to matter -- all
 software I've seen uses word-sized access).
 
 ## Clock sources per timer
@@ -25,7 +25,7 @@ software I've seen uses word-sized access).
 | 1 | System clock | H-blank | System clock | H-blank |
 | 2 | System clock | System clock | System clock / 8 | System clock / 8 |
 
-The **dot clock** advances at the pixel rate — 5.37 MHz at
+The **dot clock** advances at the pixel rate -- 5.37 MHz at
 320×240, 6.72 MHz at 384×240, etc. Timer 0 with dot-clock source
 is how games measure horizontal pixel positions.
 
@@ -48,7 +48,7 @@ VSync timing without trusting the GPU's VBlank IRQ.
 | 10 | IRQ flag | 0 = IRQ fired (latched); 1 = inactive |
 | 11 | Reached target | Read-only status |
 | 12 | Reached 0xFFFF | Read-only status |
-| 15:13 | — | Unused |
+| 15:13 | -- | Unused |
 
 Writing the mode register is surprisingly effectful: it **resets
 the counter to 0** as a side effect, and re-arms the IRQ latch.
@@ -56,7 +56,7 @@ the counter to 0** as a side effect, and re-arms the IRQ latch.
 ## Ticking (not yet implemented)
 
 The emulator's `Timers` module is register-backing only as of
-phase 2e — counters don't advance on their own. To make them
+phase 2e -- counters don't advance on their own. To make them
 useful we need:
 
 1. A system cycle counter on `Bus` that advances each time the
@@ -95,6 +95,6 @@ impl Timers {
 
 ## References
 
-- Nocash PSX-SPX — "Timers"
-- PCSX-Redux `src/core/psxcounters.cc` — the real ticking implementation
-- `emulator_core::timers` — our register-backing impl
+- Nocash PSX-SPX -- "Timers"
+- PCSX-Redux `src/core/psxcounters.cc` -- the real ticking implementation
+- `emulator_core::timers` -- our register-backing impl

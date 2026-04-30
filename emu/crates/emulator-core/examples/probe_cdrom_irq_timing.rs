@@ -1,7 +1,7 @@
 //! Walk the first N CDROM IRQ raises side-by-side between ours and
 //! Redux, pinpoint the first one that fires at a different cycle.
 //! Output shows both emulators' logs aligned by index with a Δcycle
-//! column — the first row with |Δ| > 0 is the culprit IRQ.
+//! column -- the first row with |Δ| > 0 is the culprit IRQ.
 //!
 //! Expected usage:
 //! ```bash

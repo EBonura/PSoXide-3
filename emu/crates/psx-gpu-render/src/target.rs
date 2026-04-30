@@ -9,7 +9,7 @@
 //!
 //! The target is cleared to opaque black at construction (and again on
 //! every scale change, which reallocates). Steady-state per-frame draws
-//! always `LoadOp::Load` because PSX VRAM is persistent — a primitive
+//! always `LoadOp::Load` because PSX VRAM is persistent -- a primitive
 //! drawn last frame stays until something overwrites it. The CPU
 //! rasterizer follows the same convention; the HW path now matches.
 
@@ -27,7 +27,7 @@ pub const VRAM_WIDTH: u32 = 1024;
 pub const VRAM_HEIGHT: u32 = 512;
 
 /// Cap on the internal-resolution multiplier. 4× → 4096×2048 RGBA8 ≈
-/// 32 MiB. 8× would be 128 MiB — out of reasonable range for a
+/// 32 MiB. 8× would be 128 MiB -- out of reasonable range for a
 /// retro-emulator default. The frontend can request lower; higher
 /// requires raising this cap deliberately.
 pub const MAX_SCALE: u32 = 4;
@@ -44,7 +44,7 @@ pub struct RenderTarget {
 }
 
 impl RenderTarget {
-    /// Live constructor — registers with egui for in-app paint.
+    /// Live constructor -- registers with egui for in-app paint.
     /// Initial scale = 1 (Native equivalent); the frontend bumps it
     /// via `ensure_scale` on every Native↔Window toggle / resize.
     pub fn new(
@@ -65,7 +65,7 @@ impl RenderTarget {
         }
     }
 
-    /// Headless constructor — used by the parity harness / dump CLI.
+    /// Headless constructor -- used by the parity harness / dump CLI.
     pub fn new_headless(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let scale = 1;
         let (texture, view) = create_target(device, scale);

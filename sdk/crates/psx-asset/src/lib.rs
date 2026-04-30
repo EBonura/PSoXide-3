@@ -10,7 +10,7 @@
 //! // At compile time, embed the cooked blob into the MIPS binary.
 //! static TEAPOT: &[u8] = include_bytes!("assets/teapot.psxm");
 //!
-//! // At runtime, parse into a typed view. Zero-copy — the view
+//! // At runtime, parse into a typed view. Zero-copy -- the view
 //! // just borrows slices into the original byte stream.
 //! let mesh = psx_asset::Mesh::from_bytes(TEAPOT).expect("cooked mesh");
 //! for tri_idx in 0..mesh.face_count() {
@@ -74,7 +74,7 @@ pub enum ParseError {
 /// A parsed 3D mesh backed by slices into the caller's cooked blob.
 ///
 /// Cheap to construct (just bounds-checks the header + computes
-/// sub-slice offsets). Cheap to pass around — table `&[u8]` slices,
+/// sub-slice offsets). Cheap to pass around -- table `&[u8]` slices,
 /// an index stride, a flags `u16`, and the counts.
 #[derive(Copy, Clone, Debug)]
 pub struct Mesh<'a> {
@@ -209,7 +209,7 @@ impl<'a> Mesh<'a> {
     }
 
     /// Decode vertex `i` as a Q3.12 [`Vec3I16`]. Returns
-    /// [`Vec3I16::ZERO`] if the index is out of range — keeps
+    /// [`Vec3I16::ZERO`] if the index is out of range -- keeps
     /// the render path branch-free, callers who care can
     /// check against [`Self::vert_count`] first.
     #[inline]
@@ -286,8 +286,8 @@ impl<'a> Mesh<'a> {
 /// cooked `.psxmdl` blob.
 ///
 /// This is intentionally a low-level view. It exposes the tables the
-/// renderer needs — joints, materials, rigid parts, vertices, and
-/// faces — without allocating or converting the whole model at load
+/// renderer needs -- joints, materials, rigid parts, vertices, and
+/// faces -- without allocating or converting the whole model at load
 /// time.
 #[derive(Copy, Clone, Debug)]
 pub struct Model<'a> {
@@ -891,7 +891,7 @@ fn clamp_i32_to_i16(value: i32) -> i16 {
 /// handles ready to feed into primitive constructors.
 #[derive(Copy, Clone, Debug)]
 pub struct Texture<'a> {
-    /// Packed pixel halfwords — 4 texels per u16 at 4bpp,
+    /// Packed pixel halfwords -- 4 texels per u16 at 4bpp,
     /// 2 at 8bpp, 1 Color555 at 15bpp.
     pixel_data: &'a [u8],
     /// CLUT halfwords, or empty for 15bpp.
@@ -904,7 +904,7 @@ pub struct Texture<'a> {
 
 impl<'a> Texture<'a> {
     /// Parse a cooked `.psxt` blob. Returns a `Texture` view that
-    /// borrows into `bytes`. Cheap — header decode + two slice
+    /// borrows into `bytes`. Cheap -- header decode + two slice
     /// computations.
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, ParseError> {
         use psxed_format::texture::{Depth, TextureHeader, MAGIC, VERSION};
@@ -1512,7 +1512,7 @@ mod tests {
 
     /// Pin the `.psxw` parser to v1 only. The compact format
     /// described in `docs/world-format-roadmap.md` will eventually
-    /// claim VERSION = 2, but it isn't emitted or parsed today —
+    /// claim VERSION = 2, but it isn't emitted or parsed today --
     /// any blob claiming v2 must be rejected, not silently
     /// accepted via a future `_ =>` arm slipping into the parser.
     #[test]
@@ -1520,7 +1520,7 @@ mod tests {
         let mut bad = [0u8; 12];
         bad[0..4].copy_from_slice(&psxed_format::world::MAGIC);
         bad[4..6].copy_from_slice(&2u16.to_le_bytes());
-        // Payload length 0 — won't matter; version check fires first.
+        // Payload length 0 -- won't matter; version check fires first.
         bad[8..12].copy_from_slice(&0u32.to_le_bytes());
         assert!(matches!(
             World::from_bytes(&bad),
@@ -1852,9 +1852,9 @@ mod tests {
         buf[12..14].copy_from_slice(&2u16.to_le_bytes());
         buf[14..16].copy_from_slice(&0u16.to_le_bytes());
         // Reserved already zero.
-        // Vert 0 = (0x0100, 0, 0) — X at offset 20..22.
+        // Vert 0 = (0x0100, 0, 0) -- X at offset 20..22.
         buf[20..22].copy_from_slice(&0x0100_i16.to_le_bytes());
-        // Vert 1 = (0, 0x0200, 0) — Y at offset 28..30
+        // Vert 1 = (0, 0x0200, 0) -- Y at offset 28..30
         // (vert 1 starts at 26, Y is offset +2 into the vert).
         buf[28..30].copy_from_slice(&0x0200_i16.to_le_bytes());
 

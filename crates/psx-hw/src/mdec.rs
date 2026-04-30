@@ -1,4 +1,4 @@
-//! MDEC — Motion Decoder.
+//! MDEC -- Motion Decoder.
 //!
 //! IDCT + Huffman decoder used primarily for .STR video playback. Driven
 //! via DMA channel 0; commands written to register 0, status read from

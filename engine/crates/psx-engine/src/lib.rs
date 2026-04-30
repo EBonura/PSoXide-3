@@ -1,4 +1,4 @@
-//! `psx-engine` — PSoXide engine layer.
+//! `psx-engine` -- PSoXide engine layer.
 //!
 //! The SDK exposes the PS1's hardware surface (GPU, SPU, GTE, pad
 //! VRAM layout, primitives). The engine sits one level up and
@@ -18,7 +18,7 @@
 //! The engine is `no_std`, has no allocator dependency, and compiles
 //! only for `target_arch = "mips"` (host stubs mirror the SDK's
 //! pattern so `cargo check` still works on the host). Nothing here
-//! touches disc / asset streaming — that's the game's or the
+//! touches disc / asset streaming -- that's the game's or the
 //! content-pipeline's concern.
 //!
 //! # Minimal usage

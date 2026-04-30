@@ -2,7 +2,7 @@
 //!
 //! Instruction set coverage grows one opcode at a time, each added
 //! alongside a parity assertion against PCSX-Redux. The decoder itself
-//! is intentionally a flat match on the primary opcode field — we'll
+//! is intentionally a flat match on the primary opcode field -- we'll
 //! refactor to a jump table only if a profiler says to.
 
 use psx_hw::memory;
@@ -77,13 +77,13 @@ pub struct Cpu {
     /// One-slot load-delay machinery. `LW` (and friends) stage their
     /// result here instead of committing immediately; the commit
     /// happens at the end of the *next* instruction's `step`, so the
-    /// delay-slot instruction observes the old register value — which
+    /// delay-slot instruction observes the old register value -- which
     /// is what the R3000A hardware does.
     pending_load: Option<(u8, u32)>,
     /// Load staged at the start of `step` and held during `execute`.
     /// Separate from `pending_load` so `set_gpr` can look at it and
     /// squash a same-register writeback when a non-load in the delay
-    /// slot writes the same target — R3000 load-delay semantics.
+    /// slot writes the same target -- R3000 load-delay semantics.
     committing_load: Option<(u8, u32)>,
     hi: u32,
     lo: u32,
@@ -95,14 +95,14 @@ pub struct Cpu {
     /// Per-ExcCode (0..=31) count of exception entries. Diagnostic only.
     exception_counts: [u64; 32],
     /// Count of `step()` calls where `bus.external_interrupt_pending()`
-    /// was true — answers "did the IRQ line ever go high from the
+    /// was true -- answers "did the IRQ line ever go high from the
     /// CPU's point of view?". Diagnostic.
     irq_line_high_steps: u64,
     /// Count of `step()` calls where `should_take_interrupt()` was
-    /// true — answers "did we reach the threshold that enters an IRQ
+    /// true -- answers "did we reach the threshold that enters an IRQ
     /// exception?".
     should_take_interrupt_steps: u64,
-    /// COP2 — Geometry Transformation Engine. Holds 32 data + 32
+    /// COP2 -- Geometry Transformation Engine. Holds 32 data + 32
     /// control registers and dispatches the GTE function set.
     cop2: Gte,
     /// Depth of nested exception handlers. Incremented on every
@@ -110,7 +110,7 @@ pub struct Cpu {
     /// every `RFE`. `in_isr()` returns `true` iff this is > 0.
     /// Counted as depth (not boolean) so that nested RFEs don't
     /// spuriously clear the flag while we're still inside the
-    /// outer handler — critical for the parity harness's
+    /// outer handler -- critical for the parity harness's
     /// aggregation of clean IRQ entries, which must continue
     /// across nested syscalls/IRQs inside the handler body.
     isr_depth: u32,
@@ -159,7 +159,7 @@ impl Cpu {
     }
 
     /// `true` iff we're still inside the span of a *clean* IRQ
-    /// entry — i.e. the outermost handler on the exception stack
+    /// entry -- i.e. the outermost handler on the exception stack
     /// was entered via `Interrupt` (cause=0) from user mode. Stays
     /// set across nested exceptions until the outermost RFE. The
     /// parity harness uses this to decide whether to aggregate
@@ -171,7 +171,7 @@ impl Cpu {
         self.clean_irq_entry
     }
 
-    /// COP2 (GTE) state. Diagnostics / UI surfaces only — opcode
+    /// COP2 (GTE) state. Diagnostics / UI surfaces only -- opcode
     /// dispatch goes through the inherent methods directly.
     #[inline]
     pub fn cop2(&self) -> &Gte {
@@ -255,7 +255,7 @@ impl Cpu {
         &self.gprs
     }
 
-    /// COP0 register file — System Control coprocessor state (SR, Cause,
+    /// COP0 register file -- System Control coprocessor state (SR, Cause,
     /// EPC, BadVAddr, …).
     #[inline]
     pub fn cop0(&self) -> &[u32; 32] {
@@ -287,7 +287,7 @@ impl Cpu {
     /// to commit into the same register this instruction is writing,
     /// the load's writeback is cancelled. The hardware only has one
     /// writeback port per GPR, and if the delay slot non-load-wise
-    /// writes to the load's target, its value wins — the load is lost.
+    /// writes to the load's target, its value wins -- the load is lost.
     #[inline]
     fn set_gpr(&mut self, index: u8, value: u32) {
         let i = (index & 31) as usize;
@@ -309,7 +309,7 @@ impl Cpu {
         bus.read32(self.pc)
     }
 
-    /// Execute one instruction. Production hot path — does NOT
+    /// Execute one instruction. Production hot path -- does NOT
     /// allocate an `InstructionRecord` (404 bytes returned by value
     /// per call accounted for ~10% of frontend frame time before
     /// this gate). Use [`Cpu::step_traced`] when you actually need
@@ -340,13 +340,13 @@ impl Cpu {
     }
 
     /// Execute one instruction. Returns the data needed to build an
-    /// `InstructionRecord` if the caller wants one — `pc` and `instr`
+    /// `InstructionRecord` if the caller wants one -- `pc` and `instr`
     /// at retirement (these differ between the HLE-BIOS shortcut
     /// and the normal interpreter path). Both `step` and
     /// `step_traced` go through here, so the interpreter logic
     /// stays in one place.
     fn execute_one(&mut self, bus: &mut Bus) -> Result<ExecutedInstruction, ExecutionError> {
-        // Diagnostic only — track how many steps the IRQ pin was high.
+        // Diagnostic only -- track how many steps the IRQ pin was high.
         // We deliberately do NOT mirror the pin into `cop0[13].IP[2]`:
         // PCSX-Redux's CAUSE register is only written at exception
         // entry, never live-updated, so software `mfc0 v0, $13` reads
@@ -384,19 +384,19 @@ impl Cpu {
         let pc_before = self.pc;
         let instr = bus.read32(pc_before);
 
-        // BIAS charged BEFORE the opcode runs — matches Redux's
+        // BIAS charged BEFORE the opcode runs -- matches Redux's
         // `m_regs.cycle += BIAS` at psxinterpreter.cc:1631, which is
         // *ahead* of the opcode dispatch. Any MMIO reads the opcode
         // issues (Timer counters, GPUSTAT, CDROM status) therefore
         // observe the POST-BIAS cycle. Placing the tick after the
         // opcode would have them observe the pre-BIAS cycle, drifting
         // Timer 1's counter behind Redux's by ~2 cycles per memory
-        // access — which showed as a 34-count offset at step
+        // access -- which showed as a 34-count offset at step
         // 19,472,447's Timer 1 read.
         bus.tick(cycle_cost(instr));
 
         // If the *previous* instruction was a branch, the current
-        // instruction is its delay slot — after retiring, PC goes to
+        // instruction is its delay slot -- after retiring, PC goes to
         // the branch target instead of the usual `pc + 4`.
         let branch_after_this = self.pending_pc.take();
         let in_delay_slot = branch_after_this.is_some();
@@ -405,7 +405,7 @@ impl Cpu {
         // in `committing_load` for the duration of `execute`. The
         // delay slot itself sees the pre-load value; any `set_gpr`
         // in execute that targets the load's register will squash
-        // the commit (R3000 writeback-port collision — the
+        // the commit (R3000 writeback-port collision -- the
         // non-load write wins). Any new load this instruction issues
         // goes into `pending_load` and fires on the *next* call.
         self.committing_load = self.pending_load.take();
@@ -435,7 +435,7 @@ impl Cpu {
         // slot (`if (m_inDelaySlot) ... branchTest()`). Doing it after
         // the instruction (rather than before the next) means the trace
         // record still shows the regular instruction at this step, and
-        // the interrupt-vector PC shows up at the *next* step — exactly
+        // the interrupt-vector PC shows up at the *next* step -- exactly
         // how Redux's trace reads.
         //
         // But BEFORE that IRQ check: drain scheduler events against
@@ -443,11 +443,12 @@ impl Cpu {
         // whose deadline falls during this instruction's memory-
         // access cycles (BIAS passed them, but `add_cycles` did not)
         // don't raise their IRQ bit in time for this step's check,
-        // and the IRQ only dispatches at the NEXT delay slot — a
+        // and the IRQ only dispatches at the NEXT delay slot -- a
         // consistent 5-6 instruction delay that compounds into the
         // Crash 900M -6% drift. Redux's `branchTest` calls
         // `counters->update()` inline for the same reason.
         if in_delay_slot {
+            self.apply_redux_bios_kernel_call_intercept();
             bus.drain_scheduler_events_post_op();
         }
         if in_delay_slot && self.should_take_interrupt(bus) {
@@ -467,6 +468,27 @@ impl Cpu {
             record_pc: pc_before,
             record_instr: instr,
         })
+    }
+
+    /// PCSX-Redux runs a small kernel-call intercept immediately after
+    /// a branch-delay slot lands on the BIOS A0/B0 trampolines, before
+    /// its debug trace record is emitted. It mostly mirrors TTY output
+    /// to the host, but A(03h)/B(35h) `write(fd=1, ptr, size)` also
+    /// stores `size` in `$v0`. Keeping that visible side effect here
+    /// preserves lockstep parity while still letting the real BIOS code
+    /// run on the following instructions.
+    fn apply_redux_bios_kernel_call_intercept(&mut self) {
+        let base = (self.pc >> 20) & 0x0FFC;
+        if !matches!(base, 0x000 | 0x800 | 0xA00) {
+            return;
+        }
+        let pc = self.pc & ((memory::ram::SIZE as u32) - 1);
+        let call = self.gpr(9) & 0xFF;
+        let is_stdout_write =
+            (pc == 0xA0 && call == 0x03) || (pc == 0xB0 && call == 0x35);
+        if is_stdout_write && self.gpr(4) == 1 {
+            self.set_gpr(2, self.gpr(6));
+        }
     }
 
     /// Snapshot all 64 GTE registers using the software-visible
@@ -495,7 +517,7 @@ impl Cpu {
     /// localised to the branch opcodes that will add it later).
     ///
     /// `in_delay_slot` is `true` when the current instruction sits in
-    /// the delay slot of a taken branch — the SYSCALL/BREAK handlers
+    /// the delay slot of a taken branch -- the SYSCALL/BREAK handlers
     /// need it to set the BD bit in `CAUSE` correctly.
     fn execute(
         &mut self,
@@ -581,7 +603,7 @@ impl Cpu {
         }
     }
 
-    /// `MFC2 rt, rd` — move from COP2 data register `rd` into GPR
+    /// `MFC2 rt, rd` -- move from COP2 data register `rd` into GPR
     /// `rt`. Like LW, this respects the one-slot load delay so the
     /// next instruction sees the *old* register value.
     fn op_mfc2(&mut self, instr: u32) -> Result<(), ExecutionError> {
@@ -594,7 +616,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `CFC2 rt, rd` — same as MFC2 but reads a control register.
+    /// `CFC2 rt, rd` -- same as MFC2 but reads a control register.
     fn op_cfc2(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rt = ((instr >> 16) & 0x1F) as u8;
         let rd = ((instr >> 11) & 0x1F) as u8;
@@ -605,7 +627,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `MTC2 rt, rd` — move from GPR `rt` to COP2 data register `rd`.
+    /// `MTC2 rt, rd` -- move from GPR `rt` to COP2 data register `rd`.
     /// Coprocessor writes commit immediately (no delay slot).
     fn op_mtc2(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rt = ((instr >> 16) & 0x1F) as u8;
@@ -614,7 +636,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `CTC2 rt, rd` — same as MTC2 but writes a control register.
+    /// `CTC2 rt, rd` -- same as MTC2 but writes a control register.
     fn op_ctc2(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rt = ((instr >> 16) & 0x1F) as u8;
         let rd = ((instr >> 11) & 0x1F) as u8;
@@ -622,12 +644,12 @@ impl Cpu {
         Ok(())
     }
 
-    /// `LWC2 rt, offset(rs)` — load 32-bit word from memory into COP2
+    /// `LWC2 rt, offset(rs)` -- load 32-bit word from memory into COP2
     /// data register `rt`. No GPR is touched, so no load-delay slot.
     fn op_lwc2(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
         // Charge the memory-access cycle BEFORE the read so cycle-
         // sensitive MMIO (timer counters, GPU fields, SPU status)
-        // sees the post-increment cycle — matching Redux's
+        // sees the post-increment cycle -- matching Redux's
         // `psxmem.cc:read32`, which does `m_regs.cycle += 1` on
         // entry.
         bus.add_cycles(1);
@@ -640,7 +662,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `SWC2 rt, offset(rs)` — store COP2 data register `rt` to memory.
+    /// `SWC2 rt, offset(rs)` -- store COP2 data register `rt` to memory.
     fn op_swc2(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
         // Redux's psxSWC2 unconditionally calls write32, which always
         // charges +1 cycle in psxmem.cc. Even cache-isolated stores
@@ -672,7 +694,7 @@ impl Cpu {
         }
     }
 
-    /// `MTC0 rt, rd` — move from CPU GPR `rt` to COP0 register `rd`.
+    /// `MTC0 rt, rd` -- move from CPU GPR `rt` to COP0 register `rd`.
     fn op_mtc0(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rt = ((instr >> 16) & 0x1F) as u8;
         let rd = ((instr >> 11) & 0x1F) as usize;
@@ -722,7 +744,7 @@ impl Cpu {
         }
     }
 
-    /// `LUI rt, imm16` — load upper immediate: `rt = imm16 << 16`.
+    /// `LUI rt, imm16` -- load upper immediate: `rt = imm16 << 16`.
     fn op_lui(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rt = ((instr >> 16) & 0x1F) as u8;
         let imm = instr & 0xFFFF;
@@ -730,12 +752,12 @@ impl Cpu {
         Ok(())
     }
 
-    /// `ADDI rt, rs, imm16` — add sign-extended immediate, signed.
+    /// `ADDI rt, rs, imm16` -- add sign-extended immediate, signed.
     ///
     /// Differs from `ADDIU` in one place: on signed overflow, the
     /// destination register is left unchanged and a 12 (Overflow)
     /// exception fires. Games occasionally rely on the trap for
-    /// range-check idioms — treating `ADDI` as `ADDIU` means those
+    /// range-check idioms -- treating `ADDI` as `ADDIU` means those
     /// games silently run past what should have been a clamped value.
     fn op_addi(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
@@ -748,7 +770,7 @@ impl Cpu {
                 Ok(())
             }
             None => {
-                // Signed overflow — destination unchanged, raise
+                // Signed overflow -- destination unchanged, raise
                 // CAUSE.ExcCode = 12 (Overflow). `in_delay_slot` is
                 // inferred from the pending branch already staged
                 // when Cpu::step dispatched us.
@@ -759,7 +781,7 @@ impl Cpu {
         }
     }
 
-    /// `ADDIU rt, rs, imm16` — add sign-extended immediate, no overflow trap:
+    /// `ADDIU rt, rs, imm16` -- add sign-extended immediate, no overflow trap:
     /// `rt = rs + sign_extend(imm16)`.
     ///
     /// Despite the "U" in the name, both operands are interpreted with
@@ -773,7 +795,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `ORI rt, rs, imm16` — bitwise OR with zero-extended immediate:
+    /// `ORI rt, rs, imm16` -- bitwise OR with zero-extended immediate:
     /// `rt = rs | imm16`.
     fn op_ori(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
@@ -783,7 +805,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `OR rd, rs, rt` — bitwise OR of two registers: `rd = rs | rt`.
+    /// `OR rd, rs, rt` -- bitwise OR of two registers: `rd = rs | rt`.
     fn op_or(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
@@ -792,7 +814,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `ADDU rd, rs, rt` — add unsigned (no overflow trap): `rd = rs + rt`.
+    /// `ADDU rd, rs, rt` -- add unsigned (no overflow trap): `rd = rs + rt`.
     fn op_addu(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
@@ -801,7 +823,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `SLT rd, rs, rt` — set-less-than, signed: `rd = (rs < rt) ? 1 : 0`.
+    /// `SLT rd, rs, rt` -- set-less-than, signed: `rd = (rs < rt) ? 1 : 0`.
     fn op_slt(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
@@ -812,7 +834,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `SLTU rd, rs, rt` — set-less-than, unsigned.
+    /// `SLTU rd, rs, rt` -- set-less-than, unsigned.
     fn op_sltu(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
@@ -821,7 +843,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `SLL rd, rt, sa` — shift left logical by `sa` bits.
+    /// `SLL rd, rt, sa` -- shift left logical by `sa` bits.
     /// When `rd = rt = sa = 0`, the whole encoding is `0x0000_0000`,
     /// which is the canonical `NOP`.
     fn op_sll(&mut self, instr: u32) -> Result<(), ExecutionError> {
@@ -832,12 +854,12 @@ impl Cpu {
         Ok(())
     }
 
-    /// `J target` — unconditional jump. The 26-bit `target` is left-shifted
+    /// `J target` -- unconditional jump. The 26-bit `target` is left-shifted
     /// by 2 and merged with the top 4 bits of the delay-slot's PC
     /// (`pc + 4`) to form the absolute destination.
     ///
     /// The delay slot (the instruction immediately after the jump)
-    /// executes before PC actually lands at the target — this happens
+    /// executes before PC actually lands at the target -- this happens
     /// via [`Cpu::step`]'s `pending_pc` handling.
     fn op_j(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
         let target_field = instr & 0x03FF_FFFF;
@@ -847,7 +869,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `BEQ rs, rt, offset` — branch (delay-slotted) if `rs == rt`.
+    /// `BEQ rs, rt, offset` -- branch (delay-slotted) if `rs == rt`.
     /// Target = `(pc + 4) + (sign_extend(offset) << 2)`.
     fn op_beq(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
@@ -858,7 +880,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `BNE rs, rt, offset` — branch (delay-slotted) if `rs != rt`.
+    /// `BNE rs, rt, offset` -- branch (delay-slotted) if `rs != rt`.
     fn op_bne(&mut self, instr: u32, pc: u32) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
@@ -868,7 +890,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `LW rt, offset(rs)` — load word: `rt = mem[rs + sign_ext(offset)]`.
+    /// `LW rt, offset(rs)` -- load word: `rt = mem[rs + sign_ext(offset)]`.
     ///
     /// The R3000A has a one-slot load delay: the loaded value lands in
     /// `rt` at the end of the *next* instruction, not this one. We
@@ -884,7 +906,7 @@ impl Cpu {
         // increments after the alignment check in `psxLW` early-
         // returns). The post-alignment cycle still lands BEFORE the
         // bus read so cycle-sensitive MMIO sees the post-increment
-        // cycle — fix from the Timer 1 lag caught at parity step
+        // cycle -- fix from the Timer 1 lag caught at parity step
         // 79,389,318.
         if addr & 3 != 0 {
             self.raise_address_error(ExceptionCode::AddressErrorLoad, addr);
@@ -899,19 +921,19 @@ impl Cpu {
         Ok(())
     }
 
-    /// `SW rt, offset(rs)` — store word: `mem[rs + sign_ext(offset)] = rt`.
+    /// `SW rt, offset(rs)` -- store word: `mem[rs + sign_ext(offset)] = rt`.
     ///
-    /// If COP0 Status Register bit 16 (IsC — isolate cache) is set, the
+    /// If COP0 Status Register bit 16 (IsC -- isolate cache) is set, the
     /// store is redirected away from main memory. The BIOS uses this
     /// during init to scrub the data cache without touching RAM. We
-    /// model the side effect by simply dropping the write — matching
+    /// model the side effect by simply dropping the write -- matching
     /// PS1 hardware, which has no separate D-cache for us to populate.
     fn op_sw(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
         let rt = ((instr >> 16) & 0x1F) as u8;
         let offset = (instr as i16) as i32 as u32;
         let addr = self.gpr(rs).wrapping_add(offset);
-        // Alignment trap before any cycle accounting — Redux's
+        // Alignment trap before any cycle accounting -- Redux's
         // `psxSW` checks `_oB_ & 3` ahead of `m_mem->write32`, and
         // the cycle is charged inside the bus write itself. A
         // misaligned store costs zero cycles on this side.
@@ -942,7 +964,7 @@ impl Cpu {
         //
         // Exception-depth bookkeeping: decrement the handler-depth
         // counter. When it reaches zero we've exited the outermost
-        // handler and can clear the `clean_irq_entry` latch — the
+        // handler and can clear the `clean_irq_entry` latch -- the
         // parity harness's aggregation then stops silently
         // absorbing steps and starts recording user-code
         // instructions again.
@@ -1152,7 +1174,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `LWL rt, offset(rs)` — Load Word Left. Together with `LWR`,
+    /// `LWL rt, offset(rs)` -- Load Word Left. Together with `LWR`,
     /// loads a 32-bit word that may be unaligned. LWL reads the word
     /// containing `addr` and merges its high-order bytes into `rt`
     /// from the top down.
@@ -1161,7 +1183,7 @@ impl Cpu {
     /// loads 4 bytes from `rs..rs+4` regardless of alignment.
     ///
     /// Also: LWL/LWR preserve bytes in the destination they don't
-    /// overwrite, so the delay-slot value of `rt` matters — the
+    /// overwrite, so the delay-slot value of `rt` matters -- the
     /// previous instruction's committing load gets **merged**, not
     /// squashed (the opposite of non-load writes). Redux's model
     /// peeks at the staged `rt` via the pending-load slot.
@@ -1174,7 +1196,7 @@ impl Cpu {
         let aligned = addr & !3;
         let word = bus.read32(aligned);
         // If there's a pending-commit load for the same register, see
-        // its staged value instead of the current register file —
+        // its staged value instead of the current register file --
         // that's what matches hardware's LWL-LWR-merge convention.
         let current = self.staged_gpr(rt);
         // PSX-SPX + Redux `LWL_SHIFT`/`LWL_MASK` tables:
@@ -1196,7 +1218,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `LWR rt, offset(rs)` — Load Word Right. Mirror of LWL; merges
+    /// `LWR rt, offset(rs)` -- Load Word Right. Mirror of LWL; merges
     /// the low-order bytes of the word containing `addr` into `rt`.
     fn op_lwr(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
         bus.add_cycles(1);
@@ -1217,7 +1239,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `SWL rt, offset(rs)` — Store Word Left. Mirror of LWL on the
+    /// `SWL rt, offset(rs)` -- Store Word Left. Mirror of LWL on the
     /// store side. Writes `rt`'s high bytes into the word containing
     /// `addr`, preserving the lower bytes of the memory word.
     fn op_swl(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
@@ -1245,7 +1267,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `SWR rt, offset(rs)` — Store Word Right. Mirror of LWR on the
+    /// `SWR rt, offset(rs)` -- Store Word Right. Mirror of LWR on the
     /// store side.
     fn op_swr(&mut self, instr: u32, bus: &mut Bus) -> Result<(), ExecutionError> {
         bus.add_cycles(1);
@@ -1321,7 +1343,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `ADD rd, rs, rt` — signed add. Raises Overflow (code 12) on
+    /// `ADD rd, rs, rt` -- signed add. Raises Overflow (code 12) on
     /// signed overflow; destination unchanged. `ADDU` is the wrap-
     /// silently variant.
     fn op_add(&mut self, instr: u32) -> Result<(), ExecutionError> {
@@ -1343,7 +1365,7 @@ impl Cpu {
         }
     }
 
-    /// `SUB rd, rs, rt` — signed subtract. Raises Overflow (code 12)
+    /// `SUB rd, rs, rt` -- signed subtract. Raises Overflow (code 12)
     /// on signed overflow; destination unchanged. `SUBU` wraps.
     fn op_sub(&mut self, instr: u32) -> Result<(), ExecutionError> {
         let rs = ((instr >> 21) & 0x1F) as u8;
@@ -1483,7 +1505,7 @@ impl Cpu {
     /// `true` when the CPU should take an interrupt exception right
     /// now. Mirrors PCSX-Redux's `branchTest`:
     ///   `(I_STAT & I_MASK) && ((SR & 0x401) == 0x401)`
-    /// — i.e. some hardware source is both pending and enabled,
+    /// -- i.e. some hardware source is both pending and enabled,
     /// SR.IM[2] (hardware-IRQ mask, bit 10) is on, and SR.IEc (global
     /// interrupt enable, bit 0) is on. Software interrupts on IP[0..1]
     /// would also raise via this path on real hardware; the BIOS
@@ -1493,13 +1515,13 @@ impl Cpu {
         if !(bus.external_interrupt_pending() && (sr & 0x401) == 0x401) {
             return false;
         }
-        // R3000A hardware bug — "interrupts vs GTE commands". If the
+        // R3000A hardware bug -- "interrupts vs GTE commands". If the
         // next instruction about to execute is a GTE cofun (COP2
-        // function instruction, opcode 0100_10 with bit 25 set —
+        // function instruction, opcode 0100_10 with bit 25 set --
         // i.e. top byte masked with 0xFE equals 0x4A), taking the
         // IRQ here gets the GTE instruction executed anyway but
         // also parks EPC pointing at it, so the ISR's return
-        // advances PC past the GTE op — effectively losing it.
+        // advances PC past the GTE op -- effectively losing it.
         //
         // Reference: `psx-spx`'s "Interrupts vs GTE Commands"
         // section; Redux mirrors the fix at `r3000a.cc:411`.
@@ -1515,7 +1537,7 @@ impl Cpu {
         true
     }
 
-    /// `SYSCALL` — raise a syscall exception (CAUSE.ExcCode = 8). The
+    /// `SYSCALL` -- raise a syscall exception (CAUSE.ExcCode = 8). The
     /// BIOS uses this for every kernel-mode thunk: A/B/C-table calls,
     /// memcpy, printf, event handling, etc.
     fn op_syscall(&mut self, pc: u32, in_delay_slot: bool) -> Result<(), ExecutionError> {
@@ -1523,7 +1545,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// `BREAK` — raise a breakpoint exception (CAUSE.ExcCode = 9). Not
+    /// `BREAK` -- raise a breakpoint exception (CAUSE.ExcCode = 9). Not
     /// hit during normal BIOS boot but cheap to add alongside SYSCALL
     /// since they share the exception-entry plumbing.
     fn op_break(&mut self, pc: u32, in_delay_slot: bool) -> Result<(), ExecutionError> {
@@ -1536,14 +1558,14 @@ impl Cpu {
     ///
     /// - **CAUSE**: *overwrite* with `(ExcCode << 2) | (BD bit) | (IP[2]
     ///   for Interrupt)`. Mirrors PCSX-Redux's `m_regs.CP0.n.Cause = code`
-    ///   in `R3000Acpu::exception` — Redux blows the whole register
+    ///   in `R3000Acpu::exception` -- Redux blows the whole register
     ///   away on every exception, including IP bits, so software-side
     ///   `mfc0 v0, $13` reads only ever see what the most recent
     ///   exception parked there. We have to mirror this exactly: if we
     ///   preserved IP[2] (the natural real-hardware behaviour) BIOS
     ///   syscall handlers would observe `CAUSE = 0x420` while Redux
     ///   sees `0x20`, breaking GPR parity.
-    /// - **SR**: push the 3-level KU/IE stack — bits `SR[5:0]` become
+    /// - **SR**: push the 3-level KU/IE stack -- bits `SR[5:0]` become
     ///   `(SR[3:0] << 2)`, with the new current pair (bits 1..0)
     ///   entering kernel-mode / interrupts-disabled.
     /// - **Vector**: `0xBFC0_0180` when `SR.BEV` (bit 22) is set (the
@@ -1559,7 +1581,7 @@ impl Cpu {
         }
         // Latch `clean_irq_entry` only on the outermost entry (depth
         // 0 → 1) and only if that entry was an IRQ. Nested
-        // exceptions inside an IRQ handler don't flip the latch —
+        // exceptions inside an IRQ handler don't flip the latch --
         // the parity harness keeps aggregating through them until
         // the outermost RFE brings the depth back to zero.
         // Matches Redux's `m_wasInISR` which is snapshotted at
@@ -1595,7 +1617,7 @@ impl Cpu {
     /// offending virtual address in COP0 BadVaddr (cop0[8]) and
     /// hands off to [`Cpu::enter_exception`] with the appropriate
     /// code. `in_delay_slot` is recovered from `pending_pc` the
-    /// same way `op_addi` does for overflow — every load/store
+    /// same way `op_addi` does for overflow -- every load/store
     /// reaches this helper from inside `execute()` where that
     /// invariant holds.
     fn raise_address_error(&mut self, code: ExceptionCode, addr: u32) {
@@ -1605,7 +1627,7 @@ impl Cpu {
     }
 }
 
-/// Cycle cost per instruction — matches PCSX-Redux's simple-interpreter
+/// Cycle cost per instruction -- matches PCSX-Redux's simple-interpreter
 /// `BIAS = 2` (every instruction adds 2 to its cycle counter before
 /// any opcode-specific accounting). Some opcodes on real hardware cost
 /// more (MULT ≈ 7–13, DIV ≈ 36, memory stalls by region) and Redux
@@ -1616,21 +1638,21 @@ impl Cpu {
 #[repr(u8)]
 #[derive(Copy, Clone)]
 enum ExceptionCode {
-    /// External interrupt — asserted by the IRQ controller. See
+    /// External interrupt -- asserted by the IRQ controller. See
     /// [`Cpu::should_take_interrupt`] for the gating logic.
     Interrupt = 0,
-    /// AdEL — load-side address error. Raised by `LH`/`LHU` on a
+    /// AdEL -- load-side address error. Raised by `LH`/`LHU` on a
     /// halfword-misaligned address and by `LW` on a word-misaligned
     /// one. Real BIOS code occasionally relies on this trap to
     /// reject malformed pointers; silent "succeeds with garbage"
     /// is the worst possible failure mode.
     AddressErrorLoad = 4,
-    /// AdES — store-side address error. Raised by `SH`/`SW` for
+    /// AdES -- store-side address error. Raised by `SH`/`SW` for
     /// the equivalent misalignment cases.
     AddressErrorStore = 5,
     Syscall = 8,
     Break = 9,
-    /// Integer arithmetic overflow — raised by `ADD`, `ADDI`, and
+    /// Integer arithmetic overflow -- raised by `ADD`, `ADDI`, and
     /// `SUB` when the signed result doesn't fit in 32 bits. `ADDU`,
     /// `ADDIU`, and `SUBU` are the silently-wrapping variants.
     Overflow = 12,
@@ -1647,8 +1669,15 @@ mod tests {
     use super::*;
 
     fn synthetic_bios_with_first_word(word: u32) -> Vec<u8> {
+        synthetic_bios_with_words(&[word])
+    }
+
+    fn synthetic_bios_with_words(words: &[u32]) -> Vec<u8> {
         let mut bios = vec![0u8; memory::bios::SIZE];
-        bios[0..4].copy_from_slice(&word.to_le_bytes());
+        for (i, word) in words.iter().enumerate() {
+            let offset = i * 4;
+            bios[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
         bios
     }
 
@@ -1693,7 +1722,7 @@ mod tests {
 
     #[test]
     fn lui_to_r0_is_silently_discarded() {
-        // lui $0, 0xDEAD — writing to $0 must leave it at zero.
+        // lui $0, 0xDEAD -- writing to $0 must leave it at zero.
         // opcode=0x0F, rt=0, imm=0xDEAD → 0x3C00_DEAD
         let mut bus = Bus::new(synthetic_bios_with_first_word(0x3C00_DEAD)).unwrap();
         let mut cpu = Cpu::new();
@@ -1754,7 +1783,7 @@ mod tests {
 
         let mut bus = Bus::new(bios).unwrap();
         let mut cpu = Cpu::new();
-        // $a0 = 0xBFC0_0000 (some RAM-ish address — LW reads whatever's
+        // $a0 = 0xBFC0_0000 (some RAM-ish address -- LW reads whatever's
         // there, which for this test is the BIOS itself / zeroes).
         // Actual loaded value doesn't matter; what matters is that
         // ADDIU's write survives.
@@ -1765,6 +1794,26 @@ mod tests {
         let record = cpu.step_traced(&mut bus).expect("nop reveals state");
 
         assert_eq!(record.gprs[9], 1, "addiu must survive LW's delay");
+    }
+
+    #[test]
+    fn redux_bios_write_intercept_updates_v0_on_trampoline_delay_slot() {
+        let mut bus = Bus::new(synthetic_bios_with_words(&[
+            0x0140_0008, // jr $t2
+            0x2409_0035, // addiu $t1,$zero,0x35 (B0 write)
+        ]))
+        .unwrap();
+        let mut cpu = Cpu::new();
+        cpu.gprs[4] = 1; // stdout
+        cpu.gprs[6] = 0x20; // size
+        cpu.gprs[10] = 0x0000_00B0; // BIOS B table trampoline
+
+        cpu.step(&mut bus).expect("jr decodes");
+        let record = cpu.step_traced(&mut bus).expect("delay slot decodes");
+
+        assert_eq!(record.pc, 0xBFC0_0004);
+        assert_eq!(cpu.pc(), 0x0000_00B0);
+        assert_eq!(record.gprs[2], 0x20);
     }
 
     #[test]
@@ -1844,7 +1893,7 @@ mod tests {
         bios[4..8].copy_from_slice(&0x3508_FFFFu32.to_le_bytes());
         // ori $t1, $zero, 1
         bios[8..12].copy_from_slice(&0x3409_0001u32.to_le_bytes());
-        // add $t2, $t0, $t1 — special=0, rs=8, rt=9, rd=10, funct=0x20
+        // add $t2, $t0, $t1 -- special=0, rs=8, rt=9, rd=10, funct=0x20
         let add = (8u32 << 21) | (9u32 << 16) | (10u32 << 11) | 0x20u32;
         bios[12..16].copy_from_slice(&add.to_le_bytes());
 
@@ -1867,7 +1916,7 @@ mod tests {
         bios[0..4].copy_from_slice(&0x3C08_8000u32.to_le_bytes());
         // ori $t1, $zero, 1
         bios[4..8].copy_from_slice(&0x3409_0001u32.to_le_bytes());
-        // sub $t2, $t0, $t1 — funct=0x22
+        // sub $t2, $t0, $t1 -- funct=0x22
         let sub = (8u32 << 21) | (9u32 << 16) | (10u32 << 11) | 0x22u32;
         bios[8..12].copy_from_slice(&sub.to_le_bytes());
 
@@ -1882,7 +1931,7 @@ mod tests {
 
     #[test]
     fn sub_no_overflow_writes_destination() {
-        // 10 - 3 = 7 — ordinary subtract, no trap.
+        // 10 - 3 = 7 -- ordinary subtract, no trap.
         let mut bios = vec![0u8; memory::bios::SIZE];
         // ori $t0, $zero, 10
         bios[0..4].copy_from_slice(&0x3408_000Au32.to_le_bytes());
@@ -1917,7 +1966,7 @@ mod tests {
         assert_eq!(cpu.pc(), 0xBFC0_0000);
         // With a GTE cofun at PC, the workaround should refuse to fire.
         assert!(!cpu.should_take_interrupt(&mut bus));
-        // Now change the word to something non-cofun — same opcode
+        // Now change the word to something non-cofun -- same opcode
         // area but bit 25 clear (MFC2): top byte becomes 0x48 which
         // doesn't match the mask. The IRQ should fire.
         bus = Bus::new(synthetic_bios_with_first_word(0x4800_0000)).unwrap();
@@ -1931,7 +1980,7 @@ mod tests {
     /// / `LWR_*` / `SWL_*` / `SWR_*` tables exactly. LWL was
     /// previously inverted (shift = (addr & 3) * 8 instead of
     /// (3 - (addr & 3)) * 8), which corrupted every unaligned
-    /// word load — the root cause of Crash Bandicoot's stack
+    /// word load -- the root cause of Crash Bandicoot's stack
     /// corruption after the Sony logo, where the game iterates
     /// strings via lwl/lwr pairs, and one of those overwrote the
     /// saved $ra.
@@ -2052,7 +2101,7 @@ mod tests {
         assert_eq!(exc_code, expected_code, "ExcCode mismatch");
         assert_eq!(cpu.cop0[8], expected_bad, "BadVaddr mismatch");
         assert_eq!(cpu.cop0[14], lw_pc, "EPC mismatch");
-        // SR.BEV is 0 at reset (Cpu::new) — and Redux's r3000a.cc
+        // SR.BEV is 0 at reset (Cpu::new) -- and Redux's r3000a.cc
         // reset value `0x10900000` also leaves bit 22 clear despite
         // a misleading "BEV = 1" comment. Both sides therefore land
         // on the non-BEV vector for traps fired before SR gets
@@ -2066,7 +2115,7 @@ mod tests {
         // lands the address on a non-word boundary.
         let (cpu, _bus) = step_one_load_store(0x8C89_0001, 0xBFC0_0000);
         assert_address_error(&cpu, 4, 0xBFC0_0001, 0xBFC0_0000);
-        // No load delay should have been queued — the trap fires
+        // No load delay should have been queued -- the trap fires
         // before the bus access. After one extra step the destination
         // register must still be untouched.
         assert_eq!(cpu.gprs[9], 0, "rt must remain unchanged on AdEL");
@@ -2090,7 +2139,7 @@ mod tests {
     fn op_sw_misaligned_addr_raises_ades() {
         // SW $t1, 1($a0): word write to odd address. Use scratch RAM
         // (0x0000_0000 .. 2 MiB) as the base so a non-trapping SW
-        // would actually land somewhere — proves the trap fired
+        // would actually land somewhere -- proves the trap fired
         // before the bus write rather than just being silently no-op.
         let (cpu, _bus) = step_one_load_store(0xAC89_0001, 0x0000_0000);
         assert_address_error(&cpu, 5, 0x0000_0001, 0xBFC0_0000);

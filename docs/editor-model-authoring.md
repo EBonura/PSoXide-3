@@ -31,15 +31,15 @@ already knows how to parse:
 
 | File | Format | Parsed by |
 | ---- | ------ | --------- |
-| `.psxmdl` | `PSMD` mesh — joints, parts, vertices, faces | `psx_asset::Model::from_bytes` |
-| `.psxt` | `PSXT` 4 / 8 / 15 bpp texture — pixels + CLUT | `psx_asset::Texture::from_bytes` |
-| `.psxanim` | `PSXA` skeletal animation — frames × joints | `psx_asset::Animation::from_bytes` |
+| `.psxmdl` | `PSMD` mesh -- joints, parts, vertices, faces | `psx_asset::Model::from_bytes` |
+| `.psxt` | `PSXT` 4 / 8 / 15 bpp texture -- pixels + CLUT | `psx_asset::Texture::from_bytes` |
+| `.psxanim` | `PSXA` skeletal animation -- frames × joints | `psx_asset::Animation::from_bytes` |
 
 A `Model` resource is *required* to point at a valid `.psxmdl`.
 The atlas + clips are technically optional in the data model
 (allowed for in-progress authoring), but the playtest cooker
 hard-fails any *placed* instance whose model has no atlas or
-no clips — the runtime currently has no path for untextured
+no clips -- the runtime currently has no path for untextured
 or bind-pose-only rendering. Author-time bundles without an
 atlas / clips are fine; just don't place them in a Room until
 they're complete.
@@ -63,7 +63,7 @@ The registrar:
 
 1. Walks the folder, classifying files by extension.
 2. Errors loud on `NoModelFile`, `MultipleModelFiles`, or
-   `MultipleTextureFiles` — bundles must be unambiguous.
+   `MultipleTextureFiles` -- bundles must be unambiguous.
 3. Parses every blob through `psx_asset` and validates that
    each animation's joint count matches the model's joint
    count.
@@ -99,15 +99,15 @@ clobbered.
 
 The Model resource inspector shows:
 
-- **Atlas thumbnail** — decoded via `decode_psxt_thumbnail`,
+- **Atlas thumbnail** -- decoded via `decode_psxt_thumbnail`,
   which already handles 4bpp and 8bpp indexed textures.
-- **Live `.psxmdl` stats** — joints, parts, vertices, faces,
+- **Live `.psxmdl` stats** -- joints, parts, vertices, faces,
   materials, atlas dimensions, AABB derived from the parsed
   vertex table.
-- **Clip list** — per-clip frame count, sample rate, and
+- **Clip list** -- per-clip frame count, sample rate, and
   joint count. Mismatched joint counts surface as inline
   warnings (the cooker also rejects them).
-- **Default / preview clip pickers** — `default_clip` controls
+- **Default / preview clip pickers** -- `default_clip` controls
   what runtime instances play when they don't carry an
   override; `preview_clip` is what the inspector previews.
 
@@ -122,10 +122,10 @@ The Place tool's `ModelInstance` mode creates a
 - If exactly one Model resource exists project-wide, it's
   auto-picked.
 - Otherwise the click refuses with an actionable status
-  message — no generic-marker fallback.
+  message -- no generic-marker fallback.
 
 Per-instance `animation_clip: Option<u16>` overrides the model
-default — `None` inherits.
+default -- `None` inherits.
 
 Once placed, a model instance carries a 3D selection bound the
 user can click in the viewport to select the node and drag to
@@ -136,7 +136,7 @@ See [`docs/editor-architecture.md`](editor-architecture.md) §
 "Entity selection + 3D move" for the picker priority and drag
 semantics.
 
-A Model can also drive a `Character` resource — the gameplay
+A Model can also drive a `Character` resource -- the gameplay
 metadata layer that names which clips fill the idle / walk /
 run / turn roles and pins capsule + camera defaults. Once
 assigned to the Player Spawn, that Character renders at the
@@ -188,7 +188,7 @@ Per-room residency lists track the model assets:
 2. Resolves the atlas through `find_asset_of_kind(ASSETS,
    model.texture_asset, AssetKind::Texture)`, uploads via
    `ensure_model_atlas_uploaded` to a dedicated 8bpp tpage at
-   VRAM (384, 256) with CLUT rows starting at y=484 — disjoint
+   VRAM (384, 256) with CLUT rows starting at y=484 -- disjoint
    from the room-material region so the two never collide.
 3. Resolves the active clip (`inst.clip` or
    `model.default_clip`) and parses the `.psxanim`.
@@ -224,7 +224,7 @@ The cook (`build_package`) hard-fails on:
 - A placed model has no atlas (runtime can't render
   untextured).
 - A placed model has no clips (runtime requires at least
-  one clip — bind-pose rendering is not implemented).
+  one clip -- bind-pose rendering is not implemented).
 - `ModelResource::default_clip` set to an out-of-range index
   (would emit a runtime record that can't resolve to a clip).
 - Room material texture is not 4bpp / 16-entry CLUT (the
@@ -239,7 +239,7 @@ is placed in a Room. `default_clip` validation runs whenever
 the model is registered into the playtest package (whether
 or not it has a placed instance).
 
-The runtime `default_clip` is always a valid in-range index —
+The runtime `default_clip` is always a valid in-range index --
 either the user's choice, or `0` when they didn't pick one.
 There is no bind-pose sentinel.
 
@@ -261,14 +261,14 @@ There is no bind-pose sentinel.
 
 ## See also
 
-- `editor/crates/psxed-project/src/model_import.rs` —
+- `editor/crates/psxed-project/src/model_import.rs` --
   registration + GLB import + parser/stats helpers.
-- `editor/crates/psxed-project/src/playtest.rs` — playtest
+- `editor/crates/psxed-project/src/playtest.rs` -- playtest
   cook with model pipeline.
-- `engine/examples/editor-playtest/src/main.rs` — runtime
+- `engine/examples/editor-playtest/src/main.rs` -- runtime
   consumer; model rendering via `submit_textured_model`.
-- `engine/examples/showcase-model/src/main.rs` — the
+- `engine/examples/showcase-model/src/main.rs` -- the
   reference implementation the runtime model path was ported
   from.
-- `docs/level-residency.md` — broader contract for the asset
+- `docs/level-residency.md` -- broader contract for the asset
   table + per-room residency.

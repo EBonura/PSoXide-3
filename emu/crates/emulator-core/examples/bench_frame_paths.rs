@@ -185,7 +185,7 @@ fn bench_rasterizer_textured_quad() {
     // Set up a tpage + draw area first.
     gpu.gp0_push(0xE100_0000); // E1 draw mode (4bpp tpage 0)
     gpu.gp0_push(0xE300_0000); // E3 draw area TL
-    gpu.gp0_push(0xE400_BFFFu32 | (479 << 10) | 639); // E4 draw area BR — clamp to 640x480
+    gpu.gp0_push(0xE400_BFFFu32 | (479 << 10) | 639); // E4 draw area BR -- clamp to 640x480
                                                       // Seed VRAM with random texels so sampling does work.
     for y in 0..256u16 {
         for x in 0..64u16 {

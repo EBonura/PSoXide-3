@@ -1,4 +1,4 @@
-//! `showcase-lights` — four coloured moving point lights
+//! `showcase-lights` -- four coloured moving point lights
 //! illuminating a small set of scaled cubes.
 //!
 //! Complementary to `showcase-3d`:
@@ -12,20 +12,20 @@
 //! only up to **3** at a time. Point lights need per-vertex
 //! direction + distance math which the GTE can't do, so this demo
 //! stays on the CPU. Even with 4 lights × 48 verts (6 cubes × 8),
-//! it's about 1k integer-math ops per frame — trivially under
+//! it's about 1k integer-math ops per frame -- trivially under
 //! budget on a 33 MHz MIPS R3000.
 //!
 //! What's on screen:
 //!
-//! 1. **Dark-room backdrop** — a Gouraud gradient behind the scene.
-//! 2. **6 scaled cubes** — different heights + XZ
+//! 1. **Dark-room backdrop** -- a Gouraud gradient behind the scene.
+//! 2. **6 scaled cubes** -- different heights + XZ
 //!    positions, one canonical cube mesh `include_bytes!`'d from
 //!    `assets/cube.psxm` (cooked from a face-split OBJ so per-face
 //!    normals come out of `psxed --compute-normals` flat).
 //! 3. **4 point lights** in R / G / B / Y, each on its own orbit
 //!    with a different period so they visibly "dance" around the
 //!    scene.
-//! 4. **HUD** — frame / live-tri / light positions.
+//! 4. **HUD** -- frame / live-tri / light positions.
 //!
 //! Ported to `psx-engine` in Phase 3e. The `Scene` struct (renamed
 //! to `Lighting` to avoid collision with the engine trait) now
@@ -66,7 +66,7 @@ const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(0x1800, 0x8000);
 const LIGHT_MARKER_SLOT: usize = 2;
 
 const PROJ_H: u16 = 280;
-/// Camera setback — tuned so the cubes sit comfortably in the
+/// Camera setback -- tuned so the cubes sit comfortably in the
 /// middle distance rather than crowding the screen. Kept just
 /// under `i16::MAX / 2` so light orbits ±0x2C00 around it still
 /// fit in Vec3I16 (the GTE's native vertex type).
@@ -107,7 +107,7 @@ const AMBIENT: (i32, i32, i32) = (20, 24, 36);
 
 #[derive(Copy, Clone)]
 struct PointLight {
-    /// World-space position (Q3.12-ish integers — we don't treat
+    /// World-space position (Q3.12-ish integers -- we don't treat
     /// them as fractional, just as "world-space units" where 1.0 =
     /// 0x1000 matching the cube scale).
     pos: Vec3I16,
@@ -147,7 +147,7 @@ struct CubeInstance {
 /// independent in the frame. Sizes vary so the scene reads as a
 /// "collection of objects" rather than a uniform grid.
 ///
-/// Positions are relative to WORLD_Z — the `z` component is the
+/// Positions are relative to WORLD_Z -- the `z` component is the
 /// additional depth offset from the camera plane. Raw Q19.12
 /// coordinates (not the `from_units` constructor) because the
 /// original values were hand-tuned in that scale.
@@ -183,7 +183,7 @@ const CUBE_LAYOUT: [CubeInstance; NUM_CUBES] = [
 // ----------------------------------------------------------------------
 
 /// Renamed from the pre-engine `Scene` struct to avoid name
-/// collision with [`psx_engine::Scene`] — this is *our* scene
+/// collision with [`psx_engine::Scene`] -- this is *our* scene
 /// type; the trait is what the engine calls back into.
 struct Lighting {
     tri_count: u16,
@@ -211,7 +211,7 @@ static mut GOURAUD_TRIS: [TriGouraud; 96] = [const {
     }
 }; 96];
 
-/// Rects for light position markers (one per light — small bright
+/// Rects for light position markers (one per light -- small bright
 /// square at each light's projected screen pos so the viewer can
 /// see where the lights are).
 static mut LIGHT_MARKERS: [RectFlat; 16] = [const { RectFlat::new(0, 0, 0, 0, 0, 0, 0) }; 16];
@@ -249,7 +249,7 @@ static mut CUBE_PROJ: [ProjectedLit; 32] = [EMPTY_VERT; 32];
 ///
 /// For each light: compute `direction = light_pos - vert_pos`,
 /// then the un-normalised dot product with the normal. This mixes
-/// "distance × cos(angle)" into one scalar — we skip the explicit
+/// "distance × cos(angle)" into one scalar -- we skip the explicit
 /// normalise (which would need a sqrt) and instead rely on a
 /// separate quadratic distance-falloff term to take the distance
 /// contribution out of the dot.
@@ -306,7 +306,7 @@ fn light_vertex(
 
         // To get a unit-less cosine scalar we'd want dot_unnorm /
         // (|N| × |D|). |N| = 1.0 = 0x1000. |D| = sqrt(dist_sq).
-        // We cheat: divide by sqrt(RADIUS_SQ) — a constant — which
+        // We cheat: divide by sqrt(RADIUS_SQ) -- a constant -- which
         // sacrifices strict physical accuracy but gives a clean
         // "nearness + orientation" scalar in a known range.
         //
@@ -318,13 +318,13 @@ fn light_vertex(
         // Modulate by quadratic attenuation and normal magnitude.
         // `lit_scalar` is in Q3.12, roughly [0, 0x1000].
         let lit_scalar = (intensity_q12 * att_q12) >> 12;
-        // Clamp before accumulating — single lights shouldn't
+        // Clamp before accumulating -- single lights shouldn't
         // saturate the channel on their own.
         let lit_scalar = lit_scalar.clamp(0, 0x1000);
 
         // Add colour × lit_scalar to accumulator. Colour is 0..255,
         // lit_scalar is 0..0x1000 = 0..4096. Product up to ~1M
-        // — divide by 4096 to bring back into 0..255 range.
+        // -- divide by 4096 to bring back into 0..255 range.
         r += (light.colour.0 as i32 * lit_scalar) >> 12;
         g += (light.colour.1 as i32 * lit_scalar) >> 12;
         b += (light.colour.2 as i32 * lit_scalar) >> 12;
@@ -391,7 +391,7 @@ impl Lighting {
 
         let cube = Mesh::from_bytes(CUBE_BLOB).expect("cube blob");
 
-        // Backmost slot — dark-room gradient backdrop.
+        // Backmost slot -- dark-room gradient backdrop.
         let Some(bg) = backgrounds.push(QuadGouraud::new(
             [(0, 0), (SCREEN_W, 0), (0, SCREEN_H), (SCREEN_W, SCREEN_H)],
             [(16, 10, 24), (16, 10, 24), (4, 2, 8), (4, 2, 8)],
@@ -404,14 +404,14 @@ impl Lighting {
         let mut world_pass =
             unsafe { GouraudRenderPass::new(&mut ot, &mut gouraud, &mut GOURAUD_COMMANDS) };
 
-        // World band — all cube instances, CPU-lit + GTE-projected.
+        // World band -- all cube instances, CPU-lit + GTE-projected.
         for instance in &CUBE_LAYOUT {
             // Per-instance: compose Y-spin rotation × identity (no
             // other rotation). `frame * spin` gives the current angle.
             let angle = (frame.wrapping_mul(instance.y_spin_per_frame as u32) & 0xFFFF) as u16;
             let rot = Mat3I16::rotate_y(angle);
 
-            // Build the full actor pose and upload — one call
+            // Build the full actor pose and upload -- one call
             // replaces the old hand-rolled "scale rotation → load
             // rotation → load translation" three-step. The scale
             // folds into the rotation matrix so the GTE's RTPS
@@ -422,7 +422,7 @@ impl Lighting {
             actor.load_gte();
 
             // CPU path also wants the *same* scaled rotation matrix
-            // the GTE is using — `actor.scaled_rotation()` returns
+            // the GTE is using -- `actor.scaled_rotation()` returns
             // exactly what `load_gte` uploaded, so the CPU world-
             // space positions line up bit-for-bit with the GTE's
             // projected screen-space output.
@@ -443,7 +443,7 @@ impl Lighting {
                 );
 
                 // World-space normal: rotation only (no translation,
-                // no scale — scale would stretch the normal length).
+                // no scale -- scale would stretch the normal length).
                 let nrot = Vec3I16::new(
                     mat_row_dot(&rot, 0, nl).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                     mat_row_dot(&rot, 1, nl).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
@@ -471,10 +471,10 @@ impl Lighting {
         }
         world_pass.flush();
 
-        // Foreground — visible light position markers (small bright
+        // Foreground -- visible light position markers (small bright
         // squares at each light's projected screen position, colour
-        // matches the light's colour). Use a direct-to-screen path —
-        // identity rotation + zero translation — to project light
+        // matches the light's colour). Use a direct-to-screen path --
+        // identity rotation + zero translation -- to project light
         // positions cleanly.
         scene::load_rotation(&Mat3I16::IDENTITY);
         scene::load_translation(Vec3I32::new(0, 0, 0));
@@ -539,7 +539,7 @@ impl Lighting {
 // ----------------------------------------------------------------------
 
 // The uniform-scale matrix helper that used to live here is now
-// engine-owned as `ActorTransform::scaled_rotation()` — call sites
+// engine-owned as `ActorTransform::scaled_rotation()` -- call sites
 // building their own scaled rotation should go through the actor
 // type, which guarantees the CPU and GTE paths see bit-identical
 // matrices.

@@ -1,4 +1,4 @@
-//! `hello-ot` — submit GPU primitives via an ordering table and
+//! `hello-ot` -- submit GPU primitives via an ordering table and
 //! DMA channel 2 in linked-list mode, the same path a commercial
 //! game uses.
 //!
@@ -13,7 +13,7 @@
 //! 5. Submit the OT to GP0 via DMA linked-list.
 //! 6. VSync.
 //!
-//! Each triangle drifts on a sine wave — smooth back-and-forth,
+//! Each triangle drifts on a sine wave -- smooth back-and-forth,
 //! no modulo snap-back. `psx-math::sincos` supplies the Q1.12
 //! trig table (one LUT lookup per frame per triangle).
 
@@ -81,7 +81,7 @@ fn main() {
     let mut frame: u32 = 0;
     loop {
         // Each triangle gets a sine-driven offset at a different
-        // frequency + phase. Angle steps are Q0.12 per frame —
+        // frequency + phase. Angle steps are Q0.12 per frame --
         // 32/frame = ~4.2 s per rev; 48/frame = ~2.8 s. The full
         // cycle runs forever with no modulo-snap jumps.
         let phase_red = (frame.wrapping_mul(32) & 0xFFF) as u16;

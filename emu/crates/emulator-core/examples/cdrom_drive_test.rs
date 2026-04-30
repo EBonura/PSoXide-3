@@ -24,10 +24,10 @@ fn main() {
 
     // Issue commands through the bus by emulating what a BIOS
     // would write at the MMIO port. CDROM:
-    //   0x1F801800 — index / status
-    //   0x1F801801 — command (idx=0) / response FIFO (read)
-    //   0x1F801802 — parameter push (idx=0) / data FIFO (read)
-    //   0x1F801803 — interrupt enable / ack
+    //   0x1F801800 -- index / status
+    //   0x1F801801 -- command (idx=0) / response FIFO (read)
+    //   0x1F801802 -- parameter push (idx=0) / data FIFO (read)
+    //   0x1F801803 -- interrupt enable / ack
     //
     // To issue a command: set index=0 (write 0 to port 0x1800),
     // push parameters to 0x1802, then write the opcode to 0x1801.
@@ -54,7 +54,7 @@ fn main() {
             bus.write8(0x1F801800, 1); // idx=1 for IRQ flag access
             let irq = bus.read8(0x1F801803);
             if irq & 0x1F != 0 {
-                // Drain response FIFO — the first non-zero-bits
+                // Drain response FIFO -- the first non-zero-bits
                 // status byte tells us there are response bytes.
                 while bus.read8(0x1F801800) & 0x20 != 0 {
                     let _ = bus.read8(0x1F801801);
@@ -76,7 +76,7 @@ fn main() {
     issue(&mut bus, 0x0a, &[]);
     tick_and_ack(&mut bus, 2_000_000);
 
-    // 0x02 SetLoc (02, 16, 00) — LBA 16 in BCD.
+    // 0x02 SetLoc (02, 16, 00) -- LBA 16 in BCD.
     issue(&mut bus, 0x02, &[0x00, 0x02, 0x16]); // FAKE: we're writing BCD minute, second, frame
                                                 //                                              ^
                                                 // PSX convention: params are (minute, second, frame) in BCD.
@@ -91,13 +91,13 @@ fn main() {
     issue(&mut bus, 0x0e, &[0x00]);
     tick_and_ack(&mut bus, 200_000);
 
-    // 0x06 ReadN — start streaming sectors from LBA 16.
+    // 0x06 ReadN -- start streaming sectors from LBA 16.
     issue(&mut bus, 0x06, &[]);
     // Wait just long enough for the FIRST sector to land
     // (SECTOR_READ_CYCLES = 225_000 + some slack) without letting
     // the streamer overwrite it with LBA 17's contents.
     tick_and_ack(&mut bus, 300_000);
-    // 0x09 Pause — halt the stream so the FIFO holds LBA 16.
+    // 0x09 Pause -- halt the stream so the FIFO holds LBA 16.
     issue(&mut bus, 0x09, &[]);
     tick_and_ack(&mut bus, 700_000);
 

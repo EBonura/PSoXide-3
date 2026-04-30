@@ -1,31 +1,31 @@
-//! `showcase-text` — tour of every text-rendering capability the
+//! `showcase-text` -- tour of every text-rendering capability the
 //! `psx-font` crate exposes. One frame demonstrates:
 //!
-//! 1. **Gradient title** — 2× scaled "PSOXIDE" in the 8×16 IBM
+//! 1. **Gradient title** -- 2× scaled "PSOXIDE" in the 8×16 IBM
 //!    VGA font with a vertical yellow→red colour sweep (quad-
 //!    gouraud path, GP0 0x3C).
-//! 2. **Multi-font comparison** — same word rendered at the 8×8
+//! 2. **Multi-font comparison** -- same word rendered at the 8×8
 //!    and 8×16 sizes side-by-side. Two independent atlases
 //!    uploaded into different tpage slots; zero per-glyph overhead
 //!    to mix them.
-//! 3. **Size ladder** — "Hello" at 1×, 2×, 3× scale (rect path +
+//! 3. **Size ladder** -- "Hello" at 1×, 2×, 3× scale (rect path +
 //!    quad path combined in one frame).
-//! 4. **Tint palette** — same word at six tints, showing the
+//! 4. **Tint palette** -- same word at six tints, showing the
 //!    per-texel multiplier working cleanly on the white CLUT-1
 //!    glyph (rect path).
-//! 5. **Gradient varieties** — five short strings with different
+//! 5. **Gradient varieties** -- five short strings with different
 //!    top/bottom gradient pairs, back-to-back (quad-gouraud path).
-//! 6. **Rotating text** — "SPIN!" rotating around a screen-space
+//! 6. **Rotating text** -- "SPIN!" rotating around a screen-space
 //!    pivot, animated via the frame counter (quad path + Q0.12
 //!    sin/cos).
-//! 7. **Affine transforms** — a shear + an anisotropic squash
+//! 7. **Affine transforms** -- a shear + an anisotropic squash
 //!    drawn through [`psx_font::FontAtlas::draw_text_affine`].
 //!
 //! Ported to `psx-engine` Phase 3e: the per-frame clear, vsync,
 //! draw-sync, and swap all live in [`App::run`] now. The scene
 //! owns the two `FontAtlas` handles and uploads them once in
 //! [`Scene::init`]. The raw `u32` frame counter from `Ctx` still
-//! feeds the rotation demo directly — no newtype ceremony for
+//! feeds the rotation demo directly -- no newtype ceremony for
 //! what's ultimately `frame % N` arithmetic.
 
 #![no_std]
@@ -44,13 +44,13 @@ use psx_vram::{Clut, TexDepth, Tpage};
 /// 8×8 atlas tpage. `x=320` is a multiple of 64 ✓ and clear of
 /// both display buffers (A at 0..320, B at 0..320 + vertical
 /// offset). 4bpp × 32 glyphs/row × 8-wide = 64 halfwords; atlas
-/// height is 32 halfwords for 128 glyphs — sits inside tpage.
+/// height is 32 halfwords for 128 glyphs -- sits inside tpage.
 const FONT_8X8_TPAGE: Tpage = Tpage::new(320, 0, TexDepth::Bit4);
 /// 2-entry CLUT for the 8×8 atlas at (320, 256). X is a multiple
 /// of 16 ✓, clear of the display buffers ✓, clear of both atlases ✓.
 const FONT_8X8_CLUT: Clut = Clut::new(320, 256);
 
-/// 8×16 atlas tpage. Next slot along at `x=384` — another multiple
+/// 8×16 atlas tpage. Next slot along at `x=384` -- another multiple
 /// of 64. Same 64-halfword width (8-wide × 32 glyphs/row) but
 /// taller: 64 halfwords of atlas height for 128 × 8×16 glyphs.
 const FONT_8X16_TPAGE: Tpage = Tpage::new(384, 0, TexDepth::Bit4);
@@ -74,7 +74,7 @@ struct Showcase {
 impl Scene for Showcase {
     fn init(&mut self, _ctx: &mut Ctx) {
         // Upload both atlases once at boot. They're fully independent
-        // VRAM objects — the draw methods pick which to sample from.
+        // VRAM objects -- the draw methods pick which to sample from.
         self.font8 = Some(FontAtlas::upload(&BASIC, FONT_8X8_TPAGE, FONT_8X8_CLUT));
         self.font16 = Some(FontAtlas::upload(
             &BASIC_8X16,
@@ -84,7 +84,7 @@ impl Scene for Showcase {
     }
 
     fn update(&mut self, _ctx: &mut Ctx) {
-        // Pure demo — no user input, no state changes. The rotation
+        // Pure demo -- no user input, no state changes. The rotation
         // demo reads `ctx.frame` directly in render.
     }
 
@@ -115,7 +115,7 @@ fn main() -> ! {
         font8: None,
         font16: None,
     };
-    // Deep indigo background — same `(6, 8, 24)` as the pre-engine
+    // Deep indigo background -- same `(6, 8, 24)` as the pre-engine
     // showcase; keeps the gradient title legible without washing
     // out the darker glyph tints.
     let config = Config {
@@ -126,7 +126,7 @@ fn main() -> ! {
 }
 
 // ----------------------------------------------------------------------
-// Drawing helpers — unchanged from the pre-engine showcase.
+// Drawing helpers -- unchanged from the pre-engine showcase.
 // ----------------------------------------------------------------------
 
 /// Section 1: big 2×-scaled gradient title "PSOXIDE" at the top,
@@ -160,7 +160,7 @@ fn multi_font_compare(font8: &FontAtlas, font16: &FontAtlas) {
 }
 
 /// Section 3: size ladder showing the scale parameter across 1×,
-/// 2×, 3× of the 8×8 font — demonstrates the `_scaled` path.
+/// 2×, 3× of the 8×8 font -- demonstrates the `_scaled` path.
 /// Compare to the 8×16 row above to see the difference between
 /// "scale an 8×8" (blocky) and "use a native 8×16" (crisp).
 fn size_ladder(font: &FontAtlas) {
@@ -170,7 +170,7 @@ fn size_ladder(font: &FontAtlas) {
 }
 
 /// Section 4: 6 tints of the same glyph. Proves the per-draw
-/// tint is applied independently — no atlas re-upload needed.
+/// tint is applied independently -- no atlas re-upload needed.
 fn tint_palette(font: &FontAtlas) {
     // Six primary-ish colours swept across the band.
     const PALETTE: &[(u8, u8, u8)] = &[
@@ -194,7 +194,7 @@ fn tint_palette(font: &FontAtlas) {
 ///
 /// **Tint design note.** PSX tint math is `output = texel * tint /
 /// 128`. Any channel with `tint >= 128` and a pure-white texel
-/// saturates to max — so if all three top channels are ≥ 128, the
+/// saturates to max -- so if all three top channels are ≥ 128, the
 /// top of the glyph reads as near-white regardless of hue intent.
 /// To keep every gradient visibly coloured top AND bottom, we
 /// drop at least one channel below 128 on each tier. FIRE's top
@@ -206,7 +206,7 @@ fn gradient_varieties(font: &FontAtlas) {
     // Ice: bright cyan → deep blue.
     font.draw_text_gradient(64, 116, "ICE", (80, 200, 255), (20, 40, 180));
     // Toxic: lime → dark green (poison/radioactive). The reference
-    // gradient — both top and bottom have clearly-dominant green.
+    // gradient -- both top and bottom have clearly-dominant green.
     font.draw_text_gradient(104, 116, "TOXIC", (180, 255, 80), (30, 100, 20));
     // Royal: gold → violet.
     font.draw_text_gradient(160, 116, "ROYAL", (255, 100, 20), (80, 20, 200));
@@ -235,12 +235,12 @@ fn affine_skew_demo(font16: &FontAtlas) {
     // Shear: push x proportional to y. 0.6 × 4096 = 2458.
     let shear = [[4096, 2458], [0, 4096]];
     font16.draw_text_affine((190, 158), "SKEW", shear, (180, 220, 255));
-    // Anisotropic squash — 0.8× x, 1.5× y.
+    // Anisotropic squash -- 0.8× x, 1.5× y.
     let squash = [[3277, 0], [0, 6144]];
     font16.draw_text_affine((262, 152), "TALL", squash, (255, 200, 240));
 }
 
-/// Footer — frame counter at bottom-left so we can see the demo
+/// Footer -- frame counter at bottom-left so we can see the demo
 /// is live, plus the word "psx-font" as a credit.
 fn footer(font: &FontAtlas, frame_idx: u32) {
     font.draw_text(8, 200, "rotated         affine", (140, 140, 140));
@@ -252,7 +252,7 @@ fn footer(font: &FontAtlas, frame_idx: u32) {
 }
 
 /// Format a u16 as `"0xABCD"` into a stack buffer. no_std,
-/// no_alloc — same helper used in hello-input but duplicated here
+/// no_alloc -- same helper used in hello-input but duplicated here
 /// to keep the showcase standalone.
 fn hex_u16(v: u16) -> HexU16 {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";

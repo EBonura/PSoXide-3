@@ -2,15 +2,15 @@
 //!
 //! The PS1 GTE works in two flavours of fixed point:
 //!
-//! - **1.3.12** for matrix entries, normals, small vectors — 16-bit
+//! - **1.3.12** for matrix entries, normals, small vectors -- 16-bit
 //!   signed, divide by 4096 for real value. Range: roughly ±8.0 with
 //!   12 bits of fraction.
-//! - **19.12 / 31.0** for translations, colour bias, far colour —
+//! - **19.12 / 31.0** for translations, colour bias, far colour --
 //!   32-bit signed stored raw.
 //!
 //! Types here are **POD** (`Copy`, `no_std`, no heap). The GTE register
 //! wire format is always a packed `u32`, so the types mainly exist for
-//! static correctness — the actual register I/O happens through the
+//! static correctness -- the actual register I/O happens through the
 //! [`mtc2!`][crate::mtc2!] / [`ctc2!`][crate::ctc2!] macros.
 
 /// 3-component vector of `i16` in 1.3.12 fixed point.
@@ -37,7 +37,7 @@ impl Vec3I16 {
     }
 
     /// Pack the `(x, y)` pair into the 32-bit form expected by MTC2
-    /// for V0/V1/V2 slots 0/2/4 — low half = `x`, high half = `y`.
+    /// for V0/V1/V2 slots 0/2/4 -- low half = `x`, high half = `y`.
     #[inline(always)]
     pub const fn xy_packed(self) -> u32 {
         ((self.y as u16 as u32) << 16) | (self.x as u16 as u32)
@@ -50,7 +50,7 @@ impl Vec3I16 {
     }
 }
 
-/// 3-component vector of `i32` — used for translation / colour bias
+/// 3-component vector of `i32` -- used for translation / colour bias
 /// / far colour values (stored raw in 31.0 or 19.12 depending on which
 /// register, see the GTE spec).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn vec3_i16_xy_packs_little_endian() {
-        // x in low half, y in high half — matches MTC2 expectation.
+        // x in low half, y in high half -- matches MTC2 expectation.
         let v = Vec3I16::new(-1, 2, 3);
         assert_eq!(v.xy_packed(), 0x0002_FFFF);
     }

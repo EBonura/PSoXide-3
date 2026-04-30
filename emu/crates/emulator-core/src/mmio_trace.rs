@@ -2,7 +2,7 @@
 //! `trace-mmio` Cargo feature.
 //!
 //! When the feature is off (the default), every type and method below
-//! compiles down to zero-sized storage and no-op calls — `Bus` carries
+//! compiles down to zero-sized storage and no-op calls -- `Bus` carries
 //! an empty `MmioTrace` and the hot path is untouched. When it's on,
 //! `Bus` records each read/write that lands in the MMIO window so the
 //! `smoke_draw` example (or any other diagnostic) can dump the tail.
@@ -64,7 +64,7 @@ pub struct MmioTrace {
 
 impl MmioTrace {
     /// Ring capacity when the feature is enabled. 8192 entries × ~24 B
-    /// ≈ 200 KiB — small enough to carry around, large enough to catch
+    /// ≈ 200 KiB -- small enough to carry around, large enough to catch
     /// a few BIOS event-loop iterations.
     #[cfg(feature = "trace-mmio")]
     pub const CAPACITY: usize = 8192;

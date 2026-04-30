@@ -1,7 +1,7 @@
 //! Stream every CDROM command issued by the BIOS during a disc boot,
 //! along with the response bytes returned and the cycle at which each
 //! event happens. Used to debug why the BIOS shell doesn't advance to
-//! the boot-EXE path even with a valid disc mounted — by comparing our
+//! the boot-EXE path even with a valid disc mounted -- by comparing our
 //! command trace to what's expected (nocash spec / Redux behaviour).
 //!
 //! ```bash

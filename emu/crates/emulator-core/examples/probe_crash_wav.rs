@@ -2,7 +2,7 @@
 //! spectrum-analyse) the "garbled audio" the user reports. Runs
 //! long enough to hit the game's first audio output, drains every
 //! sample, and writes a standard-format 44.1 kHz 16-bit stereo
-//! WAV — playable directly in any media player, and trivially
+//! WAV -- playable directly in any media player, and trivially
 //! diff-able against Redux's audio output for parity work.
 //!
 //! ```bash

@@ -1,4 +1,4 @@
-//! Milestone-C regression suite — SDK examples → VRAM hash.
+//! Milestone-C regression suite -- SDK examples → VRAM hash.
 //!
 //! Every SDK example is a milestone-level regression test. The
 //! example binary under `sdk/examples/<name>/` is the exact artifact
@@ -23,7 +23,7 @@
 //! 3. **Redux-verified per-example hashes** (when captured). The
 //!    `redux_display_hash: Some(h)` slot is the Redux-on-the-same-
 //!    binary answer, locked in. Psoxide.1 had READMEs for each
-//!    example but no goldens anywhere — regressions were caught
+//!    example but no goldens anywhere -- regressions were caught
 //!    by hand.
 //! 4. **Tests ARE examples**. There's no "test fixture" separate
 //!    from the binary `make run-<name>` builds. Break the test,
@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 /// Default BIOS for side-load runs. The EXE side-load bypasses BIOS
 /// execution, but `Bus::new` still requires a valid BIOS image for
-/// its memory map — any SCPH image of the right size will do.
+/// its memory map -- any SCPH image of the right size will do.
 const DEFAULT_BIOS: &str = "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN";
 
 /// Resolve the repo-root path from `CARGO_MANIFEST_DIR`. We're at
@@ -77,7 +77,7 @@ fn example_exe_path(name: &str) -> PathBuf {
 }
 
 /// Multi-signal snapshot of emulator state at a frame checkpoint.
-/// Every field that could independently regress gets its own slot —
+/// Every field that could independently regress gets its own slot --
 /// a pure-rendering bug fails on `display_hash`; an audio-scheduling
 /// regression fails on `spu_samples`; an IRQ timing shift fails on
 /// `irq_histogram`; a wild pointer at end-of-run fails on `final_pc`.
@@ -97,7 +97,7 @@ pub struct SdkExampleState {
     pub vblank_raises: u64,
     /// Total stereo audio samples the SPU has produced at end-of-run.
     pub spu_samples: u64,
-    /// Per-IrqSource raise count (11 slots — VBlank, Gpu, Cdrom, Dma,
+    /// Per-IrqSource raise count (11 slots -- VBlank, Gpu, Cdrom, Dma,
     /// Timer0/1/2, Controller, Sio, Spu, Lightpen).
     pub irq_histogram: [u64; 11],
     /// CPU program counter at end-of-run. Should land in a legit
@@ -125,7 +125,7 @@ pub struct SdkGolden {
     pub display_hash: u64,
     /// Expected `(width, height)`.
     pub display_size: (u32, u32),
-    /// Expected VBlank raise count — usually `vblanks` exactly.
+    /// Expected VBlank raise count -- usually `vblanks` exactly.
     pub vblank_raises: u64,
     /// Expected total SPU sample count.
     pub spu_samples: u64,
@@ -163,7 +163,7 @@ fn check_prereqs(exe_path: &Path) -> bool {
 ///
 /// Frame-boundary stepping polls the VBlank IRQ raise counter (slot
 /// 0 per `IrqSource::VBlank`). A watchdog cap of 500M CPU steps
-/// covers even the slowest realistic example startup — exceeding it
+/// covers even the slowest realistic example startup -- exceeding it
 /// points at a deadlock in the example or the emulator.
 pub fn side_load_and_hash(exe_path: &Path, vblanks: u64) -> Option<SdkExampleState> {
     if !check_prereqs(exe_path) {
@@ -186,12 +186,12 @@ pub fn side_load_and_hash(exe_path: &Path, vblanks: u64) -> Option<SdkExampleSta
     let mut cpu = Cpu::new();
     cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
 
-    // SPU pump cadence mirrors `run_milestone` in the A/B/D tests —
+    // SPU pump cadence mirrors `run_milestone` in the A/B/D tests --
     // one NTSC frame's worth of samples every ~560k CPU cycles.
     // Keeps SPU sample count deterministic per VBlank.
     let mut cycles_at_last_pump = 0u64;
     let target_vblanks = vblanks;
-    // Watchdog — a reasonable example hits `vblanks=1` in at most
+    // Watchdog -- a reasonable example hits `vblanks=1` in at most
     // a few million steps. 500M is generous; anything that hits it
     // is almost certainly a deadlock.
     const WATCHDOG_STEPS: u64 = 500_000_000;
@@ -336,14 +336,14 @@ fn print_capture(state: &SdkExampleState, example: &str, vblanks: u64) {
 ///
 /// Captured 2026-04-19 against the emulator state on `main` at that
 /// date (scanline-delta rasterizer + CHCR-only DMA trigger). None
-/// of these have `redux_display_hash` pinned yet — that comes from
+/// of these have `redux_display_hash` pinned yet -- that comes from
 /// running `display_parity_at` with the same .exe side-loaded into
 /// Redux, which needs a Redux-side side-load harness we haven't
 /// built. For now these are self-regression only: they catch any
 /// future change to emulator OR SDK output for this example.
 ///
 /// **If a parity-accuracy change shifts the cycle count, these
-/// hashes will drift.** That's intentional — it surfaces the
+/// hashes will drift.** That's intentional -- it surfaces the
 /// change at CI time with a pointer at which signal shifted (VRAM
 /// vs display vs SPU vs PC). Refresh the golden by re-running the
 /// test with panic output and pasting the new literal.
@@ -352,7 +352,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // All examples refreshed 2026-04-19-j for the "every
         // example is double-buffered" pass. Display hashes shift
         // because the displayed buffer alternates A/B per frame
-        // now — the capture grabs whichever is currently on
+        // now -- the capture grabs whichever is currently on
         // display. Render output visually identical to the
         // single-buffered goldens.
         "hello-tri" => Some(SdkGolden {
@@ -367,7 +367,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             redux_display_hash: None,
         }),
         // Two 4bpp CLUT textures cooked by `psxed tex` from 512×512
-        // pre-cropped source JPGs — a brick wall + a cobblestone
+        // pre-cropped source JPGs -- a brick wall + a cobblestone
         // floor, centre-square-cropped by the cooker then
         // Lanczos3-resampled to 64×64, sharing one tpage with
         // distinct CLUTs. Sprites drift via `psx_math::sincos` on
@@ -463,7 +463,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             // 0xb40 -> 0xe70 after Phase 3e: `App::run` + `Scene`
             // plumbing adds ~816 bytes of text-section code, so
             // `main`'s final `lw ra / jr ra` sits further on. VRAM
-            // + display bytes-identical — port is pure plumbing.
+            // + display bytes-identical -- port is pure plumbing.
             // Refreshed after engine render-helper growth changed
             // frame-boundary timing for this animation capture.
             final_pc: 0x8001_0e9c,
@@ -471,7 +471,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         }),
         // hello-audio: SPU init + 4 voices configured + ADPCM
         // uploaded. With no pad input in the test harness, no key-on
-        // fires — the checkpoint therefore pins "SPU set up, no
+        // fires -- the checkpoint therefore pins "SPU set up, no
         // voices playing yet" which still verifies the upload /
         // register-write path end-to-end. The `irq_histogram`
         // shows SPU IRQs firing regularly (index 7), confirming
@@ -495,7 +495,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // left; AI paddle is tracking. Nothing scored yet.
         //
         // Ported to the engine framework (commit after 964f022).
-        // VRAM + display hashes match the pre-engine build exactly —
+        // VRAM + display hashes match the pre-engine build exactly --
         // proof that `App::run` + `Scene` perfectly replace the
         // hand-rolled main loop. Only `final_pc` shifted, because
         // the engine's code went into the text section.
@@ -518,11 +518,11 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // brick-break region with effects active (gradient BG,
         // ball trail, particles via psx-fx ParticlePool, screen
         // shake via psx-fx ShakeState). Refreshed after the
-        // psx-fx extraction — VRAM + display hashes are byte-
+        // psx-fx extraction -- VRAM + display hashes are byte-
         // identical to the previous golden (same pixels), only
         // `final_pc` drifted from LTO code re-layout.
         // Ported to the engine framework. VRAM + display hashes
-        // match the pre-engine build exactly — same pixels, same
+        // match the pre-engine build exactly -- same pixels, same
         // physics, same AI. Only `final_pc` shifted because the
         // engine's code went into the text section.
         "game-breakout" => Some(SdkGolden {
@@ -546,17 +546,17 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // the 120 VBlank checkpoint the aliens have marched a
         // couple of steps + dropped their first bombs; no pad
         // input = no player shots but the enemy AI is firing.
-        // Refreshed after psx-fx extraction — pixels unchanged,
+        // Refreshed after psx-fx extraction -- pixels unchanged,
         // only `final_pc` drifted from LTO re-layout.
         // Ported to the engine framework. Unlike breakout, both
-        // VRAM and display hashes shifted — invaders uses a
+        // VRAM and display hashes shifted -- invaders uses a
         // per-frame counter in `maybe_drop_enemy_bomb` (`frame %
         // 40`) and the ship-flash strobe (`frame & 2`). The old
         // build incremented its own `g.frame` at the *start* of
         // update; the engine increments `ctx.frame` at the *end*
         // of the loop. That one-frame offset shifts bomb-drop
         // timing by one frame, which compounds to different alien
-        // + bomb positions after 120 VBlanks. Same game — just a
+        // + bomb positions after 120 VBlanks. Same game -- just a
         // time-shifted snapshot.
         "game-invaders" => Some(SdkGolden {
             example: "game-invaders",
@@ -581,7 +581,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
         // GTE). Validates the full normals→lighting→TriGouraud
         // pipeline + multi-light colour blending.
         // Phase 3e rebake: port to `psx-engine`. Phase 3f-followup:
-        // cube render loop now uses `ActorTransform::load_gte()` —
+        // cube render loop now uses `ActorTransform::load_gte()` --
         // byte-identical VRAM + display (the new helper produces
         // the same scaled-rotation matrix the old inline `scale_mat`
         // did), only `final_pc` shifted as code layout changed.
@@ -604,7 +604,7 @@ fn golden_for(example: &str) -> Option<SdkGolden> {
             redux_display_hash: None,
         }),
 
-        // Now lit via the GTE's NCCS pipeline — 3 directional
+        // Now lit via the GTE's NCCS pipeline -- 3 directional
         // camera-space lights rotated per-object into local frames,
         // per-vertex `project_lit` computes both screen coords
         // (RTPS) and lit colour (NCCS → RGB2). Triangles emit as
@@ -762,7 +762,7 @@ fn milestone_c_game_pong() {
 fn milestone_c_game_breakout() {
     // 60 VBlanks covers one serve arc + first brick break. Serve
     // auto-launches at frame 30 (no pad in harness), ball climbs
-    // and hits a blue brick around frame 85-90 in the probe —
+    // and hits a blue brick around frame 85-90 in the probe --
     // we leave 60 frames here so the test captures the ball
     // mid-flight on the way up with all 40 bricks still in place.
     // Still exercises the 44-primitive OT path every frame.
@@ -782,7 +782,7 @@ fn milestone_c_game_invaders() {
 #[ignore = "SDK milestone: showcase-lights roundtrip"]
 fn milestone_c_showcase_lights() {
     // 60 VBlanks puts the 4 orbiting lights at a mid-cycle
-    // position — cubes visibly tinted by nearby lights, 72
+    // position -- cubes visibly tinted by nearby lights, 72
     // Gouraud triangles, 4 light markers on screen.
     run_sdk_milestone("showcase-lights", 60);
 }
@@ -802,7 +802,7 @@ fn milestone_c_showcase_3d() {
 fn milestone_c_showcase_textured_sprite() {
     // 3 VBlanks gives the bouncing sprites non-trivial motion in
     // the captured frame. Larger than the hellos' 2 because this is
-    // a "polished demo" checkpoint — we want to catch regressions in
+    // a "polished demo" checkpoint -- we want to catch regressions in
     // multi-frame state, not just first-frame initialization.
     run_sdk_milestone("showcase-textured-sprite", 3);
 }
@@ -811,7 +811,7 @@ fn milestone_c_showcase_textured_sprite() {
 #[ignore = "SDK milestone: showcase-text roundtrip"]
 fn milestone_c_showcase_text() {
     // 4 VBlanks lands the rotation demo at a stable, non-zero
-    // angle (4 × 96 = 384 Q0.12 ≈ 33.75°) — pins both the
+    // angle (4 × 96 = 384 Q0.12 ≈ 33.75°) -- pins both the
     // rotating quad path and the static sections in one shot.
     run_sdk_milestone("showcase-text", 4);
 }

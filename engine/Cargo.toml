@@ -11,7 +11,7 @@ license    = "GPL-2.0-or-later"
 repository = "https://github.com/EBonura/PSoXide"
 
 [workspace.dependencies]
-# The engine runs on the MIPS target — it depends on the SDK
+# The engine runs on the MIPS target -- it depends on the SDK
 # crates, not on host-side editor crates. Paths are relative to
 # the workspace root. Every SDK crate we reach for gets listed
 # here once; engine crates inherit them via `{ workspace = true }`

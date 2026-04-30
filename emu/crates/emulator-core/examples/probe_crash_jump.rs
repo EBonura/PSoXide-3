@@ -1,5 +1,5 @@
 //! Trace the last 32 instructions before Crash's wild-pointer
-//! jump to 0x09070026. The jump target is garbage — we want to
+//! jump to 0x09070026. The jump target is garbage -- we want to
 //! see the branch / jump instruction that computed it, and its
 //! input register values.
 

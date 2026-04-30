@@ -6,7 +6,7 @@
 //! folded `(mesh_bytes, anim_bytes)` into a single cache row
 //! keyed only by the Model `ResourceId`. That meant two
 //! instances of the same model with different clip overrides
-//! shared a single animation entry — whichever clip got there
+//! shared a single animation entry -- whichever clip got there
 //! first won, and the other instance silently played the wrong
 //! pose. The player-spawn preview reuses the same cache, so its
 //! idle clip would sometimes follow whatever a placed instance
@@ -18,7 +18,7 @@
 //!   model's authored `model_path` *plus* the file's length and
 //!   mtime so an in-place rewrite invalidates the cache row.
 //! * Animation bytes keyed by `(ResourceId, clip_idx)`, signed
-//!   the same way — two instances of the same model with
+//!   the same way -- two instances of the same model with
 //!   different clip overrides resolve to different entries.
 //!
 //! Failed reads are cached too. Without that, a project
@@ -43,7 +43,7 @@ use std::time::SystemTime;
 
 use psxed_project::{ProjectDocument, ResourceData, ResourceId};
 
-/// Composite key for one cooked `.psxanim` blob — the owning
+/// Composite key for one cooked `.psxanim` blob -- the owning
 /// Model resource plus a clip index inside that model's clip
 /// list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,7 +60,7 @@ pub struct AnimKey {
 ///
 /// `metadata` is `None` when the file's metadata can't be read
 /// (file missing, permissions). That's an explicit "no
-/// metadata" signal — it equals other `None`-metadata
+/// metadata" signal -- it equals other `None`-metadata
 /// signatures with the same path, so a persistently-broken
 /// path stops re-reading. The moment the file appears, its
 /// metadata becomes `Some` and the signature differs, which
@@ -80,7 +80,7 @@ struct FileMetadata {
     modified: SystemTime,
 }
 
-/// One cached entry — either successfully loaded bytes, or a
+/// One cached entry -- either successfully loaded bytes, or a
 /// negative cache row for a path the last refresh couldn't
 /// read. Both variants carry their `Signature` so the next
 /// refresh can decide whether to re-attempt.
@@ -115,7 +115,7 @@ impl Slot {
 }
 
 /// Lazily-populated byte cache for the editor's 3D preview
-/// pass. One per `Gfx` — mirrors [`crate::editor_textures::EditorTextures`]'s
+/// pass. One per `Gfx` -- mirrors [`crate::editor_textures::EditorTextures`]'s
 /// resource-keyed shape so the editor preview never reads from
 /// disk inside its render path.
 #[derive(Debug, Default)]
@@ -134,7 +134,7 @@ impl EditorAssets {
     /// that no longer exist (signature mismatch or missing
     /// resource). Cheap when nothing changed because each
     /// entry's signature is compared against the file's
-    /// current metadata — same authored path + same length +
+    /// current metadata -- same authored path + same length +
     /// same mtime → skip.
     pub fn refresh(&mut self, project: &ProjectDocument, project_root: &Path) {
         let mut alive_meshes: Vec<ResourceId> = Vec::new();
@@ -189,7 +189,7 @@ impl EditorAssets {
         // Drop entries that no longer correspond to a live
         // resource / clip. Keeps the cache from growing across
         // delete + re-add cycles. Both Loaded and Failed rows
-        // are dropped — the failure cache only matters while
+        // are dropped -- the failure cache only matters while
         // *some* resource still references the path.
         self.meshes.retain(|id, _| alive_meshes.contains(id));
         self.animations.retain(|k, _| alive_anims.contains(k));
@@ -232,7 +232,7 @@ fn load_or_fail(abs: &Path, signature: Signature) -> Slot {
 /// Capture the bits of `std::fs::Metadata` we care about, or
 /// `None` if the file can't be stat'd. `modified()` can fail
 /// on a handful of legacy filesystems; treating that as a
-/// signature mismatch is fine — the worst case is one extra
+/// signature mismatch is fine -- the worst case is one extra
 /// re-read per refresh on those targets.
 fn read_file_metadata(abs: &Path) -> Option<FileMetadata> {
     let md = fs::metadata(abs).ok()?;
@@ -298,7 +298,7 @@ mod tests {
         let clip_a_rel = write(dir, "clip_a.psxanim", clip_a);
         let clip_b_rel = write(dir, "clip_b.psxanim", clip_b);
         // Empty project so the cache only sees the synthetic
-        // model — the starter ships Obsidian Wraith with paths
+        // model -- the starter ships Obsidian Wraith with paths
         // relative to the real project root, which would never
         // resolve under our scratch dir.
         let mut project = ProjectDocument::new("Test");
@@ -392,7 +392,7 @@ mod tests {
         // The original signature was just the path string, so
         // editing the file in place was *not* picked up. The
         // richer (path, len, mtime) signature treats a rewrite
-        // as a cache invalidation — which is what authors
+        // as a cache invalidation -- which is what authors
         // actually expect when they re-cook a model.
         let dir = scratch_dir("edit");
         let (project, model_id) = project_with_dual_clip_model(&dir, b"v1", b"v1", b"v1");
@@ -400,7 +400,7 @@ mod tests {
         assets.refresh(&project, &dir);
         assert_eq!(assets.mesh_bytes(model_id).unwrap(), b"v1");
 
-        // Same path, longer bytes — len differs even on
+        // Same path, longer bytes -- len differs even on
         // filesystems with coarse mtime granularity.
         await_next_mtime_tick();
         fs::write(dir.join("mesh.psxmdl"), b"v2-different-length").unwrap();
@@ -424,8 +424,8 @@ mod tests {
         // disk. The first refresh learns about it (read fails
         // → Failed slot stored). The second refresh sees the
         // same desired signature (still missing) and skips the
-        // re-read entirely. The third — after the file
-        // appears — picks the new bytes up.
+        // re-read entirely. The third -- after the file
+        // appears -- picks the new bytes up.
         let dir = scratch_dir("fail-then-fix");
         // Stub the mesh path; don't actually write the file
         // until later.
@@ -448,7 +448,7 @@ mod tests {
             assets.mesh_bytes(model_id).is_none(),
             "missing file must not produce bytes"
         );
-        // The failure was cached — confirm by inspecting the
+        // The failure was cached -- confirm by inspecting the
         // internal slot directly. `mesh_bytes` returning None
         // alone could mean either "not cached" or "cached
         // failure"; we want the latter so we know the next
@@ -466,7 +466,7 @@ mod tests {
         // Second refresh on a still-missing file: signature
         // unchanged, no re-read attempt should mutate the
         // slot. The signature object compares equal across
-        // refreshes — that's the no-churn observation.
+        // refreshes -- that's the no-churn observation.
         assets.refresh(&project, &dir);
         let signature_after_second = assets
             .meshes

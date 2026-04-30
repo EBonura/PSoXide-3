@@ -14,7 +14,7 @@
 //! and firing IRQs via [`crate::irq::IrqSource::Timer0`]…`Timer2`.
 
 /// One of the three root counters. Fields are 16 bits on hardware but
-/// held as `u32` for uniform bus access — upper bits read as 0.
+/// held as `u32` for uniform bus access -- upper bits read as 0.
 #[derive(Default, Clone, Copy)]
 pub struct Timer {
     /// Current counter value (bits 0..=15 meaningful).
@@ -30,7 +30,7 @@ pub struct Timer {
     /// they cross the source period.
     accum: u64,
     /// Bus cycle at which the counter was last reset (mode write).
-    /// Diagnostic — lets us compare against Redux's `cycleStart`.
+    /// Diagnostic -- lets us compare against Redux's `cycleStart`.
     pub last_reset_cycle: u64,
     /// Number of mode writes since reset. Diagnostic.
     pub mode_write_count: u64,
@@ -55,7 +55,7 @@ const MODE_IRQ_ON_TARGET: u32 = 1 << 4;
 const MODE_IRQ_ON_WRAP: u32 = 1 << 5;
 /// bit 6: IRQ repeat mode (0 = one-shot until mode-write).
 const MODE_IRQ_REPEAT: u32 = 1 << 6;
-/// bit 10: IRQ status — active-low flag; cleared on fire.
+/// bit 10: IRQ status -- active-low flag; cleared on fire.
 const MODE_IRQ_ACTIVE_LOW: u32 = 1 << 10;
 /// bit 11: "reached target" sticky flag.
 const MODE_REACHED_TARGET: u32 = 1 << 11;
@@ -68,9 +68,9 @@ pub struct Timers {
     /// Per-counter state. Index 0 / 1 / 2 corresponds to Timer 0 / 1 / 2.
     pub timers: [Timer; 3],
     /// Bus cycle at which the timers were last advanced. Used by
-    /// `advance_to` so the bus can drive timer state lazily —
+    /// `advance_to` so the bus can drive timer state lazily --
     /// once per branch-test scheduler drain and on demand from
-    /// MMIO read paths — instead of paying the per-instruction
+    /// MMIO read paths -- instead of paying the per-instruction
     /// 3-counter accumulator/divider cost. Mirrors PCSX-Redux's
     /// `Counters::set` / `update` model where each counter holds
     /// `cycleStart` and the live count is `(cycle - cycleStart) /
@@ -141,7 +141,7 @@ impl Timers {
     /// Advance all three timers by `cycles` system-clock ticks. Each
     /// timer converts that to its own clock source first:
     /// - Timer 0 source 1 / 3 → dot-clock (pixels per `dot_clock_divisor`
-    ///   system cycles — `GPU::dot_clock_divisor` gives the current
+    ///   system cycles -- `GPU::dot_clock_divisor` gives the current
     ///   value based on H-resolution).
     /// - Timer 1 source 1 / 3 → HBlank (`hsync_period` cycles per tick).
     /// - Timer 2 source 2 / 3 → system / 8.
@@ -186,7 +186,7 @@ impl Timers {
 
     /// Sync the lazy clock to `now` without advancing any state.
     /// Used by the bus when it discards skipped cycles (e.g.
-    /// post-warmup resets in tests) — calling this prevents
+    /// post-warmup resets in tests) -- calling this prevents
     /// `advance_to` from later seeing a huge backlog and trying
     /// to fast-forward through millions of cycles in one go.
     #[allow(dead_code)]
@@ -232,7 +232,7 @@ impl Timers {
         hsync_period: u64,
         dot_clock_divisor: u64,
     ) -> bool {
-        // Sync-mode gating — decide whether this timer is
+        // Sync-mode gating -- decide whether this timer is
         // currently paused.
         let paused = self.is_timer_paused(idx);
         if paused {
@@ -286,7 +286,7 @@ impl Timers {
         // Target-reset mode: when counter crosses the target, reset to 0.
         //
         // Redux (`psxcounters.cc:reset`) wraps at exactly `target*rate`
-        // cycles per lap — the counter visits 0..=target-1 and a reset
+        // cycles per lap -- the counter visits 0..=target-1 and a reset
         // fires the instant it would reach `target`, snapping it back
         // to 0. We were wrapping at `(target+1)*rate` (visiting
         // 0..=target and wrapping on the tick after), losing one count

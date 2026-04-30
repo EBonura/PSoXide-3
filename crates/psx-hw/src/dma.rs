@@ -36,18 +36,18 @@ pub const CHANNEL_COUNT: usize = 7;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Channel {
-    /// Channel 0 — MDEC input.
+    /// Channel 0 -- MDEC input.
     MdecIn = 0,
-    /// Channel 1 — MDEC output.
+    /// Channel 1 -- MDEC output.
     MdecOut = 1,
-    /// Channel 2 — GPU (rendering commands and VRAM transfers).
+    /// Channel 2 -- GPU (rendering commands and VRAM transfers).
     Gpu = 2,
-    /// Channel 3 — CD-ROM sector data.
+    /// Channel 3 -- CD-ROM sector data.
     Cdrom = 3,
-    /// Channel 4 — SPU voice data.
+    /// Channel 4 -- SPU voice data.
     Spu = 4,
-    /// Channel 5 — PIO / expansion.
+    /// Channel 5 -- PIO / expansion.
     Pio = 5,
-    /// Channel 6 — ordering-table clear (OTC).
+    /// Channel 6 -- ordering-table clear (OTC).
     Otc = 6,
 }

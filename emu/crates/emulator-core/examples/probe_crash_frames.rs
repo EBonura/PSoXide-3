@@ -1,6 +1,6 @@
 //! Capture our Crash framebuffer at a schedule of instruction counts,
 //! emit a PPM + a basic diff-from-black summary. This is a
-//! *unilateral* probe — no Redux needed — so we can iterate on
+//! *unilateral* probe -- no Redux needed -- so we can iterate on
 //! render bugs fast. Use the parity harness once we know where to
 //! look.
 //!

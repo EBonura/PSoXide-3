@@ -189,7 +189,7 @@ pub enum MenuOutcome {
 fn fill_vram_test_pattern(vram: &mut emulator_core::Vram) {
     use emulator_core::{VRAM_HEIGHT, VRAM_WIDTH};
     // Gradient: R = x/32, G = y/16, B = (x^y) & 0x1F. Makes the viewer
-    // instantly recognisable as "working" — distinct from the noise a
+    // instantly recognisable as "working" -- distinct from the noise a
     // buggy upload would produce.
     for y in 0..VRAM_HEIGHT {
         for x in 0..VRAM_WIDTH {

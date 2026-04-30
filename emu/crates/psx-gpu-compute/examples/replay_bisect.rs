@@ -111,7 +111,7 @@ fn main() {
     let mut backend = ComputeBackend::new_headless();
 
     // ---------- Phase 1: warm up. Run all but the last `window`
-    //  cycles WITHOUT bisection — we just want CPU + GPU VRAM in
+    //  cycles WITHOUT bisection -- we just want CPU + GPU VRAM in
     //  agreement at the start of the bisect window.
     let warmup = steps.saturating_sub(window);
     if warmup > 0 {
@@ -171,7 +171,7 @@ fn main() {
     eprintln!("[bisect] {} packets to bisect", log.len());
 
     // For per-packet bisection, we need the CPU's VRAM AFTER each
-    // packet. We don't have that directly — `bus.gpu.vram` is the
+    // packet. We don't have that directly -- `bus.gpu.vram` is the
     // FINAL state. To get post-i state, we'd need to re-run the CPU
     // packet-by-packet. Instead, use a simpler heuristic: the FIRST
     // GPU divergence appears against the FINAL CPU VRAM, and we can
@@ -199,7 +199,7 @@ fn main() {
     let owner = bus.gpu.pixel_owner.as_ref().expect("tracer enabled");
 
     // The CPU's `pixel_owner` only stamps writes that go through
-    // `plot_pixel` — i.e., primitive rasterization. Bulk-write
+    // `plot_pixel` -- i.e., primitive rasterization. Bulk-write
     // packets (FillRect 0x02, VRAM-to-VRAM 0x80..=0x9F,
     // CPU-to-VRAM 0xA0..=0xBF) bypass `plot_pixel` and write VRAM
     // directly, so they leave `owner` stale at the LAST plot-pixel
@@ -228,7 +228,7 @@ fn main() {
         // reflect each bulk write before the next primitive replay,
         // otherwise every later sample of an uploaded texel
         // diverges and the bisector keeps re-flagging false
-        // positives. Lift the rect from CPU final VRAM — the result
+        // positives. Lift the rect from CPU final VRAM -- the result
         // is correct for any pixel whose final value came from the
         // bulk write OR from a later opaque overdraw, and only
         // approximates pixels touched by post-upload semi-trans
@@ -325,7 +325,7 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 /// already get accurate `pixel_owner` stamps from the CPU rasterizer.
 fn bulk_writer_footprint(entry: &GpuCmdLogEntry) -> Option<(u16, u16, u16, u16)> {
     match entry.opcode {
-        // GP0 0x02 — FillRect. word1 = pos (x 16-aligned, y 9-bit),
+        // GP0 0x02 -- FillRect. word1 = pos (x 16-aligned, y 9-bit),
         // word2 = size (w rounded up to 16, h 9-bit).
         0x02 if entry.fifo.len() >= 3 => {
             let pos = entry.fifo[1];
@@ -336,7 +336,7 @@ fn bulk_writer_footprint(entry: &GpuCmdLogEntry) -> Option<(u16, u16, u16, u16)>
             let h = ((size >> 16) & 0x1FF) as u16;
             Some((x, y, w, h))
         }
-        // GP0 0x80..=0x9F — VRAM-to-VRAM copy. word2 = dst,
+        // GP0 0x80..=0x9F -- VRAM-to-VRAM copy. word2 = dst,
         // word3 = wh (0 → 1024/512).
         op if (0x80..=0x9F).contains(&op) && entry.fifo.len() >= 4 => {
             let dst = entry.fifo[2];
@@ -349,7 +349,7 @@ fn bulk_writer_footprint(entry: &GpuCmdLogEntry) -> Option<(u16, u16, u16, u16)>
             let h = if raw_h == 0 { 512 } else { raw_h };
             Some((dx, dy, w, h))
         }
-        // GP0 0xA0..=0xBF — CPU-to-VRAM upload. word1 = dst,
+        // GP0 0xA0..=0xBF -- CPU-to-VRAM upload. word1 = dst,
         // word2 = wh (0 → 1024/512).
         op if (0xA0..=0xBF).contains(&op) && entry.fifo.len() >= 3 => {
             let dst = entry.fifo[1];

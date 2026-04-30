@@ -50,7 +50,7 @@ const AUDIO_SLIDER_WIDTH: f32 = 72.0;
 const METRIC_TEXT_SIZE: f32 = 12.0;
 
 /// Running / paused status colours. Green when the CPU is stepping,
-/// dim-text when paused. Kept out of `theme.rs` for now — it's the
+/// dim-text when paused. Kept out of `theme.rs` for now -- it's the
 /// only place these get used.
 const STATUS_RUNNING: Color32 = Color32::from_rgb(80, 200, 120);
 const STATUS_PAUSED: Color32 = Color32::from_rgb(153, 153, 166);
@@ -214,7 +214,7 @@ fn draw_boot_toggle(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Debug-panel toggle cluster. Each button reflects the current on/off
-/// state of its panel — active buttons tint with the "running" green;
+/// state of its panel -- active buttons tint with the "running" green;
 /// inactive stay dim. Clicking flips the panel's visibility.
 fn draw_debug_toggles(ui: &mut egui::Ui, state: &mut AppState) {
     debug_toggle(
@@ -241,7 +241,7 @@ fn draw_debug_toggles(ui: &mut egui::Ui, state: &mut AppState) {
         "Toggle CPU registers panel",
         &mut state.panels.registers,
     );
-    // Wireframe mode lives on the GPU, not a frontend panel — we
+    // Wireframe mode lives on the GPU, not a frontend panel -- we
     // dereference through Bus to flip it.
     let wf_active = state
         .bus
@@ -347,7 +347,7 @@ fn metric(ui: &mut egui::Ui, label: &str, value: String) {
 
 /// Transport cluster, in visual left-to-right order.
 fn draw_buttons(ui: &mut egui::Ui, state: &mut AppState) {
-    // Play / Pause — icon + tooltip flip with state.
+    // Play / Pause -- icon + tooltip flip with state.
     let (icon, tooltip) = if state.running {
         (icons::PAUSE, "Pause")
     } else {
@@ -359,7 +359,7 @@ fn draw_buttons(ui: &mut egui::Ui, state: &mut AppState) {
         state.menu.sync_run_label(state.running);
     }
 
-    // Reset — rebuild the CPU, clear VRAM, keep the Bus (disc stays
+    // Reset -- rebuild the CPU, clear VRAM, keep the Bus (disc stays
     // inserted).
     let reset_btn = Button::new(icons::text(icons::ROTATE_CCW, ICON_SIZE)).min_size(BUTTON_SIZE);
     if ui.add(reset_btn).on_hover_text("Reset CPU").clicked() {

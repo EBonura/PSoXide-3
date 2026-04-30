@@ -1,6 +1,6 @@
 //! Side-load hello-input and dump a frame to PPM so we can SEE the
 //! new font-rendered label row. Hash-based milestone goldens don't
-//! catch "text rendering is visibly broken" — only eyeballing a
+//! catch "text rendering is visibly broken" -- only eyeballing a
 //! rendered frame does.
 //!
 //! ```bash

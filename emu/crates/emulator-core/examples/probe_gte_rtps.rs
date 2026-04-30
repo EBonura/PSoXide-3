@@ -9,7 +9,7 @@
 //! - V0 = (0, 0, 0x1000)              = vertex on the forward axis
 //!
 //! Expected SXY2 post-RTPS: X = 160, Y = 120 (vertex projects to the
-//! principal point — translation brings it to camera Z = 2.0, the
+//! principal point -- translation brings it to camera Z = 2.0, the
 //! X/Y components are zero so the offset applies cleanly).
 //!
 //! If the observed SXY2 is (160, 120) the emulator's RTPS is fine
@@ -143,7 +143,7 @@ fn main() {
 
     eprintln!();
     eprintln!("=== Second test: vertex off-axis ===");
-    // V0 = (0x800, 0x400, 0x1000) — should project offset from centre.
+    // V0 = (0x800, 0x400, 0x1000) -- should project offset from centre.
     // Expected SX = 160 + 200 * 0.5 / 1.0 = 260 (0x800=0.5, z=1.0)
     // Expected SY = 120 + 200 * 0.25 / 1.0 = 170 (0x400=0.25)
     // (Note: TR already applies 1.0 to Z; V0.z=0x1000 pushes SZ3 to 2.0 → halve the offsets:

@@ -187,7 +187,7 @@ fn main() {
         da.x, da.y, da.width, da.height
     );
 
-    // Probe pixels around each portrait centre — print the unique
+    // Probe pixels around each portrait centre -- print the unique
     // commands found.
     let probe = |label: &str, cx: u16, cy: u16| {
         eprintln!("\n=== {label} (display-coords {cx},{cy}) ===");
@@ -312,7 +312,7 @@ fn main() {
         // Find a vertex inside the bbox. Vertex word locations vary by
         // opcode but the X is always low 11 bits, Y next 11 bits of a
         // word; cheaper to scan ALL words and pick "looks like vertex"
-        // (low/high half are signed-11). False positives are fine —
+        // (low/high half are signed-11). False positives are fine --
         // we just want a coarse hit.
         let mut hit = false;
         for &w in &entry.fifo {

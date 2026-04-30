@@ -1,4 +1,4 @@
-//! Find the FIRST command that writes pixel (80, 120) — should be
+//! Find the FIRST command that writes pixel (80, 120) -- should be
 //! a textured primitive drawing an 'N' glyph, before the bar
 //! overwrites it. If the bar comes BEFORE the text, they come
 //! in the wrong order. If text comes before bar and gets
@@ -26,7 +26,7 @@ fn main() {
         }
     }
 
-    // Pixel (80, 120) — where Redux draws the 'N' in NAUGHTY.
+    // Pixel (80, 120) -- where Redux draws the 'N' in NAUGHTY.
     let target_vram_x = 80u16;
     let target_vram_y = 120u16;
 
@@ -37,7 +37,7 @@ fn main() {
     println!("(look for textured_rect or textured_tri/quad)");
     println!();
 
-    // Focus on commands in the last ~2% of the log — these draw
+    // Focus on commands in the last ~2% of the log -- these draw
     // the current frame. Earlier commands draw prior frames.
     let start = bus
         .gpu
@@ -128,7 +128,7 @@ fn main() {
     // Which of those banner-area glyphs come AFTER the bar is
     // drawn? The bar's first shaded_tri inside the banner is at
     // index ~839668. Anything past that with the bar y-range is
-    // drawn "on top" of the bar — if those exist in our emulator,
+    // drawn "on top" of the bar -- if those exist in our emulator,
     // the bar can't be overwriting them, so something else is
     // keeping them invisible (maybe CLUT transparency bug we missed).
     let bar_start_idx = 839668u32;
@@ -176,7 +176,7 @@ fn touches_pixel(op: u8, fifo: &[u32], target_x: i32, target_y: i32) -> bool {
         let pos = fifo[1];
         let x = sign_extend_11((pos & 0x7FF) as i32);
         let y = sign_extend_11(((pos >> 16) & 0x7FF) as i32);
-        // Apply draw_offset — approximate with scan. For our purposes
+        // Apply draw_offset -- approximate with scan. For our purposes
         // we need the DISPLAY-SPACE draw; the logs capture 0xE5 which
         // we'd have to back-walk for exact. For a rough hit test the
         // unadjusted XY usually lands in the right neighborhood, but
@@ -193,7 +193,7 @@ fn touches_pixel(op: u8, fifo: &[u32], target_x: i32, target_y: i32) -> bool {
             let wh = fifo[wh_idx];
             ((wh & 0xFFFF) as i32, ((wh >> 16) & 0xFFFF) as i32)
         };
-        // Add offset constant from tracer-captured 0xE5 if present —
+        // Add offset constant from tracer-captured 0xE5 if present --
         // we assume 256,120 from probe output.
         let ox = 256; // draw offset observed at banner time
         let oy = 120;
@@ -201,7 +201,7 @@ fn touches_pixel(op: u8, fifo: &[u32], target_x: i32, target_y: i32) -> bool {
         let sy = y + oy;
         return target_x >= sx && target_x < sx + w && target_y >= sy && target_y < sy + h;
     }
-    // Triangle / quad — bounding-box test on vertex positions.
+    // Triangle / quad -- bounding-box test on vertex positions.
     if matches!(op, 0x20..=0x3F) {
         // Extract vertex offsets depending on opcode shape.
         let vtx_indices: &[usize] = match op {

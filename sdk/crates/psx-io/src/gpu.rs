@@ -8,7 +8,7 @@ use psx_hw::gpu::{GpuStat, GP0, GP1, GPUREAD, GPUSTAT};
 
 /// Push a command or data word to `GP0`. Named `write_gp0` (not just
 /// `gp0`) so it doesn't collide with the `psx_hw::gpu::gp0` module
-/// that holds the command-word constructors — that way callers can
+/// that holds the command-word constructors -- that way callers can
 /// write `write_gp0(gp0::draw_mode(...))` and each half of the name
 /// is unambiguous.
 #[inline(always)]

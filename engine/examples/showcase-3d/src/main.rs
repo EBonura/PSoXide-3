@@ -1,10 +1,10 @@
-//! `showcase-3d` — the flagship 3D demo. Features the two
+//! `showcase-3d` -- the flagship 3D demo. Features the two
 //! canonical test models every graphics developer recognises:
 //!
-//! - **Suzanne** — the Blender monkey head (public domain,
+//! - **Suzanne** -- the Blender monkey head (public domain,
 //!   Blender Foundation). Decimated from 500 tris to ~180 tris
 //!   via vertex clustering for PSX budget; silhouette intact.
-//! - **Utah teapot** — Martin Newell's 1975 Bezier surface,
+//! - **Utah teapot** -- Martin Newell's 1975 Bezier surface,
 //!   tessellated to 6320 tris in its canonical OBJ, decimated
 //!   here to ~225 tris.
 //!
@@ -45,7 +45,7 @@ use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene;
 use psx_vram::{Clut, TexDepth, Tpage};
 
-/// Cooked mesh blobs — produced at build time by `psxed` from
+/// Cooked mesh blobs -- produced at build time by `psxed` from
 /// `vendor/*.obj`, embedded here so the homebrew is self-
 /// contained. Runtime just `Mesh::from_bytes` + index accessors.
 static SUZANNE_BLOB: &[u8] = include_bytes!("../assets/suzanne.psxm");
@@ -108,30 +108,30 @@ const TEAPOT_OFFSET: Vec3World = Vec3World::from_raw(0x1400, 0, 0);
 ///
 /// Directions are Q3.12 unit-ish vectors pointing FROM the surface
 /// TO the light. They're `const`-evaluated so the rig lives in
-/// .rodata — no per-frame rebuild cost.
+/// .rodata -- no per-frame rebuild cost.
 /// "Studio" rig in its camera reference frame (facing -Z).
 /// Per frame we rotate this around Y so lights orbit the scene,
 /// ensuring both Suzanne and the teapot see every lighting angle
 /// across a full rotation.
 const BASE_LIGHTS: LightRig = LightRig::new(
     [
-        // Key — warm, from upper-right at reference angle.
+        // Key -- warm, from upper-right at reference angle.
         Light {
             direction: Vec3I16::new(0x0B00, 0x0900, -0x0300),
             colour: (0x0E00, 0x0A80, 0x0700),
         },
-        // Fill — cool, opposite side.
+        // Fill -- cool, opposite side.
         Light {
             direction: Vec3I16::new(-0x0B00, 0x0800, -0x0300),
             colour: (0x0600, 0x0800, 0x0B00),
         },
-        // Rim — from behind, narrow highlight.
+        // Rim -- from behind, narrow highlight.
         Light {
             direction: Vec3I16::new(0, -0x0200, 0x0F00),
             colour: (0x0500, 0x0500, 0x0800),
         },
     ],
-    // Ambient — lifted so shadowed faces stay readable.
+    // Ambient -- lifted so shadowed faces stay readable.
     (0x0400, 0x0400, 0x0600),
 );
 
@@ -153,7 +153,7 @@ const FONT_CLUT: Clut = Clut::new(320, 256);
 // ----------------------------------------------------------------------
 
 /// Renamed from the pre-engine `Scene` struct to avoid name
-/// collision with [`psx_engine::Scene`] — this is *our* scene
+/// collision with [`psx_engine::Scene`] -- this is *our* scene
 /// type; the trait is what the engine calls back into.
 struct Showcase3D {
     /// Live post-cull triangle count.
@@ -170,7 +170,7 @@ struct Showcase3D {
 
 static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
 
-/// Both meshes feed this Gouraud-triangle pool — every tri has
+/// Both meshes feed this Gouraud-triangle pool -- every tri has
 /// three per-vertex colours computed via the GTE's lighting
 /// pipeline. Pre-cull upper bound is Suzanne (178) + teapot (92)
 /// = 270; back-face culling drops about half. 320 leaves room.
@@ -208,7 +208,7 @@ static mut BG_QUAD: QuadGouraud = QuadGouraud {
 ///
 /// Projected screen-space + lit vertices. The three colour channels
 /// are the GTE's NCCS output for this vertex + the current
-/// object-local light rig — they drive the Gouraud interpolator
+/// object-local light rig -- they drive the Gouraud interpolator
 /// on each triangle.
 const EMPTY_VERT: ProjectedLit = ProjectedLit {
     sx: 0,
@@ -252,23 +252,23 @@ impl Scene for Showcase3D {
             }
         }
 
-        // Spark emitter — 12-frame cadence reads `ctx.frame` via
+        // Spark emitter -- 12-frame cadence reads `ctx.frame` via
         // our own counter (see comment in `update` below for why
         // we don't just use `ctx.frame` directly). Actually we
-        // *do* — keep this in sync with the pre-engine cadence by
+        // *do* -- keep this in sync with the pre-engine cadence by
         // reading `frame % 12` on the raw counter.
         //
         // We take `ctx.frame` as the spawn clock. The pre-engine
         // demo incremented at start-of-update so its modulo hit
         // one frame earlier, but the sparks are random-seeded
-        // anyway — the cadence is what matters, and that's
+        // anyway -- the cadence is what matters, and that's
         // preserved.
     }
 
     fn render(&mut self, ctx: &mut Ctx) {
         // Spark emission lives here (rather than in update) to
         // read `ctx.frame` without duplicating the spawn logic in
-        // update — keeps the scene code compact and the frame-
+        // update -- keeps the scene code compact and the frame-
         // counter-driven cadence explicit.
         if ctx.frame % 12 == 0 {
             let x = SCREEN_W / 2 + self.rng.signed(SCREEN_W / 2 - 20);
@@ -290,7 +290,7 @@ impl Scene for Showcase3D {
 }
 
 // ----------------------------------------------------------------------
-// Showcase3D impl — starfield / OT build / HUD
+// Showcase3D impl -- starfield / OT build / HUD
 // ----------------------------------------------------------------------
 
 impl Showcase3D {
@@ -322,7 +322,7 @@ impl Showcase3D {
 
         let (shake_dx, shake_dy) = self.shake.tick();
 
-        // Backmost slot — deep-space gradient.
+        // Backmost slot -- deep-space gradient.
         let Some(bg) = backgrounds.push(QuadGouraud::new(
             [(0, 0), (SCREEN_W, 0), (0, SCREEN_H), (SCREEN_W, SCREEN_H)],
             [(10, 6, 32), (10, 6, 32), (2, 1, 8), (2, 1, 8)],
@@ -331,7 +331,7 @@ impl Showcase3D {
         };
         ot.add_packet(BG_SLOT, bg);
 
-        // Behind world geometry — starfield with a slow whole-scene
+        // Behind world geometry -- starfield with a slow whole-scene
         // roll for parallax.
         let scene_roll = Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16);
         scene::load_rotation(&scene_roll);
@@ -364,7 +364,7 @@ impl Showcase3D {
         }
 
         // Pre-project both meshes' vertices once, then walk triangle
-        // lists. Topologically both meshes share verts heavily — this
+        // lists. Topologically both meshes share verts heavily -- this
         // avoids 4-6× repeated GTE loads per vertex.
 
         // Parse both meshes at frame-start. Parsing is effectively
@@ -374,7 +374,7 @@ impl Showcase3D {
         let suzanne = Mesh::from_bytes(SUZANNE_BLOB).expect("suzanne blob");
         let teapot = Mesh::from_bytes(TEAPOT_BLOB).expect("teapot blob");
 
-        // Camera-space light rig for this frame — base rig rotated
+        // Camera-space light rig for this frame -- base rig rotated
         // around Y at the configured orbit rate so both meshes
         // eventually see every lighting angle. Compose this once per
         // frame; each object's final view rotation takes us into local
@@ -389,7 +389,7 @@ impl Showcase3D {
         let mut world_pass =
             unsafe { GouraudRenderPass::new(&mut ot, &mut gouraud, &mut GOURAUD_COMMANDS) };
 
-        // --- SUZANNE — two-axis tumble, lit by scene rig ---
+        // --- SUZANNE -- two-axis tumble, lit by scene rig ---
         let suz_rot = Mat3I16::rotate_y((frame.wrapping_mul(3) & 0xFFFF) as u16)
             .mul(&Mat3I16::rotate_x((frame.wrapping_mul(2) & 0xFFFF) as u16));
         let suz_view_rot = view.mul(&suz_rot);
@@ -407,7 +407,7 @@ impl Showcase3D {
             world_pass.submit_lit_mesh(&suzanne, unsafe { &mut SUZANNE_PROJ }, mesh_options);
         self.tri_count = self.tri_count.saturating_add(suz_stats.submitted_triangles);
 
-        // --- TEAPOT — opposite tumble, lit by same rig ---
+        // --- TEAPOT -- opposite tumble, lit by same rig ---
         let tea_rot = Mat3I16::rotate_y((frame.wrapping_mul(4) & 0xFFFF).wrapping_neg() as u16)
             .mul(&Mat3I16::rotate_z((frame.wrapping_mul(2) & 0xFFFF) as u16));
         let tea_view_rot = view.mul(&tea_rot);
@@ -422,7 +422,7 @@ impl Showcase3D {
 
         world_pass.flush();
 
-        // Foreground effects — sparks in front of the meshes.
+        // Foreground effects -- sparks in front of the meshes.
         let _ = render_particles(
             &self.sparks,
             &mut rects,
@@ -436,7 +436,7 @@ impl Showcase3D {
 
     fn draw_hud(&self, font: &FontAtlas, frame: u32) {
         font.draw_text(4, 4, "SHOWCASE-3D", (220, 220, 250));
-        // Right side lists the two hero models on two lines — clean
+        // Right side lists the two hero models on two lines -- clean
         // attribution without crowding the top bar.
         font.draw_text(SCREEN_W - 80, 4, "suzanne", (220, 160, 80));
         font.draw_text(SCREEN_W - 64, 20, "teapot", (120, 200, 240));

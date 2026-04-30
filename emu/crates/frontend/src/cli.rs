@@ -1,10 +1,10 @@
-//! Headless CLI — exercises every stateful path the GUI exposes
+//! Headless CLI -- exercises every stateful path the GUI exposes
 //! without opening a window.
 //!
 //! Existed for three reasons:
 //!
 //! 1. **Verification substrate.** Every feature added to the GUI
-//!    should land first here as a subcommand — then the UI is a
+//!    should land first here as a subcommand -- then the UI is a
 //!    thin layer over a tested CLI. "Does the game library scan
 //!    find my games?" becomes a deterministic test instead of a
 //!    click-test.
@@ -18,7 +18,7 @@
 //!
 //! When the frontend binary is run with a subcommand argument
 //! (`scan`, `list`, `launch`, `info`), this module handles it and
-//! returns — `main()` never spins up winit/wgpu. Without a
+//! returns -- `main()` never spins up winit/wgpu. Without a
 //! subcommand, the GUI runs as normal.
 
 use std::path::PathBuf;
@@ -50,7 +50,7 @@ pub struct Cli {
     /// Launch the GUI in a regular floating window instead of the
     /// default borderless-fullscreen mode. Useful when developing
     /// with the editor side-by-side with a terminal or docs. Only
-    /// meaningful when no headless subcommand is given —
+    /// meaningful when no headless subcommand is given --
     /// subcommands always run windowless.
     #[arg(long)]
     pub windowed: bool,
@@ -58,7 +58,7 @@ pub struct Cli {
     /// Run the experimental compute-shader rasterizer in parallel
     /// with the CPU rasterizer (Phase C). Per-frame the frontend
     /// drains the CPU's `cmd_log` and replays each GP0 packet
-    /// through the GPU compute path. Off by default — opt-in until
+    /// through the GPU compute path. Off by default -- opt-in until
     /// parity is confirmed in a wide enough test set. Press F12 in
     /// the GUI to toggle at runtime once the bus is wired up.
     #[arg(long)]
@@ -223,7 +223,7 @@ fn cmd_scan(paths: &ConfigPaths, args: ScanArgs) -> Result<(), String> {
 
     // Persist the root into settings.ron whenever `--root` was passed
     // explicitly. A fresh config dir that never had settings.ron
-    // written stays empty otherwise — the GUI would find the library
+    // written stays empty otherwise -- the GUI would find the library
     // but wouldn't know where to rescan from, so the next GUI-triggered
     // rescan would fail. Writing here keeps the "scan once on the CLI,
     // then use the GUI" path frictionless.
@@ -356,7 +356,7 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
         }
     }
 
-    // Step the CPU. Report early on opcode errors — they're usually
+    // Step the CPU. Report early on opcode errors -- they're usually
     // "we hit an unimplemented instruction" and worth surfacing.
     let mut stopped_at: Option<u64> = None;
     let mut audio_cycle_accum = 0u64;

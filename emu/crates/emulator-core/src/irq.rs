@@ -1,9 +1,9 @@
-//! Interrupt controller — `I_STAT` (0x1F801070) and `I_MASK` (0x1F801074).
+//! Interrupt controller -- `I_STAT` (0x1F801070) and `I_MASK` (0x1F801074).
 //!
 //! Two 32-bit registers with 11 meaningful source bits. `I_STAT` is the
 //! pending set; `I_MASK` is the enable set. A source `s` fires at the
 //! CPU iff `(I_STAT & I_MASK) >> s & 1 == 1`. The CPU reflects this in
-//! `COP0.CAUSE.IP[2]` — exactly one pin, all 11 sources OR'd together.
+//! `COP0.CAUSE.IP[2]` -- exactly one pin, all 11 sources OR'd together.
 //!
 //! Write semantics are source-asymmetric:
 //! - **`I_STAT` is an AND-acknowledge**. Writing `v` clears any bit
@@ -17,13 +17,13 @@
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub enum IrqSource {
-    /// Vertical blank — fires once per frame (50 Hz PAL, 60 Hz NTSC).
+    /// Vertical blank -- fires once per frame (50 Hz PAL, 60 Hz NTSC).
     VBlank = 0,
-    /// GPU — fires on various GPU-internal conditions.
+    /// GPU -- fires on various GPU-internal conditions.
     Gpu = 1,
     /// CD-ROM controller (command response / sector ready / …).
     Cdrom = 2,
-    /// DMA controller — any channel completing a transfer.
+    /// DMA controller -- any channel completing a transfer.
     Dma = 3,
     /// Root counter 0 (dot-clock / system-clock).
     Timer0 = 4,
@@ -53,7 +53,7 @@ pub struct Irq {
     /// Peak observed `I_STAT` value across the run. Tells us whether any
     /// pending bits have ever been set (before the BIOS ack cleared them).
     peak_stat: u32,
-    /// Number of `write_mask` calls (any width). Diagnostic — tells us
+    /// Number of `write_mask` calls (any width). Diagnostic -- tells us
     /// whether the BIOS is reaching `I_MASK` through the IRQ controller
     /// at all, or whether its writes are landing in the io[] echo buffer.
     mask_write_count: u64,
@@ -61,7 +61,7 @@ pub struct Irq {
     stat_write_count: u64,
     /// First 16 values written to `I_MASK`. Diagnostic.
     mask_write_log: Vec<u32>,
-    /// First 16 (cycle, value) pairs of `I_MASK` writes. Diagnostic —
+    /// First 16 (cycle, value) pairs of `I_MASK` writes. Diagnostic --
     /// helps cross-check when our writes happen vs Redux's.
     mask_write_events: Vec<(u64, u32)>,
     /// First 16 (cycle, value) pairs of `I_STAT` writes. Diagnostic.
@@ -72,7 +72,7 @@ impl Irq {
     /// Mask of valid source bits (0..=10).
     pub const VALID_BITS: u32 = 0x7FF;
 
-    /// All bits cleared — matches post-reset hardware.
+    /// All bits cleared -- matches post-reset hardware.
     pub fn new() -> Self {
         Self {
             stat: 0,
@@ -98,7 +98,7 @@ impl Irq {
         self.peak_stat
     }
 
-    /// Raise interrupt `source` — set its bit in `I_STAT` regardless
+    /// Raise interrupt `source` -- set its bit in `I_STAT` regardless
     /// of the mask. Matches real PSX hardware and PCSX-Redux's
     /// `setIRQ` (an unconditional `istat |= bit`). Mask gating happens
     /// at delivery time (`pending`), not at latch time.
@@ -112,12 +112,12 @@ impl Irq {
         self.peak_stat |= self.stat;
     }
 
-    /// `true` when some source is both pending and enabled — drives the
+    /// `true` when some source is both pending and enabled -- drives the
     /// single CPU IP[2] pin.
     pub fn pending(&self) -> bool {
         let p = (self.stat & self.mask & Self::VALID_BITS) != 0;
         if p {
-            // This isn't quite kosher — `pending` takes `&self` — but
+            // This isn't quite kosher -- `pending` takes `&self` -- but
             // the counter is `&mut` on the interior. Fix via a dedicated
             // method on `&mut self` that Cpu calls each step.
         }
@@ -149,7 +149,7 @@ impl Irq {
         self.mask
     }
 
-    /// MMIO write to `I_STAT` — AND-acknowledge. Writing 0 to a bit
+    /// MMIO write to `I_STAT` -- AND-acknowledge. Writing 0 to a bit
     /// clears it; writing 1 preserves it.
     pub fn write_stat(&mut self, value: u32) {
         self.stat &= value & Self::VALID_BITS;
@@ -166,7 +166,7 @@ impl Irq {
         }
     }
 
-    /// MMIO write to `I_MASK` — direct overwrite.
+    /// MMIO write to `I_MASK` -- direct overwrite.
     pub fn write_mask(&mut self, value: u32) {
         self.mask = value & Self::VALID_BITS;
         self.mask_write_count = self.mask_write_count.saturating_add(1);

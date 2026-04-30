@@ -2,14 +2,14 @@
 //!
 //! Three kinds of data land on disk:
 //!
-//! - **`settings.ron`** — user-editable preferences. BIOS paths,
+//! - **`settings.ron`** -- user-editable preferences. BIOS paths,
 //!   input bindings, UI prefs. Written in RON (Rusty Object
 //!   Notation) so enums round-trip losslessly and humans can
 //!   still hand-edit it with comments.
-//! - **`library.ron`** — machine-generated cache of the game
+//! - **`library.ron`** -- machine-generated cache of the game
 //!   library. Regenerable by re-scanning, but caching it avoids
 //!   re-parsing every BIN's PVD on every startup.
-//! - **`games/<id>/*`** — per-game data tree. Thumbnails (PNG),
+//! - **`games/<id>/*`** -- per-game data tree. Thumbnails (PNG),
 //!   save states (postcard), memory cards (raw 128 KiB in the
 //!   standard PS1 format every emulator reads).
 //!
@@ -43,5 +43,5 @@ pub use settings::{EditorSettings, InputBinding, Settings, SettingsError};
 pub const SETTINGS_VERSION: u32 = 2;
 
 /// Current version for `library.ron`. Cache files from older
-/// versions are discarded silently — the scanner regenerates them.
+/// versions are discarded silently -- the scanner regenerates them.
 pub const LIBRARY_VERSION: u32 = 1;

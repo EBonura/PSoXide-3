@@ -5,7 +5,7 @@
 //! ```bash
 //! cargo run -p emulator-core --example cache_inspect --release -- 19472417 8
 //! ```
-//! Args: TARGET_STEP [WINDOW] — print [target-WINDOW, target+WINDOW].
+//! Args: TARGET_STEP [WINDOW] -- print [target-WINDOW, target+WINDOW].
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};

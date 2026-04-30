@@ -1,5 +1,5 @@
 //! Trace every change to a given RAM word, step-by-step (no ISR
-//! folding) so the actual writing instruction's PC is captured —
+//! folding) so the actual writing instruction's PC is captured --
 //! including writes from inside an IRQ handler.
 //!
 //! ```bash
@@ -62,7 +62,7 @@ fn main() {
 
     // Pure single-stepping without ISR folding, so we can attribute
     // each write to the exact PC (user or ISR). `up_to_step` is
-    // interpreted as user-side-equivalent budget — we cap total steps
+    // interpreted as user-side-equivalent budget -- we cap total steps
     // at `up_to_step * 2` to allow for in-ISR time.
     let max_raw_steps = up_to_step.saturating_mul(2);
     for raw_step in 1..=max_raw_steps {

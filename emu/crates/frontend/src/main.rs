@@ -1,11 +1,11 @@
 //! PSoXide desktop frontend.
 //!
 //! Modular layout:
-//! - `theme`   — fonts, colors, framed-section helpers.
-//! - `icons`   — Lucide codepoint constants.
-//! - `gfx`     — winit window + wgpu surface + egui-wgpu plumbing.
-//! - `app`     — top-level state, UI orchestration entry point.
-//! - `ui/*`    — individual panels (central, registers, vram, menu, hud).
+//! - `theme`   -- fonts, colors, framed-section helpers.
+//! - `icons`   -- Lucide codepoint constants.
+//! - `gfx`     -- winit window + wgpu surface + egui-wgpu plumbing.
+//! - `app`     -- top-level state, UI orchestration entry point.
+//! - `ui/*`    -- individual panels (central, registers, vram, menu, hud).
 
 #![warn(missing_docs)]
 
@@ -65,7 +65,7 @@ fn elapsed_ms(start: Instant) -> f32 {
 }
 
 fn main() {
-    // Argument parsing first — if a subcommand is present, we
+    // Argument parsing first -- if a subcommand is present, we
     // dispatch through the headless CLI and never open a window.
     // Clap's derive API panics with a nicely-formatted message on
     // bad arguments, which is exactly what a CLI user expects.
@@ -78,7 +78,7 @@ fn main() {
         return;
     }
 
-    // `--config-dir` also applies to the GUI path — lets testers
+    // `--config-dir` also applies to the GUI path -- lets testers
     // point the app at a scratch directory without touching their
     // real settings. The GUI defaults to borderless-fullscreen;
     // `--windowed` opts back into a regular floating window for
@@ -110,9 +110,9 @@ struct Shell {
     fullscreen: bool,
     /// Host audio output. `None` when no device is available
     /// (headless CI, devices that can't open a stereo stream).
-    /// Emulation keeps running regardless — silence is fine.
+    /// Emulation keeps running regardless -- silence is fine.
     audio: Option<audio::AudioOut>,
-    /// Host input router — tracks every connected gamepad, emits
+    /// Host input router -- tracks every connected gamepad, emits
     /// merged PSX pad-1 masks, detects the Select+Start chord
     /// that opens the Menu, and logs connect / disconnect events
     /// for diagnosing missing controllers. Always constructible;
@@ -131,14 +131,14 @@ struct Shell {
     /// redraws instead produces under/over-runs on anything that
     /// isn't an exact 60 Hz render loop.
     audio_cycle_accum: u64,
-    /// Phase C — when `Some`, the experimental compute-shader
+    /// Phase C -- when `Some`, the experimental compute-shader
     /// rasterizer is shadowing the CPU rasterizer: each frame the
     /// CPU's `cmd_log` is drained and replayed onto the GPU compute
     /// path, and the display reads from the GPU's VRAM.
     compute_backend: Option<psx_gpu_compute::ComputeBackend>,
     /// Whether to display the GPU compute output instead of the CPU
     /// VRAM. Toggled at runtime by F12. Independent of whether the
-    /// compute backend is active — when off, GPU still runs (so it
+    /// compute backend is active -- when off, GPU still runs (so it
     /// stays in sync) but the user sees CPU output.
     display_gpu_compute: bool,
 }
@@ -169,7 +169,7 @@ impl Shell {
         // The compute backend gets its own headless wgpu device.
         // We *could* share the main `Graphics` device for zero-copy
         // VRAM-to-display, but that needs `Arc<Device>` plumbing
-        // throughout `Graphics` — bigger refactor for a marginal
+        // throughout `Graphics` -- bigger refactor for a marginal
         // perf win in an opt-in shadow path. Per-frame VRAM bounces
         // through CPU memory, which costs ~1 MiB read + 1 MiB write
         // and is invisible next to the rasterizer cost.
@@ -314,7 +314,7 @@ impl ApplicationHandler for Shell {
                 self.state.stop_embedded_playtest();
                 // Flush any dirty memory card so save progress
                 // survives a window-close. A hard crash still
-                // loses whatever hasn't been flushed — the run
+                // loses whatever hasn't been flushed -- the run
                 // loop could call this periodically; for now
                 // graceful exit is enough.
                 if let Err(e) = self.state.flush_memcard_port1() {
@@ -347,7 +347,7 @@ impl ApplicationHandler for Shell {
             } => {
                 // Pad state tracks both press AND release continuously
                 // so held buttons keep polling as "pressed". Auto-repeat
-                // events are ignored — the key is already down, and the
+                // events are ignored -- the key is already down, and the
                 // BIOS polls every frame anyway.
                 let route_keyboard_to_game = !self.state.workspace.is_editor()
                     || self.state.embedded_playtest_input_captured();
@@ -374,7 +374,7 @@ impl ApplicationHandler for Shell {
                 if state == ElementState::Pressed {
                     self.pending_input = merge_key(self.pending_input, &logical_key);
                 }
-                // F12 — toggle the display source between the CPU
+                // F12 -- toggle the display source between the CPU
                 // rasterizer's VRAM and the compute backend's. Only
                 // meaningful when the compute backend is active
                 // (i.e. `--gpu-compute` was passed). No-op otherwise.
@@ -429,7 +429,7 @@ impl ApplicationHandler for Shell {
                 }
                 if pad_frame.toggle_menu {
                     // Select+Start is the gamepad equivalent of
-                    // Escape — route it into the same `toggle_open`
+                    // Escape -- route it into the same `toggle_open`
                     // path so there's exactly one place that decides
                     // what "PS button" does based on current state.
                     input.toggle_open = true;
@@ -441,7 +441,7 @@ impl ApplicationHandler for Shell {
                 // gamepad doubles as the menu navigator. D-pad /
                 // left-stick edges become up/down/left/right, Cross
                 // is Enter, Circle is Back. `|=` so keyboard and
-                // pad can both contribute — last-one-wins semantics
+                // pad can both contribute -- last-one-wins semantics
                 // don't matter at this granularity.
                 input.up |= pad_frame.menu_up;
                 input.down |= pad_frame.menu_down;
@@ -450,7 +450,7 @@ impl ApplicationHandler for Shell {
                 input.confirm |= pad_frame.menu_confirm;
                 input.back |= pad_frame.menu_back;
 
-                // Escape is the "PS button" — it toggles between
+                // Escape is the "PS button" -- it toggles between
                 // "game running" and "game paused + menu open".
                 // Intercept it here so the Menu doesn't also interpret
                 // it as a navigation input. The user pressed Escape
@@ -483,7 +483,7 @@ impl ApplicationHandler for Shell {
                             self.state.menu.sync_run_label(true);
                         }
                     } else {
-                        // No game running and Menu already closed —
+                        // No game running and Menu already closed --
                         // Escape just opens the menu.
                         self.state.menu.open = true;
                     }
@@ -534,7 +534,7 @@ impl ApplicationHandler for Shell {
                     // gamepad input before stepping, so the game/homebrew
                     // sees fresh input this frame. `pad_frame.pad1_mask`
                     // already has the Select+Start chord stripped for
-                    // the frame the chord fires — prevents in-game
+                    // the frame the chord fires -- prevents in-game
                     // handlers from seeing the "open menu" combo.
                     let pad_mask = self.pad1_mask | pad_frame.pad1_mask;
                     let (rx, ry) = pad_frame.right_stick;
@@ -605,7 +605,7 @@ impl ApplicationHandler for Shell {
                                 // Surface the cpal ring depth in the HUD.
                                 self.state.hud.set_audio_queue_len(audio.queue_len());
                             } else {
-                                // No output device — drain and discard so the
+                                // No output device -- drain and discard so the
                                 // SPU's internal queue doesn't grow unbounded.
                                 let _ = bus.spu.drain_audio();
                             }
@@ -654,7 +654,7 @@ impl ApplicationHandler for Shell {
                 // Phase C: drain the CPU rasterizer's `cmd_log` and
                 // replay each GP0 packet onto the compute backend.
                 // This runs for every frame the bus advanced (or
-                // not, when paused — in which case `cmd_log` will
+                // not, when paused -- in which case `cmd_log` will
                 // be empty and the loop is a no-op).
                 let compute_start = Instant::now();
                 if let (Some(backend), Some(bus)) =
@@ -667,7 +667,7 @@ impl ApplicationHandler for Shell {
                     for entry in &frame_log {
                         backend.replay_packet(entry);
                     }
-                    // pixel_owner needs resetting too — we don't use
+                    // pixel_owner needs resetting too -- we don't use
                     // its data here, but its `current_cmd_index`
                     // would otherwise drift past u32::MAX over time.
                     if let Some(owner) = bus.gpu.pixel_owner.as_mut() {
@@ -687,7 +687,7 @@ impl ApplicationHandler for Shell {
                 // Match the HW renderer's internal scale to the
                 // current Native↔Window mode + framebuffer pixel budget.
                 // Cheap when stable; reallocates the VRAM-shaped
-                // target on change (which clears it — the next
+                // target on change (which clears it -- the next
                 // cmd_log replay paints a fresh frame).
                 let scale_mode = match state.scale_mode {
                     app::ScaleMode::Native => psx_gpu_render::ScaleMode::Native,

@@ -13,7 +13,7 @@ buffer.
 | Address | Size | Name | Access | Notes |
 |---|---|---|---|---|
 | `0x1F80_1DAA` | 16 | `SPUCNT` | R/W | Control register |
-| `0x1F80_1DAE` | 16 | `SPUSTAT` | R only | Status — mirrors `SPUCNT[5:0]` + misc internal bits |
+| `0x1F80_1DAE` | 16 | `SPUSTAT` | R only | Status -- mirrors `SPUCNT[5:0]` + misc internal bits |
 
 ### The rest (echo buffer)
 
@@ -38,13 +38,13 @@ buffer.
 | 9:8 | Noise Frequency Step | |
 | 13:10 | Noise Frequency Shift | |
 | 14 | Mute | |
-| 15 | SPU Enable | Master enable (BIOS sets this early — `0x8010`) |
+| 15 | SPU Enable | Master enable (BIOS sets this early -- `0x8010`) |
 
 ## SPUSTAT bit layout
 
 | Bit | Meaning |
 |---|---|
-| 5:0 | **Current SPU mode** — mirror of `SPUCNT[5:0]` (delayed by a few cycles on real hw; we model as instant) |
+| 5:0 | **Current SPU mode** -- mirror of `SPUCNT[5:0]` (delayed by a few cycles on real hw; we model as instant) |
 | 6 | IRQ9 flag |
 | 7 | Data transfer busy |
 | 9:8 | Data transfer mode (read from SPUCNT[5:4] as a convenience) |
@@ -75,7 +75,7 @@ write/read bytes via `0x1F80_1DA8`).
 ## What's missing
 
 - 24-voice ADPCM decoder + ADSR envelope
-- Reverb (massive chunk — convolution engine with 32 tap coefficients)
+- Reverb (massive chunk -- convolution engine with 32 tap coefficients)
 - Capture buffers
 - CD audio input path (requires CD-ROM controller)
 - Data transfer to/from SPU RAM (manual + DMA channel 4)
@@ -102,7 +102,7 @@ impl Spu {
 
 ## References
 
-- Nocash PSX-SPX — "Sound Processing Unit (SPU)" (easily the longest section)
-- PCSX-Redux `src/spu/` — the reference implementation
-- PSoXide-2 `emulator/spu/` — prior art, worth reading for voice structure
-- `emulator_core::spu` — our Phase 3a stub
+- Nocash PSX-SPX -- "Sound Processing Unit (SPU)" (easily the longest section)
+- PCSX-Redux `src/spu/` -- the reference implementation
+- PSoXide-2 `emulator/spu/` -- prior art, worth reading for voice structure
+- `emulator_core::spu` -- our Phase 3a stub

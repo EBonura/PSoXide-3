@@ -25,7 +25,7 @@ pub const TEXTURES_DIRNAME: &str = "textures";
 /// referenced by any placed [`NodeKind::MeshInstance`].
 pub const MODELS_DIRNAME: &str = "models";
 
-/// Coarse asset class — mirrors [`psx_level::AssetKind`] but
+/// Coarse asset class -- mirrors [`psx_level::AssetKind`] but
 /// stays host-side `String`/`Vec` friendly. Converted to the
 /// runtime enum at write time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +45,7 @@ pub enum PlaytestAssetKind {
 /// reaching back into the project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaytestAsset {
-    /// Asset class — drives extension + loader.
+    /// Asset class -- drives extension + loader.
     pub kind: PlaytestAssetKind,
     /// Backing payload.
     pub bytes: Vec<u8>,
@@ -53,7 +53,7 @@ pub struct PlaytestAsset {
     /// `room_000.psxw`). Stable across runs because asset order
     /// is deterministic.
     pub filename: String,
-    /// Diagnostic label — display name of the source resource
+    /// Diagnostic label -- display name of the source resource
     /// or room. Surfaces in cook reports and stays out of the
     /// runtime contract.
     pub source_label: String,
@@ -89,7 +89,7 @@ pub struct PlaytestRoom {
 pub struct PlaytestMaterial {
     /// Owning room index in [`PlaytestPackage::rooms`].
     pub room: u16,
-    /// Cooked-world local material slot — matches the slot value
+    /// Cooked-world local material slot -- matches the slot value
     /// stored in the `.psxw`.
     pub local_slot: u16,
     /// Index into [`PlaytestPackage::assets`] of the texture
@@ -122,7 +122,7 @@ pub struct PlaytestModelClip {
 pub struct PlaytestModel {
     /// Display name lifted from the editor resource.
     pub name: String,
-    /// Source resource id — used to deduplicate instances and
+    /// Source resource id -- used to deduplicate instances and
     /// to resolve per-instance clip overrides back to clip
     /// indices within this model's slice.
     pub source_resource: ResourceId,
@@ -130,7 +130,7 @@ pub struct PlaytestModel {
     /// `.psxmdl` blob.
     pub mesh_asset_index: usize,
     /// Index into [`PlaytestPackage::assets`] of the atlas
-    /// `.psxt` blob. Always `Some` for placed models — the
+    /// `.psxt` blob. Always `Some` for placed models -- the
     /// playtest cooker rejects instances of models without an
     /// atlas. Kept as `Option` so the schema can later carry
     /// untextured author-time bundles unchanged.
@@ -145,7 +145,7 @@ pub struct PlaytestModel {
     /// Cooker validation guarantees this is `< clip_count`,
     /// so the runtime always has a clip to play.
     pub default_clip: u16,
-    /// World-space height (engine units) — propagated from the
+    /// World-space height (engine units) -- propagated from the
     /// editor resource.
     pub world_height: u16,
 }
@@ -174,12 +174,12 @@ pub struct PlaytestModelInstance {
 }
 
 /// Sentinel for [`PlaytestModelInstance::clip`] meaning
-/// "inherit model default" — same value as
+/// "inherit model default" -- same value as
 /// [`psx_level::MODEL_CLIP_INHERIT`].
 pub const MODEL_CLIP_INHERIT: u16 = 0xFFFF;
 
 /// One placed point light, room-local engine units. Mirrors
-/// [`psx_level::PointLightRecord`] one-for-one — intensity is
+/// [`psx_level::PointLightRecord`] one-for-one -- intensity is
 /// already quantised to Q8.8 so the cook output is a direct
 /// copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +202,7 @@ pub struct PlaytestLight {
 }
 
 /// Player spawn record. Coordinates are room-local engine units
-/// (the same space the cooked `.psxw` lives in — array-rooted at
+/// (the same space the cooked `.psxw` lives in -- array-rooted at
 /// world `(0, 0)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaytestSpawn {
@@ -230,7 +230,7 @@ pub enum PlaytestEntityKind {
 }
 
 /// Cooked character record. Mirrors
-/// [`psx_level::LevelCharacterRecord`] one-to-one — the writer
+/// [`psx_level::LevelCharacterRecord`] one-to-one -- the writer
 /// emits the static slice from this struct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaytestCharacter {
@@ -269,7 +269,7 @@ pub struct PlaytestCharacter {
 /// [`PlaytestSpawn`] in the same package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaytestPlayerController {
-    /// Resolved spawn — same data the manifest's `PLAYER_SPAWN`
+    /// Resolved spawn -- same data the manifest's `PLAYER_SPAWN`
     /// carries.
     pub spawn: PlaytestSpawn,
     /// Character index in [`PlaytestPackage::characters`].
@@ -308,7 +308,7 @@ pub struct PlaytestEntity {
 /// instances, and residency.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlaytestPackage {
-    /// Master asset table — rooms first, then room textures,
+    /// Master asset table -- rooms first, then room textures,
     /// then per-model assets (mesh + atlas + clips), in
     /// deterministic order.
     pub assets: Vec<PlaytestAsset>,
@@ -324,14 +324,14 @@ pub struct PlaytestPackage {
     pub model_instances: Vec<PlaytestModelInstance>,
     /// Placed point lights, room-local coordinates.
     pub lights: Vec<PlaytestLight>,
-    /// Single player spawn — required.
+    /// Single player spawn -- required.
     pub spawn: Option<PlaytestSpawn>,
     /// Cooked Character resources used by player / future
     /// gameplay. Currently only the player spawn references
     /// these, but the slice ships in the manifest unconditionally
     /// so the runtime can table-drive any future controllers.
     pub characters: Vec<PlaytestCharacter>,
-    /// Resolved player controller — `Some` when a player spawn
+    /// Resolved player controller -- `Some` when a player spawn
     /// was authored *and* a Character was assigned (or
     /// auto-picked). The runtime falls back to a debug camera
     /// when this is `None`.

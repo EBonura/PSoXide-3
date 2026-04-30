@@ -9,7 +9,7 @@
 //! - Our `$r26` = 0x80050dfc; Redux's = 0x80051300.
 //! - Redux's cycles at that record = 46249947; ours = 46247459.
 //! - The 2490-cycle gap is an ISR body Redux runs that we don't.
-//! - Our `istat=0x000` — no IRQ pending. Whatever DMA-completion
+//! - Our `istat=0x000` -- no IRQ pending. Whatever DMA-completion
 //!   event would have raised `IrqSource::Dma` didn't flip our
 //!   DICR master edge (channel-enable bit not armed, or ordering
 //!   drift in the scheduler's per-channel target cycle).
@@ -34,7 +34,7 @@ fn main() {
     let mut bus = Bus::new(bios).expect("BIOS size");
     let mut cpu = Cpu::new();
 
-    // Match the parity test's trace aggregation — see tests/parity.rs
+    // Match the parity test's trace aggregation -- see tests/parity.rs
     // `our_trace` for the shape.
     let target_rec: usize = 19_474_544;
 
@@ -50,7 +50,7 @@ fn main() {
         records_len += 1;
     }
 
-    // State at the start of record N — about to execute that step.
+    // State at the start of record N -- about to execute that step.
     let gprs = cpu.gprs();
     println!("=== our state at record {} ===", target_rec);
     println!("PC         = 0x{:08x}", cpu.pc());

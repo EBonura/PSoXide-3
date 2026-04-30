@@ -1,4 +1,4 @@
-//! `game-pong` — classic two-paddle Pong, first full-game port to
+//! `game-pong` -- classic two-paddle Pong, first full-game port to
 //! the `psx-engine` framework.
 //!
 //! Same game it's always been (left paddle = D-pad, right paddle =
@@ -12,7 +12,7 @@
 //! - Pad edge detection uses [`Ctx::just_pressed`] instead of
 //!   tracking previous-frame state by hand.
 //! - Game state is a struct field on the scene rather than a
-//!   `static mut GAME` global — no more `unsafe { &mut GAME }`
+//!   `static mut GAME` global -- no more `unsafe { &mut GAME }`
 //!   laced through every logic function.
 //!
 //! What DOESN'T move out of static: the OT + the rect arena. Those
@@ -20,7 +20,7 @@
 //! frames, so a `.bss`-resident static array is still the right
 //! home for them.
 //!
-//! Original: `sdk/examples/game-pong/` — ~540 lines with its own
+//! Original: `sdk/examples/game-pong/` -- ~540 lines with its own
 //! main, its own pad polling, its own loop structure. Under the
 //! engine it's ~480 lines of almost-entirely-game-logic code;
 //! roughly 60 lines of boilerplate (setup, loop, unsafe static
@@ -73,7 +73,7 @@ const FONT_TPAGE: Tpage = Tpage::new(320, 0, TexDepth::Bit4);
 const FONT_CLUT: Clut = Clut::new(320, 256);
 
 // ----------------------------------------------------------------------
-// SPU layout — one voice per SFX, tone samples at well-known offsets
+// SPU layout -- one voice per SFX, tone samples at well-known offsets
 // ----------------------------------------------------------------------
 
 const SPU_WALL: SpuAddr = SpuAddr::new(0x1010);
@@ -85,7 +85,7 @@ const VOICE_PADDLE: Voice = Voice::V1;
 const VOICE_SCORE: Voice = Voice::V2;
 
 // ----------------------------------------------------------------------
-// DMA-facing arenas — stay in .bss so the OT walker sees stable
+// DMA-facing arenas -- stay in .bss so the OT walker sees stable
 // addresses frame-to-frame.
 // ----------------------------------------------------------------------
 
@@ -93,7 +93,7 @@ static mut OT: OrderingTable<8> = OrderingTable::new();
 static mut RECTS: [RectFlat; 20] = [const { RectFlat::new(0, 0, 0, 0, 0, 0, 0) }; 20];
 
 // ----------------------------------------------------------------------
-// Game state — now a Scene field rather than a static
+// Game state -- now a Scene field rather than a static
 // ----------------------------------------------------------------------
 
 struct Pong {
@@ -327,13 +327,13 @@ impl Pong {
         let rects = unsafe { &mut RECTS };
         ot.clear();
 
-        // Slot 0 (back) — top + bottom border strips.
+        // Slot 0 (back) -- top + bottom border strips.
         rects[0] = RectFlat::new(0, PLAYFIELD_TOP - 1, SCREEN_W as u16, BORDER_H, 140, 140, 180);
         rects[1] = RectFlat::new(0, PLAYFIELD_BOT, SCREEN_W as u16, BORDER_H, 140, 140, 180);
         ot.add(0, &mut rects[0], RectFlat::WORDS);
         ot.add(0, &mut rects[1], RectFlat::WORDS);
 
-        // Slot 2 — centre dashes.
+        // Slot 2 -- centre dashes.
         let dash_h: u16 = 10;
         let dash_gap: i16 = 10;
         let dash_x: i16 = (SCREEN_W - 4) / 2;
@@ -346,7 +346,7 @@ impl Pong {
             idx += 1;
         }
 
-        // Slot 5 — paddles.
+        // Slot 5 -- paddles.
         rects[14] = RectFlat::new(PADDLE_MARGIN, self.p1_y, PADDLE_W, PADDLE_H, 240, 240, 240);
         rects[15] = RectFlat::new(
             SCREEN_W - PADDLE_MARGIN - PADDLE_W as i16,
@@ -360,7 +360,7 @@ impl Pong {
         ot.add(5, &mut rects[14], RectFlat::WORDS);
         ot.add(5, &mut rects[15], RectFlat::WORDS);
 
-        // Slot 7 (front) — ball, warm tint to read against white paddles.
+        // Slot 7 (front) -- ball, warm tint to read against white paddles.
         rects[16] = RectFlat::new(
             self.ball_x,
             self.ball_y,

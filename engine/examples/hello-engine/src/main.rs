@@ -1,4 +1,4 @@
-//! `hello-engine` — the smallest possible `psx-engine` demo.
+//! `hello-engine` -- the smallest possible `psx-engine` demo.
 //!
 //! A single Gouraud-shaded square bounces horizontally, driven by
 //! a sine wave on the [`Angle`] type. Proves end-to-end that the
@@ -32,7 +32,7 @@ use psx_math::sincos;
 // Motion parameters
 // ----------------------------------------------------------------------
 
-/// The quad oscillates horizontally over this many frames — one
+/// The quad oscillates horizontally over this many frames -- one
 /// full sine cycle every ~2 seconds at 60 fps.
 const OSCILLATION_FRAMES: u32 = 120;
 
@@ -77,7 +77,7 @@ static mut BG: QuadGouraud = QuadGouraud {
 impl Scene for Game {
     fn update(&mut self, ctx: &mut Ctx) {
         // Pad drives vertical offset. `just_pressed` so a held
-        // D-pad doesn't scroll off-screen in a single frame — the
+        // D-pad doesn't scroll off-screen in a single frame -- the
         // user releases + re-presses to step. Shows the edge-
         // detection helper.
         if ctx.just_pressed(button::UP) {
@@ -93,7 +93,7 @@ impl Scene for Game {
         let mut quads = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut QUAD)) };
         let mut backgrounds = unsafe { PrimitiveArena::new(core::slice::from_mut(&mut BG)) };
 
-        // Background gradient quad — dim blue top, near-black
+        // Background gradient quad -- dim blue top, near-black
         // bottom. Gouraud across four vertices; showcases the OT
         // + QuadGouraud pipeline alongside the engine plumbing.
         let Some(bg) = backgrounds.push(QuadGouraud::new(
@@ -106,7 +106,7 @@ impl Scene for Game {
 
         // Foreground: a 24×24 solid quad oscillating horizontally
         // via `Angle`. `per_frames(N).mul_frame(frame)` is the
-        // canonical way to drive a periodic motion — no modulo
+        // canonical way to drive a periodic motion -- no modulo
         // snap-back, no unit mismatch.
         let phase = Angle::per_frames(OSCILLATION_FRAMES).mul_frame(ctx.frame);
         let dx = (sincos::sin_q12(phase.sin_q12_arg()) * AMPLITUDE_PX as i32) >> 12;

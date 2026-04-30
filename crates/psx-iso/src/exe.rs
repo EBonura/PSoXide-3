@@ -11,8 +11,8 @@
 //!   14h      initial GP (`$r28`)
 //!   18h      load address in RAM (t_addr)
 //!   1Ch      payload size (t_size, excluding the 2 KiB header)
-//!   20h-27h  data section (address, size) — usually zero-sized
-//!   28h-2Fh  BSS section (address, size) — zeroed by the BIOS
+//!   20h-27h  data section (address, size) -- usually zero-sized
+//!   28h-2Fh  BSS section (address, size) -- zeroed by the BIOS
 //!   30h      initial SP base (`$r29` high bits)
 //!   34h      initial SP offset added to the base
 //!   38h-4Bh  reserved
@@ -59,7 +59,7 @@ pub struct Exe {
     /// Destination address in RAM where [`Exe::payload`] goes.
     pub load_addr: u32,
     /// `$r29` base. The BIOS initialises the stack pointer as
-    /// `initial_sp_base + initial_sp_offset` — we do the same. If both
+    /// `initial_sp_base + initial_sp_offset` -- we do the same. If both
     /// are zero the caller should leave the CPU's SP alone so the
     /// default reset state survives.
     pub initial_sp_base: u32,
@@ -116,7 +116,7 @@ impl Exe {
         })
     }
 
-    /// Effective stack pointer — `base + offset`, or `None` when both
+    /// Effective stack pointer -- `base + offset`, or `None` when both
     /// fields are zero (caller should keep the CPU's reset SP).
     pub fn initial_sp(&self) -> Option<u32> {
         if self.initial_sp_base == 0 && self.initial_sp_offset == 0 {

@@ -1,6 +1,6 @@
 //! Primitive packet types for DMA-based GPU submission.
 //!
-//! Each struct is `#[repr(C)]` with the tag word first — that's the
+//! Each struct is `#[repr(C)]` with the tag word first -- that's the
 //! shape the DMA linked-list walker expects. The field names match
 //! the on-wire GP0 word order so a reader can cross-reference
 //! PSX-SPX without redundant decoding.
@@ -200,7 +200,7 @@ impl QuadGouraud {
     }
 }
 
-/// Monochrome single line. 4 words (tag + 3 data). GP0 0x40 — the
+/// Monochrome single line. 4 words (tag + 3 data). GP0 0x40 -- the
 /// real diagonal-capable line rasteriser (unlike `RectFlat`, which
 /// the GPU snaps to 16-pixel X boundaries in its GP0 0x02 fill).
 #[repr(C, align(4))]
@@ -302,7 +302,7 @@ impl TriTextured {
 pub struct TriTexturedGouraud {
     /// OT linkage.
     pub tag: u32,
-    /// `0x34000000 | color0` header — v0's RGB is packed into the
+    /// `0x34000000 | color0` header -- v0's RGB is packed into the
     /// same word as the polygon opcode.
     pub color0_cmd: u32,
     /// Vertex 0 position.

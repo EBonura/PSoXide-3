@@ -1,6 +1,6 @@
 //! Directly dump what our CDROM path delivers for LBA 16 (PVD),
 //! LBA 22 (root dir), LBA 23 (SYSTEM.CNF). Decouples "disc file is
-//! correct" from "CDROM ReadN behaviour is correct" — if the raw
+//! correct" from "CDROM ReadN behaviour is correct" -- if the raw
 //! bytes here match what's in the BIN file, we know the read path
 //! is fine and the bug is in the BIOS-facing delivery (FIFO /
 //! DMA3 / SetMode / timing).

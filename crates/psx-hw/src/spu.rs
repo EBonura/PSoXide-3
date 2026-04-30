@@ -1,4 +1,4 @@
-//! SPU — Sound Processing Unit.
+//! SPU -- Sound Processing Unit.
 //!
 //! 24 voices, 512 KiB of dedicated SPU RAM, ADSR envelopes, reverb,
 //! and XA-ADPCM stereo decoding for CD audio streaming.

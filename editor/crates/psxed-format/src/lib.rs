@@ -6,7 +6,7 @@
 //! constants in a single crate that both sides depend on makes
 //! it structurally impossible for producer + consumer to drift.
 //!
-//! The crate is **`no_std`** — it compiles on every target we
+//! The crate is **`no_std`** -- it compiles on every target we
 //! ship to, host or PS1. It defines only:
 //!
 //! - Magic byte identifiers for each asset type
@@ -16,7 +16,7 @@
 //!
 //! Encoders (host side) and decoders (PS1 side) live in
 //! separate crates. This crate knows nothing about IO, serde,
-//! or allocation — it's a layout-only contract.
+//! or allocation -- it's a layout-only contract.
 //!
 //! ## Wire format
 //!
@@ -25,9 +25,9 @@
 //! ```text
 //!   offset  bytes  field
 //!        0      4  magic    ASCII 4-char identifier (e.g. b"PSXM")
-//!        4      2  version  u16 LE — format revision, bumped on breakage
-//!        6      2  flags    u16 LE — asset-type-specific feature bits
-//!        8      4  payload_len u32 LE — size of the rest of the file
+//!        4      2  version  u16 LE -- format revision, bumped on breakage
+//!        6      2  flags    u16 LE -- asset-type-specific feature bits
+//!        8      4  payload_len u32 LE -- size of the rest of the file
 //! ```
 //!
 //! Each asset type appends its own payload after the header.
@@ -37,7 +37,7 @@
 //!
 //! All multi-byte integers are **little-endian**, matching PS1
 //! / MIPS cooked order. Consumers on big-endian hosts would need
-//! byte-swapping — not a concern for our all-LE toolchain today.
+//! byte-swapping -- not a concern for our all-LE toolchain today.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -52,7 +52,7 @@ pub mod world;
 /// Shared header that prefixes every cooked asset file.
 ///
 /// Storing this as a fixed 12-byte block simplifies the runtime
-/// parser — one read, check `magic`, check `version`, then
+/// parser -- one read, check `magic`, check `version`, then
 /// dispatch on the known payload layout for that `magic`.
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]

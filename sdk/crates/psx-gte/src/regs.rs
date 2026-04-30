@@ -1,7 +1,7 @@
 //! GTE register accessors.
 //!
 //! These are **macros**, not functions, because the GTE register
-//! index is encoded as a 5-bit immediate field in the instruction —
+//! index is encoded as a 5-bit immediate field in the instruction --
 //! you can't pass it as a runtime value without either stamping 32
 //! separate functions or generating code at build time. Macros keep
 //! the call site readable (`mtc2!(0, value)`) while letting the
@@ -19,9 +19,9 @@
 //!
 //! ```text
 //!   bits 31..26 = 0x12 (COP2)
-//!   bits 25..21 = rs           — 0=MFC2, 2=CFC2, 4=MTC2, 6=CTC2
-//!   bits 20..16 = rt           — CPU general-purpose register
-//!   bits 15..11 = rd           — COP2 data/control register index
+//!   bits 25..21 = rs           -- 0=MFC2, 2=CFC2, 4=MTC2, 6=CTC2
+//!   bits 20..16 = rt           -- CPU general-purpose register
+//!   bits 15..11 = rd           -- COP2 data/control register index
 //!   bits 10..0  = 0
 //! ```
 //!
@@ -67,7 +67,7 @@
 /// by a NOP that fills the one-cycle load-delay slot.
 ///
 /// **Why the NOP**: MIPS R3000 MFC2/CFC2 commit their result to the
-/// CPU GPR at the END of the NEXT instruction — not at the end of
+/// CPU GPR at the END of the NEXT instruction -- not at the end of
 /// MFC2 itself. Rust's inline-asm output binding (`out("$8") value`)
 /// makes the compiler insert a move-from-$8 right after the `.word`
 /// block, and that move runs in the delay slot → sees the
@@ -121,7 +121,7 @@ macro_rules! mtc2 {
 }
 
 /// Control-from-COP2 register (reads GTE *control* bank). Same
-/// load-delay concern as [`mfc2!`] — emits a NOP after the CFC2 to
+/// load-delay concern as [`mfc2!`] -- emits a NOP after the CFC2 to
 /// give the result a cycle to commit to $8 before Rust's
 /// compiler-inserted move-from-$8 runs.
 #[macro_export]
@@ -176,7 +176,7 @@ pub const fn pack_xy(x: i16, y: i16) -> u32 {
     ((y as u16 as u32) << 16) | (x as u16 as u32)
 }
 
-/// Inverse of [`pack_xy`] — split a packed word back into two `i16`s.
+/// Inverse of [`pack_xy`] -- split a packed word back into two `i16`s.
 #[inline(always)]
 pub const fn unpack_xy(value: u32) -> (i16, i16) {
     (value as i16, (value >> 16) as i16)

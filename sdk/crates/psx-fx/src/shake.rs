@@ -4,7 +4,7 @@
 //! frame counter; `tick()` decrements it and returns a small
 //! `(dx, dy)` offset the caller adds to their vertex positions.
 //!
-//! Triangle-wave pattern — sign flips each frame so it reads as a
+//! Triangle-wave pattern -- sign flips each frame so it reads as a
 //! judder rather than a smooth drift. Magnitude decays linearly
 //! with the counter, so the last frames are subtle.
 //!
@@ -33,13 +33,13 @@ impl ShakeState {
     }
 
     /// Start (or retrigger) a shake. If a bigger shake is already
-    /// active, it stays — smaller triggers don't interrupt.
+    /// active, it stays -- smaller triggers don't interrupt.
     pub fn trigger(&mut self, frames: u8) {
         self.frames = self.frames.max(frames);
     }
 
     /// Advance one frame. Returns `(dx, dy)` in pixels. Safe to
-    /// call every frame even when idle — returns `(0, 0)` then.
+    /// call every frame even when idle -- returns `(0, 0)` then.
     pub fn tick(&mut self) -> (i16, i16) {
         if self.frames == 0 {
             return (0, 0);

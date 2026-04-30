@@ -1,29 +1,29 @@
 //! CD-ROM controller.
 //!
-//! **Full implementation**, not a stub — the plan is to carry this
+//! **Full implementation**, not a stub -- the plan is to carry this
 //! from BIOS-boot-without-disc (Milestone B) all the way through
 //! real disc reads (Milestone D onward) and XA audio (Milestone F).
 //! The file will grow by phase:
 //!
-//! - **6a (this file)**: register infrastructure — the index-based
+//! - **6a (this file)**: register infrastructure -- the index-based
 //!   MMIO dispatch, the three FIFOs (parameter, response, data),
 //!   the IRQ flag/mask register model, the raw status byte.
 //! - **6b**: command dispatcher with async-response scheduling.
 //!   Commands queue first- and second-response events at specific
 //!   cycle offsets; `tick` fires them when their time comes.
-//! - **6c**: core commands that appear in every BIOS boot —
+//! - **6c**: core commands that appear in every BIOS boot --
 //!   Sync / GetStat / Init / Demute / GetID / Pause.
-//! - **6d**: disc-present commands — SetLoc, SeekL/SeekP, ReadN/ReadS,
+//! - **6d**: disc-present commands -- SetLoc, SeekL/SeekP, ReadN/ReadS,
 //!   sector data streaming into the data FIFO + DMA channel 3.
 //! - **6e**: ISO9660 filesystem hook from `psx-iso`.
-//! - **6f**: audio plumbing — volume matrix, XA decode (deferred
+//! - **6f**: audio plumbing -- volume matrix, XA decode (deferred
 //!   to Milestone F when it actually matters).
 //!
 //! **Reference**: nocash PSX-SPX "CDROM Drive" and
 //! `pcsx-redux/src/core/cdrom.cc`. Status-byte bits + IRQ types +
 //! index semantics all follow those two.
 //!
-//! This module is parity-safe at the register level — software that
+//! This module is parity-safe at the register level -- software that
 //! reads status / queues parameters / pops responses sees the values
 //! Redux would return. Command side effects (seeking, reading) start
 //! landing in 6b onwards.
@@ -35,16 +35,16 @@ use psx_iso::{bcd_to_bin, msf_to_lba, Disc};
 mod timing;
 use timing::*;
 
-/// Base MMIO address — the whole controller fits in 4 bytes at
+/// Base MMIO address -- the whole controller fits in 4 bytes at
 /// `0x1F80_1800..=0x1F80_1803`.
 pub const BASE: u32 = 0x1F80_1800;
-/// Range end (exclusive) — `BASE + 4`.
+/// Range end (exclusive) -- `BASE + 4`.
 pub const END: u32 = 0x1F80_1804;
 
 /// Status-byte bits (read from `0x1F80_1800` at any index).
 #[allow(dead_code)]
 pub mod status_bit {
-    /// Index (low 2 bits) — selects which sub-register is visible at
+    /// Index (low 2 bits) -- selects which sub-register is visible at
     /// `0x1F80_1801..=0x1F80_1803`. Written via `0x1F80_1800`.
     pub const INDEX_MASK: u8 = 0b0000_0011;
     /// ADPCM-decoder busy.
@@ -57,7 +57,7 @@ pub mod status_bit {
     pub const RESPONSE_FIFO_NOT_EMPTY: u8 = 1 << 5;
     /// Data FIFO is *not* empty (sector bytes available).
     pub const DATA_FIFO_NOT_EMPTY: u8 = 1 << 6;
-    /// A command is in flight — cleared when the first response arrives.
+    /// A command is in flight -- cleared when the first response arrives.
     pub const TRANSMISSION_BUSY: u8 = 1 << 7;
 }
 
@@ -67,18 +67,18 @@ pub mod status_bit {
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum IrqType {
-    /// No interrupt — canonical cleared state.
+    /// No interrupt -- canonical cleared state.
     None = 0,
-    /// Async sector-data-ready — fires for each sector during ReadN/S.
+    /// Async sector-data-ready -- fires for each sector during ReadN/S.
     DataReady = 1,
-    /// Second response — completion of a command whose 1st response
+    /// Second response -- completion of a command whose 1st response
     /// indicated the action would take time (seek, read, init).
     Complete = 2,
-    /// First response — command accepted, ~50 k cycles after the write.
+    /// First response -- command accepted, ~50 k cycles after the write.
     Acknowledge = 3,
-    /// Fourth response — end of data for Play/ReadS/ReadN on bounds.
+    /// Fourth response -- end of data for Play/ReadS/ReadN on bounds.
     DataEnd = 4,
-    /// Error response — command rejected, disc error, etc.
+    /// Error response -- command rejected, disc error, etc.
     Error = 5,
 }
 
@@ -96,7 +96,7 @@ impl IrqType {
     }
 }
 
-/// Drive-status byte (a.k.a. "stat" — the first byte of every
+/// Drive-status byte (a.k.a. "stat" -- the first byte of every
 /// command response). Separate from the MMIO status byte above.
 ///
 /// On cold boot with no disc, `SHELL_OPEN` is set and `MOTOR_ON`
@@ -200,24 +200,24 @@ enum DriveState {
 
 /// CD-ROM controller state.
 pub struct CdRom {
-    /// Index register low 2 bits — selects the register visible at
+    /// Index register low 2 bits -- selects the register visible at
     /// each sub-port for the next read/write.
     index: u8,
     /// Drive status byte returned by `GetStat` and embedded in the
     /// first byte of most responses. Read by phase-6c command handlers.
     #[allow(dead_code)]
     drive_status: u8,
-    /// Parameter FIFO — software pushes here before invoking a
+    /// Parameter FIFO -- software pushes here before invoking a
     /// command; the controller drains it when the command runs.
     params: VecDeque<u8>,
-    /// Response FIFO — command responses arrive here for software
+    /// Response FIFO -- command responses arrive here for software
     /// to pop via `0x1F80_1801`.
     responses: VecDeque<u8>,
     /// Command/parameter transmission busy latch (status bit 7).
     /// Redux sets this when a command byte is written, then clears it
     /// when the corresponding interrupt packet is materialized.
     command_busy: bool,
-    /// IRQ enable mask — low 3 bits; an IRQ fires only if its type
+    /// IRQ enable mask -- low 3 bits; an IRQ fires only if its type
     /// bit is enabled. BIOS writes via `0x1F80_1802 idx=1`.
     irq_mask: u8,
     /// Currently-raised IRQ type; cleared by writing 1s to the low
@@ -249,14 +249,14 @@ pub struct CdRom {
     /// live read/play head. Redux doesn't move immediately on SetLoc;
     /// it latches the target and consumes it on Seek/Read/Play.
     setloc_pending: bool,
-    /// Total commands dispatched since reset — diagnostic counter.
+    /// Total commands dispatched since reset -- diagnostic counter.
     commands_dispatched: u64,
-    /// Diagnostic histogram of each command byte seen — `[0x00..=0x1F]`
+    /// Diagnostic histogram of each command byte seen -- `[0x00..=0x1F]`
     /// is enough to capture every BIOS command. Exposed via
     /// [`CdRom::command_histogram`] for `smoke_draw`.
     command_hist: [u32; 32],
     /// The most recently dispatched command byte. Diagnostic only
-    /// — used by the `cdrom_probe` example to log exactly which
+    /// -- used by the `cdrom_probe` example to log exactly which
     /// command was just issued at each `commands_dispatched` bump.
     last_command: u8,
     /// Bounded command log. Disabled by default; probes opt in with
@@ -280,7 +280,7 @@ pub struct CdRom {
     /// deadlines without threading `now` through every command
     /// handler.
     scheduling_cycle: u64,
-    /// Per-IrqType raise histogram — indexed by `IrqType`
+    /// Per-IrqType raise histogram -- indexed by `IrqType`
     /// discriminant (0..=5). Probes read this to tell
     /// Acknowledge/DataReady/Complete/Error counts apart when the
     /// aggregate CDROM raise count looks suspicious.
@@ -292,11 +292,11 @@ pub struct CdRom {
     /// log to pinpoint which specific IRQ fires at a divergent
     /// cycle.
     pub cdrom_irq_log: Vec<(u64, u8)>,
-    /// Max length of `cdrom_irq_log` — 0 disables logging (the
+    /// Max length of `cdrom_irq_log` -- 0 disables logging (the
     /// default, to avoid the per-raise allocation in production
     /// runs). Probes set this via [`CdRom::enable_irq_log`].
     cdrom_irq_log_cap: usize,
-    /// Count of `schedule_sector_event_at` calls. Diagnostic only —
+    /// Count of `schedule_sector_event_at` calls. Diagnostic only --
     /// the BIOS should see one DataReady per sector read at the
     /// current CD speed's cadence, so this should match the sector
     /// count the game requested. A blown-out number means we're
@@ -306,7 +306,7 @@ pub struct CdRom {
     /// true and GetID / ReadN follow the disc-present paths; when
     /// `None`, they fall back to the "please insert disc" path.
     disc: Option<Disc>,
-    /// Data FIFO — 2048 bytes of sector user data, drained by MMIO
+    /// Data FIFO -- 2048 bytes of sector user data, drained by MMIO
     /// reads at `0x1F80_1802` or by DMA channel 3. Filled by each
     /// DataReady event during an active ReadN / ReadS.
     data_fifo: VecDeque<u8>,
@@ -320,10 +320,10 @@ pub struct CdRom {
     /// armed; DMA3 reads the transfer buffer once a sector is ready,
     /// matching Redux's `m_read` gate rather than the request latch.
     data_transfer_active: bool,
-    /// Last read sector header (MM, SS, FF, mode) — returned by
+    /// Last read sector header (MM, SS, FF, mode) -- returned by
     /// `GetlocL` after the drive has actually delivered a sector.
     last_sector_header: [u8; 4],
-    /// Last read sector subheader (file, channel, submode, coding) —
+    /// Last read sector subheader (file, channel, submode, coding) --
     /// likewise returned by `GetlocL`.
     last_sector_subheader: [u8; 4],
     /// Whether `last_sector_header` / `last_sector_subheader`
@@ -387,7 +387,7 @@ pub struct CdRom {
     attenuator_left_to_right_t: u8,
     attenuator_right_to_left_t: u8,
     attenuator_right_to_right_t: u8,
-    /// Decoded stereo sample buffer — filled by XA ADPCM decode
+    /// Decoded stereo sample buffer -- filled by XA ADPCM decode
     /// when an audio sector arrives. Drained by the bus each tick
     /// and pushed to the SPU's CD audio input.
     cd_audio: VecDeque<(i16, i16)>,
@@ -400,14 +400,14 @@ pub struct CdRom {
 }
 
 impl CdRom {
-    /// Fresh controller — shell open, motor off, all FIFOs empty,
+    /// Fresh controller -- shell open, motor off, all FIFOs empty,
     /// IRQ disabled. Matches hardware state a few cycles after reset,
     /// before the BIOS has had a chance to write anything.
     pub fn new() -> Self {
         Self {
             index: 0,
             // Cold boot: on a closed shell with no disc seated, we
-            // want the BIOS to reach the "Please insert disc" shell —
+            // want the BIOS to reach the "Please insert disc" shell --
             // that needs SHELL_OPEN clear (lid closed) so the Init
             // command spins the motor up without erroring.
             drive_status: 0,
@@ -421,7 +421,7 @@ impl CdRom {
             // earlier runs because we also ignored the mask when raising
             // (see `should_wake_cpu`); after adding the mask gate, our 0
             // initial value caused CDROM IRQs to silently latch without
-            // waking CPU — BIOS boot then polled the latched flag instead
+            // waking CPU -- BIOS boot then polled the latched flag instead
             // of getting its usual ISR-driven ack, drifting from Redux.
             irq_mask: 0x1F,
             irq_flag: 0,
@@ -459,7 +459,7 @@ impl CdRom {
             seek_done: false,
             location_changed: false,
             // Power-on mode: double-speed, no XA, data-only 2048-byte
-            // sectors. Matches the BIOS's probe-time expectation — it
+            // sectors. Matches the BIOS's probe-time expectation -- it
             // issues SetMode 0x80 (double-speed) before its first
             // ReadN. A fresh emulator reset without an intervening
             // SetMode still uses double-speed, matching the prior
@@ -484,7 +484,7 @@ impl CdRom {
         }
     }
 
-    /// Pull all pending CD audio samples — called by the bus once
+    /// Pull all pending CD audio samples -- called by the bus once
     /// per frame, then forwarded to `Spu::feed_cd_audio`. Returns
     /// stereo pairs in playback order (oldest first). Empty when
     /// no XA / CD-DA decode has produced samples since the last
@@ -493,17 +493,17 @@ impl CdRom {
         self.cd_audio.drain(..).collect()
     }
 
-    /// Queue depth of the CD audio buffer — diagnostic.
+    /// Queue depth of the CD audio buffer -- diagnostic.
     pub fn cd_audio_queue_len(&self) -> usize {
         self.cd_audio.len()
     }
 
-    /// Live SetMode byte — diagnostic for XA / raw-sector streaming.
+    /// Live SetMode byte -- diagnostic for XA / raw-sector streaming.
     pub fn debug_mode(&self) -> u8 {
         self.mode
     }
 
-    /// Live XA file/channel filter — diagnostic for STR/XA streams.
+    /// Live XA file/channel filter -- diagnostic for STR/XA streams.
     pub fn debug_xa_filter(&self) -> (u8, u8) {
         (self.xa_filter_file, self.xa_filter_channel)
     }
@@ -583,7 +583,7 @@ impl CdRom {
     /// treats as "drive not ready yet" and never advances past the
     /// disc-probe loop to issue `SetLoc + SeekL + ReadN`.
     ///
-    /// `insert_disc(None)` "ejects" — disc_present flips false, the
+    /// `insert_disc(None)` "ejects" -- disc_present flips false, the
     /// motor stops, any in-flight read is cancelled, and the next
     /// `GetID` returns the no-disc response again.
     pub fn insert_disc(&mut self, disc: Option<Disc>) {
@@ -619,16 +619,16 @@ impl CdRom {
     pub fn read8(&mut self, phys: u32) -> u8 {
         let offset = (phys - BASE) as u8;
         match (offset, self.index) {
-            // 0x1F80_1800 — status byte (same at every index).
+            // 0x1F80_1800 -- status byte (same at every index).
             (0, _) => self.status_byte(),
-            // 0x1F80_1801 — response FIFO (any index).
+            // 0x1F80_1801 -- response FIFO (any index).
             (1, _) => self.pop_response(),
-            // 0x1F80_1802 — data FIFO (any index).
+            // 0x1F80_1802 -- data FIFO (any index).
             (2, _) => {
                 self.data_fifo_pops = self.data_fifo_pops.saturating_add(1);
                 self.pop_data_fifo_byte()
             }
-            // 0x1F80_1803 — index-dependent:
+            // 0x1F80_1803 -- index-dependent:
             //   idx=0 → interrupt enable,
             //   idx=1 → interrupt flag,
             //   idx=2 → mirror of enable,
@@ -654,30 +654,30 @@ impl CdRom {
     /// `AddIrqQueue(cmd, delay)` which anchors on `m_regs.cycle` at
     /// the cmd-port write. The previous "relative then rebase on
     /// next tick" scheme lost the BIAS + memory-access cycles of
-    /// the SB that issued the command — surfaced as a 5-cycle late
+    /// the SB that issued the command -- surfaced as a 5-cycle late
     /// IRQ dispatch at parity step 89,198,894.
     pub fn write8_at(&mut self, phys: u32, value: u8, now: u64) -> bool {
         let offset = (phys - BASE) as u8;
         match (offset, self.index) {
-            // 0x1F80_1800 write — set the index.
+            // 0x1F80_1800 write -- set the index.
             (0, _) => self.index = value & status_bit::INDEX_MASK,
-            // 0x1F80_1801 idx=0 — command register. Queue for 6b.
+            // 0x1F80_1801 idx=0 -- command register. Queue for 6b.
             (1, 0) => self.queue_command(value, now),
-            // 0x1F80_1801 idx=1/2/3 — audio sound-map / CD-to-SPU
+            // 0x1F80_1801 idx=1/2/3 -- audio sound-map / CD-to-SPU
             // volume.
             (1, 1 | 2) => {}
             (1, 3) => self.attenuator_right_to_right_t = value,
-            // 0x1F80_1802 idx=0 — parameter FIFO push.
+            // 0x1F80_1802 idx=0 -- parameter FIFO push.
             (2, 0) => self.push_param(value),
-            // 0x1F80_1802 idx=1 — interrupt enable.
+            // 0x1F80_1802 idx=1 -- interrupt enable.
             (2, 1) => {
                 self.irq_mask = value & 0x1F;
                 return self.should_wake_cpu();
             }
-            // 0x1F80_1802 idx=2/3 — audio volume.
+            // 0x1F80_1802 idx=2/3 -- audio volume.
             (2, 2) => self.attenuator_left_to_left_t = value,
             (2, 3) => self.attenuator_right_to_left_t = value,
-            // 0x1F80_1803 idx=0 — request register (data transfer on,
+            // 0x1F80_1803 idx=0 -- request register (data transfer on,
             // command-buffer reset, etc.). Bit 7 = want-data. Full
             // modelling arrives with sector reads.
             (3, 0) => {
@@ -693,7 +693,7 @@ impl CdRom {
                     self.data_transfer_active = true;
                 }
             }
-            // 0x1F80_1803 idx=1 — acknowledge interrupts (write-1-to-
+            // 0x1F80_1803 idx=1 -- acknowledge interrupts (write-1-to-
             // clear on the low 5 bits; bit 6 resets the param FIFO too).
             (3, 1) => {
                 self.irq_flag &= !(value & 0x1F);
@@ -701,7 +701,7 @@ impl CdRom {
                     self.params.clear();
                 }
             }
-            // 0x1F80_1803 idx=2/3 — audio volume matrix.
+            // 0x1F80_1803 idx=2/3 -- audio volume matrix.
             (3, 2) => self.attenuator_left_to_right_t = value,
             (3, 3) if value & 0x20 != 0 => {
                 self.commit_attenuator();
@@ -768,7 +768,7 @@ impl CdRom {
         // command handler's signature.
         self.scheduling_cycle = now;
 
-        // Drain parameters into a local vec — handlers need them and
+        // Drain parameters into a local vec -- handlers need them and
         // pop-order matches push-order.
         let params: Vec<u8> = self.params.drain(..).collect();
         if self.command_log.len() < self.command_log_cap {
@@ -784,7 +784,7 @@ impl CdRom {
         }
 
         match command {
-            // Sync / NOP — acts as GetStat.
+            // Sync / NOP -- acts as GetStat.
             0x00 | 0x01 => self.cmd_getstat(),
             // SetLoc: 3 BCD bytes (minute, second, frame).
             0x02 => self.cmd_setloc(&params),
@@ -796,7 +796,7 @@ impl CdRom {
             0x03 => self.cmd_play(&params),
             // ReadN (read with auto-retry). Without a disc, error.
             0x06 => self.cmd_read(),
-            // MotorOn — some retail loaders wake the spindle
+            // MotorOn -- some retail loaders wake the spindle
             // explicitly before querying/reading.
             0x07 => self.cmd_motor_on(),
             // Stop: halt motor.
@@ -809,22 +809,22 @@ impl CdRom {
             // Mute / Demute.
             0x0B => self.cmd_mute(true),
             0x0C => self.cmd_mute(false),
-            // Setfilter — XA file/channel filter.
+            // Setfilter -- XA file/channel filter.
             0x0D => self.cmd_set_filter(&params),
-            // Getparam — mode/filter query.
+            // Getparam -- mode/filter query.
             0x0F => self.cmd_get_param(),
-            // GetlocL — current logical MSF + mode + subheader.
+            // GetlocL -- current logical MSF + mode + subheader.
             0x10 => self.cmd_get_loc_l(),
-            // GetlocP — current play position (track, index, MSF).
+            // GetlocP -- current play position (track, index, MSF).
             0x11 => self.cmd_get_loc_p(),
-            // SetSession — current loader only models session 1, but
+            // SetSession -- current loader only models session 1, but
             // retail software still expects the completion IRQ.
             0x12 => self.cmd_set_session(&params),
-            // GetTN — first/last track numbers.
+            // GetTN -- first/last track numbers.
             0x13 => self.cmd_get_tn(),
-            // GetTD — start time of a track, or lead-out for track 0.
+            // GetTD -- start time of a track, or lead-out for track 0.
             0x14 => self.cmd_get_td(&params),
-            // ReadS — read without auto-retry. Data arrives the same
+            // ReadS -- read without auto-retry. Data arrives the same
             // way as ReadN for our purposes; games use ReadS for
             // audio/video streaming where a retry would cause hitching.
             0x1B => self.cmd_read(),
@@ -844,7 +844,7 @@ impl CdRom {
             // for INT2 (Complete), stranding MGS / Crash at the
             // Sony splash.
             0x1E => self.cmd_read_toc(),
-            // Init — lid/rescan state machine; no CPU-visible INT2.
+            // Init -- lid/rescan state machine; no CPU-visible INT2.
             0x1C => self.cmd_init(),
             _ => self.cmd_getstat(),
         }
@@ -1168,7 +1168,7 @@ impl CdRom {
     /// - INT3 (Acknowledge) with stat, immediately.
     /// - INT2 (Complete) with stat, ~20 M cycles later (Redux:
     ///   `cdReadTime * 180 / 4 = 20_321_280`). No track data is
-    ///   returned in either response — the BIOS queries individual
+    ///   returned in either response -- the BIOS queries individual
     ///   track info via GetTD after ReadTOC completes.
     ///
     /// The BIOS's disc-boot sequence blocks on the INT2 here; we
@@ -1187,7 +1187,7 @@ impl CdRom {
     }
 
     fn cmd_init(&mut self) {
-        // Init is a drive reset — also halt any in-flight read so
+        // Init is a drive reset -- also halt any in-flight read so
         // DataReady chains from a previous ReadN don't keep firing
         // across the reset boundary.
         self.reading = false;
@@ -1263,7 +1263,7 @@ impl CdRom {
 
     fn cmd_seek(&mut self) {
         // Need a disc / motor. Without disc we still "seek" but it
-        // succeeds immediately on the real drive — BIOS rarely calls
+        // succeeds immediately on the real drive -- BIOS rarely calls
         // SeekL without a disc.
         self.reading = false;
         self.cancel_pending_data_ready_events();
@@ -1441,7 +1441,7 @@ impl CdRom {
 
             // Raw-sector miss means we ran off the end of the image.
         }
-        // Past end of disc — stop the read and leave the FIFO empty.
+        // Past end of disc -- stop the read and leave the FIFO empty.
         self.reading = false;
         self.read_rescheduled = false;
         self.location_changed = false;
@@ -1451,7 +1451,7 @@ impl CdRom {
         true
     }
 
-    /// CdlGetlocL (0x10) — return the current logical position
+    /// CdlGetlocL (0x10) -- return the current logical position
     /// and sector-header info. 8-byte reply:
     /// `[MM, SS, FF, Mode, File, Channel, Submode, Coding]` from the
     /// last delivered sector's raw header/subheader.
@@ -1474,7 +1474,7 @@ impl CdRom {
         self.schedule_first_response(resp);
     }
 
-    /// CdlGetlocP (0x11) — return the current physical play
+    /// CdlGetlocP (0x11) -- return the current physical play
     /// position. 8-byte reply: `[Track, Index, RMM, RSS, RSECT,
     /// AMM, ASS, ASECT]`. RMM/RSS/RSECT are relative to the
     /// track/index start; AMM/ASS/ASECT are absolute MSF.
@@ -1513,7 +1513,7 @@ impl CdRom {
         ]);
     }
 
-    /// CdlGetTN (0x13) — first and last track numbers from the disc's
+    /// CdlGetTN (0x13) -- first and last track numbers from the disc's
     /// track table.
     fn cmd_get_tn(&mut self) {
         if !self.disc_present {
@@ -1535,7 +1535,7 @@ impl CdRom {
         self.schedule_first_response(vec![self.stat_byte(), bin_to_bcd(first), bin_to_bcd(last)]);
     }
 
-    /// CdlGetTD (0x14) — start time for a given track, or lead-out for
+    /// CdlGetTD (0x14) -- start time for a given track, or lead-out for
     /// track 0. Parameter is a BCD track number.
     fn cmd_get_td(&mut self, params: &[u8]) {
         if !self.disc_present {
@@ -1565,7 +1565,13 @@ impl CdRom {
             start_lba
         };
         let (m, s, _f) = lba_to_msf(target_lba);
-        self.schedule_first_response(vec![self.stat_byte(), bin_to_bcd(m), bin_to_bcd(s)]);
+        // PCSX-Redux's CdlGetTD path calls SetResultSize(4) but only
+        // writes stat/min/sec, leaving the fourth result byte at the
+        // controller's zero-initialized slot. The BIOS CDROM handler
+        // drains all four bytes by polling status bit 5; publishing
+        // only three makes it skip one poll/drain loop and breaks
+        // cycle parity in Tekken 3's boot path.
+        self.schedule_first_response(vec![self.stat_byte(), bin_to_bcd(m), bin_to_bcd(s), 0x00]);
     }
 
     /// Legacy helper kept for the `0x04` / `0x05` forward / backward
@@ -1580,7 +1586,7 @@ impl CdRom {
         }
     }
 
-    /// CdlPlay (0x03) — CD-DA playback. Parameter is an optional
+    /// CdlPlay (0x03) -- CD-DA playback. Parameter is an optional
     /// track number (BCD); when absent, playback continues from
     /// the last SetLoc position.
     fn cmd_play(&mut self, params: &[u8]) {
@@ -1626,14 +1632,14 @@ impl CdRom {
 
     fn cmd_test(&mut self, params: &[u8]) {
         // Only Test 0x20 (drive version / BIOS date) is commonly used
-        // by the BIOS. Must match Redux byte-for-byte — the BIOS's
+        // by the BIOS. Must match Redux byte-for-byte -- the BIOS's
         // IRQ handler stores the 4-byte response into a kernel
         // buffer, and later code paths read those bytes back to
         // dispatch on firmware version. Parity step 89,184,517
         // diverged on a byte out of this buffer.
         //
         // Redux (cdrom.cc): `Test20[] = {0x98, 0x06, 0x10, 0xC3}`.
-        // Format is YY MM DD VER — 1998-06-10 v0xC3, matching the
+        // Format is YY MM DD VER -- 1998-06-10 v0xC3, matching the
         // SCPH-550x / 700x firmware Redux targets by default.
         match params.first().copied() {
             Some(0x20) => {
@@ -1682,7 +1688,7 @@ impl CdRom {
     /// non-zero).
     ///
     /// Returns `true` if this call raised an IRQ that was previously
-    /// clear — the caller (Bus) uses that to poke `IrqSource::Cdrom`.
+    /// clear -- the caller (Bus) uses that to poke `IrqSource::Cdrom`.
     pub fn tick(&mut self, cycles_now: u64) -> bool {
         self.tick_with_irq_pending(cycles_now, false)
     }
@@ -1716,7 +1722,7 @@ impl CdRom {
             // `load_next_sector` + chained
             // `schedule_sector_event_at`) on every failed attempt.
             // MGS triggered that tight loop: 46.9 M sector events
-            // scheduled and 11.7 M DataReady pops — enough
+            // scheduled and 11.7 M DataReady pops -- enough
             // load_next_sector re-entries to bury the emulator in
             // ISR dispatch cycles (16.7 cyc/step vs 2.4 baseline),
             // stranding MGS at the PlayStation splash.
@@ -1754,7 +1760,7 @@ impl CdRom {
                 continue;
             }
 
-            // DataReady events drive the sector-stream — load the
+            // DataReady events drive the sector-stream -- load the
             // next sector's payload into the data FIFO as the event
             // fires, and chain the subsequent DataReady (anchored on
             // `cycles_now` so the next sector fires at the steady
@@ -1831,13 +1837,13 @@ impl CdRom {
         raised
     }
 
-    /// Total commands received — used by `smoke_draw` to confirm BIOS
+    /// Total commands received -- used by `smoke_draw` to confirm BIOS
     /// is talking to the drive.
     pub fn commands_dispatched(&self) -> u64 {
         self.commands_dispatched
     }
 
-    /// Per-command histogram (indexed by command byte) — same purpose.
+    /// Per-command histogram (indexed by command byte) -- same purpose.
     pub fn command_histogram(&self) -> &[u32; 32] {
         &self.command_hist
     }
@@ -1871,7 +1877,7 @@ impl CdRom {
 
     /// Current CDROM controller INDEX (bits 0-1 of the status
     /// register at 0x1F801800). Low-level writes to 0x1F801801-3
-    /// are routed through this index — reading 0x1F801803 with
+    /// are routed through this index -- reading 0x1F801803 with
     /// index=0 returns the IRQ mask, with index=1 returns the
     /// IRQ flag. Probes compare this against Redux's to catch
     /// index-tracking drift.
@@ -1879,7 +1885,7 @@ impl CdRom {
         self.index
     }
 
-    /// Current CDROM IRQ mask (the per-IRQ-type enable bits — the
+    /// Current CDROM IRQ mask (the per-IRQ-type enable bits -- the
     /// CPU-level I_MASK is separate). Written via 0x1F801802
     /// index=1. `setIrq` in Redux (and our raise-gate) checks
     /// `irq_flag & irq_mask` before waking the CPU.
@@ -1892,7 +1898,7 @@ impl CdRom {
     /// `irq_flag & irq_mask` is nonzero. When it's zero the
     /// response stays latched for polled access via 0x1F801803
     /// idx=1, but no CPU interrupt is dispatched. MGS (and other
-    /// games) poll the flag with bits 0-2 of `irq_mask` cleared —
+    /// games) poll the flag with bits 0-2 of `irq_mask` cleared --
     /// relying on this gate to keep CDROM acks from firing the
     /// ISR while the BIOS's loader code walks the response
     /// manually. Skipping the gate (our pre-fix behaviour) caused
@@ -1939,7 +1945,7 @@ impl CdRom {
     }
 
     /// Most-recent `SetLoc` MSF target, as a `(minute, second,
-    /// frame)` BCD triple. Diagnostic-only — lets probes correlate
+    /// frame)` BCD triple. Diagnostic-only -- lets probes correlate
     /// `ReadN` events with the LBA the BIOS is asking for.
     pub fn debug_setloc_msf(&self) -> (u8, u8, u8) {
         self.setloc_msf
@@ -1964,7 +1970,7 @@ impl CdRom {
         self.data_fifo_ready
     }
 
-    /// Pull one byte from the data FIFO — used by DMA channel 3's
+    /// Pull one byte from the data FIFO -- used by DMA channel 3's
     /// block-read path to drain a sector into RAM. Returns `0` when
     /// the FIFO is empty (hardware returns stale-bus bytes; `0` is
     /// a safe stand-in).
@@ -2014,7 +2020,7 @@ impl Default for CdRom {
     }
 }
 
-// Shared helpers — `lba_to_msf` + `bin_to_bcd` live in `psx-iso` so
+// Shared helpers -- `lba_to_msf` + `bin_to_bcd` live in `psx-iso` so
 // any crate that speaks the CDROM protocol (tools, test harnesses)
 // can use them.
 use psx_iso::{bin_to_bcd, lba_to_msf};
@@ -2262,7 +2268,7 @@ mod tests {
         cd.responses.push_back(0x22);
         assert_eq!(cd.read8(BASE + 1), 0x11);
         assert_eq!(cd.read8(BASE + 1), 0x22);
-        // Empty pop reads as zero — matches Redux.
+        // Empty pop reads as zero -- matches Redux.
         assert_eq!(cd.read8(BASE + 1), 0);
     }
 
@@ -2818,6 +2824,9 @@ mod tests {
         assert_eq!(cd.read8(BASE + 1), cd.stat_byte());
         assert_eq!(cd.read8(BASE + 1), 0x00);
         assert_eq!(cd.read8(BASE + 1), 0x02);
+        assert_ne!(cd.read8(BASE) & status_bit::RESPONSE_FIFO_NOT_EMPTY, 0);
+        assert_eq!(cd.read8(BASE + 1), 0x00);
+        assert_eq!(cd.read8(BASE) & status_bit::RESPONSE_FIFO_NOT_EMPTY, 0);
     }
 
     #[test]
@@ -2831,6 +2840,9 @@ mod tests {
         let _stat = cd.read8(BASE + 1);
         assert_eq!(cd.read8(BASE + 1), 0x00);
         assert_eq!(cd.read8(BASE + 1), 0x02);
+        assert_ne!(cd.read8(BASE) & status_bit::RESPONSE_FIFO_NOT_EMPTY, 0);
+        assert_eq!(cd.read8(BASE + 1), 0x00);
+        assert_eq!(cd.read8(BASE) & status_bit::RESPONSE_FIFO_NOT_EMPTY, 0);
     }
 
     #[test]
@@ -2887,6 +2899,7 @@ mod tests {
         assert_eq!(cd.read8(BASE + 1), cd.stat_byte());
         assert_eq!(cd.read8(BASE + 1), 0x00);
         assert_eq!(cd.read8(BASE + 1), 0x02);
+        assert_eq!(cd.read8(BASE + 1), 0x00);
         cd.irq_flag = 0;
 
         cd.cmd_get_td(&[0x00]);
@@ -2894,6 +2907,7 @@ mod tests {
         assert_eq!(cd.read8(BASE + 1), cd.stat_byte());
         assert_eq!(cd.read8(BASE + 1), 0x00);
         assert_eq!(cd.read8(BASE + 1), 0x02);
+        assert_eq!(cd.read8(BASE + 1), 0x00);
     }
 
     #[test]

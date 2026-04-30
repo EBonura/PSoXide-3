@@ -45,7 +45,7 @@ pub struct Graphics {
     display_texture: wgpu::Texture,
     /// Egui-side handle for the 24bpp display fallback texture.
     display_texture_id: egui::TextureId,
-    /// Hardware renderer — issues per-primitive wgpu draw calls
+    /// Hardware renderer -- issues per-primitive wgpu draw calls
     /// from the frame's `cmd_log` into a VRAM-shaped texture. Both
     /// Native and Window framebuffer modes use this path; the only
     /// difference is the internal resolution multiplier. 24bpp video
@@ -142,7 +142,7 @@ impl Graphics {
         let hw_renderer = HwRenderer::new(device.clone(), queue.clone(), &mut egui_renderer);
         let mut editor_hw_renderer =
             HwRenderer::new(device.clone(), queue.clone(), &mut egui_renderer);
-        // Higher internal scale for the editor preview — the game's
+        // Higher internal scale for the editor preview -- the game's
         // renderer follows user/scale-mode preference, but the editor
         // viewport is always overlay-friendly host resolution.
         editor_hw_renderer.set_internal_scale(2, Some(&mut egui_renderer));
@@ -196,7 +196,7 @@ impl Graphics {
     /// Phase 1: walks the editor project's first Room, projects each
     /// floor through the host GTE shim, and feeds the resulting
     /// `TriFlat` packets to the renderer. The path is intentionally
-    /// the same one PS1 runtime code follows — only the final DMA
+    /// the same one PS1 runtime code follows -- only the final DMA
     /// step is replaced by `build_cmd_log` + `render_frame`.
     #[allow(clippy::too_many_arguments)]
     pub fn render_editor_preview(
@@ -271,7 +271,7 @@ impl Graphics {
 
     /// Upload a full VRAM snapshot to the GPU-side texture. Called once
     /// per frame from `App` before `render`. `None` means "no Bus yet"
-    /// — we leave the last texture contents alone (typically zeros).
+    /// -- we leave the last texture contents alone (typically zeros).
     pub fn prepare_vram(&self, vram: Option<&Vram>) {
         let Some(vram) = vram else {
             return;

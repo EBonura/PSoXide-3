@@ -1,5 +1,5 @@
 //! Find the first step where our tick diverges from Redux's *while
-//! pc/instr/gprs still match* — a pure cycle-accounting bug (our CPU
+//! pc/instr/gprs still match* -- a pure cycle-accounting bug (our CPU
 //! ran the same code but charged a different number of cycles).
 //! Those are the most actionable signals; a divergence accompanied
 //! by register changes is downstream of an earlier cycle bug.

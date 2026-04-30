@@ -1,4 +1,4 @@
-//! `hello-audio` — the audio equivalent of hello-input.
+//! `hello-audio` -- the audio equivalent of hello-input.
 //!
 //! Four face buttons trigger four SPU voices, each playing a
 //! different built-in [`psx_spu::tones`] waveform at a different
@@ -32,12 +32,12 @@ use psx_pad::{button, poll_port1, ButtonState};
 use psx_spu::{self as spu, tones, Adsr, Pitch, SpuAddr, Voice, Volume};
 use psx_vram::{Clut, TexDepth, Tpage};
 
-/// Font atlas tpage — past the 320-wide display buffers.
+/// Font atlas tpage -- past the 320-wide display buffers.
 const FONT_TPAGE: Tpage = Tpage::new(320, 0, TexDepth::Bit4);
 const FONT_CLUT: Clut = Clut::new(320, 256);
 
 /// SPU RAM addresses for each tone. Each tone is 16 bytes (one
-/// ADPCM block). We park them starting at 0x1010 — the BIOS
+/// ADPCM block). We park them starting at 0x1010 -- the BIOS
 /// convention is to leave 0x0000..0x1000 for system use, with the
 /// required "zero" block at 0x1000. We skip past that.
 const SPU_ADDR_SINE: SpuAddr = SpuAddr::new(0x1010);
@@ -114,7 +114,7 @@ fn main() {
     let font = FontAtlas::upload(&BASIC, FONT_TPAGE, FONT_CLUT);
 
     // Edge-detect pad state so we only key_on / key_off on transitions
-    // — otherwise we'd retrigger the attack phase every frame, which
+    // -- otherwise we'd retrigger the attack phase every frame, which
     // sounds like a constant click.
     let mut prev_pad = ButtonState::NONE;
 
@@ -146,7 +146,7 @@ fn main() {
         }
         prev_pad = pad;
 
-        // Visual feedback — tint the background with the sum of
+        // Visual feedback -- tint the background with the sum of
         // currently-active channel colours for a low-effort "you
         // can see what you hear" cue.
         let (r, g, b) = mix_background(pad);

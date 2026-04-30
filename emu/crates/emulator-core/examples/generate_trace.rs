@@ -1,6 +1,6 @@
 //! One-shot generator for a long Redux BIOS trace, written to the
 //! parity cache in streaming mode so we never hold the full `Vec`
-//! in RAM. A 100 M-record trace is ~14 GiB — this example streams
+//! in RAM. A 100 M-record trace is ~14 GiB -- this example streams
 //! each record from Redux's stdout directly into the cache file.
 //!
 //! Usage:

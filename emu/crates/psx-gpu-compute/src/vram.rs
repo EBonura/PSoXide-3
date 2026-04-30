@@ -60,7 +60,7 @@ pub enum VramGpuError {
 pub struct VramGpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    /// `[u32; 1024 * 512]` — one PS1 pixel per element, low 16 bits.
+    /// `[u32; 1024 * 512]` -- one PS1 pixel per element, low 16 bits.
     buffer: wgpu::Buffer,
 }
 
@@ -72,7 +72,7 @@ impl VramGpu {
             label: Some("psx-vram"),
             size: VRAM_BYTES,
             // STORAGE so compute shaders can bind it; COPY_DST/SRC for
-            // rect upload/download. Initialized lazily — first write
+            // rect upload/download. Initialized lazily -- first write
             // is the upload itself.
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
@@ -80,7 +80,7 @@ impl VramGpu {
             mapped_at_creation: false,
         });
         // wgpu doesn't guarantee the contents of a freshly created
-        // buffer — explicitly clear so `download_full()` reads zeros.
+        // buffer -- explicitly clear so `download_full()` reads zeros.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("psx-vram-init-clear"),
         });
@@ -138,7 +138,7 @@ impl VramGpu {
     }
 
     /// Upload a sub-rectangle. `words.len()` must be exactly `w * h`.
-    /// Out-of-bounds rects are rejected (no wrap — the rasterizer
+    /// Out-of-bounds rects are rejected (no wrap -- the rasterizer
     /// handles wrap separately on the GPU side).
     pub fn upload_rect(
         &self,
@@ -166,7 +166,7 @@ impl VramGpu {
             row_words.clear();
             let src_off = (row as usize) * (w as usize);
             for &px in &words[src_off..src_off + w as usize] {
-                // Zero-extend the 16-bit pixel into a u32 — high bits
+                // Zero-extend the 16-bit pixel into a u32 -- high bits
                 // reserved for the rasterizer (ordering tags, etc).
                 row_words.push(px as u32);
             }
@@ -179,7 +179,7 @@ impl VramGpu {
     }
 
     /// Read the entire VRAM back as `Vec<u16>` (524288 entries,
-    /// row-major). Blocks the calling thread on a `map_async` poll —
+    /// row-major). Blocks the calling thread on a `map_async` poll --
     /// for tests/screenshots only, never per-frame in the frontend.
     pub fn download_full(&self) -> Result<Vec<u16>, VramGpuError> {
         self.download_rect(0, 0, VRAM_WIDTH, VRAM_HEIGHT)
@@ -190,7 +190,7 @@ impl VramGpu {
         check_rect(x, y, w, h)?;
 
         // Copy the requested rect (one row at a time) into a packed
-        // staging buffer. Buffer copies don't need row alignment —
+        // staging buffer. Buffer copies don't need row alignment --
         // simpler than the texture-staging path, and we control the
         // layout end-to-end.
         let row_bytes = (w as u64) * 4;
@@ -215,7 +215,7 @@ impl VramGpu {
         }
         self.queue.submit(Some(encoder.finish()));
 
-        // Synchronous map — `pollster` drives the GPU until the
+        // Synchronous map -- `pollster` drives the GPU until the
         // mapping callback fires.
         let slice = staging.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -245,7 +245,7 @@ impl VramGpu {
     }
 
     /// Reset VRAM to all zeros (matches CPU `Vram::new`). Done on the
-    /// GPU side via `clear_buffer` — no host roundtrip.
+    /// GPU side via `clear_buffer` -- no host roundtrip.
     pub fn clear(&self) {
         let mut encoder = self
             .device
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn narrow_column_round_trips() {
-        // A 1×N download is the most stride-sensitive case — catches
+        // A 1×N download is the most stride-sensitive case -- catches
         // any off-by-one in the per-row copy_buffer_to_buffer loop.
         let g = fresh();
         let column: Vec<u16> = (0..VRAM_HEIGHT as u16).collect();
@@ -434,7 +434,7 @@ mod tests {
             g.upload_rect(x, y, 1, 1, &[state]).unwrap();
         }
         // Compare a selection of cells. Doing all 524288 would work
-        // but is overkill — the round-trip + partial tests already
+        // but is overkill -- the round-trip + partial tests already
         // pin layout/byte-order correctness; this just confirms that
         // the GPU mirrors the CPU's last-write-wins semantics.
         for (x, y) in [(0u32, 0u32), (511, 256), (1023, 511), (777, 333)] {

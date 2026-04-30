@@ -1,4 +1,4 @@
-//! MDEC — Motion Decoder. Hardware MPEG-ish macroblock decoder.
+//! MDEC -- Motion Decoder. Hardware MPEG-ish macroblock decoder.
 //!
 //! Games use the MDEC to play back pre-compressed FMV (cutscenes,
 //! intros, attract-mode loops). The pipeline is:
@@ -10,7 +10,7 @@
 //! 4. MDEC dequantizes, IDCT's, and YUV→RGB converts each macroblock
 //!    into either 15-bit or 24-bit pixel output.
 //! 5. CPU pulls decoded pixels out via DMA1 (MDEC→CPU, channel 1),
-//!    which streams 256 pixels (16×16) per macroblock into RAM —
+//!    which streams 256 pixels (16×16) per macroblock into RAM --
 //!    typically destined for VRAM via a follow-up GPU draw.
 //!
 //! Reference implementations consulted:
@@ -26,7 +26,7 @@
 //!   0x1F80_1824 R/W : status read / control write
 //! ```
 //!
-//! The CPU never pokes RLE data through the FIFO directly — it always
+//! The CPU never pokes RLE data through the FIFO directly -- it always
 //! goes through DMA0 for speed (at typical FMV rates the CPU would spend
 //! all its time shipping data otherwise). We expose `dma_write_in` +
 //! `dma_read_out` entry points for the bus to call on DMA channel 0 /
@@ -50,7 +50,7 @@ pub const MDEC_CTRL_STAT: u32 = 0x1F80_1824;
 //   25     : (cmd 3 only) set bit 15 on 15-bit output pixels
 //   15..0  : parameter count (words) for the command
 
-/// Command 0x3 STP flag — sets the 15-bit mask bit (bit 15 of each RGB word).
+/// Command 0x3 STP flag -- sets the 15-bit mask bit (bit 15 of each RGB word).
 const MDEC0_STP: u32 = 0x0200_0000;
 /// Command 0x3 RGB24 flag name follows Redux: set selects 15-bit, clear selects 24-bit.
 const MDEC0_RGB24: u32 = 0x0800_0000;
@@ -80,7 +80,7 @@ const MDEC1_RESET: u32 = 0x8000_0000;
 /// Data-Out FIFO Empty bit.
 #[allow(dead_code)]
 const MDEC1_EMPTY: u32 = 0x8000_0000;
-/// Command Busy bit — set while a decode is in progress.
+/// Command Busy bit -- set while a decode is in progress.
 #[allow(dead_code)]
 const MDEC1_COMMAND_BUSY: u32 = 0x2000_0000;
 /// Data-Out Request via DMA1.
@@ -99,7 +99,7 @@ const MDEC1_OUTPUT_BIT15: u32 = 0x0080_0000;
 /// End-of-data sentinel in an RLE coefficient stream.
 const MDEC_END_OF_DATA: u16 = 0xFE00;
 
-/// Block size constants — 8×8 DCT blocks, 6 blocks per macroblock
+/// Block size constants -- 8×8 DCT blocks, 6 blocks per macroblock
 /// (Cb, Cr, Y1, Y2, Y3, Y4).
 const DSIZE: usize = 8;
 const DSIZE2: usize = DSIZE * DSIZE;
@@ -117,7 +117,7 @@ const AAN_PRESCALE_SIZE: i32 = 20;
 const AAN_PRESCALE_SCALE: i32 = AAN_PRESCALE_SIZE - AAN_PRESCALE_BITS;
 const AAN_EXTRA: i32 = 12;
 
-/// `SCALER(x, n) = ((x) + ((1 << n) >> 1)) >> n` — rounded divide by 2^n.
+/// `SCALER(x, n) = ((x) + ((1 << n) >> 1)) >> n` -- rounded divide by 2^n.
 #[inline]
 fn scaler(x: i32, n: i32) -> i32 {
     (x + ((1 << n) >> 1)) >> n
@@ -147,7 +147,7 @@ fn fix_2_613125930() -> i32 {
     scaler(43_840_978, AAN_CONST_SCALE)
 }
 
-/// Zig-zag scan order — maps sequential coefficient index (0..63) to
+/// Zig-zag scan order -- maps sequential coefficient index (0..63) to
 /// the position in the 8×8 block where it belongs. RLE-encoded
 /// coefficients stream in this order; the decoder sprays them out of
 /// zigzag into row-major before IDCT.
@@ -173,11 +173,11 @@ const AAN_SCALES: [i32; DSIZE2] = [
 /// bus decide whether a DMA trigger should fire right now or wait.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MdecState {
-    /// Idle — ready for a new command.
+    /// Idle -- ready for a new command.
     Idle,
     /// Accepting parameter / RLE words through DMA0.
     AwaitingData,
-    /// Decoding — output pixels are available via DMA1.
+    /// Decoding -- output pixels are available via DMA1.
     DecodeReady,
 }
 
@@ -201,7 +201,7 @@ pub struct Mdec {
     /// Buffered RLE halfwords received via DMA0 since the decode
     /// command was issued. Drained during decode_macroblocks.
     rl_queue: std::collections::VecDeque<u16>,
-    /// Decoded pixel output queue — ready for DMA1 to pull. Format
+    /// Decoded pixel output queue -- ready for DMA1 to pull. Format
     /// depends on `MDEC0_RGB24`: 16-bit halfwords for 15-bit output,
     /// packed 8-bit bytes for 24-bit output. We always queue as
     /// halfwords and let the read path reinterpret.
@@ -217,9 +217,9 @@ pub struct Mdec {
     commands_seen: u64,
     /// Diagnostic: raw parameter-data words seen since reset.
     params_seen: u64,
-    /// Enable DMA0 (data-in) — bit 30 of the last control write.
+    /// Enable DMA0 (data-in) -- bit 30 of the last control write.
     dma_in_enabled: bool,
-    /// Enable DMA1 (data-out) — bit 29 of the last control write.
+    /// Enable DMA1 (data-out) -- bit 29 of the last control write.
     dma_out_enabled: bool,
     /// Diagnostic: total macroblocks decoded since reset.
     macroblocks_decoded: u64,
@@ -277,7 +277,7 @@ impl Mdec {
         }
     }
 
-    /// Called by the bus for DMA channel 0 transfers — CPU→MDEC.
+    /// Called by the bus for DMA channel 0 transfers -- CPU→MDEC.
     /// Each word becomes two halfwords in little-endian order.
     pub fn dma_write_in(&mut self, words: &[u32]) {
         self.params_seen = self.params_seen.saturating_add(words.len() as u64);
@@ -304,7 +304,7 @@ impl Mdec {
         }
     }
 
-    /// Called by the bus for DMA channel 1 transfers — MDEC→CPU.
+    /// Called by the bus for DMA channel 1 transfers -- MDEC→CPU.
     /// Fills `out` with decoded pixel words.
     pub fn dma_read_out(&mut self, out: &mut [u32]) {
         for slot in out {
@@ -336,7 +336,7 @@ impl Mdec {
         false
     }
 
-    /// Current coarse state — diagnostic, for UI display / debug.
+    /// Current coarse state -- diagnostic, for UI display / debug.
     pub fn state(&self) -> MdecState {
         if !self.out_queue.is_empty() {
             MdecState::DecodeReady
@@ -357,17 +357,17 @@ impl Mdec {
         self.dma_out_enabled
     }
 
-    /// Diagnostic — total command words the CPU has shipped.
+    /// Diagnostic -- total command words the CPU has shipped.
     pub fn commands_seen(&self) -> u64 {
         self.commands_seen
     }
 
-    /// Diagnostic — total parameter words seen.
+    /// Diagnostic -- total parameter words seen.
     pub fn params_seen(&self) -> u64 {
         self.params_seen
     }
 
-    /// Diagnostic — total macroblocks fully decoded since reset.
+    /// Diagnostic -- total macroblocks fully decoded since reset.
     pub fn macroblocks_decoded(&self) -> u64 {
         self.macroblocks_decoded
     }
@@ -432,7 +432,7 @@ impl Mdec {
         // codes (3, 4, 6). If we're awaiting parameter data, treat the
         // word as two RLE halfwords instead.
         if self.reg1 & MDEC1_BUSY == 0 {
-            // Not decoding — this might be a fresh command or
+            // Not decoding -- this might be a fresh command or
             // quantization-table payload depending on the command.
             let cmd = (value >> 28) & 0xF;
             match cmd {
@@ -457,7 +457,7 @@ impl Mdec {
                     self.rl_queue.clear();
                 }
                 0x4 => {
-                    // Quantization table upload — 128 bytes (64 Y + 64 UV)
+                    // Quantization table upload -- 128 bytes (64 Y + 64 UV)
                     // streamed in as 32 parameter words (4 bytes per word).
                     self.reg0 = value;
                     self.reg1 |= MDEC1_BUSY;
@@ -466,7 +466,7 @@ impl Mdec {
                     self.rl_queue.clear();
                 }
                 0x6 => {
-                    // Cosine table upload — 32 parameter words.
+                    // Cosine table upload -- 32 parameter words.
                     // The MDEC doesn't actually use a host-supplied
                     // cosine table; we accept the upload and discard.
                     self.reg0 = value;
@@ -484,12 +484,12 @@ impl Mdec {
             return;
         }
 
-        // Busy — this word is parameter / RLE data.
+        // Busy -- this word is parameter / RLE data.
         self.params_seen = self.params_seen.saturating_add(1);
         let cmd = self.command_code();
         match cmd {
             0x3 => {
-                // RLE coefficient data — two halfwords per word.
+                // RLE coefficient data -- two halfwords per word.
                 self.rl_queue.push_back(value as u16);
                 self.rl_queue.push_back((value >> 16) as u16);
                 // Check if we have enough to decode a macroblock (8 KiB
@@ -504,7 +504,7 @@ impl Mdec {
                 }
             }
             0x4 => {
-                // Quantization table upload — 64 Y bytes then 64 UV bytes.
+                // Quantization table upload -- 64 Y bytes then 64 UV bytes.
                 // 32 words × 4 bytes = 128 bytes total.
                 self.absorb_quant_word(value);
                 if self.expected_param_words > 0 {
@@ -515,7 +515,7 @@ impl Mdec {
                 }
             }
             0x6 if self.expected_param_words > 0 => {
-                // Cosine table — discard.
+                // Cosine table -- discard.
                 self.expected_param_words -= 1;
                 if self.expected_param_words == 0 {
                     self.reg1 &= !MDEC1_BUSY;
@@ -527,7 +527,7 @@ impl Mdec {
 
     fn control_write(&mut self, value: u32) {
         if value & MDEC1_RESET != 0 {
-            // Reset — clears state but preserves quantization tables
+            // Reset -- clears state but preserves quantization tables
             // per PSX-SPX (they're written via command 0x4 and need
             // to survive MDEC resets so games don't re-upload).
             self.reg0 = 0;
@@ -643,7 +643,7 @@ impl Mdec {
         let mask_bit_15 = self.reg0 & MDEC0_STP != 0;
 
         if rgb24 {
-            // 24-bit (RGB888) — 16×16 pixels × 3 bytes = 768 bytes = 384 halfwords.
+            // 24-bit (RGB888) -- 16×16 pixels × 3 bytes = 768 bytes = 384 halfwords.
             let mut image = [0u8; 16 * 16 * 3];
             yuv_to_rgb24(&mut image, cr, cb, y_blocks);
             // Pack bytes into halfwords little-endian: [b0|b1], [b2|b3], ...
@@ -653,7 +653,7 @@ impl Mdec {
                 self.out_queue.push_back(lo | (hi << 8));
             }
         } else {
-            // 15-bit (RGB555) — 16×16 pixels × 2 bytes = 512 bytes = 256 halfwords.
+            // 15-bit (RGB555) -- 16×16 pixels × 2 bytes = 512 bytes = 256 halfwords.
             let mut image = [0u16; 16 * 16];
             yuv_to_rgb15(&mut image, cr, cb, y_blocks, mask_bit_15);
             for px in image {
@@ -703,7 +703,7 @@ fn decode_block(
         let run = rle_run(rl_word) as usize;
         k += run + 1;
         if k > 63 {
-            // Broken stream — bail gracefully.
+            // Broken stream -- bail gracefully.
             break;
         }
         let pos = ZIG_ZAG_SCAN[k];
@@ -714,7 +714,7 @@ fn decode_block(
         }
     }
     if k == 0 {
-        // Only DC coefficient — fill the block uniformly.
+        // Only DC coefficient -- fill the block uniformly.
         idct(block, -1);
     } else {
         idct(block, used_col);
@@ -751,7 +751,7 @@ fn idct(block: &mut [i32; DSIZE2], used_col: i32) {
     // Column pass.
     for i in 0..DSIZE {
         if used_col & (1 << i) == 0 {
-            // Column either empty or has only DC — splat DC down.
+            // Column either empty or has only DC -- splat DC down.
             if block[i] != 0 {
                 fill_col(block, i, block[i]);
             }
@@ -920,7 +920,7 @@ fn yuv_to_rgb15(
     let mask = if mask_bit_15 { 0x8000 } else { 0 };
     // 16×16 output split into 4 quadrants of 8×8:
     //   top-left = Y1, top-right = Y2, bottom-left = Y3, bottom-right = Y4
-    // Cb/Cr are 8×8 for the entire macroblock — each pixel of Cb/Cr
+    // Cb/Cr are 8×8 for the entire macroblock -- each pixel of Cb/Cr
     // corresponds to a 2×2 block of Y pixels.
     for qy in 0..2 {
         for qx in 0..2 {
@@ -1054,7 +1054,7 @@ mod tests {
     #[test]
     fn data_write_tallies_commands_vs_parameters() {
         let mut m = Mdec::new();
-        // Quant table upload command — 32 param words expected.
+        // Quant table upload command -- 32 param words expected.
         m.write32(MDEC_CMD_DATA, 0x4000_0020);
         assert_eq!(m.commands_seen(), 1);
         // DMA0 carries the payload after the command register is latched.
@@ -1080,7 +1080,7 @@ mod tests {
         // (but all-zero) output.
         m.write32(MDEC_CMD_DATA, 0x4000_0020);
         m.dma_write_in(&[0x01_01_01_01; 32]);
-        // Issue decode command — tiny parameter count.
+        // Issue decode command -- tiny parameter count.
         m.write32(MDEC_CMD_DATA, 0x3000_0001);
         // Feed a single word holding two END-of-data sentinels.
         let sentinel = MDEC_END_OF_DATA as u32;

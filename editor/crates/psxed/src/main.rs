@@ -1,4 +1,4 @@
-//! `psxed` — PSoXide content-pipeline CLI.
+//! `psxed` -- PSoXide content-pipeline CLI.
 //!
 //! Cooks source assets into the compact binary formats the PS1
 //! runtime consumes via `include_bytes!`. Invoked by hand, by a
@@ -6,7 +6,7 @@
 //!
 //! # Subcommands
 //!
-//! ## `obj` — Wavefront OBJ → `.psxm`
+//! ## `obj` -- Wavefront OBJ → `.psxm`
 //!
 //! ```bash
 //! psxed obj SRC.obj -o DST.psxm [options]
@@ -18,7 +18,7 @@
 //!   --compute-normals   Add per-vertex normals for lit rendering.
 //! ```
 //!
-//! ## `glb` — glTF/GLB → `.psxm`
+//! ## `glb` -- glTF/GLB → `.psxm`
 //!
 //! ```bash
 //! psxed glb SRC.glb -o DST.psxm [options]
@@ -31,7 +31,7 @@
 //!   --no-material-colors    Ignore glTF material base colours and use palette cycling.
 //! ```
 //!
-//! ## `glb-model` — skinned glTF/GLB → `.psxmdl` + `.psxanim` + `.psxt`
+//! ## `glb-model` -- skinned glTF/GLB → `.psxmdl` + `.psxanim` + `.psxt`
 //!
 //! ```bash
 //! psxed glb-model SRC.glb --out-dir assets/models/name --name name [options]
@@ -43,7 +43,7 @@
 //!   --world-height N      Suggested engine/world height (default 1024).
 //! ```
 //!
-//! ## `tex` — PNG/JPG → `.psxt`
+//! ## `tex` -- PNG/JPG → `.psxt`
 //!
 //! ```bash
 //! psxed tex SRC.{png,jpg,bmp} -o DST.psxt [options]
@@ -57,9 +57,9 @@
 //!
 //! ## Future subcommands
 //!
-//! - `vag`   — WAV → PSX VAG ADPCM audio
-//! - `font`  — TTF or bitmap → psx-font atlas
-//! - `scene` — edit a .pscene JSON and cook it into runtime format
+//! - `vag`   -- WAV → PSX VAG ADPCM audio
+//! - `font`  -- TTF or bitmap → psx-font atlas
+//! - `scene` -- edit a .pscene JSON and cook it into runtime format
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -91,7 +91,7 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "\
-psxed — PSoXide content pipeline
+psxed -- PSoXide content pipeline
 
 USAGE:
     psxed <subcommand> [arguments]

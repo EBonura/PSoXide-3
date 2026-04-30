@@ -1,4 +1,4 @@
-//! VRAM viewer — renders the full 1024×512 VRAM as an image panel.
+//! VRAM viewer -- renders the full 1024×512 VRAM as an image panel.
 //!
 //! The texture upload happens in `gfx::Graphics::prepare_vram`; this
 //! module is purely the egui layout that places the image inside a

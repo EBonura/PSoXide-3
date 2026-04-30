@@ -1,6 +1,6 @@
 # Frontend architecture
 
-The desktop frontend lives in [`emu/crates/frontend`](../emu/crates/frontend). It's a single-threaded wgpu + egui app that drives the emulator core directly — no `Arc<Mutex<_>>`, no message-passing, no separate render thread. The UI reads emulator state in place each frame.
+The desktop frontend lives in [`emu/crates/frontend`](../emu/crates/frontend). It's a single-threaded wgpu + egui app that drives the emulator core directly -- no `Arc<Mutex<_>>`, no message-passing, no separate render thread. The UI reads emulator state in place each frame.
 
 ## Why single-threaded?
 
@@ -17,19 +17,19 @@ Both prior attempts (`psoxide`, `PSoXide-2`) experimented with threaded architec
 | `egui-winit` | 0.31 | egui input from winit events |
 | `pollster` | 0.3 | Block-on for wgpu async setup |
 
-These are pinned deliberately — both priors independently converged on this set, and any bump is a conscious decision, not drift.
+These are pinned deliberately -- both priors independently converged on this set, and any bump is a conscious decision, not drift.
 
 ## Module layout
 
 ```text
 src/
 ├── main.rs           # winit ApplicationHandler shell, event dispatch, run loop
-├── app.rs            # AppState — emulator + UI state, no Arc/Mutex
-├── gfx.rs            # Graphics — wgpu surface + egui renderer + VRAM texture
+├── app.rs            # AppState -- emulator + UI state, no Arc/Mutex
+├── gfx.rs            # Graphics -- wgpu surface + egui renderer + VRAM texture
 ├── theme.rs          # charcoal/teal palette, VT323 + Lucide fonts, section helpers
 ├── icons.rs          # Lucide codepoint constants
 └── ui/
-    ├── mod.rs        # draw_layout — composes panels in layer order
+    ├── mod.rs        # draw_layout -- composes panels in layer order
     ├── registers.rs  # CPU + COP0 + history + breakpoints side panel
     ├── memory.rs     # hex+ASCII viewer, quick-jump, BP toggle
     ├── profiler.rs   # rolling frame-time breakdown + stderr summaries
@@ -40,13 +40,13 @@ src/
 
 ## Layer order, outside-in
 
-1. **Central panel** — the future PS1 framebuffer. Currently placeholder text.
+1. **Central panel** -- the future PS1 framebuffer. Currently placeholder text.
 2. **Register side panel** (left, `egui::SidePanel::left`).
 3. **Memory side panel** (right, `egui::SidePanel::right`, hidden by default).
 4. **VRAM bottom panel** (`egui::TopBottomPanel::bottom`).
 5. **Profiler window** (`egui::Window`, hidden by default).
-6. **Menu overlay** on `egui::Order::Middle` — dims background, slides animated category icons.
-7. **HUD bar** on `egui::Order::Foreground` — always on top, above Menu.
+6. **Menu overlay** on `egui::Order::Middle` -- dims background, slides animated category icons.
+7. **HUD bar** on `egui::Order::Foreground` -- always on top, above Menu.
 
 Each panel is its own module, so adding a new one is about 150 lines and touching `ui/mod.rs`' layout-orchestration function.
 
@@ -74,7 +74,7 @@ Key pattern: `run_frame` destructures `state` so `state.bus`, `state.cpu`, and `
 
 `Graphics` owns a persistent `wgpu::Texture` (1024×512, `Rgba8UnormSrgb`, `TEXTURE_BINDING | COPY_DST`) registered with the egui-wgpu renderer as a native texture once at startup. Every frame, `prepare_vram` decodes the 16bpp VRAM into an RGBA8 scratch buffer (full-range `(v<<3)|(v>>2)` expansion, not the naive `v<<3` that loses 8% of white brightness) and `queue.write_texture`s it onto the persistent target.
 
-The VRAM panel then renders the single `egui::Image` referencing this texture — all three panels (game view, VRAM view, and future framebuffer clip) will eventually share the same upload by differing only in their `uv` rect.
+The VRAM panel then renders the single `egui::Image` referencing this texture -- all three panels (game view, VRAM view, and future framebuffer clip) will eventually share the same upload by differing only in their `uv` rect.
 
 ## Frame profiler
 
@@ -95,7 +95,7 @@ cadence.
 
 ## Menu mechanics
 
-Ported from `psoxide-1`'s `menu.rs`, trimmed to three categories (Game / Debug / System) plus infrastructure for expansion. Drawn entirely through `egui::Painter` on a middle layer — no high-level widgets — which keeps it snappy and position-locked.
+Ported from `psoxide-1`'s `menu.rs`, trimmed to three categories (Game / Debug / System) plus infrastructure for expansion. Drawn entirely through `egui::Painter` on a middle layer -- no high-level widgets -- which keeps it snappy and position-locked.
 
 - `anim_x` interpolates toward `target_x` at `10/dt`, yielding the signature horizontal slide.
 - Selection uses a 3-pixel accent-color bar on the left edge of the item rect.
@@ -124,7 +124,7 @@ The frontend is designed to double as a live debugger:
 
 - **No gamepad**. Lands with the controller subsystem (SIO0).
 - **No audio output**. Lands with SPU voice playback.
-- **No framebuffer display**. Lands with the GPU rasterizer — the central panel stays placeholder until then.
+- **No framebuffer display**. Lands with the GPU rasterizer -- the central panel stays placeholder until then.
 - **No save states**. Will require a serializable-state contract across all subsystems.
 
 All of these are part of the canary ladder's later milestones; the frontend scaffolding is in place to slot them in when they land.

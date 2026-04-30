@@ -14,7 +14,7 @@ use crate::{
     WorldSurfaceOptions, WorldVertex,
 };
 
-/// Floor / ceiling split id for the standard NW→SE diagonal —
+/// Floor / ceiling split id for the standard NW→SE diagonal --
 /// the value the cooker stamps when no rotation has been
 /// authored. Mirrors `psxed_format::world::split::NORTH_WEST_SOUTH_EAST`.
 /// Used by tests to spell the split id explicitly; runtime
@@ -29,13 +29,13 @@ const SPLIT_NE_SW: u8 = 1;
 /// Texture-page-relative tile size used by the helper. v1 records
 /// don't carry per-face UV info, so floors / ceilings / walls
 /// all UV-tile a single 64×64 patch over the quad. Per-face UVs
-/// would land alongside the future compact material table — see
+/// would land alongside the future compact material table -- see
 /// `docs/world-format-roadmap.md`.
 const TILE_UV: u8 = 64;
 
 /// Direction id for the north edge.
 ///
-/// Mirrors `psxed_format::world::direction::NORTH` — kept inline
+/// Mirrors `psxed_format::world::direction::NORTH` -- kept inline
 /// so `psx-engine` doesn't need a direct `psxed-format` dep
 /// (it already reaches the format via `psx-asset`, but adding
 /// the direct dep just for four byte constants is overkill).
@@ -53,13 +53,13 @@ const WALL_UVS: [(u8, u8); 4] = [(0, TILE_UV), (TILE_UV, TILE_UV), (TILE_UV, 0),
 /// `materials` is indexed by the slot ids returned from
 /// [`SectorRender::floor_material`], [`SectorRender::ceiling_material`]
 /// and [`WallRender::material`]. A face whose slot points past the
-/// table is dropped silently — friendlier than a panic while the
+/// table is dropped silently -- friendlier than a panic while the
 /// author is mid-iteration with partially-assigned materials.
 ///
 /// Cells are corner-rooted at world `(0, 0)`: cell `(sx, sz)`
 /// occupies `x ∈ [sx*S, (sx+1)*S]`, `z ∈ [sz*S, (sz+1)*S]`.
-/// Position the camera target at the room's centre — typically
-/// `(W*S/2, 0, D*S/2)` — so the orbit lands on the geometry.
+/// Position the camera target at the room's centre -- typically
+/// `(W*S/2, 0, D*S/2)` -- so the orbit lands on the geometry.
 ///
 /// `options` carries the depth band + range; the helper flips
 /// only `cull_mode` per face kind: floors and ceilings use
@@ -73,9 +73,9 @@ const WALL_UVS: [(u8, u8); 4] = [(0, TILE_UV), (TILE_UV, TILE_UV), (TILE_UV, 0),
 /// so corner positions and UVs must agree on what `0`, `1`, `2`,
 /// `3` mean.
 ///
-/// * **Floors / ceilings** — `[NW, NE, SE, SW]`. UVs match in the
+/// * **Floors / ceilings** -- `[NW, NE, SE, SW]`. UVs match in the
 ///   same order: `[(0,0), (T,0), (T,T), (0,T)]`.
-/// * **Walls** — `[bottom-left, bottom-right, top-right, top-left]`,
+/// * **Walls** -- `[bottom-left, bottom-right, top-right, top-left]`,
 ///   measured from inside the cell looking at the wall. UVs match:
 ///   `[(0,T), (T,T), (T,0), (0,0)]`.
 ///
@@ -200,7 +200,7 @@ fn emit_floor<const OT: usize>(
 }
 
 /// Emit one ceiling quad. Same `[NW, NE, SE, SW]` height order
-/// as the floor — culling is left off so the inward face draws
+/// as the floor -- culling is left off so the inward face draws
 /// regardless of winding orientation. Once the cooker emits
 /// inward-facing winding consistently, this can flip to
 /// `CullMode::Back` for free.
@@ -239,7 +239,7 @@ fn emit_ceiling<const OT: usize>(
 
 /// Emit one wall quad. Wall heights `[BL, BR, TR, TL]` map onto
 /// the cell's edge endpoints by direction. Diagonal directions
-/// (4 / 5) silently drop — the cooker rejects them, so they
+/// (4 / 5) silently drop -- the cooker rejects them, so they
 /// shouldn't appear, but skipping is cheaper than panicking.
 #[allow(clippy::too_many_arguments)]
 fn emit_wall<const OT: usize>(
@@ -320,7 +320,7 @@ fn submit_quad<const OT: usize>(
 /// keeps the standard NW→SE diagonal; `split == 1` flips to
 /// NE→SW. UVs are kept in the same `[NW, NE, SE, SW]` slot
 /// order as the input verts, so the texture orientation
-/// doesn't change with the diagonal — only the triangulation
+/// doesn't change with the diagonal -- only the triangulation
 /// boundary moves.
 #[allow(clippy::too_many_arguments)]
 fn submit_split_quad<const OT: usize>(
@@ -335,7 +335,7 @@ fn submit_split_quad<const OT: usize>(
     world: &mut WorldRenderPass<'_, '_, OT>,
 ) {
     if split != SPLIT_NE_SW {
-        // Standard split shares the existing helper — same
+        // Standard split shares the existing helper -- same
         // triangulation `submit_textured_quad` always used.
         submit_quad(
             camera, options, cull, material, verts, uvs, triangles, world,
@@ -371,7 +371,7 @@ fn submit_split_quad<const OT: usize>(
 /// `[NW=0, NE=1, SE=2, SW=3]` convention every
 /// `[i32; 4]` heights array uses.
 ///
-/// Each entry is `(a, b, c)` — three corner indices producing
+/// Each entry is `(a, b, c)` -- three corner indices producing
 /// one of the two emitted triangles. Picking the boundary
 /// `1`/`3` (NE/SW) instead of `0`/`2` (NW/SE) splits the quad
 /// along the alternate diagonal.
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn split_zero_uses_nw_se_diagonal() {
-        // Standard split — both triangles meet at corners 0
+        // Standard split -- both triangles meet at corners 0
         // and 2, which is the diagonal `submit_textured_quad`
         // has always used.
         let triangles = split_triangles(SPLIT_NW_SE);
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn split_one_uses_ne_sw_diagonal() {
-        // Alternate split — the two triangles share corners
+        // Alternate split -- the two triangles share corners
         // 1 (NE) and 3 (SW), which is the perpendicular
         // diagonal. This is the case the prior renderer got
         // wrong: it used the NW→SE diagonal regardless of
@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn unknown_split_id_falls_back_to_nw_se() {
         // Future split-ids (e.g. quad subdivision) shouldn't
-        // empty the room — fall through to the standard
+        // empty the room -- fall through to the standard
         // diagonal so the user sees something while the
         // schema catches up.
         for unknown in [2u8, 3, 9, 200] {

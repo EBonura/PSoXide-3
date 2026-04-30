@@ -109,7 +109,7 @@ pub mod button {
     pub const SQUARE: u16 = 1 << 15;
 }
 
-/// One port on SIO0. Holds up to one pad **and** one memory card —
+/// One port on SIO0. Holds up to one pad **and** one memory card --
 /// real hardware multiplexes them on the same port via different
 /// leading address bytes (`0x01` = talk to controller, `0x81` =
 /// talk to memory card). Both slots can be empty independently.
@@ -139,7 +139,7 @@ enum Selected {
 }
 
 impl PortDevice {
-    /// Build an empty port — no pad, no memcard.
+    /// Build an empty port -- no pad, no memcard.
     pub const fn empty() -> Self {
         Self {
             pad: None,
@@ -243,7 +243,7 @@ impl PortDevice {
         out
     }
 
-    /// Deselect (JOYN goes high) — every device drops back to idle
+    /// Deselect (JOYN goes high) -- every device drops back to idle
     /// and the port forgets which slot was active.
     pub fn deselect(&mut self) {
         if let Some(pad) = self.pad.as_mut() {
@@ -270,7 +270,7 @@ impl PortDevice {
         self.pad.as_ref()
     }
 
-    /// Mutable access to the attached pad — lets the frontend
+    /// Mutable access to the attached pad -- lets the frontend
     /// push analog-stick samples in each frame without going
     /// through the SIO protocol loop.
     pub fn pad_mut(&mut self) -> Option<&mut DigitalPad> {
@@ -341,7 +341,7 @@ impl Default for PortDevice {
     }
 }
 
-/// Default analog-stick reading — 0x80 (128) = centre, 0x00 = full
+/// Default analog-stick reading -- 0x80 (128) = centre, 0x00 = full
 /// negative, 0xFF = full positive. Matches real DualShock output.
 pub const STICK_CENTER: u8 = 0x80;
 
@@ -366,7 +366,7 @@ pub struct PollSnapshot {
 /// game runs the config-mode dance (`0x43` + `0x44` commands) to
 /// switch them to Analog. Games that expect specific analog
 /// responses (racers, souls-likes, most modern ports) rely on the
-/// mode transition working correctly — reporting Analog from the
+/// mode transition working correctly -- reporting Analog from the
 /// start confuses games that assume a Digital → Analog sequence.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PadMode {
@@ -383,7 +383,7 @@ pub enum PadMode {
     Config,
 }
 
-/// PS1 controller — digital by default, DualShock-capable. Tracks
+/// PS1 controller -- digital by default, DualShock-capable. Tracks
 /// the active operating mode, the 16 digital buttons, the four
 /// analog axes, and DualShock vibration state.
 pub struct DigitalPad {
@@ -401,7 +401,7 @@ pub struct DigitalPad {
     mode: PadMode,
     /// The mode we were in before entering config. On `0x43`+`0x00`
     /// (exit config) we restore this instead of defaulting back to
-    /// Digital — matters because a game can enter config from
+    /// Digital -- matters because a game can enter config from
     /// Analog mode to change rumble mapping and expects Analog to
     /// still be active on exit.
     mode_before_config: PadMode,
@@ -418,11 +418,11 @@ pub struct DigitalPad {
     /// `0x4D` in Config mode. Each entry maps a byte position in
     /// the `0x42` (poll) command's payload (steps 2..=7) to a
     /// motor:
-    /// - `0x00` → small motor (on/off — `0xFF` = on).
+    /// - `0x00` → small motor (on/off -- `0xFF` = on).
     /// - `0x01` → big motor (strength `0..=0xFF`).
     /// - `0xFF` → no motor at this position (default).
     ///
-    /// Default state is `[0xFF; 6]` — no motors mapped — matching
+    /// Default state is `[0xFF; 6]` -- no motors mapped -- matching
     /// a fresh DualShock before a game has configured rumble.
     motor_mapping: [u8; 6],
     /// Selector byte latched at step 2 for config-query commands
@@ -504,7 +504,7 @@ impl DigitalPad {
     /// Current vibration-motor state: `(small_on, big_strength)`.
     /// The frontend polls this once per frame to drive a host
     /// haptics device (gamepad rumble, phone vibrate, etc.).
-    /// Values are latched — they persist across polls — so a
+    /// Values are latched -- they persist across polls -- so a
     /// reader that samples less often than the game polls still
     /// sees the most recently-commanded state.
     pub fn motor_state(&self) -> (bool, u8) {
@@ -632,7 +632,7 @@ impl DigitalPad {
     }
 
     /// Process one byte of a transaction. Returns `(rx_byte,
-    /// ack_is_low)` — ACK stays low (true) for all bytes except the
+    /// ack_is_low)` -- ACK stays low (true) for all bytes except the
     /// final one of the transaction.
     fn exchange(&mut self, tx: u8) -> (u8, bool) {
         // Step 0: host sent the command byte (`0x42`, `0x43`,
@@ -685,7 +685,7 @@ impl DigitalPad {
                 PadMode::Analog | PadMode::Config => ANALOG_POLL_LAST,
             },
             0x43 | 0x44 | 0x45 | 0x46 | 0x47 | 0x4C | 0x4D => ANALOG_POLL_LAST,
-            // Unknown command — abort after the ID bytes (steps
+            // Unknown command -- abort after the ID bytes (steps
             // 0 + 1) have been exchanged.
             _ => 1,
         }
@@ -696,7 +696,7 @@ impl DigitalPad {
     /// Dispatches on `self.cmd`.
     fn payload_byte(&mut self, tx: u8) -> u8 {
         match self.cmd {
-            // 0x42 — standard button poll. 4 payload bytes in
+            // 0x42 -- standard button poll. 4 payload bytes in
             // Digital, 8 in Analog. `self.step` currently points at
             // the byte we're ABOUT to respond with (step 2 = buttons
             // group 1, step 3 = buttons group 2, etc).
@@ -712,7 +712,7 @@ impl DigitalPad {
                 self.poll_byte(self.step)
             }
 
-            // 0x43 — enter / exit config mode. Param at step 2:
+            // 0x43 -- enter / exit config mode. Param at step 2:
             //   0x01 → enter config (save prior mode first)
             //   0x00 → exit config (restore saved mode)
             // Remaining bytes are buttons (digital or analog shape
@@ -729,7 +729,7 @@ impl DigitalPad {
                 self.poll_byte(self.step)
             }
 
-            // 0x44 — set mode (only valid in Config). Param at step
+            // 0x44 -- set mode (only valid in Config). Param at step
             // 2 chooses Digital (0x00) or Analog (0x01). We record
             // the target into `mode_before_config` so the subsequent
             // `0x43`+`0x00` exit lands us in the right mode.
@@ -752,7 +752,7 @@ impl DigitalPad {
                 0x00
             }
 
-            // 0x45 — query current mode. Returns a 6-byte status
+            // 0x45 -- query current mode. Returns a 6-byte status
             // block. Games probe this to confirm the pad accepted a
             // mode switch.
             0x45 => match self.step {
@@ -765,10 +765,10 @@ impl DigitalPad {
                 _ => 0x00,
             },
 
-            // 0x4D — vibration-motor mapping. 6 param bytes at
+            // 0x4D -- vibration-motor mapping. 6 param bytes at
             // steps 2..=7 each assign a motor to its corresponding
             // 0x42-poll slot (see `motor_mapping` docs). The
-            // response is the PREVIOUS mapping byte at that slot —
+            // response is the PREVIOUS mapping byte at that slot --
             // games read the returned bytes to confirm their
             // mapping took effect.
             0x4D => {
@@ -782,7 +782,7 @@ impl DigitalPad {
                 }
             }
 
-            // 0x46 / 0x47 / 0x4C — DualShock config queries. Retail
+            // 0x46 / 0x47 / 0x4C -- DualShock config queries. Retail
             // games probe these exact constants during controller
             // bring-up; replying with zeroes makes the pad look
             // half-dead even though simple BIOS polls still work.
@@ -845,7 +845,7 @@ impl DigitalPad {
 
     /// Apply a rumble-control TX byte at the given step when a
     /// `0x42` poll is in progress. `step` is the same step index
-    /// the response path uses — values 2..=7 map to motor slots
+    /// the response path uses -- values 2..=7 map to motor slots
     /// 0..=5 (matching the 6 mapping bytes set by command 0x4D).
     fn apply_rumble_tx(&mut self, tx: u8, step: u8) {
         let slot = match step {
@@ -857,16 +857,16 @@ impl DigitalPad {
         }
         match self.motor_mapping[slot] {
             0x00 => {
-                // Small motor — binary on/off. Any value != 0xFF
+                // Small motor -- binary on/off. Any value != 0xFF
                 // means off; 0xFF means on. Redux matches this
                 // in `pad/controller.cc`.
                 self.motor_small = tx == 0xFF;
             }
             0x01 => {
-                // Big motor — strength directly from the byte.
+                // Big motor -- strength directly from the byte.
                 self.motor_big = tx;
             }
-            // Unmapped slot — ignore.
+            // Unmapped slot -- ignore.
             _ => {}
         }
     }
@@ -928,7 +928,7 @@ pub const MEMCARD_FRAME_SIZE: usize = 128;
 /// protocol state machine for the Read/Write/GetID commands the
 /// BIOS issues via SIO0.
 ///
-/// Game-specific persistence lives one level up (frontend side) —
+/// Game-specific persistence lives one level up (frontend side) --
 /// this struct just holds the live bytes and the "NEW" (never
 /// written) flag.
 pub struct MemoryCard {
@@ -990,7 +990,7 @@ enum MemcardReadState {
     /// Host sends frame MSB; we return zero.
     RxMsb,
     /// Host sends frame LSB; we return the MSB echo (hardware
-    /// quirk — once we have both halves we can compute the address).
+    /// quirk -- once we have both halves we can compute the address).
     RxLsb,
     /// Send the ACK-1 byte `0x5C`.
     SendAck1,
@@ -1038,7 +1038,7 @@ enum MemcardGetIdState {
 }
 
 impl MemoryCard {
-    /// Build a fresh memory card — all bytes `0x00`, "new" flag set.
+    /// Build a fresh memory card -- all bytes `0x00`, "new" flag set.
     pub fn new() -> Self {
         Self {
             bytes: Self::formatted_bytes(),
@@ -1088,7 +1088,7 @@ impl MemoryCard {
         bytes
     }
 
-    /// Build a memory card from an existing backing buffer —
+    /// Build a memory card from an existing backing buffer --
     /// typically the bytes loaded from disk. Panics if the buffer
     /// isn't exactly 128 KiB.
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
@@ -1140,7 +1140,7 @@ impl MemoryCard {
         self.spdr = 0xFF;
     }
 
-    /// Compute the flag byte — `0x08` when new, `0x00` once at
+    /// Compute the flag byte -- `0x08` when new, `0x00` once at
     /// least one successful write has cleared the flag.
     fn flag_byte(&self) -> u8 {
         if self.flag_new {
@@ -1175,17 +1175,17 @@ impl MemoryCard {
             }
             MemcardState::GotAddr => match tx {
                 0x52 => {
-                    // "R" — read.
+                    // "R" -- read.
                     self.state = MemcardState::Read(MemcardReadState::SendId1);
                     (0x5A, true)
                 }
                 0x57 => {
-                    // "W" — write.
+                    // "W" -- write.
                     self.state = MemcardState::Write(MemcardWriteState::SendId1);
                     (0x5A, true)
                 }
                 0x53 => {
-                    // "S" — get ID.
+                    // "S" -- get ID.
                     self.state = MemcardState::GetId(MemcardGetIdState::SendId1);
                     (0x5A, true)
                 }
@@ -1508,12 +1508,12 @@ mod tests {
         // Poll in analog mode.
         assert_eq!(pad.exchange(0x42), (0x73, true)); // analog ID
         assert_eq!(pad.exchange(0x00), (0x5A, true));
-        assert_eq!(pad.exchange(0x00).0, 0xFF); // buttons low — all released
-        assert_eq!(pad.exchange(0x00).0, 0xFF); // buttons high — all released
+        assert_eq!(pad.exchange(0x00).0, 0xFF); // buttons low -- all released
+        assert_eq!(pad.exchange(0x00).0, 0xFF); // buttons high -- all released
         assert_eq!(pad.exchange(0x00).0, 0x10); // right X
         assert_eq!(pad.exchange(0x00).0, 0x20); // right Y
         assert_eq!(pad.exchange(0x00).0, 0x30); // left X
-                                                // Last byte — no ack.
+                                                // Last byte -- no ack.
         assert_eq!(pad.exchange(0x00), (0x40, false));
     }
 
@@ -1698,9 +1698,9 @@ mod tests {
         // strength.
         assert_eq!(pad.exchange(0x42).0, 0x73);
         assert_eq!(pad.exchange(0x00).0, 0x5A);
-        // Payload step 2 — small motor slot. 0xFF turns it on.
+        // Payload step 2 -- small motor slot. 0xFF turns it on.
         let _ = pad.exchange(0xFF);
-        // Payload step 3 — big motor slot. 0x80 = half strength.
+        // Payload step 3 -- big motor slot. 0x80 = half strength.
         let _ = pad.exchange(0x80);
         // Consume remaining payload bytes.
         for _ in 4..=7 {

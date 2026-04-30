@@ -35,7 +35,7 @@ fn main() {
     // --- Capture Redux side ---
     // Redux accepts the disc via `-iso PATH`; OracleConfig threads it
     // through. Passing the same disc to both emulators is what
-    // unlocks milestone-D-plus parity (Crash, Tekken) — the old
+    // unlocks milestone-D-plus parity (Crash, Tekken) -- the old
     // "no-disc-only" restriction is dead.
     let lua = OracleConfig::default_lua_dir().join("oracle.lua");
     let mut config = OracleConfig::new(bios_path.clone(), lua).expect("Redux binary resolves");

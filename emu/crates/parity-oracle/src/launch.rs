@@ -2,11 +2,11 @@
 //!
 //! The harness owns three pipes into Redux:
 //!
-//! - **stdin** — the harness writes newline-terminated commands.
-//! - **stdout** — Redux's own log output *and* our protocol responses
+//! - **stdin** -- the harness writes newline-terminated commands.
+//! - **stdout** -- Redux's own log output *and* our protocol responses
 //!   share this stream; responses are distinguished by a `#PSX3:` line
 //!   prefix and pulled out by the drain thread.
-//! - **stderr** — captured to a rolling buffer for diagnosis.
+//! - **stderr** -- captured to a rolling buffer for diagnosis.
 //!
 //! The drain thread classifies every stdout line:
 //! - starts with `#PSX3:` → stripped and forwarded on the response channel
@@ -59,7 +59,7 @@ pub struct ReduxProcess {
 /// What a terminated process produced (for diagnostic reporting).
 #[derive(Debug, Clone)]
 pub struct Capture {
-    /// Exit code (`None` if killed by signal — the normal case for our SIGKILL).
+    /// Exit code (`None` if killed by signal -- the normal case for our SIGKILL).
     pub exit_code: Option<i32>,
     /// Rolling tail of non-protocol stdout (Redux's own log).
     pub stdout: String,
@@ -83,7 +83,7 @@ pub struct DisplayHash {
     pub width: u32,
     /// Display height in pixels.
     pub height: u32,
-    /// Redux's `bpp` enum value (opaque to us — use `byte_len`
+    /// Redux's `bpp` enum value (opaque to us -- use `byte_len`
     /// and `width` to derive bytes-per-pixel).
     pub bpp: u32,
     /// Total byte count of the pixel buffer (width × height ×
@@ -239,7 +239,7 @@ impl ReduxProcess {
     ///
     /// Each step uses a per-instruction breakpoint at `PC + 4`. This is
     /// correct for ordinary instructions but wrong for branches with
-    /// delay slots — see the note in `oracle.lua`.
+    /// delay slots -- see the note in `oracle.lua`.
     pub fn step(
         &mut self,
         n: u32,
@@ -262,7 +262,7 @@ impl ReduxProcess {
     /// Like [`step`], but invokes `on_record` for each record as it
     /// arrives instead of accumulating a `Vec`. Use this when `n` is
     /// large enough that holding every record in memory would exhaust
-    /// RAM — e.g. a 100 M-record trace is 14 GiB as `Vec`, but only
+    /// RAM -- e.g. a 100 M-record trace is 14 GiB as `Vec`, but only
     /// kilobytes at a time if the callback writes each record straight
     /// to disk.
     ///
@@ -320,7 +320,7 @@ impl ReduxProcess {
     /// between ours and Redux to find which specific IRQ fires at
     /// a divergent cycle.
     ///
-    /// `max_log` bounds the number of entries returned — the Lua
+    /// `max_log` bounds the number of entries returned -- the Lua
     /// loop stops emitting past that but keeps running to `n`.
     pub fn log_cdrom_irqs(
         &mut self,
@@ -358,7 +358,7 @@ impl ReduxProcess {
                     got: format!("err log_cdrom_irqs{rest}"),
                 });
             }
-            // Unknown line — protocol error.
+            // Unknown line -- protocol error.
             return Err(OracleError::Protocol {
                 expected: "cdrom_irq ... or log_cdrom_irqs ok".to_string(),
                 got: line,
@@ -509,7 +509,7 @@ impl ReduxProcess {
     /// Silently advance Redux by `n` instructions without emitting
     /// per-step records. The caller typically follows this with a
     /// `vram_hash` / `regs` / `peek32` query to capture only the
-    /// final state — avoiding the per-step Lua-stdout overhead that
+    /// final state -- avoiding the per-step Lua-stdout overhead that
     /// makes `step()` cost ~25 s per million instructions. Good for
     /// milestone tests where intermediate trace records aren't needed.
     pub fn run(&mut self, n: u64, timeout: Duration) -> Result<u64, OracleError> {
@@ -606,7 +606,7 @@ impl ReduxProcess {
     /// pipe instead of the full pixel buffer.
     ///
     /// Returns an `Err` if Redux's build of the PCSX Lua API
-    /// doesn't expose a screenshot accessor — callers can fall
+    /// doesn't expose a screenshot accessor -- callers can fall
     /// back to a determinism-only check.
     pub fn display_hash(&mut self, timeout: Duration) -> Result<DisplayHash, OracleError> {
         self.send_command("vram_hash")?;
@@ -874,7 +874,7 @@ fn spawn_stdout_drain<R: Read + Send + 'static>(
     })
 }
 
-/// Plain stderr drain — everything goes to the diagnostic buffer.
+/// Plain stderr drain -- everything goes to the diagnostic buffer.
 fn spawn_stderr_drain<R: Read + Send + 'static>(
     log: Arc<Mutex<RollingBuffer>>,
     pipe: R,

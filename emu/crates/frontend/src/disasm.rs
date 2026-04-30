@@ -1,7 +1,7 @@
 //! MIPS R3000 disassembler.
 //!
 //! Takes a `(pc, instr)` pair and returns a printable mnemonic string.
-//! Coverage is the opcodes we actually care about in the debug UI —
+//! Coverage is the opcodes we actually care about in the debug UI --
 //! everything the BIOS emits in the first few million instructions,
 //! plus a handful of common ones we'll hit soon. Unknowns render as
 //! `<??? op=0xNN>` so they stand out in the exec history.
@@ -49,7 +49,7 @@ pub fn disasm(pc: u32, instr: u32) -> String {
         0x0E => format!("xori {}, {}, 0x{:04X}", GPR[rt], GPR[rs], imm),
         0x0F => format!("lui {}, 0x{:04X}", GPR[rt], imm),
         0x10 => cop0(rs, rt, rd),
-        0x12 => format!("cop2 0x{instr:08X}"), // GTE — detail later
+        0x12 => format!("cop2 0x{instr:08X}"), // GTE -- detail later
         0x20 => format!("lb {}, {}({})", GPR[rt], simm, GPR[rs]),
         0x21 => format!("lh {}, {}({})", GPR[rt], simm, GPR[rs]),
         0x22 => format!("lwl {}, {}({})", GPR[rt], simm, GPR[rs]),
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn lui_formats_immediate_as_hex() {
-        // lui $t0, 0x0013 — the first real BIOS instruction
+        // lui $t0, 0x0013 -- the first real BIOS instruction
         assert_eq!(disasm(0xBFC0_0000, 0x3C08_0013), "lui t0, 0x0013");
     }
 
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn sw_formats_offset_base_syntax() {
-        // sw $t0, -4($sp) — very common BIOS pattern
+        // sw $t0, -4($sp) -- very common BIOS pattern
         let instr = (0x2B << 26) | (29 << 21) | (8 << 16) | ((-4i32 as u32) & 0xFFFF);
         assert_eq!(disasm(0, instr), "sw t0, -4(sp)");
     }

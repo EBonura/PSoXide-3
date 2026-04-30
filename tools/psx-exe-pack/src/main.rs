@@ -1,4 +1,4 @@
-//! `psx-exe-info` — validate a PSX-EXE and print its header.
+//! `psx-exe-info` -- validate a PSX-EXE and print its header.
 //!
 //! Our linker script emits a binary that already has the PSX-EXE header
 //! baked in at offset 0, so "packing" is a no-op today. This tool just

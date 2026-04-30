@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Expected first opcode of stock BIOS images: `0x3C08_1F80`
-//! (`lui $t0, 0x1F80` — load the I/O base into `$t0`).
+//! (`lui $t0, 0x1F80` -- load the I/O base into `$t0`).
 
 use std::env;
 use std::fs;

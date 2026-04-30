@@ -5,19 +5,19 @@
 //! three hashes per milestone to give us both correctness and
 //! determinism coverage:
 //!
-//! 1. **Full-VRAM hash** (self-regression) — FNV-1a-64 over the
+//! 1. **Full-VRAM hash** (self-regression) -- FNV-1a-64 over the
 //!    1 MiB VRAM buffer. Catches any change in VRAM bytes, even
 //!    off-screen CLUT/texture regions the user never sees. This
 //!    pins our emulator to a bit-exact behavior run-to-run so any
 //!    code change that alters rendering fails the test. **Does not
-//!    validate against Redux** — if we're wrong in some consistent
+//!    validate against Redux** -- if we're wrong in some consistent
 //!    way, this test will still pass.
 //!
-//! 2. **Display-area hash** (self-regression) — FNV-1a-64 over the
+//! 2. **Display-area hash** (self-regression) -- FNV-1a-64 over the
 //!    visible-display rectangle only (`GPU::display_hash`). Same
 //!    caveat: self-consistent, not Redux-correct.
 //!
-//! 3. **Redux-verified display hash** (correctness) — where
+//! 3. **Redux-verified display hash** (correctness) -- where
 //!    captured, the expected display-area hash that Redux produces
 //!    at the same step count. If `redux_display_hash` is `Some(h)`
 //!    and our `display_hash` doesn't equal it, the test fails and
@@ -43,7 +43,7 @@
 //! - A = BIOS boots to Sony logo (SCPH1001, no disc)
 //! - B = BIOS boots to shell (MAIN MENU / MEMORY CARD / CD PLAYER)
 //! - C = Homebrew SDK triangle renders (see `sdk/examples/hello-tri`)
-//! - D = BIOS disc-check passes (Crash Bandicoot) — licensed-disc
+//! - D = BIOS disc-check passes (Crash Bandicoot) -- licensed-disc
 //!   splash rendered; game boot-EXE load is still pending.
 
 use emulator_core::{Bus, Cpu};
@@ -87,7 +87,7 @@ fn run_milestone(steps: u64, disc_path: Option<&str>) -> MilestoneState {
     // pure BIOS and never trip this; D+ will until GTE / SPU /
     // MDEC land.
     //
-    // Pump the SPU periodically the way the frontend does — one
+    // Pump the SPU periodically the way the frontend does -- one
     // NTSC frame's worth of samples every ~560k CPU cycles. This
     // exercises the real per-frame flow and catches crashes in
     // the SPU pipeline (e.g. the Gaussian OOB at index 1028 that
@@ -125,7 +125,7 @@ fn run_milestone(steps: u64, disc_path: Option<&str>) -> MilestoneState {
 
 /// Assert our state matches the frozen goldens. `redux_display_hash`
 /// carries the Redux-verified correctness check if we've captured
-/// one — when `Some`, a mismatch means we diverge from Redux at
+/// one -- when `Some`, a mismatch means we diverge from Redux at
 /// the pixel level (a real bug); when `None`, we haven't captured
 /// Redux parity yet.
 fn assert_milestone(
@@ -155,7 +155,7 @@ fn assert_milestone(
         assert_eq!(
             state.display_hash, expected,
             "{name}: display hash doesn't match Redux's at the same step count \
-             — we're rendering the wrong pixels. \
+             -- we're rendering the wrong pixels. \
              Compare with `cargo run --example display_parity_at --release -- <steps>`.",
         );
     }
@@ -169,21 +169,21 @@ fn milestone_a_bios_to_sony_logo() {
     // (640×478 visible display area in NTSC 480-interlaced mode).
     //
     // Current Redux parity: ~3.21% of display-area bytes differ
-    // from Redux at this step — concentrated in the diamond's
+    // from Redux at this step -- concentrated in the diamond's
     // gradient shading and the "TM" text region, where our
     // rasterizer / semi-transparency / dither paths diverge. The
     // `redux_display_hash` field is left `None` until we fix those;
     // when pixel parity hits 0% differing bytes, replace with the
     // captured Redux hash to lock in correctness.
     let state = run_milestone(100_000_000, None);
-    // Hashes updated 2026-04-19 — scanline-delta rasterizer port lands.
+    // Hashes updated 2026-04-19 -- scanline-delta rasterizer port lands.
     // Byte-exact parity with Redux at the Sony logo:
     //   display_fnv1a_64 = 0xa3ac6881044333d0
     //   Redux hash       = 0xa3ac6881044333d0 (same)
     //
     // Four renderer-parity fixes in total:
-    //   1. `dither_rgb` — Redux's coefficient-threshold model
-    //   2. `blend_pixel` Average — per-channel `(bg>>1) + (fg>>1)`
+    //   1. `dither_rgb` -- Redux's coefficient-threshold model
+    //   2. `blend_pixel` Average -- per-channel `(bg>>1) + (fg>>1)`
     //   3. Top-left fill rule (now subsumed by the scanline walk)
     //   4. Scanline-delta rasterizer (replaces the per-pixel
     //      barycentric interpolator). Matches Redux's `drawPoly3Gi`
@@ -192,7 +192,7 @@ fn milestone_a_bios_to_sony_logo() {
         "Milestone A",
         &state,
         0xc9b9_c135_d24c_6f57, // full VRAM (self)
-        0xa3ac_6881_0443_33d0, // display area — PIXEL-EXACT with Redux
+        0xa3ac_6881_0443_33d0, // display area -- PIXEL-EXACT with Redux
         (640, 478),
         Some(0xa3ac_6881_0443_33d0), // Redux-verified pixel parity
     );
@@ -205,14 +205,14 @@ fn milestone_b_bios_to_shell() {
     // boot logo to the MAIN MENU shell screen (MEMORY CARD / CD
     // PLAYER, radial blue gradient).
     let state = run_milestone(500_000_000, None);
-    // Hashes updated 2026-04-19 — scanline-delta rasterizer port.
+    // Hashes updated 2026-04-19 -- scanline-delta rasterizer port.
     assert_milestone(
         "Milestone B",
         &state,
         0xd893_ba53_aae6_be64, // full VRAM (self)
         0x64da_b0b5_1f27_1fb7, // display area (self)
         (640, 478),
-        None, // Redux hash at 500M TBD — capture after next parity run
+        None, // Redux hash at 500M TBD -- capture after next parity run
     );
 }
 
@@ -224,7 +224,7 @@ fn milestone_d_bios_accepts_licensed_disc() {
     // disc-read sequence from ROM, cleared the boot-logo VRAM, and
     // rendered the "SONY / PlayStation™" licensed-disc splash.
     //
-    // Redux-parity on this is pending — the oracle doesn't pass
+    // Redux-parity on this is pending -- the oracle doesn't pass
     // `-iso` to Redux yet, so we can't run Redux with Crash mounted
     // through the oracle path.
     if !std::path::Path::new(CRASH_DISC).exists() {
@@ -245,7 +245,7 @@ fn milestone_d_bios_accepts_licensed_disc() {
         bus.cdrom.insert_disc(Some(Disc::from_bin(disc_bytes)));
         let mut cpu = Cpu::new();
         let mut cycles_at_last_pump = 0u64;
-        // Run for 300M instructions — well past the old crash
+        // Run for 300M instructions -- well past the old crash
         // point (step 208M).
         for _ in 0..300_000_000u64 {
             if cpu.step(&mut bus).is_err() {
@@ -284,7 +284,7 @@ fn milestone_d_bios_accepts_licensed_disc() {
     // Redux/PSX-SPX use `(3 - (addr & 3)) * 8`), which corrupted
     // every unaligned word load. Crash iterates strings via
     // lwl/lwr pairs and one of those writes was overwriting the
-    // saved $ra on the stack — function return then jumped to
+    // saved $ra on the stack -- function return then jumped to
     // 0x09070026, an unmapped address. The old milestone hashes
     // captured the post-crash (frozen) VRAM state; these new
     // ones capture the game actually running past that point.
@@ -306,7 +306,7 @@ fn milestone_d_tekken_licensed_screen() {
     // the 3D red "PlayStation / Licensed by Sony Computer
     // Entertainment America / SCEA™" screen. Unlike Crash (which
     // crashes on a wild pointer at step 180M, likely downstream
-    // of GTE gaps), Tekken holds stably on the license screen —
+    // of GTE gaps), Tekken holds stably on the license screen --
     // probably waiting for SPU / MDEC that we don't implement yet.
     //
     // Having two D-level goldens from different games doubles the
@@ -320,7 +320,7 @@ fn milestone_d_tekken_licensed_screen() {
         return;
     }
     let state = run_milestone(800_000_000, Some(TEKKEN_DISC));
-    // Hashes updated 2026-04-19 — scanline-delta rasterizer port.
+    // Hashes updated 2026-04-19 -- scanline-delta rasterizer port.
     assert_milestone(
         "Milestone D (Tekken license screen)",
         &state,

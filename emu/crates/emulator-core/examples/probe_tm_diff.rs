@@ -1,12 +1,12 @@
-//! Localize where our display diverges from Redux — pixel heatmap +
+//! Localize where our display diverges from Redux -- pixel heatmap +
 //! side-by-side PPMs so we can eyeball the TM-glyph artifact.
 //!
 //! Reads `/tmp/redux_display_<n>.bin` + `/tmp/ours_display_<n>.bin`
 //! (both produced by `display_parity_at`) and emits:
-//! - `/tmp/diff_<n>_ours.ppm`   — our display, 5bpc→8bpc expand
-//! - `/tmp/diff_<n>_redux.ppm`  — their display
-//! - `/tmp/diff_<n>_mask.ppm`   — black-on-red mask of differing pixels
-//! - stdout — a 40×30 ASCII heatmap of diff density and the bounding
+//! - `/tmp/diff_<n>_ours.ppm`   -- our display, 5bpc→8bpc expand
+//! - `/tmp/diff_<n>_redux.ppm`  -- their display
+//! - `/tmp/diff_<n>_mask.ppm`   -- black-on-red mask of differing pixels
+//! - stdout -- a 40×30 ASCII heatmap of diff density and the bounding
 //!   box of the densest cluster.
 //!
 //! ```bash
@@ -30,7 +30,7 @@ fn main() {
     let ours = fs::read(format!("/tmp/ours_display_{n}.bin")).expect("ours bin");
     assert_eq!(redux.len(), ours.len(), "dim mismatch");
 
-    // Meta file carries width / height — parse once.
+    // Meta file carries width / height -- parse once.
     let meta = fs::read_to_string(format!("/tmp/redux_display_{n}.bin.txt"))
         .unwrap_or_else(|_| "w=640 h=478".into());
     let (w, h) = parse_wh(&meta);

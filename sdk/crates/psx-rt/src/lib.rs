@@ -53,7 +53,7 @@ extern "Rust" {
 ///
 /// # Safety
 /// Called exactly once at boot by the loader. The caller must
-/// have set up a valid stack pointer before branching here — the
+/// have set up a valid stack pointer before branching here -- the
 /// PSX-EXE header's `initial_sp_base` + `initial_sp_offset` fields
 /// guarantee this.
 #[cfg(target_arch = "mips")]
@@ -92,7 +92,7 @@ pub fn halt() -> ! {
 /// (and our emulator's future console hook) shows it, then halts.
 ///
 /// Only registered when targeting PS1 hardware. Host builds of the
-/// SDK use `std`'s panic handler — this avoids the lang-item conflict
+/// SDK use `std`'s panic handler -- this avoids the lang-item conflict
 /// that would otherwise fire when something on host transitively
 /// depends on both `psx-rt` and `std`.
 #[cfg(target_arch = "mips")]

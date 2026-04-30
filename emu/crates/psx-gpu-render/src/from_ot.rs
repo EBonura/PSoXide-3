@@ -9,7 +9,7 @@
 //! translator already consumes when it renders the live emulator.
 //!
 //! The adapter is the only piece between "scene authored in the
-//! editor" and "wgpu draw calls" — everything else (projection,
+//! editor" and "wgpu draw calls" -- everything else (projection,
 //! primitive composition, OT insertion) is the same code that ships
 //! on PS1.
 
@@ -91,7 +91,7 @@ mod tests {
         );
     }
 
-    /// Two primitives in the same OT — the cmd-log preserves DMA
+    /// Two primitives in the same OT -- the cmd-log preserves DMA
     /// walk order (most-recently-inserted in a slot first).
     #[test]
     fn build_cmd_log_preserves_dma_order() {

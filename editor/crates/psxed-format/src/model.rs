@@ -49,7 +49,7 @@
 //!
 //! Skinning is a hybrid model. Each part still owns one rigid bone
 //! (its `joint_index`), and most triangles transform rigidly through
-//! that bone — fast GTE path. A vertex near a joint seam can name a
+//! that bone -- fast GTE path. A vertex near a joint seam can name a
 //! second bone in `joint1` along with a `blend` weight: the runtime
 //! transforms that vertex by both bones and lerps the view-space
 //! results, which keeps elbow and shoulder creases continuous instead

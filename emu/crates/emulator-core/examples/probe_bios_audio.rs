@@ -1,11 +1,11 @@
 //! Audit SPU output during BIOS boot (no disc). The BIOS plays the
 //! Sony-logo chime *only when a licensed disc boots successfully*,
 //! so a pure no-disc boot producing silence is EXPECTED. The user
-//! reports "no sound during BIOS intro" — we want to know whether
+//! reports "no sound during BIOS intro" -- we want to know whether
 //! the chime is genuinely missing in the disc-boot path or if it's
 //! producing samples we're failing to surface.
 //!
-//! Run twice (once per mode) — compare peak amplitudes:
+//! Run twice (once per mode) -- compare peak amplitudes:
 //!
 //! ```bash
 //! cargo run -p emulator-core --example probe_bios_audio --release
@@ -36,7 +36,7 @@ fn main() {
     let mut peak_ever_l: i32 = 0;
     let mut peak_ever_r: i32 = 0;
 
-    // Run 500M instructions — well past the Sony logo (100M) and
+    // Run 500M instructions -- well past the Sony logo (100M) and
     // into the shell (500M) or disc boot (500M+).
     for _ in 0..500_000_000u64 {
         if cpu.step(&mut bus).is_err() {

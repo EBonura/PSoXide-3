@@ -1,6 +1,6 @@
 //! User-editable preferences, persisted as `settings.ron`.
 //!
-//! The on-disk file is meant to be read — and sometimes edited — by
+//! The on-disk file is meant to be read -- and sometimes edited -- by
 //! humans. That shapes two decisions in this module:
 //!
 //! 1. **RON instead of TOML/JSON.** Our settings are enum-heavy
@@ -59,13 +59,13 @@ pub enum SettingsError {
         #[source]
         source: ron::error::SpannedError,
     },
-    /// RON serialisation failed — unlikely at this scale, but
+    /// RON serialisation failed -- unlikely at this scale, but
     /// propagated for completeness.
     #[error("settings serialization error: {0}")]
     Serialize(#[from] ron::Error),
 }
 
-/// Video output preferences. Kept small — we'll grow it as the
+/// Video output preferences. Kept small -- we'll grow it as the
 /// renderer picks up more knobs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoSettings {
@@ -87,10 +87,10 @@ impl Default for VideoSettings {
 }
 
 /// Where on the filesystem the app pulls assets from at startup.
-/// Empty strings mean "no preference — use built-in defaults or
+/// Empty strings mean "no preference -- use built-in defaults or
 /// explicit env-var fallbacks." All paths are stored as strings so the
 /// RON file stays platform-portable (Path on disk uses forward
-/// slashes even on Windows — we join via `PathBuf` at read time).
+/// slashes even on Windows -- we join via `PathBuf` at read time).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Paths {
     /// Preferred BIOS image (`SCPH1001.BIN` & friends). Empty =
@@ -104,7 +104,7 @@ pub struct Paths {
     /// SDK-built homebrew example `.exe` files. Empty = frontend
     /// auto-detects the standard `build/examples/mipsel-sony-psx/release/`
     /// directory relative to the repo root (compile-time path from
-    /// `CARGO_MANIFEST_DIR`). Set explicitly to override — e.g.
+    /// `CARGO_MANIFEST_DIR`). Set explicitly to override -- e.g.
     /// pointing at a co-developer's alternate SDK build tree.
     ///
     /// Kept separate from `game_library` so users can ship the
@@ -124,7 +124,7 @@ pub struct Paths {
 ///
 /// Named variants carry an owned `String` (not a `&'static str`)
 /// because the loader materialises bindings from the RON file at
-/// runtime — a borrow couldn't satisfy serde's lifetime. In-flight
+/// runtime -- a borrow couldn't satisfy serde's lifetime. In-flight
 /// cost at keypress is one `String::eq` per binding; negligible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum InputBinding {
@@ -133,7 +133,7 @@ pub enum InputBinding {
     Named(String),
     /// A character key, lowercased (`'x'`, `'a'`, `'1'`, …).
     Character(char),
-    /// Explicitly unbound — renders as blank in the UI. Useful for
+    /// Explicitly unbound -- renders as blank in the UI. Useful for
     /// defaulting some pad buttons to "not yet assigned" without
     /// forcing a real key.
     #[default]
@@ -141,14 +141,14 @@ pub enum InputBinding {
 }
 
 impl InputBinding {
-    /// Convenience constructor for a named-key binding — keeps
+    /// Convenience constructor for a named-key binding -- keeps
     /// call-site noise down (`named("Enter")` vs
     /// `Named("Enter".into())`).
     pub fn named(name: impl Into<String>) -> Self {
         InputBinding::Named(name.into())
     }
 
-    /// A short human-readable label for this binding — used by the
+    /// A short human-readable label for this binding -- used by the
     /// settings UI and the HUD.
     pub fn label(&self) -> String {
         match self {
@@ -207,7 +207,7 @@ impl Default for PortBindings {
     /// the d-pad on the left hand (arrow keys) and the action
     /// cluster on the right (X / C / V / D forms a rough diamond).
     ///
-    /// Not claiming this is optimal — users will want to rebind.
+    /// Not claiming this is optimal -- users will want to rebind.
     /// It's just "works immediately on a fresh install."
     fn default() -> Self {
         Self {
@@ -285,7 +285,7 @@ impl InputSettings {
     }
 }
 
-/// Emulator-level toggles. `hle_bios` is the big one — everything
+/// Emulator-level toggles. `hle_bios` is the big one -- everything
 /// else can grow as we add features.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmulatorSettings {
@@ -294,7 +294,7 @@ pub struct EmulatorSettings {
     /// that gets applied when launching a game; per-game overrides
     /// in the library cache can flip it.
     ///
-    /// Defaults to **true** — matches what `PSOXIDE_EXE=…` side-load
+    /// Defaults to **true** -- matches what `PSOXIDE_EXE=…` side-load
     /// does unconditionally (see `app::load_exe`). Previously this
     /// derived `Default`, giving `false`, which made the library-
     /// launch path ship a half-initialised BIOS kernel state to the
@@ -313,7 +313,7 @@ pub struct EmulatorSettings {
     #[serde(default = "default_fast_boot_disc")]
     pub fast_boot_disc: bool,
     /// If set, the run loop paces itself to real-time instead of
-    /// running flat-out. Defaults to false — we want flat-out
+    /// running flat-out. Defaults to false -- we want flat-out
     /// speed for parity / debugging. A future audio feature will
     /// flip this on so the SPU stays in sync.
     #[serde(default)]
@@ -341,7 +341,7 @@ impl Default for EmulatorSettings {
 /// Editor-side preferences that persist across sessions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditorSettings {
-    /// Last-opened project directory. `None` on first launch — the
+    /// Last-opened project directory. `None` on first launch -- the
     /// frontend then opens `psxed_project::default_project_dir()`.
     /// Updated by the frontend after every successful
     /// `open_directory` / `create_and_open_project` so re-launches
@@ -350,8 +350,8 @@ pub struct EditorSettings {
     pub last_project_dir: Option<PathBuf>,
 }
 
-/// The full settings root. Shape is intentionally flat — no deep
-/// nesting — so that someone skimming `settings.ron` can see every
+/// The full settings root. Shape is intentionally flat -- no deep
+/// nesting -- so that someone skimming `settings.ron` can see every
 /// section at once.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
@@ -396,7 +396,7 @@ impl Default for Settings {
 
 impl Settings {
     /// Read `path` and parse as RON. If the file doesn't exist, the
-    /// returned settings are the defaults — *not* an error, because
+    /// returned settings are the defaults -- *not* an error, because
     /// first-run shouldn't fail. If the file exists but is corrupt,
     /// returns [`SettingsError::Parse`] so the caller can decide
     /// whether to log + default or bail.
@@ -420,7 +420,7 @@ impl Settings {
     }
 
     /// Serialise to RON and write atomically. The content is written
-    /// to `<path>.tmp` first, then renamed to `path` — so a crash
+    /// to `<path>.tmp` first, then renamed to `path` -- so a crash
     /// mid-write can never leave a half-written settings file
     /// behind.
     ///
@@ -468,7 +468,7 @@ impl Settings {
     }
 
     /// Hook for cross-version migrations. Today it only pins the
-    /// version field to the current value — as the schema evolves,
+    /// version field to the current value -- as the schema evolves,
     /// this branches on `self.version` to upgrade.
     pub fn migrate(&mut self) {
         if self.version < 2 {

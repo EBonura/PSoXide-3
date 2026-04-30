@@ -49,7 +49,7 @@ pub struct Rasterizer {
     tex_rect_pipeline: wgpu::ComputePipeline,
     tex_rect_uniform: wgpu::Buffer,
 
-    // Fill pipeline (B.5.c). Custom 2-binding shape — no draw area
+    // Fill pipeline (B.5.c). Custom 2-binding shape -- no draw area
     // because fill bypasses clipping.
     fill_pipeline: wgpu::ComputePipeline,
     fill_bg_layout: wgpu::BindGroupLayout,
@@ -72,7 +72,7 @@ pub struct Rasterizer {
     tex_tri_scanline_bg_layout: wgpu::BindGroupLayout,
     tex_tri_scanline_consts: wgpu::Buffer,
     /// Resizable per-row storage buffer. Reallocated when a primitive
-    /// needs more rows than the current capacity (cheap — wgpu
+    /// needs more rows than the current capacity (cheap -- wgpu
     /// doesn't actually free until `submit` completes anyway).
     tex_tri_scanline_rows: std::cell::RefCell<wgpu::Buffer>,
 
@@ -89,7 +89,7 @@ pub struct Rasterizer {
     tex_quad_bilinear_uniform: wgpu::Buffer,
 
     // Phase B.x: mono + shaded triangle scanline pipelines. Same
-    // 5-binding shape (VRAM + prim + draw area + rows + consts —
+    // 5-binding shape (VRAM + prim + draw area + rows + consts --
     // no tpage since neither samples a texture).
     mono_shaded_scanline_bg_layout: wgpu::BindGroupLayout,
     mono_tri_scanline_pipeline: wgpu::ComputePipeline,
@@ -170,7 +170,7 @@ impl Rasterizer {
             cache: None,
         });
 
-        // Reusable uniform buffers — wgpu doesn't let us write a
+        // Reusable uniform buffers -- wgpu doesn't let us write a
         // struct directly into a freshly-bound resource per dispatch
         // without allocating, so we keep a stable buffer and update
         // it via `queue.write_buffer`.
@@ -325,7 +325,7 @@ impl Rasterizer {
         });
 
         // ---------- Fill pipeline (B.5.c) ----------
-        // 2 bindings: VRAM + Fill uniform. No draw area / no tpage —
+        // 2 bindings: VRAM + Fill uniform. No draw area / no tpage --
         // fill bypasses clipping and never reads VRAM.
         let fill_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("psx-rasterizer-fill-bgl"),
@@ -867,7 +867,7 @@ impl Rasterizer {
             return false;
         }
         // Both mono and shaded scanline paths reuse `mono_tri_uniform`
-        // (mono) / `shaded_tri_uniform` (shaded) — but to keep this
+        // (mono) / `shaded_tri_uniform` (shaded) -- but to keep this
         // helper generic, we'll write through the existing per-prim
         // uniform we already manage. Looking up which one to use:
         let prim_uniform = match label {
@@ -1076,7 +1076,7 @@ impl Rasterizer {
     /// Results match the CPU rasterizer byte-for-byte.
     ///
     /// Returns `false` if the triangle degenerates (zero height /
-    /// longest) — same drop conditions as the CPU.
+    /// longest) -- same drop conditions as the CPU.
     pub fn dispatch_tex_tri_scanline(
         &self,
         vram: &VramGpu,
@@ -1307,7 +1307,7 @@ impl Rasterizer {
     }
 
     /// Dispatch one quick-fill primitive into VRAM. Bypasses all
-    /// drawing-state — matches the CPU `Gpu::fill_rect`. Caller is
+    /// drawing-state -- matches the CPU `Gpu::fill_rect`. Caller is
     /// responsible for the 16-pixel x/w masking; `Fill::new` does
     /// it for you.
     /// Dispatch one axis-aligned textured quad with bilinear UV
@@ -1421,14 +1421,14 @@ impl Rasterizer {
     /// row-by-row semantics exactly: for each row, the entire source
     /// row is read into a staging buffer first, then written to the
     /// dest row. This means vertically-overlapping copies "smear"
-    /// the source down — the same behaviour the CPU produces (Sony
+    /// the source down -- the same behaviour the CPU produces (Sony
     /// docs describe this as the row-buffer of the copy unit).
     ///
     /// Implementation: one per-row `src→temp` + `temp→dst` pair,
     /// all queued into a single command encoder so wgpu runs them
     /// strictly in order. Goes through a 1-row staging buffer
     /// because wgpu rejects `copy_buffer_to_buffer` with the same
-    /// buffer as src and dst — we'd need that for direct VRAM-to-
+    /// buffer as src and dst -- we'd need that for direct VRAM-to-
     /// VRAM otherwise.
     pub fn dispatch_vram_copy(
         &self,
@@ -1703,7 +1703,7 @@ impl Rasterizer {
     }
 }
 
-// `DrawArea` is exactly 16 bytes — std::mem::size_of_val would also
+// `DrawArea` is exactly 16 bytes -- std::mem::size_of_val would also
 // work, but bytemuck::bytes_of needs `Pod`. Both `MonoTri` and
 // `DrawArea` derive Pod in `primitive.rs`. We assert the layout
 // invariants at compile time below.
@@ -1721,7 +1721,7 @@ fn _phantom_zeroable<T: Zeroable + Pod>() -> T {
 }
 
 // =============================================================
-//  Tests — GPU rasterizer vs CPU rasterize_triangle parity
+//  Tests -- GPU rasterizer vs CPU rasterize_triangle parity
 // =============================================================
 
 #[cfg(test)]
@@ -1746,7 +1746,7 @@ mod tests {
     ///   - `mask_e6` writes GP0 0xE6 with the given low-2-bit value
     ///     (bit 0 = mask_set_on_draw, bit 1 = mask_check_before_draw).
     ///   - `prefill` paints the entire VRAM with one color before
-    ///     submitting the primitive — needed for semi-trans tests
+    ///     submitting the primitive -- needed for semi-trans tests
     ///     where the back buffer must not be zero, and for mask-check
     ///     tests where the existing pixel needs bit 15 set.
     fn cpu_rasterize_mono_tri_full(
@@ -1769,7 +1769,7 @@ mod tests {
                 }
             }
         }
-        gpu.gp0_push(0xE3000000); // E3 — top-left at (0, 0)
+        gpu.gp0_push(0xE3000000); // E3 -- top-left at (0, 0)
         gpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
         // Tpage: only bits 5-6 (semi-trans mode) matter for mono prims.
         let e1 = 0xE100_0000_u32 | ((tpage_blend_bits as u32) & 0x3) << 5;
@@ -1911,7 +1911,7 @@ mod tests {
     }
 
     // -------------------------------------------------------
-    //  Phase B.4 — semi-trans + mask-bit parity vs CPU
+    //  Phase B.4 -- semi-trans + mask-bit parity vs CPU
     // -------------------------------------------------------
 
     /// Run the GPU rasterizer for one mono-tri with the given flags
@@ -1958,7 +1958,7 @@ mod tests {
 
     #[test]
     fn semi_trans_average_matches_cpu_byte_for_byte() {
-        // The trickiest blend mode — Redux's `(b>>1) + (f>>1)` quirk
+        // The trickiest blend mode -- Redux's `(b>>1) + (f>>1)` quirk
         // produces different LSBs from the naive `(b+f)/2`. If the
         // shader gets this wrong, every output pixel of an axis-
         // aligned triangle (no edge-rule diffs) will be off-by-one
@@ -1991,7 +1991,7 @@ mod tests {
         let v2 = (5, 45);
         // Pick a color whose channels saturate against the prefill.
         let color = 0x4210; // (r=0x10, g=0x10, b=0x10)
-        let prefill = 0x4210; // same — sum must clamp to 31 per channel
+        let prefill = 0x4210; // same -- sum must clamp to 31 per channel
         let cpu = cpu_rasterize_mono_tri_full(v0, v1, v2, color, 0x22, 1, 0, prefill);
         let gpu = gpu_rasterize_mono_tri_full(
             v0,
@@ -2106,7 +2106,7 @@ mod tests {
             BlendMode::Average,
             prefill,
         );
-        // Strict equality on every pixel — nothing should have changed.
+        // Strict equality on every pixel -- nothing should have changed.
         let diffs = diff_inside_bbox(&cpu, &gpu, (10, 10), (50, 50));
         assert!(diffs == 0, "MASK_CHECK parity: {diffs} differ");
         let inside_idx = 20 * 1024 + 20;
@@ -2141,7 +2141,7 @@ mod tests {
         cpu_gpu.gp0_push(0xE3000000);
         cpu_gpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
         cpu_gpu.gp0_push(0xE100_0000); // tpage
-        cpu_gpu.gp0_push(0xE600_0002); // E6 — mask_check_before_draw
+        cpu_gpu.gp0_push(0xE600_0002); // E6 -- mask_check_before_draw
         let cmd = 0x20_000000_u32 | bgr15_to_rgb24(color);
         cpu_gpu.gp0_push(cmd);
         cpu_gpu.gp0_push(pack_xy(v0));
@@ -2264,7 +2264,7 @@ mod tests {
     }
 
     // -------------------------------------------------------
-    //  Phase B.2 — textured triangle parity vs CPU
+    //  Phase B.2 -- textured triangle parity vs CPU
     // -------------------------------------------------------
 
     /// Pack a (u, v) pair into the low 16 bits of a UV0/UV1/UV2 word.
@@ -2347,7 +2347,7 @@ mod tests {
         // CPU side.
         let mut cpu = Gpu::new();
         seed_vram(&vram, &mut cpu, &VramGpu::new_headless());
-        // (Re-seed VRAM cleanly — `seed_vram` above used a throwaway
+        // (Re-seed VRAM cleanly -- `seed_vram` above used a throwaway
         // headless device. We need a fresh one used for the actual
         // dispatch below. Easier: just call set_pixel + upload twice.)
         let vg = VramGpu::new_headless();
@@ -2380,7 +2380,7 @@ mod tests {
         // as the CPU at each integer pixel position with a barycentric
         // affine interpolation. Pixel-EXACT parity vs the Redux-port
         // scanline-delta math (which uses specific Q16.16 setup +
-        // shl10idiv) is a Phase-B.x follow-up — that path produces
+        // shl10idiv) is a Phase-B.x follow-up -- that path produces
         // off-by-1/2 UV at some interior pixels due to the difference
         // between cumulative per-row deltas and a barycentric divide.
         //
@@ -2507,9 +2507,9 @@ mod tests {
         let tpage_x = 64u32;
         let tpage_y = 0u32;
         let tpage_word = make_tpage_word(tpage_x, tpage_y, 1, 0);
-        // CLUT at (16, 256) — 16 must be multiple of 16 (it is).
+        // CLUT at (16, 256) -- 16 must be multiple of 16 (it is).
         // For 8bpp the CLUT row is 256 entries wide, but the host
-        // doesn't pre-shift the X — we pass the raw VRAM column.
+        // doesn't pre-shift the X -- we pass the raw VRAM column.
         let clut_x = 16u32;
         let clut_y = 256u32;
         let clut_word = make_clut_word(clut_x, clut_y);
@@ -2580,7 +2580,7 @@ mod tests {
         let uv = [(0u8, 0u8), (32, 0), (0, 32)];
         let tpage_x = 128u32;
         let tpage_word = make_tpage_word(tpage_x, 0, 2, 0);
-        // 50% tint on each channel — exactly half the value.
+        // 50% tint on each channel -- exactly half the value.
         let tint = (0x40u8, 0x40u8, 0x40u8);
 
         let mut vram = vec![0u16; 1024 * 512];
@@ -2597,7 +2597,7 @@ mod tests {
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
-        // 0x24 = textured + modulated (NOT raw — tint applies).
+        // 0x24 = textured + modulated (NOT raw -- tint applies).
         cpu_push_tex_tri(&mut cpu, 0x24, tint, v, uv, 0, tpage_word);
         let cpu_words = cpu.vram.words().to_vec();
 
@@ -2739,7 +2739,7 @@ mod tests {
     }
 
     // -------------------------------------------------------
-    //  Phase B.x — scanline-delta textured triangle: BIT-EXACT
+    //  Phase B.x -- scanline-delta textured triangle: BIT-EXACT
     // -------------------------------------------------------
 
     #[test]
@@ -2846,7 +2846,7 @@ mod tests {
 
     #[test]
     fn tex_tri_scanline_4bpp_with_clut_is_bit_exact() {
-        // 4bpp + CLUT — exercises the texture-window-free CLUT
+        // 4bpp + CLUT -- exercises the texture-window-free CLUT
         // sampling path with bit-exact UV.
         let v = [(20i32, 20i32), (60, 20), (20, 60)];
         let uv = [(0u8, 0u8), (32, 0), (0, 32)];
@@ -2910,7 +2910,7 @@ mod tests {
     fn shaded_tex_tri_scanline_15bpp_is_bit_exact() {
         // The same setup as the B.3.b textured-shaded test, but
         // through the scanline-delta dispatcher. Strict equality
-        // expected — both UV and RGB walks now exactly match the
+        // expected -- both UV and RGB walks now exactly match the
         // CPU's cumulative arithmetic.
         let v = [(20i32, 20i32), (60, 20), (20, 60)];
         let uv = [(0u8, 0u8), (32, 0), (0, 32)];
@@ -3027,7 +3027,7 @@ mod tests {
         }
         cpu.gp0_push(0xE3000000);
         cpu.gp0_push(0xE4000000 | 1023 | (511 << 10));
-        // 0x2D — textured quad, raw texture, opaque.
+        // 0x2D -- textured quad, raw texture, opaque.
         cpu.gp0_push(0x2D000000);
         cpu.gp0_push(pack_xy(v[0]));
         cpu.gp0_push(uv_pack(uv[0])); // clut=0
@@ -3138,12 +3138,12 @@ mod tests {
     }
 
     // -------------------------------------------------------
-    //  Phase B.5 — rectangle parity vs CPU
+    //  Phase B.5 -- rectangle parity vs CPU
     // -------------------------------------------------------
 
     /// Drive the CPU rasterizer for one monochrome rectangle via
     /// GP0 0x60 (variable-size mono rect, 3-word packet).
-    /// `prefill` paints VRAM before the rect — needed for mask-check
+    /// `prefill` paints VRAM before the rect -- needed for mask-check
     /// and semi-trans tests.
     fn cpu_rasterize_mono_rect(
         xy: (i32, i32),
@@ -3186,7 +3186,7 @@ mod tests {
     fn mono_rect_basic_opaque_matches_cpu() {
         // Strict bit-exact parity: rectangles have no interpolation,
         // so the only sources of disagreement would be coverage or
-        // RMW bugs — neither of which we expect.
+        // RMW bugs -- neither of which we expect.
         let xy = (50, 60);
         let wh = (40u32, 30u32);
         let color = 0x4321;
@@ -3302,7 +3302,7 @@ mod tests {
         wh: (u32, u32),
         uv: (u8, u8),
         clut_word: u32,
-        // CPU side picks tpage from the LAST GP0 0xE1 — the rect
+        // CPU side picks tpage from the LAST GP0 0xE1 -- the rect
         // packet has no per-prim tpage word. Caller pushes it
         // separately before calling.
     ) {
@@ -3492,7 +3492,7 @@ mod tests {
             let val = (i.max(1) << 1) | (i.max(1) << 6) | 0x4000;
             vram[clut_y as usize * 1024 + (clut_x as usize + i as usize)] = val;
         }
-        // 16×16 4bpp texture — 4 nibbles per VRAM word.
+        // 16×16 4bpp texture -- 4 nibbles per VRAM word.
         for vy in 0..16u16 {
             for word_x in 0..4u16 {
                 let mut word = 0u16;
@@ -3538,7 +3538,7 @@ mod tests {
     }
 
     // -------------------------------------------------------
-    //  Phase B.5.c — fill + VRAM-to-VRAM copy parity vs CPU
+    //  Phase B.5.c -- fill + VRAM-to-VRAM copy parity vs CPU
     // -------------------------------------------------------
 
     /// Drive the CPU rasterizer for one quick-fill via GP0 0x02.
@@ -3574,7 +3574,7 @@ mod tests {
 
     #[test]
     fn fill_basic_matches_cpu_byte_for_byte() {
-        // Strict parity. Fill is the simplest primitive — any diff
+        // Strict parity. Fill is the simplest primitive -- any diff
         // is a real bug.
         let xy = (32u32, 64u32);
         let wh = (64u32, 32u32);
@@ -3593,7 +3593,7 @@ mod tests {
         let xy = (32u32, 32u32);
         let wh = (64u32, 64u32);
         let color = 0x1234;
-        // Restrict draw area to (40..60, 40..60) — but fill IGNORES
+        // Restrict draw area to (40..60, 40..60) -- but fill IGNORES
         // this. The whole rect at (32..96, 32..96) should still write.
         let cpu = cpu_rasterize_fill(xy, wh, color, 0, 40 | (40 << 10), 60 | (60 << 10), 0);
         let vg = VramGpu::new_headless();
@@ -3675,7 +3675,7 @@ mod tests {
 
     #[test]
     fn vram_copy_non_overlapping_matches_cpu_byte_for_byte() {
-        // Source and dest disjoint — direct GPU copy path.
+        // Source and dest disjoint -- direct GPU copy path.
         let mut seed = vec![0u16; 1024 * 512];
         for vy in 0..32u16 {
             for ux in 0..32u16 {
@@ -3694,7 +3694,7 @@ mod tests {
 
     #[test]
     fn vram_copy_overlapping_uses_host_bounce_correctly() {
-        // Overlap — host-bounce path. Result should still match CPU
+        // Overlap -- host-bounce path. Result should still match CPU
         // because the CPU's row-buffer pattern protects horizontal
         // overlap, and our host bounce reads ALL src then writes
         // (effectively the same as a full temp buffer).
@@ -3714,7 +3714,7 @@ mod tests {
         r.dispatch_vram_copy(&vg, (50, 50), (54, 54), (16, 16));
         let gpu = vg.download_full().unwrap();
         // Strict parity: our host-bounce reads the entire src rect
-        // before any writes — equivalent to the CPU's row-buffer
+        // before any writes -- equivalent to the CPU's row-buffer
         // semantics for non-vertically-overlapping cases.
         // For vertically overlapping cases the CPU's row-by-row
         // semantics may differ; we accept that as a known
@@ -3723,7 +3723,7 @@ mod tests {
     }
 
     // -------------------------------------------------------
-    //  Phase B.3 — shaded triangle parity vs CPU
+    //  Phase B.3 -- shaded triangle parity vs CPU
     // -------------------------------------------------------
 
     /// Drive the CPU rasterizer for one Gouraud-shaded triangle via

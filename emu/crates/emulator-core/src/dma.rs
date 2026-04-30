@@ -1,4 +1,4 @@
-//! DMA controller — 7 channels plus global control registers.
+//! DMA controller -- 7 channels plus global control registers.
 //!
 //! Channel layout (each is 16 bytes at `0x1F80_1080 + 0x10 * ch`):
 //! - `+0x0` base address (RAM address the channel transfers to/from)
@@ -6,12 +6,12 @@
 //! - `+0x8` channel control (direction, sync mode, start trigger, …)
 //!
 //! Global:
-//! - `0x1F80_10F0` DPCR — per-channel enables + priority bits
-//! - `0x1F80_10F4` DICR — IRQ enables + pending flags
+//! - `0x1F80_10F0` DPCR -- per-channel enables + priority bits
+//! - `0x1F80_10F4` DICR -- IRQ enables + pending flags
 //!
 //! **Phase 2g scope:** register backing + MMIO dispatch only. No actual
 //! transfers fire yet. When a channel's `channel_control` start bit is
-//! written, we record the intent but don't move bytes — the channel's
+//! written, we record the intent but don't move bytes -- the channel's
 //! owning subsystem (GPU for ch 2, SPU for ch 4, CD-ROM for ch 3, …)
 //! isn't online. OTC (ch 6) is self-contained and will be the first
 //! real transfer path; it lands in the follow-up commit that wires
@@ -36,15 +36,15 @@ pub const NUM_CHANNELS: usize = 7;
 /// Per-channel register state.
 #[derive(Default, Clone, Copy)]
 pub struct DmaChannel {
-    /// `MADR` — base address (destination for RAM-bound transfers,
+    /// `MADR` -- base address (destination for RAM-bound transfers,
     /// source otherwise). Lower 24 bits are the physical RAM offset;
     /// upper bits read back as written but aren't consulted during
     /// transfers.
     pub base: u32,
-    /// `BCR` — block control. Format depends on sync mode; for block
+    /// `BCR` -- block control. Format depends on sync mode; for block
     /// mode, lower 16 bits are block size and upper 16 bits are count.
     pub block_control: u32,
-    /// `CHCR` — channel control (direction / step / sync / start).
+    /// `CHCR` -- channel control (direction / step / sync / start).
     pub channel_control: u32,
 }
 
@@ -52,18 +52,18 @@ pub struct DmaChannel {
 pub struct Dma {
     /// Per-channel register blocks.
     pub channels: [DmaChannel; NUM_CHANNELS],
-    /// `DPCR` — DMA Primary Control Register (per-channel enables +
+    /// `DPCR` -- DMA Primary Control Register (per-channel enables +
     /// priority). Reset value is `0x0765_4321` on hardware but the BIOS
     /// writes it early so the reset default doesn't matter for us.
     pub dpcr: u32,
-    /// `DICR` — DMA Interrupt Register (IRQ enable + pending bits).
+    /// `DICR` -- DMA Interrupt Register (IRQ enable + pending bits).
     pub dicr: u32,
     /// Per-channel count of CHCR writes with the start bit set.
-    /// Diagnostic only — tells us which channels software is using
+    /// Diagnostic only -- tells us which channels software is using
     /// and how often. Cleared on `new()`, never decremented.
     pub start_trigger_counts: [u64; NUM_CHANNELS],
     /// Mirror of `start_trigger_counts` that survives cargo-naming
-    /// nuance — a second counter bumped in the same place so a
+    /// nuance -- a second counter bumped in the same place so a
     /// probe can distinguish "channel never touched" from "channel
     /// touched but we haven't picked it up."
     pub chcr_write_count: [u64; NUM_CHANNELS],
@@ -103,7 +103,7 @@ impl Dma {
     /// `isDMAEnabled<n>()` in `psxmem.h`: the enable bit for
     /// channel N is DPCR bit `N*4 + 3`. Software writes DPCR to
     /// selectively enable/disable channels before starting a
-    /// transfer — if the channel is off, the CHCR start-bit write
+    /// transfer -- if the channel is off, the CHCR start-bit write
     /// MUST NOT kick the DMA. Skipping this check lets Crash's
     /// intro issue CHCR writes that Redux ignores, producing extra
     /// DMA completions on our side and a +2488-cycle drift in the
@@ -246,9 +246,9 @@ impl Default for Dma {
 //   bits  0..5  : Unknown (R/W)
 //   bits  6..14 : Reserved (always 0)
 //   bit   15    : Bus-error flag
-//   bits 16..22 : Per-channel IRQ enable (R/W) — DMA0..DMA6
+//   bits 16..22 : Per-channel IRQ enable (R/W) -- DMA0..DMA6
 //   bit   23    : IRQ master enable (R/W)
-//   bits 24..30 : Per-channel IRQ flag (R, W1C) — DMA0..DMA6
+//   bits 24..30 : Per-channel IRQ flag (R, W1C) -- DMA0..DMA6
 //   bit   31    : IRQ master flag (stored by Redux, not purely derived)
 //
 // Redux stores bit 31 explicitly and raises IRQ 8 from two places:
@@ -292,7 +292,7 @@ impl Dma {
     /// Notify the DICR that DMA channel `ch` has completed. Sets the
     /// channel's IRQ flag (bit `24+ch`) when the matching enable bit
     /// (`16+ch`) is set, and returns `true` when the master IRQ flag
-    /// transitions from clear to set as a result — that's the edge the
+    /// transitions from clear to set as a result -- that's the edge the
     /// main IRQ controller should treat as a `Dma` raise.
     pub fn notify_channel_done(&mut self, ch: usize) -> bool {
         if ch >= NUM_CHANNELS {
@@ -329,10 +329,10 @@ impl Dma {
     /// mem++;        *mem = 0xffffff;   // overwrites last chain ptr
     /// ```
     /// Crucially, the terminator overwrites the chain pointer the loop
-    /// just wrote at the lowest address — so the structure ends up:
+    /// just wrote at the lowest address -- so the structure ends up:
     /// `madr → madr-4 → … → madr-(count-2)*4 → terminator`.
     ///
-    /// CHCR start (24) and busy (28) bits are NOT cleared here — the
+    /// CHCR start (24) and busy (28) bits are NOT cleared here -- the
     /// caller schedules a delayed completion (Redux's
     /// `scheduleGPUOTCDMAIRQ(size)`) so BIOS polls of CHCR keep
     /// observing the busy state for `size` cycles after kickoff.
@@ -447,7 +447,7 @@ mod tests {
         // round-trip; W1C bits (15, 24..30) ignore writes-of-zero.
         let mut dma = Dma::new();
         dma.write32(0x1F80_10F4, 0x00FF_0000); // enables 16..23
-                                               // Read-back includes the computed master flag in bit 31 — clear
+                                               // Read-back includes the computed master flag in bit 31 -- clear
                                                // here because no per-channel flag is set.
         assert_eq!(dma.read32(0x1F80_10F4), 0x00FF_0000);
     }
@@ -521,7 +521,7 @@ mod tests {
     fn otc_madr_is_head_terminator_at_tail() {
         let mut dma = Dma::new();
         let mut ram = vec![0u8; 2 * 1024 * 1024];
-        // Sentinel just below the OT range — must remain untouched
+        // Sentinel just below the OT range -- must remain untouched
         // (validates that the loop's last chain-write to 0x3F4 is
         // overwritten by the terminator, not extended into 0x3F0).
         write_u32(&mut ram, 0x3F0, 0xDEAD_BEEF);
@@ -550,7 +550,7 @@ mod tests {
         // polling of CHCR sees the same sequence Redux produces.
         //
         // Preventing duplicate runs is done at the bus level via the
-        // CHCR-write-only trigger — only a CHCR write with bit 24 set
+        // CHCR-write-only trigger -- only a CHCR write with bit 24 set
         // enters `maybe_run_dma`. See `bus.rs:write32` handling of the
         // DMA region.
         let mut dma = Dma::new();

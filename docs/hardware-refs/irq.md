@@ -7,7 +7,7 @@
 | `0x1F80_1070` | 32 | `I_STAT` | R / W (ack) | Pending interrupts. Write is AND-acknowledge. |
 | `0x1F80_1074` | 32 | `I_MASK` | R / W | Enabled interrupts. Direct overwrite. |
 
-Upper bits are hardware-reserved — the 11 meaningful positions are 0..=10.
+Upper bits are hardware-reserved -- the 11 meaningful positions are 0..=10.
 
 ## Source bits
 
@@ -32,7 +32,7 @@ Upper bits are hardware-reserved — the 11 meaningful positions are 0..=10.
 - Any bit set in `v` is **preserved**.
 - Any bit cleared in `v` is **cleared**.
 
-Software typically acknowledges source `s` by writing `!(1 << s)` — every bit set to 1 *except* the one being acknowledged.
+Software typically acknowledges source `s` by writing `!(1 << s)` -- every bit set to 1 *except* the one being acknowledged.
 
 **`I_MASK` is a straight write.** The written value becomes the new mask (with reserved bits dropped).
 
@@ -81,10 +81,10 @@ impl Irq {
 }
 ```
 
-Peripherals own the `raise` side — Timer N raises `IrqSource::Timer(N)`, the GPU raises `IrqSource::Gpu` when it needs to, etc. The CPU owns the `pending` side via its per-step sync.
+Peripherals own the `raise` side -- Timer N raises `IrqSource::Timer(N)`, the GPU raises `IrqSource::Gpu` when it needs to, etc. The CPU owns the `pending` side via its per-step sync.
 
 ## References
 
-- Nocash PSX-SPX — "Interrupts"
-- PCSX-Redux `src/core/psxhw.cc` — the `readHardwareRegister` / `writeHardwareRegister` paths for 0x1F801070/74
-- `emulator_core::irq` — our impl + the acknowledge-semantics unit tests
+- Nocash PSX-SPX -- "Interrupts"
+- PCSX-Redux `src/core/psxhw.cc` -- the `readHardwareRegister` / `writeHardwareRegister` paths for 0x1F801070/74
+- `emulator_core::irq` -- our impl + the acknowledge-semantics unit tests

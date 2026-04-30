@@ -1,6 +1,6 @@
 //! Quick parity scorecard: run each disc-backed scenario to 100M
 //! CPU steps and print the display hash. The Sony-logo display hash
-//! must match Redux's canonical `0xa3ac6881044333d0` — a value we've
+//! must match Redux's canonical `0xa3ac6881044333d0` -- a value we've
 //! verified pixel-exact for BIOS (no disc), Crash, Tekken, and
 //! WipEout 1. The BIOS logo is rendered identically regardless of
 //! which game's disc is inserted (the disc doesn't get accessed
@@ -11,7 +11,7 @@
 //! A mismatch here means our emulator has some game-specific
 //! rendering bug (wrong initial GPU state, mis-parsed CDROM TOC
 //! affecting BIOS init, etc.) that shows up before the logo even
-//! draws — worth investigating.
+//! draws -- worth investigating.
 //!
 //! ```bash
 //! cargo run -p emulator-core --example probe_all_games_100m --release

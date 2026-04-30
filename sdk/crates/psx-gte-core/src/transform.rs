@@ -5,7 +5,7 @@
 //! access (`mtc2!` / `ctc2!` macros) lives in `psx-gte`, which
 //! re-exports this module so callers can keep importing it from there.
 //!
-//! The PS1 has no hardware sin/cos — we ship a 65-entry quarter-sine
+//! The PS1 has no hardware sin/cos -- we ship a 65-entry quarter-sine
 //! lookup and derive the full range by reflection. Angles are in
 //! **256-per-revolution** units (`u16` with implicit wrap at 256)
 //! rather than radians or degrees, matching the convention most PSX
@@ -13,7 +13,7 @@
 //! quarter-table lookup is one mask away.
 //!
 //! Fixed-point conventions (inherited from the GTE):
-//! - Matrix cells: **1.3.12** signed — `0x1000` = 1.0.
+//! - Matrix cells: **1.3.12** signed -- `0x1000` = 1.0.
 //! - Translation / screen offset / H: integers in engine-chosen
 //!   scaling; the math here just passes them through.
 //! - Vectors: **1.3.12** `i16`; accumulator outputs are `i32` in MAC
@@ -23,7 +23,7 @@
 
 use crate::math::{Mat3I16, Vec3I16};
 
-/// Quarter-sine table — 65 entries (indices 0..=64) covering angles
+/// Quarter-sine table -- 65 entries (indices 0..=64) covering angles
 /// `0..=π/2` in 1.3.12. Full-range [`sin_1_3_12`] / [`cos_1_3_12`] use
 /// this plus quadrant reflection. Values were computed as
 /// `round(sin(i * π / 128) * 4096)`.
@@ -43,7 +43,7 @@ static QUARTER_SIN: [i16; 65] = [
 /// Sine of `angle` in 256-per-revolution units, returned in 1.3.12.
 ///
 /// Angles wrap modulo 256. Values are piecewise-linear approximations
-/// of `sin` — accurate to within ±1 LSB of the 1.3.12 representation,
+/// of `sin` -- accurate to within ±1 LSB of the 1.3.12 representation,
 /// which is good enough for real-time 3D but not for scientific use.
 #[inline]
 pub const fn sin_1_3_12(angle: u16) -> i16 {
@@ -72,7 +72,7 @@ pub const fn cos_1_3_12(angle: u16) -> i16 {
 
 impl Mat3I16 {
     /// Matrix × matrix, with 1.3.12 fixed-point scaling applied so the
-    /// output stays in 1.3.12. Saturates each cell to `i16` range —
+    /// output stays in 1.3.12. Saturates each cell to `i16` range --
     /// rotation compositions stay well within, but callers doing
     /// scale-by-100 before compose should watch for truncation.
     pub fn mul(&self, other: &Self) -> Self {
@@ -194,7 +194,7 @@ mod tests {
             let c = cos_1_3_12(angle as u16) as i32;
             let sum = s * s + c * c;
             let expected = 0x0100_0000;
-            // ±0.5% tolerance — quarter-sine table rounds each entry.
+            // ±0.5% tolerance -- quarter-sine table rounds each entry.
             let tolerance = expected / 200;
             assert!(
                 (sum - expected).abs() <= tolerance,

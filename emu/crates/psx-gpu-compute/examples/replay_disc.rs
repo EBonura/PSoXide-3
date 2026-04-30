@@ -1,4 +1,4 @@
-//! Headless validation of Phase C — boot a disc on the CPU
+//! Headless validation of Phase C -- boot a disc on the CPU
 //! rasterizer, run for some cycles, drain the cmd_log onto the
 //! compute backend, then compare CPU VRAM vs GPU VRAM.
 //!

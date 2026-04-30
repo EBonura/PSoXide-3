@@ -31,8 +31,8 @@ editor must not be forced to store borrowed runtime slices. The cooker is the
 contract boundary.
 
 `GridRoom` / `GridWorld` (the older "engine model" type) are now flagged
-**authoring / test helpers** in their doc comments. New runtime systems —
-collision, rendering, AI floor sampling — should grow on top of `RuntimeRoom`,
+**authoring / test helpers** in their doc comments. New runtime systems --
+collision, rendering, AI floor sampling -- should grow on top of `RuntimeRoom`,
 which holds zero owned state and decodes sectors / walls by value on demand.
 
 ## Authoring vs Runtime
@@ -59,9 +59,9 @@ Two concrete consequences:
 
 Same room data, two consumers, two read paths:
 
-* `RoomRender` — heights and splits for vertex emission, materials for tpage /
+* `RoomRender` -- heights and splits for vertex emission, materials for tpage /
   CLUT lookup, world-level lighting state.
-* `RoomCollision` — heights and splits for floor / ceiling sampling, walkable /
+* `RoomCollision` -- heights and splits for floor / ceiling sampling, walkable /
   solid bits for stop-or-pass decisions.
 
 Materials are render-only. Walkable / solid bits are collision-only. The two
@@ -71,7 +71,7 @@ walkability; a collision query cannot reach a tpage word).
 
 The cooker today writes one record per sector / wall, with both render and
 collision concerns interleaved. When the compact byte format lands, those two
-concerns split into separate tables — the cooker pipeline is already organized
+concerns split into separate tables -- the cooker pipeline is already organized
 by render-emit / collision-emit phases so that future split is a small change.
 
 ## Tomb Raider parallels
@@ -100,7 +100,7 @@ Two lessons we deliberately ignore for now:
   explicit face list per room because sector geometry alone doesn't capture
   decoration (statues, columns, water surface). PSoXide currently emits all
   faces from sector data; once decorative geometry lands, a face table is the
-  obvious shape — but the `RuntimeRoom` API will absorb it as
+  obvious shape -- but the `RuntimeRoom` API will absorb it as
   `RoomRender::faces()` rather than another concern on `SectorRender`.
 
 * **No item / entity table inside `.psxw`**. TR mixes statics into the room
@@ -179,14 +179,14 @@ active wire records.
 
 ## i16 Vertex Safety
 
-`SECTOR_SIZE * MAX_ROOM_WIDTH = 32 * 1024 = 32 768` — that's the i16 cliff.
+`SECTOR_SIZE * MAX_ROOM_WIDTH = 32 * 1024 = 32 768` -- that's the i16 cliff.
 A 32×32 room sits exactly on it; bigger rooms silently truncate.
 
 Editor preview: vertices are emitted relative to a per-frame `VIEW_ANCHOR`
 (the camera target). The GTE translation absorbs the offset via `cam_local`.
 Debug builds assert the relative coord fits i16; release saturates loudly via
 the same clamp. With sector_size 1024 this gives ±32 sectors of headroom from
-the camera target — comfortably the editor cap.
+the camera target -- comfortably the editor cap.
 
 Runtime: same trick, room-local i16 heights, room origin added during vertex
 emission. Keeps i16 vertex space valid for any room up to the budget cap.

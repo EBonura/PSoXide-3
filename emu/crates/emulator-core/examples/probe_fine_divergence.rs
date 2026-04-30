@@ -1,6 +1,6 @@
 //! Zoom in on a known-small divergence window by fast-forwarding
 //! both emulators silently to a start step, then capturing per-step
-//! records for a small window. Much faster than a full trace cache —
+//! records for a small window. Much faster than a full trace cache --
 //! a 10 K-step window costs ~0.3 s of tracing vs 14 GiB of cache.
 //!
 //! ```bash

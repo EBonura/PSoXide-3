@@ -257,7 +257,7 @@ pub struct GridFloorSample {
     pub height: i32,
 }
 
-/// One cooked grid room — **authoring / test helper**, not the
+/// One cooked grid room -- **authoring / test helper**, not the
 /// resident PSX runtime format.
 ///
 /// The room body holds `&[Option<GridSector<'a>>]` where each
@@ -266,7 +266,7 @@ pub struct GridFloorSample {
 /// engine-side code that wants direct access; **but six-pointer
 /// pre-decoded sectors are not what we want resident in PSX
 /// memory at scale**. The PSX target shape is `psx_asset::World<'a>`
-/// — flat byte tables decoded by-value on demand. Don't grow new
+/// -- flat byte tables decoded by-value on demand. Don't grow new
 /// runtime systems on top of `GridRoom`; build them on
 /// `psx_asset::World`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,7 +408,7 @@ fn mul_sector(delta: i32, amount: i32) -> i32 {
 /// Same authoring / test caveat as [`GridRoom`]: this is the
 /// engine-side helper, not the PSX-resident shape. PSX-resident
 /// world data is `psx_asset::World<'a>` (one room) plus a thin
-/// runtime wrapper — see [`RuntimeRoom`].
+/// runtime wrapper -- see [`RuntimeRoom`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridWorld<'a> {
     /// Rooms in the world.
@@ -433,7 +433,7 @@ impl<'a> GridWorld<'a> {
 /// PSX-resident wrapper over a parsed `.psxw` blob.
 ///
 /// Compared with [`GridRoom`], this type holds **only** the
-/// zero-copy `psx_asset::World<'a>` view — no pre-decoded sector
+/// zero-copy `psx_asset::World<'a>` view -- no pre-decoded sector
 /// array, no `Option<GridSector>` slice, no per-sector borrows.
 /// Sectors and walls decode by value on demand:
 ///
@@ -455,7 +455,7 @@ impl<'a> GridWorld<'a> {
 /// ```
 ///
 /// New runtime systems (collision, rendering, AI floor sampling)
-/// should grow on this type rather than `GridRoom` — `GridRoom`
+/// should grow on this type rather than `GridRoom` -- `GridRoom`
 /// stays for tests and authoring helpers only.
 #[derive(Copy, Clone, Debug)]
 pub struct RuntimeRoom<'a> {
@@ -540,7 +540,7 @@ impl<'a> RuntimeRoom<'a> {
 // over a single `RuntimeRoom`. Both views are zero-cost
 // `Copy` borrows; the v1 byte format keeps render + collision
 // fields in one record so today's cooker writes both streams
-// in one pass — but a caller that says
+// in one pass -- but a caller that says
 // `room.render().sector(...)` cannot accidentally branch on
 // `floor_walkable`, and a caller that says
 // `room.collision().sector(...)` cannot accidentally read a

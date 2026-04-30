@@ -1,4 +1,4 @@
-//! `showcase-room` — render a cooked `.psxw` on PS1 hardware.
+//! `showcase-room` -- render a cooked `.psxw` on PS1 hardware.
 //!
 //! End-to-end validation of the cooker → asset → runtime path:
 //! `build.rs` cooks the editor's starter room (3×3 stone room
@@ -7,7 +7,7 @@
 //! `psx_engine::draw_room` walks every populated sector through
 //! `WorldRenderPass::submit_textured_quad`.
 //!
-//! No character, no input-driven movement, no portals — D-pad
+//! No character, no input-driven movement, no portals -- D-pad
 //! orbits the camera around the room centre.
 
 #![no_std]
@@ -26,7 +26,7 @@ use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
 // `room.psxw` is produced by build.rs from the starter project.
-// Slot 0 = floor.psxt, slot 1 = brick-wall.psxt — pinned by the
+// Slot 0 = floor.psxt, slot 1 = brick-wall.psxt -- pinned by the
 // build-time assertion next to the cook call.
 static ROOM_PSXW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/room.psxw"));
 static FLOOR_BLOB: &[u8] = include_bytes!("../../../../assets/textures/floor.psxt");
@@ -55,7 +55,7 @@ const NEAR_Z: i32 = 64;
 const FAR_Z: i32 = 8192;
 const PROJECTION: WorldProjection = WorldProjection::new(SCREEN_CX, SCREEN_CY, FOCAL, NEAR_Z);
 
-// Room centre for a 3×3 sector_size=1024 room — half_w * S = 1536.
+// Room centre for a 3×3 sector_size=1024 room -- half_w * S = 1536.
 // Cells are corner-rooted at world (0, 0) by `draw_room`, so the
 // orbit target sits at the geometric centre.
 const ROOM_HALF_X: i32 = 1536;
@@ -96,7 +96,7 @@ static mut WORLD_COMMANDS: [WorldTriCommand; MAX_TEXTURED_TRIS] =
 struct Showcase {
     /// Parsed at `init` time; `None` until then so the const
     /// constructor stays legal. Render falls through silently
-    /// if parsing failed — no panic on hardware.
+    /// if parsing failed -- no panic on hardware.
     room: Option<RuntimeRoom<'static>>,
     camera_yaw: u16,
     camera_radius: i32,
@@ -116,7 +116,7 @@ impl Scene for Showcase {
     fn init(&mut self, _ctx: &mut Ctx) {
         upload_textures();
         // Parse once at boot. If the blob is malformed the field
-        // stays `None` and `render` skips the geometry pass —
+        // stays `None` and `render` skips the geometry pass --
         // beats panicking and locking the console.
         if let Ok(world) = AssetWorld::from_bytes(ROOM_PSXW) {
             self.room = Some(RuntimeRoom::from_world(world));
@@ -213,7 +213,7 @@ fn upload_textures() {
     upload_clut(brick_clut_rect, brick.clut_bytes());
 }
 
-/// Mirrors `upload_blend_clut` in showcase-textured-sprite — sets
+/// Mirrors `upload_blend_clut` in showcase-textured-sprite -- sets
 /// the 0x8000 (semi-transparency-disable) bit on every non-zero
 /// CLUT entry so opaque textures don't accidentally trigger the
 /// PSX's STP-bit blending path.

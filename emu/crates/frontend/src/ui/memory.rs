@@ -1,4 +1,4 @@
-//! Memory viewer panel — hex+ASCII dump of a 1 KiB window anchored
+//! Memory viewer panel -- hex+ASCII dump of a 1 KiB window anchored
 //! at a user-selectable address.
 //!
 //! Quick-jump buttons land the window at the canonical entry points
@@ -34,7 +34,7 @@ pub enum ViewMode {
 pub struct MemoryView {
     pub addr: u32,
     pub mode: ViewMode,
-    /// Address input as a string — kept separately so partial typing
+    /// Address input as a string -- kept separately so partial typing
     /// ("0x8001_") doesn't immediately clobber the numeric anchor.
     addr_input: String,
 }
@@ -51,7 +51,7 @@ impl Default for MemoryView {
 
 impl MemoryView {
     /// Move the viewer to `addr` and sync the text field. Alignment
-    /// depends on the current mode — 16-byte rows in hex, 4-byte rows
+    /// depends on the current mode -- 16-byte rows in hex, 4-byte rows
     /// in disasm.
     pub fn jump_to(&mut self, addr: u32) {
         let mask = match self.mode {
@@ -145,7 +145,7 @@ fn draw_header(
         }
     });
 
-    // Mode toggle — separate row so it doesn't fight for space with
+    // Mode toggle -- separate row so it doesn't fight for space with
     // the nav buttons.
     ui.horizontal(|ui| {
         ui.radio_value(&mut view.mode, ViewMode::Hex, "Hex");
@@ -183,7 +183,7 @@ fn draw_hex_dump(
                 let text = format_row(bus, row_addr, has_bp, has_pc);
 
                 let color = match (has_pc, has_bp) {
-                    // PC wins over BP — the arrow marker is the one we
+                    // PC wins over BP -- the arrow marker is the one we
                     // most want to eyeball.
                     (true, _) => Some(egui::Color32::from_rgb(80, 200, 120)),
                     (false, true) => Some(theme::ACCENT),

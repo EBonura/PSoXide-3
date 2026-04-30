@@ -1,7 +1,7 @@
 //! Cooked-model bundle registration + GLB import.
 //!
-//! Two entry points feed the same end product —
-//! [`ResourceData::Model`] — from different sources:
+//! Two entry points feed the same end product --
+//! [`ResourceData::Model`] -- from different sources:
 //!
 //! * [`register_cooked_model_bundle`] adopts an existing
 //!   `bundle_dir/` containing one cooked `.psxmdl`, optionally a
@@ -15,7 +15,7 @@
 //!
 //! Both paths validate every blob through `psx_asset` parsers and
 //! confirm animation joint counts match the model's joint count
-//! before creating the resource — bad bundles never produce a
+//! before creating the resource -- bad bundles never produce a
 //! half-broken Model entry.
 
 use std::path::{Path, PathBuf};
@@ -73,7 +73,7 @@ pub struct AnimationClipStats {
     /// Sample rate in Hz from the clip header.
     pub sample_rate_hz: u16,
     /// `false` when the clip's joint count differs from the
-    /// owning model — the inspector flags this and the cooker
+    /// owning model -- the inspector flags this and the cooker
     /// refuses such bundles.
     pub valid_for_model: bool,
 }
@@ -89,7 +89,7 @@ pub struct ModelTextureStats {
     pub width: u16,
     /// Texel height.
     pub height: u16,
-    /// Bits per pixel — `4`, `8`, or `15`.
+    /// Bits per pixel -- `4`, `8`, or `15`.
     pub depth: u8,
     /// CLUT entry count (`16` for 4bpp, `256` for 8bpp, `0`
     /// for direct 15bpp).
@@ -258,7 +258,7 @@ pub enum ModelImportError {
         detail: String,
     },
     /// An animation's joint count differs from the model's joint
-    /// count — they would render scrambled frames at runtime.
+    /// count -- they would render scrambled frames at runtime.
     JointCountMismatch {
         /// Clip path.
         path: PathBuf,
@@ -408,7 +408,7 @@ pub fn register_cooked_model_bundle(
     let texture_path = psxt.pop();
 
     // Validate the model + texture + every animation. Failure
-    // here means the resource is never created — we never leave
+    // here means the resource is never created -- we never leave
     // a half-broken `Model` entry in `project.resources`.
     let model_bytes = std::fs::read(&model_path).map_err(|e| ModelImportError::Io {
         path: model_path.clone(),
@@ -486,7 +486,7 @@ pub fn register_cooked_model_bundle(
 ///
 /// Existing bundle directories are accepted only when they
 /// contain exactly the same kinds of files this importer
-/// produces — anything else and the import refuses rather than
+/// produces -- anything else and the import refuses rather than
 /// clobbering user data.
 pub fn import_glb_model(
     project: &mut ProjectDocument,
@@ -561,7 +561,7 @@ pub fn import_glb_model(
 fn clip_name_from_path(path: &Path) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
     // Bundle-prefix stripping: pick the longest known model
-    // prefix that the stem starts with. This is heuristic — when
+    // prefix that the stem starts with. This is heuristic -- when
     // we don't recognise the prefix we keep the full stem so the
     // user can rename in the inspector.
     let parent_name = path
@@ -636,7 +636,7 @@ mod tests {
     use super::*;
     use crate::ProjectDocument;
 
-    /// Layout of a synthetic bundle dir for tests — caller
+    /// Layout of a synthetic bundle dir for tests -- caller
     /// passes byte slices for each file kind, helper writes them
     /// next to a fresh tempdir.
     fn make_bundle(
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn multiple_models_fail() {
         let mut project = ProjectDocument::starter();
-        // Two models — content doesn't matter because the
+        // Two models -- content doesn't matter because the
         // duplicate detection happens before parsing.
         let bogus = b"PSMDbogus";
         let dir = make_bundle("multi-model", Some(bogus), 2, &[], &[]);

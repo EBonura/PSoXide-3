@@ -43,7 +43,7 @@ pub(super) fn validate_grid_budget(grid: &WorldGrid) -> Result<(), WorldGridCook
             limit: MAX_ROOM_DEPTH,
         });
     }
-    // Per-edge wall stack — caught at the source rather than
+    // Per-edge wall stack -- caught at the source rather than
     // after wall records have been laid out, so the error
     // message points at the authored sector.
     for x in 0..grid.width {

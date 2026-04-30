@@ -17,7 +17,7 @@ members = [
 ]
 
 # The examples are built against the MIPS target via a separate
-# nightly toolchain — keep them out of the main workspace so
+# nightly toolchain -- keep them out of the main workspace so
 # `cargo check` in the default (host) target doesn't try to compile
 # bare-metal binaries on the wrong target.
 exclude = ["examples"]

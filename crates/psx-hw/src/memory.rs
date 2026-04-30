@@ -16,7 +16,7 @@
 /// Strip the segment bits from a virtual address to get the physical address.
 ///
 /// Valid for KUSEG, KSEG0, and KSEG1. KSEG2 addresses (≥ `0xC000_0000`)
-/// do not participate in normal memory accesses — they are reserved for
+/// do not participate in normal memory accesses -- they are reserved for
 /// the cache-control register.
 ///
 /// ```

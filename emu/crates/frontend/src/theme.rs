@@ -1,4 +1,4 @@
-//! UI theme — charcoal background, teal accent, VT323 monospace, Lucide icons.
+//! UI theme -- charcoal background, teal accent, VT323 monospace, Lucide icons.
 //!
 //! Ported from PSoXide-2's theme, itself derived from the Bonnie-32 editor.
 //! Same palette and typography across both debug panels and the Menu overlay

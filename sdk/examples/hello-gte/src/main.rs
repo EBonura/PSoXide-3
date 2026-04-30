@@ -1,4 +1,4 @@
-//! `hello-gte` — spin a 3D cube via the GTE, using the SDK math layer.
+//! `hello-gte` -- spin a 3D cube via the GTE, using the SDK math layer.
 //!
 //! Reads like a normal 3D engine: build a rotation, load it, project
 //! vertices, draw edges. Rotation spins yaw × pitch so the cube's
@@ -9,7 +9,7 @@
 //! Edges drawn via `gpu::draw_line_mono` (GP0 0x40, real diagonal
 //! rasteriser). The previous version of this example used
 //! `fill_rect`-per-pixel, which the PSX's GP0 0x02 fill primitive
-//! rounds to 16-pixel X boundaries — the result was blocky noise
+//! rounds to 16-pixel X boundaries -- the result was blocky noise
 //! rather than a visible wireframe.
 
 #![no_std]
@@ -23,7 +23,7 @@ use psx_gte::scene;
 use psx_rt::tty;
 
 /// Eight corners of a unit cube, centred at the origin, in 1.3.12
-/// fixed point — `0x0800` = 0.5.
+/// fixed point -- `0x0800` = 0.5.
 const CUBE_VERTS: [Vec3I16; 8] = [
     Vec3I16::new(-0x0800, -0x0800, -0x0800),
     Vec3I16::new(0x0800, -0x0800, -0x0800),
@@ -85,7 +85,7 @@ fn main() {
             projected[i] = (p.sx, p.sy);
         }
 
-        // Twelve real GPU lines — GP0 0x40.
+        // Twelve real GPU lines -- GP0 0x40.
         for &(a, b) in &CUBE_EDGES {
             let (ax, ay) = projected[a];
             let (bx, by) = projected[b];

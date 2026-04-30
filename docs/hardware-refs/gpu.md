@@ -46,12 +46,12 @@ opcodes cover display configuration and DMA direction.
 
 Bits 26/27/28 are the "ready" flags BIOS + games spin on before
 sending commands. A "soft GPU" (non-cycle-accurate) keeps them
-permanently set — PCSX-Redux and PSoXide-2 both do this, and our
+permanently set -- PCSX-Redux and PSoXide-2 both do this, and our
 Phase 2h impl follows suit.
 
 Bit 25 is **computed per read** from the DMA-direction bits:
 - Off: 0
-- FIFO: 1 (always — FIFO can always accept)
+- FIFO: 1 (always -- FIFO can always accept)
 - CPU→GPU: copy of bit 28
 - GPU→CPU: copy of bit 27
 
@@ -79,14 +79,14 @@ opcode + colour, followed by 2–12 additional words (vertices,
 UVs, extra colours). A full GP0 decoder implements a FIFO state
 machine: after the primary word the GPU knows how many more words
 to expect and accumulates them before acting. Our Phase 2h impl
-accepts and discards the primary word only — full FIFO arrives
+accepts and discards the primary word only -- full FIFO arrives
 when we need to render.
 
 ## GP1 command space
 
 | Opcode | Action |
 |---|---|
-| `0x00` | Reset GPU — clears everything, restores defaults |
+| `0x00` | Reset GPU -- clears everything, restores defaults |
 | `0x01` | Reset command buffer |
 | `0x02` | Acknowledge GPU interrupt |
 | `0x03` | Display enable (bit 0: 0 = on, 1 = off) |
@@ -144,7 +144,7 @@ Each of these is its own milestone-A subtask.
 
 ## References
 
-- Nocash PSX-SPX — "GPU"
-- PCSX-Redux `src/core/gpu.cc` + `src/gpu/soft/` — our primary reference oracle
-- PSoXide-2 `emulator/gpu/` — still worth reading for rasterizer design
-- `emulator_core::gpu` — our impl
+- Nocash PSX-SPX -- "GPU"
+- PCSX-Redux `src/core/gpu.cc` + `src/gpu/soft/` -- our primary reference oracle
+- PSoXide-2 `emulator/gpu/` -- still worth reading for rasterizer design
+- `emulator_core::gpu` -- our impl

@@ -1,7 +1,7 @@
 //! Side-load hello-gte and dump N frames to PPM so we can SEE what
 //! the cube actually looks like on screen. Hash-based milestone
 //! tests don't catch "visible garbage that happens to be
-//! deterministic" — only a human looking at a rendered frame does.
+//! deterministic" -- only a human looking at a rendered frame does.
 //!
 //! ```bash
 //! cargo run -p emulator-core --example probe_hello_gte_frames --release
@@ -55,7 +55,7 @@ fn main() {
 
 /// Print every GP0 0x40 (mono line) packet from `cmd_log`. Lets us
 /// see the actual screen-space coordinates the example hands the
-/// GPU — if they're all at (0, 0) or off-screen, the GTE
+/// GPU -- if they're all at (0, 0) or off-screen, the GTE
 /// projection is producing garbage.
 fn dump_gp0_lines(bus: &Bus, frame: u64) {
     eprintln!();

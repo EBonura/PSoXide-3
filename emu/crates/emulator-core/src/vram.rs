@@ -1,4 +1,4 @@
-//! VRAM — 1 MiB of 16bpp (5:5:5:1) video memory, arranged as 1024×512.
+//! VRAM -- 1 MiB of 16bpp (5:5:5:1) video memory, arranged as 1024×512.
 //!
 //! Ported verbatim from PSoXide-2's GPU crate (since there is no GPU crate
 //! here yet). When the GPU subsystem lands, `Vram` will become owned by
@@ -57,7 +57,7 @@ impl Vram {
     ///
     /// Full-range 5-to-8-bit expansion: `(v << 3) | (v >> 2)` maps 0→0 and
     /// 31→255. The naive `v << 3` only reaches 248, producing visibly
-    /// dimmer whites — a subtle bug PSoXide-2 learned the hard way.
+    /// dimmer whites -- a subtle bug PSoXide-2 learned the hard way.
     pub fn to_rgba8(&self, x_start: u16, y_start: u16, width: u16, height: u16) -> Vec<u8> {
         let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
         for y in y_start..y_start + height {
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn rgba_expansion_reaches_full_range() {
         let mut vram = Vram::new();
-        vram.set_pixel(0, 0, 0x7FFF); // all 31s — should be white
+        vram.set_pixel(0, 0, 0x7FFF); // all 31s -- should be white
         let rgba = vram.to_rgba8(0, 0, 1, 1);
         assert_eq!(&rgba[..3], &[0xFF, 0xFF, 0xFF]);
     }

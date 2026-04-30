@@ -1,4 +1,4 @@
-//! `breakout` — mini-game #2, ported to the `psx-engine`
+//! `breakout` -- mini-game #2, ported to the `psx-engine`
 //! Scene/App framework.
 //!
 //! Same classic brick-buster: paddle at the bottom, 40-brick
@@ -11,13 +11,13 @@
 //! `Scene::init` does SPU setup + font upload + `reset_match`;
 //! `Scene::update` integrates physics and state transitions;
 //! `Scene::render` builds the OT + HUD. The per-game `frame`
-//! counter that breakout tracked by hand is gone — the engine's
+//! counter that breakout tracked by hand is gone -- the engine's
 //! [`Ctx::frame`] replaces it.
 //!
 //! What stays in `static mut`: the DMA arena (OT + RECTS +
 //! BG_QUAD). Those need fixed bus addresses across frames so the
-//! DMA walker can pick them up. Everything else — phase, bricks,
-//! particles, shake, trail — is a field on the scene, accessed
+//! DMA walker can pick them up. Everything else -- phase, bricks,
+//! particles, shake, trail -- is a field on the scene, accessed
 //! through `&mut self` instead of `unsafe { &mut GAME }`.
 //!
 //! Originally `sdk/examples/game-breakout/`.
@@ -353,7 +353,7 @@ impl Scene for Breakout {
         self.ball_x += self.ball_vx;
         self.ball_y += self.ball_vy;
 
-        // Wall collisions (L/R/top; no bottom wall — losing is the bottom).
+        // Wall collisions (L/R/top; no bottom wall -- losing is the bottom).
         if self.ball_x <= BORDER_W as i16 {
             self.ball_x = BORDER_W as i16;
             self.ball_vx = self.ball_vx.abs();
@@ -425,7 +425,7 @@ impl Breakout {
 
         let (shake_dx, shake_dy) = self.shake.tick();
 
-        // Slot 7 (back) — gradient background.
+        // Slot 7 (back) -- gradient background.
         *bg = QuadGouraud::new(
             [
                 (0, 0),
@@ -442,7 +442,7 @@ impl Breakout {
         );
         ot.add(7, bg, QuadGouraud::WORDS);
 
-        // Slot 6 — side borders.
+        // Slot 6 -- side borders.
         rects[0] = RectFlat::new(shake_dx, 0, BORDER_W, SCREEN_H as u16, 140, 140, 180);
         rects[1] = RectFlat::new(
             SCREEN_W - BORDER_W as i16 + shake_dx,
@@ -456,7 +456,7 @@ impl Breakout {
         ot.add(6, &mut rects[0], RectFlat::WORDS);
         ot.add(6, &mut rects[1], RectFlat::WORDS);
 
-        // Slot 4 — bricks.
+        // Slot 4 -- bricks.
         let mut idx = 2;
         for row in 0..ROWS {
             let (r, gc, b) = ROW_COLORS[row];
@@ -473,7 +473,7 @@ impl Breakout {
             }
         }
 
-        // Slot 3 — particles. Reserve 6 trailing slots for
+        // Slot 3 -- particles. Reserve 6 trailing slots for
         // paddle + ball + trail so particles don't starve them.
         let particle_budget = rects.len().saturating_sub(idx + 6);
         let wrote = self.particles.render_into_ot(
@@ -484,7 +484,7 @@ impl Breakout {
         );
         idx += wrote;
 
-        // Slot 2 — ball trail (only during Playing).
+        // Slot 2 -- ball trail (only during Playing).
         if self.phase == Phase::Playing {
             for i in 0..TRAIL_LEN {
                 let slot_idx = (self.trail_head as usize + i) % TRAIL_LEN;
@@ -503,7 +503,7 @@ impl Breakout {
             }
         }
 
-        // Slot 1 — paddle (flashes bright after ball hit).
+        // Slot 1 -- paddle (flashes bright after ball hit).
         let (pr, pg, pb) = if self.paddle_flash_frames > 0 {
             (255, 255, 200)
         } else {
@@ -521,7 +521,7 @@ impl Breakout {
         ot.add(1, &mut rects[idx], RectFlat::WORDS);
         idx += 1;
 
-        // Slot 0 (front) — ball.
+        // Slot 0 (front) -- ball.
         rects[idx] = RectFlat::new(
             self.ball_x + shake_dx,
             self.ball_y + shake_dy,

@@ -3,7 +3,7 @@
 //! ## Design
 //!
 //! - **Binary (postcard)**, because a typical save state is
-//!   ~2 MiB and RON would balloon it 5-10× for no benefit — nobody
+//!   ~2 MiB and RON would balloon it 5-10× for no benefit -- nobody
 //!   hand-edits save states.
 //! - **Explicit file header** with a 8-byte magic (`PSOX001\0`), a
 //!   format version, and a human-readable creator tag.
@@ -17,7 +17,7 @@
 //! This format is PSoXide-specific. The PS1 emulator community
 //! hasn't converged on a shared save-state schema
 //! (Duckstation/PCSX-Redux/Beetle/Mednafen all roll their own),
-//! so we don't either — at least not at format level. Cross-load
+//! so we don't either -- at least not at format level. Cross-load
 //! with other emulators would live as an explicit converter
 //! module, when/if demand lands.
 //!
@@ -87,11 +87,11 @@ pub enum SaveStateError {
         max: u32,
     },
     /// Postcard decode failed. Usually means a corrupt or
-    /// partially-written file — but it can also mean the schema
+    /// partially-written file -- but it can also mean the schema
     /// changed mid-development without a version bump.
     #[error("save-state decode failed: {0}")]
     Decode(String),
-    /// Postcard encode failed. Extremely unlikely in practice —
+    /// Postcard encode failed. Extremely unlikely in practice --
     /// postcard only fails on custom serde impls that return errs.
     #[error("save-state encode failed: {0}")]
     Encode(String),
@@ -106,11 +106,11 @@ pub enum SaveStateError {
 /// so any rearrangement silently breaks old files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaveStateHeader {
-    /// Magic bytes — must equal [`SAVESTATE_MAGIC`].
+    /// Magic bytes -- must equal [`SAVESTATE_MAGIC`].
     pub magic: [u8; 8],
     /// Format version of the payload that follows.
     pub format_version: u32,
-    /// Creator tag — human-readable "what produced this save."
+    /// Creator tag -- human-readable "what produced this save."
     /// Displayed by the UI; useful when debugging cross-build
     /// format drift.
     pub creator: String,
@@ -118,17 +118,17 @@ pub struct SaveStateHeader {
     /// created. Displayed by the UI.
     pub created_at: u64,
     /// ID of the game this save belongs to. Matches the `id` in
-    /// [`crate::LibraryEntry`] — lets the loader verify the user
+    /// [`crate::LibraryEntry`] -- lets the loader verify the user
     /// didn't cross-load slot0.psx from Game A into Game B (which
     /// would crash spectacularly).
     pub game_id: String,
-    /// Absolute instruction count at the moment of the save — for
+    /// Absolute instruction count at the moment of the save -- for
     /// diagnostics / UI.
     pub cpu_tick: u64,
 }
 
 /// Version-1 save-state payload. Kept intentionally abstract here
-/// — the actual CPU + Bus state types live in `emulator-core`, so
+/// -- the actual CPU + Bus state types live in `emulator-core`, so
 /// pinning the concrete types in this module would create a
 /// circular dependency. Callers supply their own concrete
 /// serializable state (typically a `(Cpu, Bus)` newtype) and pass
@@ -142,7 +142,7 @@ pub struct SaveStateV1<T> {
     /// File header (magic + version + metadata).
     pub header: SaveStateHeader,
     /// Emulator state payload. The generic is supplied by the
-    /// caller — typically a serializable wrapper over
+    /// caller -- typically a serializable wrapper over
     /// `(Cpu, Bus)`.
     pub payload: T,
 }
@@ -203,7 +203,7 @@ where
     }
 
     /// Write atomically to `path`. Writes to `<path>.tmp` first,
-    /// renames on success — no half-written save-state file ever
+    /// renames on success -- no half-written save-state file ever
     /// lands on disk, which is critical because partial writes
     /// deserialise as garbage that corrupts user progress.
     pub fn write_to(&self, path: &Path) -> Result<(), SaveStateError> {
@@ -257,10 +257,10 @@ where
 /// Quick header-only peek: read just enough of `path` to pull the
 /// creation time, game ID, and cpu_tick out for a slot-list UI.
 /// Avoids deserializing the full multi-MiB payload when all we
-/// want to do is show "Slot 0 — Crash — 2026-04-18".
+/// want to do is show "Slot 0 -- Crash -- 2026-04-18".
 pub fn peek_header(path: &Path) -> Result<SaveStateHeader, SaveStateError> {
     // We still have to postcard-decode because postcard's format
-    // isn't random-access — but we decode only the header (a small
+    // isn't random-access -- but we decode only the header (a small
     // struct) by using a wrapper that ignores the tail. postcard's
     // `take_from_bytes` returns the unread remainder; we use that
     // to stop early once the header is in hand.
@@ -294,7 +294,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
 
-    // Stand-in for the real emulator state — keeps these tests
+    // Stand-in for the real emulator state -- keeps these tests
     // from pulling emulator-core in as a dep. In the frontend
     // we'll wrap the actual (Cpu, Bus) similarly.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

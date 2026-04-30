@@ -129,7 +129,7 @@ pub enum WorldGridCookError {
     /// Diagonal walls (`NorthWestSouthEast` / `NorthEastSouthWest`)
     /// aren't supported by the v1 cooker / runtime. The data model
     /// has the slots so authoring can land later, but render +
-    /// picking + collision aren't consistent yet — better to fail
+    /// picking + collision aren't consistent yet -- better to fail
     /// loud than ship half-working diagonals.
     UnsupportedDiagonalWall {
         /// Sector X coordinate.
@@ -177,7 +177,7 @@ pub enum WorldGridCookError {
         /// Cap.
         limit: usize,
     },
-    /// Two cells claim the same physical wall — `East(x, z)`
+    /// Two cells claim the same physical wall -- `East(x, z)`
     /// and `West(x+1, z)` describe the same vertical face, and
     /// authoring both would double-render and double-collide.
     /// The cooker rejects rather than silently dedup-pick: a
@@ -213,7 +213,7 @@ pub enum WorldGridCookError {
         /// Required step.
         quantum: i32,
     },
-    /// A face has a `dropped_corner` set — the editor models it
+    /// A face has a `dropped_corner` set -- the editor models it
     /// as a triangle, but the v1 `.psxw` wire format only carries
     /// quad faces. Render / pick / collision in the editor live
     /// preview already honour the drop, but the cooked runtime
@@ -542,8 +542,8 @@ fn cook_sector(
     // already separates via `psx_engine::RoomRender` /
     // `psx_engine::RoomCollision`:
     //
-    //   render    — heights, splits, material slot
-    //   collision — heights, splits, walkable / solid bits
+    //   render    -- heights, splits, material slot
+    //   collision -- heights, splits, walkable / solid bits
     //
     // Heights and splits feed both views. Materials are render-
     // only (no collision branches on tpage). `walkable` /
@@ -551,7 +551,7 @@ fn cook_sector(
     // walkability). When v2 lands and the byte format splits
     // render and collision into distinct tables, this function
     // peels into `cook_sector_render` + `cook_sector_collision`
-    // — the call structure is already grouped that way below.
+    // -- the call structure is already grouped that way below.
 
     // -------- render-relevant cook --------
     let floor = sector
@@ -589,7 +589,7 @@ fn cook_sector(
     // -------- collision-relevant cook --------
     // `walkable` / `solid` are forwarded through the cooked
     // structs by `cook_horizontal_face` / `cook_walls` already
-    // — listed here only so the future v2 split has an obvious
+    // -- listed here only so the future v2 split has an obvious
     // landing spot for any extra collision-only data
     // (sector logic offset, traversal portal slots, …).
 
@@ -639,7 +639,7 @@ fn cook_walls(
     let mut cooked = CookedGridWalls::default();
     // Diagonal walls fail loud: the data model has the slots
     // (so authoring + serialization works), but render / pick /
-    // collision aren't consistent yet — better to refuse to
+    // collision aren't consistent yet -- better to refuse to
     // cook than ship half-supported geometry.
     for direction in GridDirection::DIAGONAL {
         if !walls.get(direction).is_empty() {
@@ -649,7 +649,7 @@ fn cook_walls(
     // Cardinal walls only. Duplicate physical walls (east of
     // (x,z) and west of (x+1,z) describe the same face) are
     // already rejected upstream by `validate_no_duplicate_walls`
-    // — by the time we reach this loop the grid is guaranteed
+    // -- by the time we reach this loop the grid is guaranteed
     // to claim each physical edge from at most one side.
     for direction in GridDirection::CARDINAL {
         for wall in walls.get(direction) {
@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(world.sector_size(), cooked.sector_size);
         assert_eq!(world.material_count() as usize, cooked.materials.len());
 
-        // Sector (0,0) — the starter has a floor + perimeter walls
+        // Sector (0,0) -- the starter has a floor + perimeter walls
         // in its first populated cell, so this exercises both
         // decoded paths without assuming a fixed starter shape.
         let (sx, sz, _) = cooked
@@ -1118,7 +1118,7 @@ mod tests {
         // shipping half-supported geometry.
         let project = ProjectDocument::starter();
         let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
-        // No floor — the diagonal-wall check has to fire before
+        // No floor -- the diagonal-wall check has to fire before
         // any material validation in the rest of the sector.
         grid.add_wall(
             0,

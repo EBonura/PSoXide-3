@@ -1,4 +1,4 @@
-//! Minimal ISO 9660 writer — enough to produce a bootable PS1 disc
+//! Minimal ISO 9660 writer -- enough to produce a bootable PS1 disc
 //! image from a PSX-EXE + a `SYSTEM.CNF`.
 //!
 //! This is **not** a full ISO 9660 implementation. Features deliberately
@@ -14,7 +14,7 @@
 //!
 //! - A 2048-byte-per-sector "cooked" image (`.iso`). Every emulator
 //!   will boot this directly. Real PlayStation hardware requires a
-//!   raw 2352-byte `.bin` with CD-ROM EDC/ECC — conversion is a
+//!   raw 2352-byte `.bin` with CD-ROM EDC/ECC -- conversion is a
 //!   post-step (tools like `cdrdao` or `bchunk` do it). This crate
 //!   focuses on the filesystem layout; upgrading to raw-sector output
 //!   is purely a sector-encoding change in [`IsoBuilder::build`].
@@ -54,7 +54,7 @@ pub const SECTOR_SIZE: usize = 2048;
 pub const RAW_SECTOR_SIZE: usize = 2352;
 
 /// Fixed ISO 9660 date used for every volume / file timestamp. Games
-/// don't read these, so any valid date works — we use 2026-01-01.
+/// don't read these, so any valid date works -- we use 2026-01-01.
 const FIXED_VOLUME_DATE: &[u8; 17] = b"2026010100000000\x00";
 /// 7-byte directory record date: year-since-1900, month, day, hour,
 /// minute, second, GMT offset in 15-minute units. 126 = 2026.
@@ -154,7 +154,7 @@ impl IsoBuilder {
         root_extent.extend_from_slice(&dir_record(lba_root_dir, SECTOR_SIZE as u32, &[0], true));
         // ".." entry (parent = self for root).
         root_extent.extend_from_slice(&dir_record(lba_root_dir, SECTOR_SIZE as u32, &[1], true));
-        // File entries — stored as ASCII bytes from the placement names.
+        // File entries -- stored as ASCII bytes from the placement names.
         for p in &placements {
             root_extent.extend_from_slice(&dir_record(
                 p.lba,
@@ -195,11 +195,11 @@ impl IsoBuilder {
         write_be_u32(&mut pvd[148..152], lba_m_path);
         // pvd[152..156] = 0 (optional M-path table)
 
-        // Root directory record — 34 bytes embedded at offset 156.
+        // Root directory record -- 34 bytes embedded at offset 156.
         let root_record = dir_record(lba_root_dir, SECTOR_SIZE as u32, &[0], true);
         pvd[156..156 + 34].copy_from_slice(&root_record);
 
-        // Volume set / publisher / prepare / app / file identifiers —
+        // Volume set / publisher / prepare / app / file identifiers --
         // all blank-filled per spec.
         fill_ascii(&mut pvd[190..318], ""); // volume set id (128 bytes)
         fill_ascii(&mut pvd[318..446], ""); // publisher id
@@ -240,7 +240,7 @@ impl IsoBuilder {
         out
     }
 
-    /// Serialise as a raw .bin image — 2352-byte Mode-2 Form-1 sectors
+    /// Serialise as a raw .bin image -- 2352-byte Mode-2 Form-1 sectors
     /// with sync pattern, BCD MSF header, and subheader set. EDC/ECC
     /// bytes are left zero: PSoXide's CDROM emulation and most
     /// desktop emulators don't verify them, and a real PS1 lens
@@ -273,7 +273,7 @@ impl IsoBuilder {
             sector[14] = bin_to_bcd(frame);
             sector[15] = 0x02; // Mode 2
                                // Subheader: FILE=0, CHAN=0, SUBMODE=0x08 (data), CI=0
-                               // (repeated twice — Mode 2 requires the sub-header pair).
+                               // (repeated twice -- Mode 2 requires the sub-header pair).
             sector[16] = 0x00;
             sector[17] = 0x00;
             sector[18] = 0x08;
@@ -282,7 +282,7 @@ impl IsoBuilder {
             sector[21] = 0x00;
             sector[22] = 0x08;
             sector[23] = 0x00;
-            // User data — copy the cooked sector's 2048 bytes.
+            // User data -- copy the cooked sector's 2048 bytes.
             sector[24..24 + SECTOR_SIZE]
                 .copy_from_slice(&cooked[cooked_start..cooked_start + SECTOR_SIZE]);
             // EDC (2072..2076) + ECC (2076..2352) left zero.
@@ -306,7 +306,7 @@ pub fn default_system_cnf() -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------
-// Helpers — byte-layer encoding of ISO 9660 primitives.
+// Helpers -- byte-layer encoding of ISO 9660 primitives.
 // ---------------------------------------------------------------------
 
 fn write_le_u32(dst: &mut [u8], value: u32) {
@@ -356,7 +356,7 @@ fn iso_file_identifier(name: &str) -> String {
 }
 
 /// Encode a single directory record. `ident` is the raw identifier
-/// bytes — a single `\x00` for ".", single `\x01` for "..", or the
+/// bytes -- a single `\x00` for ".", single `\x01` for "..", or the
 /// ASCII-uppercase filename otherwise.
 fn dir_record(extent_lba: u32, size: u32, ident: &[u8], is_dir: bool) -> Vec<u8> {
     let ident_len = ident.len() as u8;

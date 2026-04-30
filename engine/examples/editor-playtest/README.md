@@ -10,7 +10,7 @@ into this crate's `generated/` directory:
 
 ```
 generated/
-  level_manifest.rs              Rust source — psx_level records + include_bytes!
+  level_manifest.rs              Rust source -- psx_level records + include_bytes!
   rooms/
     room_NNN.psxw                cooked room geometry (one per Room node)
   textures/
@@ -29,7 +29,7 @@ current room, resolves the room's world asset through `ASSETS`,
 parses it via [`psx_asset::World::from_bytes`], wraps it in a
 [`psx_engine::RuntimeRoom`], and uploads the room's texture
 assets through a tiny no-alloc [`psx_level::ResidencyManager`].
-Materials are built from `MATERIALS` records — the runtime no
+Materials are built from `MATERIALS` records -- the runtime no
 longer hardcodes any starter texture binding; `local_slot →
 texture_asset` is the source of truth.
 
@@ -53,7 +53,7 @@ For headless / CI workflows, these Make targets remain:
 
 ```sh
 # Cook the active editor project (or starter, with no args) into
-# generated/. Destructive — overwrites whatever was there.
+# generated/. Destructive -- overwrites whatever was there.
 make cook-playtest [PROJECT=path/to/project.ron]
 
 # Build the EXE against whatever's in generated/ right now.
@@ -85,8 +85,8 @@ generated/
 
 From a fresh clone:
 
-1. `make build-editor-playtest` — works from the placeholder.
-2. Editor -> "Play" — cooks your current scene, builds, and runs inside the editor
+1. `make build-editor-playtest` -- works from the placeholder.
+2. Editor -> "Play" -- cooks your current scene, builds, and runs inside the editor
    3D viewport until you press Stop.
 
 ## Scope
@@ -97,7 +97,7 @@ streaming, no enemies, no AI, and no entity scripting.
 Triggers / Portals / AudioSources surface as warnings during
 cook and are skipped from the runtime manifest.
 
-The runtime renders a player character at the spawn — driven
+The runtime renders a player character at the spawn -- driven
 by the Character resource the Player Spawn references. The
 camera follows behind, and analog movement + Circle drive
 idle / walk / run animations on the character's authored
@@ -107,7 +107,7 @@ for the full Character → cook → runtime contract.
 What it *does* render:
 
 - **Rooms** via `psx_engine::draw_room`. Material slots come
-  from generated `MATERIALS` records — no hardcoded
+  from generated `MATERIALS` records -- no hardcoded
   floor.psxt / brick-wall.psxt path remains.
 - **Animated model instances** via the same
   `WorldRenderPass::submit_textured_model` path
@@ -117,7 +117,7 @@ What it *does* render:
   `.psxmdl` + `.psxt` + `.psxanim`, uploads the atlas, and
   draws the textured animated model. See
   [`docs/editor-model-authoring.md`](../../../docs/editor-model-authoring.md).
-- **Room-level lighting** — every `Light` node cooks into a
+- **Room-level lighting** -- every `Light` node cooks into a
   `PointLightRecord`; the runtime accumulates contributions
   at the room centre and modulates each room material's tint.
   Linear falloff, no shadows, models are not lit yet. The
@@ -129,25 +129,25 @@ What it *does* render:
 
 ## Files
 
-- `src/main.rs` — Scene impl, camera, input, draw call, residency wiring.
-- `Cargo.toml` — standalone PSX-target crate (its own `[workspace]`).
-- `.cargo/config.toml` — pins `target = "mipsel-sony-psx"`.
-- `generated/level_manifest.rs` — generated; do not edit.
-- `generated/rooms/*.psxw` — generated; do not edit; gitignored.
-- `generated/textures/*.psxt` — generated; do not edit; gitignored.
-- `generated/models/model_NNN_*/` — per-model folders carrying
+- `src/main.rs` -- Scene impl, camera, input, draw call, residency wiring.
+- `Cargo.toml` -- standalone PSX-target crate (its own `[workspace]`).
+- `.cargo/config.toml` -- pins `target = "mipsel-sony-psx"`.
+- `generated/level_manifest.rs` -- generated; do not edit.
+- `generated/rooms/*.psxw` -- generated; do not edit; gitignored.
+- `generated/textures/*.psxt` -- generated; do not edit; gitignored.
+- `generated/models/model_NNN_*/` -- per-model folders carrying
   cooked `.psxmdl` + `.psxt` + `.psxanim`; do not edit; gitignored.
 
 ## See also
 
-- [`docs/level-residency.md`](../../../docs/level-residency.md) —
+- [`docs/level-residency.md`](../../../docs/level-residency.md) --
   the full contract: schema, writer, reader, future backing stores.
-- [`engine/crates/psx-level`](../../crates/psx-level/) — shared
+- [`engine/crates/psx-level`](../../crates/psx-level/) -- shared
   no_std schema crate.
-- `editor/crates/psxed-project/src/playtest.rs` — manifest types,
+- `editor/crates/psxed-project/src/playtest.rs` -- manifest types,
   validation, writer.
-- `editor/crates/psxed-project/src/bin/cook_playtest.rs` — CLI.
-- `engine/crates/psx-engine/src/world_render.rs` — `draw_room`.
-- `engine/examples/showcase-room/` — sister example that cooks
+- `editor/crates/psxed-project/src/bin/cook_playtest.rs` -- CLI.
+- `engine/crates/psx-engine/src/world_render.rs` -- `draw_room`.
+- `engine/examples/showcase-room/` -- sister example that cooks
   the starter at build time and renders it directly (no editor
   generated/ step).

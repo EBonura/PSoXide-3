@@ -4,7 +4,7 @@
 //! them forward in N-step chunks, and after each chunk compares
 //! FNV-1a-64 hashes of the visible display area. The first chunk
 //! where the hashes disagree localises "when did our rendering
-//! drift from Redux's" — which tells us which subsystem to look at
+//! drift from Redux's" -- which tells us which subsystem to look at
 //! next (GTE, GPU blending, DMA ordering, IRQ timing, etc).
 //!
 //! ```bash
@@ -145,7 +145,7 @@ fn main() {
         let chunk = args.chunk.min(args.steps - cursor);
         chunk_count += 1;
 
-        // Redux: silent run — no trace records emitted unless input
+        // Redux: silent run -- no trace records emitted unless input
         // scheduling is enabled, in which case `run_checkpoint_pad`
         // is the protocol surface that keeps controller state synced.
         let run_timeout = Duration::from_secs((chunk / 500_000).max(30));

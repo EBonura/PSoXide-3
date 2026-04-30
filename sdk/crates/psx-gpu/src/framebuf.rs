@@ -1,6 +1,6 @@
 //! Double-buffered framebuffer management.
 //!
-//! A `FrameBuffer` tracks two on-screen regions in VRAM — one being
+//! A `FrameBuffer` tracks two on-screen regions in VRAM -- one being
 //! displayed, one being drawn into. `swap()` flips them at a VBlank
 //! boundary. Layout is vertical: buffer A at Y=0, buffer B at Y=height.
 //! That fits 2×(640×240) side-by-side inside the 1024×512 VRAM on
@@ -42,7 +42,7 @@ impl FrameBuffer {
     }
 
     /// Push a display-start command for the buffer we're NOT currently
-    /// drawing to — flipping the display at the next VBlank.
+    /// drawing to -- flipping the display at the next VBlank.
     pub fn swap(&mut self) {
         // Show the buffer we were drawing into; drain into the other.
         let show = self.drawing;

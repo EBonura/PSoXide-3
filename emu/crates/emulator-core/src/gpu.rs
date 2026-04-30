@@ -1,10 +1,10 @@
-//! GPU — minimum viable surface for BIOS init + VRAM display.
+//! GPU -- minimum viable surface for BIOS init + VRAM display.
 //!
 //! **Phase 2h scope:** the GPU owns VRAM (migrated here from the
-//! top-level `vram` module — re-exported for compatibility), exposes
+//! top-level `vram` module -- re-exported for compatibility), exposes
 //! `GPUSTAT` reads with the ready-bit pattern the BIOS polls for, and
 //! accepts GP0 / GP1 writes. No command processing, no rasterization,
-//! no display output yet — those arrive in follow-up milestones once
+//! no display output yet -- those arrive in follow-up milestones once
 //! DMA actually ships command lists.
 //!
 //! Register map (single-cycle MMIO, 32-bit):
@@ -23,7 +23,7 @@ pub const GP1_ADDR: u32 = 0x1F80_1814;
 
 /// GPU state.
 pub struct Gpu {
-    /// Video memory — 1 MiB, 1024×512 at 16 bpp. The VRAM viewer in
+    /// Video memory -- 1 MiB, 1024×512 at 16 bpp. The VRAM viewer in
     /// the frontend decodes this each frame.
     pub vram: Vram,
     status: GpuStatus,
@@ -35,11 +35,11 @@ pub struct Gpu {
     /// Number of words the current packet expects in total (including
     /// the first/opcode word). `0` means "no packet in progress".
     gp0_expected: usize,
-    /// Total GP0 writes the GPU has received since reset — diagnostic
+    /// Total GP0 writes the GPU has received since reset -- diagnostic
     /// for `examples/smoke_draw` and the frontend HUD, tells us whether
     /// software has actually started shipping commands.
     gp0_write_count: u64,
-    /// X offset (signed 11-bit) added to every primitive vertex —
+    /// X offset (signed 11-bit) added to every primitive vertex --
     /// set by GP0 0xE5. Usually zero on BIOS boot, non-zero once the
     /// kernel sets up a display-list origin.
     draw_offset_x: i32,
@@ -59,9 +59,16 @@ pub struct Gpu {
     /// source rect and is now supplying pixel-data words via GPUREAD.
     vram_download: Option<VramTransfer>,
     /// Most-recent single-word response to a GP1 0x10 (Get GPU Info)
-    /// request — returned on the next GPUREAD while a VRAM download
+    /// request -- returned on the next GPUREAD while a VRAM download
     /// isn't active. Matches hardware's "GPU info" latch.
     gpuread_latch: u32,
+    /// Raw environment command payloads returned by Redux for GP1
+    /// query sub-ops 2..=5. The decoded fields above drive rendering;
+    /// these preserve the CPU-visible readback contract.
+    texture_window_raw: u32,
+    drawing_start_raw: u32,
+    drawing_end_raw: u32,
+    drawing_offset_raw: u32,
 
     // --- Texture-page state (GP0 0xE1 draw mode) ---
     /// VRAM X base of the current texture page (pixels, 0..=960,
@@ -82,7 +89,7 @@ pub struct Gpu {
     /// Texture-window mask X in pixels (multiple of 8). Set by
     /// GP0 0xE2 bits 0..=4, left-shifted by 3. Used at UV-lookup
     /// time to force the high bits of the effective U to a constant
-    /// pattern — typically 0 (no mask) so UV passes through, but
+    /// pattern -- typically 0 (no mask) so UV passes through, but
     /// games that tile a texture via this feature set specific bits.
     tex_window_mask_x: u8,
     /// Texture-window mask Y, same shape.
@@ -112,7 +119,7 @@ pub struct Gpu {
     /// with tint modulation; flat colour + raw-texture prims are
     /// unaffected (their source is already 15-bit).
     ///
-    /// Games rarely enable this — it's a conservative choice that
+    /// Games rarely enable this -- it's a conservative choice that
     /// trades crispness for banding reduction. When it's on, the
     /// 24-bit shaded intermediate gets a per-pixel offset in the
     /// range -4..=+3 added before the `>> 3` truncation, producing
@@ -134,7 +141,7 @@ pub struct Gpu {
     /// regular packet assembler.
     polyline: Option<PolylineState>,
 
-    /// Wireframe mode — replaces filled triangles with their
+    /// Wireframe mode -- replaces filled triangles with their
     /// three edges, rendered as lines at the triangle's primary
     /// colour. Rectangles and already-line primitives are
     /// unchanged. Off by default; toggled from the frontend's
@@ -142,18 +149,18 @@ pub struct Gpu {
     /// submitting.
     pub wireframe_enabled: bool,
 
-    /// Pixel-owner trace — when `Some`, every `plot_pixel` records
+    /// Pixel-owner trace -- when `Some`, every `plot_pixel` records
     /// the index of the currently-executing GPU command into
     /// `pixel_owner[y*VRAM_WIDTH + x]`. Paired with `cmd_log`
     /// this lets us answer "which command drew the pixel at
     /// (x, y)?" after a run, the essential first step in
     /// diagnosing per-pixel parity divergences against Redux.
     ///
-    /// Allocating is opt-in because the buffer is 2 MiB — tiny
+    /// Allocating is opt-in because the buffer is 2 MiB -- tiny
     /// in absolute terms but enough to want control over when it
     /// appears in core state.
     pub pixel_owner: Option<Vec<u32>>,
-    /// Command log — one entry per GP0 packet executed since this
+    /// Command log -- one entry per GP0 packet executed since this
     /// tracer was enabled. Each entry captures the opcode plus
     /// the raw fifo words the packet consumed, so we can replay
     /// the exact inputs to a single draw in isolation.
@@ -165,7 +172,7 @@ pub struct Gpu {
     /// or its per-pixel stamping cost.
     cmd_log_enabled: bool,
     /// The index that will be written into `pixel_owner` for the
-    /// NEXT pixel plotted — i.e., the index of the currently-
+    /// NEXT pixel plotted -- i.e., the index of the currently-
     /// executing command. Bumped just before each packet dispatch.
     current_cmd_index: u32,
 
@@ -184,22 +191,22 @@ pub struct Gpu {
     /// Horizontal display resolution from GP1 0x08 (pixels). One of
     /// 256, 320, 368, 512, 640.
     display_width: u16,
-    /// Vertical resolution flag from GP1(08h) bit 2 — `true` means
+    /// Vertical resolution flag from GP1(08h) bit 2 -- `true` means
     /// 480-line interlaced (each V-range line doubles). The actual
     /// displayed row count is computed from the V-range (Y1..Y2)
     /// and this flag in [`Gpu::effective_display_height`].
     display_height_480: bool,
-    /// V-range Y1 from GP1(07h) bits 0..=9 — top scanline of the
+    /// V-range Y1 from GP1(07h) bits 0..=9 -- top scanline of the
     /// visible window in the video output. Default ~16.
     v_range_y1: u16,
-    /// V-range Y2 from GP1(07h) bits 10..=19 — bottom scanline of
+    /// V-range Y2 from GP1(07h) bits 10..=19 -- bottom scanline of
     /// the visible window. Default ~256, giving 240 visible rows.
     v_range_y2: u16,
-    /// H-range X1 from GP1(06h) bits 0..=11 — left-edge GPU clock
+    /// H-range X1 from GP1(06h) bits 0..=11 -- left-edge GPU clock
     /// of the visible window. Stored for display-area reporting but
     /// not (yet) used to derive the width.
     h_range_x1: u16,
-    /// H-range X2 from GP1(06h) bits 12..=23 — right-edge GPU clock.
+    /// H-range X2 from GP1(06h) bits 12..=23 -- right-edge GPU clock.
     h_range_x2: u16,
     /// 24bpp colour depth flag from GP1 0x08 bit 4. For now we always
     /// decode VRAM as 15bpp; when this flag comes into play the
@@ -207,7 +214,7 @@ pub struct Gpu {
     display_24bpp: bool,
     /// `true` after the BIOS / game has written GP1 0x07 (V-range) or
     /// GP1 0x08 (display mode). Before that, `display_area` reports
-    /// (0, 0) — matching Redux's `takeScreenShot`, which also hands
+    /// (0, 0) -- matching Redux's `takeScreenShot`, which also hands
     /// back a zero-sized image until its internal
     /// `updateDisplayIfChanged` runs (triggered by those same two
     /// GP1 writes). Parity tools rely on this to avoid seeing a
@@ -216,7 +223,7 @@ pub struct Gpu {
     display_configured: bool,
 
     /// Count of executed GP0 packets by opcode byte (the high 8 bits
-    /// of the header word). Diagnostic only — lets `smoke_draw` see at
+    /// of the header word). Diagnostic only -- lets `smoke_draw` see at
     /// a glance which primitive types the BIOS is issuing.
     gp0_opcode_hist: [u32; 256],
     /// Count of GP1 writes by opcode byte. Same diagnostic role as
@@ -263,7 +270,7 @@ pub struct GpuCmdLogEntry {
     /// at u32::MAX; not a concern for typical debug runs (a few
     /// hundred thousand draw calls at most).
     pub index: u32,
-    /// Opcode byte — top 8 bits of the first FIFO word.
+    /// Opcode byte -- top 8 bits of the first FIFO word.
     pub opcode: u8,
     /// Full FIFO contents at dispatch time. Draw packets are short
     /// slices (3..=12 words). CPU→VRAM uploads append their payload
@@ -272,7 +279,7 @@ pub struct GpuCmdLogEntry {
     pub fifo: Vec<u32>,
 }
 
-/// In-flight CPU→VRAM transfer state — 2 pixels per incoming GP0 word,
+/// In-flight CPU→VRAM transfer state -- 2 pixels per incoming GP0 word,
 /// written in row-major order across the destination rect. Completes
 /// when `remaining == 0`, and then the GPU goes back to accepting
 /// command packets on GP0.
@@ -295,7 +302,7 @@ struct VramTransfer {
 }
 
 impl Gpu {
-    /// Construct a fresh GPU — VRAM zeroed, status at the soft-GPU
+    /// Construct a fresh GPU -- VRAM zeroed, status at the soft-GPU
     /// always-ready pattern the BIOS expects.
     pub fn new() -> Self {
         Self {
@@ -340,7 +347,7 @@ impl Gpu {
             // Range.x1 = Range.y0 = Range.y1 = 0`. Crucially the
             // BIOS writes GP1 0x08 (display mode) *before* GP1 0x07
             // (v-range), and because Redux derives Height from
-            // `y1 - y0` — both zero — its `takeScreenShot` height
+            // `y1 - y0` -- both zero -- its `takeScreenShot` height
             // is 0 during that window. Earlier we defaulted these
             // to 0x10/0x100, which made our screenshot height 240
             // during the same window and broke lockstep parity at
@@ -353,6 +360,10 @@ impl Gpu {
             display_configured: false,
             vram_download: None,
             gpuread_latch: 0,
+            texture_window_raw: 0,
+            drawing_start_raw: 0,
+            drawing_end_raw: 0,
+            drawing_offset_raw: 0,
             gp0_opcode_hist: [0; 256],
             gp1_opcode_hist: [0; 256],
             display_start_history: std::collections::BTreeSet::new(),
@@ -377,7 +388,7 @@ impl Gpu {
         &self.gp1_write_history
     }
 
-    /// Snapshot of the GP0 opcode histogram — per-byte count of
+    /// Snapshot of the GP0 opcode histogram -- per-byte count of
     /// executed packets keyed by high-byte of word 0. Diagnostic.
     pub fn gp0_opcode_histogram(&self) -> [u32; 256] {
         self.gp0_opcode_hist
@@ -392,7 +403,7 @@ impl Gpu {
     /// frontend's framebuffer panel. Cheap to call each frame. The
     /// `height` is derived from the V-range + 480-mode flag (see
     /// [`Gpu::effective_display_height`]) so it matches what Redux's
-    /// screenshot path reports — letting milestone parity tests
+    /// screenshot path reports -- letting milestone parity tests
     /// compare byte-for-byte.
     pub fn display_area(&self) -> DisplayArea {
         if !self.display_configured {
@@ -421,13 +432,13 @@ impl Gpu {
     /// FNV-1a-64 over the visible display area's 15bpp pixel bytes,
     /// for Redux-parity comparisons. Rows are packed tightly (no
     /// stride padding) so a given (width, height, bpp) maps to a
-    /// specific byte sequence — identical to what Redux's
+    /// specific byte sequence -- identical to what Redux's
     /// `PCSX.GPU.takeScreenShot()` produces server-side on the
     /// oracle path.
     ///
     /// Returns `(hash, width, height, byte_len)`. If the display
     /// area extends past VRAM the rows are clipped at the VRAM
-    /// edge and the row count is reduced — matching Redux's
+    /// edge and the row count is reduced -- matching Redux's
     /// behaviour.
     pub fn display_hash(&self) -> (u64, u32, u32, usize) {
         let da = self.display_area();
@@ -485,7 +496,7 @@ impl Gpu {
     /// Enable cmd_log capture WITHOUT allocating the per-pixel owner
     /// buffer. The HW (wgpu render-pipeline) renderer needs the GP0
     /// packet stream to drive its draw calls each frame, but doesn't
-    /// need pixel-level provenance — saves the 2 MiB owner Vec and
+    /// need pixel-level provenance -- saves the 2 MiB owner Vec and
     /// the per-`plot_pixel` stamp cost. The bench probes that DO
     /// want owner tracking still call `enable_pixel_tracer`.
     ///
@@ -523,7 +534,7 @@ impl Gpu {
     /// Read one 24-bit display pixel. VRAM bytes are packed: pixel
     /// N lives at byte offsets `3*N..3*N+2` within a row, and each
     /// row is 2048 bytes (1024 × 16-bit). The three bytes may
-    /// straddle two VRAM halfwords — we read them individually.
+    /// straddle two VRAM halfwords -- we read them individually.
     fn read_pixel_rgb24(&self, x: u16, y: u16) -> (u8, u8, u8) {
         let byte_x = (x as u32) * 3;
         let word_x = (byte_x / 2) as u16;
@@ -548,7 +559,7 @@ impl Gpu {
     /// in 24-bit mode the packed RGB888 triplets are used directly.
     /// Alpha is always 0xFF. Size = `width * height * 4` bytes.
     ///
-    /// Used by the frontend to upload a display texture — a single
+    /// Used by the frontend to upload a display texture -- a single
     /// format regardless of the PS1's current bpp, so the wgpu
     /// path doesn't need to branch.
     pub fn display_rgba8(&self) -> (Vec<u8>, u32, u32) {
@@ -596,7 +607,7 @@ impl Gpu {
         }
     }
 
-    /// GPUREAD — two paths:
+    /// GPUREAD -- two paths:
     /// - If a VRAM→CPU transfer is active, return the next 2 packed
     ///   16bpp pixels from the source rect.
     /// - Otherwise return the latch written by the last GP1 0x10.
@@ -623,7 +634,7 @@ impl Gpu {
     /// that spin-wait on GPU idle before kicking the next DMA.
     ///
     /// Small primitives (triangles, lines, short rectangles) don't
-    /// charge any credit — they're fast enough on real hardware
+    /// charge any credit -- they're fast enough on real hardware
     /// that software rarely polls ready between them, and charging
     /// busy here would just add delays where none are needed.
     pub fn charge_busy(&mut self, cost: u64) {
@@ -632,7 +643,7 @@ impl Gpu {
 
     /// Drain busy credit over time. Called by the bus each tick
     /// so the busy flag settles back to "ready" as cycles advance.
-    /// One cycle of real time decays one unit of credit — with
+    /// One cycle of real time decays one unit of credit -- with
     /// primitives charging in the tens of units, the ready flag
     /// goes high again within a few hundred cycles.
     pub fn decay_busy(&mut self, cycles: u64) {
@@ -668,7 +679,7 @@ impl Gpu {
         }
     }
 
-    /// GP0 0xC0 — VRAM→CPU transfer. `[cmd, xy, wh]` header; pixel
+    /// GP0 0xC0 -- VRAM→CPU transfer. `[cmd, xy, wh]` header; pixel
     /// words are then drained by GPUREAD. Two 16bpp pixels per word
     /// in row-major order across the source rect.
     fn begin_vram_download(&mut self) {
@@ -749,30 +760,25 @@ impl Gpu {
     fn apply_gp1_display(&mut self, value: u32) {
         let cmd = (value >> 24) & 0xFF;
         match cmd {
-            // GP1 0x10 — Get GPU Info. Sub-op selects what latches
+            // GP1 0x10 -- Get GPU Info. Sub-op selects what latches
             // into GPUREAD. See nocash PSX-SPX "GPU Memory Transfer
             // Commands / GP1(10h)". Common sub-ops:
-            //   0x02 — texture window (E2 readback)
-            //   0x03 — draw area top-left  (E3 readback)
-            //   0x04 — draw area bottom-right (E4)
-            //   0x05 — draw offset (E5)
-            //   0x07 — GPU version / misc (returns 0x0000_0002)
-            //   0x08 — unknown / returns 0
+            //   0x02 -- texture window (E2 readback)
+            //   0x03 -- draw area top-left  (E3 readback)
+            //   0x04 -- draw area bottom-right (E4)
+            //   0x05 -- draw offset (E5)
+            // Redux masks the query to three bits and leaves the
+            // latch untouched for 0, 1, 6 and 7.
             0x10 => {
-                let sub_op = value & 0x0F;
-                self.gpuread_latch = match sub_op {
-                    0x03 => (self.draw_area_left as u32) | ((self.draw_area_top as u32) << 10),
-                    0x04 => (self.draw_area_right as u32) | ((self.draw_area_bottom as u32) << 10),
-                    0x05 => {
-                        let x = (self.draw_offset_x as u32) & 0x7FF;
-                        let y = (self.draw_offset_y as u32) & 0x7FF;
-                        x | (y << 11)
-                    }
-                    0x07 => 0x0000_0002,
-                    _ => 0,
-                };
+                match value & 0x07 {
+                    0x02 => self.gpuread_latch = self.texture_window_raw,
+                    0x03 => self.gpuread_latch = self.drawing_start_raw,
+                    0x04 => self.gpuread_latch = self.drawing_end_raw,
+                    0x05 => self.gpuread_latch = self.drawing_offset_raw,
+                    _ => {}
+                }
             }
-            // GP1 0x00 — GPU reset. Matches Redux's `CtrlReset`:
+            // GP1 0x00 -- GPU reset. Matches Redux's `CtrlReset`:
             // clears the display-enable flag + RGB24/interlace bits
             // and resets DrawOffset, but **does not** touch the
             // V/H-ranges or DisplayPosition. The BIOS writes those
@@ -789,8 +795,13 @@ impl Gpu {
                 self.mask_set_on_draw = false;
                 self.mask_check_before_draw = false;
                 self.status.raw &= !0x1800;
+                self.texture_window_raw = 0;
+                self.drawing_start_raw = 0;
+                self.drawing_end_raw = 0;
+                self.drawing_offset_raw = 0;
+                self.gpuread_latch = 0x400;
             }
-            // GP1 0x05 — display area start (top-left corner in VRAM).
+            // GP1 0x05 -- display area start (top-left corner in VRAM).
             //   bits 9:0  = X (pixels)
             //   bits 18:10 = Y (pixels)
             0x05 => {
@@ -799,26 +810,26 @@ impl Gpu {
                 self.display_start_history
                     .insert((self.display_start_x, self.display_start_y));
             }
-            // GP1 0x06 — Horizontal display range (on screen, in GPU
-            // clocks — not pixels). Used for centering the active
+            // GP1 0x06 -- Horizontal display range (on screen, in GPU
+            // clocks -- not pixels). Used for centering the active
             // display inside the video signal; doesn't change the
             // VRAM read window's width. Stored for completeness.
             0x06 => {
                 self.h_range_x1 = (value & 0xFFF) as u16;
                 self.h_range_x2 = ((value >> 12) & 0xFFF) as u16;
             }
-            // GP1 0x07 — Vertical display range. Bits 0..=9 = top
+            // GP1 0x07 -- Vertical display range. Bits 0..=9 = top
             // scanline, bits 10..=19 = bottom scanline. Effective
             // rendered rows = (y2 - y1), doubled in 480-interlaced
             // mode. Redux's `takeScreenShot` dimensions come from
-            // this, not from the GP1(08h) mode bit — matching it is
+            // this, not from the GP1(08h) mode bit -- matching it is
             // what gets us 640×478 instead of 640×480 at boot.
             0x07 => {
                 self.v_range_y1 = (value & 0x3FF) as u16;
                 self.v_range_y2 = ((value >> 10) & 0x3FF) as u16;
                 self.display_configured = true;
             }
-            // GP1 0x08 — display mode. Height is the interlace flag;
+            // GP1 0x08 -- display mode. Height is the interlace flag;
             // actual pixel count is derived together with V-range in
             // [`Gpu::effective_display_height`].
             0x08 => {
@@ -855,7 +866,7 @@ impl Gpu {
     ///
     /// Used by Timer 0 when its source is set to "dot clock" (mode
     /// bits 8..9 = 1 or 3). Games that sync to horizontal raster
-    /// (rare — dot-clock timing is usually a bit granular) key off
+    /// (rare -- dot-clock timing is usually a bit granular) key off
     /// this.
     pub fn dot_clock_divisor(&self) -> u64 {
         match self.display_width {
@@ -868,7 +879,7 @@ impl Gpu {
         }
     }
 
-    /// Effective vertical pixel count shown on the video output —
+    /// Effective vertical pixel count shown on the video output --
     /// derived from V-range (`GP1(07h)`) and the 480-mode flag
     /// (`GP1(08h)` bit 2). Matches Redux's
     /// `PCSX.GPU.takeScreenShot()` height, so using this value for
@@ -901,13 +912,13 @@ impl Gpu {
         self.gp0_write_count += 1;
 
         // CPU→VRAM transfer consumes pixel words ahead of the packet
-        // assembler — it's a mode, not a packet.
+        // assembler -- it's a mode, not a packet.
         if self.vram_upload.is_some() {
             self.ingest_vram_upload_word(word);
             return;
         }
 
-        // Polyline receive — every word is either a vertex / colour
+        // Polyline receive -- every word is either a vertex / colour
         // or the terminator sentinel until the list ends.
         if self.polyline.is_some() {
             self.ingest_polyline_word(word);
@@ -940,7 +951,7 @@ impl Gpu {
         // Pixel tracer also wants to see state-modifying single-word
         // packets (0xE1..=0xE6 draw-mode / tex-window / draw-area /
         // draw-offset / mask). These don't plot pixels but they shift
-        // the state that subsequent draws interpret — useful to see
+        // the state that subsequent draws interpret -- useful to see
         // in the log when chasing a parity divergence.
         if self.cmd_log_enabled {
             let index = self.cmd_log.len() as u32;
@@ -952,22 +963,25 @@ impl Gpu {
             });
         }
         match op {
-            // GP0 0xE3 — drawing area top-left. X bits 9:0, Y bits 18:10.
+            // GP0 0xE3 -- drawing area top-left. X bits 9:0, Y bits 18:10.
             0xE3 => {
+                self.drawing_start_raw = word & 0x000F_FFFF;
                 self.draw_area_left = (word & 0x3FF) as u16;
                 self.draw_area_top = ((word >> 10) & 0x1FF) as u16;
             }
-            // GP0 0xE4 — drawing area bottom-right.
+            // GP0 0xE4 -- drawing area bottom-right.
             0xE4 => {
+                self.drawing_end_raw = word & 0x000F_FFFF;
                 self.draw_area_right = (word & 0x3FF) as u16;
                 self.draw_area_bottom = ((word >> 10) & 0x1FF) as u16;
             }
-            // GP0 0xE5 — drawing offset. X / Y are both signed 11-bit.
+            // GP0 0xE5 -- drawing offset. X / Y are both signed 11-bit.
             0xE5 => {
+                self.drawing_offset_raw = word & 0x003F_FFFF;
                 self.draw_offset_x = sign_extend_11((word & 0x7FF) as i32);
                 self.draw_offset_y = sign_extend_11(((word >> 11) & 0x7FF) as i32);
             }
-            // GP0 0xE1 — draw mode: texture page base + colour depth
+            // GP0 0xE1 -- draw mode: texture page base + colour depth
             // + dither/display/transparency flags. We extract the
             // subset the texture rasterizer needs AND mirror bits
             // 0..=10 into `GpuStatus::raw`, since those are
@@ -1002,7 +1016,7 @@ impl Gpu {
                 let stat_bits = word & 0x07FF;
                 self.status.raw = (self.status.raw & !0x07FF) | stat_bits;
             }
-            // GP0 0xE6 — mask-bit setting.
+            // GP0 0xE6 -- mask-bit setting.
             //   bit 0 = `mask_set_on_draw`: force bit 15 of every
             //           plotted pixel to 1 (protect it against
             //           later draws that check the mask).
@@ -1016,7 +1030,7 @@ impl Gpu {
                 let stat_bits = (word & 0x3) << 11;
                 self.status.raw = (self.status.raw & !0x1800) | stat_bits;
             }
-            // GP0 0xE2 — texture window. Lets a textured primitive
+            // GP0 0xE2 -- texture window. Lets a textured primitive
             // AND-mask its U/V into a smaller patch of the tpage,
             // effectively tiling a sub-rectangle of texture across
             // the prim. Format:
@@ -1029,10 +1043,11 @@ impl Gpu {
             //     V' = (V & ~(mask_y << 3)) | ((offset_y & mask_y) << 3)
             // (mask is in 8-pixel units; left-shift by 3 gives the
             // pixel-space mask.) Games that use palettes laid out in
-            // small sub-rectangles rely on this to save VRAM — the
+            // small sub-rectangles rely on this to save VRAM -- the
             // same 128×128 tile gets reused for many prims with
             // different offsets.
             0xE2 => {
+                self.texture_window_raw = word & 0x000F_FFFF;
                 self.tex_window_mask_x = ((word & 0x1F) as u8) << 3;
                 self.tex_window_mask_y = (((word >> 5) & 0x1F) as u8) << 3;
                 self.tex_window_offset_x = (((word >> 10) & 0x1F) as u8) << 3;
@@ -1048,7 +1063,7 @@ impl Gpu {
         let op = (self.gp0_fifo[0] >> 24) & 0xFF;
         self.gp0_opcode_hist[op as usize] = self.gp0_opcode_hist[op as usize].saturating_add(1);
         // If the pixel tracer is armed, stamp this packet into the
-        // command log *before* dispatching — `plot_pixel` uses
+        // command log *before* dispatching -- `plot_pixel` uses
         // `current_cmd_index` to tag every write, so it must point
         // at the index of the entry we're about to push.
         if self.cmd_log_enabled {
@@ -1068,55 +1083,55 @@ impl Gpu {
             // both as opaque for now).
             0x20..=0x23 => self.draw_monochrome_tri(),
             0x28..=0x2B => self.draw_monochrome_quad(),
-            // Single monochrome line — 3 words.
+            // Single monochrome line -- 3 words.
             0x40..=0x43 => self.draw_line_mono_single(),
-            // Polyline monochrome start — 3 words. After this packet
+            // Polyline monochrome start -- 3 words. After this packet
             // the FIFO enters a streaming mode that accepts vertex
             // words until the 0x55555555 / 0x50005000 terminator.
             0x48..=0x4B => self.draw_line_mono_start_polyline(),
-            // Single shaded line — 4 words.
+            // Single shaded line -- 4 words.
             0x50..=0x53 => self.draw_line_shaded_single(),
-            // Polyline shaded start — 4 words.
+            // Polyline shaded start -- 4 words.
             0x58..=0x5B => self.draw_line_shaded_start_polyline(),
-            // Gouraud-shaded triangle / quad — per-vertex colour
+            // Gouraud-shaded triangle / quad -- per-vertex colour
             // interpolated across the primitive via barycentrics.
             0x30..=0x33 => self.draw_shaded_tri(),
             0x38..=0x3B => self.draw_shaded_quad(),
-            // Textured (flat-shade) triangle / quad — per-vertex UV,
+            // Textured (flat-shade) triangle / quad -- per-vertex UV,
             // texture-page and CLUT pulled from the UV words.
             0x24..=0x27 => self.draw_textured_tri(),
             0x2C..=0x2F => self.draw_textured_quad(),
-            // Textured + Gouraud shaded — both per-vertex tint colours
+            // Textured + Gouraud shaded -- both per-vertex tint colours
             // AND per-vertex UV. The tint modulates every sampled
             // texel (per PSX-SPX tint formula). Triangle = 9 words,
             // quad = 12 words.
             0x34..=0x37 => self.draw_textured_shaded_tri(),
             0x3C..=0x3F => self.draw_textured_shaded_quad(),
-            // Monochrome rectangles — bit 3 set selects variable size
+            // Monochrome rectangles -- bit 3 set selects variable size
             // (followed by a W/H word), else 1×1/8×8/16×16 by bits 5:4.
             0x60..=0x63 => self.draw_monochrome_rect_variable(),
             0x68..=0x6B => self.draw_monochrome_rect_sized(1, 1),
             0x70..=0x73 => self.draw_monochrome_rect_sized(8, 8),
             0x78..=0x7B => self.draw_monochrome_rect_sized(16, 16),
-            // Textured rectangles — same geometry as the monochrome
+            // Textured rectangles -- same geometry as the monochrome
             // variants plus a UV/CLUT word between pos and size.
             0x64..=0x67 => self.draw_textured_rect_variable(),
             0x6C..=0x6F => self.draw_textured_rect_sized(1, 1),
             0x74..=0x77 => self.draw_textured_rect_sized(8, 8),
             0x7C..=0x7F => self.draw_textured_rect_sized(16, 16),
-            // CPU→VRAM transfer — 3 words of setup, then `w*h/2`
+            // CPU→VRAM transfer -- 3 words of setup, then `w*h/2`
             // words of pixel data follow as a separate mode.
             0xA0 => self.begin_vram_upload(),
-            // VRAM→CPU transfer — 3 words of setup, pixel words are
+            // VRAM→CPU transfer -- 3 words of setup, pixel words are
             // then pulled by the CPU via GPUREAD.
             0xC0 => self.begin_vram_download(),
-            // VRAM→VRAM copy — source rect blitted to dest rect.
+            // VRAM→VRAM copy -- source rect blitted to dest rect.
             0x80..=0x9F => self.vram_to_vram_copy(),
             _ => {}
         }
     }
 
-    /// GP0 0x80 — copy a rectangle of VRAM to another VRAM location.
+    /// GP0 0x80 -- copy a rectangle of VRAM to another VRAM location.
     /// Packet: `[cmd, src_xy, dst_xy, wh]`. PS1 hardware masks the
     /// coordinates to VRAM size and wraps at the edges; our `get_pixel`
     /// / `set_pixel` already do that, so a simple double loop suffices.
@@ -1163,7 +1178,7 @@ impl Gpu {
         (x, y)
     }
 
-    /// GP0 0x20..=0x23 — monochrome 3-vertex triangle.
+    /// GP0 0x20..=0x23 -- monochrome 3-vertex triangle.
     /// Words: `[cmd+color, v0, v1, v2]`.
     fn draw_monochrome_tri(&mut self) {
         let cmd = self.gp0_fifo[0];
@@ -1175,7 +1190,7 @@ impl Gpu {
         self.rasterize_triangle(v0, v1, v2, color, mode);
     }
 
-    /// GP0 0x28..=0x2B — monochrome 4-vertex quad. Redux draws the
+    /// GP0 0x28..=0x2B -- monochrome 4-vertex quad. Redux draws the
     /// lower/right half first, then the upper/left half, so pixels on
     /// the shared diagonal are owned by `(v0, v1, v2)`.
     fn draw_monochrome_quad(&mut self) {
@@ -1190,7 +1205,7 @@ impl Gpu {
         self.rasterize_triangle(v0, v1, v2, color, mode);
     }
 
-    /// GP0 0x30..=0x33 — Gouraud triangle. Per-vertex RGB24 colours,
+    /// GP0 0x30..=0x33 -- Gouraud triangle. Per-vertex RGB24 colours,
     /// interpolated across the triangle via barycentric weights.
     /// Words: `[cmd+c0, v0, c1, v1, c2, v2]`.
     fn draw_shaded_tri(&mut self) {
@@ -1205,7 +1220,7 @@ impl Gpu {
         self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2, mode);
     }
 
-    /// GP0 0x38..=0x3B — Gouraud quad. 4 × (colour+vertex) =
+    /// GP0 0x38..=0x3B -- Gouraud quad. 4 × (colour+vertex) =
     /// 8 words, split in Redux order so the first half wins the
     /// shared diagonal.
     fn draw_shaded_quad(&mut self) {
@@ -1223,7 +1238,7 @@ impl Gpu {
         self.rasterize_shaded_triangle(v0, v1, v2, c0, c1, c2, mode);
     }
 
-    /// GP0 0x60..=0x63 — monochrome variable-size rectangle.
+    /// GP0 0x60..=0x63 -- monochrome variable-size rectangle.
     /// Words: `[cmd+color, xy, wh]`.
     fn draw_monochrome_rect_variable(&mut self) {
         let cmd = self.gp0_fifo[0];
@@ -1238,7 +1253,7 @@ impl Gpu {
         self.paint_rect(x, y, w, h, color, mode);
     }
 
-    /// GP0 0x68/0x70/0x78 — fixed-size monochrome rectangles.
+    /// GP0 0x68/0x70/0x78 -- fixed-size monochrome rectangles.
     fn draw_monochrome_rect_sized(&mut self, w: i32, h: i32) {
         let cmd = self.gp0_fifo[0];
         let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
@@ -1264,7 +1279,7 @@ impl Gpu {
         let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
         // Raw-texture flag is bit 0 of the *opcode byte* (bit 24 of
         // the full cmd word), per PSX-SPX. Testing `cmd & 1` reads
-        // bit 0 of the R channel of the embedded colour instead —
+        // bit 0 of the R channel of the embedded colour instead --
         // so odd-R tints like 0xFF would be mis-flagged raw.
         let tint = if (cmd >> 24) & 1 != 0 {
             RAW_TEXTURE_TINT
@@ -1287,7 +1302,7 @@ impl Gpu {
         let clut_word = ((uv_clut >> 16) & 0xFFFF) as u16;
         // Raw-texture flag is bit 0 of the *opcode byte* (bit 24 of
         // the full cmd word), per PSX-SPX. Testing `cmd & 1` reads
-        // bit 0 of the R channel of the embedded colour instead —
+        // bit 0 of the R channel of the embedded colour instead --
         // so odd-R tints like 0xFF would be mis-flagged raw.
         let tint = if (cmd >> 24) & 1 != 0 {
             RAW_TEXTURE_TINT
@@ -1302,11 +1317,11 @@ impl Gpu {
     /// 4bpp / 8bpp modes, direct for 15bpp. Texels of value 0 are
     /// transparent (standard PS1 convention).
     ///
-    /// `semi_trans` — cmd-bit-1. Texels with bit 15 high blend via
+    /// `semi_trans` -- cmd-bit-1. Texels with bit 15 high blend via
     /// `self.tex_blend_mode` when it's set; texels with bit 15 clear
     /// always draw opaque.
     ///
-    /// `tint` — 24-bit vertex colour that modulates each texel (see
+    /// `tint` -- 24-bit vertex colour that modulates each texel (see
     /// [`modulate_tint`]). Raw-texture rectangles pass
     /// `(0x80, 0x80, 0x80)` so modulation is a no-op.
     #[allow(clippy::too_many_arguments)]
@@ -1363,7 +1378,7 @@ impl Gpu {
     }
 
     /// Fetch a single texel from the active texture page. Returns
-    /// `None` for transparent — PSX convention is **the resolved
+    /// `None` for transparent -- PSX convention is **the resolved
     /// 16-bit colour == 0x0000**, regardless of mode. For 4bpp/8bpp,
     /// that means `CLUT[idx] == 0` (not `idx == 0`); games routinely
     /// place `0x0000` at non-zero CLUT entries to punch transparency
@@ -1380,18 +1395,18 @@ impl Gpu {
     /// tiling set non-zero mask/offset to reuse a sub-rectangle of
     /// the tpage across multiple primitives.
     fn sample_texture(&self, u: u16, v: u16, clut_x: u16, clut_y: u16) -> Option<u16> {
-        // PSX-SPX: the GPU's U/V counters are 8 bits — texture pages
+        // PSX-SPX: the GPU's U/V counters are 8 bits -- texture pages
         // wrap every 256 texels horizontally and vertically. Callers
         // pass u16 because rasterizer interpolation works in a wider
         // domain, so we mask down to 8 bits *before* the texture
         // window. Without this, a sprite or polygon whose `U + dx`
-        // exceeds 255 reads VRAM PAST the tpage edge — typically the
+        // exceeds 255 reads VRAM PAST the tpage edge -- typically the
         // neighbouring tpage's data, garbage texels, or a different
         // CLUT-driven byte. Visible as smeared / corrupted 2D sprites
         // (Tekken 3 character portraits, BIOS dialog frames).
         let u = u & 0xFF;
         let v = v & 0xFF;
-        // Apply the texture window — PSX-SPX:
+        // Apply the texture window -- PSX-SPX:
         //   U' = (U AND NOT(mask_x * 8)) OR ((offset_x * 8) AND (mask_x * 8))
         // but both `mask_*` and `offset_*` are already pre-shifted (×8)
         // when we stored them in the GP0 0xE2 handler.
@@ -1433,7 +1448,7 @@ impl Gpu {
 
     /// Plot a rectangle of `color` in screen-space, clipped to the
     /// GPU's drawing area. `mode` lets the caller pass the
-    /// primitive's semi-transparency mode — opaque for the common
+    /// primitive's semi-transparency mode -- opaque for the common
     /// case, one of the blend variants when the GP0 command's
     /// cmd-bit-1 is set.
     fn paint_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16, mode: BlendMode) {
@@ -1469,7 +1484,7 @@ impl Gpu {
     ) {
         // Wireframe debug mode: replace the filled fill with three
         // edge lines. Useful for visualising the geometry a game
-        // actually submits, independent of shading / texturing —
+        // actually submits, independent of shading / texturing --
         // including over-sized triangles that would normally be
         // dropped by the hardware extent check below.
         if self.wireframe_enabled {
@@ -1482,7 +1497,7 @@ impl Gpu {
             return;
         }
         // Flat triangles don't need Gouraud or UV interpolation, but
-        // the scanline walk itself is identical — reuse `setup_sections`
+        // the scanline walk itself is identical -- reuse `setup_sections`
         // with zeroed colour/UV and just plot `color` for every pixel
         // between leftX and rightX per scanline.
         let Some(mut setup) = setup_sections(
@@ -1522,7 +1537,7 @@ impl Gpu {
         }
     }
 
-    /// GP0 0x24..=0x27 — textured triangle. 7 words:
+    /// GP0 0x24..=0x27 -- textured triangle. 7 words:
     /// `[cmd+tint, v0, clut+uv0, v1, tpage+uv1, v2, uv2]`.
     ///
     /// Command bit 0 chooses raw-texture (tint ignored) vs
@@ -1544,7 +1559,7 @@ impl Gpu {
         let t2 = ((uv2 & 0xFF) as u16, ((uv2 >> 8) & 0xFF) as u16);
         // Raw-texture flag is bit 0 of the *opcode byte* (bit 24 of
         // the full cmd word), per PSX-SPX. Testing `cmd & 1` reads
-        // bit 0 of the R channel of the embedded colour instead —
+        // bit 0 of the R channel of the embedded colour instead --
         // so odd-R tints like 0xFF would be mis-flagged raw.
         let tint = if (cmd >> 24) & 1 != 0 {
             RAW_TEXTURE_TINT
@@ -1564,7 +1579,7 @@ impl Gpu {
         );
     }
 
-    /// GP0 0x2C..=0x2F — textured quad. 9 words; split in Redux order.
+    /// GP0 0x2C..=0x2F -- textured quad. 9 words; split in Redux order.
     fn draw_textured_quad(&mut self) {
         let cmd = self.gp0_fifo[0];
         let v0 = self.decode_vertex(self.gp0_fifo[1]);
@@ -1584,7 +1599,7 @@ impl Gpu {
         let semi = prim_is_semi_trans(cmd);
         // Raw-texture flag is bit 0 of the *opcode byte* (bit 24 of
         // the full cmd word), per PSX-SPX. Testing `cmd & 1` reads
-        // bit 0 of the R channel of the embedded colour instead —
+        // bit 0 of the R channel of the embedded colour instead --
         // so odd-R tints like 0xFF would be mis-flagged raw.
         let tint = if (cmd >> 24) & 1 != 0 {
             RAW_TEXTURE_TINT
@@ -1600,7 +1615,7 @@ impl Gpu {
         self.rasterize_textured_triangle(v0, v1, v2, t0, t1, t2, clut_word, semi, tint);
     }
 
-    /// GP0 0x34..=0x37 — textured + Gouraud-shaded triangle.
+    /// GP0 0x34..=0x37 -- textured + Gouraud-shaded triangle.
     /// Words: `[cmd+c0, v0, uv0+clut, c1, v1, uv1+texpage, c2, v2, uv2]`.
     /// Per-vertex tint interpolation is barycentric just like flat
     /// Gouraud, but the tint modulates the sampled texel instead of
@@ -1642,7 +1657,7 @@ impl Gpu {
         );
     }
 
-    /// GP0 0x3C..=0x3F — textured + Gouraud-shaded quad. 12 words;
+    /// GP0 0x3C..=0x3F -- textured + Gouraud-shaded quad. 12 words;
     /// split in Redux order.
     /// Words: `[cmd+c0, v0, uv0+clut, c1, v1, uv1+texpage, c2, v2, uv2,
     ///          c3, v3, uv3]`.
@@ -1919,7 +1934,7 @@ impl Gpu {
     /// before calling `texturePage`, the drawPoly handler OR-s bit 9
     /// of the incoming tpage with the current `m_ditherMode`. That
     /// gives a primitive the power to *enable* dither but not to
-    /// disable it — in effect, dither is sticky across primitives
+    /// disable it -- in effect, dither is sticky across primitives
     /// until an explicit GP0 0xE1 turns it off. Then `texturePage`
     /// copies bits 0..=10 of the (possibly OR-fixed) tpage into
     /// `m_statusRet`.
@@ -1954,7 +1969,7 @@ impl Gpu {
     ///   bit 15 so subsequent mask checks protect it.
     ///
     /// Callers do their own draw-area clipping before calling this
-    /// — it's the hot per-pixel path and shouldn't re-check bounds.
+    /// -- it's the hot per-pixel path and shouldn't re-check bounds.
     fn plot_pixel(&mut self, x: u16, y: u16, fg: u16, mode: BlendMode) {
         let existing = self.vram.get_pixel(x, y);
         if self.mask_check_before_draw && existing & 0x8000 != 0 {
@@ -1971,21 +1986,21 @@ impl Gpu {
         self.vram.set_pixel(x, y, pixel);
         // Stamp ownership for the pixel tracer if enabled. We hit
         // this every time a primitive writes a pixel, but the cost
-        // is a single array write behind an Option check — cheap
+        // is a single array write behind an Option check -- cheap
         // enough to keep on even in release diagnostic builds.
         if let Some(ref mut owner) = self.pixel_owner {
             owner[y as usize * VRAM_WIDTH + x as usize] = self.current_cmd_index;
         }
     }
 
-    /// Rasterize a textured triangle — same edge-function test as the
+    /// Rasterize a textured triangle -- same edge-function test as the
     /// other triangle paths, with nearest-neighbor texture sampling
     /// via barycentric-interpolated UV.
     ///
     /// `semi_trans` is the primitive's command-bit-1 state. When set,
     /// texels with bit 15 high blend via `self.tex_blend_mode`; texels
     /// with bit 15 clear still draw opaquely. When clear, every texel
-    /// draws opaque regardless of its bit 15 — matching PSX-SPX's
+    /// draws opaque regardless of its bit 15 -- matching PSX-SPX's
     /// per-texel semi-transparency rule.
     ///
     /// `tint` is the 24-bit vertex colour that modulates each texel
@@ -2088,7 +2103,7 @@ impl Gpu {
         }
     }
 
-    /// Rasterize a triangle with per-vertex colours — Gouraud shading.
+    /// Rasterize a triangle with per-vertex colours -- Gouraud shading.
     /// Same edge-function inside test as the flat path, but interpolates
     /// RGB using normalized barycentric weights `(w0, w1, w2)` per pixel
     /// and packs the result back into a 15-bit BGR VRAM word.
@@ -2120,7 +2135,7 @@ impl Gpu {
             return;
         }
 
-        // Channel-extract closures — r/g/b are low/mid/high bytes of the
+        // Channel-extract closures -- r/g/b are low/mid/high bytes of the
         // 24-bit word written in the command.
         let r = |c: u32| (c & 0xFF) as i32;
         let g = |c: u32| ((c >> 8) & 0xFF) as i32;
@@ -2136,7 +2151,7 @@ impl Gpu {
             return;
         };
 
-        // Per-column (per-pixel horizontal) deltas — computed once at
+        // Per-column (per-pixel horizontal) deltas -- computed once at
         // setup, applied on every step within a scanline.
         let dif_r = setup.delta_col_r;
         let dif_g = setup.delta_col_g;
@@ -2182,7 +2197,7 @@ impl Gpu {
                 let mut j = xmin_clipped;
                 while j <= xmax {
                     // Redux packs the 8-bit channels into the top byte
-                    // of each Q16.16 accumulator — recover them with
+                    // of each Q16.16 accumulator -- recover them with
                     // `>> 16`. Clamp isn't necessary for well-formed
                     // triangles (vertex colours are 0..=255 and the
                     // per-column deltas keep them in range), but we
@@ -2215,7 +2230,7 @@ impl Gpu {
 
     // --- Lines (GP0 0x40..=0x5F) ---
 
-    /// GP0 0x40..=0x43 — single monochrome line. Packet: `[cmd+color, v0, v1]`.
+    /// GP0 0x40..=0x43 -- single monochrome line. Packet: `[cmd+color, v0, v1]`.
     fn draw_line_mono_single(&mut self) {
         let cmd = self.gp0_fifo[0];
         let color = rgb24_to_bgr15(cmd & 0x00FF_FFFF);
@@ -2225,8 +2240,8 @@ impl Gpu {
         self.rasterize_line(v0, v1, color, color, mode, false);
     }
 
-    /// GP0 0x50..=0x53 — single Gouraud-shaded line. Packet:
-    /// `[cmd+c0, v0, c1, v1]` — each endpoint carries its own colour
+    /// GP0 0x50..=0x53 -- single Gouraud-shaded line. Packet:
+    /// `[cmd+c0, v0, c1, v1]` -- each endpoint carries its own colour
     /// word.
     fn draw_line_shaded_single(&mut self) {
         let cmd = self.gp0_fifo[0];
@@ -2238,7 +2253,7 @@ impl Gpu {
         self.rasterize_line_shaded(v0, v1, c0, c1, mode);
     }
 
-    /// GP0 0x48..=0x4B — start a monochrome polyline. The initial
+    /// GP0 0x48..=0x4B -- start a monochrome polyline. The initial
     /// packet has the same shape as a single line (cmd+color, v0,
     /// v1); after executing it we switch to receive mode.
     fn draw_line_mono_start_polyline(&mut self) {
@@ -2257,7 +2272,7 @@ impl Gpu {
         });
     }
 
-    /// GP0 0x58..=0x5B — start a Gouraud polyline. Initial packet
+    /// GP0 0x58..=0x5B -- start a Gouraud polyline. Initial packet
     /// is `[cmd+c0, v0, c1, v1]`; after the first segment we
     /// enter receive mode waiting for alternating (color, vertex)
     /// pairs.
@@ -2279,12 +2294,12 @@ impl Gpu {
     }
 
     /// Consume one GP0 word while in polyline mode. Terminator
-    /// pattern per PSX-SPX is `0x50005000` / `0x55555555` — any
+    /// pattern per PSX-SPX is `0x50005000` / `0x55555555` -- any
     /// word whose top bits match `0x5000_5000 >> 28 == 0x5` in
     /// both high and low halves means "end". We accept the
     /// canonical sentinels.
     fn ingest_polyline_word(&mut self, word: u32) {
-        // Sentinel check — both halves have the terminator pattern.
+        // Sentinel check -- both halves have the terminator pattern.
         // Redux uses `(word & 0xF000F000) == 0x50005000`.
         let is_term = (word & 0xF000_F000) == 0x5000_5000;
         if is_term {
@@ -2384,7 +2399,7 @@ impl Gpu {
         }
     }
 
-    /// Rasterize a Gouraud-shaded line — interpolates RGB between
+    /// Rasterize a Gouraud-shaded line -- interpolates RGB between
     /// `c0` and `c1` linearly in screen space. Uses the same
     /// Bresenham walk as the mono path; the colour parameter is
     /// re-evaluated each step from a normalised distance-along-
@@ -2451,7 +2466,7 @@ impl Gpu {
 
     // --- CPU→VRAM transfer (GP0 0xA0) ---
 
-    /// GP0 0xA0 — start a CPU-to-VRAM transfer. `[cmd, xy, wh]` is
+    /// GP0 0xA0 -- start a CPU-to-VRAM transfer. `[cmd, xy, wh]` is
     /// followed (in subsequent GP0 writes) by `ceil(w*h / 2)` words
     /// of 16bpp pixel data, 2 pixels per word. Transfer state lives
     /// in [`Gpu::vram_upload`] until every pixel has been ingested.
@@ -2540,13 +2555,13 @@ impl Gpu {
         }
     }
 
-    /// GP0 0x02 — monochrome fill rectangle, ignores draw mode /
+    /// GP0 0x02 -- monochrome fill rectangle, ignores draw mode /
     /// clipping / blending. Writes `color` directly into VRAM.
     ///
     /// Packet layout (Redux `GPU::cmdFillRect`):
-    ///   word 0: `0x02RRGGBB`      — opcode + 24-bit RGB
-    ///   word 1: `0xYYYYXXXX`      — top-left: X is 16-pixel-aligned
-    ///   word 2: `0xHHHHWWWW`      — width is rounded up to 16 pixels
+    ///   word 0: `0x02RRGGBB`      -- opcode + 24-bit RGB
+    ///   word 1: `0xYYYYXXXX`      -- top-left: X is 16-pixel-aligned
+    ///   word 2: `0xHHHHWWWW`      -- width is rounded up to 16 pixels
     ///
     /// Both coordinates and sizes wrap mod VRAM dimensions.
     fn fill_rect(&mut self) {
@@ -2600,14 +2615,14 @@ impl Gpu {
 // Naming convention: Redux's `m_deltaRightR` / `m_deltaRightU` etc are
 // actually **per-column** (per-X) deltas despite being named "right".
 // This port keeps the Redux names so a side-by-side diff with
-// `soft.cc` stays readable — even where "right" looks wrong in isolation.
+// `soft.cc` stays readable -- even where "right" looks wrong in isolation.
 //
 // Fixed-point layout: X / U / V are Q16.16. Colour channels are stored
 // in bits 16..23 of the state (Q16.8 relative to the 8-bit vertex
 // colours, i.e. the fraction lives in bits 0..15).
 
-/// One vertex as seen by the scanline setup. All attributes — position,
-/// colour, UV — are already shifted into the fixed-point domain the
+/// One vertex as seen by the scanline setup. All attributes -- position,
+/// colour, UV -- are already shifted into the fixed-point domain the
 /// rasterizer uses. `y` stays as a plain integer because scanlines step
 /// by 1 on hardware; only horizontal attributes need sub-pixel precision.
 #[derive(Copy, Clone, Debug, Default)]
@@ -2643,7 +2658,7 @@ struct SlTriSetup {
     /// ascending. Stored as owned values because we shuffle pointers
     /// into the left/right arrays below.
     sorted: [SlVertex; 3],
-    /// Left-edge walk: `[bottom, maybe_middle, top]` — `left_section`
+    /// Left-edge walk: `[bottom, maybe_middle, top]` -- `left_section`
     /// indexes the highest-unvisited entry; section descends toward 0.
     left_array: [usize; 3],
     right_array: [usize; 3],
@@ -2686,7 +2701,7 @@ struct SlTriSetup {
     // --- Per-column (per-X) deltas, computed once at setup time. ---
     //
     // Named "delta_right_*" to match Redux's `m_deltaRightR` / `m_deltaRightU`
-    // (which are also mis-named — they're per-column, not per-edge).
+    // (which are also mis-named -- they're per-column, not per-edge).
     delta_col_r: i64,
     delta_col_g: i64,
     delta_col_b: i64,
@@ -2800,12 +2815,12 @@ fn shl10_idiv(x: i64, y: i64) -> i64 {
 /// Hardware extent rule: any triangle whose vertex pairs span more
 /// than 1023 pixels horizontally or 511 vertically is silently
 /// dropped on real PS1 hardware. Off-screen geometry coming out of
-/// projection lands here constantly — without this gate it
+/// projection lands here constantly -- without this gate it
 /// rasterises as a giant garbage smear instead of being culled.
 ///
 /// The check is per-edge, not bounding-box: hardware compares each
 /// pair of vertices independently. Quads are already split into
-/// two triangles by the caller, so each half is gated separately —
+/// two triangles by the caller, so each half is gated separately --
 /// matching hardware behaviour where one half of a quad can survive
 /// while the other gets dropped.
 fn triangle_exceeds_hw_extent(v0: (i32, i32), v1: (i32, i32), v2: (i32, i32)) -> bool {
@@ -2818,7 +2833,7 @@ fn triangle_exceeds_hw_extent(v0: (i32, i32), v1: (i32, i32), v2: (i32, i32)) ->
 }
 
 /// (the "middle" vertex v2), and seed left / right walks. Colour + UV
-/// are optional — pass zeros for the ones a particular primitive
+/// are optional -- pass zeros for the ones a particular primitive
 /// doesn't use. Returns the setup ready for the scanline loop, or
 /// `None` when the triangle has zero height or zero "longest" width
 /// (both degenerate).
@@ -2871,7 +2886,7 @@ fn setup_sections(
     let temp = ((v2.y - v1.y) as i64) << 16;
     let temp = temp / (height as i64);
     // longest = temp * (v3.x - v1.x) / (2^16) + (v1.x - v2.x)
-    //   — i.e. extrapolate the v1→v3 edge to y=v2.y, subtract v2.x.
+    //   -- i.e. extrapolate the v1→v3 edge to y=v2.y, subtract v2.x.
     // Both factors of `temp` are already in Q16.16, so `(v3.x - v1.x) >> 16`
     // drops the fixed fraction before multiply (matches Redux).
     let longest = temp * ((v3.x - v1.x) >> 16) + (v1.x - v2.x);
@@ -2941,7 +2956,7 @@ fn setup_sections(
     }
 
     // Clamp `longest` to ±0x1000 (Redux does this as `if (longest <
-    // 0x1000) longest = 0x1000` and symmetric for the other sign —
+    // 0x1000) longest = 0x1000` and symmetric for the other sign --
     // prevents pathological per-column deltas when the triangle is
     // degenerately thin horizontally).
     let longest_clamped: i64 = if longest < 0 {
@@ -2992,7 +3007,7 @@ fn rgb24_to_bgr15(rgb24: u32) -> u16 {
 /// Redux's 4×4 dither coefficient table, indexed by
 /// `(y & 3) * 4 + (x & 3)`. See `s_dithertable` in
 /// `pcsx-redux/src/gpu/soft/soft.cc`. Note these are NOT the signed
-/// Bayer offsets you'll see quoted in some PSX-SPX derivatives —
+/// Bayer offsets you'll see quoted in some PSX-SPX derivatives --
 /// they're threshold coefficients for Redux's "conditional round-up"
 /// dither model, which produces the exact bit pattern PSX hardware
 /// uses.
@@ -3005,7 +3020,7 @@ const DITHER_COEFFS: [u8; 16] = [7, 0, 6, 1, 2, 5, 3, 4, 1, 6, 0, 7, 4, 3, 5, 2]
 /// 3-bit remainder; if the remainder beats the coefficient for this
 /// pixel AND the quotient isn't already saturated (0x1F), round the
 /// quotient up by one. That produces the characteristic PSX 4×4
-/// dither pattern — fundamentally different from the additive
+/// dither pattern -- fundamentally different from the additive
 /// `-4..+3` offset model PSX-SPX sometimes describes, and
 /// producing different bit patterns. Matching Redux's algorithm
 /// exactly is the only way to hit pixel-exact parity on Gouraud
@@ -3019,7 +3034,7 @@ fn dither_rgb(r: i32, g: i32, b: i32, x: i32, y: i32) -> u16 {
     let mut gc = g >> 3;
     let mut bc = b >> 3;
     // Round-up rule: if the low 3 bits exceed the coefficient AND we
-    // have headroom, increment. The saturation guard is essential —
+    // have headroom, increment. The saturation guard is essential --
     // without it pure-white pixels would get stuck rounding up past
     // 0x1F and wrapping (or in Redux's case, indexing past the
     // precomputed LUT).
@@ -3041,13 +3056,13 @@ fn dither_rgb(r: i32, g: i32, b: i32, x: i32, y: i32) -> u16 {
 /// next segment can chain from it.
 #[derive(Copy, Clone, Debug)]
 enum PolylineState {
-    /// Monochrome polyline — all segments use the same color.
+    /// Monochrome polyline -- all segments use the same color.
     Mono {
         color: u16,
         mode: BlendMode,
         last_vertex: (i32, i32),
     },
-    /// Gouraud polyline — each segment interpolates between the
+    /// Gouraud polyline -- each segment interpolates between the
     /// prior vertex's colour and the next colour word. Polyline
     /// receive mode alternates between (color word, vertex word)
     /// pairs; `awaiting_color` tracks which half we're on.
@@ -3062,19 +3077,19 @@ enum PolylineState {
 
 /// PSX semi-transparency mode. The four non-`Opaque` variants map
 /// directly to the four encodings in GP0 0xE1 / tpage bits 5-6.
-/// `Opaque` is our shortcut for "don't touch the destination — just
+/// `Opaque` is our shortcut for "don't touch the destination -- just
 /// overwrite" so primitives share one rasterizer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BlendMode {
     /// Write the foreground pixel directly, ignoring the background.
     Opaque,
-    /// `(B + F) / 2` — 50% average. Smoke, translucent glass.
+    /// `(B + F) / 2` -- 50% average. Smoke, translucent glass.
     Average,
-    /// `B + F`, channel-clamped to 31. Additive blending — fire, lights.
+    /// `B + F`, channel-clamped to 31. Additive blending -- fire, lights.
     Add,
-    /// `B - F`, channel-clamped to 0. Subtractive — shadows.
+    /// `B - F`, channel-clamped to 0. Subtractive -- shadows.
     Sub,
-    /// `B + F/4`, channel-clamped to 31. Low-intensity additive —
+    /// `B + F/4`, channel-clamped to 31. Low-intensity additive --
     /// subtle glow / haze.
     AddQuarter,
 }
@@ -3082,7 +3097,7 @@ pub enum BlendMode {
 impl BlendMode {
     /// Decode the 2-bit tpage/E1-command "semi-transparency" field
     /// (bits 5-6 of GP0 0xE1, or of a textured-primitive tpage word).
-    /// Always returns a non-`Opaque` variant — whether the primitive
+    /// Always returns a non-`Opaque` variant -- whether the primitive
     /// actually blends is determined by the caller's "is this prim
     /// semi-transparent?" flag.
     fn from_tpage_bits(bits: u32) -> Self {
@@ -3107,7 +3122,7 @@ fn prim_is_semi_trans(cmd_word: u32) -> bool {
 /// Resolve the blend mode for a non-textured primitive: opaque if
 /// the cmd-bit-1 flag is clear, otherwise the current tpage's
 /// active semi-transparency mode. Textured primitives don't use
-/// this helper — per-texel bit-15 controls blending there.
+/// this helper -- per-texel bit-15 controls blending there.
 #[inline]
 fn prim_blend_mode(cmd_word: u32, tpage_mode: BlendMode) -> BlendMode {
     if prim_is_semi_trans(cmd_word) {
@@ -3123,7 +3138,7 @@ fn prim_blend_mode(cmd_word: u32, tpage_mode: BlendMode) -> BlendMode {
 /// and `0xFF` act as double-brightness (clamped to 31 per channel).
 ///
 /// Called with `tint = 0x80_80_80` when the primitive is a "raw
-/// texture" (cmd bit 0 set) — that passes the texel through
+/// texture" (cmd bit 0 set) -- that passes the texel through
 /// unchanged. Callers of flat-tint textured primitives derive the
 /// tint from the cmd word's low 24 bits; Gouraud-textured primitives
 /// interpolate per pixel and call us with the per-pixel colour.
@@ -3140,7 +3155,7 @@ fn modulate_tint(texel: u16, tint_r: u32, tint_g: u32, tint_b: u32) -> u16 {
     r | (g << 5) | (b << 10) | (texel & 0x8000)
 }
 
-/// Dithered variant of [`modulate_tint`] — computes the modulated
+/// Dithered variant of [`modulate_tint`] -- computes the modulated
 /// RGB in 8-bit space, applies the 4×4 Bayer dither offset for the
 /// pixel position, then truncates to 5 bits per channel. Used by
 /// textured-Gouraud primitives when GP0 0xE1 bit 9 is on.
@@ -3167,13 +3182,13 @@ fn modulate_tint_dithered(
 /// primitive's command) into the three channels the modulator
 /// expects. Returns `(tint_r, tint_g, tint_b)` with each in 0..=255.
 /// For "raw texture" primitives the caller substitutes `(128, 128,
-/// 128)` directly — one code path through [`modulate_tint`].
+/// 128)` directly -- one code path through [`modulate_tint`].
 #[inline]
 fn split_tint(tint24: u32) -> (u32, u32, u32) {
     (tint24 & 0xFF, (tint24 >> 8) & 0xFF, (tint24 >> 16) & 0xFF)
 }
 
-/// Identity tint — pass-through for raw-texture primitives. Each
+/// Identity tint -- pass-through for raw-texture primitives. Each
 /// channel at `0x80` means modulation returns the texel unchanged.
 const RAW_TEXTURE_TINT: (u32, u32, u32) = (0x80, 0x80, 0x80);
 
@@ -3187,7 +3202,7 @@ const RAW_TEXTURE_TINT: (u32, u32, u32) = (0x80, 0x80, 0x80);
 /// is **Average**: Redux computes `(bg >> 1) + (fg >> 1)` independent
 /// per-channel, dropping each operand's LSB *before* summing. The
 /// naive `(bg + fg) / 2` rounds differently when both inputs are
-/// odd — e.g. `(3 + 3) / 2 = 3` vs Redux's `1 + 1 = 2`. That bug
+/// odd -- e.g. `(3 + 3) / 2 = 3` vs Redux's `1 + 1 = 2`. That bug
 /// alone produces off-by-1 diffs on the Sony logo's semi-
 /// transparent gradient edges.
 fn blend_pixel(bg: u16, fg: u16, mode: BlendMode) -> u16 {
@@ -3202,7 +3217,7 @@ fn blend_pixel(bg: u16, fg: u16, mode: BlendMode) -> u16 {
     let fb = ((fg >> 10) & 0x1F) as i16;
     let (r, g, b) = match mode {
         BlendMode::Opaque => unreachable!(),
-        // Half-back + half-front — per-channel right-shift before
+        // Half-back + half-front -- per-channel right-shift before
         // summing, matching Redux's `& 0x7bde >> 1` pattern.
         BlendMode::Average => (
             (br >> 1) + (fr >> 1),
@@ -3211,7 +3226,7 @@ fn blend_pixel(bg: u16, fg: u16, mode: BlendMode) -> u16 {
         ),
         BlendMode::Add => ((br + fr).min(31), (bgg + fgg).min(31), (bb + fb).min(31)),
         BlendMode::Sub => ((br - fr).max(0), (bgg - fgg).max(0), (bb - fb).max(0)),
-        // Full-back + quarter-front — `fg / 4` via integer division
+        // Full-back + quarter-front -- `fg / 4` via integer division
         // is the same as Redux's `(fg & 0x1c) >> 2` for 5-bit
         // channels: both truncate the low 2 bits then shift.
         BlendMode::AddQuarter => (
@@ -3229,7 +3244,7 @@ impl Default for Gpu {
     }
 }
 
-/// GPUSTAT — the status register the CPU polls to check whether the
+/// GPUSTAT -- the status register the CPU polls to check whether the
 /// GPU is ready for commands, ready to upload VRAM, etc.
 ///
 /// Value model matches a "always-idle soft GPU" (same convention as
@@ -3277,7 +3292,7 @@ impl GpuStatus {
             ret &= !0x0800_0000;
         }
 
-        // Bit 25 (DMA data request) — Redux-observed semantics, not
+        // Bit 25 (DMA data request) -- Redux-observed semantics, not
         // PSX-SPX's. PSX-SPX says dir=2 copies bit 28 and dir=3 copies
         // bit 27; Redux only sets bit 25 when direction == 1 (FIFO)
         // and leaves it clear otherwise. Parity at step 19,474,030
@@ -3394,6 +3409,23 @@ mod tests {
         gpu.write32(GP1_ADDR, 0x0300_0000);
         let stat_enabled = gpu.read32(GP1_ADDR).unwrap();
         assert_eq!(stat_enabled & (1 << 23), 0);
+    }
+
+    #[test]
+    fn gp1_query_unknown_subops_preserve_read_latch_like_redux() {
+        let mut gpu = Gpu::new();
+        gpu.write32(GP1_ADDR, 0x0000_0000); // reset seeds Redux's dataRet latch
+        assert_eq!(gpu.read32(GP0_ADDR).unwrap(), 0x0000_0400);
+
+        gpu.write32(GP1_ADDR, 0x1000_0007); // Redux CtrlQuery::Unknown
+        assert_eq!(gpu.read32(GP0_ADDR).unwrap(), 0x0000_0400);
+
+        gpu.write32(GP0_ADDR, 0xE300_1234);
+        gpu.write32(GP1_ADDR, 0x1000_0003);
+        assert_eq!(gpu.read32(GP0_ADDR).unwrap(), 0x0000_1234);
+
+        gpu.write32(GP1_ADDR, 0x1000_0007);
+        assert_eq!(gpu.read32(GP0_ADDR).unwrap(), 0x0000_1234);
     }
 
     #[test]
@@ -3726,7 +3758,7 @@ mod tests {
 
     #[test]
     fn textured_shaded_tri_packet_size_is_nine() {
-        // 0x34..=0x37 is "textured + Gouraud-shaded triangle" —
+        // 0x34..=0x37 is "textured + Gouraud-shaded triangle" --
         // 3 vertices × (colour+vertex+uv) = 9 words total.
         assert_eq!(gp0_packet_size(0x34), 9);
         assert_eq!(gp0_packet_size(0x37), 9);
@@ -3734,7 +3766,7 @@ mod tests {
 
     #[test]
     fn textured_shaded_quad_packet_size_is_twelve() {
-        // 0x3C..=0x3F is "textured + Gouraud-shaded quad" —
+        // 0x3C..=0x3F is "textured + Gouraud-shaded quad" --
         // 4 vertices × (colour+vertex+uv) = 12 words.
         assert_eq!(gp0_packet_size(0x3C), 12);
         assert_eq!(gp0_packet_size(0x3F), 12);
@@ -3797,7 +3829,7 @@ mod tests {
 
     #[test]
     fn dither_rgb_saturates_at_255() {
-        // Pure 255 must never wrap — tests the `rc < 0x1F` guard
+        // Pure 255 must never wrap -- tests the `rc < 0x1F` guard
         // across every coefficient position.
         for x in 0..4 {
             for y in 0..4 {
@@ -3876,12 +3908,12 @@ mod tests {
         gpu.write32(GP0_ADDR, 0x0000_0000);
         gpu.write32(GP0_ADDR, 0x0000_0004);
         gpu.write32(GP0_ADDR, 0x0002_0002);
-        // Corner pixels sit on edges — must be lit.
+        // Corner pixels sit on edges -- must be lit.
         assert_ne!(gpu.vram.get_pixel(0, 0), 0, "corner (0,0)");
         assert_ne!(gpu.vram.get_pixel(4, 0), 0, "corner (4,0)");
         assert_ne!(gpu.vram.get_pixel(2, 2), 0, "corner (2,2)");
         // A fully-interior pixel at (2, 1) sits just inside the
-        // triangle and on no edge — must stay zero.
+        // triangle and on no edge -- must stay zero.
         assert_eq!(gpu.vram.get_pixel(2, 1), 0, "interior should be empty");
     }
 
@@ -3926,7 +3958,7 @@ mod tests {
         // packet must not panic or leave the FIFO partially full.
         let mut gpu = Gpu::new();
         // All vertices inside draw area, degenerate (zero-area) triangle
-        // so we don't need to chase pixel output — the dispatch path is
+        // so we don't need to chase pixel output -- the dispatch path is
         // what we're testing.
         gpu.write32(GP0_ADDR, 0xE3_00_00_00); // draw area top-left 0,0
         gpu.write32(GP0_ADDR, 0xE4_00_03_FF); // draw area bottom-right 1023,0
@@ -3944,7 +3976,7 @@ mod tests {
         for w in words {
             gpu.write32(GP0_ADDR, w);
         }
-        // FIFO must be empty — the 9-word packet consumed cleanly.
+        // FIFO must be empty -- the 9-word packet consumed cleanly.
         assert_eq!(gpu.gp0_expected, 0);
     }
 
@@ -3965,7 +3997,7 @@ mod tests {
         gpu.tex_depth = 0; // 4bpp
         gpu.tex_page_x = 0;
         gpu.tex_page_y = 0;
-        // Texture word at (0, 0) — all four texels point to CLUT idx 0.
+        // Texture word at (0, 0) -- all four texels point to CLUT idx 0.
         gpu.vram.set_pixel(0, 0, 0x0000);
         // CLUT row at (0x100, 0), entry 0 = red (0x001F).
         gpu.vram.set_pixel(0x100, 0, 0x001F);
@@ -3989,7 +4021,7 @@ mod tests {
         gpu.tex_page_x = 0;
         gpu.tex_page_y = 0;
         // Texture word at (0, 0): idx[0]=5, idx[1]=3, idx[2]=2, idx[3]=1.
-        // We want to hit idx=5 — that means bits 0..3 should be 5.
+        // We want to hit idx=5 -- that means bits 0..3 should be 5.
         // (word >> 0) & 0xF = 5. So word low nibble = 5.
         gpu.vram.set_pixel(0, 0, 0x0005);
         // CLUT at (0x200, 0): entry 5 is 0x0000 (punch-through).
@@ -4049,10 +4081,10 @@ mod tests {
         //
         // Test: in 15bpp mode, place a recognisable colour at tpage
         // origin (u,v)=(0,0) and a different colour at host VRAM
-        // (256,0) — outside the tpage. Sampling at u=256 must return
+        // (256,0) -- outside the tpage. Sampling at u=256 must return
         // the FIRST colour (wrap), not the second.
         let mut gpu = Gpu::new();
-        gpu.tex_depth = 2; // 15bpp — one VRAM word per texel
+        gpu.tex_depth = 2; // 15bpp -- one VRAM word per texel
         gpu.tex_page_x = 0;
         gpu.tex_page_y = 0;
         gpu.vram.set_pixel(0, 0, 0x1111); // tpage origin
@@ -4103,7 +4135,7 @@ mod tests {
 
     #[test]
     fn extent_boundary_inclusive_keeps_triangle() {
-        // Exactly 1023 / 511 deltas are *kept* — only strictly greater
+        // Exactly 1023 / 511 deltas are *kept* -- only strictly greater
         // is dropped. This matches the hardware spec that the punch
         // list quotes ("|Δx| > 1023 or |Δy| > 511").
         assert!(!triangle_exceeds_hw_extent((0, 0), (1023, 0), (0, 511),));
@@ -4121,7 +4153,7 @@ mod tests {
 
     #[test]
     fn extent_check_uses_absolute_value() {
-        // Negative deltas must trip the check too — typically a vertex
+        // Negative deltas must trip the check too -- typically a vertex
         // at (-2000, 0) paired with (0, 0).
         assert!(triangle_exceeds_hw_extent((-2000, 0), (0, 0), (0, 0)));
         assert!(triangle_exceeds_hw_extent((0, 0), (0, 0), (0, -700)));
@@ -4211,11 +4243,11 @@ mod tests {
     fn oversize_monochrome_triangle_is_dropped() {
         // Submit a triangle whose v0→v1 edge is 1500px wide via the
         // GP0 monochrome-tri command. Hardware drops it; we should
-        // too — VRAM stays untouched.
+        // too -- VRAM stays untouched.
         let mut gpu = Gpu::new();
         gpu.write32(GP0_ADDR, 0x2000_00FF); // 0x20 cmd + red
         gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
-        gpu.write32(GP0_ADDR, 0x0000_05DC); // v1 = (1500, 0) — 1500 > 1023
+        gpu.write32(GP0_ADDR, 0x0000_05DC); // v1 = (1500, 0) -- 1500 > 1023
         gpu.write32(GP0_ADDR, 0x0064_0064); // v2 = (100, 100)
                                             // No pixel anywhere along the would-be triangle should be set.
         for x in [0u16, 50, 100, 500, 1000, 1500] {
@@ -4232,14 +4264,14 @@ mod tests {
         // A four-vertex monochrome quad (GP0 0x28) splits into two
         // triangles: (v0,v1,v2) and (v1,v2,v3). Build one where the
         // first half is sane and the second half has v3 placed so
-        // its Δy from v1 exceeds 511 — only the bad half should be
+        // its Δy from v1 exceeds 511 -- only the bad half should be
         // culled.
         let mut gpu = Gpu::new();
         gpu.write32(GP0_ADDR, 0x2800_00FF); // 0x28 + red
         gpu.write32(GP0_ADDR, 0x0000_0000); // v0 = (0, 0)
         gpu.write32(GP0_ADDR, 0x0000_0010); // v1 = (16, 0)
         gpu.write32(GP0_ADDR, 0x0010_0000); // v2 = (0, 16)
-                                            // v3 = (16, 600) — |v3.y - v1.y| = 600 > 511, second triangle drops.
+                                            // v3 = (16, 600) -- |v3.y - v1.y| = 600 > 511, second triangle drops.
         gpu.write32(GP0_ADDR, 0x0258_0010);
         // Sane half wrote pixels.
         assert_ne!(gpu.vram.get_pixel(1, 1), 0, "first half should rasterise");

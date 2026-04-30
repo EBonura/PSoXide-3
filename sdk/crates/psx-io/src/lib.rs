@@ -5,7 +5,7 @@
 //! module builds on. Keeping these centralised means we can audit
 //! every MMIO touchpoint in one file.
 //!
-//! All functions here are `#[inline(always)]` and `unsafe` — they
+//! All functions here are `#[inline(always)]` and `unsafe` -- they
 //! accept arbitrary addresses and widths. Higher-level SDK crates
 //! present safe APIs on top of these.
 

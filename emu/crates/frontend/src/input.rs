@@ -11,7 +11,7 @@
 //! # Multi-pad policy
 //!
 //! All connected pads OR into port 1. Two users pressing the same
-//! button on different pads looks like one user holding it —
+//! button on different pads looks like one user holding it --
 //! acceptable for the "anything plugged in just works" era of PS1
 //! homebrew. The router's state is keyed by `GamepadId`, so a
 //! future settings panel can peel this apart into `port[0]` /
@@ -20,7 +20,7 @@
 //! # Why an explicit tracked-pad set
 //!
 //! The pre-router code called `gilrs.gamepads().next()` every
-//! frame — "whatever comes first in gilrs's internal map". That's
+//! frame -- "whatever comes first in gilrs's internal map". That's
 //! fine with one pad plugged in, but a disconnect-then-reconnect
 //! can flip iteration order and the game silently starts reading
 //! a different device. Worse: the only time events were drained
@@ -45,7 +45,7 @@
 //!
 //! The chord fires on the **rising edge**: both bits must go from
 //! "not-both-held last frame" to "both-held this frame". Subsequent
-//! frames with the chord still held do nothing — so the menu
+//! frames with the chord still held do nothing -- so the menu
 //! doesn't flicker open/closed while the user is lazy about
 //! releasing.
 //!
@@ -103,7 +103,7 @@ impl InputNotice {
 /// Per-frame summary returned by [`InputRouter::poll`].
 ///
 /// The shell consumes this to drive both the PSX pad input and
-/// Menu menu navigation in a single call — separate fields rather
+/// Menu menu navigation in a single call -- separate fields rather
 /// than one blob so each consumer's needs are obvious at the call
 /// site.
 #[derive(Clone, Debug, Default)]
@@ -117,7 +117,7 @@ pub struct InputFrame {
     /// phantom combo when the user is actually opening the menu.
     pub pad1_mask: u16,
 
-    /// Rising-edge of Select+Start on any pad — goes `true` for
+    /// Rising-edge of Select+Start on any pad -- goes `true` for
     /// exactly one frame after both become held. The shell wires
     /// this into `MenuInput.toggle_open`, reusing the same path
     /// Escape goes through.
@@ -139,9 +139,9 @@ pub struct InputFrame {
     pub menu_left: bool,
     /// See [`Self::menu_up`].
     pub menu_right: bool,
-    /// Rising-edge of Cross — the Menu's "enter / confirm".
+    /// Rising-edge of Cross -- the Menu's "enter / confirm".
     pub menu_confirm: bool,
-    /// Rising-edge of Circle — the Menu's "back / cancel".
+    /// Rising-edge of Circle -- the Menu's "back / cancel".
     pub menu_back: bool,
 
     /// Left stick on the first currently-connected pad, in
@@ -166,7 +166,7 @@ pub struct InputRouter {
     /// Every pad gilrs has told us about, still connected.
     /// Updated on `Connected` / `Disconnected` events.
     pads: HashMap<GamepadId, TrackedPad>,
-    /// Previous frame's merged mask — used for rising-edge
+    /// Previous frame's merged mask -- used for rising-edge
     /// detection on both the chord and the menu-nav buttons.
     prev_mask: u16,
     /// Previous frame's host Analog/Mode button state.
@@ -178,14 +178,14 @@ pub struct InputRouter {
 
 impl InputRouter {
     /// Initialise gilrs and enumerate any pads already known at
-    /// startup. A failed init is non-fatal — subsequent polls
+    /// startup. A failed init is non-fatal -- subsequent polls
     /// return an empty [`InputFrame`] and the shell happily runs
     /// on keyboard alone.
     pub fn new() -> Self {
         let gilrs = match Gilrs::new() {
             Ok(g) => {
                 // Log every pad gilrs already enumerated at this
-                // point — the "did it even see my controller?"
+                // point -- the "did it even see my controller?"
                 // question users will ask when BT pads go missing.
                 for (id, gp) in g.gamepads() {
                     eprintln!(
@@ -242,7 +242,7 @@ impl InputRouter {
 
     /// Drain pending events, recompute the merged state, and
     /// return the [`InputFrame`] for this tick. Must be called
-    /// once per frame — call it even when the game is paused,
+    /// once per frame -- call it even when the game is paused,
     /// otherwise gilrs's event queue never drains and hot-plugged
     /// pads go un-noticed.
     pub fn poll(&mut self) -> InputFrame {
@@ -277,21 +277,21 @@ impl InputRouter {
                 }
                 // Other events (button + axis state) are handled
                 // implicitly by re-reading `gp.is_pressed` /
-                // `gp.value` below — no per-event bookkeeping.
+                // `gp.value` below -- no per-event bookkeeping.
                 _ => {}
             }
         }
 
         // 2. Sample every connected pad; OR into the merged mask.
         //    Record the first connected pad's sticks for the
-        //    caller — analog routing is single-player even when
+        //    caller -- analog routing is single-player even when
         //    multiple pads contribute to port 1's digital mask.
         let mut mask: u16 = 0;
         let mut first_sticks: Option<((f32, f32), (f32, f32))> = None;
         let mut analog_down = false;
 
         // Iterate through our *own* tracked set instead of
-        // `gilrs.gamepads()` — deterministic order across frames
+        // `gilrs.gamepads()` -- deterministic order across frames
         // (HashMap iteration order is randomised per-Map, but
         // stable within one HashMap's lifetime when unchanged).
         for id in self.pads.keys() {
@@ -321,7 +321,7 @@ impl InputRouter {
 
         // 4. Build the frame.
         //    Menu-nav edges are derived from the raw merged mask
-        //    *before* we mask out the chord bits — pressing just
+        //    *before* we mask out the chord bits -- pressing just
         //    Select (without Start) should still behave like the
         //    pad sees it (no menu_* flag fires for Select alone,
         //    since CHORD_MASK bits aren't in any menu_* field).
@@ -348,7 +348,7 @@ impl InputRouter {
 
         // 5. Stash for next frame's edge math. We store the raw
         //    merged mask (chord bits included) so the chord's
-        //    rising-edge math works — stashing the chord-masked
+        //    rising-edge math works -- stashing the chord-masked
         //    value would make the chord re-fire every frame it
         //    stayed held.
         self.prev_mask = mask;
@@ -364,7 +364,7 @@ impl InputRouter {
     }
 
     /// Comma-separated list of currently-connected pad names.
-    /// Empty string when nothing is plugged in. Diagnostic —
+    /// Empty string when nothing is plugged in. Diagnostic --
     /// surfaced in the startup banner and (eventually) the
     /// settings panel.
     pub fn connected_names(&self) -> String {
@@ -375,7 +375,7 @@ impl InputRouter {
 }
 
 /// Sample one pad's PSX button mask. Extracted so the mapping
-/// table is in exactly one place — no ambiguity about which
+/// table is in exactly one place -- no ambiguity about which
 /// flavour of `is_pressed` the router uses vs what a hypothetical
 /// "preview current pad" feature might do.
 ///
@@ -437,7 +437,7 @@ fn sample_pad(gp: &gilrs::Gamepad<'_>) -> u16 {
         mask |= button::RIGHT;
     }
 
-    // Left stick as D-pad proxy — useful for both games that
+    // Left stick as D-pad proxy -- useful for both games that
     // treat the pad as digital regardless of DualShock capability
     // AND for Menu nav, which needs directional edges.
     let lx = gp.value(Axis::LeftStickX);

@@ -1,6 +1,6 @@
 //! Host-side GTE shim.
 //!
-//! On real PS1 hardware the GTE is a coprocessor — a singleton owned
+//! On real PS1 hardware the GTE is a coprocessor -- a singleton owned
 //! by the CPU. The SDK's macros and op functions encode that as
 //! parameter-less inline-asm calls. Host builds preserve the same
 //! shape by routing those calls through a per-thread

@@ -8,9 +8,9 @@
 /// to match.
 pub(super) fn gp0_packet_size(op: u8) -> usize {
     match op {
-        // NOP / clear cache / misc — single word.
+        // NOP / clear cache / misc -- single word.
         0x00 | 0x01 | 0x03..=0x1E => 1,
-        // Quick fill — RGB + (X,Y) + (W,H) = 3 words.
+        // Quick fill -- RGB + (X,Y) + (W,H) = 3 words.
         0x02 => 3,
         // Monochrome flat triangle: color + 3 vertices = 4 words.
         0x20..=0x23 => 4,
@@ -51,7 +51,7 @@ pub(super) fn gp0_packet_size(op: u8) -> usize {
         0xA0..=0xBF => 3,
         // VRAM-to-CPU: same 3-word header.
         0xC0..=0xDF => 3,
-        // Draw-mode settings (E1..=E6) — single word each.
+        // Draw-mode settings (E1..=E6) -- single word each.
         0xE1..=0xE6 => 1,
         _ => 1,
     }

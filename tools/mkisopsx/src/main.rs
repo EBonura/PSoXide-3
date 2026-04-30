@@ -1,4 +1,4 @@
-//! `mkisopsx` — wrap a PSX-EXE into a bootable PS1 disc image.
+//! `mkisopsx` -- wrap a PSX-EXE into a bootable PS1 disc image.
 //!
 //! Usage:
 //!
@@ -6,7 +6,7 @@
 //!   mkisopsx --exe path/to/hello-tri.exe --out hello.bin [--volume HELLO] [--iso]
 //! ```
 //!
-//! Default output is a raw 2352-byte-per-sector `.bin` image — the
+//! Default output is a raw 2352-byte-per-sector `.bin` image -- the
 //! format PSoXide's own CDROM loader expects and that most desktop
 //! emulators (PCSX-Redux, Duckstation, Mednafen) also accept. Pass
 //! `--iso` to emit a cooked 2048-byte-per-sector `.iso` instead
@@ -16,7 +16,7 @@
 //! (points the BIOS at `PSX.EXE`) and the EXE itself, both in the
 //! root directory.
 //!
-//! The tool is deliberately a tiny CLI — actual encoding lives in
+//! The tool is deliberately a tiny CLI -- actual encoding lives in
 //! `psx-iso::iso9660` so it's reusable from build scripts, test
 //! harnesses, or a future GUI bundler.
 
@@ -113,7 +113,7 @@ fn main() -> ExitCode {
     };
 
     // Validate the input actually is a PSX-EXE before we bake it into
-    // an ISO — silently packing a corrupt file would produce a disc
+    // an ISO -- silently packing a corrupt file would produce a disc
     // that just sits at the BIOS screen, which is annoying to debug.
     if let Err(e) = Exe::parse(&exe_bytes) {
         eprintln!("{}: not a valid PSX-EXE ({e:?})", args.exe.display());

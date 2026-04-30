@@ -1,5 +1,5 @@
 //! Quantify our CPU cycle-count per step vs Redux's. At step N,
-//! ours reports `bus.cycles()` and Redux reports its tick counter —
+//! ours reports `bus.cycles()` and Redux reports its tick counter --
 //! if the two diverge at matching step counts, render parity
 //! across frames is impossible (we're at different moments in the
 //! same game).
@@ -30,7 +30,7 @@ fn main() {
     //
     // Redux tick numbers captured via `display_parity_at` runs (the
     // Redux side prints `reached tick=N`). Checkpoints chosen to
-    // bisect where the drift becomes visible — 1M, 10M, 30M at the
+    // bisect where the drift becomes visible -- 1M, 10M, 30M at the
     // front find early divergence; 100M/500M/1B show long-run trend.
     //
     // To add a new row: run `display_parity_at <steps> [disc]` and
@@ -49,7 +49,7 @@ fn main() {
             Some("/Users/ebonura/Downloads/ps1 games/Crash Bandicoot (USA)/Crash Bandicoot (USA).bin"),
             &[
                 (100_000_000, 235_279_073),
-                // Print just this one — we'll run with different step
+                // Print just this one -- we'll run with different step
                 // counts via `cargo run` + arg override if needed.
                 (300_000_000, 705_660_075),
                 (900_000_000, 2_177_711_744),

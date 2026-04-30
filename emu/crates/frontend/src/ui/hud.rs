@@ -18,7 +18,7 @@ pub struct HudState {
     /// Most recent audio-ring-buffer depth, in stereo samples.
     /// Updated by [`HudState::set_audio_queue_len`] from the
     /// shell each frame right after the SPU pump drain. Shown in
-    /// the toolbar so you can see audio backlog — low values
+    /// the toolbar so you can see audio backlog -- low values
     /// (< 100) mean we're starving the audio thread; high values
     /// (> 10k) mean the emu is outrunning real-time playback.
     audio_queue_len: usize,

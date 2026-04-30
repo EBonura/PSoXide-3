@@ -17,7 +17,7 @@ pub mod world_cook;
 /// Embedded copy of the default project's RON, baked at compile
 /// time so the editor binary always carries a working starter even
 /// if `editor/projects/default/` is absent at runtime. Single source
-/// of truth — edits to the on-disk file propagate to `starter()` on
+/// of truth -- edits to the on-disk file propagate to `starter()` on
 /// the next build.
 const DEFAULT_PROJECT_RON: &str = include_str!("../../../projects/default/project.ron");
 
@@ -45,7 +45,7 @@ pub fn default_project_dir() -> PathBuf {
 /// Enumerate every directory under [`projects_dir`] that contains a
 /// `project.ron`. Cheap directory walk, used by the editor's open /
 /// switch flow once that lands. Returns an empty Vec rather than
-/// erroring when `projects_dir` doesn't exist — fresh checkout
+/// erroring when `projects_dir` doesn't exist -- fresh checkout
 /// before the dev runs the editor once.
 pub fn list_projects() -> std::io::Result<Vec<PathBuf>> {
     let root = projects_dir();
@@ -464,7 +464,7 @@ impl GridHorizontalFace {
         }
     }
 
-    /// Drop one corner — the face becomes a visible triangle.
+    /// Drop one corner -- the face becomes a visible triangle.
     /// Forces `split` to the diagonal that keeps a triangle
     /// alive (drop NE / SW → NW-SE; drop NW / SE → NE-SW). The
     /// dropped corner's stored height is left untouched so the
@@ -531,7 +531,7 @@ impl GridVerticalFace {
 /// wall of `(x+1, z)` simultaneously. The editor's PaintWall tool
 /// stamps only one side (whichever the user clicked). When both
 /// sides claim the same physical edge the cooker rejects the grid
-/// with `DuplicatePhysicalWall` — render-+-collision-correct
+/// with `DuplicatePhysicalWall` -- render-+-collision-correct
 /// double walls aren't a thing, and silent-dedup risks the editor
 /// and runtime disagreeing about which side won. North/South share
 /// `North(x, z)` ↔ `South(x, z+1)` under the same rule.
@@ -621,7 +621,7 @@ impl GridSector {
 
 /// Hard caps on a single room's authoring shape. The cooker
 /// rejects past these, and the editor inspector warns as the
-/// budget approaches them — both to keep the cooked `.psxw`
+/// budget approaches them -- both to keep the cooked `.psxw`
 /// inside reasonable PSX-side memory and to surface coordinate
 /// safety early (32-sector room × 1024 sector_size = 32 768,
 /// right at the i16 cliff; the renderer uses anchor-relative
@@ -634,13 +634,13 @@ pub const MAX_ROOM_BYTES: usize = 64 * 1024;
 
 /// World-unit step every authored vertex height must align to.
 ///
-/// The X / Z grid is locked by construction — corners are always
+/// The X / Z grid is locked by construction -- corners are always
 /// computed from the cell's array index and `sector_size`. Y is
 /// the only free axis, and we constrain it to multiples of this
 /// step so the editor can't author noise heights that the runtime
 /// quantises away anyway.
 ///
-/// 32 is `sector_size / 32` at the default 1024 — fine enough that
+/// 32 is `sector_size / 32` at the default 1024 -- fine enough that
 /// authored slopes look smooth, coarse enough that PS1 i16 vertex
 /// jitter never fights the snap.
 pub const HEIGHT_QUANTUM: i32 = 32;
@@ -648,7 +648,7 @@ pub const HEIGHT_QUANTUM: i32 = 32;
 /// Snap a vertex height to the nearest [`HEIGHT_QUANTUM`] multiple.
 ///
 /// Round-half-away-from-zero so the snap is symmetric for
-/// negative heights — `snap_height(-15)` returns `0`,
+/// negative heights -- `snap_height(-15)` returns `0`,
 /// `snap_height(-16)` returns `-32`. Plain integer math; no
 /// float intermediaries.
 pub fn snap_height(y: i32) -> i32 {
@@ -690,13 +690,13 @@ pub struct WorldGridBudget {
     /// Estimated size if we shipped the future compact format
     /// described in `docs/world-format-roadmap.md` (28-byte
     /// sectors, 12-byte walls). Surfaced as a planning aid, not
-    /// a contract — no live `.psxw` is ever this size today.
+    /// a contract -- no live `.psxw` is ever this size today.
     pub future_compact_estimated_bytes: usize,
 }
 
 impl WorldGridBudget {
     /// `true` if any cap is exceeded. Mirrors the validation the
-    /// cooker now enforces — UI and cooker can't disagree about
+    /// cooker now enforces -- UI and cooker can't disagree about
     /// what counts as "too big."
     pub fn over_budget(&self) -> bool {
         self.width > MAX_ROOM_WIDTH
@@ -865,7 +865,7 @@ impl WorldGrid {
         }
         // v1 wire layout (matches `psxed_format::world` records):
         //   AssetHeader = 12, WorldHeader = 20, Sector = 44, Wall = 24.
-        // v1 stores a sector record for every cell — empty or not —
+        // v1 stores a sector record for every cell -- empty or not --
         // so the byte count uses `total_cells`. Using
         // `populated_cells` here was the original bug: it under-
         // reported the wire size by ~44 B per empty cell.
@@ -917,7 +917,7 @@ impl WorldGrid {
     }
 
     /// World-space `(x, z)` centre of cell `(sx, sz)` in floating
-    /// point — handy for picking, edge inference, and entity
+    /// point -- handy for picking, edge inference, and entity
     /// snapping. Mirrors the renderer's cell positioning so all
     /// three pipelines agree on where each cell physically sits.
     pub fn cell_center_world(&self, sx: u16, sz: u16) -> [f32; 2] {
@@ -933,7 +933,7 @@ impl WorldGrid {
     /// just `half`, so callers stay correct without each
     /// re-deriving the offset.
     ///
-    /// This is the **canonical** editor centre — every coordinate
+    /// This is the **canonical** editor centre -- every coordinate
     /// helper that bridges editor-viewport units (sector-units,
     /// room-centre-relative) and world-cell / world-space units
     /// goes through this single source of truth.
@@ -984,7 +984,7 @@ impl WorldGrid {
         [world_cells[0] * s, 0.0, world_cells[1] * s]
     }
 
-    /// Inverse of [`Self::editor_to_room_local`] — world-space
+    /// Inverse of [`Self::editor_to_room_local`] -- world-space
     /// `(x, _, z)` → editor-viewport `(x, z)` (sector-units,
     /// room-centre-relative). The `y` component is dropped:
     /// cell positioning is purely XZ.
@@ -1153,14 +1153,14 @@ const fn default_model_world_height() -> u16 {
 }
 
 impl ModelResource {
-    /// Index of the clip the editor inspector should preview —
+    /// Index of the clip the editor inspector should preview --
     /// `preview_clip` if set, else `default_clip`, else `None`.
     pub fn effective_preview_clip(&self) -> Option<u16> {
         self.preview_clip.or(self.default_clip)
     }
 
     /// Index of the clip a runtime instance with no override
-    /// should play — `default_clip` if set, else clip 0 if any
+    /// should play -- `default_clip` if set, else clip 0 if any
     /// clip exists, else `None`.
     pub fn effective_runtime_clip(&self) -> Option<u16> {
         self.default_clip
@@ -1178,7 +1178,7 @@ impl ModelResource {
 /// the player spawn must resolve to a Model with valid idle and
 /// walk clips at cook time.
 ///
-/// Engine units throughout — same convention used by the rest
+/// Engine units throughout -- same convention used by the rest
 /// of the runtime (`sector_size = 1024`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharacterResource {
@@ -1186,18 +1186,18 @@ pub struct CharacterResource {
     /// validated at cook time when assigned to the player.
     #[serde(default)]
     pub model: Option<ResourceId>,
-    /// Index into the model's clip list — played when the
+    /// Index into the model's clip list -- played when the
     /// character has no movement input. Required for the player.
     #[serde(default)]
     pub idle_clip: Option<u16>,
-    /// Index into the model's clip list — played while walking.
+    /// Index into the model's clip list -- played while walking.
     /// Required for the player.
     #[serde(default)]
     pub walk_clip: Option<u16>,
-    /// Index into the model's clip list — optional run clip.
+    /// Index into the model's clip list -- optional run clip.
     #[serde(default)]
     pub run_clip: Option<u16>,
-    /// Index into the model's clip list — optional turn clip.
+    /// Index into the model's clip list -- optional turn clip.
     #[serde(default)]
     pub turn_clip: Option<u16>,
     /// Capsule radius (engine units). Used by collision +
@@ -1255,7 +1255,7 @@ pub enum ResourceData {
     /// Cooked PSXT artifact reference.
     ///
     /// The editor and the runtime both consume the same `.psxt` blob
-    /// — the runtime via `include_bytes!` at compile time, the editor
+    /// -- the runtime via `include_bytes!` at compile time, the editor
     /// via `std::fs::read` at refresh time and `psx_asset::Texture::from_bytes`
     /// to extract pixel + CLUT bytes. PNG → PSXT cooking lives in the
     /// `psxed-tex` CLI; the editor's runtime path doesn't touch PNGs.
@@ -1270,7 +1270,7 @@ pub enum ResourceData {
     },
     /// Editor material.
     Material(MaterialResource),
-    /// Cooked animated PSX model — `.psxmdl` + optional `.psxt`
+    /// Cooked animated PSX model -- `.psxmdl` + optional `.psxt`
     /// atlas + animation clips. Instantiated in scenes via
     /// [`NodeKind::MeshInstance`] referencing this resource id.
     Model(ModelResource),
@@ -1295,7 +1295,7 @@ pub enum ResourceData {
         /// Project-relative audio path.
         source_path: String,
     },
-    /// Gameplay character — Model + role clip mapping +
+    /// Gameplay character -- Model + role clip mapping +
     /// capsule/camera defaults. Layered on top of a Model
     /// resource; the player spawn references this to resolve
     /// what to render and how the controller behaves.
@@ -1354,7 +1354,7 @@ pub enum NodeKind {
     ///
     /// `mesh` references either a legacy [`ResourceData::Mesh`] or a
     /// cooked [`ResourceData::Model`]. When it points at a Model,
-    /// `animation_clip` selects which clip plays — an explicit
+    /// `animation_clip` selects which clip plays -- an explicit
     /// `Some(idx)` overrides the model's `default_clip`; `None`
     /// inherits the model default. Instances of legacy meshes
     /// ignore this field.
@@ -1582,7 +1582,7 @@ impl Scene {
     /// Refuses (returns `false`) when:
     /// * `id` is the scene root,
     /// * `id` or `new_parent` is missing,
-    /// * `new_parent` is `id` or any of its descendants — that would
+    /// * `new_parent` is `id` or any of its descendants -- that would
     ///   form a cycle.
     ///
     /// `position` clamps to the destination's current child count.
@@ -1680,7 +1680,7 @@ impl ProjectDocument {
 
     /// Deserialize the default project shipped at
     /// `editor/projects/default/project.ron`. The on-disk RON file
-    /// is the single source of truth — the editor reads the exact
+    /// is the single source of truth -- the editor reads the exact
     /// same bytes a `cargo run` would, so changes to the default
     /// project are git-trackable and don't require a rebuild.
     ///
@@ -1802,7 +1802,7 @@ mod tests {
         // Above half-quantum rounds up away from zero.
         assert_eq!(snap_height(17), 32);
         assert_eq!(snap_height(-17), -32);
-        // Past one quantum the same rule applies — round to the
+        // Past one quantum the same rule applies -- round to the
         // nearest multiple.
         assert_eq!(snap_height(47), 32);
         assert_eq!(snap_height(48), 64);
@@ -1965,7 +1965,7 @@ mod tests {
         // (1, 0) has world-cell centre [0.5, 0.5], so editor centre
         // is [0.5 - 1.0, 0.5 - 1.5] = [-0.5, -1.0].
         assert_eq!(grid.editor_cells_to_array([-0.5, -1.0]), Some((1, 0)));
-        // Newly-included cell at array (0, 0) — world-cell (-1, 0),
+        // Newly-included cell at array (0, 0) -- world-cell (-1, 0),
         // editor centre [-0.5 - 1.0, -1.0] = [-1.5, -1.0].
         assert_eq!(grid.editor_cells_to_array([-1.5, -1.0]), Some((0, 0)));
     }
@@ -2016,7 +2016,7 @@ mod tests {
         // 2 tris per face: 9 floors + 12 walls = 21 faces.
         assert_eq!(b.triangles, 42);
         // v2 should be strictly smaller than v1 once any geometry
-        // exists — the size delta is the whole point of the v2
+        // exists -- the size delta is the whole point of the v2
         // record reshape.
         assert!(b.future_compact_estimated_bytes < b.psxw_v1_bytes);
         assert!(!b.over_budget());
@@ -2037,9 +2037,9 @@ mod tests {
         assert_eq!(b.floors, 1024);
         assert_eq!(b.triangles, 2048);
         assert!(b.triangles <= MAX_ROOM_TRIANGLES);
-        // v1: 32 + 1024 * 44 = 45088 — over the 64KiB cap on the
+        // v1: 32 + 1024 * 44 = 45088 -- over the 64KiB cap on the
         // wall-stack-heavy worst case but fine on floors-only.
-        // v2: 32 + 1024 * 28 = 28704 — well under cap.
+        // v2: 32 + 1024 * 28 = 28704 -- well under cap.
         assert!(b.future_compact_estimated_bytes <= MAX_ROOM_BYTES);
         assert!(!b.over_budget());
     }
@@ -2331,8 +2331,8 @@ mod tests {
 
     #[test]
     fn legacy_mesh_instance_without_animation_clip_loads() {
-        // Synthesize the pre-extension MeshInstance shape — `animation_clip`
-        // missing — and confirm `#[serde(default)]` lands `None`.
+        // Synthesize the pre-extension MeshInstance shape -- `animation_clip`
+        // missing -- and confirm `#[serde(default)]` lands `None`.
         let ron = r#"
             (
                 name: "Legacy",

@@ -1,7 +1,7 @@
 //! Dump GPU display-mode state for Crash Bandicoot at several
 //! instruction counts, so we can see what resolution / display-area
 //! Crash programs and when it changes modes. The user reported the
-//! game renders "stretched horizontally" — the first question is
+//! game renders "stretched horizontally" -- the first question is
 //! whether that's our fault (mis-decoding GP1 0x08) or just an
 //! unusual-but-correct mode that our framebuffer painter handles
 //! without pixel-aspect correction.

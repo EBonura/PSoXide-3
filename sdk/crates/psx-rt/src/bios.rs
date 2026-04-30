@@ -45,30 +45,30 @@ macro_rules! bios_calls {
 bios_calls! {
     // ---- A-table ----
 
-    /// A(3Ch) `putchar` — write one byte to the TTY.
+    /// A(3Ch) `putchar` -- write one byte to the TTY.
     A(0x3C) fn bios_putchar(ch: u32);
 
-    /// A(3Eh) `puts` — write a null-terminated string to the TTY.
+    /// A(3Eh) `puts` -- write a null-terminated string to the TTY.
     A(0x3E) fn bios_puts(s: *const u8);
 
-    /// A(44h) `FlushCache` — invalidate the instruction cache.
+    /// A(44h) `FlushCache` -- invalidate the instruction cache.
     A(0x44) fn bios_flush_cache();
 
     // ---- B-table ----
 
-    /// B(08h) `OpenEvent` — register an event handler.
+    /// B(08h) `OpenEvent` -- register an event handler.
     B(0x08) fn bios_open_event(class: u32, spec: u16, mode: u16, func: u32) -> u32;
 
-    /// B(0Ah) `WaitEvent` — block until event fires.
+    /// B(0Ah) `WaitEvent` -- block until event fires.
     B(0x0A) fn bios_wait_event(event: u32) -> u32;
 
-    /// B(0Bh) `TestEvent` — non-blocking: returns 1 if fired, 0 else.
+    /// B(0Bh) `TestEvent` -- non-blocking: returns 1 if fired, 0 else.
     B(0x0B) fn bios_test_event(event: u32) -> u32;
 
     /// B(0Ch) `EnableEvent`.
     B(0x0C) fn bios_enable_event(event: u32);
 
-    /// B(3Dh) `std_out_putchar` — write one byte to stdout device.
+    /// B(3Dh) `std_out_putchar` -- write one byte to stdout device.
     B(0x3D) fn bios_std_out_putchar(ch: u32);
 }
 

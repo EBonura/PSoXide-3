@@ -1,4 +1,4 @@
-//! `hello-tex` — upload two 4bpp CLUT textures cooked from source
+//! `hello-tex` -- upload two 4bpp CLUT textures cooked from source
 //! photographs (a brick wall + a cobblestone floor, produced by
 //! `psxed tex` from their `vendor/*.jpg` originals) and draw them
 //! as animated bouncing sprites.
@@ -36,14 +36,14 @@ use psx_io::gpu::{wait_cmd_ready, write_gp0};
 use psx_math::sincos;
 use psx_vram::{Clut, TexDepth, Tpage, VramRect, upload_bytes};
 
-/// Wall (brick) — cooked by `make assets` from
+/// Wall (brick) -- cooked by `make assets` from
 /// `vendor/brick-wall.jpg`.
 static BRICK_BLOB: &[u8] = include_bytes!("../../../../assets/textures/brick-wall.psxt");
 
-/// Floor (cobblestone / batako) — cooked from `vendor/floor.jpg`.
+/// Floor (cobblestone / batako) -- cooked from `vendor/floor.jpg`.
 static FLOOR_BLOB: &[u8] = include_bytes!("../../../../assets/textures/floor.psxt");
 
-/// Shared tpage — both 64-texel-wide 4bpp textures fit in one
+/// Shared tpage -- both 64-texel-wide 4bpp textures fit in one
 /// 256-wide tpage with room to spare. The `apply_as_draw_mode`
 /// call at startup sets this as the current tpage; every textured
 /// sprite we draw samples from it.
@@ -53,7 +53,7 @@ const SHARED_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
 /// both framebuffer halves (0..240 and 240..480).
 const BRICK_CLUT: Clut = Clut::new(0, 480);
 
-/// CLUT for the floor texture. One row down — 16 halfwords ≠ a
+/// CLUT for the floor texture. One row down -- 16 halfwords ≠ a
 /// full VRAM row width, so we just step Y by 1 to keep CLUTs
 /// compact.
 const FLOOR_CLUT: Clut = Clut::new(0, 481);
@@ -77,8 +77,8 @@ fn main() {
     let floor = Texture::from_bytes(FLOOR_BLOB).expect("floor.psxt");
 
     // Brick occupies the left 16 halfwords of the tpage (U 0..64).
-    // VRAM rect width is in HALFWORDS — 4 texels per halfword at
-    // 4bpp — so 64 texels wide = 16 halfwords wide.
+    // VRAM rect width is in HALFWORDS -- 4 texels per halfword at
+    // 4bpp -- so 64 texels wide = 16 halfwords wide.
     let brick_pix_rect = VramRect::new(
         SHARED_TPAGE.x(),
         SHARED_TPAGE.y(),
@@ -108,7 +108,7 @@ fn main() {
     let brick_clut_word = BRICK_CLUT.uv_clut_word();
     let floor_clut_word = FLOOR_CLUT.uv_clut_word();
 
-    // Sine-oscillating centres — same Q0.12 phase pattern as
+    // Sine-oscillating centres -- same Q0.12 phase pattern as
     // hello-ot's triangles. Modulo arithmetic would create a
     // sawtooth snap-back every N frames; `sincos::sin_q12`
     // gives a smooth back-and-forth drift.
@@ -142,7 +142,7 @@ fn main() {
 
 /// Pixel displacement from a Q0.12 phase. `sin_q12` returns Q1.12
 /// in `[-0x1000, 0x1000]`; multiplying by `amp_px` and shifting 12
-/// rescales back to pixels — smooth ±`amp_px` drift with no
+/// rescales back to pixels -- smooth ±`amp_px` drift with no
 /// sawtooth wrap.
 #[inline]
 fn drift(phase_q12: u16, amp_px: i16) -> i16 {

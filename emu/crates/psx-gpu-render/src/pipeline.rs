@@ -8,7 +8,7 @@ use crate::target::{TARGET_FORMAT, VRAM_HEIGHT, VRAM_WIDTH};
 /// `Vec<HwVertex>` into the GPU vertex buffer with `cast_slice`.
 ///
 /// `flags` packs every per-primitive piece of state the fragment
-/// shader needs — the format is identical across primitives, so a
+/// shader needs -- the format is identical across primitives, so a
 /// single draw call handles mixed textured / mono / different
 /// tpages / different CLUTs in one batch. See [`flags`] module for
 /// the bit layout (host + WGSL must agree).
@@ -29,7 +29,7 @@ pub struct HwVertex {
     pub flags: u32,
 }
 
-/// `HwVertex::flags` bit layout. Host + shader must agree —
+/// `HwVertex::flags` bit layout. Host + shader must agree --
 /// any change here needs the matching constants in
 /// `shaders/prim.wgsl` updated in lockstep.
 ///
@@ -80,7 +80,7 @@ pub mod flags {
 const INITIAL_VERTEX_CAPACITY: u64 = 16 * 1024;
 
 /// Per-primitive PSX blend mode. Maps 1:1 to one of the 5 render
-/// pipelines `HwPipeline` builds — the translator sorts vertices
+/// pipelines `HwPipeline` builds -- the translator sorts vertices
 /// into contiguous batches by `BlendKind`, the renderer issues
 /// one draw per batch with the matching pipeline + blend constant.
 ///
@@ -129,7 +129,7 @@ fn blend_constant_for(kind: BlendKind) -> wgpu::Color {
 
 pub struct HwPipeline {
     /// One render pipeline per [`BlendKind`]. Same shader, same
-    /// vertex layout — only `BlendState` differs. Indexed by
+    /// vertex layout -- only `BlendState` differs. Indexed by
     /// `BlendKind::index()`.
     pipelines: [wgpu::RenderPipeline; BlendKind::COUNT],
     bind_group_layout: wgpu::BindGroupLayout,
@@ -159,7 +159,7 @@ impl HwPipeline {
 
         // VRAM as a 1024×512 R16Uint texture. Filled each frame
         // by `upload_vram`. The fragment shader reads from it via
-        // `textureLoad` (no filtering — every PSX texture access
+        // `textureLoad` (no filtering -- every PSX texture access
         // is integer-addressed).
         let vram_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("psx-hw-vram-r16uint"),
@@ -181,7 +181,7 @@ impl HwPipeline {
             label: Some("psx-hw-bgl"),
             entries: &[
                 // 0: VRAM texture (fragment shader). Vertex shader
-                // doesn't need any uniforms — VRAM dims are
+                // doesn't need any uniforms -- VRAM dims are
                 // hardcoded constants in the WGSL.
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -260,7 +260,7 @@ impl HwPipeline {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
-                    // PSX has no winding constraint — quads / rects
+                    // PSX has no winding constraint -- quads / rects
                     // come in with mixed windings depending on game
                     // UV layout.
                     cull_mode: None,
@@ -313,7 +313,7 @@ impl HwPipeline {
 
     /// Mirror CPU VRAM into the GPU-side `R16Uint` texture used by
     /// the fragment shader. Cheap full-frame upload (1 MiB / frame)
-    /// — same cost the existing `Graphics::prepare_vram` already
+    /// -- same cost the existing `Graphics::prepare_vram` already
     /// pays for the VRAM viewer panel. Phase 7 may dirty-track
     /// regions to skip unchanged frames; for now full-upload keeps
     /// the renderer obviously correct.
@@ -363,7 +363,7 @@ impl HwPipeline {
     }
 
     /// Upload the frame's vertex data. If the payload exceeds the
-    /// current buffer capacity we silently truncate — the
+    /// current buffer capacity we silently truncate -- the
     /// `Translator` itself caps emission so this shouldn't trigger
     /// in Phase 1 with PSX-typical primitive counts. Phase 7 will
     /// plumb a proper buffer-grow path through `&Device` if real
@@ -403,9 +403,9 @@ fn _bgl_used(p: &HwPipeline) -> &wgpu::BindGroupLayout {
 // channel of the output is unused by egui's display path; we
 // just keep it consistent). The blend constant is bound per draw
 // call via `RenderPass::set_blend_constant`. PSX doesn't need
-// per-component constants — same value on R/G/B/A is fine.
+// per-component constants -- same value on R/G/B/A is fine.
 
-/// PSX mode 0 — `(B + F) / 2`. With blend_constant = 0.5,
+/// PSX mode 0 -- `(B + F) / 2`. With blend_constant = 0.5,
 /// `Constant * F + Constant * B = 0.5*F + 0.5*B`.
 fn blend_state_average() -> wgpu::BlendState {
     let c = wgpu::BlendComponent {
@@ -416,7 +416,7 @@ fn blend_state_average() -> wgpu::BlendState {
     wgpu::BlendState { color: c, alpha: c }
 }
 
-/// PSX mode 1 — `B + F`. Plain additive: `One*F + One*B`.
+/// PSX mode 1 -- `B + F`. Plain additive: `One*F + One*B`.
 fn blend_state_add() -> wgpu::BlendState {
     let c = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
@@ -426,7 +426,7 @@ fn blend_state_add() -> wgpu::BlendState {
     wgpu::BlendState { color: c, alpha: c }
 }
 
-/// PSX mode 2 — `B - F`. Reverse-subtract gives
+/// PSX mode 2 -- `B - F`. Reverse-subtract gives
 /// `One*B - One*F = B - F`.
 fn blend_state_sub() -> wgpu::BlendState {
     let c = wgpu::BlendComponent {
@@ -437,7 +437,7 @@ fn blend_state_sub() -> wgpu::BlendState {
     wgpu::BlendState { color: c, alpha: c }
 }
 
-/// PSX mode 3 — `B + F/4`. `Constant=0.25`,
+/// PSX mode 3 -- `B + F/4`. `Constant=0.25`,
 /// `Constant*F + One*B = 0.25*F + B`.
 fn blend_state_add_quarter() -> wgpu::BlendState {
     let c = wgpu::BlendComponent {

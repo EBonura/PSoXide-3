@@ -8,10 +8,10 @@
 //!   1. Run the CPU emulator forward by `--cycles-per-frame` cycles
 //!      (~558k for ~30 fps Tekken 3 boot, the ratio the frontend
 //!      uses).
-//!   2. `sync_vram_from_cpu` — 1 MiB CPU-to-GPU bounce.
+//!   2. `sync_vram_from_cpu` -- 1 MiB CPU-to-GPU bounce.
 //!   3. Drain `cmd_log` and `replay_packet` each entry through the
 //!      compute backend.
-//!   4. `download_vram` — 1 MiB GPU-to-CPU bounce + device poll.
+//!   4. `download_vram` -- 1 MiB GPU-to-CPU bounce + device poll.
 //!
 //! Outputs per-phase wall-clock totals over the whole run, plus
 //! per-frame averages, so we can see whether `sync` / `replay` /

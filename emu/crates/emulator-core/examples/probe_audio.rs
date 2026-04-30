@@ -1,6 +1,6 @@
 //! Measure whether the SPU is producing non-silent audio when
 //! running a game. If peak amplitude stays at 0 across the whole
-//! run, the SPU isn't being driven (voices never keyed on) — or
+//! run, the SPU isn't being driven (voices never keyed on) -- or
 //! we have a mixer bug. If peak is high but you still hear nothing,
 //! the problem is downstream (cpal ring / host device).
 
@@ -64,7 +64,7 @@ fn main() {
     eprintln!("MAIN_VOL_L = 0x{main_l:04x}");
     eprintln!("MAIN_VOL_R = 0x{main_r:04x}");
     // Scan voice bank for any voice with non-zero ADSR_CURRENT (which
-    // we pin to 1 for Redux parity — so non-1 means the game has
+    // we pin to 1 for Redux parity -- so non-1 means the game has
     // written there, or a voice is active in our model).
     let kon_raw_lo = bus.spu.read16(0x1F80_1D88);
     let kon_raw_hi = bus.spu.read16(0x1F80_1D8A);

@@ -1,5 +1,5 @@
 //! Dump our emulator's trace starting from a given step for N steps.
-//! Helps cross-reference Redux's trace when we diverge — especially
+//! Helps cross-reference Redux's trace when we diverge -- especially
 //! to see which path we took after a missed IRQ.
 
 #[path = "support/disc.rs"]

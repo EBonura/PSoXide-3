@@ -39,7 +39,7 @@ fn main() {
     let mut cpu = Cpu::new();
     cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
 
-    // Step two frames — same checkpoint the milestone tests use.
+    // Step two frames -- same checkpoint the milestone tests use.
     let mut cycles_at_last_pump = 0u64;
     while bus.irq().raise_counts()[0] < 2 {
         if cpu.step(&mut bus).is_err() {
@@ -59,7 +59,7 @@ fn main() {
         cpu.pc(),
     );
 
-    // Also count how many primitive writes hit GPU — a blank frame
+    // Also count how many primitive writes hit GPU -- a blank frame
     // has no geometry commands, a working one has lots. Cheap smoke
     // check independent of hash values.
     let hist = bus.gpu.gp0_opcode_histogram();

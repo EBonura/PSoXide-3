@@ -1,4 +1,4 @@
-//! Editor 3D viewport — Phase 1 sector renderer.
+//! Editor 3D viewport -- Phase 1 sector renderer.
 //!
 //! Walks the editor's active Room and feeds the editor-owned
 //! [`HwRenderer`](psx_gpu_render::HwRenderer) the same way runtime
@@ -14,7 +14,7 @@
 //! 5. Walk the OT via `iter_packets`, build a `GpuCmdLogEntry` log,
 //!    hand it to `psx-gpu-render::HwRenderer::render_frame`.
 //!
-//! That's the same path PS1 software follows (minus DMA) — so the
+//! That's the same path PS1 software follows (minus DMA) -- so the
 //! editor preview is bit-identical to the renderer the emulator runs
 //! against the actual cooked `.psxw`.
 //!
@@ -43,13 +43,13 @@ use psxed_ui::ViewportCameraState;
 /// 4096-cap caps the per-frame primitive count at a comfortable
 /// number for the host renderer.
 const TRI_CAP: usize = 4096;
-/// Ordering-table depth — tradeoff between Z resolution and the
+/// Ordering-table depth -- tradeoff between Z resolution and the
 /// per-frame chain-walk cost. 256 slots is plenty for an orbit-camera
 /// view where the front-to-back range is a small multiple of the
 /// sector size.
 const OT_DEPTH: usize = 256;
 
-/// Default screen geometry — matches the PSX 320×240 framebuffer the
+/// Default screen geometry -- matches the PSX 320×240 framebuffer the
 /// editor's HwRenderer is sized to display.
 const SCREEN_W: i32 = 320;
 const SCREEN_H: i32 = 240;
@@ -58,12 +58,12 @@ const SCREEN_CY: i32 = SCREEN_H / 2;
 /// Projection-plane distance (focal length). Bigger = narrower FOV.
 const PROJ_H: i32 = 320;
 
-/// Per-frame scratch — primitives **and** OT must live in the same
+/// Per-frame scratch -- primitives **and** OT must live in the same
 /// memory region. `OrderingTable` stores 24-bit chain pointers (the
 /// PS1 DMA encoding); `iter_packets` reconstructs full addresses by
 /// OR-ing the OT slot's high 40 bits over the 24-bit chain entries.
 /// That only works if every chained primitive sits in the same 16 MB
-/// window as the OT itself — heap-allocated `Vec<TriFlat>` lives in
+/// window as the OT itself -- heap-allocated `Vec<TriFlat>` lives in
 /// a totally separate region on host and segfaults on dereference.
 /// Keeping the array inline alongside the OT in the static fixes
 /// that and matches PS1's flat 2 MB main RAM layout.
@@ -78,7 +78,7 @@ struct PreviewScratch {
     /// GP0(02h) fill-rectangle packet: 1 tag word + 3 data words
     /// (`opcode|color`, `pack_xy(x, y)`, `pack_xy(w, h)`). Must live
     /// in the same static as the OT for the same reason the prim
-    /// arrays do — `iter_packets` reconstructs full pointers from
+    /// arrays do -- `iter_packets` reconstructs full pointers from
     /// the OT's 24-bit chain encoding plus the OT struct's high
     /// address bits, so chained packets must share that 16 MB
     /// region.
@@ -106,7 +106,7 @@ static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
 /// Build a fresh `cmd_log` rendering the project's first Room from
 /// `camera`'s orbit angles.
 ///
-/// Returns an empty log if the project has no Rooms — the editor
+/// Returns an empty log if the project has no Rooms -- the editor
 /// renderer will then paint a black panel, which is the correct "no
 /// scene to show" affordance.
 #[allow(clippy::too_many_arguments)]
@@ -137,7 +137,7 @@ pub fn build_phase1_cmd_log(
     walk_entities(project, grid, selected, &mut scratch);
     walk_light_gizmos(project, grid, selected, &mut scratch);
 
-    // Selection / hover / paint overlays drawn before models —
+    // Selection / hover / paint overlays drawn before models --
     // they project through the camera GTE matrix that
     // `setup_gte_for_camera` installed. Models render after,
     // overwriting per-joint GTE state. We re-install the
@@ -166,7 +166,7 @@ pub fn build_phase1_cmd_log(
         &mut scratch,
     );
 
-    // Re-prime the GTE with the camera matrix — model
+    // Re-prime the GTE with the camera matrix -- model
     // rendering left it set to the last joint's view, which
     // would project entity bound lines into junk.
     let _ = setup_gte_for_camera(camera, target);
@@ -274,7 +274,7 @@ fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) -> psx_en
 /// Shared anchor that `world_to_view` subtracts from each vertex
 /// before squashing to `i16`. Set per-frame by
 /// `setup_gte_for_camera` to the camera target so the emitted
-/// vertices stay anchor-relative — the GTE absorbs the offset via
+/// vertices stay anchor-relative -- the GTE absorbs the offset via
 /// its translation register. Without this, a single 32-sector
 /// room (32 × 1024 = 32 768) sits exactly on the i16 cliff.
 static VIEW_ANCHOR: std::sync::Mutex<[i32; 3]> = std::sync::Mutex::new([0, 0, 0]);
@@ -309,7 +309,7 @@ fn clamp_i16(value: i32) -> i16 {
 struct PreviewLight {
     position: [i32; 3],
     radius: i32,
-    /// `color × intensity` in 0..65535 per channel — already
+    /// `color × intensity` in 0..65535 per channel -- already
     /// includes the Q8.8 multiplier so the per-face math
     /// reduces to one >>8 shift per attenuated channel.
     weighted_color: [u32; 3],
@@ -448,7 +448,7 @@ fn face_shade(
 /// Walk every Light node in `project` whose enclosing room is
 /// the active grid and pre-multiply its colour×intensity_q8.
 /// Lights authored outside any Room (no enclosing parent) are
-/// skipped silently — the cooker warns about those, the
+/// skipped silently -- the cooker warns about those, the
 /// preview just doesn't render them.
 fn collect_preview_lights(
     project: &ProjectDocument,
@@ -470,7 +470,7 @@ fn collect_preview_lights(
         if *radius <= 0.0 || !intensity.is_finite() || *intensity < 0.0 {
             continue;
         }
-        // Filter by enclosing Room — a light authored under
+        // Filter by enclosing Room -- a light authored under
         // some other Room must not bleed into this one.
         if !is_descendant_of_room(scene, node.id, room_id) {
             continue;
@@ -528,7 +528,7 @@ fn is_descendant_of_room(
     false
 }
 
-/// Centre of a horizontal face (floor / ceiling) — average X /
+/// Centre of a horizontal face (floor / ceiling) -- average X /
 /// Z of the bounds, mean of the four corner heights for Y.
 fn horizontal_face_center(bounds: [i32; 4], heights: [i32; 4]) -> [i32; 3] {
     let [x0, x1, z0, z1] = bounds;
@@ -538,7 +538,7 @@ fn horizontal_face_center(bounds: [i32; 4], heights: [i32; 4]) -> [i32; 3] {
     [cx, cy as i32, cz]
 }
 
-/// Centre of a wall face — midpoint of the wall's bottom edge
+/// Centre of a wall face -- midpoint of the wall's bottom edge
 /// in X/Z, midpoint of the four corner heights for Y. Wall
 /// edges run along one of the cell's four cardinal sides; the
 /// `WallEdge` picks which.
@@ -560,7 +560,7 @@ fn wall_face_center(bounds: [i32; 4], edge: WallEdge, heights: [i32; 4]) -> [i32
 /// Lighting convention (PSX-neutral):
 ///
 /// * `light_rgb` is in `0..=255` per channel.
-/// * `128` = neutral — material renders at its base brightness.
+/// * `128` = neutral -- material renders at its base brightness.
 /// * `0`   = pitch black.
 /// * `255` = saturated overbright (clamped at the modulate
 ///   step).
@@ -580,7 +580,7 @@ fn light_face(
         FaceShade::Flat(r, g, b) => (r, g, b),
         FaceShade::Textured { tint, .. } => tint,
     };
-    // Start at room ambient — *not* `ambient * 256`. The
+    // Start at room ambient -- *not* `ambient * 256`. The
     // accumulator is the same 0..255 light_rgb space the
     // modulate step expects: ambient = neutral 128 produces
     // unmodified base material; ambient < 128 produces a
@@ -595,7 +595,7 @@ fn light_face(
         if r <= 0 || d2 >= r * r {
             continue;
         }
-        // Linear falloff: weight in Q8 — `0..=256` where 256
+        // Linear falloff: weight in Q8 -- `0..=256` where 256
         // means "at the centre".
         let d = isqrt_i64(d2);
         let weight_q8 = (((r - d) << 8) / r) as u32;
@@ -662,7 +662,7 @@ fn isqrt_i64(value: i64) -> i64 {
 /// `flip_winding=true` reverses the vertex order for ceilings.
 /// `dropped_corner=Some(c)` makes the face a triangle: the half
 /// containing `c` is skipped (`split` must already be on the
-/// diagonal that keeps the other half alive — `Corner::surviving_split`
+/// diagonal that keeps the other half alive -- `Corner::surviving_split`
 /// enforces this at the data layer).
 fn push_horizontal_face(
     scratch: &mut PreviewScratch,
@@ -701,12 +701,12 @@ fn push_horizontal_face(
     let _ = max_v;
 
     // Per split, pick the two triangles. Triangle A is the
-    // perimeter walk's "first" half, B the "second" — under
+    // perimeter walk's "first" half, B the "second" -- under
     // each split the dropped corner exists in exactly one of
     // them so we can skip cleanly.
     let (tri_a, tri_b) = match split {
         GridSplit::NorthWestSouthEast => (
-            // (NW, NE, SE) and (NW, SE, SW) — diagonal NW–SE.
+            // (NW, NE, SE) and (NW, SE, SW) -- diagonal NW–SE.
             (
                 [p_nw, p_ne, p_se],
                 [uv_nw, uv_ne, uv_se],
@@ -719,7 +719,7 @@ fn push_horizontal_face(
             ),
         ),
         GridSplit::NorthEastSouthWest => (
-            // (NW, NE, SW) and (NE, SE, SW) — diagonal NE–SW.
+            // (NW, NE, SW) and (NE, SE, SW) -- diagonal NE–SW.
             (
                 [p_nw, p_ne, p_sw],
                 [uv_nw, uv_ne, uv_sw],
@@ -822,7 +822,7 @@ fn push_wall_face(
     let use_br_tl = matches!(dropped_corner, Some(WallCorner::BL) | Some(WallCorner::TR));
     let (tri_a, tri_b) = if use_br_tl {
         (
-            // (BL, BR, TL) and (BR, TR, TL) — diagonal BR-TL.
+            // (BL, BR, TL) and (BR, TR, TL) -- diagonal BR-TL.
             (
                 [p_bl, p_br, p_tl],
                 [uv_bl, uv_br, uv_tl],
@@ -836,7 +836,7 @@ fn push_wall_face(
         )
     } else {
         (
-            // (BL, BR, TR) and (BL, TR, TL) — diagonal BL-TR.
+            // (BL, BR, TR) and (BL, TR, TL) -- diagonal BL-TR.
             (
                 [p_bl, p_br, p_tr],
                 [uv_bl, uv_br, uv_tr],
@@ -866,7 +866,7 @@ fn push_wall_face(
 /// The room geometry uses the GTE-projected world coords; markers
 /// project the same way so they read as "here is this thing in the
 /// world", but the corners are drawn at fixed pixel offsets around
-/// the projected centre — a billboarded square that doesn't shrink
+/// the projected centre -- a billboarded square that doesn't shrink
 /// with distance, the way Godot's editor sprites work.
 fn walk_entities(
     project: &ProjectDocument,
@@ -877,7 +877,7 @@ fn walk_entities(
     let s = grid.sector_size;
     let scene = project.active_scene();
     for node in scene.nodes() {
-        // Skip Model-backed MeshInstances — `walk_model_instances`
+        // Skip Model-backed MeshInstances -- `walk_model_instances`
         // renders them as real textured models. Without this guard
         // they'd get *both* a marker square and the real model on
         // top of each other.
@@ -949,7 +949,7 @@ fn walk_entities(
 
 /// Cap on placed Model-backed MeshInstance nodes the editor
 /// preview will render in one frame. Excess instances skip
-/// silently (the manifest hasn't filtered them) — keeps a
+/// silently (the manifest hasn't filtered them) -- keeps a
 /// runaway scene from busting the per-frame budget.
 const MAX_PREVIEW_MODEL_INSTANCES: usize = 8;
 /// Cap on joints any one previewed model can carry. Matches
@@ -961,7 +961,7 @@ const PREVIEW_JOINT_CAP: usize = 32;
 /// editor's looping model preview. Bumped once per
 /// `build_phase1_cmd_log` call. PSX angle / phase math needs
 /// monotonic ticks rather than wall-clock, and the editor
-/// frame rate fluctuates on host — so this is "preview
+/// frame rate fluctuates on host -- so this is "preview
 /// frames", not real-time. Good enough for inspector preview.
 static PREVIEW_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -988,11 +988,11 @@ struct PreviewModelInstance<'a> {
 /// Render every Model-backed `MeshInstance` in the scene as a
 /// real textured animated model. Mirrors the runtime path in
 /// `editor-playtest`: parse `.psxmdl` + `.psxt` + `.psxanim`,
-/// upload atlas (lazily — done by `EditorTextures::refresh_models`),
+/// upload atlas (lazily -- done by `EditorTextures::refresh_models`),
 /// compose joint transforms via `compute_joint_view_transform`,
 /// project per-vertex, emit textured triangles into the OT.
 ///
-/// Models with bad/missing data are skipped silently — the
+/// Models with bad/missing data are skipped silently -- the
 /// editor inspector + cook validation surface those errors
 /// elsewhere; the preview just keeps drawing what it can.
 fn walk_model_instances(
@@ -1035,12 +1035,12 @@ fn walk_model_instances(
         let ResourceData::Model(model) = &model_resource.data else {
             continue;
         };
-        // Atlas required — runtime contract.
+        // Atlas required -- runtime contract.
         if model.texture_path.is_none() {
             continue;
         }
         // Atlas slot must already be uploaded (refresh_models
-        // ran earlier in the frame). Skip if not — lets the
+        // ran earlier in the frame). Skip if not -- lets the
         // user know visually that the atlas is broken.
         let Some(atlas_slot) = textures.model_atlas_slot(*mesh_id) else {
             continue;
@@ -1056,7 +1056,7 @@ fn walk_model_instances(
         }
 
         // World position: same convention `walk_entities` uses
-        // for marker nodes — translation is in sectors relative
+        // for marker nodes -- translation is in sectors relative
         // to the room centre, so multiply by sector_size and
         // shift by half-grid.
         let s = grid.sector_size;
@@ -1085,14 +1085,14 @@ fn walk_model_instances(
     // Player-spawn preview: render the player's character at
     // the spawn so level designers see where the player starts
     // *and* what they look like. Reuses the same model render
-    // path — no separate player renderer.
+    // path -- no separate player renderer.
     walk_player_spawn_preview(project, grid, textures, selected, &mut instances_meta);
 
     // Resolve parsed model + animation per instance straight
     // out of the cache. Each meta carries its own
     // `(mesh_id, clip_local)` pair so two instances of the
     // same model with different clips resolve to two different
-    // animation entries — fixes the prior shared-buffer bug
+    // animation entries -- fixes the prior shared-buffer bug
     // where whichever clip got loaded first won.
     let mut instances: Vec<PreviewModelInstance> = Vec::new();
     for meta in &instances_meta {
@@ -1117,7 +1117,7 @@ fn walk_model_instances(
         });
     }
 
-    // Gizmos first while GTE still holds the camera matrix —
+    // Gizmos first while GTE still holds the camera matrix --
     // `draw_preview_model_instance` overrides rotation/translation
     // per joint so any project_vertex after a model render uses
     // joint-space, not world-space.
@@ -1135,7 +1135,7 @@ fn walk_model_instances(
 /// resolve its `character` link to a Model + idle clip and
 /// queue an `InstanceMeta` so the same render path placed
 /// model instances follow renders the character at the spawn.
-/// `(mesh_id, clip_local)` is the cache key — different player
+/// `(mesh_id, clip_local)` is the cache key -- different player
 /// idle clips and different placed-instance clips each resolve
 /// to their own animation entry.
 ///
@@ -1189,7 +1189,7 @@ fn walk_player_spawn_preview(
             continue;
         };
 
-        // Idle clip drives the preview loop — the spec wants
+        // Idle clip drives the preview loop -- the spec wants
         // designers to see "what would the player be doing
         // standing still here". Falls through to the model's
         // preview / default clip if the Character has no idle
@@ -1220,7 +1220,7 @@ fn walk_player_spawn_preview(
             origin,
             instance_rotation,
             atlas: atlas_slot,
-            // Spawn node is selected, not the model — but the
+            // Spawn node is selected, not the model -- but the
             // preview gizmo still helps designers see *which*
             // spawn they have selected.
             is_selected: node.id == selected,
@@ -1233,7 +1233,7 @@ fn walk_player_spawn_preview(
 /// Resolve a Player Spawn's character reference, applying the
 /// "auto-pick the only one" rule when no explicit character is
 /// set. `None` means the editor preview can't render a player
-/// model — typically because the project has zero or multiple
+/// model -- typically because the project has zero or multiple
 /// Characters and the spawn is mid-author.
 fn resolve_player_spawn_character(
     project: &ProjectDocument,
@@ -1263,7 +1263,7 @@ fn resolve_player_spawn_character(
 /// projecting because `draw_preview_model_instance` left the
 /// GTE primed with the *last part's* joint transform.
 fn draw_model_selection_gizmo(meta: &InstanceMeta, scratch: &mut PreviewScratch) {
-    // Re-prime the GTE with the camera transform — model
+    // Re-prime the GTE with the camera transform -- model
     // rendering left it set to the last joint's view.
     // `world_to_view` already does the anchor subtract so we
     // just need rotation+translation back to camera basis.
@@ -1401,7 +1401,7 @@ fn draw_preview_model_instance(
         psx_engine::LocalToWorldScale::from_q12(instance.model.local_to_world_q12());
     let frame_q12 = instance.animation.phase_at_tick_q12(tick, 60);
 
-    // Joint view transforms — one per joint, capped.
+    // Joint view transforms -- one per joint, capped.
     let joint_count = (instance.model.joint_count() as usize).min(PREVIEW_JOINT_CAP);
     let mut joint_view_transforms: [psx_engine::JointViewTransform; PREVIEW_JOINT_CAP] =
         [psx_engine::JointViewTransform::ZERO; PREVIEW_JOINT_CAP];
@@ -1434,7 +1434,7 @@ fn draw_preview_model_instance(
     // implements the secondary-joint LERP path; the editor
     // preview takes the cheaper single-joint shortcut. For
     // models that use only rigid skinning (one joint per
-    // vertex — current Wraith / Hooded Wretch rigs) the editor
+    // vertex -- current Wraith / Hooded Wretch rigs) the editor
     // preview matches the runtime exactly. For models with
     // secondary joint weights the preview will diverge at
     // those vertices; placement / clip / atlas validation
@@ -1560,7 +1560,7 @@ fn walk_light_gizmos(
 
 /// Wireframe AABB + facing arrow per selectable scene entity.
 /// Bounds are gathered by `EditorWorkspace::collect_entity_bounds`
-/// — every entity-kind node (model, spawn, light, trigger,
+/// -- every entity-kind node (model, spawn, light, trigger,
 /// portal, audio source, legacy mesh) carries an AABB the user
 /// can click to select and drag to move. This pass renders the
 /// box wireframe so the user can *see* what they're picking;
@@ -1583,7 +1583,7 @@ fn walk_entity_bounds(
         let style = entity_bound_style(b.kind, is_selected, is_hovered);
         push_aabb_wireframe(scratch, b.center, b.half_extents, style);
 
-        // Yaw arrow only for kinds with meaningful facing —
+        // Yaw arrow only for kinds with meaningful facing --
         // models and spawn points point at where they'll
         // render / face. Lights / triggers / portals / audio
         // are either omnidirectional or carry their own
@@ -1778,7 +1778,7 @@ const FALLBACK_CEILING: (u8, u8, u8) = (0x60, 0x60, 0x70);
 /// `(0x80, 0x80, 0x80)` because that's the right value when sampling
 /// a textured polygon (output = texel × tint / 128). For the editor's
 /// pre-textured flat-shaded preview that means every face renders the
-/// same dull grey — useless for distinguishing materials. Mirror the
+/// same dull grey -- useless for distinguishing materials. Mirror the
 /// 2D viewport's approach: derive a colour from the material's name
 /// so a project's "Floor Material" / "Brick Material" / "Glass" all
 /// land at distinct, recognisable hues until real texturing arrives.
@@ -1805,7 +1805,7 @@ fn material_color(
     } else if name.contains("metal") {
         (0x90, 0x96, 0x9A)
     } else if let ResourceData::Material(mat) = &resource.data {
-        // Author actually tinted the material away from neutral — use
+        // Author actually tinted the material away from neutral -- use
         // the tint directly. The mid-grey default falls through to
         // the role-specific fallback below.
         if mat.tint != [0x80, 0x80, 0x80] {
@@ -1823,7 +1823,7 @@ fn material_color(
 /// expects. Subtracts the per-frame view anchor (= camera target)
 /// first so the emitted coord is anchor-relative. With sector_size
 /// 1024, this gives ±32 sectors of headroom from the camera target
-/// before clamp truncation kicks in — comfortably the editor's
+/// before clamp truncation kicks in -- comfortably the editor's
 /// budget cap.
 ///
 /// Debug builds assert; release silently saturates rather than
@@ -1847,7 +1847,7 @@ fn world_to_view(world: [i32; 3]) -> Vec3I16 {
 /// Render the paint-target ghost outline. Cell ghosts trace the
 /// floor footprint of the would-be cell; wall ghosts use
 /// `push_face_outline` with a synthetic `FaceRef` whose world cell
-/// might lie outside the current grid — `push_face_outline`'s
+/// might lie outside the current grid -- `push_face_outline`'s
 /// missing-data fallback supplies default heights for the ghost
 /// case. World-cell coords let both work for cells the grid
 /// hasn't allocated yet; the outline appears exactly where the
@@ -1885,7 +1885,7 @@ fn push_paint_preview(
                 kind: psxed_ui::FaceKind::Wall { dir, stack },
             };
             // For off-grid wall ghosts we have to project the
-            // outline ourselves — `push_face_outline` short-
+            // outline ourselves -- `push_face_outline` short-
             // circuits when sx/sz are out of grid bounds.
             if sx == u16::MAX || sz == u16::MAX {
                 push_ghost_wall_outline(grid, world_cell_x, world_cell_z, dir, scratch);
@@ -1967,7 +1967,7 @@ fn push_ghost_wall_outline(
 /// thickness in pixels; selected reads bolder so the user can spot
 /// it across a busy room. Thicknesses are at least 2 px because
 /// `push_screen_line` carries the line as two screen-space tris
-/// whose half-width gets truncated to integer pixels — anything
+/// whose half-width gets truncated to integer pixels -- anything
 /// less collapses to a degenerate zero-width strip.
 const FACE_OUTLINE_HOVER: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0xFF, 0xE0, 0x60),
@@ -1977,7 +1977,7 @@ const FACE_OUTLINE_SELECTED: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0x60, 0xC8, 0xFF),
     thickness_px: 4,
 };
-/// PaintWall hover preview — green for "this would be added /
+/// PaintWall hover preview -- green for "this would be added /
 /// replaced". 3 px so it reads through the `FACE_OUTLINE_HOVER`
 /// yellow when both fire on the same face.
 const FACE_OUTLINE_WALL_PAINT: FaceOutlineStyle = FaceOutlineStyle {
@@ -1991,7 +1991,7 @@ struct FaceOutlineStyle {
     thickness_px: i16,
 }
 
-/// Hover vs Selected — outline style picker for the unified
+/// Hover vs Selected -- outline style picker for the unified
 /// selection dispatch. Hover uses the lighter yellow; selected
 /// uses the bolder cyan. Same constants the original face-only
 /// path consumed.
@@ -2056,7 +2056,7 @@ fn push_edge_outline(
 /// Small screen-space cross at the vertex's world position.
 /// The cross is drawn as four short line segments offset along
 /// world axes so its on-screen size scales naturally with
-/// distance — close vertices read clearly, far ones don't
+/// distance -- close vertices read clearly, far ones don't
 /// dominate the viewport.
 fn push_vertex_outline(
     grid: &WorldGrid,
@@ -2239,7 +2239,7 @@ fn push_face_outline(
         }),
         psxed_ui::FaceKind::Wall { dir, stack } => {
             // Default ghost heights span the full sector when the
-            // wall doesn't exist yet — used by the PaintWall
+            // wall doesn't exist yet -- used by the PaintWall
             // hover preview to outline where a brand-new wall
             // would land.
             let h = sector
@@ -2266,7 +2266,7 @@ fn push_face_outline(
         gte_scene::project_vertex(world_to_view(corners[2])),
         gte_scene::project_vertex(world_to_view(corners[3])),
     ];
-    // Skip outlines whose corners didn't project — `project_vertex`
+    // Skip outlines whose corners didn't project -- `project_vertex`
     // returns `sz == 0` for behind-camera or near-plane-clipped
     // points, which would produce nonsense screen lines.
     if projected.iter().any(|p| p.sz == 0) {
@@ -2280,7 +2280,7 @@ fn push_face_outline(
 }
 
 /// World-space (x, z) endpoints of a wall on the given cardinal
-/// edge — mirrors `push_wall_face` so picking, paint preview, and
+/// edge -- mirrors `push_wall_face` so picking, paint preview, and
 /// outline rendering all agree.
 fn wall_xy_for(dir: GridDirection, x0: i32, x1: i32, z0: i32, z1: i32) -> ((i32, i32), (i32, i32)) {
     match dir {
@@ -2339,7 +2339,7 @@ fn push_screen_line(
     let half = (style.thickness_px as f32) * 0.5;
     // Round-away-from-zero on both components so a diagonal screen
     // edge with a sub-pixel perpendicular doesn't collapse the line
-    // to zero width — `0.707 as i16` truncates to 0, so a 2 px
+    // to zero width -- `0.707 as i16` truncates to 0, so a 2 px
     // hover line on any tilted edge would otherwise disappear. We
     // also clamp the magnitude to ≥ 1 px on the dominant axis so
     // very thin slopes still render visibly.
@@ -2387,7 +2387,7 @@ fn push_tri_at_slot(
 
 /// Stamp a GP0(02h) fill-rectangle into `scratch.clear_packet` and
 /// link it into the back-most OT slot so it runs first when DMA
-/// walks the chain — which is the same pattern PS1 software uses to
+/// walks the chain -- which is the same pattern PS1 software uses to
 /// "clear" the framebuffer at the start of every frame, since the
 /// HwRenderer (faithfully) preserves VRAM across frames the way real
 /// hardware does.
@@ -2398,7 +2398,7 @@ fn push_clear(scratch: &mut PreviewScratch) {
     let xy_word = 0u32; // top-left at (0, 0)
     let wh_word = ((240u32) << 16) | 320u32; // pack_xy(320, 240)
                                              // word[0] is rewritten by `OrderingTable::insert` with the
-                                             // chain tag — leave it at 0 here.
+                                             // chain tag -- leave it at 0 here.
     scratch.clear_packet[1] = color_word;
     scratch.clear_packet[2] = xy_word;
     scratch.clear_packet[3] = wh_word;

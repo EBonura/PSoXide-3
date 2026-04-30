@@ -1,4 +1,4 @@
-//! `showcase-particles` — fixed-pool particle effects through the
+//! `showcase-particles` -- fixed-pool particle effects through the
 //! engine ordering-table helpers.
 //!
 //! The SDK's `psx-fx` crate already had a reusable `ParticlePool`,

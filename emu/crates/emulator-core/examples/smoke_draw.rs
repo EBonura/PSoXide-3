@@ -19,7 +19,7 @@ fn main() {
     let mut bus = Bus::new(bios).expect("bus");
     let mut cpu = Cpu::new();
 
-    // PSOXIDE_EXE=path.exe — side-load a PSX-EXE, seeding the CPU
+    // PSOXIDE_EXE=path.exe -- side-load a PSX-EXE, seeding the CPU
     // to jump straight into the homebrew. BIOS stays resident in ROM
     // so the homebrew's B(44h) FlushCache + BIOS syscalls still work.
     if let Ok(exe_path) = std::env::var("PSOXIDE_EXE") {
@@ -40,7 +40,7 @@ fn main() {
         );
     }
 
-    // Sample the last ~1% of the run for a PC histogram — tells us
+    // Sample the last ~1% of the run for a PC histogram -- tells us
     // whether BIOS is in a tight loop or executing broadly.
     let sample_start = n.saturating_sub(n / 100);
     let mut pc_hits: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
@@ -79,7 +79,7 @@ fn main() {
         );
     }
     println!("cdrom irq_flag   = 0x{:02X}", bus.cdrom.irq_flag());
-    // Need a safe peek at IRQ controller state — reading through the bus
+    // Need a safe peek at IRQ controller state -- reading through the bus
     // would need &mut. Read raw IRQ register via the MMIO path.
     let i_stat = {
         let b0 = bus.try_read8(0xBF80_1070).unwrap_or(0) as u32;
@@ -336,7 +336,7 @@ fn main() {
         }
     }
 
-    // MMIO trace tail — only populated when built with
+    // MMIO trace tail -- only populated when built with
     //   cargo run --example smoke_draw --features emulator-core/trace-mmio
     // Otherwise `len()` is 0 and this block is silent.
     #[cfg(feature = "trace-mmio")]
@@ -355,7 +355,7 @@ fn main() {
                     e.value
                 );
             }
-            // Hot-address histogram — which MMIO ports is the BIOS
+            // Hot-address histogram -- which MMIO ports is the BIOS
             // hammering? Spinning on one is a tell for a wait loop.
             let mut counts: std::collections::BTreeMap<u32, u32> =
                 std::collections::BTreeMap::new();
@@ -467,7 +467,7 @@ fn read32(bus: &Bus, addr: u32) -> Option<u32> {
 }
 
 /// Dump full 1024×512 VRAM to a binary PPM at `path`. PPM is header +
-/// raw RGB — every image viewer (Preview, feh, `open`, etc.) opens it
+/// raw RGB -- every image viewer (Preview, feh, `open`, etc.) opens it
 /// with no extra deps. 15bpp → 8bpp uses the `(v << 3) | (v >> 2)`
 /// expansion to reach full 0..=255 range.
 #[allow(dead_code)]

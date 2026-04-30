@@ -26,7 +26,7 @@
 //! which uses the same arithmetic as the CPU.
 //!
 //! **DO NOT MODIFY** the math here without keeping
-//! `emulator-core::gpu::setup_sections` in sync — every quirk
+//! `emulator-core::gpu::setup_sections` in sync -- every quirk
 //! (`shl10_idiv`, the `longest` clamp, sort order, the pop-once-on-
 //! degenerate-section dance) was tuned to hit pixel-exact parity
 //! with PCSX-Redux and represents non-obvious knowledge.

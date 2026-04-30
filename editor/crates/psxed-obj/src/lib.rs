@@ -7,7 +7,7 @@
 //! This is the Rust port of an earlier one-off Python script
 //! (`sdk/examples/showcase-3d/tools/obj_to_psx.py`) lifted into
 //! the content pipeline. Same algorithm, same determinism, same
-//! output byte-for-byte — but now reusable across every asset we
+//! output byte-for-byte -- but now reusable across every asset we
 //! build from source meshes, and usable from `build.rs` hooks so
 //! asset generation happens as part of `cargo build`.
 //!
@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashSet};
 #[derive(Debug, Clone)]
 pub struct Config {
     /// If `Some(n)`, run vertex-cluster decimation into `n × n × n`
-    /// cells. If `None`, preserve the input mesh unchanged — use
+    /// cells. If `None`, preserve the input mesh unchanged -- use
     /// this for meshes that were authored natively low-poly.
     pub decimate_grid: Option<u32>,
     /// Palette used to assign per-face flat colours.
@@ -49,18 +49,18 @@ pub struct Config {
 /// Built-in colour palettes that cycle through face indices.
 #[derive(Debug, Clone)]
 pub enum Palette {
-    /// Oranges / reds — good for warm-toned objects.
+    /// Oranges / reds -- good for warm-toned objects.
     Warm,
-    /// Cyans / blues — cool-toned objects.
+    /// Cyans / blues -- cool-toned objects.
     Cool,
-    /// Greens — natural / foliage.
+    /// Greens -- natural / foliage.
     Green,
     /// Explicit user-provided palette (repeats across face index).
     Custom(Vec<(u8, u8, u8)>),
 }
 
 impl Palette {
-    /// Colour at face index `i` — wraps around the palette.
+    /// Colour at face index `i` -- wraps around the palette.
     pub fn at(&self, i: usize) -> (u8, u8, u8) {
         let table: &[(u8, u8, u8)] = match self {
             Palette::Warm => &WARM,
@@ -115,7 +115,7 @@ pub enum Error {
         /// Short parse failure description.
         reason: &'static str,
     },
-    /// Post-decimation mesh has more than 65535 vertices — indices
+    /// Post-decimation mesh has more than 65535 vertices -- indices
     /// don't fit in PSXM v2's `u16` index table.
     TooManyVerts {
         /// Vertex count after optional decimation.
@@ -163,7 +163,7 @@ pub fn convert(obj_bytes: &[u8], cfg: &Config) -> Result<Vec<u8>, Error> {
     } else {
         (verts, faces)
     };
-    // Compute normals AFTER decimation — on the final vertex set.
+    // Compute normals AFTER decimation -- on the final vertex set.
     let normals_vec = if cfg.include_normals {
         Some(compute_vertex_normals(&verts, &faces))
     } else {
@@ -184,7 +184,7 @@ pub type ObjGeometry = (Vec<[f32; 3]>, Vec<[usize; 3]>);
 ///
 /// Handles vertex lines (`v x y z`) and face lines (`f a b c …`)
 /// with fan-triangulation for n-gons. `vt` / `vn` / `o` / `g` /
-/// `usemtl` etc. are ignored — we only need geometry.
+/// `usemtl` etc. are ignored -- we only need geometry.
 pub fn parse_obj(src: &str) -> Result<ObjGeometry, Error> {
     let mut verts = Vec::new();
     let mut faces = Vec::new();
@@ -249,7 +249,7 @@ pub fn parse_obj(src: &str) -> Result<ObjGeometry, Error> {
                 faces.push([idx[0], idx[k], idx[k + 1]]);
             }
         }
-        // Everything else is ignored silently — comments, `vt`, etc.
+        // Everything else is ignored silently -- comments, `vt`, etc.
     }
     if faces.is_empty() {
         return Err(Error::Empty);
@@ -352,7 +352,7 @@ pub fn cluster_decimate_with_face_data<T: Clone>(
     };
 
     // Group input verts by cell. BTreeMap instead of HashMap so
-    // iteration order is deterministic (sorted by cell key) —
+    // iteration order is deterministic (sorted by cell key) --
     // otherwise every build gets different vertex indices, which
     // flows through to face-index palette cycling and makes the
     // rendered output non-reproducible.
@@ -405,7 +405,7 @@ pub fn cluster_decimate_with_face_data<T: Clone>(
 // ----------------------------------------------------------------------
 
 /// Quantise `[-1, +1]` float to Q3.12 `i16`. `1.0` maps to
-/// `0x0E00` — leaves headroom below `0x1000` for animation
+/// `0x0E00` -- leaves headroom below `0x1000` for animation
 /// scale-up without overflow.
 fn to_q3_12(v: f32) -> i16 {
     let q = (v * 0x0E00 as f32).round() as i32;
@@ -426,11 +426,11 @@ fn normal_to_q3_12(v: f32) -> i16 {
 /// normals, weighted by face area.
 ///
 /// For each triangle `(v0, v1, v2)`:
-///   face_normal = cross(v1 - v0, v2 - v0)  — magnitude is 2× area
+///   face_normal = cross(v1 - v0, v2 - v0)  -- magnitude is 2× area
 ///   each vertex accumulates this unnormalised face_normal
 ///
 /// At the end, normalise each vertex sum. Area-weighting is free
-/// — we don't normalise per-face, so big faces contribute more.
+/// -- we don't normalise per-face, so big faces contribute more.
 /// This matches the standard practice for smooth shading of
 /// low-poly meshes.
 pub fn compute_vertex_normals(verts: &[[f32; 3]], faces: &[[usize; 3]]) -> Vec<[f32; 3]> {
@@ -442,7 +442,7 @@ pub fn compute_vertex_normals(verts: &[[f32; 3]], faces: &[[usize; 3]]) -> Vec<[
         // Edge vectors.
         let ex = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
         let fx = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-        // Cross product — magnitude is 2× area, direction is face normal.
+        // Cross product -- magnitude is 2× area, direction is face normal.
         let n = [
             ex[1] * fx[2] - ex[2] * fx[1],
             ex[2] * fx[0] - ex[0] * fx[2],
@@ -462,7 +462,7 @@ pub fn compute_vertex_normals(verts: &[[f32; 3]], faces: &[[usize; 3]]) -> Vec<[
             v[1] /= m;
             v[2] /= m;
         } else {
-            // Isolated vertex — give it a plausible up normal so
+            // Isolated vertex -- give it a plausible up normal so
             // lighting doesn't produce garbage colours for it.
             *v = [0.0, 1.0, 0.0];
         }
@@ -472,7 +472,7 @@ pub fn compute_vertex_normals(verts: &[[f32; 3]], faces: &[[usize; 3]]) -> Vec<[
 
 /// Encode a vertex/face/colour/normal set into `.psxm` bytes.
 ///
-/// `normals` is optional — pass `Some(&[..])` to include a normal
+/// `normals` is optional -- pass `Some(&[..])` to include a normal
 /// table with the matching `HAS_NORMALS` flag; pass `None` to
 /// skip. The slice must have the same length as `verts`.
 pub fn encode_psxm(
@@ -667,7 +667,7 @@ f 1 2 3
 
     #[test]
     fn computed_normals_point_in_face_direction() {
-        // Unit-triangle in XY plane — all vertex normals should
+        // Unit-triangle in XY plane -- all vertex normals should
         // equal the face normal (0, 0, 1) after averaging.
         let verts: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let faces: Vec<[usize; 3]> = vec![[0, 1, 2]];

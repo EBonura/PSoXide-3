@@ -1,6 +1,6 @@
 //! Log the frequency of each A/B/C BIOS function call while the
 //! emulator is running. Used to figure out what the BIOS is
-//! spinning on after the PlayStation splash — if one A-function
+//! spinning on after the PlayStation splash -- if one A-function
 //! is called millions of times and the disc-read functions never
 //! fire, the BIOS is waiting on a syscall-visible state (a
 //! counter, a flag) that we're not updating correctly.
@@ -53,7 +53,7 @@ fn main() {
     let mut last_cdrom_cmd_count: u64 = 0;
 
     for i in 0..n {
-        // Before each step, sample pc — dispatch happens when we
+        // Before each step, sample pc -- dispatch happens when we
         // execute at exactly 0xa0 / 0xb0 / 0xc0 (the J to the
         // table dispatcher). `t1` carries the function number.
         let pc = cpu.pc();
@@ -115,7 +115,7 @@ fn main() {
             last_cdrom_cmd_count = c;
             let op = bus.cdrom.last_command();
             if op == 0x02 || op == 0x15 || op == 0x06 {
-                // SetLoc / SeekL / ReadN — snapshot current MSF.
+                // SetLoc / SeekL / ReadN -- snapshot current MSF.
                 let (m, s, f) = bus.cdrom.debug_setloc_msf();
                 let lba = psx_iso::msf_to_lba(m, s, f);
                 let tag = match op {
@@ -187,7 +187,7 @@ fn main() {
 }
 
 /// Canonical names for the BIOS A/B/C function numbers. Pulled
-/// from nocash PSX-SPX — not exhaustive, just the common ones so
+/// from nocash PSX-SPX -- not exhaustive, just the common ones so
 /// the histogram reads more usefully than raw hex.
 fn function_name(table: u8, fn_no: u8) -> &'static str {
     match (table, fn_no) {

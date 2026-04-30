@@ -1,7 +1,7 @@
 //! TTY output for debug printing.
 //!
 //! The PS1 BIOS has a `putchar` handler that forwards bytes to the
-//! Expansion 2 TTY port — PCSX-Redux reads that port and prints to
+//! Expansion 2 TTY port -- PCSX-Redux reads that port and prints to
 //! stdout. Our emulator does the same. So calling [`print`] /
 //! [`println`] from homebrew lands in the host terminal, which is
 //! the canonical PS1 debug channel.

@@ -1,7 +1,7 @@
 //! On-disk cache for Redux traces.
 //!
 //! Running PCSX-Redux through the Lua oracle costs ~25 seconds of
-//! wall time per million steps — a 50M parity probe takes half an
+//! wall time per million steps -- a 50M parity probe takes half an
 //! hour. Our emulator runs the same 50M in a couple of seconds.
 //!
 //! To keep divergence-hunting fast, we cache the Redux trace on
@@ -10,7 +10,7 @@
 //! step-by-step. Redux is only re-invoked when the step count grows
 //! or the BIOS image changes.
 //!
-//! The file format is intentionally simple — raw little-endian
+//! The file format is intentionally simple -- raw little-endian
 //! `InstructionRecord`s with a header. No compression yet; a 50M
 //! step cache is ~20 GiB at v2 (was ~7 GiB at v1, before COP2
 //! capture). When this starts hurting we swap in zstd streaming;
@@ -30,13 +30,13 @@ use psx_trace::InstructionRecord;
 const MAGIC: &[u8; 8] = b"PSXTRACE";
 /// Current cache-file format version. Bump whenever the on-disk
 /// layout changes in an incompatible way. v2 added the GTE register
-/// snapshot (`cop2_data` + `cop2_ctl`) — 256 bytes per record.
+/// snapshot (`cop2_data` + `cop2_ctl`) -- 256 bytes per record.
 const VERSION: u32 = 2;
 /// Bytes per record:
 ///   `tick(8) + pc(4) + instr(4) + gprs(32*4) + cop2_data(32*4) + cop2_ctl(32*4) = 400`.
 const RECORD_BYTES: usize = 8 + 4 + 4 + 32 * 4 + 32 * 4 + 32 * 4;
 
-/// Cache location — environment-overridable, so CI machines can
+/// Cache location -- environment-overridable, so CI machines can
 /// stash caches under a different volume. Defaults to
 /// `$CARGO_MANIFEST_DIR/../../../target/parity-cache` which keeps
 /// caches with the build artifacts (gitignored).
@@ -44,7 +44,7 @@ pub fn default_dir() -> PathBuf {
     if let Ok(over) = std::env::var("PSOXIDE_PARITY_CACHE_DIR") {
         return PathBuf::from(over);
     }
-    // Tests run with CWD inside `emu/` — resolve the cache under the
+    // Tests run with CWD inside `emu/` -- resolve the cache under the
     // workspace's `target` so `cargo clean` wipes it consistently.
     let base = std::env::var("CARGO_TARGET_DIR")
         .ok()
@@ -55,7 +55,7 @@ pub fn default_dir() -> PathBuf {
 
 /// Cache key: (BIOS digest, step count). A fresh BIOS image or a
 /// different step count produces a different path. The digest is a
-/// cheap xxHash-style fold over the BIOS bytes — collisions aren't
+/// cheap xxHash-style fold over the BIOS bytes -- collisions aren't
 /// a security concern here, only data integrity.
 pub fn path_for(dir: &Path, bios_bytes: &[u8], steps: usize) -> PathBuf {
     let hash = fold_hash(bios_bytes);
@@ -65,7 +65,7 @@ pub fn path_for(dir: &Path, bios_bytes: &[u8], steps: usize) -> PathBuf {
 /// Prefix-aware lookup. Searches `dir` for any cache file matching
 /// the same BIOS hash with a step count ≥ `min_steps`, and returns
 /// the first `min_steps` records from the longest one found. This
-/// means a single 50M-step Redux run satisfies 10M, 20M, 30M — any
+/// means a single 50M-step Redux run satisfies 10M, 20M, 30M -- any
 /// shorter probe loads instantly.
 pub fn load_prefix(
     dir: &Path,
@@ -123,7 +123,7 @@ pub fn load_prefix(
 /// Load the longest cache file on disk matching this BIOS hash,
 /// returning all its records (no truncation). Useful when the caller
 /// wants "whatever's available" rather than a specific minimum step
-/// count — e.g. the divergence probe, which walks until it runs out
+/// count -- e.g. the divergence probe, which walks until it runs out
 /// of records regardless of how many there are.
 pub fn load_longest(dir: &Path, bios_bytes: &[u8]) -> Option<Vec<InstructionRecord>> {
     let hash = fold_hash(bios_bytes);
@@ -467,7 +467,7 @@ mod tests {
         )
         .unwrap();
 
-        // Ask for 50 — should pick the 100-record cache, not the 10.
+        // Ask for 50 -- should pick the 100-record cache, not the 10.
         let loaded = load_prefix(dir.path(), bios, 50).unwrap();
         assert_eq!(loaded.len(), 50);
     }
@@ -517,7 +517,7 @@ mod tests {
         w.push(&sample_record(1)).unwrap();
         let err = w.finish().expect_err("should reject short write");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        // Final path must not exist — only the tmp file.
+        // Final path must not exist -- only the tmp file.
         assert!(!path.exists());
     }
 }

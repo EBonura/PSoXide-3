@@ -7,7 +7,7 @@
 //! (`0x28..=0x2B`, decomposed to two tris with the same winding
 //! the CPU rasterizer uses).
 //!
-//! Other primitive opcodes are silently skipped — their state
+//! Other primitive opcodes are silently skipped -- their state
 //! setters still update `ReplayState` so that when later phases
 //! enable them the tpage / draw_offset / draw_area they observe
 //! is correct.
@@ -33,7 +33,7 @@ pub struct DrawRun {
     pub clip: [u16; 4],
 }
 
-/// Output of [`Translator::translate`] — vertices remain in GP0 order
+/// Output of [`Translator::translate`] -- vertices remain in GP0 order
 /// and `runs` describes contiguous draw ranges that share pipeline
 /// state and draw-area clipping.
 pub struct TranslatedFrame<'a> {
@@ -381,7 +381,7 @@ impl Translator {
 
     // ----- Phase 2: textured tris + quads -----
 
-    /// `0x24..=0x27` — textured triangle. Packet:
+    /// `0x24..=0x27` -- textured triangle. Packet:
     ///   `[cmd+tint, v0, uv0+clut, v1, uv1+tpage, v2, uv2]`
     /// uv1's high half is the active tpage word; consume it via
     /// `apply_primitive_tpage` so subsequent primitives see the
@@ -410,7 +410,7 @@ impl Translator {
         }
     }
 
-    /// `0x2C..=0x2F` — textured quad. Packet:
+    /// `0x2C..=0x2F` -- textured quad. Packet:
     ///   `[cmd+tint, v0, uv0+clut, v1, uv1+tpage, v2, uv2, v3, uv3]`
     /// Decomposes to two triangles using the same winding the CPU
     /// rasterizer's `draw_textured_quad` uses (`v0,v1,v2` then
@@ -540,7 +540,7 @@ impl Translator {
 
     // ----- Phase 3: shaded (Gouraud) tris + quads -----
 
-    /// `0x30..=0x33` — Gouraud-shaded triangle.
+    /// `0x30..=0x33` -- Gouraud-shaded triangle.
     /// Words: `[cmd+c0, v0, c1, v1, c2, v2]`.
     /// The fragment shader interpolates `color` linearly across
     /// the tri; we just push three different vertex colours.
@@ -563,7 +563,7 @@ impl Translator {
         }
     }
 
-    /// `0x38..=0x3B` — Gouraud-shaded quad.
+    /// `0x38..=0x3B` -- Gouraud-shaded quad.
     /// Words: `[cmd+c0, v0, c1, v1, c2, v2, c3, v3]`.
     fn emit_shaded_quad(&mut self, fifo: &[u32]) {
         if fifo.len() < 8 {
@@ -588,7 +588,7 @@ impl Translator {
         }
     }
 
-    /// `0x34..=0x37` — Gouraud + textured triangle.
+    /// `0x34..=0x37` -- Gouraud + textured triangle.
     /// Words: `[cmd+c0, v0, uv0+clut, c1, v1, uv1+tpage, c2, v2, uv2]`.
     fn emit_shaded_tex_tri(&mut self, fifo: &[u32]) {
         if fifo.len() < 9 {
@@ -616,7 +616,7 @@ impl Translator {
         }
     }
 
-    /// `0x3C..=0x3F` — Gouraud + textured quad. Words:
+    /// `0x3C..=0x3F` -- Gouraud + textured quad. Words:
     /// `[cmd+c0, v0, uv0+clut, c1, v1, uv1+tpage, c2, v2, uv2,
     ///   c3, v3, uv3]`.
     fn emit_shaded_tex_quad(&mut self, fifo: &[u32]) {
@@ -751,7 +751,7 @@ impl Translator {
 
     // ----- Phase 3: rectangles -----
 
-    /// `0x60..=0x63` — variable-size mono rect.
+    /// `0x60..=0x63` -- variable-size mono rect.
     /// Words: `[cmd+rgb24, xy, wh]`. Decomposes to two tris.
     fn emit_mono_rect_variable(&mut self, fifo: &[u32]) {
         if fifo.len() < 3 {
@@ -764,7 +764,7 @@ impl Translator {
     }
 
     /// `0x68..=0x6B` (1×1), `0x70..=0x73` (8×8), `0x78..=0x7B` (16×16)
-    /// — fixed-size mono rect. Words: `[cmd+rgb24, xy]`.
+    /// -- fixed-size mono rect. Words: `[cmd+rgb24, xy]`.
     fn emit_mono_rect_fixed(&mut self, fifo: &[u32], w: i32, h: i32) {
         if fifo.len() < 2 {
             return;
@@ -774,7 +774,7 @@ impl Translator {
         self.push_mono_rect(cmd, x, y, w, h);
     }
 
-    /// `0x64..=0x67` — variable-size textured rect.
+    /// `0x64..=0x67` -- variable-size textured rect.
     /// Words: `[cmd+tint, xy, uv+clut, wh]`. Tpage is the active
     /// state setter's; rectangles do NOT update tpage on their
     /// own (unlike textured polys' uv1).
@@ -803,10 +803,10 @@ impl Translator {
         self.push_tex_rect(cmd, x, y, w, h, uv0, clut);
     }
 
-    /// `0x02` — fill rectangle. Clears a VRAM region to a solid
+    /// `0x02` -- fill rectangle. Clears a VRAM region to a solid
     /// colour. Bypasses `draw_offset` (XY is absolute VRAM coords)
     /// and `draw_area` (always opaque, ignores scissor). Most demos
-    /// emit one per frame as their clear-screen primitive — without
+    /// emit one per frame as their clear-screen primitive -- without
     /// this the HW target keeps stale pixels everywhere the game
     /// hasn't redrawn this frame.
     ///
@@ -829,7 +829,7 @@ impl Translator {
             return;
         }
         let color = mono_color_rgba8(cmd);
-        // Always opaque, regardless of state — fills aren't blended.
+        // Always opaque, regardless of state -- fills aren't blended.
         let clip = full_clip();
         let make = |vx: i32, vy: i32| HwVertex {
             pos: [vx as i16, vy as i16],
@@ -838,7 +838,7 @@ impl Translator {
             flags: 0,
         };
         // Two tris covering [x..x+w] × [y..y+h]. Same winding as
-        // push_mono_rect — semi-trans / mask-bit behaviour stays
+        // push_mono_rect -- semi-trans / mask-bit behaviour stays
         // pixel-equivalent in later phases.
         let v00 = (x, y);
         let v10 = (x + w, y);
@@ -883,10 +883,10 @@ impl Translator {
         let color = tex_tint(cmd);
         let prim_flags = self.tex_prim_flags(cmd, clut);
         let kind = self.blend_kind(cmd);
-        // Sprite UVs step 1 texel per pixel — top-left at uv0,
+        // Sprite UVs step 1 texel per pixel -- top-left at uv0,
         // bottom-right at uv0 + (w, h). The GPU rasterizer
         // interpolates UV continuously across the quad, giving
-        // subpixel UV at fractional internal scale — texture
+        // subpixel UV at fractional internal scale -- texture
         // detail tracks output resolution. Wrap to 0..=255 happens
         // in the shader's `page_uv`.
         let u0 = uv0.0 as i32;
@@ -933,7 +933,7 @@ impl Default for Translator {
 /// writes BGR15 to VRAM; the CPU rasterizer goes via
 /// `rgb24_to_bgr15` then `plot_pixel`, which is what shows up on
 /// screen. For the HW renderer we keep RGB8 because the output
-/// texture is `Rgba8UnormSrgb` — the channel reduction to 5 bits
+/// texture is `Rgba8UnormSrgb` -- the channel reduction to 5 bits
 /// happens on the CPU side, the HW side renders the full-precision
 /// RGB. Phase 7 may add a knob to clamp to PSX 5-bit precision for
 /// strict-look games.

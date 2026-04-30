@@ -1,6 +1,6 @@
 //! GPU-side VRAM for the compute-shader rasterizer.
 //!
-//! Phase A — infrastructure only. This crate owns nothing about
+//! Phase A -- infrastructure only. This crate owns nothing about
 //! primitive rasterization yet. It exposes a [`VramGpu`] handle that
 //! wraps a 1024×512 `R16Uint` storage texture (the PS1's BGR15
 //! framebuffer) plus rect upload/download helpers and round-trip

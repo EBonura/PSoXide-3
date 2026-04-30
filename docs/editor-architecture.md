@@ -115,12 +115,12 @@ world-space AABB the user can click to select and drag to move.
 
 3D-viewport clicks resolve in this order:
 
-1. **Entity bound** — `EditorWorkspace::pick_entity_bound` ray-tests
+1. **Entity bound** -- `EditorWorkspace::pick_entity_bound` ray-tests
    the active room's collected `EntityBounds` and returns the nearest
    hit. A successful hit promotes that node to `selected_node`.
-2. **Grid primitive** — `pick_face_with_hit` falls through to face /
+2. **Grid primitive** -- `pick_face_with_hit` falls through to face /
    edge / vertex picking on the room geometry under the same ray.
-3. **Empty space** — clears the selection.
+3. **Empty space** -- clears the selection.
 
 This priority lets the user click directly on a light marker even
 when it sits over a floor cell.
@@ -130,15 +130,15 @@ when it sits over a floor cell.
 `collect_entity_bounds(room_filter)` walks the active scene and emits
 one `EntityBounds` per entity-kind node. Each bound carries:
 
-- **`kind`** — selects the wireframe colour and whether a facing arrow
+- **`kind`** -- selects the wireframe colour and whether a facing arrow
   is drawn (models / spawn points have a yaw arrow; lights / audio /
   portals don't).
-- **`center` + `half_extents`** — world-space AABB. Sizes are
+- **`center` + `half_extents`** -- world-space AABB. Sizes are
   per-kind heuristics (`entity_bound_kind_and_size` in psxed-ui):
   models use the parsed model bounds when available; spawns / lights /
   triggers / portals / audio fall back to fixed marker boxes sized to
   remain pickable without blocking grid clicks underneath.
-- **`yaw_degrees`** — copy of the node's authored Y rotation, retained
+- **`yaw_degrees`** -- copy of the node's authored Y rotation, retained
   so the renderer can draw a facing arrow without re-walking the tree.
 
 The picker filters by `room_filter` so a click in the active room
@@ -152,7 +152,7 @@ the drag plane to its current world Y. `update_node_drag` re-casts
 the cursor onto that plane each frame and writes
 `start + (world_delta / sector_size)` back into the node's
 translation, so 1 cursor-sector ≈ 1 editor-space sector. Undo is
-lazy — the first non-zero delta pushes one snapshot, so a click that
+lazy -- the first non-zero delta pushes one snapshot, so a click that
 doesn't move doesn't churn the undo stack.
 
 ### 2D parity

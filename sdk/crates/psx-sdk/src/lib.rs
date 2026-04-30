@@ -1,4 +1,4 @@
-//! PSoXide SDK — umbrella crate.
+//! PSoXide SDK -- umbrella crate.
 //!
 //! Re-exports the per-subsystem crates so homebrew doesn't have to
 //! track each one individually:

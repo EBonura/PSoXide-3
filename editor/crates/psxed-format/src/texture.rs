@@ -1,8 +1,8 @@
 //! On-disk layout for cooked 2D textures (`.psxt` files).
 //!
 //! A PSXT blob carries a VRAM-ready texture plus (for indexed
-//! formats) its CLUT. The runtime parser pulls out two slices —
-//! pixel halfwords and CLUT halfwords — and hands them to
+//! formats) its CLUT. The runtime parser pulls out two slices --
+//! pixel halfwords and CLUT halfwords -- and hands them to
 //! [`upload_16bpp`][psx-vram::upload_16bpp] / [`upload_clut`]
 //! without copying. The cooking step (host-side in
 //! `psxed-tex`) has already packed the indices into the exact
@@ -18,13 +18,13 @@
 //!     payload_len = everything after this header
 //!
 //!   TextureHeader (16 bytes)
-//!     depth         u8   — 4, 8, or 15 bit per texel
-//!     _pad          u8   — zero
-//!     width_px      u16  — texture width in TEXELS
-//!     height_px     u16  — texture height in TEXELS
-//!     clut_entries  u16  — 16 (4bpp), 256 (8bpp), or 0 (15bpp)
-//!     pixel_bytes   u32  — byte count of the pixel block
-//!     clut_bytes    u32  — byte count of the CLUT block (0 for 15bpp)
+//!     depth         u8   -- 4, 8, or 15 bit per texel
+//!     _pad          u8   -- zero
+//!     width_px      u16  -- texture width in TEXELS
+//!     height_px     u16  -- texture height in TEXELS
+//!     clut_entries  u16  -- 16 (4bpp), 256 (8bpp), or 0 (15bpp)
+//!     pixel_bytes   u32  -- byte count of the pixel block
+//!     clut_bytes    u32  -- byte count of the CLUT block (0 for 15bpp)
 //!
 //!   Pixel data (pixel_bytes bytes)
 //!     Halfword-packed LE. At 4bpp, each u16 holds 4 texels with
@@ -51,7 +51,7 @@ pub const VERSION: u16 = 1;
 /// The three bit-depths the PSX GPU supports natively.
 ///
 /// Stored in [`TextureHeader::depth`] as the exact integer (4, 8,
-/// or 15) so the byte is self-describing — no need to cross-
+/// or 15) so the byte is self-describing -- no need to cross-
 /// reference an enum table to interpret a blob.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -103,7 +103,7 @@ impl Depth {
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]
 pub struct TextureHeader {
-    /// 4, 8, or 15 — matches [`Depth`] discriminants.
+    /// 4, 8, or 15 -- matches [`Depth`] discriminants.
     pub depth: u8,
     /// Alignment padding; writers set to zero, readers ignore.
     pub _pad: u8,
@@ -125,7 +125,7 @@ impl TextureHeader {
     pub const SIZE: usize = 16;
 
     /// Halfwords per row at the given depth and width. Rows are
-    /// padded up to a full halfword — a 5-texel-wide 4bpp texture
+    /// padded up to a full halfword -- a 5-texel-wide 4bpp texture
     /// still uses 2 halfwords per row.
     pub const fn halfwords_per_row(depth: Depth, width_px: u16) -> u16 {
         let per_hw = depth.texels_per_halfword();

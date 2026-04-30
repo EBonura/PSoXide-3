@@ -1,6 +1,6 @@
 //! Audit DMA3 (CDROM → RAM) behaviour. After the BIOS has
 //! dispatched its LBA-16 ReadN we search RAM for the "CD001" PVD
-//! magic — if the full PVD landed in RAM, the bug is downstream
+//! magic -- if the full PVD landed in RAM, the bug is downstream
 //! (e.g. BIOS parse logic we don't mimic). If the magic is
 //! missing or the root-directory-LBA field is wrong, DMA3 itself
 //! is corrupting data.
@@ -66,7 +66,7 @@ fn main() {
     for &addr in &found {
         println!();
         println!("=== RAM @ 0x{addr:08x} ===");
-        // The PVD's type byte sits 1 byte before "CD001" — so the
+        // The PVD's type byte sits 1 byte before "CD001" -- so the
         // PVD *block* starts at addr - 1.
         let pvd_base = addr.wrapping_sub(1);
         let ty = bus.try_read8(pvd_base).unwrap_or(0xff);

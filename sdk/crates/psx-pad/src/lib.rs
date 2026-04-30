@@ -86,7 +86,7 @@ pub mod button {
 pub struct ButtonState(u16);
 
 impl ButtonState {
-    /// Empty — nothing held.
+    /// Empty -- nothing held.
     pub const NONE: Self = Self(0);
 
     /// Construct from an active-high mask.

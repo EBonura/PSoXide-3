@@ -69,15 +69,15 @@ fn main() {
     const FULL_REPORT_LIMIT: usize = 10;
 
     for (i, expected) in trace.iter().enumerate() {
-        // Capture our state BEFORE step — Redux's record is "the state
+        // Capture our state BEFORE step -- Redux's record is "the state
         // after step i retired", so we check AFTER we step too.
         //
         // Redux's oracle folds IRQ-handler instructions into the
         // trace record of the instruction that triggered the IRQ
         // (see `debug.cc`: process() returns early when entering ISR
         // with cause=0, so stepIn's breakpoint fires only after RFE).
-        // Our `cpu.step` retires one instruction at a time — user OR
-        // ISR — so we have to perform the same folding in the
+        // Our `cpu.step` retires one instruction at a time -- user OR
+        // ISR -- so we have to perform the same folding in the
         // walker, otherwise Redux's "step 19472417" (= NOP + entire
         // VBlank ISR) appears to us as just "NOP".
         let was_in_isr = cpu.in_isr();
@@ -155,13 +155,13 @@ fn main() {
 
         // Break early on first cycle-only mismatch since that tells us
         // everything we need to know (instruction was the same but
-        // cycles differed — scheduler / memory-region cost issue).
+        // cycles differed -- scheduler / memory-region cost issue).
         if our_rec.tick != expected.tick
             && our_rec.pc == expected.pc
             && our_rec.instr == expected.instr
             && our_rec.gprs == expected.gprs
         {
-            // This is exactly the case we want to find — a cycle-only
+            // This is exactly the case we want to find -- a cycle-only
             // divergence. Print opcode category + surrounding context
             // then stop.
             println!();

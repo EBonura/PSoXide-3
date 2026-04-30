@@ -1,7 +1,7 @@
 //! System bus: owns physical memory and dispatches loads to regions.
 //!
 //! Current coverage: RAM, BIOS, scratchpad. Everything else panics on
-//! access — deliberately, because we want unmapped reads to be loud
+//! access -- deliberately, because we want unmapped reads to be loud
 //! until each region's owning module (GPU, SPU, CD-ROM, …) is wired up.
 
 use psx_hw::memory::{self, to_physical};
@@ -58,22 +58,22 @@ pub struct Bus {
     /// DMA controller (7 channels + DPCR + DICR). Phase 2g is
     /// register-backing only; transfers land as subsystems come online.
     dma: Dma,
-    /// GPU — owns VRAM and handles the GP0/GP1 MMIO ports. The
+    /// GPU -- owns VRAM and handles the GP0/GP1 MMIO ports. The
     /// frontend's VRAM viewer reads `bus.gpu.vram` directly.
     pub gpu: Gpu,
-    /// SPU — full 24-voice ADPCM synthesis, ADSR envelopes, stereo
+    /// SPU -- full 24-voice ADPCM synthesis, ADSR envelopes, stereo
     /// mixing at 44.1 kHz. Output drains into `spu.audio_out`; the
     /// frontend pulls samples every frame via [`Spu::drain_audio`].
     /// Public so the frontend can access the audio queue + tests can
     /// inspect voice state directly.
     pub spu: Spu,
-    /// SIO0 — controller / memory-card port. Currently models a cold
+    /// SIO0 -- controller / memory-card port. Currently models a cold
     /// port with nothing connected; enough to satisfy BIOS init polls.
     sio0: Sio0,
-    /// CD-ROM controller — byte-granular MMIO at 0x1F80_1800..=0x1803.
+    /// CD-ROM controller -- byte-granular MMIO at 0x1F80_1800..=0x1803.
     /// Exposed public so diagnostics can inspect FIFO / command state.
     pub cdrom: CdRom,
-    /// Motion decoder. Defensive stub today — register shape is
+    /// Motion decoder. Defensive stub today -- register shape is
     /// faithful (idle / empty status, DMA-enable latching, reset)
     /// but no real Huffman / IDCT / YUV→RGB. Games that poll MDEC
     /// status see plausible values instead of the unmapped 0xFFFF_FFFF.
@@ -87,7 +87,7 @@ pub struct Bus {
     // [`EventSlot::VBlank`]. Seeded at `FIRST_VBLANK_CYCLE` by
     // `Bus::new`; every VBlank handler invocation re-schedules the
     // next one `VBLANK_PERIOD_CYCLES` later.
-    /// Unified event scheduler — the 15-slot queue that owns
+    /// Unified event scheduler -- the 15-slot queue that owns
     /// DMA / CDROM / VBlank / SPU / MDEC / SIO timings, matching
     /// Redux's `m_regs.interrupt` + `intTargets`. See
     /// [`crate::scheduler`] for the model.
@@ -95,18 +95,18 @@ pub struct Bus {
     /// Migration status: DMA channel completions (slots `GpuDma`,
     /// `GpuOtcDma`, `CdrDma`, `MdecInDma`, `MdecOutDma`, `SpuDma`)
     /// run through the scheduler. VBlank, CDROM command / read
-    /// events, SPU async, SIO — still on their legacy per-subsystem
+    /// events, SPU async, SIO -- still on their legacy per-subsystem
     /// timers; migrations land in follow-up commits.
     pub scheduler: crate::scheduler::Scheduler,
     /// Bounded ring buffer of recent MMIO accesses. Zero-sized and
     /// no-op at every call site unless the `trace-mmio` Cargo feature
-    /// is enabled — see `mmio_trace.rs` for the rationale.
+    /// is enabled -- see `mmio_trace.rs` for the rationale.
     pub mmio_trace: MmioTrace,
     /// When true, the CPU replaces fetches at `0xA0` / `0xB0` / `0xC0`
     /// with a host-Rust implementation of the BIOS syscall they
     /// dispatch to. Off by default so parity tests stay bit-exact
     /// against Redux (which does the real BIOS ROM dispatch).
-    /// Turned on by [`Bus::enable_hle_bios`] — typically right after
+    /// Turned on by [`Bus::enable_hle_bios`] -- typically right after
     /// side-loading an EXE that wants BIOS services but skipped the
     /// BIOS's own init.
     pub hle_bios_enabled: bool,
@@ -124,7 +124,7 @@ pub struct Bus {
     /// keeping this separate from Timer 1's HBlank source preserves
     /// that phase.
     vblank_hsync_cycles: u64,
-    /// VBlank period in cycles — one full frame at the current
+    /// VBlank period in cycles -- one full frame at the current
     /// video region. 564_398 for NTSC, 677_343 for PAL.
     vblank_period: u64,
     /// Addresses we've already logged as unmapped reads. Keeps
@@ -135,7 +135,7 @@ pub struct Bus {
     /// address both log at least once.
     unmapped_write_seen: std::collections::BTreeSet<u32>,
     /// Diagnostic: when true, every DMA-completion schedule pushes
-    /// a record to `dma_log`. Off by default — only the
+    /// a record to `dma_log`. Off by default -- only the
     /// `probe_dma_schedules` example flips it on.
     dma_log_enabled: bool,
     dma_log: Vec<(String, u64, u64, u64)>,
@@ -184,7 +184,7 @@ impl Bus {
                 // we tick the SPU on every 768th cycle during the same
                 // window, our ADSR advances (envelope non-zero,
                 // voice_on_cycle bookkeeping) while Redux's stays
-                // frozen — and downstream SPU reads diverge. Until
+                // frozen -- and downstream SPU reads diverge. Until
                 // the parity oracle learns to pump Redux's SPU thread
                 // synchronously, we leave SPU synthesis dormant during
                 // CPU execution and pump it on demand from the
@@ -212,7 +212,7 @@ impl Bus {
     /// through GP1 display-mode writes; NTSC is the reset default.
     ///
     /// Calling this after any stepping has already happened leaves
-    /// cumulative `cycles` in place — the next VBlank will still
+    /// cumulative `cycles` in place -- the next VBlank will still
     /// fire at the correct *frame* boundary even if mid-frame.
     pub fn set_pal_mode(&mut self) {
         self.set_video_region(true);
@@ -314,19 +314,19 @@ impl Bus {
             .schedule(crate::scheduler::EventSlot::VBlank, self.cycles, delay);
     }
 
-    /// Current HSync period in cycles — NTSC = 2146, PAL = 2157.
+    /// Current HSync period in cycles -- NTSC = 2146, PAL = 2157.
     pub fn hsync_cycles(&self) -> u64 {
         self.hsync_cycles
     }
 
-    /// Current VBlank period — one frame in cycles.
+    /// Current VBlank period -- one frame in cycles.
     pub fn vblank_period(&self) -> u64 {
         self.vblank_period
     }
 
     /// Turn on HLE BIOS interception. Call after side-loading an EXE
     /// that expects BIOS services to be live without running the real
-    /// BIOS boot sequence. Never enable when validating parity — the
+    /// BIOS boot sequence. Never enable when validating parity -- the
     /// oracle emulator runs the real BIOS ROM and will diverge.
     pub fn enable_hle_bios(&mut self) {
         self.hle_bios_enabled = true;
@@ -353,7 +353,7 @@ impl Bus {
     /// Plug a memory card into port 1 with the given backing
     /// contents (128 KiB buffer, typically loaded from a
     /// `.mcd` file). Pass an empty `Vec` to start with a fresh
-    /// card. Keeps any pad already attached — real hardware
+    /// card. Keeps any pad already attached -- real hardware
     /// multiplexes pad + memcard on the same port.
     pub fn attach_memcard_port1(&mut self, initial_bytes: Vec<u8>) {
         let card = if initial_bytes.len() == crate::pad::MEMCARD_SIZE {
@@ -467,7 +467,7 @@ impl Bus {
     /// Plug a digital controller into port 2. Used by two-player
     /// games (Tekken VS, Bomberman, Street Fighter Alpha, etc.).
     /// SIO0 already multiplexes port 1 / port 2 internally via
-    /// the CTRL.SLOT bit — games switch between them per poll.
+    /// the CTRL.SLOT bit -- games switch between them per poll.
     pub fn attach_digital_pad_port2(&mut self) {
         let old = std::mem::take(self.sio0.port2_mut());
         let memcard = old.into_memcard();
@@ -540,7 +540,7 @@ impl Bus {
     }
 
     /// True when `phys` sits inside the MMIO window at `0x1F80_1000..0x1F80_2000`.
-    /// Used to filter trace recording — RAM / BIOS fetches are out of scope.
+    /// Used to filter trace recording -- RAM / BIOS fetches are out of scope.
     #[inline]
     fn is_mmio(phys: u32) -> bool {
         (memory::io::BASE..memory::io::BASE + memory::io::SIZE as u32).contains(&phys)
@@ -559,7 +559,7 @@ impl Bus {
     /// forward any newly latched controller IRQ to `I_STAT`, and
     /// (re)schedule [`EventSlot::Sio`] for whatever deadline is
     /// next pending. With the scheduler firing the wake-up, the
-    /// per-instruction poll is no longer needed — `Bus::tick`
+    /// per-instruction poll is no longer needed -- `Bus::tick`
     /// dropped its `service_sio0` call. Read paths still call
     /// this synchronously so a load that happens between the
     /// branch tests sees a deadline that's already due.
@@ -598,13 +598,13 @@ impl Bus {
     /// peripheral events that have come due. Called once per
     /// instruction from `Cpu::step` (charging BIAS before the opcode).
     ///
-    /// CDROM is deliberately NOT processed here — only at
+    /// CDROM is deliberately NOT processed here -- only at
     /// `drain_scheduler_events_post_op`, which the CPU calls at
     /// branch-delay-slot boundaries. That matches Redux's
     /// `branchTest` timing (psxinterpreter.cc:1650) where CDROM
     /// `interrupt()` fires at end-of-delay-slot, not on every
     /// instruction. Ticking CDROM on every BIAS makes our ACK
-    /// land one or two instructions earlier than Redux's — long
+    /// land one or two instructions earlier than Redux's -- long
     /// enough for a CDROM-polling spin-wait (e.g. MGS's BIOS
     /// ReadTOC-Ack wait at step ~90M) to see a different register
     /// byte than Redux and exit the loop early.
@@ -613,7 +613,7 @@ impl Bus {
         self.drain_scheduler_events_without_cdr_dma();
         // SIO0 used to be polled here (every instruction).
         // It's now woken up by `EventSlot::Sio` from the scheduler
-        // — see `drain_scheduler_events_inner`. Read paths still
+        // -- see `drain_scheduler_events_inner`. Read paths still
         // call `service_sio0` synchronously so MMIO loads observe
         // any deadline that's already due.
     }
@@ -665,7 +665,7 @@ impl Bus {
     ///
     /// Slots we haven't migrated yet (CDROM, VBlank, SPU, SIO,
     /// MDEC) will never appear here because no subsystem schedules
-    /// them — the legacy timers still own those. Each migration
+    /// them -- the legacy timers still own those. Each migration
     /// replaces a legacy timer with `scheduler.schedule(...)` and
     /// adds a `match` arm here.
     fn drain_scheduler_events_without_cdr_dma(&mut self) {
@@ -767,12 +767,12 @@ impl Bus {
                 EventSlot::VBlank => {
                     self.irq.raise(IrqSource::VBlank);
                     // Toggle GPUSTAT bit 31 (interlace / field flag)
-                    // — some BIOS and game code polls this instead
+                    // -- some BIOS and game code polls this instead
                     // of (or in addition to) the VBlank IRQ to detect
                     // frame boundaries. Matches Redux's
                     // `SoftGPU::vblank` which XORs the same bit.
                     self.gpu.toggle_vblank_field();
-                    // Tell the timer bank — Timer 1 sync-mode-1
+                    // Tell the timer bank -- Timer 1 sync-mode-1
                     // resets its counter on this pulse.
                     self.timers.notify_vblank();
                     // Re-arm the next VBlank from the original
@@ -786,7 +786,7 @@ impl Bus {
                     // from the frontend instead of the scheduler while
                     // the parity oracle runs with a dormant SPU
                     // thread. If anything schedules this slot it is
-                    // a logic bug — log and drop.
+                    // a logic bug -- log and drop.
                     debug_assert!(false, "SpuAsync fired but SPU pumps from frontend");
                 }
                 // Not-yet-migrated slots. A subsystem scheduling one
@@ -836,7 +836,7 @@ impl Bus {
     /// (Redux's `m_regs.cycle += 1` inside `read8/16/32` and
     /// `write8/16/32` in `psxmem.cc`). VBlank / DMA6 / CDROM schedulers
     /// still see the accumulated cycle count when `tick()` runs at end
-    /// of instruction — matching Redux's `psxBranchTest`, which only
+    /// of instruction -- matching Redux's `psxBranchTest`, which only
     /// runs after delay slots and observes the post-BIAS,
     /// post-data-access total. Timers, however, see every cycle so
     /// their counter values stay in lock-step with Redux's cycle-derived
@@ -852,13 +852,13 @@ impl Bus {
         self.cycles = self.cycles.wrapping_add(n as u64);
         // Timers used to be ticked here every instruction (~25M
         // calls/sec, three accumulator-divides each). They're now
-        // advanced lazily — `service_timers()` runs once per
+        // advanced lazily -- `service_timers()` runs once per
         // scheduler drain and on demand from MMIO read / write
         // paths. The lazy advance reads `self.cycles` so it
         // observes the same effective time the per-tick path did.
         // Decay the GPU's pseudo-busy credit as time passes. At
         // 32 units per cycle a full-screen (~640×478) fill-rect
-        // credit of 153k takes ~4.8k cycles to drain — about the
+        // credit of 153k takes ~4.8k cycles to drain -- about the
         // duration of a short VBlank window, matching real
         // hardware's "a few scanlines to finish the batch".
         self.gpu.decay_busy((n as u64) * 32);
@@ -924,7 +924,7 @@ impl Bus {
     /// (e.g. 735 samples per NTSC frame at 44.1 kHz).
     ///
     /// Also forwards any CD audio samples the CDROM has decoded
-    /// (CD-DA / XA ADPCM) into the SPU's CD input mix — one
+    /// (CD-DA / XA ADPCM) into the SPU's CD input mix -- one
     /// drain-and-feed per call keeps the latency bounded.
     pub fn run_spu_samples(&mut self, n: usize) {
         // Move any freshly-decoded CDROM audio into the SPU's CD
@@ -941,7 +941,7 @@ impl Bus {
         }
     }
 
-    /// Borrow the interrupt controller — caller can `.raise()` sources
+    /// Borrow the interrupt controller -- caller can `.raise()` sources
     /// or inspect state without going through MMIO.
     pub fn irq_mut(&mut self) -> &mut Irq {
         &mut self.irq
@@ -1024,7 +1024,7 @@ impl Bus {
 
     /// Run DMA on a single channel after its CHCR was just written
     /// with the start bit set. Mirrors Redux's per-channel
-    /// `dmaExec<N>` dispatch in `psxhw.cc` — each CHCR write goes
+    /// `dmaExec<N>` dispatch in `psxhw.cc` -- each CHCR write goes
     /// to exactly one channel's handler, NOT a sweep across every
     /// channel. That distinction matters: if another channel's
     /// transfer was still in-flight (start bit set, awaiting its
@@ -1096,11 +1096,11 @@ impl Bus {
                 }
             }
             4 => {
-                if let Some(spu_words) = self.run_dma_spu() {
-                    let target = self.cycles + spu_words as u64;
-                    self.log_dma_schedule("SpuDma", spu_words as u64, target);
+                if let Some(spu_delay) = self.run_dma_spu() {
+                    let target = self.cycles + spu_delay as u64;
+                    self.log_dma_schedule("SpuDma", spu_delay as u64, target);
                     self.scheduler
-                        .schedule(EventSlot::SpuDma, self.cycles, spu_words as u64);
+                        .schedule(EventSlot::SpuDma, self.cycles, spu_delay as u64);
                 }
             }
             6 => {
@@ -1117,7 +1117,7 @@ impl Bus {
                 }
             }
             _ => {
-                // Channel 5 (PIO) + invalid indices — skip silently.
+                // Channel 5 (PIO) + invalid indices -- skip silently.
                 // Matches Redux's `#if 0` guard that disables PIO DMA.
             }
         }
@@ -1224,19 +1224,16 @@ impl Bus {
         Some(total_words)
     }
 
-    /// Execute DMA channel 4 ↔ SPU. Sync mode 1 (block) is the only
-    /// mode games use; mode 0 (manual) falls through as a single-block
-    /// transfer with BCR as the total word count (matches Redux). The
-    /// SPU's transfer pointer tracks the current RAM-side address; we
-    /// copy halfword-pairs in the direction the channel selects.
+    /// Execute DMA channel 4 ↔ SPU. Redux treats the BCR product as a
+    /// halfword count for the data copy and schedules completion after
+    /// half that product (`scheduleSPUDMAIRQ(product / 2)`).
     ///
-    /// - Direction bit 0 = 1: main RAM → SPU RAM (normal — upload sample data).
-    /// - Direction bit 0 = 0: SPU RAM → main RAM (rare — live capture).
+    /// - Direction bit 0 = 1: main RAM → SPU RAM (normal -- upload sample data).
+    /// - Direction bit 0 = 0: SPU RAM → main RAM (rare -- live capture).
     ///
     /// CHCR start/busy bits are NOT cleared here; the completion
     /// handler in `drain_scheduler_events` does that at the scheduled
-    /// cycle (one tick per word transferred, matching Redux's
-    /// `scheduleSPUDMAIRQ(size)`).
+    /// cycle.
     fn run_dma_spu(&mut self) -> Option<u32> {
         if !self.dma.is_channel_enabled(4) {
             return None;
@@ -1251,56 +1248,45 @@ impl Bus {
         // before kicking the channel, so this is a belt-and-braces
         // check.
         if !self.spu.dma_transfer_enabled() {
-            // Still return Some so the completion IRQ fires — the
+            // Still return Some so the completion IRQ fires -- the
             // CHCR start bit must clear or the BIOS's DMA-wait loop
             // hangs forever.
             return Some(0);
         }
         let sync_mode = (ch.channel_control >> 9) & 0x3;
         let bcr = ch.block_control;
-        let total_words: u32 = match sync_mode {
+        let halfword_count: u32 = match sync_mode {
             0 => bcr & 0xFFFF,
             1 => {
                 let block_size = bcr & 0xFFFF;
-                let block_count = (bcr >> 16).max(1) & 0xFFFF;
+                let block_count = (bcr >> 16) & 0xFFFF;
                 block_size * block_count
             }
-            _ => 0, // Linked list + reserved — not used for SPU.
+            _ => 0, // Linked list + reserved -- not used for SPU.
         };
         let to_spu = ch.channel_control & 1 != 0;
         let step: u32 = if (ch.channel_control >> 1) & 1 != 0 {
-            0xFFFF_FFFCu32
+            0xFFFF_FFFEu32
         } else {
-            4
+            2
         };
-        let mut addr = ch.base & 0x001F_FFFC;
+        let mut addr = ch.base & 0x001F_FFFF;
         if to_spu {
-            // Buffer the RAM words so we can ship them to the SPU's
-            // `dma_write` which takes a slice of halfwords. Each 32-bit
-            // word becomes two halfwords, low then high.
-            let mut words: Vec<u16> = Vec::with_capacity((total_words * 2) as usize);
-            for _ in 0..total_words {
-                let word = read_ram_u32(&self.ram[..], addr);
-                words.push(word as u16);
-                words.push((word >> 16) as u16);
+            let mut words: Vec<u16> = Vec::with_capacity(halfword_count as usize);
+            for _ in 0..halfword_count {
+                words.push(read_ram_u16(&self.ram[..], addr));
                 addr = addr.wrapping_add(step);
             }
             self.spu.dma_write(&words);
         } else {
-            let mut words = vec![0u16; (total_words * 2) as usize];
+            let mut words = vec![0u16; halfword_count as usize];
             self.spu.dma_read(&mut words);
-            for i in 0..total_words {
-                let lo = words[(i as usize) * 2] as u32;
-                let hi = words[(i as usize) * 2 + 1] as u32;
-                let word = lo | (hi << 16);
-                let offset = (addr & 0x001F_FFFF) as usize;
-                if offset + 4 <= self.ram.len() {
-                    self.ram[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
-                }
+            for word in words {
+                write_ram_u16(&mut self.ram[..], addr, word);
                 addr = addr.wrapping_add(step);
             }
         }
-        Some(total_words)
+        Some(halfword_count / 2)
     }
 
     /// Execute DMA channel 3 → CPU. Block mode (sync=1) is the only
@@ -1308,7 +1294,7 @@ impl Bus {
     /// FIFO and write them to RAM at `MADR` with +4 step. Returns
     /// `Some(word_count)` when a transfer was kicked (so the caller
     /// can schedule the completion IRQ), `None` when the channel
-    /// wasn't armed. CHCR start/busy bits are NOT cleared here — the
+    /// wasn't armed. CHCR start/busy bits are NOT cleared here -- the
     /// per-channel scheduler does that at the completion cycle.
     fn run_dma_cdrom(&mut self) -> Option<u32> {
         if !self.dma.is_channel_enabled(3) {
@@ -1335,7 +1321,7 @@ impl Bus {
         //
         //   mode 0 (manual): BCR is the total number of words to
         //                    transfer. BA is ignored.
-        //   mode 1 (block):  BCR is (BA << 16) | BS — transfer BS
+        //   mode 1 (block):  BCR is (BA << 16) | BS -- transfer BS
         //                    words per request, BA times.
         //
         // Both result in the same byte flow from the CDROM data
@@ -1355,7 +1341,7 @@ impl Bus {
                 block_size * block_count.max(1)
             }
             _ => {
-                // Linked-list (2) + reserved (3) — not used for
+                // Linked-list (2) + reserved (3) -- not used for
                 // CDROM. Drop the trigger silently.
                 return Some(0);
             }
@@ -1400,14 +1386,14 @@ impl Bus {
     ///   given by CHCR bit 1 (+4 or -4). PS1 always uses +4 direction
     ///   for CPU→GPU.
     /// - **Mode 2 (linked list)**: Walk a chain of packets in RAM.
-    ///   Each node header is `[NN AAAAAA]` — top byte = word count
+    ///   Each node header is `[NN AAAAAA]` -- top byte = word count
     ///   (following 32-bit words to ship to GP0), low 24 bits = next
     ///   node address. Terminator is `AAAAAA == 0xFFFFFF`.
     ///
     /// Returns `Some(completion_cycles)` when a transfer was kicked
     /// (caller uses it to schedule the GpuDma event), `None` when
     /// the channel wasn't armed. CHCR start/busy bits are NOT cleared
-    /// here — the scheduler does that at the completion cycle.
+    /// here -- the scheduler does that at the completion cycle.
     ///
     /// `completion_cycles` is the Redux-accurate event delay, which
     /// depends on sync mode and transfer direction:
@@ -1434,11 +1420,11 @@ impl Bus {
         let completion = match sync_mode {
             1 => self.dma_gpu_block(direction_to_device),
             2 => self.dma_gpu_linked_list(),
-            _ => 0, // Manual (0) + prohibited (3) — nothing standard uses
+            _ => 0, // Manual (0) + prohibited (3) -- nothing standard uses
                     // them for the GPU channel. Drop the trigger silently.
         };
         // Start bit stays set until the scheduled completion event
-        // fires — Redux's `gpuInterrupt` is where `clearDMABusy<2>()`
+        // fires -- Redux's `gpuInterrupt` is where `clearDMABusy<2>()`
         // is called. BIOS polling of CHCR bit 24 during the transfer
         // window must read 1 until the IRQ fires.
         Some(completion)
@@ -1452,7 +1438,7 @@ impl Bus {
         let block_count = (bcr >> 16).max(1) & 0xFFFF;
         let total_words = block_size * block_count;
         let step = if (ch.channel_control >> 1) & 1 != 0 {
-            // Decrement mode — rarely used for GPU but handle for safety.
+            // Decrement mode -- rarely used for GPU but handle for safety.
             0xFFFF_FFFCu32
         } else {
             4
@@ -1513,7 +1499,7 @@ impl Bus {
     /// crashing the emulator on unmapped addresses.
     ///
     /// Byte-granular reads of the GPU / timer / DMA / IRQ MMIO don't
-    /// try to decompose the typed 32-bit registers — they return the
+    /// try to decompose the typed 32-bit registers -- they return the
     /// echo-buffer byte, which is fine for a diagnostic dump.
     /// Byte write that silently drops addresses outside mapped RAM /
     /// scratchpad. Used by HLE BIOS helpers (like `memset`) where
@@ -1534,7 +1520,7 @@ impl Bus {
         }
     }
 
-    /// Side-effect-free byte read — used by diagnostics (trace
+    /// Side-effect-free byte read -- used by diagnostics (trace
     /// printer, parity oracle) that must not perturb peripheral
     /// state. Returns `None` for addresses that aren't backed by
     /// plain memory (CD-ROM FIFO, timers, etc.); the caller is
@@ -1571,11 +1557,11 @@ impl Bus {
     /// Read a 32-bit little-endian word from a virtual address.
     ///
     /// Panics on any address that does not resolve to a currently-mapped
-    /// region. This is intentional — unmapped reads during development
+    /// region. This is intentional -- unmapped reads during development
     /// should surface immediately, not return silent zeros.
     ///
     /// `&mut self` because some peripherals (notably CD-ROM) mutate on
-    /// read — popping response FIFOs, advancing data-transfer state.
+    /// read -- popping response FIFOs, advancing data-transfer state.
     pub fn read8(&mut self, virt: u32) -> u8 {
         let phys = to_physical(virt);
         let value = self.read8_impl(virt, phys);
@@ -1634,7 +1620,7 @@ impl Bus {
     /// Unmapped regions behave identically to [`Bus::read8`] (see the
     /// region-by-region notes there).
     ///
-    /// `&mut self` for the same reason as `read8` — peripheral-side
+    /// `&mut self` for the same reason as `read8` -- peripheral-side
     /// effects.
     pub fn read16(&mut self, virt: u32) -> u16 {
         let phys = to_physical(virt);
@@ -1721,11 +1707,11 @@ impl Bus {
     }
 
     /// Side-effect-free peek at a 32-bit instruction word. Returns
-    /// `None` when `virt` isn't in RAM or BIOS — those are the only
+    /// `None` when `virt` isn't in RAM or BIOS -- those are the only
     /// places PS1 code ever executes from, so a `None` here is
     /// cheap to treat as "can't be a GTE cofun" at the call site.
     ///
-    /// Used by [`crate::Cpu::should_take_interrupt`] — see the
+    /// Used by [`crate::Cpu::should_take_interrupt`] -- see the
     /// "interrupts vs GTE" hardware bug workaround.
     pub fn peek_instruction(&self, virt: u32) -> Option<u32> {
         let phys = to_physical(virt);
@@ -1853,7 +1839,7 @@ impl Bus {
             if self.dma.write32(phys, value) {
                 self.irq.raise(IrqSource::Dma);
             }
-            // Only a CHCR write with bit 24 set starts a transfer —
+            // Only a CHCR write with bit 24 set starts a transfer --
             // matches Redux's `dmaExec<N>` dispatcher in `psxhw.cc`,
             // which runs from the per-channel `case 0x1f80_1088/98/
             // a8/b8/c8/e8` arms. Crucially it runs ONLY channel N,
@@ -1867,7 +1853,7 @@ impl Bus {
             // first. Example caught by `probe_dma_schedules`:
             // writing channel 6's CHCR at cycle 46246689 re-ran
             // channel 2's in-flight DMA, pushing its IRQ target from
-            // 46247457 to 46247720 — which is exactly the -2488-
+            // 46247457 to 46247720 -- which is exactly the -2488-
             // cycle drift `probe_cycle_first_divergence` flagged at
             // step 19474544.
             let offset = phys.wrapping_sub(Dma::BASE);
@@ -1967,7 +1953,7 @@ impl Bus {
         // CDROM is byte-addressed (4 registers, each switching meaning by
         // index). Without this dispatch the BIOS's `sb` to 1F801800..1803
         // ends up in the io[] echo buffer and the CDROM module never sees
-        // the index switch / param push / command write — so commands are
+        // the index switch / param push / command write -- so commands are
         // silently dropped, no IRQ ever fires, and the BIOS stalls in the
         // event-wait loop after the Sony intro.
         if CdRom::contains(phys) {
@@ -2034,7 +2020,7 @@ impl Bus {
         }
         // The BIOS uses `sh` (16-bit store) to write `I_MASK` and ack
         // `I_STAT`. Without this dispatch the value lands in the io[]
-        // echo buffer and the IRQ controller never sees it — meaning
+        // echo buffer and the IRQ controller never sees it -- meaning
         // mask stays 0 and pending() always returns false, so no IRQ
         // exception is ever taken.
         if phys == IRQ_STAT_ADDR {
@@ -2106,6 +2092,25 @@ fn read_ram_u32(ram: &[u8], phys: u32) -> u32 {
         ])
     } else {
         0
+    }
+}
+
+/// Halfword read from a RAM slice at a physical RAM offset. SPU DMA is
+/// halfword-based in Redux: the BCR product counts 16-bit samples and
+/// the completion delay is half that product.
+fn read_ram_u16(ram: &[u8], phys: u32) -> u16 {
+    let offset = (phys & 0x001F_FFFF) as usize;
+    if offset + 2 <= ram.len() {
+        u16::from_le_bytes([ram[offset], ram[offset + 1]])
+    } else {
+        0
+    }
+}
+
+fn write_ram_u16(ram: &mut [u8], phys: u32, value: u16) {
+    let offset = (phys & 0x001F_FFFF) as usize;
+    if offset + 2 <= ram.len() {
+        ram[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
 }
 
@@ -2258,12 +2263,12 @@ mod tests {
     #[test]
     fn vblank_scheduler_fires_at_first_threshold() {
         let mut bus = Bus::new(synthetic_bios()).unwrap();
-        // Just below the first VBlank — no fire yet.
+        // Just below the first VBlank -- no fire yet.
         bus.tick(FIRST_VBLANK_CYCLE as u32 - 1);
         bus.run_vblank_scheduler();
         assert_eq!(bus.irq.stat() & 1, 0);
 
-        // Cross the threshold — one VBlank fires.
+        // Cross the threshold -- one VBlank fires.
         bus.tick(2);
         bus.run_vblank_scheduler();
         assert_eq!(bus.irq.stat() & 1, 1);
@@ -2286,13 +2291,13 @@ mod tests {
 
     #[test]
     fn vblank_scheduler_catches_up_after_long_tick() {
-        // Tick far past the first VBlank in one go — the scheduler
+        // Tick far past the first VBlank in one go -- the scheduler
         // must fire every VBlank that would have elapsed, not just one.
         // Ack each time so we can count.
         let mut bus = Bus::new(synthetic_bios()).unwrap();
         bus.tick((FIRST_VBLANK_CYCLE + 3 * VBLANK_PERIOD_CYCLES + 1) as u32);
         bus.run_vblank_scheduler();
-        // irq.stat bit 0 is either 0 or 1 — can't count from there.
+        // irq.stat bit 0 is either 0 or 1 -- can't count from there.
         // Instead, check next_vblank_cycle advanced by 4 periods.
         let expected = FIRST_VBLANK_CYCLE + 4 * VBLANK_PERIOD_CYCLES;
         assert_eq!(bus.next_vblank_cycle(), expected);
@@ -2386,6 +2391,53 @@ mod tests {
         bus.run_dma_channel(3);
 
         assert_eq!(bus.scheduler.target(EventSlot::CdrDma), Some(101));
+    }
+
+    #[test]
+    fn spu_dma_uses_halfword_count_and_redux_half_rate_completion_delay() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        bus.cycles = 100;
+        bus.spu.write16(crate::spu::TRANSFER_ADDR, 0);
+        bus.spu.write16(crate::spu::SPUCNT, 2 << 4);
+        bus.dma.dpcr = 1 << (4 * 4 + 3);
+
+        for i in 0..32u16 {
+            write_ram_u16(&mut bus.ram[..], 0x100 + u32::from(i) * 2, 0x2000 + i);
+        }
+
+        bus.dma.channels[4].base = 0x100;
+        bus.dma.channels[4].block_control = (4 << 16) | 8;
+        bus.dma.channels[4].channel_control = 0x0100_0201;
+        bus.run_dma_channel(4);
+
+        assert_eq!(bus.scheduler.target(EventSlot::SpuDma), Some(116));
+
+        bus.spu.write16(crate::spu::TRANSFER_ADDR, 0);
+        let mut copied = [0u16; 32];
+        bus.spu.dma_read(&mut copied);
+        assert_eq!(copied[0], 0x2000);
+        assert_eq!(copied[31], 0x201F);
+    }
+
+    #[test]
+    fn spu_read_dma_writes_halfwords_back_to_ram() {
+        let mut bus = Bus::new(synthetic_bios()).unwrap();
+        bus.spu.write16(crate::spu::TRANSFER_ADDR, 0);
+        bus.spu.write16(crate::spu::SPUCNT, 3 << 4);
+        bus.dma.dpcr = 1 << (4 * 4 + 3);
+        let payload = [0x1111u16, 0x2222, 0x3333, 0x4444];
+        bus.spu.dma_write(&payload);
+        bus.spu.write16(crate::spu::TRANSFER_ADDR, 0);
+
+        bus.dma.channels[4].base = 0x300;
+        bus.dma.channels[4].block_control = (1 << 16) | 4;
+        bus.dma.channels[4].channel_control = 0x0100_0200;
+
+        assert_eq!(bus.run_dma_spu(), Some(2));
+        assert_eq!(read_ram_u16(&bus.ram[..], 0x300), 0x1111);
+        assert_eq!(read_ram_u16(&bus.ram[..], 0x302), 0x2222);
+        assert_eq!(read_ram_u16(&bus.ram[..], 0x304), 0x3333);
+        assert_eq!(read_ram_u16(&bus.ram[..], 0x306), 0x4444);
     }
 
     #[test]

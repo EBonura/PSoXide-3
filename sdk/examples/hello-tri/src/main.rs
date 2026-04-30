@@ -1,4 +1,4 @@
-//! `hello-tri` — the smallest interesting PSoXide homebrew.
+//! `hello-tri` -- the smallest interesting PSoXide homebrew.
 //!
 //! Initialises the GPU, clears the framebuffer to dark blue, and
 //! draws one Gouraud-shaded triangle per frame with a slight
@@ -29,7 +29,7 @@ fn main() {
 
     // Double-buffer: buffer A at VRAM (0, 0), buffer B at (0, 240).
     // The TV always scans out a stable completed frame while we
-    // draw into the other buffer. PS1 games do this universally —
+    // draw into the other buffer. PS1 games do this universally --
     // workload-light demos like this one wouldn't flicker even
     // single-buffered, but adopting the pattern here keeps every
     // example on the same footing.

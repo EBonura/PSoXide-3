@@ -12,13 +12,13 @@
 
 use bitflags::bitflags;
 
-/// `GP0` — write: rendering commands and VRAM transfer data.
+/// `GP0` -- write: rendering commands and VRAM transfer data.
 ///
 /// Reading from this address returns `GPUREAD` (VRAM-to-CPU transfer data
 /// or GP1(10h) register response).
 pub const GP0: u32 = 0x1F80_1810;
 
-/// `GP1` — write: display-control commands (reset, display enable, mode,
+/// `GP1` -- write: display-control commands (reset, display enable, mode,
 /// DMA direction, display area, horizontal/vertical range, etc.).
 ///
 /// Reading from this address returns [`GPUSTAT`](GpuStat).
@@ -31,7 +31,7 @@ pub const GPUREAD: u32 = GP0;
 pub const GPUSTAT: u32 = GP1;
 
 bitflags! {
-    /// `GPUSTAT` — 32-bit status register read via [`GPUSTAT`].
+    /// `GPUSTAT` -- 32-bit status register read via [`GPUSTAT`].
     ///
     /// Several fields are multi-bit (texture page base, horizontal
     /// resolution, DMA direction); those are exposed as masks with a
@@ -169,19 +169,19 @@ pub enum DmaDirection {
 ///
 /// GP1 commands are single 32-bit writes to [`GP1`]. The top byte is
 /// the opcode; the low 24 bits are the parameters. Each constructor
-/// encodes exactly one command — callers are free to use them
+/// encodes exactly one command -- callers are free to use them
 /// directly or wrap them in higher-level SDK calls.
 pub mod gp1 {
-    /// GP1(00h) — Reset GPU (clear FIFO, reset mode, disable display).
+    /// GP1(00h) -- Reset GPU (clear FIFO, reset mode, disable display).
     pub const RESET: u32 = 0x0000_0000;
 
-    /// GP1(01h) — Reset command buffer / FIFO.
+    /// GP1(01h) -- Reset command buffer / FIFO.
     pub const RESET_CMD_BUFFER: u32 = 0x0100_0000;
 
-    /// GP1(02h) — Acknowledge GPU IRQ1 (GP0 1Fh).
+    /// GP1(02h) -- Acknowledge GPU IRQ1 (GP0 1Fh).
     pub const ACK_IRQ: u32 = 0x0200_0000;
 
-    /// GP1(03h) — Display enable. `true` disables (screen black),
+    /// GP1(03h) -- Display enable. `true` disables (screen black),
     /// `false` enables (normal output). The sense is inverted on
     /// hardware: bit 0 set = DISABLED.
     #[inline(always)]
@@ -189,14 +189,14 @@ pub mod gp1 {
         0x0300_0000 | ((!enable) as u32 & 1)
     }
 
-    /// GP1(04h) — DMA direction.
+    /// GP1(04h) -- DMA direction.
     /// `0` = off, `1` = FIFO, `2` = CPU→GP0, `3` = GPUREAD→CPU.
     #[inline(always)]
     pub const fn dma_direction(dir: u32) -> u32 {
         0x0400_0000 | (dir & 3)
     }
 
-    /// GP1(05h) — VRAM coordinates of the top-left displayed pixel.
+    /// GP1(05h) -- VRAM coordinates of the top-left displayed pixel.
     /// Used for double-buffering: write the back buffer's origin
     /// to flip.
     #[inline(always)]
@@ -204,21 +204,21 @@ pub mod gp1 {
         0x0500_0000 | (x & 0x3FF) | ((y & 0x1FF) << 10)
     }
 
-    /// GP1(06h) — Horizontal display range (GPU clock counts from
+    /// GP1(06h) -- Horizontal display range (GPU clock counts from
     /// start-of-line). Standard NTSC window: `0x260..0xC60`.
     #[inline(always)]
     pub const fn h_display_range(x1: u32, x2: u32) -> u32 {
         0x0600_0000 | (x1 & 0xFFF) | ((x2 & 0xFFF) << 12)
     }
 
-    /// GP1(07h) — Vertical display range (scanline). Standard NTSC:
+    /// GP1(07h) -- Vertical display range (scanline). Standard NTSC:
     /// `0x10..0x100` → 240 lines starting at line 16.
     #[inline(always)]
     pub const fn v_display_range(y1: u32, y2: u32) -> u32 {
         0x0700_0000 | (y1 & 0x3FF) | ((y2 & 0x3FF) << 10)
     }
 
-    /// GP1(08h) — Display mode (resolution, video standard, depth).
+    /// GP1(08h) -- Display mode (resolution, video standard, depth).
     /// - `hres_1` (0..3): 256/320/512/640 (combine with `hres_2=true`
     ///   for 368).
     /// - `vres`: 0 = 240 lines, 1 = 480 interlaced.
@@ -241,7 +241,7 @@ pub mod gp1 {
             | ((interlace as u32) << 5)
     }
 
-    /// GP1(10h) — Get-GPU-info latch. The returned value can be read
+    /// GP1(10h) -- Get-GPU-info latch. The returned value can be read
     /// via `GPUREAD` (at `GP0`) on the next read.
     /// - `0x02`: texture-window setting
     /// - `0x03`: draw-area top-left
@@ -265,12 +265,12 @@ pub mod gp1 {
 pub mod gp0 {
     use super::pack_color;
 
-    /// GP0(00h) — NOP.
+    /// GP0(00h) -- NOP.
     pub const NOP: u32 = 0x0000_0000;
-    /// GP0(01h) — Clear texture cache.
+    /// GP0(01h) -- Clear texture cache.
     pub const CLEAR_CACHE: u32 = 0x0100_0000;
 
-    /// GP0(02h) — Fill rectangle in VRAM (not clipped, ignores draw
+    /// GP0(02h) -- Fill rectangle in VRAM (not clipped, ignores draw
     /// area / offset). Header carries the color; follow-up words are
     /// `pack_xy(x, y)` then `pack_xy(w, h)`.
     #[inline(always)]
@@ -278,7 +278,7 @@ pub mod gp0 {
         0x0200_0000 | pack_color(r, g, b)
     }
 
-    /// GP0(E1h) — Draw mode (texpage + semi-transparency + depth).
+    /// GP0(E1h) -- Draw mode (texpage + semi-transparency + depth).
     #[inline(always)]
     pub const fn draw_mode(
         texpage_x: u32,
@@ -297,7 +297,7 @@ pub mod gp0 {
             | ((draw_to_display as u32) << 10)
     }
 
-    /// GP0(E2h) — Texture window (wrap inside a rect).
+    /// GP0(E2h) -- Texture window (wrap inside a rect).
     #[inline(always)]
     pub const fn tex_window(mask_x: u32, mask_y: u32, off_x: u32, off_y: u32) -> u32 {
         0xE200_0000
@@ -307,26 +307,26 @@ pub mod gp0 {
             | ((off_y & 0x1F) << 15)
     }
 
-    /// GP0(E3h) — Draw area top-left corner (pixels clipped inside).
+    /// GP0(E3h) -- Draw area top-left corner (pixels clipped inside).
     #[inline(always)]
     pub const fn draw_area_top_left(x: u32, y: u32) -> u32 {
         0xE300_0000 | (x & 0x3FF) | ((y & 0x1FF) << 10)
     }
 
-    /// GP0(E4h) — Draw area bottom-right corner.
+    /// GP0(E4h) -- Draw area bottom-right corner.
     #[inline(always)]
     pub const fn draw_area_bottom_right(x: u32, y: u32) -> u32 {
         0xE400_0000 | (x & 0x3FF) | ((y & 0x1FF) << 10)
     }
 
-    /// GP0(E5h) — Draw offset (added to every vertex before raster).
+    /// GP0(E5h) -- Draw offset (added to every vertex before raster).
     /// Each component is 11-bit signed; pass negatives as two's-comp.
     #[inline(always)]
     pub const fn draw_offset(x: i32, y: i32) -> u32 {
         0xE500_0000 | ((x as u32) & 0x7FF) | (((y as u32) & 0x7FF) << 11)
     }
 
-    /// GP0(E6h) — Mask-bit setting (stencil-style control).
+    /// GP0(E6h) -- Mask-bit setting (stencil-style control).
     #[inline(always)]
     pub const fn mask_bit(set_on_draw: bool, check_before_draw: bool) -> u32 {
         0xE600_0000 | (set_on_draw as u32) | ((check_before_draw as u32) << 1)
@@ -358,18 +358,18 @@ pub mod gp0 {
             | ((raw_tex as u32) << 24)
     }
 
-    /// GP0(A0h) — Begin CPU→VRAM transfer. Header is this word; then
+    /// GP0(A0h) -- Begin CPU→VRAM transfer. Header is this word; then
     /// two words of dest `xy` / `wh`; then `ceil(w*h/2)` pixel words.
     pub const COPY_CPU_TO_VRAM: u32 = 0xA000_0000;
 
-    /// GP0(C0h) — Begin VRAM→CPU transfer. Same header layout as
+    /// GP0(C0h) -- Begin VRAM→CPU transfer. Same header layout as
     /// [`COPY_CPU_TO_VRAM`]; pixel words come back via `GPUREAD`.
     pub const COPY_VRAM_TO_CPU: u32 = 0xC000_0000;
 
-    /// GP0(80h) — VRAM→VRAM copy (rect blit).
+    /// GP0(80h) -- VRAM→VRAM copy (rect blit).
     pub const COPY_VRAM_TO_VRAM: u32 = 0x8000_0000;
 
-    /// GP0(1Fh) — Request IRQ1.
+    /// GP0(1Fh) -- Request IRQ1.
     pub const REQUEST_IRQ: u32 = 0x1F00_0000;
 }
 
@@ -382,7 +382,7 @@ pub const fn pack_color(r: u8, g: u8, b: u8) -> u32 {
 }
 
 /// Pack a signed 11-bit XY pair into a GP0 vertex word. The GPU
-/// sign-extends each half internally — we store them as unsigned
+/// sign-extends each half internally -- we store them as unsigned
 /// u16 bit patterns.
 #[inline(always)]
 pub const fn pack_vertex(x: i16, y: i16) -> u32 {

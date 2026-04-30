@@ -26,7 +26,7 @@
 //! orphan its savestates.
 //!
 //! `ConfigPaths` is constructed once at startup and threaded
-//! through the app — no code outside this module should build
+//! through the app -- no code outside this module should build
 //! paths by hand. Tests construct an instance rooted at a
 //! tempdir instead of the OS config dir.
 
@@ -42,10 +42,10 @@ const APP_NAME: &str = "PSoXide";
 ///
 /// Construct with [`ConfigPaths::default`] in production (uses the
 /// platform config dir) or [`ConfigPaths::rooted`] in tests (uses a
-/// caller-supplied directory — typically a tempdir).
+/// caller-supplied directory -- typically a tempdir).
 #[derive(Debug, Clone)]
 pub struct ConfigPaths {
-    /// Root directory — everything else hangs off this.
+    /// Root directory -- everything else hangs off this.
     root: PathBuf,
 }
 
@@ -70,7 +70,7 @@ pub enum PathError {
 }
 
 impl ConfigPaths {
-    /// Resolve paths rooted at the platform config directory — the
+    /// Resolve paths rooted at the platform config directory -- the
     /// normal production path. Returns [`PathError::NoConfigDir`] if
     /// the OS won't hand us one (e.g. inside some restrictive
     /// container).
@@ -112,7 +112,7 @@ impl ConfigPaths {
         self.root.join("editor")
     }
 
-    /// Per-game directory under `games/<id>/`. Nothing is created —
+    /// Per-game directory under `games/<id>/`. Nothing is created --
     /// callers use `ensure_dir` when they actually need to write.
     pub fn game_dir(&self, game_id: &str) -> PathBuf {
         self.root.join("games").join(game_id)
@@ -137,7 +137,7 @@ impl ConfigPaths {
     }
 
     /// Memory-card file for the given port (1 or 2). Stored raw (128
-    /// KiB), same format every PS1 emulator reads — that's the one
+    /// KiB), same format every PS1 emulator reads -- that's the one
     /// bit of community-standard interop we inherit for free.
     pub fn memcard_file(&self, game_id: &str, port: u8) -> PathBuf {
         let clamped = port.clamp(1, 2);
@@ -161,7 +161,7 @@ impl ConfigPaths {
     }
 
     /// Convenience wrapper around [`ensure_dir`] for the per-game
-    /// tree — the usual thing the caller wants before writing a
+    /// tree -- the usual thing the caller wants before writing a
     /// save state or thumbnail.
     pub fn ensure_game_tree(&self, game_id: &str) -> Result<(), PathError> {
         self.ensure_dir(&self.game_dir(game_id))?;
@@ -219,7 +219,7 @@ mod tests {
     fn memcard_port_is_clamped() {
         let tmp = TempDir::new().unwrap();
         let p = ConfigPaths::rooted(tmp.path());
-        // Ports 0 and 3 both clamp to 1/2 — no surprising out-of-range files.
+        // Ports 0 and 3 both clamp to 1/2 -- no surprising out-of-range files.
         assert!(p
             .memcard_file("g", 0)
             .to_string_lossy()

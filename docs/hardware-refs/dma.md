@@ -45,7 +45,7 @@ Channels live at `0x1F80_1080 + 0x10 * ch` for `ch` in `0..=6`.
 
 ### Manual (`0`)
 
-Single-word transfer — software writes MADR, asserts bit 24, a single word moves, bit 24 clears. Rare on PS1.
+Single-word transfer -- software writes MADR, asserts bit 24, a single word moves, bit 24 clears. Rare on PS1.
 
 ### Block / request (`1`)
 
@@ -53,11 +53,11 @@ Transfers `BS` (block size, low 16 bits of `BCR`) words per request. Either a fi
 
 ### Linked list (`2`)
 
-Walks a linked list in RAM. Each node header: `0xSS_AAAAAA` — `SS` is the word count to ship (little-endian read, so the upper byte), `AAAAAA` is the physical address of the next node. Terminator `AAAAAA = 0xFFFFFF`. Used by the GPU channel to ship ordering tables.
+Walks a linked list in RAM. Each node header: `0xSS_AAAAAA` -- `SS` is the word count to ship (little-endian read, so the upper byte), `AAAAAA` is the physical address of the next node. Terminator `AAAAAA = 0xFFFFFF`. Used by the GPU channel to ship ordering tables.
 
 ## OTC channel (channel 6)
 
-OTC = "Ordering Table Clear". Unlike the other channels it doesn't interact with any external device — it just fills a RAM region with the linked-list terminator pattern that the GPU channel will then walk in reverse.
+OTC = "Ordering Table Clear". Unlike the other channels it doesn't interact with any external device -- it just fills a RAM region with the linked-list terminator pattern that the GPU channel will then walk in reverse.
 
 Layout produced by a count-`N` OTC at base `B` (all words 32-bit, addresses word-aligned):
 
@@ -77,7 +77,7 @@ OTC uses sync mode 0 (manual count) with step bit 1 (decrement).
 
 ```rust
 pub struct DmaChannel {
-    pub base: u32,           // MADR — 24-bit masked
+    pub base: u32,           // MADR -- 24-bit masked
     pub block_control: u32,  // BCR
     pub channel_control: u32, // CHCR
 }
@@ -99,9 +99,9 @@ impl Dma {
 }
 ```
 
-`Bus::write32` calls `Dma::run_otc` after every DMA-register write so an OTC kick is observable immediately without waiting for a scheduler tick. The other channels (GPU, SPU, CD-ROM, MDEC) have their CHCR start bits *recorded* but no transfer fires — each lands with its consumer subsystem.
+`Bus::write32` calls `Dma::run_otc` after every DMA-register write so an OTC kick is observable immediately without waiting for a scheduler tick. The other channels (GPU, SPU, CD-ROM, MDEC) have their CHCR start bits *recorded* but no transfer fires -- each lands with its consumer subsystem.
 
-## DICR — incomplete
+## DICR -- incomplete
 
 DICR carries per-channel IRQ enable bits + flag bits + a master-enable bit + a force-flag bit. Correct modelling needs to:
 
@@ -109,10 +109,10 @@ DICR carries per-channel IRQ enable bits + flag bits + a master-enable bit + a f
 2. Raise `IrqSource::Dma` when any enabled channel completes *and* the master enable is on.
 3. Handle write-acknowledge: writing 1 to a flag bit clears it (opposite polarity from `I_STAT`'s AND-acknowledge, yes, really).
 
-Currently `DICR` just stores what's written — sufficient until a DMA channel needs to signal completion. When OTC or the GPU channel needs to fire an IRQ, this gets a proper implementation.
+Currently `DICR` just stores what's written -- sufficient until a DMA channel needs to signal completion. When OTC or the GPU channel needs to fire an IRQ, this gets a proper implementation.
 
 ## References
 
-- Nocash PSX-SPX — "DMA Channels"
-- PCSX-Redux `src/core/psxdma.cc` — the dispatch that splits block / linked-list / OTC
-- `emulator_core::dma` — our impl + the OTC unit tests
+- Nocash PSX-SPX -- "DMA Channels"
+- PCSX-Redux `src/core/psxdma.cc` -- the dispatch that splits block / linked-list / OTC
+- `emulator_core::dma` -- our impl + the OTC unit tests

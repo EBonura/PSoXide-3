@@ -1,7 +1,7 @@
 //! Run to the step just before the first cycle-accounting divergence
 //! (step 19474544 per earlier probing) and trace every instruction
 //! we execute inside the IRQ handler. Compare the path to what the
-//! Redux trace says user code does after the RFE — that tells us
+//! Redux trace says user code does after the RFE -- that tells us
 //! whether our ISR body has a divergent branch (different registers,
 //! different condition), or whether we're simply executing fewer
 //! instructions than Redux per ISR pass.
@@ -34,7 +34,7 @@ fn main() {
     // with Redux's trace indices.
     // `target_step` is Redux's 0-based index of the diverging record.
     // We want to end up in the state that matches trace[target_step-1]
-    // — i.e., JUST about to execute the instruction Redux is ABOUT to
+    // -- i.e., JUST about to execute the instruction Redux is ABOUT to
     // retire as step `target_step`.
     for _i in 0..target_step {
         let was_in_isr = cpu.in_isr();
@@ -66,7 +66,7 @@ fn main() {
     let cycles_before = bus.cycles();
     eprintln!("Starting: pc=0x{pc_before:08x}  cycles={cycles_before}  in_isr={was_in_isr}",);
 
-    // Dump bus state before stepping — which IRQs are pending?
+    // Dump bus state before stepping -- which IRQs are pending?
     let istat = bus.irq().stat();
     let imask = bus.irq().mask();
     let sr = cpu.cop0()[12]; // Status register is COP0 reg 12
@@ -81,7 +81,7 @@ fn main() {
         (istat & imask) != 0 && sr & 1 != 0 && sr & (1 << 10) != 0,
     );
 
-    // Total IRQ raises per source up to this point — lets us verify
+    // Total IRQ raises per source up to this point -- lets us verify
     // whether our VBlank/CDROM/DMA counts match Redux's expected
     // rate.
     let raise_counts = bus.irq().raise_counts();
@@ -162,7 +162,7 @@ fn main() {
 
     // Probe forward: at what later step does our emulator finally
     // take the ISR that Redux folded into step `target_step`? If
-    // `never`, the divergence is permanent — our IRQ source is
+    // `never`, the divergence is permanent -- our IRQ source is
     // missing an event Redux raises.
     eprintln!();
     eprintln!("=== Scanning forward to find when our ISR finally fires ===");
