@@ -13,9 +13,9 @@
 //!    which streams 256 pixels (16×16) per macroblock into RAM --
 //!    typically destined for VRAM via a follow-up GPU draw.
 //!
-//! Reference implementations consulted:
-//! - PCSX-Redux `src/core/mdec.{h,cc}` (GPL-2+) for the AAN IDCT +
-//!   YUV→RGB pipeline + scaling constants.
+//! Reference implementations consulted as parity oracles:
+//! - PCSX-Redux `src/core/mdec.{h,cc}` (GPL-2.0-or-later) -- behavioural
+//!   reference for the AAN IDCT + YUV→RGB pipeline + scaling constants.
 //! - PSX-SPX "Macroblock Decoder (MDEC)" chapter for register semantics.
 //!
 //! MMIO map:

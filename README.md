@@ -254,8 +254,15 @@ Ignored tests and parity tools may require:
 
 ## License
 
-Cargo manifests currently declare `GPL-2.0-or-later` for project code.
-Before public release, resolve the blockers in
-[docs/license-audit.md](docs/license-audit.md), especially GPL-derived
-implementation comments, missing root license files, and incomplete
-asset provenance.
+PSoXide is licensed under the **GNU General Public License, version 2
+or (at your option) any later version**. The full license text is in
+[LICENSE](LICENSE); third-party references and provenance are in
+[NOTICE.md](NOTICE.md).
+
+The GPL choice is deliberate: the emulator core builds on PCSX-Redux
+as a parity oracle and reference, and PCSX-Redux is GPL-2.0-or-later.
+Releasing PSoXide under the same license keeps the lineage clean.
+
+Outstanding non-license release items (asset provenance, BIOS-output
+goldens, README media) are tracked in
+[docs/license-audit.md](docs/license-audit.md).

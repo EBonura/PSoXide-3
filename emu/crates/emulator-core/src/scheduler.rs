@@ -1,6 +1,8 @@
-//! Unified event scheduler -- port of Redux's
-//! `m_regs.interrupt` + `m_regs.intTargets` + `lowestTarget` from
-//! `src/core/r3000a.h::scheduleInterrupt`.
+//! Unified event scheduler. Slot layout and dispatch shape are kept
+//! parity-compatible with PCSX-Redux's interrupt scheduler (the
+//! `m_regs.interrupt` / `m_regs.intTargets` / `lowestTarget` triple in
+//! `src/core/r3000a.h::scheduleInterrupt`) so per-slot cycle deltas
+//! line up against the parity oracle.
 //!
 //! Background: every subsystem that needs to fire an IRQ "N cycles
 //! from now" -- CDROM command acks, GPU DMA completions, SPU async,

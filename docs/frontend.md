@@ -35,7 +35,7 @@ src/
     ├── profiler.rs   # rolling frame-time breakdown + stderr summaries
     ├── vram.rs       # 1024×512 VRAM as an egui::Image
     ├── hud.rs        # FPS / frame-time / tick overlay
-    └── menu.rs        # Menu menu, Painter-drawn on Middle layer
+    └── menu.rs        # launcher / pause menu overlay, Painter-drawn on Middle layer
 ```
 
 ## Layer order, outside-in
@@ -95,7 +95,7 @@ cadence.
 
 ## Menu mechanics
 
-Ported from `psoxide-1`'s `menu.rs`, trimmed to three categories (Game / Debug / System) plus infrastructure for expansion. Drawn entirely through `egui::Painter` on a middle layer -- no high-level widgets -- which keeps it snappy and position-locked.
+Three categories (Game / Debug / System) plus infrastructure for expansion. Drawn entirely through `egui::Painter` on a middle layer -- no high-level widgets -- which keeps it snappy and position-locked.
 
 - `anim_x` interpolates toward `target_x` at `10/dt`, yielding the signature horizontal slide.
 - Selection uses a 3-pixel accent-color bar on the left edge of the item rect.

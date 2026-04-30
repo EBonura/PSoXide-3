@@ -2,6 +2,7 @@
 name    = "hello-gte"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-2.0-or-later"
 
 # Examples live outside the sdk/ workspace so cargo doesn't try to
 # compile them for the host target when the user runs `cargo check`

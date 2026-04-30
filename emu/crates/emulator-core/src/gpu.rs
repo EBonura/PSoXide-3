@@ -2598,12 +2598,13 @@ impl Gpu {
 // Scanline-delta triangle rasterizer
 // ======================================================================
 //
-// Direct port of Redux's `drawPoly3Gi` / `drawPoly3TGEx8i` family from
-// `pcsx-redux/src/gpu/soft/soft.cc`. The scanline-delta approach is what
-// PSX hardware actually does: sort vertices by Y, walk each of the three
-// edges as scanline-advancing sections, and for each scanline plot pixels
-// from `leftX` to `rightX - 1` inclusive with attribute interpolation
-// driven by precomputed per-pixel (column) deltas.
+// Scanline-delta triangle rasterizer. Parity-matched against Redux's
+// `drawPoly3Gi` / `drawPoly3TGEx8i` family (`pcsx-redux/src/gpu/soft/soft.cc`).
+// The scanline-delta approach is what PSX hardware actually does: sort
+// vertices by Y, walk each of the three edges as scanline-advancing
+// sections, and for each scanline plot pixels from `leftX` to `rightX - 1`
+// inclusive with attribute interpolation driven by precomputed per-pixel
+// (column) deltas.
 //
 // Why this beats barycentric division-per-pixel: rounding. Two equivalent
 // formulas for interpolated colour or UV produce subtly different integer
@@ -2614,8 +2615,8 @@ impl Gpu {
 //
 // Naming convention: Redux's `m_deltaRightR` / `m_deltaRightU` etc are
 // actually **per-column** (per-X) deltas despite being named "right".
-// This port keeps the Redux names so a side-by-side diff with
-// `soft.cc` stays readable -- even where "right" looks wrong in isolation.
+// We keep the Redux names so a side-by-side diff with `soft.cc` stays
+// readable -- even where "right" looks wrong in isolation.
 //
 // Fixed-point layout: X / U / V are Q16.16. Colour channels are stored
 // in bits 16..23 of the state (Q16.8 relative to the 8-bit vertex

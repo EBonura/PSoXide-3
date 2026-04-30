@@ -39,9 +39,9 @@
 //!
 //! # Chord semantics
 //!
-//! `Select + Start` = open / close the Menu. Matches the
-//! PS1-era "player holds both shoulders" convention that shipped
-//! in everything from game input and launcher navigation.
+//! `Select + Start` = open / close the Menu. The chord avoids
+//! single-button collisions with in-game input, since any individual
+//! pad button might be a meaningful action while a game is running.
 //!
 //! The chord fires on the **rising edge**: both bits must go from
 //! "not-both-held last frame" to "both-held this frame". Subsequent

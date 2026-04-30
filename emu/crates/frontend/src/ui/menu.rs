@@ -1,4 +1,4 @@
-//! Menu overlay -- launcher menu ported from psoxide-1.
+//! Menu overlay -- the launcher / pause shell drawn over the framebuffer.
 //!
 //! Horizontal animated category icons with a vertical item list beneath
 //! the active category. Drawn via `egui::Painter` on a middle layer so
@@ -464,7 +464,6 @@ impl MenuState {
         // item visible with a lead-in margin: once you hit row
         // `edge_margin` from the top or bottom, further navigation
         // scrolls the whole list instead of just moving the cursor.
-        // Matches the console Menu behaviour.
         //
         // For very short lists (num_items ≤ visible_rows) the target
         // is 0 -- nothing to scroll.
@@ -636,9 +635,8 @@ fn build_games_category(games: &[LibraryItem]) -> Category {
                 },
             });
         }
-        // Always offer a rescan at the end of the Games list --
-        // matches menu UX where "Refresh" sits below the
-        // scrollable section.
+        // Always offer a rescan at the end of the Games list so the
+        // primary entries stay grouped together.
         items.push(MenuItem {
             label: "Refresh library".into(),
             action: MenuAction::RescanLibrary,
@@ -706,9 +704,8 @@ fn build_create_category(editor_open: bool) -> Category {
 }
 
 /// The System category holds emulator-wide actions: run/pause,
-/// step, reset. Renamed from "Game" -- on the PSX-style Menu, the
-/// Game column holds games, System holds controls. Matches
-/// menu convention.
+/// step, reset. The Games column stays focused on launchable entries,
+/// while System carries runtime controls.
 fn build_system_category(running: bool) -> Category {
     let run_label = if running { "Pause" } else { "Run" };
     Category {

@@ -1,0 +1,79 @@
+# cargo-deny configuration for PSoXide.
+#
+# PSoXide is licensed GPL-2.0-or-later. This file defines which transitive
+# dependency licenses are acceptable in that context.
+#
+# Run with:
+#   cargo deny check licenses
+#
+# Or to check everything:
+#   cargo deny check
+#
+# This config focuses on the licenses check (the relevant one for the
+# release audit). Advisories / bans / sources checks are left at defaults.
+
+[graph]
+all-features = true
+
+[licenses]
+# Allow-list of acceptable dependency licenses. Each must be a valid SPDX
+# identifier. A dep carrying any other license fails the check.
+allow = [
+    # Permissive — universally GPL-compatible.
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    # Weak copyleft — GPL-compatible.
+    "MPL-2.0",
+    # GPL family.
+    "GPL-2.0",
+    "GPL-2.0-only",
+    "GPL-2.0-or-later",
+    "GPL-3.0",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "LGPL-2.0-only",
+    "LGPL-2.0-or-later",
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+    # Unicode crates — Unicode license is GPL-compatible.
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    # Boost Software License — permissive, OSI-approved, FSF Free/Libre.
+    # Reaches us via clipboard-win / error-code through arboard → egui-winit.
+    "BSL-1.0",
+    # Font licenses — GPL-compatible when fonts are bundled as data
+    # ("mere aggregation"), which is what epaint_default_fonts and the
+    # frontend's own font assets do. Fonts are not linked into our code.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+# Don't warn when an allow-listed license isn't actually present in any
+# dependency. The list is intentionally broader than today's tree so
+# future deps don't trigger spurious failures.
+unused-allowed-license = "allow"
+
+# Crate-specific exceptions for unusual licensing arrangements. Add entries
+# here if a check fails for a justifiable reason (e.g. a vendored binary
+# with a license cargo-deny can't auto-detect).
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+
+[advisories]
+yanked = "warn"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"

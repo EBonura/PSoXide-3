@@ -38,7 +38,7 @@ pub const ACCENT_DIM: Color32 = Color32::from_rgb(0, 120, 120);
 pub const SEPARATOR: Color32 = Color32::from_rgb(45, 45, 52);
 pub const SECTION_BG: Color32 = Color32::from_rgb(30, 30, 35);
 
-// --- Menu-specific palette (from psoxide-1 menu.rs) ---
+// --- Menu-specific palette ---
 
 /// Menu backdrop overlay (dims the game below).
 pub const MENU_BACKDROP: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 128);

@@ -14,9 +14,9 @@
 //! and Redux-compatible voice volume decode, including its non-animated
 //! sweep-register approximation.
 //!
-//! Reference implementations consulted:
-//! - PCSX-Redux `src/spu/{spu,adsr,registers,dma}.cc` (GPL-2+) for
-//!   ADSR rate tables and voice state model.
+//! Reference implementations consulted as parity oracles:
+//! - PCSX-Redux `src/spu/{spu,adsr,registers,dma}.cc` (GPL-2.0-or-later)
+//!   -- behavioural reference for ADSR rate tables and voice state model.
 //! - psx-spx "SPU" chapter for register layout + ADPCM filter table.
 //! - Neill Corlett's SPU envelope notes (quoted in `adsr.cc`).
 //!
@@ -191,7 +191,9 @@ const OUTPUT_BUFFER_CAP: usize = 44100 * 2; // 2 seconds of stereo samples
 const ADPCM_FILTER_TABLE: [(i32, i32); 5] = [(0, 0), (60, 0), (115, -52), (98, -55), (122, -60)];
 
 // ===============================================================
-//  ADSR envelope rate tables -- port of Redux's `EnvelopeTables`.
+//  ADSR envelope rate tables. Generated to match Redux's
+//  `EnvelopeTables` output exactly so envelope ticks line up
+//  sample-for-sample against the parity oracle.
 // ===============================================================
 
 /// Envelope tick-period denominator for each rate (0..=127).

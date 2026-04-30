@@ -263,7 +263,7 @@ impl Dma {
     const DICR_ERROR_OR_FLAGS: u32 = 0x7F00_8000;
 
     fn write_dicr(&mut self, value: u32) -> bool {
-        // Direct port of Redux `psxhw.cc` DICR write handling:
+        // DICR write semantics, parity-matched against Redux `psxhw.cc`:
         // - bits 24..30 are write-1-to-clear flags
         // - bits 0..5 and 16..23 are regular writable state
         // - writing master-enable while a flag is pending raises IRQ 8

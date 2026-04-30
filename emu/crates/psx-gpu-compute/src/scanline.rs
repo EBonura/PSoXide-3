@@ -1,4 +1,4 @@
-//! Host-side port of the CPU rasterizer's `setup_sections` +
+//! Host-side mirror of the CPU rasterizer's `setup_sections` +
 //! `next_row` Q16.16 scanline-delta math (`emulator-core/src/gpu.rs`).
 //! Used by the compute-shader rasterizer to ship per-row state to the
 //! GPU so the shader can do **bit-exact** UV / colour interpolation

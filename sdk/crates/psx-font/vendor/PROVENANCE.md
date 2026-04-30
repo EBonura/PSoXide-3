@@ -64,6 +64,6 @@ sources to the same internal representation.
 Linux's kernel fbcon fonts are GPL-2.0 licensed even though the
 bitmap data itself is universally considered PD. Shipping under a
 plain PD grant via projects dedicated to PD redistribution is
-simpler to reason about for this GPL-licensed repo. The visual output
+simpler to reason about for bundled SDK font data. The visual output
 is the same IBM-VGA look — these are all derivatives of the same
 1981 IBM character-generator ROM.

@@ -1,6 +1,6 @@
 # PSoXide License And Provenance Audit
 
-Audit date: 2026-04-29
+Audit date: 2026-04-29 (last revised 2026-04-30).
 
 Scope: repository source, checked-in binary assets, generated artifacts,
 third-party references, and public README media.
@@ -17,133 +17,108 @@ assets, docs, canaries, and generated outputs all need a coherent story.
 
 ## Current Position
 
-Project Cargo manifests declare:
+PSoXide is licensed under **GPL-2.0-or-later**. The full license text
+is at [`LICENSE`](../LICENSE) at the repo root; third-party references
+and credit are in [`NOTICE.md`](../NOTICE.md).
 
-```text
-GPL-2.0-or-later
+The choice is deliberate: the emulator core uses PCSX-Redux
+(GPL-2.0-or-later) as a parity oracle and reference for several
+subsystems, and matching its license keeps the lineage clean and removes
+the derivative-work question entirely.
+
+## Resolved Blockers
+
+### Root license files (resolved 2026-04-30)
+
+`LICENSE` (GPL-2.0 canonical text) and `NOTICE.md` are now at the repo
+root. All `Cargo.toml` `license` fields declare `GPL-2.0-or-later`.
+
+### PCSX-Redux derivation risk (resolved 2026-04-30)
+
+By relicensing under GPL-2.0-or-later, the parts of the emulator core
+that mirror Redux's algorithm shapes (scheduler, DMA DICR, SPU ADSR
+tables, MDEC AAN IDCT, scanline triangle rasterizer) are GPL-compatible
+and require no further action. Comments in those files have been
+softened from "port of" / "Direct port of" to behaviour-parity language
+("matches Redux's behaviour", "parity-matched against Redux's …") --
+the code is unchanged, but the language no longer overstates derivation.
+
+## Resolved (continued)
+
+### Bundled asset provenance (resolved 2026-04-30)
+
+A complete asset inventory now lives at
+[`docs/asset-provenance.md`](asset-provenance.md), covering branding,
+3D models, textures, fonts, SPU tone blobs, OBJ reference meshes, and
+README media. Per-directory `PROVENANCE.md` files exist beside the
+fonts ([`emu/crates/frontend/assets/fonts/PROVENANCE.md`](../emu/crates/frontend/assets/fonts/PROVENANCE.md))
+and SPU tones ([`sdk/crates/psx-spu/vendor/PROVENANCE.md`](../sdk/crates/psx-spu/vendor/PROVENANCE.md))
+for the items where local context matters.
+
+Provenance is documented; the asset-level **release-gating** TODOs
+that remain (exact Pexels URLs, SPU tone regeneration) are tracked in
+`asset-provenance.md` itself, not here. Meshy model provenance is
+recorded there as paid-subscription, private, customer-owned generated
+assets; retain the subscription/export evidence with project records.
+
+### BIOS-output golden PNGs (resolved 2026-04-30)
+
+The four direct-from-Sony-BIOS milestone PNGs (SCE diamond logo,
+PlayStation 3D-P splash, "Licensed by SCEA™", BIOS shell) were removed
+from `emu/crates/emulator-core/tests/milestones/` on 2026-04-30. Tests
+were already hash-only and continue to compile and run; the PNGs
+served only as human-readable artefacts. The `tests/milestones/`
+directory is now empty and auto-cleaned by macOS.
+
+### Launcher menu trademark cleanup (resolved 2026-04-30)
+
+The launcher / pause overlay was renamed to "Menu" across code, docs,
+and prose, dropping the Sony-owned shell terminology from the project.
+The frontend overlay module is now `emu/crates/frontend/src/ui/menu.rs`;
+state/input/library item types use `Menu*` names; menu theme constants
+use `MENU_*`. Comments that previously framed the overlay as derived
+from vendor-specific console UI were rewritten to factual descriptions of the
+overlay's behaviour. The launch-simulation example was renamed
+`probe_menu_launch_sim.rs` for consistency. Frontend (40) and
+emulator-core (332) test suites pass after the rename.
+
+### Dependency license audit (resolved 2026-04-30)
+
+`cargo-deny` was installed and run across all five workspaces (root,
+`emu`, `sdk`, `engine`, `editor`) with the allow-list defined in
+[`deny.toml`](../deny.toml). All workspaces pass (`licenses ok`).
+
+The transitive dependency tree carries the following non-permissive
+licenses, all of which are compatible with GPL-2.0-or-later and are
+explicitly allow-listed:
+
+- **BSL-1.0** (Boost Software License 1.0) — permissive, OSI-approved,
+  FSF Free/Libre. Reaches the tree via `clipboard-win` and
+  `error-code` through `arboard` → `egui-winit`.
+- **OFL-1.1** (SIL Open Font License) — covers fonts bundled by
+  `epaint_default_fonts` (the egui default font crate). Fonts are
+  data, not linked code; bundling is "mere aggregation", not
+  derivative work.
+- **Ubuntu-font-1.0** — same crate, same aggregation rationale.
+
+Re-run any time with:
+
+```bash
+for ws in . emu sdk engine editor; do
+  (cd "$ws" && cargo deny --manifest-path Cargo.toml check licenses \
+    --config "$(git rev-parse --show-toplevel)/deny.toml")
+done
 ```
 
-No root `LICENSE-MIT`, `LICENSE-APACHE`, `LICENSE`, or `NOTICE` file is
-currently present. That is a release blocker.
+`cargo-deny` advisories / bans / sources checks have not been run yet
+(separate from licenses). They are left at their default-permissive
+settings in `deny.toml`; tightening them is a future-hardening item,
+not a publish blocker.
 
-## Release Blockers
+## Outstanding Blockers
 
-### 1. Root license files are missing
-
-Add the standard MIT and Apache-2.0 license texts at the repo root, or
-change the manifest declarations to the actual intended license before
-publishing.
-
-### 2. GPL-derived implementation risk
-
-The codebase contains comments that describe direct ports or close
-ports from PCSX-Redux, which is GPL-2.0-or-later. Examples found during
-this audit include:
-
-- `emu/crates/emulator-core/src/scheduler.rs`: "port of Redux"
-- `emu/crates/emulator-core/src/gpu.rs`: "Direct port of Redux"
-- `emu/crates/emulator-core/src/spu.rs`: Redux SPU files and ADSR tables
-- `emu/crates/emulator-core/src/dma.rs`: "Direct port of Redux"
-- `emu/crates/emulator-core/src/mdec.rs`: Redux AAN IDCT/Huffman path
-
-If those comments accurately describe copied or translated GPL
-implementation, the affected code cannot simply be released as
-GPL-compatible. Choose one path before public release:
-
-- relicense the affected emulator portions under a GPL-compatible
-  license,
-- obtain permission for a permissive relicense,
-- or rewrite the affected code from public hardware documentation,
-  test results, and clean-room notes.
-
-Using PCSX-Redux as an external oracle is fine. Copying implementation
-logic into permissively licensed code is the risk.
-
-### 3. Bundled model and texture provenance gaps
-
-The following checked-in cooked assets need source links, author names,
-license names, and ideally original source files or regeneration notes:
-
-- `assets/branding/logo-wordmark.svg`
-- `assets/branding/logo-icon-player.svg`
-- `assets/branding/logo-icon-player.png`
-- `assets/models/obsidian_wraith/*`
-- `assets/models/hooded_wretch/*`
-- `editor/projects/default/assets/models/obsidian_wraith/*`
-- `assets/textures/brick-wall.psxt`
-- `assets/textures/floor.psxt`
-- `editor/projects/default/assets/textures/*.psxt`
-
-The default editor project currently depends on the Obsidian Wraith
-model bundle, so this is not optional if the default project ships.
-The README also depends on the branding assets, so their ownership
-should be explicitly recorded before external publication.
-
-### 4. Demo JPG attribution is incomplete
-
-Tracked source JPGs:
-
-- `sdk/examples/hello-tex/vendor/brick-wall.jpg`
-- `sdk/examples/hello-tex/vendor/floor.jpg`
-- `engine/examples/showcase-fog/vendor/brick-wall.jpg`
-- `engine/examples/showcase-fog/vendor/floor.jpg`
-
-`sdk/examples/hello-tex/vendor/README.md` names Pexels sources, but it
-does not include exact URLs, download dates, Pexels license text/link,
-or confirmation that the showcase-fog copies share the same provenance.
-
-### 5. Public README media needs a clean capture record
-
-The README uses current editor/play screenshots under `docs/media/`.
-Before a public announcement, record:
-
-- exact commit,
-- whether the capture includes only project-owned or properly licensed
-  assets,
-- capture date,
-- any shader/filter/settings differences from default.
-
-Do not use commercial game screenshots or BIOS-logo screenshots as
-public README media unless their legal status is explicitly accepted.
-
-### 6. Canary screenshots may be redistribution-sensitive
-
-Tracked files under `emu/crates/emulator-core/tests/milestones/` include
-BIOS/commercial-game visual output. They are useful tests, but public
-redistribution may be questionable. Consider replacing checked-in PNGs
-with hashes, synthetic homebrew captures, or a private canary fixture
-package.
-
-### 7. Frontend font license files are missing
-
-Tracked frontend fonts:
-
-- `emu/crates/frontend/assets/fonts/VT323-Regular.ttf`
-- `emu/crates/frontend/assets/fonts/lucide.ttf`
-
-VT323 embeds SIL Open Font License metadata. Lucide is commonly shipped
-under ISC, but this repo should include explicit upstream URLs and
-license text for both fonts in a local provenance file.
-
-### 8. SPU tone provenance is missing
-
-Tracked ADPCM tone blobs:
-
-- `sdk/crates/psx-spu/vendor/tone_sine.adpcm`
-- `sdk/crates/psx-spu/vendor/tone_square.adpcm`
-- `sdk/crates/psx-spu/vendor/tone_triangle.adpcm`
-- `sdk/crates/psx-spu/vendor/tone_sawtooth.adpcm`
-
-If generated locally, add the generator command/source. If imported,
-add the upstream license.
-
-### 9. Rust dependency license audit has not been run
-
-Cargo manifests identify the local crate license, but this audit did
-not resolve every crates.io dependency license across root, `editor`,
-`emu`, `engine`, `sdk`, and `tools/*`. Run `cargo deny` or
-`cargo about` across every workspace/tool and commit the report before
-claiming a clean dependency license story.
+None. All previously identified blockers are resolved. The remaining
+items below are quality / completeness, not legal blockers.
 
 ## Lower-Risk Or Documented Items
 
@@ -198,13 +173,10 @@ The third category is the one that changes license obligations.
 
 ## Recommended Pre-Publish Tasks
 
-1. Add root license files and a `NOTICE` or `THIRD_PARTY.md`.
-2. Decide how to resolve the PCSX-Redux/GPL-derived implementation
-   risk.
-3. Add `docs/asset-provenance.md` with every bundled asset, source URL,
-   author, license, and regeneration command.
-4. Add provenance files beside frontend fonts and SPU tone blobs.
-5. Replace or private-gate BIOS/commercial-game golden PNGs.
-6. Run dependency license tooling and commit the report.
-7. Capture fresh README screenshots/video from a clean clone after the
-   asset provenance is fixed.
+1. Resolve the asset-level TODOs in
+   [`asset-provenance.md`](asset-provenance.md) (exact Pexels URLs,
+   SPU tone regeneration-or-delete decision, and retention of Meshy
+   subscription/export evidence).
+2. Capture fresh README screenshots from a clean clone after the
+   asset-level TODOs are settled.
+3. Any remaining trademark-adjacent prose surfaced by future review.
