@@ -182,8 +182,11 @@ impl HwRenderer {
         if frame.total() > 0 {
             let vertices = frame.vertices.to_vec();
             let runs = frame.runs.to_vec();
-            self.pipeline
-                .upload_vertices(&self.queue, bytemuck::cast_slice(&vertices));
+            self.pipeline.upload_vertices(
+                &self.device,
+                &self.queue,
+                bytemuck::cast_slice(&vertices),
+            );
             self.draw_runs(&runs);
         }
     }

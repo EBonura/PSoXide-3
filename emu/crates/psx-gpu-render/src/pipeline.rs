@@ -362,22 +362,30 @@ impl HwPipeline {
         &self.vertex_buffer
     }
 
-    /// Upload the frame's vertex data. If the payload exceeds the
-    /// current buffer capacity we silently truncate -- the
-    /// `Translator` itself caps emission so this shouldn't trigger
-    /// in Phase 1 with PSX-typical primitive counts. Phase 7 will
-    /// plumb a proper buffer-grow path through `&Device` if real
-    /// frames get noisier.
-    pub fn upload_vertices(&mut self, queue: &wgpu::Queue, bytes: &[u8]) {
-        let cap = self.vertex_capacity_bytes as usize;
-        let payload = if bytes.len() > cap {
-            &bytes[..cap]
-        } else {
-            bytes
-        };
-        if !payload.is_empty() {
-            queue.write_buffer(&self.vertex_buffer, 0, payload);
+    /// Upload the frame's vertex data, growing the GPU-side vertex
+    /// buffer when debug modes or primitive-heavy games exceed the
+    /// previous high-water mark. Wireframe can multiply polygon
+    /// output by 6x, so truncating here would leave later draw ranges
+    /// pointing past the bound buffer and trip wgpu validation.
+    pub fn upload_vertices(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8]) {
+        self.ensure_vertex_capacity(device, bytes.len() as u64);
+        if !bytes.is_empty() {
+            queue.write_buffer(&self.vertex_buffer, 0, bytes);
         }
+    }
+
+    fn ensure_vertex_capacity(&mut self, device: &wgpu::Device, required_bytes: u64) {
+        if required_bytes <= self.vertex_capacity_bytes {
+            return;
+        }
+        self.vertex_capacity_bytes =
+            grown_vertex_capacity_bytes(self.vertex_capacity_bytes, required_bytes);
+        self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("psx-hw-vertices"),
+            size: self.vertex_capacity_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
     }
 
     /// Vertex-buffer capacity in bytes (sticky high-water mark).
@@ -395,6 +403,11 @@ impl HwPipeline {
 #[allow(dead_code)]
 fn _bgl_used(p: &HwPipeline) -> &wgpu::BindGroupLayout {
     &p.bind_group_layout
+}
+
+fn grown_vertex_capacity_bytes(current: u64, required: u64) -> u64 {
+    let doubled = current.saturating_mul(2);
+    doubled.max(required).next_power_of_two()
 }
 
 // ---- PSX semi-trans blend states ----
@@ -446,4 +459,25 @@ fn blend_state_add_quarter() -> wgpu::BlendState {
         operation: wgpu::BlendOperation::Add,
     };
     wgpu::BlendState { color: c, alpha: c }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertex_capacity_growth_covers_wireframe_spikes() {
+        let initial = INITIAL_VERTEX_CAPACITY * std::mem::size_of::<HwVertex>() as u64;
+        let required = 22_758 * std::mem::size_of::<HwVertex>() as u64;
+        let grown = grown_vertex_capacity_bytes(initial, required);
+
+        assert!(grown >= required);
+        assert_eq!(grown, initial * 2);
+    }
+
+    #[test]
+    fn vertex_capacity_growth_keeps_power_of_two_high_water_mark() {
+        assert_eq!(grown_vertex_capacity_bytes(256, 257), 512);
+        assert_eq!(grown_vertex_capacity_bytes(256, 900), 1024);
+    }
 }
