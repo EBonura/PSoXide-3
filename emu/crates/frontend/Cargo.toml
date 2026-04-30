@@ -29,3 +29,4 @@ egui-winit = { workspace = true }
 pollster   = { workspace = true }
 cpal       = { workspace = true }
 gilrs      = { workspace = true }
+rfd        = { workspace = true }

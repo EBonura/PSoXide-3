@@ -55,8 +55,10 @@ pub enum MenuAction {
     RescanLibrary,
     /// Enter or leave the host-side editor workspace.
     ToggleEditorWorkspace,
-    /// Open the emulator settings page.
-    OpenSettings,
+    /// Pick and persist the BIOS image path.
+    ChooseBiosPath,
+    /// Pick and persist the games library root.
+    ChooseGamesPath,
     /// Toggle visibility of the register side panel.
     ToggleRegisters,
     /// Toggle visibility of the memory viewer panel.
@@ -261,6 +263,21 @@ impl MenuState {
                     "Open editor workspace".into()
                 };
                 item.value = Some(if editor_open { "Active" } else { "Studio" }.into());
+            }
+        }
+    }
+
+    /// Update the Settings category path summaries.
+    pub fn sync_settings_paths(&mut self, bios: impl Into<String>, games: impl Into<String>) {
+        let bios = bios.into();
+        let games = games.into();
+        if let Some(settings) = self.categories.iter_mut().find(|c| c.name == "Settings") {
+            for item in &mut settings.items {
+                match item.action {
+                    MenuAction::ChooseBiosPath => item.value = Some(bios.clone()),
+                    MenuAction::ChooseGamesPath => item.value = Some(games.clone()),
+                    _ => {}
+                }
             }
         }
     }
@@ -575,11 +592,18 @@ fn build_settings_category() -> Category {
     Category {
         name: "Settings",
         icon: icons::HARD_DRIVE,
-        items: vec![MenuItem {
-            label: "Open settings".into(),
-            action: MenuAction::OpenSettings,
-            value: Some("Paths".into()),
-        }],
+        items: vec![
+            MenuItem {
+                label: "Choose BIOS path".into(),
+                action: MenuAction::ChooseBiosPath,
+                value: Some("Missing".into()),
+            },
+            MenuItem {
+                label: "Choose games path".into(),
+                action: MenuAction::ChooseGamesPath,
+                value: Some("Missing".into()),
+            },
+        ],
     }
 }
 
@@ -881,6 +905,17 @@ mod tests {
         let mut s = MenuState::new();
         s.select_category("Settings");
         assert_eq!(s.current_category(), Some("Settings"));
-        assert_eq!(s.selected_action(), Some(&MenuAction::OpenSettings));
+        assert_eq!(s.selected_action(), Some(&MenuAction::ChooseBiosPath));
+    }
+
+    #[test]
+    fn sync_settings_paths_updates_menu_values() {
+        let mut s = MenuState::new();
+        s.sync_settings_paths("SCPH1001.BIN", "ps1 games");
+        assert_eq!(
+            s.categories[2].items[0].value.as_deref(),
+            Some("SCPH1001.BIN")
+        );
+        assert_eq!(s.categories[2].items[1].value.as_deref(), Some("ps1 games"));
     }
 }

@@ -10,7 +10,6 @@ pub mod hud;
 pub mod memory;
 pub mod profiler;
 pub mod registers;
-pub mod settings;
 pub mod toolbar;
 pub mod vram;
 pub mod menu;
@@ -83,7 +82,6 @@ pub fn draw_layout(
 
     let menu_warning = state.menu_setup_warning();
     state.menu.draw(ctx, dt, menu_warning);
-    settings::draw(ctx, state);
     draw_status_toast(ctx, state);
 }
 
@@ -139,7 +137,7 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
                 Err(e) => {
                     eprintln!("[frontend] launch failed: {e}");
                     if e.contains("BIOS path is not configured") {
-                        state.open_settings_page();
+                        state.select_settings_category();
                     }
                     state.status_message_set(format!("Launch failed: {e}"));
                 }
@@ -166,8 +164,12 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
             state.menu.open = false;
             MenuOutcome::None
         }
-        OpenSettings => {
-            state.open_settings_page();
+        ChooseBiosPath => {
+            state.choose_bios_path();
+            MenuOutcome::None
+        }
+        ChooseGamesPath => {
+            state.choose_games_path();
             MenuOutcome::None
         }
         ToggleRegisters => {

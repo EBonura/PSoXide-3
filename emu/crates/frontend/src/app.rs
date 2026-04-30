@@ -4,7 +4,7 @@
 //! join once the GPU subsystem lands) and drives the per-frame UI build.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use emulator_core::{
@@ -20,7 +20,6 @@ use crate::embedded_playtest::EmbeddedPlaytestState;
 use crate::ui;
 use crate::ui::hud::HudState;
 use crate::ui::memory::MemoryView;
-use crate::ui::settings::SettingsPanelState;
 use crate::ui::menu::{LibraryItem as MenuLibraryItem, MenuState};
 
 /// Ring-buffer capacity for the execution-history panel. 16 rows is
@@ -123,13 +122,11 @@ pub struct AppState {
     /// this along with the rest of the emulator state.
     pub gpr_snapshot: Option<[u32; 32]>,
     /// Persisted user preferences (BIOS path, library root, input
-    /// mappings, video tweaks). Read at startup, re-saved when the
-    /// settings panel commits changes. The frontend mutates this
+    /// mappings, video tweaks). Read at startup, re-saved when Menu
+    /// settings actions commit changes. The frontend mutates this
     /// directly; the filesystem is written via
     /// [`AppState::save_settings`].
     pub settings: Settings,
-    /// Draft state for the in-app settings page.
-    pub settings_panel: SettingsPanelState,
     /// Cached library scan results. Populated from
     /// `<config>/library.ron` at startup, refreshed by
     /// [`AppState::rescan_library`] (triggered from the Menu's
@@ -215,10 +212,8 @@ impl AppState {
             })
             .unwrap_or_else(|err| {
                 panic!("open default editor project: {err}");
-            });
+        });
         let library = Library::load_or_empty(&paths.library_file());
-        let settings_panel_open = settings_setup_incomplete(&settings);
-        let settings_panel = SettingsPanelState::from_settings(&settings, settings_panel_open);
 
         // Legacy env-var side-load path: if PSOXIDE_EXE or
         // PSOXIDE_DISC is set, honour it so existing developer
@@ -260,7 +255,6 @@ impl AppState {
             breakpoints: BTreeSet::new(),
             gpr_snapshot: None,
             settings,
-            settings_panel,
             library,
             paths,
             current_game: None,
@@ -293,8 +287,9 @@ impl AppState {
         out.menu
             .sync_fast_boot_label(out.settings.emulator.fast_boot_disc);
         out.menu.sync_editor_label(out.workspace.is_editor());
-        if out.settings_panel.open {
-            out.menu.select_category("Settings");
+        out.sync_menu_settings_paths();
+        if settings_setup_incomplete(&out.settings) {
+            out.select_settings_category();
         }
         out
     }
@@ -638,38 +633,87 @@ impl AppState {
         }
     }
 
-    /// Open the settings page and move Menu selection to Settings.
-    pub fn open_settings_page(&mut self) {
-        self.settings_panel.sync_from_settings(&self.settings);
-        self.settings_panel.open = true;
+    /// Move Menu selection to Settings and ensure the overlay is open.
+    pub fn select_settings_category(&mut self) {
         self.menu.open = true;
         self.menu.select_category("Settings");
     }
 
-    /// Persist path edits from the settings page.
-    pub fn commit_settings_panel(&mut self, force_rescan: bool) {
-        let next_bios = self.settings_panel.bios_path.trim().to_string();
-        let next_game_library = self.settings_panel.game_library_path.trim().to_string();
-        let game_library_changed = self.settings.paths.game_library != next_game_library;
-
-        self.settings.paths.bios = next_bios;
-        self.settings.paths.game_library = next_game_library;
-
+    /// Choose and persist a BIOS image from the Menu Settings column.
+    pub fn choose_bios_path(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Choose PlayStation BIOS")
+            .add_filter("PlayStation BIOS", &["bin", "rom"]);
+        if let Some(dir) = path_parent_or_self(self.settings.paths.bios.trim()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        self.settings.paths.bios = path.to_string_lossy().into_owned();
         match self.save_settings() {
-            Ok(()) => self.status_message_set("Settings saved"),
+            Ok(()) => {
+                self.sync_menu_settings_paths();
+                self.status_message_set(format!("BIOS path saved: {}", path_label(&path)));
+            }
             Err(e) => {
                 eprintln!("[frontend] {e}");
                 self.status_message_set(e);
-                return;
             }
         }
+    }
 
-        self.settings_panel.sync_from_settings(&self.settings);
-        if force_rescan || game_library_changed {
-            if let Err(e) = self.rescan_library() {
-                eprintln!("[frontend] rescan after settings save failed: {e}");
-                self.status_message_set(format!("Settings saved; rescan failed: {e}"));
+    /// Choose and persist the games folder from the Menu Settings column.
+    pub fn choose_games_path(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("Choose games folder");
+        if let Some(dir) = path_parent_or_self(self.settings.paths.game_library.trim()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_folder() else {
+            return;
+        };
+        self.settings.paths.game_library = path.to_string_lossy().into_owned();
+        match self.save_settings() {
+            Ok(()) => {
+                self.sync_menu_settings_paths();
+                match self.rescan_library() {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("[frontend] rescan after games path change failed: {e}");
+                        self.status_message_set(format!("Games path saved; rescan failed: {e}"));
+                    }
+                }
             }
+            Err(e) => {
+                eprintln!("[frontend] {e}");
+                self.status_message_set(e);
+            }
+        }
+    }
+
+    /// Refresh the Settings Menu row values from persisted path state.
+    pub fn sync_menu_settings_paths(&mut self) {
+        self.menu
+            .sync_settings_paths(self.bios_path_label(), self.games_path_label());
+    }
+
+    fn bios_path_label(&self) -> String {
+        let configured = self.settings.paths.bios.trim();
+        if !configured.is_empty() {
+            return path_label(PathBuf::from(configured));
+        }
+        if let Some(env) = std::env::var_os("PSOXIDE_BIOS") {
+            return format!("env: {}", path_label(PathBuf::from(env)));
+        }
+        "Missing".into()
+    }
+
+    fn games_path_label(&self) -> String {
+        let configured = self.settings.paths.game_library.trim();
+        if configured.is_empty() {
+            "Missing".into()
+        } else {
+            path_label(PathBuf::from(configured))
         }
     }
 
@@ -1036,6 +1080,27 @@ fn effective_bios_configured(settings: &Settings) -> bool {
 
 fn settings_setup_incomplete(settings: &Settings) -> bool {
     !effective_bios_configured(settings) || settings.paths.game_library.trim().is_empty()
+}
+
+fn path_parent_or_self(value: &str) -> Option<PathBuf> {
+    if value.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent().map(Path::to_path_buf)
+    }
+}
+
+fn path_label(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Record a retired instruction into the ring buffer, evicting the
