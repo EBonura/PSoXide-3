@@ -4,6 +4,12 @@
   <img src="assets/branding/logo-wordmark.svg" alt="PSoXide" width="420">
 </p>
 
+<p align="center">
+  <a href="LICENSE"><img alt="License: GPL-2.0-or-later" src="https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg"></a>
+  <img alt="Rust: nightly" src="https://img.shields.io/badge/rust-nightly-orange.svg">
+  <img alt="Platforms: macOS · Linux" src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux-lightgrey.svg">
+</p>
+
 PSoXide is a Rust-native PlayStation 1 platform. It is deliberately
 all three pieces in one repository:
 
