@@ -20,6 +20,7 @@ use crate::embedded_playtest::EmbeddedPlaytestState;
 use crate::ui;
 use crate::ui::hud::HudState;
 use crate::ui::memory::MemoryView;
+use crate::ui::settings::SettingsPanelState;
 use crate::ui::menu::{LibraryItem as MenuLibraryItem, MenuState};
 
 /// Ring-buffer capacity for the execution-history panel. 16 rows is
@@ -127,6 +128,8 @@ pub struct AppState {
     /// directly; the filesystem is written via
     /// [`AppState::save_settings`].
     pub settings: Settings,
+    /// Draft state for the in-app settings page.
+    pub settings_panel: SettingsPanelState,
     /// Cached library scan results. Populated from
     /// `<config>/library.ron` at startup, refreshed by
     /// [`AppState::rescan_library`] (triggered from the Menu's
@@ -214,6 +217,8 @@ impl AppState {
                 panic!("open default editor project: {err}");
             });
         let library = Library::load_or_empty(&paths.library_file());
+        let settings_panel_open = settings_setup_incomplete(&settings);
+        let settings_panel = SettingsPanelState::from_settings(&settings, settings_panel_open);
 
         // Legacy env-var side-load path: if PSOXIDE_EXE or
         // PSOXIDE_DISC is set, honour it so existing developer
@@ -255,6 +260,7 @@ impl AppState {
             breakpoints: BTreeSet::new(),
             gpr_snapshot: None,
             settings,
+            settings_panel,
             library,
             paths,
             current_game: None,
@@ -287,6 +293,9 @@ impl AppState {
         out.menu
             .sync_fast_boot_label(out.settings.emulator.fast_boot_disc);
         out.menu.sync_editor_label(out.workspace.is_editor());
+        if out.settings_panel.open {
+            out.menu.select_category("Settings");
+        }
         out
     }
 }
@@ -436,10 +445,11 @@ impl AppState {
     /// Also refreshes the Menu's Games + Examples columns so the
     /// newly-scanned entries appear immediately.
     pub fn rescan_library(&mut self) -> Result<usize, String> {
-        let game_root = if self.settings.paths.game_library.is_empty() {
+        let game_library = self.settings.paths.game_library.trim();
+        let game_root = if game_library.is_empty() {
             None
         } else {
-            Some(PathBuf::from(&self.settings.paths.game_library))
+            Some(PathBuf::from(game_library))
         };
         let sdk_root = self.resolve_sdk_examples_dir();
 
@@ -605,6 +615,62 @@ impl AppState {
         self.settings
             .save(&self.paths.settings_file())
             .map_err(|e| format!("save settings.ron: {e}"))
+    }
+
+    /// True when no BIOS can be resolved from settings or env.
+    pub fn bios_path_missing(&self) -> bool {
+        !effective_bios_configured(&self.settings)
+    }
+
+    /// True when the user game-library path is blank.
+    pub fn games_path_missing(&self) -> bool {
+        self.settings.paths.game_library.trim().is_empty()
+    }
+
+    /// Warning banner to show at the top of the Menu, if any.
+    pub fn menu_setup_warning(&self) -> Option<&'static str> {
+        if self.bios_path_missing() {
+            Some("please chose a bios path")
+        } else if self.games_path_missing() {
+            Some("please chose a games path")
+        } else {
+            None
+        }
+    }
+
+    /// Open the settings page and move Menu selection to Settings.
+    pub fn open_settings_page(&mut self) {
+        self.settings_panel.sync_from_settings(&self.settings);
+        self.settings_panel.open = true;
+        self.menu.open = true;
+        self.menu.select_category("Settings");
+    }
+
+    /// Persist path edits from the settings page.
+    pub fn commit_settings_panel(&mut self, force_rescan: bool) {
+        let next_bios = self.settings_panel.bios_path.trim().to_string();
+        let next_game_library = self.settings_panel.game_library_path.trim().to_string();
+        let game_library_changed = self.settings.paths.game_library != next_game_library;
+
+        self.settings.paths.bios = next_bios;
+        self.settings.paths.game_library = next_game_library;
+
+        match self.save_settings() {
+            Ok(()) => self.status_message_set("Settings saved"),
+            Err(e) => {
+                eprintln!("[frontend] {e}");
+                self.status_message_set(e);
+                return;
+            }
+        }
+
+        self.settings_panel.sync_from_settings(&self.settings);
+        if force_rescan || game_library_changed {
+            if let Err(e) = self.rescan_library() {
+                eprintln!("[frontend] rescan after settings save failed: {e}");
+                self.status_message_set(format!("Settings saved; rescan failed: {e}"));
+            }
+        }
     }
 
     /// Persist the embedded editor project if it has unsaved edits,
@@ -954,16 +1020,22 @@ fn format_subtitle(e: &LibraryEntry) -> String {
 /// every normal frontend caller agrees and no local path leaks into
 /// app defaults.
 pub(crate) fn resolve_bios_path(settings: &Settings) -> Result<PathBuf, String> {
-    if !settings.paths.bios.is_empty() {
-        Ok(PathBuf::from(&settings.paths.bios))
+    let configured = settings.paths.bios.trim();
+    if !configured.is_empty() {
+        Ok(PathBuf::from(configured))
     } else if let Ok(p) = std::env::var("PSOXIDE_BIOS") {
         Ok(PathBuf::from(p))
     } else {
-        Err(
-            "BIOS path is not configured. Set it in settings.ron or export PSOXIDE_BIOS."
-                .to_string(),
-        )
+        Err("BIOS path is not configured. Open Settings and choose a BIOS image, or export PSOXIDE_BIOS.".to_string())
     }
+}
+
+fn effective_bios_configured(settings: &Settings) -> bool {
+    !settings.paths.bios.trim().is_empty() || std::env::var_os("PSOXIDE_BIOS").is_some()
+}
+
+fn settings_setup_incomplete(settings: &Settings) -> bool {
+    !effective_bios_configured(settings) || settings.paths.game_library.trim().is_empty()
 }
 
 /// Record a retired instruction into the ring buffer, evicting the

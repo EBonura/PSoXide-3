@@ -55,6 +55,8 @@ pub enum MenuAction {
     RescanLibrary,
     /// Enter or leave the host-side editor workspace.
     ToggleEditorWorkspace,
+    /// Open the emulator settings page.
+    OpenSettings,
     /// Toggle visibility of the register side panel.
     ToggleRegisters,
     /// Toggle visibility of the memory viewer panel.
@@ -154,6 +156,7 @@ impl MenuState {
         let categories = vec![
             build_games_category(&[]),
             build_examples_category(&[]),
+            build_settings_category(),
             build_create_category(false),
             build_system_category(running),
             build_debug_category(),
@@ -262,6 +265,15 @@ impl MenuState {
         }
     }
 
+    /// Move selection to the category named `name`, if it exists.
+    pub fn select_category(&mut self, name: &str) {
+        if let Some(idx) = self.categories.iter().position(|c| c.name == name) {
+            self.category_index = idx;
+            self.item_index = 0;
+            self.scroll_y = 0.0;
+        }
+    }
+
     /// Feed one frame of input. Returns `Some(action)` when a confirm
     /// selects an item.
     pub fn update(&mut self, input: &MenuInput) -> Option<MenuAction> {
@@ -331,7 +343,7 @@ impl MenuState {
 
     /// Draw the Menu overlay on a middle-layer painter. `dt` drives the
     /// slide animation.
-    pub fn draw(&mut self, ctx: &egui::Context, dt: f32) {
+    pub fn draw(&mut self, ctx: &egui::Context, dt: f32, warning: Option<&str>) {
         if !self.open {
             return;
         }
@@ -346,6 +358,18 @@ impl MenuState {
         ));
 
         painter.rect_filled(screen, 0.0, theme::MENU_BACKDROP);
+        if let Some(warning) = warning {
+            let banner_h = 34.0;
+            let rect = Rect::from_min_size(screen.min, Vec2::new(sw, banner_h));
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(126, 24, 34));
+            painter.text(
+                Pos2::new(sw / 2.0, banner_h / 2.0),
+                Align2::CENTER_CENTER,
+                warning,
+                FontId::proportional(15.0),
+                egui::Color32::WHITE,
+            );
+        }
 
         // Animate horizontal slide.
         let target_x = self.category_index as f32;
@@ -546,6 +570,19 @@ impl MenuState {
     }
 }
 
+/// Emulator settings entry point.
+fn build_settings_category() -> Category {
+    Category {
+        name: "Settings",
+        icon: icons::HARD_DRIVE,
+        items: vec![MenuItem {
+            label: "Open settings".into(),
+            action: MenuAction::OpenSettings,
+            value: Some("Paths".into()),
+        }],
+    }
+}
+
 /// Construct the Games category from a library snapshot. Empty
 /// libraries get a helpful placeholder item so the user
 /// understands the category isn't broken, just unpopulated.
@@ -720,15 +757,16 @@ mod tests {
     }
 
     #[test]
-    fn fresh_state_has_six_categories() {
+    fn fresh_state_has_expected_categories() {
         let s = MenuState::new();
-        assert_eq!(s.categories.len(), 6);
+        assert_eq!(s.categories.len(), 7);
         assert_eq!(s.categories[0].name, "Games");
         assert_eq!(s.categories[1].name, "Examples");
-        assert_eq!(s.categories[2].name, "Create");
-        assert_eq!(s.categories[3].name, "System");
-        assert_eq!(s.categories[4].name, "Debug");
-        assert_eq!(s.categories[5].name, "Quit");
+        assert_eq!(s.categories[2].name, "Settings");
+        assert_eq!(s.categories[3].name, "Create");
+        assert_eq!(s.categories[4].name, "System");
+        assert_eq!(s.categories[5].name, "Debug");
+        assert_eq!(s.categories[6].name, "Quit");
     }
 
     #[test]
@@ -762,7 +800,7 @@ mod tests {
     fn set_library_preserves_category_across_rebuild() {
         let mut s = MenuState::new();
         // Move to "System" category before rebuilding.
-        s.category_index = 3;
+        s.category_index = 4;
         s.set_library(&[], &[]);
         assert_eq!(s.current_category(), Some("System"));
     }
@@ -770,17 +808,17 @@ mod tests {
     #[test]
     fn sync_run_label_flips_system_run_item() {
         let mut s = MenuState::new();
-        assert_eq!(s.categories[3].items[0].label, "Run");
+        assert_eq!(s.categories[4].items[0].label, "Run");
         s.sync_run_label(true);
-        assert_eq!(s.categories[3].items[0].label, "Pause");
+        assert_eq!(s.categories[4].items[0].label, "Pause");
         s.sync_run_label(false);
-        assert_eq!(s.categories[3].items[0].label, "Run");
+        assert_eq!(s.categories[4].items[0].label, "Run");
     }
 
     #[test]
     fn sync_fast_boot_label_flips_system_value() {
         let mut s = MenuState::new();
-        let fast_boot = s.categories[3]
+        let fast_boot = s.categories[4]
             .items
             .iter()
             .find(|item| item.action == MenuAction::ToggleFastBoot)
@@ -788,7 +826,7 @@ mod tests {
         assert_eq!(fast_boot.value.as_deref(), Some("On"));
 
         s.sync_fast_boot_label(false);
-        let fast_boot = s.categories[3]
+        let fast_boot = s.categories[4]
             .items
             .iter()
             .find(|item| item.action == MenuAction::ToggleFastBoot)
@@ -796,7 +834,7 @@ mod tests {
         assert_eq!(fast_boot.value.as_deref(), Some("Off"));
 
         s.sync_fast_boot_label(true);
-        let fast_boot = s.categories[3]
+        let fast_boot = s.categories[4]
             .items
             .iter()
             .find(|item| item.action == MenuAction::ToggleFastBoot)
@@ -821,6 +859,7 @@ mod tests {
             ..Default::default()
         };
         s.update(&right); // Examples
+        s.update(&right); // Settings
         s.update(&right); // Create
         s.update(&right); // System
         s.update(&right); // Debug
@@ -835,5 +874,13 @@ mod tests {
             s.update(&left);
         }
         assert_eq!(s.current_category(), Some("Games"));
+    }
+
+    #[test]
+    fn select_category_moves_to_settings() {
+        let mut s = MenuState::new();
+        s.select_category("Settings");
+        assert_eq!(s.current_category(), Some("Settings"));
+        assert_eq!(s.selected_action(), Some(&MenuAction::OpenSettings));
     }
 }

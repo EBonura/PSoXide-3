@@ -10,6 +10,7 @@ pub mod hud;
 pub mod memory;
 pub mod profiler;
 pub mod registers;
+pub mod settings;
 pub mod toolbar;
 pub mod vram;
 pub mod menu;
@@ -35,7 +36,8 @@ pub fn draw_layout(
         if state.panels.profiler {
             profiler::draw(ctx, &mut state.profiler);
         }
-        state.menu.draw(ctx, dt);
+        let menu_warning = state.menu_setup_warning();
+        state.menu.draw(ctx, dt, menu_warning);
         draw_status_toast(ctx, state);
         return;
     }
@@ -79,7 +81,9 @@ pub fn draw_layout(
         );
     });
 
-    state.menu.draw(ctx, dt);
+    let menu_warning = state.menu_setup_warning();
+    state.menu.draw(ctx, dt, menu_warning);
+    settings::draw(ctx, state);
     draw_status_toast(ctx, state);
 }
 
@@ -134,6 +138,9 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
                 }
                 Err(e) => {
                     eprintln!("[frontend] launch failed: {e}");
+                    if e.contains("BIOS path is not configured") {
+                        state.open_settings_page();
+                    }
                     state.status_message_set(format!("Launch failed: {e}"));
                 }
             }
@@ -157,6 +164,10 @@ pub fn apply_menu_action(state: &mut AppState, action: menu::MenuAction) -> Menu
         ToggleEditorWorkspace => {
             state.toggle_editor_workspace();
             state.menu.open = false;
+            MenuOutcome::None
+        }
+        OpenSettings => {
+            state.open_settings_page();
             MenuOutcome::None
         }
         ToggleRegisters => {
