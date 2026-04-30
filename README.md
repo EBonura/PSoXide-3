@@ -22,15 +22,14 @@ SDK, and not a finished game editor yet.
 
 ## Media
 
-Current editor build:
+Current editor build, captured from the bundled default project:
 
 | Editor 3D View | Embedded Play Mode |
 | --- | --- |
 | ![Editor 3D view](docs/media/editor-3d-view.png) | ![Embedded play mode](docs/media/embedded-play-mode.png) |
 
-Demo video: capture pending from a clean clone. The repo intentionally
-does not use commercial game or BIOS-logo screenshots as public README
-media.
+A short editor/play-mode walkthrough video is still on the release
+checklist.
 
 ## Current Status
 
