@@ -124,16 +124,16 @@ fn main() {
             println!("  pc=0x{pc:08x} instr=0x{instr:08x} count={count}");
         }
     }
-    dump_sio_mmio(&bus);
+    dump_relevant_mmio(&bus);
 }
 
 #[cfg(feature = "trace-mmio")]
-fn dump_sio_mmio(bus: &Bus) {
+fn dump_relevant_mmio(bus: &Bus) {
     let entries = bus
         .mmio_trace
         .iter_chronological()
         .filter(|e| {
-            Sio0::contains(e.addr)
+            let is_sio = Sio0::contains(e.addr)
                 && matches!(
                     (e.addr - Sio0::BASE, e.kind),
                     (0x0, MmioKind::R8 | MmioKind::R16 | MmioKind::R32)
@@ -142,18 +142,22 @@ fn dump_sio_mmio(bus: &Bus) {
                         | (0x8, MmioKind::W16 | MmioKind::W32)
                         | (0xA, MmioKind::W16 | MmioKind::W32)
                         | (0xE, MmioKind::W16 | MmioKind::W32)
-                )
+                );
+            let is_cdrom = (0x1f80_1800..=0x1f80_1803).contains(&e.addr);
+            let is_irq = matches!(e.addr, 0x1f80_1070 | 0x1f80_1074);
+            let is_dma_irq = e.addr == 0x1f80_10f4;
+            is_sio || is_cdrom || is_irq || is_dma_irq
         })
         .collect::<Vec<_>>();
     let skip = entries.len().saturating_sub(160);
     println!(
-        "sio_mmio_tail count={} showing={}",
+        "mmio_tail count={} showing={}",
         entries.len(),
         entries.len() - skip
     );
     for e in &entries[skip..] {
         println!(
-            "  sio cyc={:>12} {} addr=0x{:08x} value=0x{:08x}",
+            "  mmio cyc={:>12} {} addr=0x{:08x} value=0x{:08x}",
             e.cycle,
             e.kind.tag(),
             e.addr,
@@ -163,7 +167,7 @@ fn dump_sio_mmio(bus: &Bus) {
 }
 
 #[cfg(not(feature = "trace-mmio"))]
-fn dump_sio_mmio(_bus: &Bus) {}
+fn dump_relevant_mmio(_bus: &Bus) {}
 
 fn parse_range(text: &str) -> Option<(u32, u32)> {
     let (lo, hi) = text.split_once('-')?;
