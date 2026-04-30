@@ -54,6 +54,7 @@ wgpu        = "24"
 egui        = "0.31"
 egui-wgpu   = "0.31"
 egui-winit  = "0.31"
+image       = { version = "0.25", default-features = false, features = ["png"] }
 pollster    = "0.3"
 cpal        = "0.15"
 gilrs       = "0.11"

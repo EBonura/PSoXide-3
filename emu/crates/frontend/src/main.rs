@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 mod app;
+mod app_icon;
 mod audio;
 mod cli;
 mod disasm;
@@ -282,6 +283,8 @@ impl ApplicationHandler for Shell {
             return;
         }
 
+        app_icon::set_application_icon();
+
         // Borderless-fullscreen on the primary monitor by default.
         // `--windowed` switches to a 1600×1000 floating window so
         // dev work next to a terminal / docs stays bearable.
@@ -289,6 +292,9 @@ impl ApplicationHandler for Shell {
             .with_title("PSoXide")
             .with_inner_size(winit::dpi::PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
             .with_min_inner_size(winit::dpi::PhysicalSize::new(MIN_WIDTH, MIN_HEIGHT));
+        if let Some(icon) = app_icon::load_window_icon() {
+            attrs = attrs.with_window_icon(Some(icon));
+        }
         if self.fullscreen {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
