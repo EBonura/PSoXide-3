@@ -319,11 +319,17 @@ impl MenuState {
         }
 
         let num_items = self.categories[self.category_index].items.len();
-        if input.up && self.item_index > 0 {
-            self.item_index -= 1;
-        }
-        if input.down && self.item_index + 1 < num_items {
-            self.item_index += 1;
+        if num_items > 0 {
+            if input.up {
+                self.item_index = if self.item_index == 0 {
+                    num_items - 1
+                } else {
+                    self.item_index - 1
+                };
+            }
+            if input.down {
+                self.item_index = (self.item_index + 1) % num_items;
+            }
         }
 
         if input.confirm && num_items > 0 {
@@ -898,6 +904,36 @@ mod tests {
             s.update(&left);
         }
         assert_eq!(s.current_category(), Some("Games"));
+    }
+
+    #[test]
+    fn vertical_navigation_wraps_within_category() {
+        let mut s = MenuState::new();
+        s.set_library(
+            &[
+                dummy_item("a", "A", ""),
+                dummy_item("b", "B", ""),
+                dummy_item("c", "C", ""),
+            ],
+            &[],
+        );
+
+        let up = MenuInput {
+            up: true,
+            ..Default::default()
+        };
+        s.update(&up);
+        assert_eq!(s.selected_action(), Some(&MenuAction::RescanLibrary));
+
+        let down = MenuInput {
+            down: true,
+            ..Default::default()
+        };
+        s.update(&down);
+        assert_eq!(
+            s.selected_action(),
+            Some(&MenuAction::LaunchGame("a".to_string()))
+        );
     }
 
     #[test]
