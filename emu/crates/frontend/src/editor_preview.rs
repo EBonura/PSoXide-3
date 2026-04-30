@@ -1425,21 +1425,11 @@ fn draw_preview_model_instance(
         }
     }
 
-    // Per-part projection + face emit.
-    //
-    // Editor-preview limitation: skin-blend vertices (those
-    // with `vertex.is_blend() == true`, i.e. carrying a
-    // secondary joint + blend weight) project from the primary
-    // joint only here. The runtime's `submit_textured_model`
-    // implements the secondary-joint LERP path; the editor
-    // preview takes the cheaper single-joint shortcut. For
-    // models that use only rigid skinning (one joint per
-    // vertex -- current Wraith / Hooded Wretch rigs) the editor
-    // preview matches the runtime exactly. For models with
-    // secondary joint weights the preview will diverge at
-    // those vertices; placement / clip / atlas validation
-    // remain correct.
-    let mut projected: Vec<psx_gte::scene::Projected> = Vec::with_capacity(64);
+    // Per-part projection + face emit. This mirrors the runtime
+    // compact-model path: project each skinned point once, then draw
+    // face-corner UVs against those projected positions.
+    let mut projected =
+        vec![psx_gte::scene::Projected::default(); instance.model.vertex_count() as usize];
     for part_index in 0..instance.model.part_count() {
         let Some(part) = instance.model.part(part_index) else {
             break;
@@ -1453,53 +1443,115 @@ fn draw_preview_model_instance(
         gte_scene::load_rotation(&primary.rotation);
         gte_scene::load_translation(primary.translation);
 
-        let part_vertex_count = part.vertex_count() as usize;
-        projected.clear();
         let first_vertex = part.first_vertex();
-        for local in 0..part_vertex_count {
+        for local in 0..part.vertex_count() as usize {
             let global = first_vertex.saturating_add(local as u16);
             let Some(v) = instance.model.vertex(global) else {
                 break;
             };
-            projected.push(gte_scene::project_vertex(v.position));
+            if let Some(slot) = projected.get_mut(global as usize) {
+                *slot =
+                    project_preview_model_vertex(v, primary, &joint_view_transforms, joint_count);
+            }
         }
+    }
 
-        // Per-face triangle emit. UV pairs come straight from
-        // the model vertex table; tint stays neutral.
+    for part_index in 0..instance.model.part_count() {
+        let Some(part) = instance.model.part(part_index) else {
+            break;
+        };
+        // Per-face triangle emit. UV pairs live on face corners so
+        // compacted skinned vertices can be shared across UV seams.
         let first_face = part.first_face();
         let face_count = part.face_count();
         for face in 0..face_count {
-            let Some((ia, ib, ic)) = instance.model.face(first_face + face) else {
+            let Some(face) = instance.model.face(first_face + face) else {
                 break;
             };
-            let local_indices = [
-                (ia as i32 - first_vertex as i32) as usize,
-                (ib as i32 - first_vertex as i32) as usize,
-                (ic as i32 - first_vertex as i32) as usize,
+            let indices = [
+                face.corners[0].vertex_index as usize,
+                face.corners[1].vertex_index as usize,
+                face.corners[2].vertex_index as usize,
             ];
-            if local_indices.iter().any(|&i| i >= projected.len()) {
+            if indices.iter().any(|&i| i >= projected.len()) {
                 continue;
             }
             let p = [
-                projected[local_indices[0]],
-                projected[local_indices[1]],
-                projected[local_indices[2]],
+                projected[indices[0]],
+                projected[indices[1]],
+                projected[indices[2]],
             ];
             // Skip near-plane / behind-camera triangles.
             if p[0].sz == 0 || p[1].sz == 0 || p[2].sz == 0 {
                 continue;
             }
-            // UV lookup straight off the model's vertex table.
-            let uv = |idx: u16| -> (u8, u8) {
-                instance
-                    .model
-                    .vertex(idx)
-                    .map(|v| (v.uv.0, v.uv.1))
-                    .unwrap_or((0, 0))
-            };
-            let uvs = [uv(ia), uv(ib), uv(ic)];
+            let uvs = [face.corners[0].uv, face.corners[1].uv, face.corners[2].uv];
             push_tex_tri(scratch, p, uvs, instance.atlas, (0x80, 0x80, 0x80));
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreviewViewVertex {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+fn project_preview_model_vertex(
+    vertex: psx_asset::ModelVertex,
+    primary: psx_engine::JointViewTransform,
+    joint_view_transforms: &[psx_engine::JointViewTransform],
+    joint_count: usize,
+) -> psx_gte::scene::Projected {
+    if vertex.is_blend() && (vertex.joint1 as usize) < joint_count {
+        let secondary = joint_view_transforms[vertex.joint1 as usize];
+        let a = preview_view_transform(primary, vertex.position);
+        let b = preview_view_transform(secondary, vertex.position);
+        return project_preview_gte_view(preview_lerp_view(a, b, vertex.blend));
+    }
+
+    gte_scene::project_vertex(vertex.position)
+}
+
+fn preview_view_transform(
+    transform: psx_engine::JointViewTransform,
+    position: Vec3I16,
+) -> PreviewViewVertex {
+    let vx = position.x as i32;
+    let vy = position.y as i32;
+    let vz = position.z as i32;
+    let m = &transform.rotation.m;
+    PreviewViewVertex {
+        x: (((m[0][0] as i32) * vx + (m[0][1] as i32) * vy + (m[0][2] as i32) * vz) >> 12)
+            .saturating_add(transform.translation.x),
+        y: (((m[1][0] as i32) * vx + (m[1][1] as i32) * vy + (m[1][2] as i32) * vz) >> 12)
+            .saturating_add(transform.translation.y),
+        z: (((m[2][0] as i32) * vx + (m[2][1] as i32) * vy + (m[2][2] as i32) * vz) >> 12)
+            .saturating_add(transform.translation.z),
+    }
+}
+
+fn preview_lerp_view(a: PreviewViewVertex, b: PreviewViewVertex, t: u8) -> PreviewViewVertex {
+    let t = t as i32;
+    let inv = 256 - t;
+    PreviewViewVertex {
+        x: ((a.x.saturating_mul(inv)).saturating_add(b.x.saturating_mul(t))) >> 8,
+        y: ((a.y.saturating_mul(inv)).saturating_add(b.y.saturating_mul(t))) >> 8,
+        z: ((a.z.saturating_mul(inv)).saturating_add(b.z.saturating_mul(t))) >> 8,
+    }
+}
+
+fn project_preview_gte_view(view: PreviewViewVertex) -> psx_gte::scene::Projected {
+    if view.z <= 0 {
+        return psx_gte::scene::Projected::default();
+    }
+    let sx = SCREEN_CX + (view.x * PROJ_H) / view.z;
+    let sy = SCREEN_CY + (view.y * PROJ_H) / view.z;
+    psx_gte::scene::Projected {
+        sx: clamp_i16(sx),
+        sy: clamp_i16(sy),
+        sz: view.z.clamp(0, u16::MAX as i32) as u16,
     }
 }
 

@@ -8,11 +8,11 @@
 pub mod framebuffer;
 pub mod hud;
 pub mod memory;
+pub mod menu;
 pub mod profiler;
 pub mod registers;
 pub mod toolbar;
 pub mod vram;
-pub mod menu;
 
 use crate::app::AppState;
 

@@ -10,6 +10,7 @@
 use emulator_core::{gpu::GpuCmdLogEntry, Bus, ButtonState, Cpu};
 use psx_iso::Exe;
 use std::io::Write;
+use std::path::Path;
 use std::time::Instant;
 
 fn main() {
@@ -35,9 +36,14 @@ fn main() {
         .ok()
         .and_then(|text| parse_sticks(&text));
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("bios");
-    let exe_path = format!(
-        "/Users/ebonura/Desktop/repos/psoxide/build/examples/mipsel-sony-psx/release/{name}.exe"
-    );
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("repo root");
+    let exe_path = repo_root
+        .join("build/examples/mipsel-sony-psx/release")
+        .join(format!("{name}.exe"));
     let exe_bytes = std::fs::read(&exe_path).expect("exe");
     let exe = Exe::parse(&exe_bytes).expect("parse");
 

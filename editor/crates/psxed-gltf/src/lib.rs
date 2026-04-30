@@ -15,7 +15,7 @@
 //! current PSXM runtime format has no UV/material table. That is the
 //! next format bump once we are ready for textured imported models.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use gltf::animation::{Interpolation, Property};
@@ -681,6 +681,18 @@ struct SkinnedSourceMesh {
 }
 
 #[derive(Clone, Copy)]
+struct CookedModelVertex {
+    primary_joint: u16,
+    record: [u8; psxed_format::model::VERTEX_RECORD_SIZE],
+}
+
+#[derive(Clone, Copy)]
+struct CookedFaceCorner {
+    vertex_index: u16,
+    uv: (u8, u8),
+}
+
+#[derive(Clone, Copy)]
 struct ModelBounds {
     center: [f32; 3],
     extent: f32,
@@ -1182,14 +1194,6 @@ fn cook_model_blob(
         node_to_joint[node_index] = Some(joint_index as u16);
     }
 
-    let mut grouped_faces: BTreeMap<u16, Vec<[usize; 3]>> = BTreeMap::new();
-    for face in &source.faces {
-        grouped_faces
-            .entry(face.joint)
-            .or_default()
-            .push(face.indices);
-    }
-
     let mut joint_records = Vec::new();
     for node_index in joints.iter().copied() {
         let parent = parents[node_index]
@@ -1198,50 +1202,103 @@ fn cook_model_blob(
         joint_records.push(parent);
     }
 
-    let mut part_records = Vec::new();
+    let mut canonical_by_position: BTreeMap<[i16; 3], u16> = BTreeMap::new();
+    let mut canonical_vertices: Vec<CookedModelVertex> = Vec::new();
+    let mut grouped_faces: BTreeMap<u16, Vec<[CookedFaceCorner; 3]>> = BTreeMap::new();
+
+    for face in &source.faces {
+        let mut out_face = [CookedFaceCorner {
+            vertex_index: 0,
+            uv: (0, 0),
+        }; 3];
+        for (corner, out_corner) in out_face.iter_mut().enumerate() {
+            let vertex = source.vertices[face.indices[corner]];
+            let primary_joint = vertex.dominant_joint;
+            let record = encode_model_vertex(vertex, primary_joint, bounds);
+            let key = model_vertex_position_key(&record);
+            let temp_index = if let Some(index) = canonical_by_position.get(&key) {
+                *index
+            } else {
+                let index = ensure_u16("vertices", canonical_vertices.len())?;
+                canonical_by_position.insert(key, index);
+                canonical_vertices.push(CookedModelVertex {
+                    primary_joint,
+                    record,
+                });
+                index
+            };
+            *out_corner = CookedFaceCorner {
+                vertex_index: temp_index,
+                uv: (
+                    uv_to_u8(vertex.uv[0], texture_width),
+                    uv_to_u8(vertex.uv[1], texture_height),
+                ),
+            };
+        }
+        grouped_faces.entry(face.joint).or_default().push(out_face);
+    }
+
+    let mut vertices_by_joint: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
+    for (index, vertex) in canonical_vertices.iter().enumerate() {
+        vertices_by_joint
+            .entry(vertex.primary_joint)
+            .or_default()
+            .push(ensure_u16("vertices", index)?);
+    }
+
+    let mut part_joints = BTreeSet::new();
+    for joint in vertices_by_joint.keys().copied() {
+        part_joints.insert(joint);
+    }
+    for joint in grouped_faces.keys().copied() {
+        part_joints.insert(joint);
+    }
+
+    let mut temp_to_final = vec![0u16; canonical_vertices.len()];
+    let mut vertex_ranges: BTreeMap<u16, (u16, u16)> = BTreeMap::new();
     let mut cooked_vertices: Vec<[u8; psxed_format::model::VERTEX_RECORD_SIZE]> = Vec::new();
-    let mut cooked_faces: Vec<[u16; 3]> = Vec::new();
     let mut blend_skin = false;
 
-    for (joint_index, faces) in grouped_faces {
-        let first_vertex = cooked_vertices.len();
-        let first_face = cooked_faces.len();
-        let mut local_map = BTreeMap::new();
-
-        for face in faces {
-            let mut out_face = [0u16; 3];
-            for corner in 0..3 {
-                let source_index = face[corner];
-                let cooked_index = if let Some(index) = local_map.get(&source_index) {
-                    *index
-                } else {
-                    let vertex = source.vertices[source_index];
-                    let index = ensure_u16("vertices", cooked_vertices.len())?;
-                    let record = encode_model_vertex(
-                        vertex,
-                        joint_index,
-                        bounds,
-                        texture_width,
-                        texture_height,
-                    );
-                    if record[15] != 0 {
-                        blend_skin = true;
-                    }
-                    cooked_vertices.push(record);
-                    local_map.insert(source_index, index);
-                    index
-                };
-                out_face[corner] = cooked_index;
+    for joint in &part_joints {
+        let first_vertex = ensure_u16("part first vertex", cooked_vertices.len())?;
+        if let Some(indices) = vertices_by_joint.get(joint) {
+            for temp_index in indices {
+                let final_index = ensure_u16("vertices", cooked_vertices.len())?;
+                temp_to_final[*temp_index as usize] = final_index;
+                let record = canonical_vertices[*temp_index as usize].record;
+                if record[7] != 0 {
+                    blend_skin = true;
+                }
+                cooked_vertices.push(record);
             }
-            cooked_faces.push(out_face);
         }
+        let vertex_count = ensure_u16(
+            "part vertices",
+            cooked_vertices.len() - first_vertex as usize,
+        )?;
+        vertex_ranges.insert(*joint, (first_vertex, vertex_count));
+    }
 
-        let vertex_count = cooked_vertices.len() - first_vertex;
+    let mut part_records = Vec::new();
+    let mut cooked_faces: Vec<[CookedFaceCorner; 3]> = Vec::new();
+
+    for joint in part_joints {
+        let (first_vertex, vertex_count) = vertex_ranges.get(&joint).copied().unwrap_or((0, 0));
+        let first_face = cooked_faces.len();
+        if let Some(faces) = grouped_faces.get(&joint) {
+            for face in faces {
+                let mut out_face = *face;
+                for corner in &mut out_face {
+                    corner.vertex_index = temp_to_final[corner.vertex_index as usize];
+                }
+                cooked_faces.push(out_face);
+            }
+        }
         let face_count = cooked_faces.len() - first_face;
         part_records.push((
-            joint_index,
-            ensure_u16("part first vertex", first_vertex)?,
-            ensure_u16("part vertices", vertex_count)?,
+            joint,
+            first_vertex,
+            vertex_count,
             ensure_u16("part first face", first_face)?,
             ensure_u16("part faces", face_count)?,
             0u16,
@@ -1259,9 +1316,8 @@ fn cook_model_blob(
         + cooked_vertices.len() * psxed_format::model::VERTEX_RECORD_SIZE
         + cooked_faces.len() * psxed_format::model::FACE_RECORD_SIZE;
     let mut out = Vec::with_capacity(psxed_format::AssetHeader::SIZE + payload_len);
-    let mut model_flags = psxed_format::model::flags::HAS_NORMALS
-        | psxed_format::model::flags::HAS_UVS
-        | psxed_format::model::flags::RIGID_SKINNED;
+    let mut model_flags =
+        psxed_format::model::flags::HAS_UVS | psxed_format::model::flags::RIGID_SKINNED;
     if blend_skin {
         model_flags |= psxed_format::model::flags::BLEND_SKIN;
     }
@@ -1303,37 +1359,37 @@ fn cook_model_blob(
         out.extend_from_slice(vertex);
     }
     for face in &cooked_faces {
-        append_u16(&mut out, face[0]);
-        append_u16(&mut out, face[1]);
-        append_u16(&mut out, face[2]);
+        for corner in face {
+            append_u16(&mut out, corner.vertex_index);
+            out.push(corner.uv.0);
+            out.push(corner.uv.1);
+        }
     }
 
     Ok((out, cooked_vertices.len(), part_records.len()))
+}
+
+fn model_vertex_position_key(record: &[u8; psxed_format::model::VERTEX_RECORD_SIZE]) -> [i16; 3] {
+    [
+        i16::from_le_bytes([record[0], record[1]]),
+        i16::from_le_bytes([record[2], record[3]]),
+        i16::from_le_bytes([record[4], record[5]]),
+    ]
 }
 
 fn encode_model_vertex(
     vertex: SourceVertex,
     primary_joint: u16,
     bounds: &ModelBounds,
-    texture_width: u16,
-    texture_height: u16,
 ) -> [u8; psxed_format::model::VERTEX_RECORD_SIZE] {
     let position = bounds.normalize_point(vertex.position);
-    let normal = normalize3(vertex.normal);
-    let u = uv_to_u8(vertex.uv[0], texture_width);
-    let v = uv_to_u8(vertex.uv[1], texture_height);
     let (joint1_byte, blend_byte) = blend_slot_for_vertex(vertex, primary_joint);
     let mut out = [0u8; psxed_format::model::VERTEX_RECORD_SIZE];
     write_i16(&mut out, 0, q12_i16(position[0]));
     write_i16(&mut out, 2, q12_i16(position[1]));
     write_i16(&mut out, 4, q12_i16(position[2]));
-    write_i16(&mut out, 6, q12_i16(normal[0]));
-    write_i16(&mut out, 8, q12_i16(normal[1]));
-    write_i16(&mut out, 10, q12_i16(normal[2]));
-    out[12] = u;
-    out[13] = v;
-    out[14] = joint1_byte;
-    out[15] = blend_byte;
+    out[6] = joint1_byte;
+    out[7] = blend_byte;
     out
 }
 
@@ -1348,13 +1404,10 @@ const BLEND_DROP_THRESHOLD: f32 = 0.04;
 /// it ended up in.
 ///
 /// `joint0` is implicit at runtime (it is the part's bone), so we only
-/// store `joint1` and a relative weight in 0..=255. The secondary bone
-/// is the strongest of:
-///
-/// * the vertex's own dominant bone, when the part's bone differs (a
-///   "pulled" vertex on the wrong side of a seam -- pulling it back
-///   toward its natural bone removes the gap);
-/// * otherwise the next-highest-weight bone after `primary_joint`.
+/// store `joint1` and a relative weight in 0..=255. VERSION 4 stores
+/// each skinned point once under its dominant bone, so the secondary
+/// bone is simply the highest remaining influence after
+/// `primary_joint`.
 fn blend_slot_for_vertex(vertex: SourceVertex, primary_joint: u16) -> (u8, u8) {
     let mut weight0 = 0.0f32;
     let mut weight1 = 0.0f32;
@@ -1378,13 +1431,8 @@ fn blend_slot_for_vertex(vertex: SourceVertex, primary_joint: u16) -> (u8, u8) {
             joint1 = Some(j);
             weight1 = w;
         } else if w > weight1 && Some(j) != joint1 {
-            // Replace joint1 only if we have not committed it to the
-            // pulled-vertex case above. The first branch already set
-            // `joint1` to the natural bone in that case.
-            if vertex.dominant_joint == primary_joint {
-                joint1 = Some(j);
-                weight1 = w;
-            }
+            joint1 = Some(j);
+            weight1 = w;
         }
     }
 
@@ -1940,6 +1988,50 @@ mod tests {
             assert!((vertex.normal[1] - 0.0).abs() < 0.0001);
             assert!((vertex.normal[2] - 1.0).abs() < 0.0001);
         }
+    }
+
+    #[test]
+    fn native_model_compacts_duplicate_part_vertices() {
+        let source = SkinnedSourceMesh {
+            vertices: vec![
+                test_source_vertex([0.0, 0.0, 0.0]),
+                test_source_vertex([1.0, 0.0, 0.0]),
+                test_source_vertex([0.0, 1.0, 0.0]),
+            ],
+            faces: vec![
+                SourceFace {
+                    indices: [0, 1, 2],
+                    joint: 0,
+                },
+                SourceFace {
+                    indices: [0, 2, 1],
+                    joint: 1,
+                },
+            ],
+        };
+        let bounds = ModelBounds::from_min_max([0.0, 0.0, 0.0], [1.0, 1.0, 0.0], 30_000.0).unwrap();
+
+        let (bytes, vertices, parts) = cook_model_blob(
+            &source,
+            &bounds,
+            &[None, None],
+            &[0, 1],
+            [255, 255, 255, 255],
+            128,
+            128,
+            psxed_format::model::DEFAULT_LOCAL_TO_WORLD_Q12,
+        )
+        .unwrap();
+
+        let model = psx_asset::Model::from_bytes(&bytes).unwrap();
+        assert_eq!(vertices, 3);
+        assert_eq!(parts, 2);
+        assert_eq!(model.part(0).unwrap().vertex_count(), 3);
+        assert_eq!(model.part(1).unwrap().vertex_count(), 0);
+        assert_eq!(model.face(0).unwrap().corners[0].vertex_index, 0);
+        assert_eq!(model.face(1).unwrap().corners[0].vertex_index, 0);
+        assert_eq!(model.face(1).unwrap().corners[1].vertex_index, 2);
+        assert_eq!(model.face(1).unwrap().corners[2].vertex_index, 1);
     }
 
     fn minimal_triangle_glb() -> Vec<u8> {

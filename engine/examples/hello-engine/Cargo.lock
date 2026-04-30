@@ -35,6 +35,7 @@ dependencies = [
  "psx-gte",
  "psx-math",
  "psx-pad",
+ "psx-rt",
  "psx-spu",
  "psx-vram",
 ]
@@ -49,6 +50,13 @@ dependencies = [
 
 [[package]]
 name = "psx-gte"
+version = "0.1.0"
+dependencies = [
+ "psx-gte-core",
+]
+
+[[package]]
+name = "psx-gte-core"
 version = "0.1.0"
 
 [[package]]

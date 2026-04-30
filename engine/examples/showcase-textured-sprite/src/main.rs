@@ -14,8 +14,8 @@ extern crate psx_rt;
 
 use psx_asset::Texture;
 use psx_engine::{
-    button, App, Config, Ctx, CullMode, DepthBand, DepthRange, OtFrame, PrimitiveArena,
-    Scene, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
+    button, App, Config, Ctx, CullMode, DepthBand, DepthRange, OtFrame, PrimitiveArena, Scene,
+    WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
     WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
@@ -316,17 +316,17 @@ fn draw_floor(
                         z: ROOM_EDGES[zi],
                     },
                     WorldVertex {
-                        x: ROOM_EDGES[xi],
-                        y: 0,
-                        z: ROOM_EDGES[zi + 1],
-                    },
-                    WorldVertex {
                         x: ROOM_EDGES[xi + 1],
                         y: 0,
                         z: ROOM_EDGES[zi + 1],
                     },
+                    WorldVertex {
+                        x: ROOM_EDGES[xi],
+                        y: 0,
+                        z: ROOM_EDGES[zi + 1],
+                    },
                 ],
-                FLOOR_U,
+                floor_uvs(FLOOR_U),
                 material,
                 options,
                 world,
@@ -378,20 +378,28 @@ fn draw_z_wall(
             let y1 = WALL_Y_EDGES[yi + 1];
             let verts = if reverse_x {
                 [
-                    WorldVertex { x: x1, y: y1, z },
-                    WorldVertex { x: x0, y: y1, z },
                     WorldVertex { x: x1, y: y0, z },
                     WorldVertex { x: x0, y: y0, z },
+                    WorldVertex { x: x0, y: y1, z },
+                    WorldVertex { x: x1, y: y1, z },
                 ]
             } else {
                 [
-                    WorldVertex { x: x0, y: y1, z },
-                    WorldVertex { x: x1, y: y1, z },
                     WorldVertex { x: x0, y: y0, z },
                     WorldVertex { x: x1, y: y0, z },
+                    WorldVertex { x: x1, y: y1, z },
+                    WorldVertex { x: x0, y: y1, z },
                 ]
             };
-            draw_wall_textured(camera, verts, BRICK_U, material, options, world, triangles);
+            draw_wall_textured(
+                camera,
+                verts,
+                wall_uvs(BRICK_U),
+                material,
+                options,
+                world,
+                triangles,
+            );
             xi += 1;
         }
         yi += 1;
@@ -417,20 +425,28 @@ fn draw_x_wall(
             let y1 = WALL_Y_EDGES[yi + 1];
             let verts = if reverse_z {
                 [
-                    WorldVertex { x, y: y1, z: z1 },
-                    WorldVertex { x, y: y1, z: z0 },
                     WorldVertex { x, y: y0, z: z1 },
                     WorldVertex { x, y: y0, z: z0 },
+                    WorldVertex { x, y: y1, z: z0 },
+                    WorldVertex { x, y: y1, z: z1 },
                 ]
             } else {
                 [
-                    WorldVertex { x, y: y1, z: z0 },
-                    WorldVertex { x, y: y1, z: z1 },
                     WorldVertex { x, y: y0, z: z0 },
                     WorldVertex { x, y: y0, z: z1 },
+                    WorldVertex { x, y: y1, z: z1 },
+                    WorldVertex { x, y: y1, z: z0 },
                 ]
             };
-            draw_wall_textured(camera, verts, BRICK_U, material, options, world, triangles);
+            draw_wall_textured(
+                camera,
+                verts,
+                wall_uvs(BRICK_U),
+                material,
+                options,
+                world,
+                triangles,
+            );
             zi += 1;
         }
         yi += 1;
@@ -467,7 +483,12 @@ fn draw_vertical_square(
         [
             WorldVertex {
                 x: x0,
-                y: y1,
+                y: y0,
+                z: PANEL_Z,
+            },
+            WorldVertex {
+                x: x1,
+                y: y0,
                 z: PANEL_Z,
             },
             WorldVertex {
@@ -477,16 +498,11 @@ fn draw_vertical_square(
             },
             WorldVertex {
                 x: x0,
-                y: y0,
-                z: PANEL_Z,
-            },
-            WorldVertex {
-                x: x1,
-                y: y0,
+                y: y1,
                 z: PANEL_Z,
             },
         ],
-        base_u,
+        wall_uvs(base_u),
         material,
         options,
         world,
@@ -497,48 +513,43 @@ fn draw_vertical_square(
 fn draw_world_textured(
     camera: WorldCamera,
     verts: [WorldVertex; 4],
-    base_u: u8,
+    uvs: [(u8, u8); 4],
     material: TextureMaterial,
     options: WorldSurfaceOptions,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
-    let uvs = texture_uvs(base_u);
-    let _ = world.submit_textured_world_quad(
-        triangles,
-        camera,
-        verts,
-        uvs,
-        material,
-        options,
-    );
+    let _ = world.submit_textured_world_quad(triangles, camera, verts, uvs, material, options);
 }
 
 fn draw_wall_textured(
     camera: WorldCamera,
     verts: [WorldVertex; 4],
-    base_u: u8,
+    uvs: [(u8, u8); 4],
     material: TextureMaterial,
     options: WorldSurfaceOptions,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
 ) {
     if let Some(projected) = camera.project_world_quad(verts) {
-        let _ = world.submit_textured_quad(
-            triangles,
-            projected,
-            texture_uvs(base_u),
-            material,
-            options,
-        );
+        let _ = world.submit_textured_quad(triangles, projected, uvs, material, options);
     }
 }
 
-fn texture_uvs(base_u: u8) -> [(u8, u8); 4] {
+fn floor_uvs(base_u: u8) -> [(u8, u8); 4] {
     [
         (base_u, 0),
         (base_u + (TEX_W as u8 - 1), 0),
+        (base_u + (TEX_W as u8 - 1), TEX_H as u8 - 1),
+        (base_u, TEX_H as u8 - 1),
+    ]
+}
+
+fn wall_uvs(base_u: u8) -> [(u8, u8); 4] {
+    [
         (base_u, TEX_H as u8 - 1),
         (base_u + (TEX_W as u8 - 1), TEX_H as u8 - 1),
+        (base_u + (TEX_W as u8 - 1), 0),
+        (base_u, 0),
     ]
 }

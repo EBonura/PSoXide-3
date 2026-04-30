@@ -36,15 +36,14 @@
 //!     joint_index, first_vertex, vertex_count, first_face, face_count,
 //!     material_index, _reserved
 //!
-//!   Vertex table: vertex_count × 16 bytes
+//!   Vertex table: vertex_count × 8 bytes
 //!     position: i16x3 model-local units
-//!     normal:   i16x3 Q3.12
-//!     uv:       u8x2
 //!     joint1:   u8 secondary skin bone (`NO_JOINT8` when unused)
 //!     blend:    u8 weight on `joint1`, 0..=255 (0 = single-bone)
 //!
-//!   Face table: face_count × 6 bytes
-//!     a, b, c: u16 LE each, indexing the global vertex table
+//!   Face table: face_count × 12 bytes
+//!     three corners, each:
+//!       vertex_index: u16 LE, u: u8, v: u8
 //! ```
 //!
 //! Skinning is a hybrid model. Each part still owns one rigid bone
@@ -54,16 +53,19 @@
 //! transforms that vertex by both bones and lerps the view-space
 //! results, which keeps elbow and shoulder creases continuous instead
 //! of opening into chunky gaps. `blend == 0` opts a vertex out of the
-//! slow path entirely. Model-local coordinates are deliberately
-//! allowed to use a much denser scale than world/grid coordinates;
-//! the header's `local_to_world_q12` is the content pipeline's
-//! suggested conversion for previews and simple runtime draw paths.
+//! slow path entirely. VERSION 4 stores each skinned point once and
+//! moves UVs onto face corners, so seams no longer need duplicate
+//! vertices or a runtime weld pass. Model-local coordinates are
+//! deliberately allowed to use a much denser scale than world/grid
+//! coordinates; the header's `local_to_world_q12` is the content
+//! pipeline's suggested conversion for previews and simple runtime
+//! draw paths.
 
 /// ASCII magic identifying the `.psxmdl` model format.
 pub const MAGIC: [u8; 4] = *b"PSMD";
 
 /// Current model format revision.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 4;
 
 /// Sentinel parent/joint value used when a record has no joint.
 pub const NO_JOINT: u16 = u16::MAX;
@@ -80,9 +82,10 @@ pub const DEFAULT_LOCAL_TO_WORLD_Q12: u16 = 0x1000;
 
 /// Model-specific feature flags (stored in `AssetHeader::flags`).
 pub mod flags {
-    /// Vertex records carry Q3.12 normals.
+    /// Reserved for a future lit model format. VERSION 4 textured
+    /// models do not carry normal data in vertex records.
     pub const HAS_NORMALS: u16 = 1 << 0;
-    /// Vertex records carry 8-bit UV coordinates.
+    /// Face corner records carry 8-bit UV coordinates.
     pub const HAS_UVS: u16 = 1 << 1;
     /// Part records are associated with joint pose matrices.
     pub const RIGID_SKINNED: u16 = 1 << 2;
@@ -247,7 +250,7 @@ impl PartRecord {
 }
 
 /// Size of one vertex record in bytes.
-pub const VERTEX_RECORD_SIZE: usize = 16;
+pub const VERTEX_RECORD_SIZE: usize = 8;
 
 /// Size of one face record in bytes.
-pub const FACE_RECORD_SIZE: usize = 6;
+pub const FACE_RECORD_SIZE: usize = 12;

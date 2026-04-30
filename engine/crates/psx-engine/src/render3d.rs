@@ -12,7 +12,7 @@
 //! frame's opaque mesh triangles share one depth policy and one
 //! deterministic OT insertion order.
 
-use psx_asset::{Animation, JointPose, Mesh, Model};
+use psx_asset::{Animation, JointPose, Mesh, Model, ModelFaceCorner, ModelVertex};
 use psx_gpu::{
     material::TextureMaterial,
     prim::{TriGouraud, TriTextured},
@@ -1016,12 +1016,12 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
 
     /// Submit an animated rigid-skeletal textured model through the GTE.
     ///
-    /// The engine loads one GTE transform per model part, projects that
-    /// part's vertices once into `projected_vertices`, and then builds
-    /// textured triangle packets from those projected vertices. Vertex
-    /// projection uses GTE `RTPT` batches where possible. This is the
-    /// native textured model path; callers should size the scratch
-    /// buffer for the largest part vertex count, not the whole model.
+    /// The engine loads one GTE transform per model part, projects
+    /// each compact skinned vertex once into `projected_vertices`, and
+    /// then builds textured triangle packets from face-corner UVs.
+    /// Single-bone vertices are batched through `RTPT` three at a
+    /// time; blend vertices take the CPU path because they need two
+    /// joint transforms before projection.
     /// `frame_q12` is a looping sampled-frame phase with 12
     /// fractional bits, so decimated animation clips can still play
     /// smoothly between stored poses.
@@ -1042,7 +1042,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         camera: WorldCamera,
         origin: WorldVertex,
         instance_rotation: Mat3I16,
-        projected_vertices: &mut [ProjectedTexturedVertex],
+        projected_vertices: &mut [ProjectedVertex],
         joint_view_transforms: &mut [JointViewTransform],
         material: TextureMaterial,
         options: WorldSurfaceOptions,
@@ -1075,6 +1075,14 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             };
         }
 
+        let project_count = (model.vertex_count() as usize)
+            .min(projected_vertices.len())
+            .min(u16::MAX as usize);
+        if project_count < model.vertex_count() as usize {
+            stats.vertex_overflow = true;
+        }
+        stats.projected_vertices = project_count as u16;
+
         let mut part_index = 0;
         while part_index < model.part_count() {
             let Some(part) = model.part(part_index) else {
@@ -1087,68 +1095,93 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             }
             let primary = joint_view_transforms[primary_joint];
 
-            let part_vertex_count = part.vertex_count() as usize;
-            let project_count = part_vertex_count
-                .min(projected_vertices.len())
-                .min(u16::MAX as usize);
-            if project_count < part_vertex_count {
-                stats.vertex_overflow = true;
-            }
-            stats.projected_vertices = stats
-                .projected_vertices
-                .saturating_add(project_count as u16);
-
             scene::load_rotation(&primary.rotation);
             scene::load_translation(primary.translation);
 
-            let first_vertex = part.first_vertex();
-            let mut local_index = 0;
-            while local_index < project_count {
-                let global_index = first_vertex.saturating_add(local_index as u16);
-                let Some(vertex) = model.vertex(global_index) else {
+            let mut global_index = part.first_vertex() as usize;
+            let part_end = global_index
+                .saturating_add(part.vertex_count() as usize)
+                .min(project_count);
+            while global_index < part_end {
+                let Some(vertex) = model.vertex(global_index as u16) else {
                     break;
                 };
-                let projected = if !vertex.is_blend() || (vertex.joint1 as usize) >= joint_count {
-                    let proj = scene::project_vertex(vertex.position);
-                    ProjectedVertex::new(proj.sx, proj.sy, proj.sz as i32)
-                } else {
-                    let secondary = joint_view_transforms[vertex.joint1 as usize];
-                    let view_a = cpu_view_transform(&primary, vertex.position);
-                    let view_b = cpu_view_transform(&secondary, vertex.position);
-                    let view_blend = lerp_view_vertex(view_a, view_b, vertex.blend);
-                    match cpu_project_gte_view(view_blend, camera.projection) {
-                        Some(proj) => proj,
-                        None => ProjectedVertex::new(0, 0, camera.projection.near_z - 1),
+                if model_vertex_uses_cpu_blend(vertex, joint_count) {
+                    projected_vertices[global_index] = project_textured_model_vertex(
+                        vertex,
+                        primary,
+                        joint_view_transforms,
+                        joint_count,
+                        camera.projection,
+                    );
+                    global_index += 1;
+                    continue;
+                }
+
+                let mut batch = [vertex; 3];
+                let mut batch_count = 1usize;
+                while batch_count < 3 && global_index + batch_count < part_end {
+                    let Some(next) = model.vertex((global_index + batch_count) as u16) else {
+                        break;
+                    };
+                    if model_vertex_uses_cpu_blend(next, joint_count) {
+                        break;
                     }
-                };
-                projected_vertices[local_index] =
-                    ProjectedTexturedVertex::new(projected, vertex.uv.0 as i32, vertex.uv.1 as i32);
-                local_index += 1;
+                    batch[batch_count] = next;
+                    batch_count += 1;
+                }
+
+                if batch_count == 3 {
+                    let projected = scene::project_triangle(
+                        batch[0].position,
+                        batch[1].position,
+                        batch[2].position,
+                    );
+                    projected_vertices[global_index] = projected_from_gte(projected[0]);
+                    projected_vertices[global_index + 1] = projected_from_gte(projected[1]);
+                    projected_vertices[global_index + 2] = projected_from_gte(projected[2]);
+                } else {
+                    let mut batch_index = 0usize;
+                    while batch_index < batch_count {
+                        projected_vertices[global_index + batch_index] =
+                            project_gte_model_vertex(batch[batch_index]);
+                        batch_index += 1;
+                    }
+                }
+                global_index += batch_count;
             }
 
+            part_index += 1;
+        }
+
+        part_index = 0;
+        while part_index < model.part_count() {
+            let Some(part) = model.part(part_index) else {
+                break;
+            };
             let first_face = part.first_face();
             let last_face = first_face.saturating_add(part.face_count());
             let mut face_index = first_face;
             while face_index < last_face {
-                let Some((ia, ib, ic)) = model.face(face_index) else {
+                let Some(face) = model.face(face_index) else {
                     break;
                 };
                 let Some(a) =
-                    textured_part_vertex(projected_vertices, first_vertex, project_count, ia)
+                    textured_model_corner(projected_vertices, project_count, face.corners[0])
                 else {
                     stats.skipped_triangles = stats.skipped_triangles.saturating_add(1);
                     face_index += 1;
                     continue;
                 };
                 let Some(b) =
-                    textured_part_vertex(projected_vertices, first_vertex, project_count, ib)
+                    textured_model_corner(projected_vertices, project_count, face.corners[1])
                 else {
                     stats.skipped_triangles = stats.skipped_triangles.saturating_add(1);
                     face_index += 1;
                     continue;
                 };
                 let Some(c) =
-                    textured_part_vertex(projected_vertices, first_vertex, project_count, ic)
+                    textured_model_corner(projected_vertices, project_count, face.corners[2])
                 else {
                     stats.skipped_triangles = stats.skipped_triangles.saturating_add(1);
                     face_index += 1;
@@ -1707,20 +1740,20 @@ fn vertex_material(mesh: &Mesh<'_>, vert: u16, fallback: (u8, u8, u8)) -> (u8, u
     fallback
 }
 
-fn textured_part_vertex(
-    projected_vertices: &[ProjectedTexturedVertex],
-    first_vertex: u16,
+fn textured_model_corner(
+    projected_vertices: &[ProjectedVertex],
     project_count: usize,
-    vertex_index: u16,
+    corner: ModelFaceCorner,
 ) -> Option<ProjectedTexturedVertex> {
-    if vertex_index < first_vertex {
+    if corner.vertex_index as usize >= project_count {
         return None;
     }
-    let local_index = vertex_index - first_vertex;
-    if local_index as usize >= project_count {
-        return None;
-    }
-    projected_vertices.get(local_index as usize).copied()
+    projected_vertices
+        .get(corner.vertex_index as usize)
+        .copied()
+        .map(|projected| {
+            ProjectedTexturedVertex::new(projected, corner.uv.0 as i32, corner.uv.1 as i32)
+        })
 }
 
 fn load_world_projection_gte(projection: WorldProjection) {
@@ -1893,6 +1926,42 @@ fn cpu_view_transform(transform: &JointViewTransform, position: Vec3I16) -> View
         y.saturating_add(transform.translation.y),
         z.saturating_add(transform.translation.z),
     )
+}
+
+fn project_textured_model_vertex(
+    vertex: ModelVertex,
+    primary: JointViewTransform,
+    joint_view_transforms: &[JointViewTransform],
+    joint_count: usize,
+    projection: WorldProjection,
+) -> ProjectedVertex {
+    if model_vertex_uses_cpu_blend(vertex, joint_count) {
+        let secondary = joint_view_transforms[vertex.joint1 as usize];
+        let view_a = cpu_view_transform(&primary, vertex.position);
+        let view_b = cpu_view_transform(&secondary, vertex.position);
+        let view_blend = lerp_view_vertex(view_a, view_b, vertex.blend);
+        match cpu_project_gte_view(view_blend, projection) {
+            Some(proj) => proj,
+            None => ProjectedVertex::new(0, 0, projection.near_z - 1),
+        }
+    } else {
+        project_gte_model_vertex(vertex)
+    }
+}
+
+#[inline]
+fn model_vertex_uses_cpu_blend(vertex: ModelVertex, joint_count: usize) -> bool {
+    vertex.is_blend() && (vertex.joint1 as usize) < joint_count
+}
+
+#[inline]
+fn project_gte_model_vertex(vertex: ModelVertex) -> ProjectedVertex {
+    projected_from_gte(scene::project_vertex(vertex.position))
+}
+
+#[inline]
+fn projected_from_gte(projected: scene::Projected) -> ProjectedVertex {
+    ProjectedVertex::new(projected.sx, projected.sy, projected.sz as i32)
 }
 
 /// CPU projection that matches the GTE RTPS convention used by the

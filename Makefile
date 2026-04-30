@@ -251,14 +251,15 @@ psxed:
 # runtime input available without having to run the editor.
 SHOWCASE_3D := engine/examples/showcase-3d
 SHOWCASE_LIGHTS := engine/examples/showcase-lights
-SHOWCASE_FOG := engine/examples/showcase-fog
 HELLO_TEX := sdk/examples/hello-tex
+TEXTURE_ASSETS := assets/textures
 
 # Texture sources committed under example `vendor/` directories are
 # small pre-cropped JPGs. Larger originals are intentionally not
-# committed. `make assets` still skips missing source files so local
-# experiments with ignored high-res replacements do not break fresh
-# clones or CI.
+# committed. Runtime examples consume the shared cooked blobs under
+# `assets/textures/`, so `make assets` updates that canonical location.
+# It still skips missing source files so local experiments with ignored
+# high-res replacements do not break fresh clones or CI.
 define cook_texture
 	@if [ -f "$(1)" ]; then \
 	    $(PSXED) tex "$(1)" -o "$(2)" --size $(3) --depth $(4) --resample lanczos3 ; \
@@ -268,7 +269,7 @@ define cook_texture
 endef
 
 assets: psxed
-	@mkdir -p $(SHOWCASE_3D)/assets $(SHOWCASE_LIGHTS)/assets $(HELLO_TEX)/assets
+	@mkdir -p $(SHOWCASE_3D)/assets $(SHOWCASE_LIGHTS)/assets $(TEXTURE_ASSETS)
 	@$(PSXED) obj $(SHOWCASE_3D)/vendor/suzanne.obj \
 	    -o $(SHOWCASE_3D)/assets/suzanne.psxm \
 	    --palette warm --decimate-grid 6 --compute-normals
@@ -278,16 +279,13 @@ assets: psxed
 	@$(PSXED) obj $(SHOWCASE_LIGHTS)/vendor/cube.obj \
 	    -o $(SHOWCASE_LIGHTS)/assets/cube.psxm \
 	    --compute-normals --no-colors
-	@mkdir -p $(SHOWCASE_FOG)/assets
-	$(call cook_texture,$(HELLO_TEX)/vendor/brick-wall.jpg,$(HELLO_TEX)/assets/brick-wall.psxt,64x64,4)
-	$(call cook_texture,$(HELLO_TEX)/vendor/floor.jpg,$(HELLO_TEX)/assets/floor.psxt,64x64,4)
-	$(call cook_texture,$(SHOWCASE_FOG)/vendor/brick-wall.jpg,$(SHOWCASE_FOG)/assets/brick-wall.psxt,64x64,4)
-	$(call cook_texture,$(SHOWCASE_FOG)/vendor/floor.jpg,$(SHOWCASE_FOG)/assets/floor.psxt,64x64,4)
+	$(call cook_texture,$(HELLO_TEX)/vendor/brick-wall.jpg,$(TEXTURE_ASSETS)/brick-wall.psxt,64x64,4)
+	$(call cook_texture,$(HELLO_TEX)/vendor/floor.jpg,$(TEXTURE_ASSETS)/floor.psxt,64x64,4)
 
-examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-model showcase-lights showcase-fog showcase-particles hello-engine
+examples: hello-tri hello-input hello-ot hello-tex hello-gte hello-audio showcase-textured-sprite showcase-text game-pong game-breakout game-invaders showcase-3d showcase-model showcase-lights showcase-fog showcase-particles showcase-room hello-engine
 	@echo ""
-	@echo "Built SDK examples:"
-	@ls -la $(EXAMPLE_OUT)/*.exe 2>/dev/null || true
+	@echo "Built public examples:"
+	@find $(EXAMPLE_OUT) -maxdepth 1 -type f -name '*.exe' ! -name 'editor-playtest.exe' -print | sort | while IFS= read -r exe; do ls -la "$$exe"; done
 
 # Frontend side-load helpers. PSOXIDE_EXE makes the frontend skip the
 # BIOS reset vector and jump straight into the homebrew. HLE BIOS +

@@ -18,8 +18,8 @@ extern crate psx_rt;
 use psx_asset::{Animation, Model, Texture};
 use psx_engine::{
     button, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange, JointViewTransform,
-    Mat3I16, OtFrame, PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex, Scene, WorldCamera,
-    WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    Mat3I16, OtFrame, PrimitiveArena, ProjectedVertex, Scene, WorldCamera, WorldProjection,
+    WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
@@ -168,8 +168,8 @@ static mut TEXTURED_TRIS: [TriTextured; TRI_CAP] = [const {
     )
 }; TRI_CAP];
 static mut WORLD_COMMANDS: [WorldTriCommand; TRI_CAP] = [WorldTriCommand::EMPTY; TRI_CAP];
-static mut MODEL_VERTICES: [ProjectedTexturedVertex; MODEL_VERTEX_CAP] =
-    [ProjectedTexturedVertex::new(ProjectedVertex::new(0, 0, 0), 0, 0); MODEL_VERTEX_CAP];
+static mut MODEL_VERTICES: [ProjectedVertex; MODEL_VERTEX_CAP] =
+    [ProjectedVertex::new(0, 0, 0); MODEL_VERTEX_CAP];
 static mut JOINT_VIEW_TRANSFORMS: [JointViewTransform; JOINT_CAP] =
     [const { JointViewTransform::ZERO }; JOINT_CAP];
 

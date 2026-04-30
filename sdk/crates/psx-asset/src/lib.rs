@@ -512,15 +512,13 @@ impl<'a> Model<'a> {
             .get(base..base + psxed_format::model::VERTEX_RECORD_SIZE)?;
         Some(ModelVertex {
             position: Vec3I16::new(read_i16(bytes, 0), read_i16(bytes, 2), read_i16(bytes, 4)),
-            normal: Vec3I16::new(read_i16(bytes, 6), read_i16(bytes, 8), read_i16(bytes, 10)),
-            uv: (bytes[12], bytes[13]),
-            joint1: bytes[14],
-            blend: bytes[15],
+            joint1: bytes[6],
+            blend: bytes[7],
         })
     }
 
-    /// Triangle indices by global face index.
-    pub fn face(&self, index: u16) -> Option<(u16, u16, u16)> {
+    /// Textured triangle by global face index.
+    pub fn face(&self, index: u16) -> Option<ModelFace> {
         if index >= self.face_count {
             return None;
         }
@@ -528,7 +526,22 @@ impl<'a> Model<'a> {
         let bytes = self
             .faces
             .get(base..base + psxed_format::model::FACE_RECORD_SIZE)?;
-        Some((read_u16(bytes, 0), read_u16(bytes, 2), read_u16(bytes, 4)))
+        Some(ModelFace {
+            corners: [
+                ModelFaceCorner {
+                    vertex_index: read_u16(bytes, 0),
+                    uv: (bytes[2], bytes[3]),
+                },
+                ModelFaceCorner {
+                    vertex_index: read_u16(bytes, 4),
+                    uv: (bytes[6], bytes[7]),
+                },
+                ModelFaceCorner {
+                    vertex_index: read_u16(bytes, 8),
+                    uv: (bytes[10], bytes[11]),
+                },
+            ],
+        })
     }
 }
 
@@ -639,10 +652,6 @@ pub struct ModelVertex {
     /// scale here than world/grid units; use [`Model::local_to_world_q12`]
     /// when placing the model directly into world space.
     pub position: Vec3I16,
-    /// Q3.12 model-space normal.
-    pub normal: Vec3I16,
-    /// 8-bit texture coordinates.
-    pub uv: (u8, u8),
     /// Secondary blend joint, or [`NO_JOINT8`] when this vertex is
     /// single-bone.
     pub joint1: u8,
@@ -657,6 +666,22 @@ impl ModelVertex {
     pub fn is_blend(&self) -> bool {
         self.blend != 0 && self.joint1 != NO_JOINT8
     }
+}
+
+/// One textured triangle corner in a cooked model face.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModelFaceCorner {
+    /// Global skinned vertex index.
+    pub vertex_index: u16,
+    /// 8-bit texture coordinate for this face corner.
+    pub uv: (u8, u8),
+}
+
+/// Decoded textured model face.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModelFace {
+    /// Three triangle corners in packet order.
+    pub corners: [ModelFaceCorner; 3],
 }
 
 /// A parsed rigid-skeletal animation backed by slices into the
@@ -1418,8 +1443,8 @@ fn validate_model_faces(faces: &[u8], vertex_count: u16) -> Result<(), ParseErro
     for index in 0..count {
         let base = index * size;
         let a = read_u16(faces, base);
-        let b = read_u16(faces, base + 2);
-        let c = read_u16(faces, base + 4);
+        let b = read_u16(faces, base + 4);
+        let c = read_u16(faces, base + 8);
         if a >= vertex_count || b >= vertex_count || c >= vertex_count {
             return Err(ParseError::InvalidModelLayout);
         }
@@ -1601,10 +1626,7 @@ mod tests {
         let mut buf = std::vec::Vec::new();
         buf.extend_from_slice(&model::MAGIC);
         buf.extend_from_slice(&model::VERSION.to_le_bytes());
-        buf.extend_from_slice(
-            &(model::flags::HAS_NORMALS | model::flags::HAS_UVS | model::flags::RIGID_SKINNED)
-                .to_le_bytes(),
-        );
+        buf.extend_from_slice(&(model::flags::HAS_UVS | model::flags::RIGID_SKINNED).to_le_bytes());
         buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
 
         buf.extend_from_slice(&1u16.to_le_bytes()); // joints
@@ -1626,22 +1648,18 @@ mod tests {
         }
         buf.extend_from_slice(&0u32.to_le_bytes());
 
-        for (x, y, u, v) in [(0i16, 0i16, 0u8, 0u8), (4096, 0, 127, 0), (0, 4096, 0, 127)] {
+        for (x, y) in [(0i16, 0i16), (4096, 0), (0, 4096)] {
             buf.extend_from_slice(&x.to_le_bytes());
             buf.extend_from_slice(&y.to_le_bytes());
             buf.extend_from_slice(&0i16.to_le_bytes());
-            buf.extend_from_slice(&0i16.to_le_bytes());
-            buf.extend_from_slice(&4096i16.to_le_bytes());
-            buf.extend_from_slice(&0i16.to_le_bytes());
-            buf.push(u);
-            buf.push(v);
-            // joint1 sentinel + blend=0 → single-bone vertex, matching
-            // the v2 layout `psxed_format::model` documents.
+            // joint1 sentinel + blend=0 means single-bone vertex.
             buf.push(psxed_format::model::NO_JOINT8);
             buf.push(0);
         }
-        for index in [0u16, 1, 2] {
+        for (index, u, v) in [(0u16, 0u8, 0u8), (1, 127, 0), (2, 0, 127)] {
             buf.extend_from_slice(&index.to_le_bytes());
+            buf.push(u);
+            buf.push(v);
         }
 
         let model = Model::from_bytes(&buf).expect("parse model");
@@ -1660,8 +1678,13 @@ mod tests {
             [255, 255, 255, 255]
         );
         assert_eq!(model.part(0).unwrap().face_count(), 1);
-        assert_eq!(model.vertex(1).unwrap().uv, (127, 0));
-        assert_eq!(model.face(0), Some((0, 1, 2)));
+        assert_eq!(model.vertex(1).unwrap().position, Vec3I16::new(4096, 0, 0));
+        let face = model.face(0).unwrap();
+        assert_eq!(face.corners[0].vertex_index, 0);
+        assert_eq!(face.corners[1].vertex_index, 1);
+        assert_eq!(face.corners[1].uv, (127, 0));
+        assert_eq!(face.corners[2].vertex_index, 2);
+        assert_eq!(face.corners[2].uv, (0, 127));
     }
 
     #[test]

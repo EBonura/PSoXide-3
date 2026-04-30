@@ -33,10 +33,10 @@ use psx_asset::{Animation, Model, Texture, World as AssetWorld};
 use psx_engine::{
     button, draw_room, App, CharacterMotorAnim, CharacterMotorConfig, CharacterMotorInput,
     CharacterMotorState, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange,
-    JointViewTransform, Mat3I16, OtFrame, PrimitiveArena, ProjectedTexturedVertex, ProjectedVertex,
-    RuntimeRoom, Scene, ThirdPersonCameraConfig, ThirdPersonCameraInput, ThirdPersonCameraState,
-    ThirdPersonCameraTarget, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions,
-    WorldTriCommand, WorldVertex,
+    JointViewTransform, Mat3I16, OtFrame, PrimitiveArena, ProjectedVertex, RuntimeRoom, Scene,
+    ThirdPersonCameraConfig, ThirdPersonCameraInput, ThirdPersonCameraState, ThirdPersonCameraTarget,
+    WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
+    WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{draw_quad_flat, material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
@@ -196,8 +196,8 @@ static mut TEXTURED_TRIS: [TriTextured; MAX_TEXTURED_TRIS] =
     [const { TRI_ZERO }; MAX_TEXTURED_TRIS];
 static mut WORLD_COMMANDS: [WorldTriCommand; MAX_TEXTURED_TRIS] =
     [WorldTriCommand::EMPTY; MAX_TEXTURED_TRIS];
-static mut MODEL_VERTICES: [ProjectedTexturedVertex; MODEL_VERTEX_CAP] =
-    [ProjectedTexturedVertex::new(ProjectedVertex::new(0, 0, 0), 0, 0); MODEL_VERTEX_CAP];
+static mut MODEL_VERTICES: [ProjectedVertex; MODEL_VERTEX_CAP] =
+    [ProjectedVertex::new(0, 0, 0); MODEL_VERTEX_CAP];
 static mut JOINT_VIEW_TRANSFORMS: [JointViewTransform; JOINT_CAP] =
     [JointViewTransform::ZERO; JOINT_CAP];
 

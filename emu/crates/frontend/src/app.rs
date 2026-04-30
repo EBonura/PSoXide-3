@@ -524,7 +524,8 @@ impl AppState {
     ///    one exists, and skip BINs that map to the *same* CUE as
     ///    an earlier BIN (dedup). For CUE entries: hidden from the
     ///    games list because the owning BIN already appears there
-    ///    under the CUE's title/ID. For EXE entries: into Examples.
+    ///    under the CUE's title/ID. For EXE entries: into Examples,
+    ///    except internal runtime templates owned by editor Play.
     /// 3. Alphabetise each column.
     ///
     /// Result: Crash Bandicoot shows once, under its friendly
@@ -589,6 +590,7 @@ impl AppState {
                         subtitle: format_subtitle(e),
                     });
                 }
+                GameKind::Exe if is_internal_example_exe(&e.path) => continue,
                 GameKind::Exe => examples.push(MenuLibraryItem {
                     id: e.id.clone(),
                     title: e.title.clone(),
@@ -1059,6 +1061,12 @@ fn format_subtitle(e: &LibraryEntry) -> String {
     }
 }
 
+fn is_internal_example_exe(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "editor-playtest.exe")
+}
+
 /// Pick the BIOS path the launcher should read, honouring
 /// precedence: explicit settings field > env var. Centralised so
 /// every normal frontend caller agrees and no local path leaks into
@@ -1379,4 +1387,19 @@ pub fn build_ui(
         framebuffer_source,
         dt,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_editor_playtest_exe_is_hidden_from_menu_examples() {
+        assert!(is_internal_example_exe(Path::new(
+            "build/examples/mipsel-sony-psx/release/editor-playtest.exe"
+        )));
+        assert!(!is_internal_example_exe(Path::new(
+            "build/examples/mipsel-sony-psx/release/showcase-room.exe"
+        )));
+    }
 }
