@@ -4049,24 +4049,24 @@ impl EditorWorkspace {
         );
         draw_scene_group(
             ui,
-            icons::SUN,
-            "Lights",
-            count_nodes(&self.project, |kind| matches!(kind, NodeKind::Light { .. })),
-        );
-        draw_scene_group(
-            ui,
-            icons::MAP_PIN,
-            "Spawns",
+            icons::BOX,
+            "Entities",
             count_nodes(&self.project, |kind| {
-                matches!(kind, NodeKind::SpawnPoint { .. })
+                matches!(kind, NodeKind::Entity | NodeKind::Actor)
             }),
         );
         draw_scene_group(
             ui,
-            icons::BOX,
-            "Meshes",
+            icons::LAYERS,
+            "Components",
+            count_nodes(&self.project, NodeKind::is_component),
+        );
+        draw_scene_group(
+            ui,
+            icons::SUN,
+            "Lights",
             count_nodes(&self.project, |kind| {
-                matches!(kind, NodeKind::MeshInstance { .. })
+                matches!(kind, NodeKind::Light { .. } | NodeKind::PointLight { .. })
             }),
         );
     }
@@ -4200,7 +4200,12 @@ impl EditorWorkspace {
                         });
                 }
 
-                // Phase 2: per-sector inspector. Owns its own borrow of the
+                // Phase 2: component host/member authoring. This uses
+                // its own borrow so adding/selecting component nodes does
+                // not fight the selected node's property editor above.
+                self.draw_component_authoring_panel(ui, selected);
+
+                // Phase 3: per-sector inspector. Owns its own borrow of the
                 // project so it can edit the active Room's grid.
                 if let Some(room_id) = active_room {
                     // Room budget panel -- same data the cooker
@@ -4232,7 +4237,7 @@ impl EditorWorkspace {
                     }
                 }
 
-                // Phase 3: read-only diagnostics that just need name / kind.
+                // Phase 4: read-only diagnostics that just need name / kind.
                 let scene = self.project.active_scene();
                 let Some(node) = scene.node(selected) else {
                     if changed {
@@ -5792,6 +5797,133 @@ impl EditorWorkspace {
             self.status = "Deleted node".to_string();
             self.mark_dirty();
         }
+    }
+
+    fn draw_component_authoring_panel(&mut self, ui: &mut egui::Ui, selected: NodeId) {
+        let scene = self.project.active_scene();
+        let Some(node) = scene.node(selected) else {
+            return;
+        };
+
+        let is_host = matches!(node.kind, NodeKind::Entity | NodeKind::Actor);
+        let is_component = node.kind.is_component();
+        if !is_host && !is_component {
+            return;
+        }
+
+        if is_component {
+            let parent = node.parent.and_then(|parent| scene.node(parent));
+            egui::CollapsingHeader::new(icons::label(icons::LAYERS, "Component"))
+                .default_open(true)
+                .show(ui, |ui| {
+                    if let Some(parent) = parent {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Host").color(STUDIO_TEXT_WEAK));
+                            if ui.button(&parent.name).clicked() {
+                                self.selected_node = parent.id;
+                            }
+                        });
+                    } else {
+                        ui.weak("Component has no host parent.");
+                    }
+                });
+            return;
+        }
+
+        let host_kind = node.kind.clone();
+        let components: Vec<(NodeId, String, &'static str)> = node
+            .children
+            .iter()
+            .filter_map(|id| scene.node(*id))
+            .filter(|child| child.kind.is_component())
+            .map(|child| (child.id, child.name.clone(), child.kind.label()))
+            .collect();
+        let existing: Vec<&NodeKind> = node
+            .children
+            .iter()
+            .filter_map(|id| scene.node(*id))
+            .filter(|child| child.kind.is_component())
+            .map(|child| &child.kind)
+            .collect();
+        let addable = addable_component_templates(&host_kind, &existing);
+
+        let mut add_component = None;
+        let mut select_component = None;
+        egui::CollapsingHeader::new(icons::label(icons::LAYERS, "Components"))
+            .default_open(true)
+            .show(ui, |ui| {
+                if components.is_empty() {
+                    ui.weak("No components attached.");
+                } else {
+                    for (id, name, kind) in &components {
+                        ui.horizontal(|ui| {
+                            draw_inline_icon(ui, node_lucide_icon(kind, false), STUDIO_TEXT_WEAK);
+                            ui.label(name);
+                            ui.label(RichText::new(*kind).color(STUDIO_TEXT_WEAK).small());
+                            if ui.small_button("Select").clicked() {
+                                select_component = Some(*id);
+                            }
+                        });
+                    }
+                }
+
+                ui.separator();
+                ui.menu_button(icons::label(icons::PLUS, "Add Component"), |ui| {
+                    if addable.is_empty() {
+                        ui.weak("All singleton components are already present.");
+                    }
+                    for (label, kind) in &addable {
+                        if ui.button(*label).clicked() {
+                            add_component = Some((*label, kind.clone()));
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+
+        if let Some(id) = select_component {
+            self.selected_node = id;
+        }
+        if let Some((label, kind)) = add_component {
+            self.add_component_to_host(selected, label, kind);
+        }
+    }
+
+    fn add_component_to_host(
+        &mut self,
+        host: NodeId,
+        label: &'static str,
+        kind: NodeKind,
+    ) -> Option<NodeId> {
+        if !kind.is_component() {
+            self.status = "Only component nodes can be added as components".to_string();
+            return None;
+        }
+        let scene = self.project.active_scene();
+        let Some(host_node) = scene.node(host) else {
+            self.status = "Component host no longer exists".to_string();
+            return None;
+        };
+        if !matches!(host_node.kind, NodeKind::Entity | NodeKind::Actor) {
+            self.status = "Components can only be added to Entity or Actor nodes".to_string();
+            return None;
+        }
+        if !component_can_be_added_to_host(&host_node.kind, &kind, scene, host) {
+            self.status = format!("{label} is already present or invalid for this host");
+            return None;
+        }
+
+        self.push_undo();
+        let id = self
+            .project
+            .active_scene_mut()
+            .add_node(host, label.to_string(), kind);
+        self.selected_node = id;
+        self.selected_resource = None;
+        self.selected_primitive = None;
+        self.status = format!("Added {label} component");
+        self.mark_dirty();
+        Some(id)
     }
 
     /// Delete dispatch for the active selection:
@@ -8436,6 +8568,151 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
             },
         ),
     ]
+}
+
+fn addable_component_templates(
+    host_kind: &NodeKind,
+    existing: &[&NodeKind],
+) -> Vec<(&'static str, NodeKind)> {
+    component_templates_for_host(host_kind)
+        .into_iter()
+        .filter(|(_, candidate)| {
+            component_can_be_added(candidate, existing)
+                && component_is_valid_for_host(host_kind, candidate)
+        })
+        .collect()
+}
+
+fn component_templates_for_host(host_kind: &NodeKind) -> Vec<(&'static str, NodeKind)> {
+    let mut out = vec![
+        (
+            "ModelRenderer",
+            NodeKind::ModelRenderer {
+                model: None,
+                material: None,
+            },
+        ),
+        (
+            "Animator",
+            NodeKind::Animator {
+                clip: None,
+                autoplay: true,
+            },
+        ),
+        (
+            "Collider",
+            NodeKind::Collider {
+                shape: ColliderShape::default(),
+                solid: true,
+            },
+        ),
+        (
+            "Interactable",
+            NodeKind::Interactable {
+                prompt: String::new(),
+                action: String::new(),
+            },
+        ),
+        (
+            "PointLight",
+            NodeKind::PointLight {
+                color: [255, 240, 200],
+                intensity: 1.0,
+                radius: 4.0,
+            },
+        ),
+    ];
+
+    if matches!(host_kind, NodeKind::Actor) {
+        out.extend([
+            (
+                "CharacterController",
+                NodeKind::CharacterController {
+                    character: None,
+                    player: false,
+                },
+            ),
+            (
+                "AiController",
+                NodeKind::AiController {
+                    behavior: String::new(),
+                },
+            ),
+            (
+                "Combat",
+                NodeKind::Combat {
+                    faction: String::new(),
+                    health: 1,
+                },
+            ),
+        ]);
+    }
+
+    out
+}
+
+fn component_can_be_added_to_host(
+    host_kind: &NodeKind,
+    candidate: &NodeKind,
+    scene: &psxed_project::Scene,
+    host: NodeId,
+) -> bool {
+    let existing: Vec<&NodeKind> = scene
+        .node(host)
+        .into_iter()
+        .flat_map(|host| host.children.iter())
+        .filter_map(|id| scene.node(*id))
+        .filter(|child| child.kind.is_component())
+        .map(|child| &child.kind)
+        .collect();
+    component_is_valid_for_host(host_kind, candidate)
+        && component_can_be_added(candidate, &existing)
+}
+
+const fn component_is_valid_for_host(host_kind: &NodeKind, component: &NodeKind) -> bool {
+    if !component.is_component() {
+        return false;
+    }
+    match component {
+        NodeKind::CharacterController { .. }
+        | NodeKind::AiController { .. }
+        | NodeKind::Combat { .. } => matches!(host_kind, NodeKind::Actor),
+        _ => matches!(host_kind, NodeKind::Entity | NodeKind::Actor),
+    }
+}
+
+fn component_can_be_added(candidate: &NodeKind, existing: &[&NodeKind]) -> bool {
+    if component_allows_multiple(candidate) {
+        return true;
+    }
+    let Some(candidate_slot) = component_slot(candidate) else {
+        return true;
+    };
+    !existing
+        .iter()
+        .filter_map(|component| component_slot(component))
+        .any(|slot| slot == candidate_slot)
+}
+
+const fn component_allows_multiple(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Collider { .. } | NodeKind::PointLight { .. }
+    )
+}
+
+const fn component_slot(kind: &NodeKind) -> Option<&'static str> {
+    match kind {
+        NodeKind::ModelRenderer { .. } => Some("ModelRenderer"),
+        NodeKind::Animator { .. } => Some("Animator"),
+        NodeKind::Collider { .. } => Some("Collider"),
+        NodeKind::Interactable { .. } => Some("Interactable"),
+        NodeKind::CharacterController { .. } => Some("CharacterController"),
+        NodeKind::AiController { .. } => Some("AiController"),
+        NodeKind::Combat { .. } => Some("Combat"),
+        NodeKind::PointLight { .. } => Some("PointLight"),
+        _ => None,
+    }
 }
 
 fn node_draw_mode(kind: &NodeKind) -> &'static str {
@@ -11577,6 +11854,64 @@ mod tests {
                 .node(*id)
                 .is_some_and(|child| matches!(child.kind, NodeKind::Collider { .. }))
         }));
+        assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn component_templates_filter_by_host_kind_and_singletons() {
+        let entity_options = component_templates_for_host(&NodeKind::Entity);
+        assert!(entity_options
+            .iter()
+            .any(|(_, kind)| matches!(kind, NodeKind::ModelRenderer { .. })));
+        assert!(!entity_options
+            .iter()
+            .any(|(_, kind)| matches!(kind, NodeKind::CharacterController { .. })));
+
+        let actor_existing = [NodeKind::CharacterController {
+            character: None,
+            player: false,
+        }];
+        let existing_refs: Vec<&NodeKind> = actor_existing.iter().collect();
+        let actor_options = addable_component_templates(&NodeKind::Actor, &existing_refs);
+        assert!(!actor_options
+            .iter()
+            .any(|(_, kind)| matches!(kind, NodeKind::CharacterController { .. })));
+        assert!(actor_options
+            .iter()
+            .any(|(_, kind)| matches!(kind, NodeKind::AiController { .. })));
+        assert!(actor_options
+            .iter()
+            .any(|(_, kind)| matches!(kind, NodeKind::Collider { .. })));
+    }
+
+    #[test]
+    fn add_component_to_host_creates_child_and_selects_it() {
+        let mut workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let room = workspace.active_room_id().expect("starter has room");
+        let actor = workspace
+            .project
+            .active_scene_mut()
+            .add_node(room, "Enemy", NodeKind::Actor);
+
+        let controller = workspace
+            .add_component_to_host(
+                actor,
+                "CharacterController",
+                NodeKind::CharacterController {
+                    character: None,
+                    player: false,
+                },
+            )
+            .expect("component is added");
+
+        let scene = workspace.project.active_scene();
+        assert_eq!(workspace.selected_node, controller);
+        assert!(scene.node(actor).unwrap().children.contains(&controller));
+        assert!(matches!(
+            scene.node(controller).unwrap().kind,
+            NodeKind::CharacterController { .. }
+        ));
         assert!(workspace.is_dirty());
     }
 
