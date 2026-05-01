@@ -123,9 +123,43 @@ pub struct LevelMaterialRecord {
     /// Per-material modulation tint. Renderer multiplies the
     /// texture sample by this colour.
     pub tint_rgb: [u8; 3],
-    /// Reserved (blend mode bits land here once the runtime
-    /// supports more than `Opaque`).
+    /// Runtime material flags. Low two bits encode face sidedness
+    /// using [`material_flags::FACE_*`].
     pub flags: u16,
+}
+
+/// Material flag bits stored in [`LevelMaterialRecord::flags`].
+pub mod material_flags {
+    /// Mask for the face-sidedness bits.
+    pub const FACE_MASK: u16 = 0x0003;
+    /// Draw only the authored front side.
+    pub const FACE_FRONT: u16 = 0x0000;
+    /// Draw only the opposite side.
+    pub const FACE_BACK: u16 = 0x0001;
+    /// Draw either winding.
+    pub const FACE_BOTH: u16 = 0x0002;
+}
+
+/// Which side of a room face should render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelMaterialSidedness {
+    /// Authored/front winding only.
+    Front,
+    /// Opposite winding only.
+    Back,
+    /// No winding cull.
+    Both,
+}
+
+impl LevelMaterialRecord {
+    /// Decode the material's face-sidedness flags.
+    pub const fn sidedness(self) -> LevelMaterialSidedness {
+        match self.flags & material_flags::FACE_MASK {
+            material_flags::FACE_BACK => LevelMaterialSidedness::Back,
+            material_flags::FACE_BOTH => LevelMaterialSidedness::Both,
+            _ => LevelMaterialSidedness::Front,
+        }
+    }
 }
 
 /// Per-room residency contract. The runtime calls

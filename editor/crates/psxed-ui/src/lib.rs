@@ -23,9 +23,9 @@ use egui::{
 };
 use psxed_project::{
     snap_height, GridCellBounds, GridDirection, GridHorizontalFace, GridSplit, GridVerticalFace,
-    MaterialResource, NodeId, NodeKind, NodeRow, ProjectDocument, PsxBlendMode, Resource,
-    ResourceData, ResourceId, WorldGrid, WorldGridBudget, HEIGHT_QUANTUM, MAX_ROOM_BYTES,
-    MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
+    MaterialFaceSidedness, MaterialResource, NodeId, NodeKind, NodeRow, ProjectDocument,
+    PsxBlendMode, Resource, ResourceData, ResourceId, WorldGrid, WorldGridBudget, HEIGHT_QUANTUM,
+    MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
 };
 
 /// Discrete action a scene-tree row can produce in one frame.
@@ -449,10 +449,10 @@ pub enum EntityBoundKind {
 }
 
 /// World-space AABB for one selectable scene entity.
-/// Coordinates use the same convention everything else in
-/// the editor preview uses: `((editor.x + width/2) * S,
-/// editor.y * S, (editor.z + depth/2) * S)` for entities
-/// under a Room.
+/// Coordinates use [`psxed_project::spatial::node_preview_bounds_center`]
+/// for entities under a Room, so bounds line up with the same
+/// origin-aware preview world used by rendered models, markers, and
+/// lights.
 #[derive(Debug, Clone, Copy)]
 pub struct EntityBounds {
     /// Owning scene-tree node id.
@@ -779,6 +779,76 @@ pub struct ViewportCameraState {
     pub pitch_q12: u16,
     /// Distance from the camera to the orbit target, world units.
     pub radius: i32,
+}
+
+/// Floating-point camera basis used by editor picking.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewportCameraBasis {
+    /// Camera position in editor preview world units.
+    pub position: [f32; 3],
+    /// Forward unit vector.
+    pub forward: [f32; 3],
+    /// Right unit vector.
+    pub right: [f32; 3],
+    /// Up unit vector.
+    pub up: [f32; 3],
+}
+
+impl ViewportCameraState {
+    /// Orbit camera basis around a preview-world target.
+    pub fn basis(self, target_world: [f32; 3]) -> ViewportCameraBasis {
+        let radius = self.radius as f32;
+        let cos_p = psx_gte::transform::cos_1_3_12(self.pitch_q12) as f32 / 4096.0;
+        let sin_p = psx_gte::transform::sin_1_3_12(self.pitch_q12) as f32 / 4096.0;
+        let cos_y = psx_gte::transform::cos_1_3_12(self.yaw_q12) as f32 / 4096.0;
+        let sin_y = psx_gte::transform::sin_1_3_12(self.yaw_q12) as f32 / 4096.0;
+        let position = [
+            target_world[0] + radius * cos_p * sin_y,
+            target_world[1] - radius * sin_p,
+            target_world[2] + radius * cos_p * cos_y,
+        ];
+        let forward = normalize3([
+            target_world[0] - position[0],
+            target_world[1] - position[1],
+            target_world[2] - position[2],
+        ]);
+        let right = normalize3(cross3(forward, [0.0, 1.0, 0.0]));
+        let up = cross3(right, forward);
+        ViewportCameraBasis {
+            position,
+            forward,
+            right,
+            up,
+        }
+    }
+
+    /// Build a world-space ray from normalized panel coordinates.
+    ///
+    /// `nx` and `ny` are in `[-1, 1]`, where `0, 0` is the panel
+    /// centre. Constants match the editor preview's 320x240,
+    /// projection-plane-320 camera.
+    pub fn ray_for_normalized_panel_point(
+        self,
+        target_world: [f32; 3],
+        nx: f32,
+        ny: f32,
+    ) -> ([f32; 3], [f32; 3]) {
+        let basis = self.basis(target_world);
+        let half_fov_x: f32 = 0.5;
+        let half_fov_y: f32 = 0.5 * 240.0 / 320.0;
+        let dir = normalize3([
+            basis.forward[0]
+                + basis.right[0] * (nx * half_fov_x)
+                + basis.up[0] * (-ny * half_fov_y),
+            basis.forward[1]
+                + basis.right[1] * (nx * half_fov_x)
+                + basis.up[1] * (-ny * half_fov_y),
+            basis.forward[2]
+                + basis.right[2] * (nx * half_fov_x)
+                + basis.up[2] * (-ny * half_fov_y),
+        ]);
+        (basis.position, dir)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2523,48 +2593,13 @@ impl EditorWorkspace {
             return None;
         };
 
-        let yaw = self.viewport_3d_yaw;
-        let pitch = self.viewport_3d_pitch;
-        let radius = self.viewport_3d_radius as f32;
-        let cos_p = psx_gte::transform::cos_1_3_12(pitch) as f32 / 4096.0;
-        let sin_p = psx_gte::transform::sin_1_3_12(pitch) as f32 / 4096.0;
-        let cos_y = psx_gte::transform::cos_1_3_12(yaw) as f32 / 4096.0;
-        let sin_y = psx_gte::transform::sin_1_3_12(yaw) as f32 / 4096.0;
-        // Geometric centre in world coords. Editor `(0, 0)` is the
-        // room centre by definition, so `editor_to_room_local`
-        // delivers the right point -- origin-aware via the canonical
-        // helper, no ad-hoc multiplication at this call site.
-        let target_world = grid.editor_to_room_local([0.0, 0.0]);
-        let cam_pos = [
-            target_world[0] + radius * cos_p * sin_y,
-            target_world[1] - radius * sin_p,
-            target_world[2] + radius * cos_p * cos_y,
-        ];
-        let forward = normalize3([
-            target_world[0] - cam_pos[0],
-            target_world[1] - cam_pos[1],
-            target_world[2] - cam_pos[2],
-        ]);
-        let right = normalize3(cross3(forward, [0.0, 1.0, 0.0]));
-        let up = cross3(right, forward);
-
+        let target_world = psxed_project::spatial::room_preview_center_f32(grid);
         let nx = (pointer.x - rect.center().x) / (rect.width() * 0.5);
         let ny = (pointer.y - rect.center().y) / (rect.height() * 0.5);
-        // PSX projection plane H = 320, framebuffer = 320×240. The
-        // ray's right/up offsets are tan(half-FOV) at panel-edge:
-        // 160/320 = 0.5 horizontally, 120/320 = 0.375 vertically.
-        // Hardcoding 0.5 for both (the previous shape) over-shoots
-        // the vertical ray angle by exactly the 4:3 aspect ratio,
-        // which is why floor picking worked but walls -- whose Y
-        // range is narrow -- never got hit.
-        let half_fov_x: f32 = 0.5;
-        let half_fov_y: f32 = 0.5 * 240.0 / 320.0;
-        let dir = normalize3([
-            forward[0] + right[0] * (nx * half_fov_x) + up[0] * (-ny * half_fov_y),
-            forward[1] + right[1] * (nx * half_fov_x) + up[1] * (-ny * half_fov_y),
-            forward[2] + right[2] * (nx * half_fov_x) + up[2] * (-ny * half_fov_y),
-        ]);
-        Some((cam_pos, dir))
+        Some(
+            self.viewport_3d_camera()
+                .ray_for_normalized_panel_point(target_world, nx, ny),
+        )
     }
 
     /// Map a `(face, world-hit)` pair from `pick_face_with_hit`
@@ -2801,6 +2836,7 @@ impl EditorWorkspace {
     /// already speaks. Lets every paint tool (Floor / Wall / Ceiling
     /// / Erase / Place) work identically in 3D and 2D.
     fn pick_3d_world(&self, rect: egui::Rect, pointer: egui::Pos2) -> Option<[f32; 2]> {
+        let (origin, dir) = self.camera_ray_for_pointer(rect, pointer)?;
         let scene = self.project.active_scene();
         let room = scene
             .nodes()
@@ -2810,71 +2846,17 @@ impl EditorWorkspace {
             return None;
         };
 
-        // Camera basis from the orbit state. Mirrors the math in
-        // `editor_preview::setup_gte_for_camera` so picking and
-        // rendering agree on every axis convention.
-        let yaw = self.viewport_3d_yaw;
-        let pitch = self.viewport_3d_pitch;
-        let radius = self.viewport_3d_radius as f32;
-        let cos_p = psx_gte::transform::cos_1_3_12(pitch) as f32 / 4096.0;
-        let sin_p = psx_gte::transform::sin_1_3_12(pitch) as f32 / 4096.0;
-        let cos_y = psx_gte::transform::cos_1_3_12(yaw) as f32 / 4096.0;
-        let sin_y = psx_gte::transform::sin_1_3_12(yaw) as f32 / 4096.0;
-
-        // Geometric centre in world coords. Editor `(0, 0)` is the
-        // room centre by definition, so `editor_to_room_local`
-        // delivers the right point -- origin-aware via the canonical
-        // helper, no ad-hoc multiplication at this call site.
-        let target_world = grid.editor_to_room_local([0.0, 0.0]);
-        let cam_pos = [
-            target_world[0] + radius * cos_p * sin_y,
-            target_world[1] - radius * sin_p,
-            target_world[2] + radius * cos_p * cos_y,
-        ];
-
-        // World-space camera basis: forward = target - camera, with
-        // +Y up. `right` is forward × up, `up` recomputed from those
-        // two so the basis is orthonormal in floating point.
-        let forward = normalize3([
-            target_world[0] - cam_pos[0],
-            target_world[1] - cam_pos[1],
-            target_world[2] - cam_pos[2],
-        ]);
-        let right = normalize3(cross3(forward, [0.0, 1.0, 0.0]));
-        let up = cross3(right, forward);
-
-        // Map the pointer to PSX 320×240 NDC, clamped to the panel
-        // rect since clicks beyond it shouldn't pick.
-        if !rect.contains(pointer) {
-            return None;
-        }
-        // Pixel offset from panel centre, normalised so ±1 covers
-        // the half-FOV. Focal=320, half-screen=160 → tan(half_fov)
-        // = 0.5; we bake that into the multiplier below.
-        let nx = (pointer.x - rect.center().x) / (rect.width() * 0.5);
-        let ny = (pointer.y - rect.center().y) / (rect.height() * 0.5);
-        // Same FOV constants `camera_ray_for_pointer` uses; see the
-        // comment there. Hardcoded for the PSX framebuffer's
-        // 320×240 over PROJ_H=320.
-        let half_fov_x: f32 = 0.5;
-        let half_fov_y: f32 = 0.5 * 240.0 / 320.0;
-        let dir = normalize3([
-            forward[0] + right[0] * (nx * half_fov_x) + up[0] * (-ny * half_fov_y),
-            forward[1] + right[1] * (nx * half_fov_x) + up[1] * (-ny * half_fov_y),
-            forward[2] + right[2] * (nx * half_fov_x) + up[2] * (-ny * half_fov_y),
-        ]);
-
         // Ray-plane intersection at world Y=0. The orbit cam never
         // sits exactly on Y=0, but we still guard against a near-
         // zero divisor for numerical safety.
         if dir[1].abs() < 1e-5 {
             return None;
         }
-        let t = -cam_pos[1] / dir[1];
+        let t = -origin[1] / dir[1];
         if t < 0.0 {
             return None;
         }
-        let hit_world = [cam_pos[0] + dir[0] * t, cam_pos[2] + dir[2] * t];
+        let hit_world = [origin[0] + dir[0] * t, origin[2] + dir[2] * t];
 
         // 3D ground hit → editor sector-units, room-centre-relative.
         // `WorldGrid::room_local_to_editor` is the canonical inverse of
@@ -3153,79 +3135,88 @@ impl EditorWorkspace {
 
     fn draw_action_bar(&mut self, ctx: &egui::Context, playtest_status: EditorPlaytestStatus) {
         egui::TopBottomPanel::top("psxed_action_bar")
-            .exact_height(43.0)
+            .exact_height(66.0)
             .frame(top_bar_frame())
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(icons::label(icons::FILE_PLUS, "New Project"))
-                        .on_hover_text(
-                            "Create a new project in editor/projects/<name>/ from the default template.",
-                        )
-                        .clicked()
-                    {
-                        self.open_new_project_dialog();
-                    }
-                    if ui.button(icons::label(icons::SAVE, "Save")).clicked() {
-                        if let Err(error) = self.save() {
-                            self.status = format!("Save failed: {error}");
-                        }
-                    }
-                    if ui
-                        .button(icons::label(icons::ROTATE_CCW, "Reload"))
-                        .clicked()
-                    {
-                        self.reload();
-                    }
-                    if ui.button(icons::label(icons::FOCUS, "Frame")).clicked() {
-                        self.frame_viewport();
-                    }
-                    if ui.button(icons::label(icons::BLEND, "Cook World")).clicked() {
-                        match self.cook_world_to_disk() {
-                            Ok(report) => self.status = report,
-                            Err(error) => self.status = format!("Cook failed: {error}"),
-                        }
-                    }
-                    let playtest_active = playtest_status.is_active();
-                    let play_label = if playtest_active {
-                        "Rebuild & Play"
-                    } else {
-                        "Play"
-                    };
-                    if ui
-                        .button(icons::label(icons::PLAY, play_label))
-                        .on_hover_text(
-                            "Cook the active scene, build editor-playtest, and run it inside the 3D viewport.",
-                        )
-                        .clicked()
-                    {
-                        self.pending_playtest_request = Some(if playtest_active {
-                            EditorPlaytestRequest::Rebuild
-                        } else {
-                            EditorPlaytestRequest::Play
-                        });
-                    }
-                    if playtest_active
-                        && ui
-                            .button(icons::label(icons::TRASH, "Stop"))
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(icons::label(icons::FILE_PLUS, "New Project"))
                             .on_hover_text(
-                                "Stop embedded play mode and return the viewport to editing.",
+                                "Create a new project in editor/projects/<name>/ from the default template.",
                             )
                             .clicked()
-                    {
-                        self.pending_playtest_request = Some(EditorPlaytestRequest::Stop);
-                    }
+                        {
+                            self.open_new_project_dialog();
+                        }
+                        if ui.button(icons::label(icons::SAVE, "Save")).clicked() {
+                            if let Err(error) = self.save() {
+                                self.status = format!("Save failed: {error}");
+                            }
+                        }
+                        if ui
+                            .button(icons::label(icons::ROTATE_CCW, "Reload"))
+                            .clicked()
+                        {
+                            self.reload();
+                        }
+                        if ui.button(icons::label(icons::FOCUS, "Frame")).clicked() {
+                            self.frame_viewport();
+                        }
+                        if ui.button(icons::label(icons::BLEND, "Cook World")).clicked() {
+                            match self.cook_world_to_disk() {
+                                Ok(report) => self.status = report,
+                                Err(error) => self.status = format!("Cook failed: {error}"),
+                            }
+                        }
+                        let playtest_active = playtest_status.is_active();
+                        let play_label = if playtest_active {
+                            "Rebuild & Play"
+                        } else {
+                            "Play"
+                        };
+                        if ui
+                            .button(icons::label(icons::PLAY, play_label))
+                            .on_hover_text(
+                                "Cook the active scene, build editor-playtest, and run it inside the 3D viewport.",
+                            )
+                            .clicked()
+                        {
+                            self.pending_playtest_request = Some(if playtest_active {
+                                EditorPlaytestRequest::Rebuild
+                            } else {
+                                EditorPlaytestRequest::Play
+                            });
+                        }
+                        if playtest_active
+                            && ui
+                                .button(icons::label(icons::TRASH, "Stop"))
+                                .on_hover_text(
+                                    "Stop embedded play mode and return the viewport to editing.",
+                                )
+                                .clicked()
+                        {
+                            self.pending_playtest_request = Some(EditorPlaytestRequest::Stop);
+                        }
 
-                    ui.separator();
-                    let project_label = if self.dirty {
-                        format!("{} *", self.project.name)
-                    } else {
-                        self.project.name.clone()
-                    };
-                    ui.label(project_label);
+                        ui.separator();
+                        let project_label = if self.dirty {
+                            format!("{} *", self.project.name)
+                        } else {
+                            self.project.name.clone()
+                        };
+                        ui.label(project_label);
+                    });
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(&self.status).color(STUDIO_TEXT_WEAK));
+                    ui.add_space(1.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&self.status).small().color(STUDIO_TEXT_WEAK),
+                            )
+                            .wrap(),
+                        );
                     });
                 });
             });
@@ -4077,9 +4068,36 @@ impl EditorWorkspace {
                         );
                         changed |= blend_mode_editor(ui, &mut material.blend_mode);
                         changed |= color_editor(ui, "Tint", &mut material.tint);
-                        changed |= ui
-                            .checkbox(&mut material.double_sided, "Double sided")
-                            .changed();
+                        let resolved_sides = material.sidedness();
+                        if material.face_sidedness != resolved_sides {
+                            material.face_sidedness = resolved_sides;
+                            material.sync_legacy_sidedness();
+                            changed = true;
+                        }
+                        let before = material.face_sidedness;
+                        egui::ComboBox::from_label("Sides")
+                            .selected_text(material.face_sidedness.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut material.face_sidedness,
+                                    MaterialFaceSidedness::Front,
+                                    MaterialFaceSidedness::Front.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut material.face_sidedness,
+                                    MaterialFaceSidedness::Back,
+                                    MaterialFaceSidedness::Back.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut material.face_sidedness,
+                                    MaterialFaceSidedness::Both,
+                                    MaterialFaceSidedness::Both.label(),
+                                );
+                            });
+                        if material.face_sidedness != before {
+                            material.sync_legacy_sidedness();
+                            changed = true;
+                        }
                     });
                 if let Some((_, stats)) = preview_thumb {
                     egui::CollapsingHeader::new(icons::label(icons::SCAN, "Linked Texture"))
@@ -4709,15 +4727,11 @@ impl EditorWorkspace {
             // with the rendered marker / model exactly.
             let center_world = match enclosing_room.and_then(|id| scene.node(id)) {
                 Some(room_node) => match &room_node.kind {
-                    NodeKind::Room { grid } => {
-                        let pos = node.transform.translation;
-                        let xz = grid.editor_to_room_local([pos[0], pos[2]]);
-                        [
-                            xz[0],
-                            pos[1] * grid.sector_size as f32 + half_extents[1],
-                            xz[2],
-                        ]
-                    }
+                    NodeKind::Room { grid } => psxed_project::spatial::node_preview_bounds_center(
+                        grid,
+                        &node.transform,
+                        half_extents,
+                    ),
                     _ => continue,
                 },
                 None => {
@@ -5300,7 +5314,22 @@ fn draw_node_kind_editor(
                     grid.populated_sector_count()
                 ));
             });
-            changed |= color_editor(ui, "Ambient", &mut grid.ambient_color);
+            changed |= color_editor(ui, "Ambient Light", &mut grid.ambient_color);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Preset").color(STUDIO_TEXT_WEAK));
+                if ui.small_button("Low").clicked() {
+                    grid.ambient_color = [32, 32, 32];
+                    changed = true;
+                }
+                if ui.small_button("Neutral").clicked() {
+                    grid.ambient_color = [128, 128, 128];
+                    changed = true;
+                }
+                if ui.small_button("Warm").clicked() {
+                    grid.ambient_color = [96, 80, 64];
+                    changed = true;
+                }
+            });
             changed |= ui
                 .checkbox(&mut grid.fog_enabled, icons::label(icons::SCAN, "Fog"))
                 .changed();
@@ -5572,6 +5601,7 @@ fn color_editor(ui: &mut egui::Ui, label: &str, color: &mut [u8; 3]) -> bool {
         let mut changed = false;
         ui.label(icons::text(icons::PALETTE, 12.0).color(STUDIO_TEXT_WEAK));
         ui.label(label);
+        changed |= ui.color_edit_button_srgb(color).changed();
         changed |= ui
             .add(
                 egui::DragValue::new(&mut color[0])
@@ -8616,17 +8646,7 @@ fn direction_label(dir: GridDirection) -> &'static str {
 /// `North = +Z`, `East = +X`, `South = -Z`, `West = -X`. The
 /// dominant axis decides; ties favour the X axis.
 fn edge_from_world_offset(dx: f32, dz: f32) -> GridDirection {
-    if dz.abs() > dx.abs() {
-        if dz >= 0.0 {
-            GridDirection::North
-        } else {
-            GridDirection::South
-        }
-    } else if dx >= 0.0 {
-        GridDirection::East
-    } else {
-        GridDirection::West
-    }
+    psxed_project::spatial::editor_wall_direction_from_offset(dx, dz)
 }
 
 /// World-space integer position of `corner` in the room

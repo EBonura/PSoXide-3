@@ -316,9 +316,12 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
             cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
             // Match the GUI launch path: side-loaded EXEs need the
             // HLE syscall tables even for users with old settings.ron
-            // files where the former preference is still false.
+            // files where the former preference is still false. The
+            // editor-playtest runtime also gates on analog mode, so keep
+            // headless parity with embedded Play by forcing it here.
             bus.enable_hle_bios();
             bus.attach_digital_pad_port1();
+            let _ = bus.force_port1_analog_mode();
             eprintln!(
                 "[cli] side-loaded {} — entry=0x{:08x} payload={}B",
                 game_path.display(),

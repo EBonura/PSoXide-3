@@ -14,6 +14,118 @@ use crate::{
     WorldSurfaceOptions, WorldVertex,
 };
 
+/// Which side(s) of a room face should render.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SurfaceSidedness {
+    /// Authored/front winding only.
+    Front,
+    /// Opposite winding only.
+    Back,
+    /// No winding cull.
+    Both,
+}
+
+/// Runtime material binding for cooked room geometry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WorldRenderMaterial {
+    /// GPU texture/material state.
+    pub texture: TextureMaterial,
+    /// Face-sidedness policy.
+    pub sidedness: SurfaceSidedness,
+}
+
+impl WorldRenderMaterial {
+    /// Build a front-sided material.
+    pub const fn front(texture: TextureMaterial) -> Self {
+        Self {
+            texture,
+            sidedness: SurfaceSidedness::Front,
+        }
+    }
+
+    /// Build a back-sided material.
+    pub const fn back(texture: TextureMaterial) -> Self {
+        Self {
+            texture,
+            sidedness: SurfaceSidedness::Back,
+        }
+    }
+
+    /// Build a double-sided material.
+    pub const fn both(texture: TextureMaterial) -> Self {
+        Self {
+            texture,
+            sidedness: SurfaceSidedness::Both,
+        }
+    }
+
+    /// Return a copy with the same texture state and sidedness but
+    /// a different flat RGB tint.
+    pub const fn with_tint(mut self, tint: (u8, u8, u8)) -> Self {
+        self.texture = self.texture.with_tint(tint);
+        self
+    }
+}
+
+impl From<TextureMaterial> for WorldRenderMaterial {
+    fn from(texture: TextureMaterial) -> Self {
+        Self::front(texture)
+    }
+}
+
+/// Kind of room surface currently being emitted.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WorldSurfaceKind {
+    /// Sector floor.
+    Floor,
+    /// Sector ceiling.
+    Ceiling,
+    /// Sector wall on a runtime cardinal edge.
+    Wall {
+        /// Runtime wall direction id.
+        direction: u8,
+    },
+}
+
+/// Per-surface data exposed to a room lighting/material pass.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WorldSurfaceSample {
+    /// Surface kind.
+    pub kind: WorldSurfaceKind,
+    /// Sector X coordinate.
+    pub sx: u16,
+    /// Sector Z coordinate.
+    pub sz: u16,
+    /// Surface centre in the same room-local world coordinates as
+    /// the emitted vertices.
+    pub center: WorldVertex,
+}
+
+/// Hook used by [`draw_room_lit`] to vary material tint per room
+/// surface.
+pub trait WorldSurfaceLighting {
+    /// Shade one material for one room surface.
+    fn shade(
+        &self,
+        sample: WorldSurfaceSample,
+        material: WorldRenderMaterial,
+    ) -> WorldRenderMaterial;
+}
+
+/// No-op surface lighting.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NoWorldSurfaceLighting;
+
+impl WorldSurfaceLighting for NoWorldSurfaceLighting {
+    fn shade(
+        &self,
+        _sample: WorldSurfaceSample,
+        material: WorldRenderMaterial,
+    ) -> WorldRenderMaterial {
+        material
+    }
+}
+
 /// Floor / ceiling split id for the standard NW→SE diagonal --
 /// the value the cooker stamps when no rotation has been
 /// authored. Mirrors `psxed_format::world::split::NORTH_WEST_SOUTH_EAST`.
@@ -61,9 +173,9 @@ const WALL_UVS: [(u8, u8); 4] = [(0, TILE_UV), (TILE_UV, TILE_UV), (TILE_UV, 0),
 /// Position the camera target at the room's centre -- typically
 /// `(W*S/2, 0, D*S/2)` -- so the orbit lands on the geometry.
 ///
-/// `options` carries the depth band + range; the helper flips
-/// only `cull_mode` per face kind: floors and ceilings use
-/// [`CullMode::None`], walls use [`CullMode::Back`].
+/// `options` carries the depth band + range. Per-material
+/// [`SurfaceSidedness`] selects front-only, back-only, or
+/// double-sided emission; front-sided faces use [`CullMode::Back`].
 ///
 /// # Quad corner conventions
 ///
@@ -73,18 +185,43 @@ const WALL_UVS: [(u8, u8); 4] = [(0, TILE_UV), (TILE_UV, TILE_UV), (TILE_UV, 0),
 /// so corner positions and UVs must agree on what `0`, `1`, `2`,
 /// `3` mean.
 ///
-/// * **Floors / ceilings** -- `[NW, NE, SE, SW]`. UVs match in the
-///   same order: `[(0,0), (T,0), (T,T), (0,T)]`.
-/// * **Walls** -- `[bottom-left, bottom-right, top-right, top-left]`,
-///   measured from inside the cell looking at the wall. UVs match:
-///   `[(0,T), (T,T), (T,0), (0,0)]`.
+/// * **Floors / ceilings** -- records store `[NW, NE, SE, SW]`.
+///   Floors keep that top-facing winding; ceilings flip to the
+///   inward underside winding. UVs are transformed with the vertices.
+/// * **Walls** -- runtime records store `[bottom-left, bottom-right,
+///   top-right, top-left]` for an owning cell edge. The renderer flips
+///   that to inward-facing winding before culling while keeping the same
+///   physical UV mapping.
 ///
 /// [`SectorRender::floor_material`]: crate::SectorRender::floor_material
 /// [`SectorRender::ceiling_material`]: crate::SectorRender::ceiling_material
 /// [`WallRender::material`]: crate::WallRender::material
 pub fn draw_room<const OT: usize>(
     room: RoomRender<'_, '_>,
-    materials: &[TextureMaterial],
+    materials: &[WorldRenderMaterial],
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) {
+    draw_room_lit(
+        room,
+        materials,
+        &NoWorldSurfaceLighting,
+        camera,
+        options,
+        triangles,
+        world,
+    );
+}
+
+/// Draw a room while giving the caller one material-shading hook per
+/// emitted floor, ceiling, and wall surface.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_room_lit<const OT: usize, L: WorldSurfaceLighting>(
+    room: RoomRender<'_, '_>,
+    materials: &[WorldRenderMaterial],
+    lighting: &L,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -99,7 +236,21 @@ pub fn draw_room<const OT: usize>(
 
             if sector.has_floor() {
                 if let Some(slot) = sector.floor_material() {
-                    if let Some(&material) = materials.get(slot as usize) {
+                    if let Some(&base_material) = materials.get(slot as usize) {
+                        let material = lighting.shade(
+                            WorldSurfaceSample {
+                                kind: WorldSurfaceKind::Floor,
+                                sx,
+                                sz,
+                                center: horizontal_face_center(
+                                    sx,
+                                    sz,
+                                    sector_size,
+                                    sector.floor_heights(),
+                                ),
+                            },
+                            base_material,
+                        );
                         emit_floor(
                             sx,
                             sz,
@@ -118,7 +269,21 @@ pub fn draw_room<const OT: usize>(
 
             if sector.has_ceiling() {
                 if let Some(slot) = sector.ceiling_material() {
-                    if let Some(&material) = materials.get(slot as usize) {
+                    if let Some(&base_material) = materials.get(slot as usize) {
+                        let material = lighting.shade(
+                            WorldSurfaceSample {
+                                kind: WorldSurfaceKind::Ceiling,
+                                sx,
+                                sz,
+                                center: horizontal_face_center(
+                                    sx,
+                                    sz,
+                                    sector_size,
+                                    sector.ceiling_heights(),
+                                ),
+                            },
+                            base_material,
+                        );
                         emit_ceiling(
                             sx,
                             sz,
@@ -138,7 +303,24 @@ pub fn draw_room<const OT: usize>(
             let mut i = 0;
             while i < sector.wall_count() {
                 if let Some(wall) = room.sector_wall(sector, i) {
-                    if let Some(&material) = materials.get(wall.material() as usize) {
+                    if let Some(&base_material) = materials.get(wall.material() as usize) {
+                        let Some(center) =
+                            wall_face_center(sx, sz, sector_size, wall.direction(), wall.heights())
+                        else {
+                            i += 1;
+                            continue;
+                        };
+                        let material = lighting.shade(
+                            WorldSurfaceSample {
+                                kind: WorldSurfaceKind::Wall {
+                                    direction: wall.direction(),
+                                },
+                                sx,
+                                sz,
+                                center,
+                            },
+                            base_material,
+                        );
                         emit_wall(
                             sx,
                             sz,
@@ -159,13 +341,8 @@ pub fn draw_room<const OT: usize>(
     }
 }
 
-/// Emit one floor quad. Corners feed the renderer in
-/// `[NW, NE, SE, SW]` order, which matches the heights array
-/// the cooker stores. `split` picks the diagonal: `0` keeps
-/// the default NW→SE split (`submit_textured_quad`'s 0–2
-/// diagonal); `1` swaps to NE→SW so an authored sector with a
-/// rotated split renders the same triangulation the cooker +
-/// collision view see.
+/// Emit one floor quad. Cooked corners are `[NW, NE, SE, SW]`,
+/// which already faces upward into playable space.
 #[allow(clippy::too_many_arguments)]
 fn emit_floor<const OT: usize>(
     sx: u16,
@@ -173,7 +350,7 @@ fn emit_floor<const OT: usize>(
     sector_size: i32,
     heights: [i32; 4],
     split: u8,
-    material: TextureMaterial,
+    material: WorldRenderMaterial,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -189,7 +366,7 @@ fn emit_floor<const OT: usize>(
     submit_split_quad(
         camera,
         options,
-        CullMode::None,
+        CullMode::Back,
         material,
         verts,
         FLOOR_UVS,
@@ -199,11 +376,9 @@ fn emit_floor<const OT: usize>(
     );
 }
 
-/// Emit one ceiling quad. Same `[NW, NE, SE, SW]` height order
-/// as the floor -- culling is left off so the inward face draws
-/// regardless of winding orientation. Once the cooker emits
-/// inward-facing winding consistently, this can flip to
-/// `CullMode::Back` for free.
+/// Emit one ceiling quad. Cooked corners are `[NW, NE, SE, SW]`;
+/// runtime flips them so front-sided ceilings face the room
+/// interior/underside.
 #[allow(clippy::too_many_arguments)]
 fn emit_ceiling<const OT: usize>(
     sx: u16,
@@ -211,26 +386,26 @@ fn emit_ceiling<const OT: usize>(
     sector_size: i32,
     heights: [i32; 4],
     split: u8,
-    material: TextureMaterial,
+    material: WorldRenderMaterial,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT>,
 ) {
     let (x0, x1, z0, z1) = cell_bounds(sx, sz, sector_size);
-    let verts = [
+    let verts = reverse_quad_winding([
         WorldVertex::new(x0, heights[0], z0),
         WorldVertex::new(x1, heights[1], z0),
         WorldVertex::new(x1, heights[2], z1),
         WorldVertex::new(x0, heights[3], z1),
-    ];
+    ]);
     submit_split_quad(
         camera,
         options,
-        CullMode::None,
+        CullMode::Back,
         material,
         verts,
-        FLOOR_UVS,
+        reverse_quad_winding(FLOOR_UVS),
         split,
         triangles,
         world,
@@ -248,39 +423,14 @@ fn emit_wall<const OT: usize>(
     sector_size: i32,
     direction: u8,
     heights: [i32; 4],
-    material: TextureMaterial,
+    material: WorldRenderMaterial,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT>,
 ) {
-    let (x0, x1, z0, z1) = cell_bounds(sx, sz, sector_size);
-    let verts = match direction {
-        DIR_NORTH => [
-            WorldVertex::new(x0, heights[0], z0),
-            WorldVertex::new(x1, heights[1], z0),
-            WorldVertex::new(x1, heights[2], z0),
-            WorldVertex::new(x0, heights[3], z0),
-        ],
-        DIR_EAST => [
-            WorldVertex::new(x1, heights[0], z0),
-            WorldVertex::new(x1, heights[1], z1),
-            WorldVertex::new(x1, heights[2], z1),
-            WorldVertex::new(x1, heights[3], z0),
-        ],
-        DIR_SOUTH => [
-            WorldVertex::new(x1, heights[0], z1),
-            WorldVertex::new(x0, heights[1], z1),
-            WorldVertex::new(x0, heights[2], z1),
-            WorldVertex::new(x1, heights[3], z1),
-        ],
-        DIR_WEST => [
-            WorldVertex::new(x0, heights[0], z1),
-            WorldVertex::new(x0, heights[1], z0),
-            WorldVertex::new(x0, heights[2], z0),
-            WorldVertex::new(x0, heights[3], z1),
-        ],
-        _ => return,
+    let Some(verts) = inward_wall_vertices(sx, sz, sector_size, direction, heights) else {
+        return;
     };
     submit_quad(
         camera,
@@ -288,7 +438,7 @@ fn emit_wall<const OT: usize>(
         CullMode::Back,
         material,
         verts,
-        WALL_UVS,
+        inward_wall_uvs(),
         triangles,
         world,
     );
@@ -303,7 +453,7 @@ fn submit_quad<const OT: usize>(
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
     cull: CullMode,
-    material: TextureMaterial,
+    material: WorldRenderMaterial,
     verts: [WorldVertex; 4],
     uvs: [(u8, u8); 4],
     triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -312,8 +462,7 @@ fn submit_quad<const OT: usize>(
     let Some(projected) = camera.project_world_quad(verts) else {
         return;
     };
-    let opts = options.with_cull_mode(cull).with_material_layer(material);
-    let _ = world.submit_textured_quad(triangles, projected, uvs, material, opts);
+    submit_sided_projected_quad(world, triangles, projected, uvs, material, options, cull);
 }
 
 /// Project + submit a split-aware textured quad. `split == 0`
@@ -327,7 +476,7 @@ fn submit_split_quad<const OT: usize>(
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
     cull: CullMode,
-    material: TextureMaterial,
+    material: WorldRenderMaterial,
     verts: [WorldVertex; 4],
     uvs: [(u8, u8); 4],
     split: u8,
@@ -342,16 +491,23 @@ fn submit_split_quad<const OT: usize>(
         );
         return;
     }
-    let Some(projected) = camera.project_world_quad(verts) else {
+    let Some(mut projected) = camera.project_world_quad(verts) else {
         return;
     };
-    let opts = options.with_cull_mode(cull).with_material_layer(material);
+    let mut uvs = uvs;
+    if material.sidedness == SurfaceSidedness::Back {
+        projected = reverse_quad_winding(projected);
+        uvs = reverse_quad_winding(uvs);
+    }
+    let opts = options
+        .with_cull_mode(cull_for_sidedness(material.sidedness, cull))
+        .with_material_layer(material.texture);
     let [(a, b, c), (d, e, f)] = SPLIT_NE_SW_TRIANGLES;
     let stats = world.submit_textured_triangle(
         triangles,
         [projected[a], projected[b], projected[c]],
         [uvs[a], uvs[b], uvs[c]],
-        material,
+        material.texture,
         opts,
     );
     if stats.primitive_overflow || stats.command_overflow {
@@ -361,9 +517,35 @@ fn submit_split_quad<const OT: usize>(
         triangles,
         [projected[d], projected[e], projected[f]],
         [uvs[d], uvs[e], uvs[f]],
-        material,
+        material.texture,
         opts,
     );
+}
+
+fn submit_sided_projected_quad<const OT: usize>(
+    world: &mut WorldRenderPass<'_, '_, OT>,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
+    verts: [crate::render3d::ProjectedVertex; 4],
+    uvs: [(u8, u8); 4],
+    material: WorldRenderMaterial,
+    options: WorldSurfaceOptions,
+    base_cull: CullMode,
+) {
+    let (verts, uvs) = match material.sidedness {
+        SurfaceSidedness::Back => (reverse_quad_winding(verts), reverse_quad_winding(uvs)),
+        SurfaceSidedness::Front | SurfaceSidedness::Both => (verts, uvs),
+    };
+    let opts = options
+        .with_cull_mode(cull_for_sidedness(material.sidedness, base_cull))
+        .with_material_layer(material.texture);
+    let _ = world.submit_textured_quad(triangles, verts, uvs, material.texture, opts);
+}
+
+const fn cull_for_sidedness(sidedness: SurfaceSidedness, base: CullMode) -> CullMode {
+    match sidedness {
+        SurfaceSidedness::Both => CullMode::None,
+        SurfaceSidedness::Front | SurfaceSidedness::Back => base,
+    }
 }
 
 /// Triangle index pairs used when a sector authors the
@@ -407,9 +589,81 @@ const fn cell_bounds(sx: u16, sz: u16, sector_size: i32) -> (i32, i32, i32, i32)
     (x0, x1, z0, z1)
 }
 
+fn horizontal_face_center(sx: u16, sz: u16, sector_size: i32, heights: [i32; 4]) -> WorldVertex {
+    let (x0, x1, z0, z1) = cell_bounds(sx, sz, sector_size);
+    let cy = average4_i32(heights[0], heights[1], heights[2], heights[3]);
+    WorldVertex::new((x0 + x1) / 2, cy, (z0 + z1) / 2)
+}
+
+fn wall_face_center(
+    sx: u16,
+    sz: u16,
+    sector_size: i32,
+    direction: u8,
+    heights: [i32; 4],
+) -> Option<WorldVertex> {
+    let verts = inward_wall_vertices(sx, sz, sector_size, direction, heights)?;
+    Some(WorldVertex::new(
+        average4_i32(verts[0].x, verts[1].x, verts[2].x, verts[3].x),
+        average4_i32(verts[0].y, verts[1].y, verts[2].y, verts[3].y),
+        average4_i32(verts[0].z, verts[1].z, verts[2].z, verts[3].z),
+    ))
+}
+
+fn average4_i32(a: i32, b: i32, c: i32, d: i32) -> i32 {
+    a.saturating_add(b).saturating_add(c).saturating_add(d) / 4
+}
+
+fn inward_wall_vertices(
+    sx: u16,
+    sz: u16,
+    sector_size: i32,
+    direction: u8,
+    heights: [i32; 4],
+) -> Option<[WorldVertex; 4]> {
+    let (x0, x1, z0, z1) = cell_bounds(sx, sz, sector_size);
+    let bl_br_tr_tl = match direction {
+        DIR_NORTH => [
+            WorldVertex::new(x0, heights[0], z0),
+            WorldVertex::new(x1, heights[1], z0),
+            WorldVertex::new(x1, heights[2], z0),
+            WorldVertex::new(x0, heights[3], z0),
+        ],
+        DIR_EAST => [
+            WorldVertex::new(x1, heights[0], z0),
+            WorldVertex::new(x1, heights[1], z1),
+            WorldVertex::new(x1, heights[2], z1),
+            WorldVertex::new(x1, heights[3], z0),
+        ],
+        DIR_SOUTH => [
+            WorldVertex::new(x1, heights[0], z1),
+            WorldVertex::new(x0, heights[1], z1),
+            WorldVertex::new(x0, heights[2], z1),
+            WorldVertex::new(x1, heights[3], z1),
+        ],
+        DIR_WEST => [
+            WorldVertex::new(x0, heights[0], z1),
+            WorldVertex::new(x0, heights[1], z0),
+            WorldVertex::new(x0, heights[2], z0),
+            WorldVertex::new(x0, heights[3], z1),
+        ],
+        _ => return None,
+    };
+    Some(reverse_quad_winding(bl_br_tr_tl))
+}
+
+fn inward_wall_uvs() -> [(u8, u8); 4] {
+    reverse_quad_winding(WALL_UVS)
+}
+
+fn reverse_quad_winding<T: Copy>(corners: [T; 4]) -> [T; 4] {
+    [corners[0], corners[3], corners[2], corners[1]]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ProjectedVertex, WorldProjection};
 
     /// Helper: the two indices both triangles in `[t0, t1]`
     /// share form the diagonal of the split. Returned sorted
@@ -478,5 +732,104 @@ mod tests {
             }
             assert!(seen.iter().all(|&v| v), "split {split} misses a corner");
         }
+    }
+
+    #[test]
+    fn cardinal_walls_face_their_owning_cell() {
+        let projection = WorldProjection::new(160, 120, 200, 16);
+        let y = 512;
+        let center = WorldVertex::new(512, y, 512);
+        let cases = [
+            (
+                DIR_NORTH,
+                WorldCamera::from_basis(projection, center, 0, 4096, 0, 4096),
+            ),
+            (
+                DIR_EAST,
+                WorldCamera::from_basis(projection, center, -4096, 0, 0, 4096),
+            ),
+            (
+                DIR_SOUTH,
+                WorldCamera::from_basis(projection, center, 0, -4096, 0, 4096),
+            ),
+            (
+                DIR_WEST,
+                WorldCamera::from_basis(projection, center, 4096, 0, 0, 4096),
+            ),
+        ];
+
+        for (direction, camera) in cases {
+            let verts = inward_wall_vertices(0, 0, 1024, direction, [0, 0, 1024, 1024])
+                .expect("cardinal wall");
+            let projected = camera
+                .project_world_quad(verts)
+                .expect("wall projects from owning cell");
+            for (a, b, c) in SPLIT_NW_SE_TRIANGLES {
+                assert!(
+                    projected_triangle_area(projected[a], projected[b], projected[c]) > 0,
+                    "direction {direction} should not be culled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn floors_face_playable_interior() {
+        let projection = WorldProjection::new(160, 120, 200, 16);
+        let camera =
+            WorldCamera::orbit_yaw(projection, WorldVertex::new(512, 0, 512), 1100, 2048, 0);
+        let verts = [
+            WorldVertex::new(0, 0, 0),
+            WorldVertex::new(1024, 0, 0),
+            WorldVertex::new(1024, 0, 1024),
+            WorldVertex::new(0, 0, 1024),
+        ];
+        let projected = camera
+            .project_world_quad(verts)
+            .expect("floor projects from playable camera");
+
+        for (a, b, c) in SPLIT_NW_SE_TRIANGLES {
+            let area = projected_triangle_area(projected[a], projected[b], projected[c]);
+            assert!(
+                area > 0,
+                "floor should not be culled from above: area={area} projected={projected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wall_uvs_follow_the_reversed_winding() {
+        assert_eq!(
+            inward_wall_uvs(),
+            [(0, TILE_UV), (0, 0), (TILE_UV, 0), (TILE_UV, TILE_UV)]
+        );
+    }
+
+    #[test]
+    fn horizontal_face_center_uses_cell_midpoint_and_average_height() {
+        assert_eq!(
+            horizontal_face_center(2, 3, 1024, [0, 512, 1024, 512]),
+            WorldVertex::new(2560, 512, 3584)
+        );
+    }
+
+    #[test]
+    fn wall_face_center_uses_emitted_runtime_wall_geometry() {
+        assert_eq!(
+            wall_face_center(0, 0, 1024, DIR_EAST, [0, 0, 1024, 1024]),
+            Some(WorldVertex::new(1024, 512, 512))
+        );
+        assert_eq!(
+            wall_face_center(0, 0, 1024, DIR_NORTH, [0, 0, 1024, 1024]),
+            Some(WorldVertex::new(512, 512, 0))
+        );
+    }
+
+    fn projected_triangle_area(a: ProjectedVertex, b: ProjectedVertex, c: ProjectedVertex) -> i32 {
+        let ax = (b.sx as i32) - (a.sx as i32);
+        let ay = (b.sy as i32) - (a.sy as i32);
+        let bx = (c.sx as i32) - (a.sx as i32);
+        let by = (c.sy as i32) - (a.sy as i32);
+        ax * by - ay * bx
     }
 }

@@ -484,8 +484,7 @@ impl Cpu {
         }
         let pc = self.pc & ((memory::ram::SIZE as u32) - 1);
         let call = self.gpr(9) & 0xFF;
-        let is_stdout_write =
-            (pc == 0xA0 && call == 0x03) || (pc == 0xB0 && call == 0x35);
+        let is_stdout_write = (pc == 0xA0 && call == 0x03) || (pc == 0xB0 && call == 0x35);
         if is_stdout_write && self.gpr(4) == 1 {
             self.set_gpr(2, self.gpr(6));
         }

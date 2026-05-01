@@ -31,20 +31,21 @@ extern crate psx_rt;
 
 use psx_asset::{Animation, Model, Texture, World as AssetWorld};
 use psx_engine::{
-    button, draw_room, App, CharacterMotorAnim, CharacterMotorConfig, CharacterMotorInput,
-    CharacterMotorState, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange,
-    JointViewTransform, Mat3I16, OtFrame, PrimitiveArena, ProjectedVertex, RuntimeRoom, Scene,
-    ThirdPersonCameraConfig, ThirdPersonCameraInput, ThirdPersonCameraState, ThirdPersonCameraTarget,
-    WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
-    WorldVertex,
+    button, draw_room_lit, shade_tint_with_lights, App, CharacterMotorAnim, CharacterMotorConfig,
+    CharacterMotorInput, CharacterMotorState, Config, Ctx, CullMode, DepthBand, DepthPolicy,
+    DepthRange, JointViewTransform, Mat3I16, OtFrame, PointLightSample, PrimitiveArena,
+    ProjectedVertex, RuntimeRoom, Scene, ThirdPersonCameraConfig, ThirdPersonCameraInput,
+    ThirdPersonCameraState, ThirdPersonCameraTarget, WorldCamera, WorldProjection,
+    WorldRenderMaterial, WorldRenderPass, WorldSurfaceLighting, WorldSurfaceOptions,
+    WorldSurfaceSample, WorldTriCommand, WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{draw_quad_flat, material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_gte::transform::{cos_1_3_12, sin_1_3_12};
 use psx_level::{
     find_asset_of_kind, AssetId, AssetKind, EntityRecord, LevelCharacterRecord,
-    LevelMaterialRecord, LevelRoomRecord, ResidencyManager, CHARACTER_CLIP_NONE,
-    MODEL_CLIP_INHERIT,
+    LevelMaterialRecord, LevelMaterialSidedness, LevelModelRecord, LevelRoomRecord,
+    ResidencyManager, CHARACTER_CLIP_NONE, MODEL_CLIP_INHERIT,
 };
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
@@ -145,7 +146,7 @@ const FALLBACK_PLAYER_YAW_STEP: u16 = 32;
 const FALLBACK_PLAYER_SPEED: i32 = 32;
 const RUN_BUTTON: u16 = button::CIRCLE;
 
-const OT_DEPTH: usize = 64;
+const OT_DEPTH: usize = 512;
 const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 1);
 const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, FAR_Z);
 
@@ -174,6 +175,13 @@ const MODEL_VERTEX_CAP: usize = 1024;
 const JOINT_CAP: usize = 32;
 /// Cap on placed model instances rendered per frame.
 const MAX_MODEL_INSTANCES: usize = 16;
+/// Runtime model cache capacity. The current playtest package only
+/// needs one player model, but this keeps a little headroom for
+/// lightweight NPC experiments without introducing heap allocation.
+const MAX_RUNTIME_MODELS: usize = 8;
+/// Runtime animation cache capacity. Matches the residency table
+/// scale and avoids reparsing `.psxanim` headers per frame.
+const MAX_RUNTIME_MODEL_CLIPS: usize = 32;
 
 /// Marker visualization tuning. Markers are debug stubs -- keep
 /// them visible at orbit-camera scales without dominating the
@@ -181,8 +189,6 @@ const MAX_MODEL_INSTANCES: usize = 16;
 const MARKER_HALF: i32 = 96;
 const MARKER_LIFT: i32 = MARKER_HALF;
 const MARKER_TINT: (u8, u8, u8) = (0xff, 0xa8, 0x40);
-const ROOM_LIGHT_MAX_Q8: u32 = 144;
-
 const TRI_ZERO: TriTextured = TriTextured::new(
     [(0, 0), (0, 0), (0, 0)],
     [(0, 0), (0, 0), (0, 0)],
@@ -328,6 +334,51 @@ impl RuntimeCharacter {
     }
 }
 
+/// Parsed, VRAM-bound model payload ready for the hot render path.
+#[derive(Copy, Clone)]
+struct RuntimeModelAsset {
+    model: Model<'static>,
+    material: TextureMaterial,
+    clip_first: u16,
+    clip_count: u16,
+    default_clip: u16,
+    world_height: u16,
+}
+
+impl RuntimeModelAsset {
+    fn from_record(record: &LevelModelRecord) -> Option<Self> {
+        let mesh_asset = find_asset_of_kind(ASSETS, record.mesh_asset, AssetKind::ModelMesh)?;
+        let model = Model::from_bytes(mesh_asset.bytes).ok()?;
+        let texture_asset = record.texture_asset?;
+        let atlas_asset = find_asset_of_kind(ASSETS, texture_asset, AssetKind::Texture)?;
+        let atlas_slot = ensure_model_atlas_uploaded(atlas_asset.id, atlas_asset.bytes)?;
+        Some(Self {
+            model,
+            material: TextureMaterial::opaque(
+                atlas_slot.clut_word,
+                atlas_slot.tpage_word,
+                (0x80, 0x80, 0x80),
+            ),
+            clip_first: record.clip_first,
+            clip_count: record.clip_count,
+            default_clip: record.default_clip,
+            world_height: record.world_height,
+        })
+    }
+
+    fn clip(
+        self,
+        clips: &[Option<Animation<'static>>; MAX_RUNTIME_MODEL_CLIPS],
+        local_clip: u16,
+    ) -> Option<Animation<'static>> {
+        if local_clip >= self.clip_count {
+            return None;
+        }
+        let index = self.clip_first as usize + local_clip as usize;
+        clips.get(index).copied().flatten()
+    }
+}
+
 struct Playtest {
     /// Active room. `None` until `init` runs and only `Some`
     /// when the manifest had at least one room and its bytes
@@ -339,7 +390,7 @@ struct Playtest {
     /// Active room's material table, ordered by `local_slot`.
     /// Indexed directly by the slot value the cooked `.psxw`
     /// stores per face.
-    materials: [Option<TextureMaterial>; MAX_ROOM_MATERIALS],
+    materials: [Option<WorldRenderMaterial>; MAX_ROOM_MATERIALS],
     /// `materials[..material_count]` is the in-use slice; rest
     /// is `None`.
     material_count: usize,
@@ -379,6 +430,10 @@ struct Playtest {
     spawn: WorldVertex,
     /// Font atlas used for the analog-mode required prompt.
     font: Option<FontAtlas>,
+    /// Parsed models/materials, built once at init.
+    models: [Option<RuntimeModelAsset>; MAX_RUNTIME_MODELS],
+    /// Parsed animations, indexed like `MODEL_CLIPS`.
+    clips: [Option<Animation<'static>>; MAX_RUNTIME_MODEL_CLIPS],
 }
 
 impl Playtest {
@@ -402,6 +457,8 @@ impl Playtest {
             soft_lock_suppressed: false,
             spawn: WorldVertex::ZERO,
             font: None,
+            models: [const { None }; MAX_RUNTIME_MODELS],
+            clips: [const { None }; MAX_RUNTIME_MODEL_CLIPS],
         }
     }
 }
@@ -439,22 +496,8 @@ impl Scene for Playtest {
         // of MATERIALS. For each entry: ensure VRAM-resident
         // (uploading on first sight), then build the
         // TextureMaterial referencing the slot's CLUT/tpage.
-        // Pass parsed room dimensions through so room-level
-        // lighting samples the *actual* room centre -- not the
-        // authored origin, which would land outside the room
-        // on any non-1×1 grid.
-        let room_dims = self
-            .room
-            .map(|r| {
-                let render = r.render();
-                RoomDims {
-                    width: render.width(),
-                    depth: render.depth(),
-                    sector_size: render.sector_size(),
-                }
-            })
-            .unwrap_or(RoomDims::ZERO);
-        self.material_count = build_room_materials(room_record, room_dims, 0, &mut self.materials);
+        self.material_count = build_room_materials(room_record, &mut self.materials);
+        self.load_runtime_models();
 
         // Player init: prefer PLAYER_CONTROLLER (cook output)
         // for spawn + character; fall back to the bare
@@ -563,15 +606,17 @@ impl Scene for Playtest {
 
         let mut ot = unsafe { OtFrame::begin(&mut OT) };
         let mut triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_TRIS) };
-        let mut world = unsafe { WorldRenderPass::new(&mut ot, &mut WORLD_COMMANDS) };
+        let mut world = unsafe { WorldRenderPass::new_bucketed(&mut ot, &mut WORLD_COMMANDS) };
 
         if let Some(room) = self.room {
             // Pack the materials slice down to a contiguous
-            // `&[TextureMaterial]` indexed by local_slot. Slots
+            // `&[WorldRenderMaterial]` indexed by local_slot. Slots
             // that didn't resolve become a sentinel material --
             // visually obvious without crashing the renderer.
-            let mut bound: [TextureMaterial; MAX_ROOM_MATERIALS] =
-                [TextureMaterial::opaque(0, TPAGE_WORD, (0x80, 0x80, 0x80)); MAX_ROOM_MATERIALS];
+            let mut bound: [WorldRenderMaterial; MAX_ROOM_MATERIALS] = [WorldRenderMaterial::both(
+                TextureMaterial::opaque(0, TPAGE_WORD, (0x80, 0x80, 0x80)),
+            );
+                MAX_ROOM_MATERIALS];
             for i in 0..self.material_count {
                 if let Some(m) = self.materials[i] {
                     bound[i] = m;
@@ -579,9 +624,14 @@ impl Scene for Playtest {
             }
             let materials = &bound[..self.material_count];
             let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE);
-            draw_room(
+            let lighting = RuntimeRoomLighting {
+                room_index: self.room_index,
+                ambient: room.render().ambient_color(),
+            };
+            draw_room_lit(
                 room.render(),
                 materials,
+                &lighting,
                 &camera,
                 options,
                 &mut triangles,
@@ -603,19 +653,19 @@ impl Scene for Playtest {
                 ctx.time.video_hz(),
                 &camera,
                 options,
+                &self.models,
+                &self.clips,
                 &mut triangles,
                 &mut world,
             );
-            // Player draws on top of model instances. Same
-            // `submit_textured_model` path; the scene-tree
-            // duplicate (Wraith MeshInstance at room centre)
-            // is the *placement preview* -- the active player
-            // is the one driven by PLAYER_CONTROLLER and lives
-            // at the player position.
+            // Player draws through the same compact model path as
+            // placed model instances.
             if let Some(character) = self.character {
                 let player = self.motor.position();
                 draw_player(
                     character,
+                    &self.models,
+                    &self.clips,
                     player.x,
                     player.y,
                     player.z,
@@ -638,6 +688,38 @@ impl Scene for Playtest {
 }
 
 impl Playtest {
+    fn load_runtime_models(&mut self) {
+        let mut i = 0;
+        while i < MAX_RUNTIME_MODELS {
+            self.models[i] = None;
+            i += 1;
+        }
+        i = 0;
+        while i < MAX_RUNTIME_MODEL_CLIPS {
+            self.clips[i] = None;
+            i += 1;
+        }
+
+        for (index, clip) in MODEL_CLIPS.iter().enumerate() {
+            if index >= MAX_RUNTIME_MODEL_CLIPS {
+                break;
+            }
+            let Some(asset) =
+                find_asset_of_kind(ASSETS, clip.animation_asset, AssetKind::ModelAnimation)
+            else {
+                continue;
+            };
+            self.clips[index] = Animation::from_bytes(asset.bytes).ok();
+        }
+
+        for (index, record) in MODELS.iter().enumerate() {
+            if index >= MAX_RUNTIME_MODELS {
+                break;
+            }
+            self.models[index] = RuntimeModelAsset::from_record(record);
+        }
+    }
+
     fn motor_config(&self) -> CharacterMotorConfig {
         match self.character {
             Some(c) => c.motor_config(),
@@ -729,32 +811,34 @@ impl Playtest {
         let Some(target) = self.target_position(index) else {
             return false;
         };
-        distance_xz_sq(self.motor.position(), target) <= (range as i64 * range as i64)
+        distance_xz_sq(self.motor.position(), target) <= square_i32_saturating(range)
     }
 
     fn find_best_lock_target(&self, range: i32) -> Option<usize> {
         let player = self.motor.position();
         let view_yaw = self.camera.yaw_q12().wrapping_add(HALF_TURN_Q12);
-        let sin_yaw = sin_1_3_12(view_yaw) as i64;
-        let cos_yaw = cos_1_3_12(view_yaw) as i64;
-        let range_sq = range as i64 * range as i64;
-        let mut best: Option<(usize, i64)> = None;
+        let sin_yaw = sin_1_3_12(view_yaw) as i32;
+        let cos_yaw = cos_1_3_12(view_yaw) as i32;
+        let range_sq = square_i32_saturating(range);
+        let mut best: Option<(usize, i32)> = None;
         for (index, entity) in ENTITIES.iter().enumerate() {
             if entity.room != self.room_index {
                 continue;
             }
             let target = WorldVertex::new(entity.x, entity.y, entity.z);
-            let dx = (target.x - player.x) as i64;
-            let dz = (target.z - player.z) as i64;
-            let dist_sq = dx * dx + dz * dz;
+            let dx = target.x.saturating_sub(player.x);
+            let dz = target.z.saturating_sub(player.z);
+            let dist_sq = square_i32_saturating(dx).saturating_add(square_i32_saturating(dz));
             if dist_sq == 0 || dist_sq > range_sq {
                 continue;
             }
-            let dot = dx * sin_yaw + dz * cos_yaw;
+            let dot = dx
+                .saturating_mul(sin_yaw)
+                .saturating_add(dz.saturating_mul(cos_yaw));
             if dot <= 0 {
                 continue;
             }
-            let score = (dot >> 4) - (dist_sq >> 12);
+            let score = (dot >> 4).saturating_sub(dist_sq >> 12);
             match best {
                 Some((_, best_score)) if best_score >= score => {}
                 _ => best = Some((index, score)),
@@ -796,24 +880,26 @@ impl Playtest {
             return;
         };
         let player = self.motor.position();
-        let current_dx = (current.x - player.x) as i64;
-        let current_dz = (current.z - player.z) as i64;
+        let current_dx = current.x.saturating_sub(player.x);
+        let current_dz = current.z.saturating_sub(player.z);
         if current_dx == 0 && current_dz == 0 {
             return;
         }
-        let range_sq = LOCK_RANGE as i64 * LOCK_RANGE as i64;
-        let mut best: Option<(usize, i64)> = None;
+        let range_sq = square_i32_saturating(LOCK_RANGE);
+        let mut best: Option<(usize, i32)> = None;
         for (index, entity) in ENTITIES.iter().enumerate() {
             if index == current_index || entity.room != self.room_index {
                 continue;
             }
-            let dx = (entity.x - player.x) as i64;
-            let dz = (entity.z - player.z) as i64;
-            let dist_sq = dx * dx + dz * dz;
+            let dx = entity.x.saturating_sub(player.x);
+            let dz = entity.z.saturating_sub(player.z);
+            let dist_sq = square_i32_saturating(dx).saturating_add(square_i32_saturating(dz));
             if dist_sq == 0 || dist_sq > range_sq {
                 continue;
             }
-            let cross = current_dx * dz - current_dz * dx;
+            let cross = current_dx
+                .saturating_mul(dz)
+                .saturating_sub(current_dz.saturating_mul(dx));
             if direction > 0 {
                 if cross >= 0 {
                     continue;
@@ -821,8 +907,10 @@ impl Playtest {
             } else if cross <= 0 {
                 continue;
             }
-            let dot = current_dx * dx + current_dz * dz;
-            let score = ((dot.max(0) << 8) / dist_sq.max(1)) - (dist_sq >> 14);
+            let dot = current_dx
+                .saturating_mul(dx)
+                .saturating_add(current_dz.saturating_mul(dz));
+            let score = ratio_q8_i32(dot.max(0), dist_sq.max(1)).saturating_sub(dist_sq >> 14);
             match best {
                 Some((_, best_score)) if best_score >= score => {}
                 _ => best = Some((index, score)),
@@ -834,8 +922,29 @@ impl Playtest {
     }
 }
 
+fn ratio_q8_i32(numerator: i32, denominator: i32) -> i32 {
+    if numerator <= 0 || denominator <= 0 {
+        return 0;
+    }
+    let numerator = numerator as u32;
+    let denominator = denominator as u32;
+    let whole = numerator / denominator;
+    let remainder = numerator % denominator;
+    let scaled_whole = if whole > (i32::MAX as u32 / 256) {
+        return i32::MAX;
+    } else {
+        whole * 256
+    };
+    let scaled_remainder = remainder.saturating_mul(256) / denominator;
+    scaled_whole
+        .saturating_add(scaled_remainder)
+        .min(i32::MAX as u32) as i32
+}
+
 fn draw_player(
     character: RuntimeCharacter,
+    models: &[Option<RuntimeModelAsset>; MAX_RUNTIME_MODELS],
+    clips: &[Option<Animation<'static>>; MAX_RUNTIME_MODEL_CLIPS],
     x: i32,
     y: i32,
     z: i32,
@@ -849,71 +958,29 @@ fn draw_player(
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
 ) {
-    let model_record = match MODELS.get(character.model as usize) {
-        Some(m) => m,
-        None => return,
+    let Some(runtime_model) = models.get(character.model as usize).copied().flatten() else {
+        return;
     };
-    let mesh_asset = match find_asset_of_kind(ASSETS, model_record.mesh_asset, AssetKind::ModelMesh)
-    {
-        Some(a) => a,
-        None => return,
-    };
-    let model = match Model::from_bytes(mesh_asset.bytes) {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-
-    let atlas_slot = match model_record.texture_asset {
-        Some(id) => match find_asset_of_kind(ASSETS, id, AssetKind::Texture) {
-            Some(asset) => match ensure_model_atlas_uploaded(asset.id, asset.bytes) {
-                Some(slot) => slot,
-                None => return,
-            },
-            None => return,
-        },
-        None => return,
-    };
-    let material = TextureMaterial::opaque(
-        atlas_slot.clut_word,
-        atlas_slot.tpage_word,
-        (0x80, 0x80, 0x80),
-    );
     let model_options = options
         .with_depth_policy(DepthPolicy::Average)
         .with_cull_mode(CullMode::Back)
-        .with_material_layer(material);
+        .with_material_layer(runtime_model.material)
+        .with_textured_triangle_splitting(false);
 
-    if clip_local >= model_record.clip_count {
+    let Some(anim) = runtime_model.clip(clips, clip_local) else {
         return;
-    }
-    let global = (model_record.clip_first + clip_local) as usize;
-    let clip_record = match MODEL_CLIPS.get(global) {
-        Some(c) => c,
-        None => return,
-    };
-    let anim_asset = match find_asset_of_kind(
-        ASSETS,
-        clip_record.animation_asset,
-        AssetKind::ModelAnimation,
-    ) {
-        Some(a) => a,
-        None => return,
-    };
-    let anim = match Animation::from_bytes(anim_asset.bytes) {
-        Ok(a) => a,
-        Err(_) => return,
     };
     // Phase the animation relative to the clip-start tick so
     // state changes don't pop into the middle of a new clip.
     let local_tick = elapsed_vblanks.saturating_sub(anim_start_tick);
     let phase = anim.phase_at_tick_q12(local_tick, video_hz);
 
-    let origin = floor_anchored_model_origin(x, y, z, model_record.world_height);
+    let origin = floor_anchored_model_origin(x, y, z, runtime_model.world_height);
     let instance_rotation = yaw_rotation_matrix(yaw);
 
     let _ = world.submit_textured_model(
         triangles,
-        model,
+        runtime_model.model,
         anim,
         phase,
         *camera,
@@ -921,7 +988,7 @@ fn draw_player(
         instance_rotation,
         unsafe { &mut MODEL_VERTICES },
         unsafe { &mut JOINT_VIEW_TRANSFORMS },
-        material,
+        runtime_model.material,
         model_options,
     );
 }
@@ -935,48 +1002,13 @@ fn draw_player(
 ///
 /// Returns the highest `local_slot + 1` so the caller knows the
 /// in-use prefix length.
-/// Parsed room dimensions in the runtime's preferred shape.
-/// Pulled off `RuntimeRoom` once at init so the per-frame light
-/// sampler can compute the room centre without re-parsing the
-/// `.psxw` blob.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct RoomDims {
-    width: u16,
-    depth: u16,
-    sector_size: i32,
-}
-
-impl RoomDims {
-    /// Sentinel used when the room couldn't be parsed.
-    /// `room_center_world` falls back to the cooked origin in
-    /// that case so an unparseable manifest still picks *some*
-    /// sample point.
-    const ZERO: Self = Self {
-        width: 0,
-        depth: 0,
-        sector_size: 0,
-    };
-}
-
 fn build_room_materials(
     room: &LevelRoomRecord,
-    room_dims: RoomDims,
-    room_index: u16,
-    out: &mut [Option<TextureMaterial>; MAX_ROOM_MATERIALS],
+    out: &mut [Option<WorldRenderMaterial>; MAX_ROOM_MATERIALS],
 ) -> usize {
     let first = room.material_first as usize;
     let count = room.material_count as usize;
     let slice: &[LevelMaterialRecord] = &MATERIALS[first..first + count];
-
-    // Compute a single room-center light contribution and
-    // modulate every material tint by it. Per-face lighting
-    // would need a draw_room change -- for this pass we ship
-    // room-level lighting that honours light colour /
-    // intensity / radius without a renderer rewrite. The
-    // editor preview does per-face lighting so authors still
-    // see spatial variation while authoring.
-    let room_center = room_center_world(room, room_dims);
-    let lit_tint_factor = accumulate_room_light(room_center, room_index);
 
     let mut max_slot: usize = 0;
     for material in slice {
@@ -991,12 +1023,16 @@ fn build_room_materials(
         let Some(slot_record) = ensure_texture_uploaded(asset.id, asset.bytes) else {
             continue;
         };
-        let lit = modulate_tint(material.tint_rgb, lit_tint_factor);
-        out[slot] = Some(TextureMaterial::opaque(
+        let texture = TextureMaterial::opaque(
             slot_record.clut_word,
             slot_record.tpage_word,
-            lit,
-        ));
+            rgb_tuple(material.tint_rgb),
+        );
+        out[slot] = Some(match material.sidedness() {
+            LevelMaterialSidedness::Front => WorldRenderMaterial::front(texture),
+            LevelMaterialSidedness::Back => WorldRenderMaterial::back(texture),
+            LevelMaterialSidedness::Both => WorldRenderMaterial::both(texture),
+        });
         if slot + 1 > max_slot {
             max_slot = slot + 1;
         }
@@ -1004,103 +1040,41 @@ fn build_room_materials(
     max_slot
 }
 
-/// World coords of the room centre. Cooker emits geometry
-/// array-rooted at world `(0, 0)`, so the centre is
-/// `(width * sector_size / 2, 0, depth * sector_size / 2)`.
-/// Without parsed dimensions (placeholder manifest, parse
-/// failure) we fall back to the cooked origin so the sampler
-/// still has *some* sample point.
-fn room_center_world(room: &LevelRoomRecord, dims: RoomDims) -> [i32; 3] {
-    if dims.sector_size <= 0 || (dims.width == 0 && dims.depth == 0) {
-        return [room.origin_x, 0, room.origin_z];
-    }
-    [
-        (dims.width as i32) * dims.sector_size / 2,
-        0,
-        (dims.depth as i32) * dims.sector_size / 2,
-    ]
+#[derive(Copy, Clone)]
+struct RuntimeRoomLighting {
+    room_index: u16,
+    ambient: [u8; 3],
 }
 
-/// Walk every `LIGHTS` record for `room_index` and accumulate
-/// `(R, G, B)` brightness contributions at `world_center`. Each
-/// channel returned is in 0..=ROOM_LIGHT_MAX_Q8 -- neutral light
-/// produces 128 (matching `tint_rgb`'s neutral value); bright
-/// lights get a little headroom without crushing authored textures
-/// to white.
-fn accumulate_room_light(world_center: [i32; 3], room_index: u16) -> (u32, u32, u32) {
-    // Start at neutral 128 so an unlit room is not pitch black.
-    let mut accum: [u32; 3] = [128, 128, 128];
-    for light in LIGHTS {
-        if light.room != room_index {
-            continue;
-        }
-        let dx = (world_center[0] - light.x) as i64;
-        let dy = (world_center[1] - light.y) as i64;
-        let dz = (world_center[2] - light.z) as i64;
-        let d2 = dx * dx + dy * dy + dz * dz;
-        let r = light.radius as i64;
-        if r <= 0 {
-            continue;
-        }
-        let r2 = r * r;
-        if d2 >= r2 {
-            continue;
-        }
-        let d = isqrt(d2);
-        // Linear falloff in Q8: weight = 256 * (r - d) / r.
-        let weight_q8 = (((r - d) << 8) / r) as u32;
-        // intensity_q8 already = intensity × 256.
-        let intensity_q8 = light.intensity_q8 as u32;
-        for c in 0..3 {
-            let contrib = (light.color[c] as u32) * intensity_q8 / 256 * weight_q8 / 256;
-            accum[c] = accum[c].saturating_add(contrib);
-        }
+impl WorldSurfaceLighting for RuntimeRoomLighting {
+    fn shade(
+        &self,
+        sample: WorldSurfaceSample,
+        material: WorldRenderMaterial,
+    ) -> WorldRenderMaterial {
+        let lights = LIGHTS
+            .iter()
+            .filter(|light| light.room == self.room_index)
+            .map(|light| {
+                PointLightSample::from_color_intensity_q8(
+                    [light.x, light.y, light.z],
+                    light.radius as i32,
+                    light.color,
+                    light.intensity_q8 as u32,
+                )
+            });
+        let tint = shade_tint_with_lights(
+            material.texture.tint(),
+            [sample.center.x, sample.center.y, sample.center.z],
+            self.ambient,
+            lights,
+        );
+        material.with_tint(tint)
     }
-    (
-        accum[0].min(ROOM_LIGHT_MAX_Q8),
-        accum[1].min(ROOM_LIGHT_MAX_Q8),
-        accum[2].min(ROOM_LIGHT_MAX_Q8),
-    )
 }
 
-/// Multiply a base tint (`128 = neutral`) by a Q8 lighting
-/// factor, clamping to 8-bit. Output goes straight into
-/// `TextureMaterial::opaque`.
-fn modulate_tint(base: [u8; 3], factor: (u32, u32, u32)) -> (u8, u8, u8) {
-    let mod_channel = |b: u8, f: u32| -> u8 {
-        let scaled = (b as u32) * f / 128;
-        scaled.min(255) as u8
-    };
-    (
-        mod_channel(base[0], factor.0),
-        mod_channel(base[1], factor.1),
-        mod_channel(base[2], factor.2),
-    )
-}
-
-/// Simple integer square root for `i64` -- same shape as the
-/// host editor's helper; needed because `f32` would drag in
-/// libm on the no_std target.
-fn isqrt(value: i64) -> i64 {
-    if value <= 0 {
-        return 0;
-    }
-    let mut x = value as u64;
-    let mut r: u64 = 0;
-    let mut bit: u64 = 1u64 << 62;
-    while bit > x {
-        bit >>= 2;
-    }
-    while bit != 0 {
-        if x >= r + bit {
-            x -= r + bit;
-            r = (r >> 1) + bit;
-        } else {
-            r >>= 1;
-        }
-        bit >>= 2;
-    }
-    r as i64
+const fn rgb_tuple(rgb: [u8; 3]) -> (u8, u8, u8) {
+    (rgb[0], rgb[1], rgb[2])
 }
 
 /// Upload `asset_bytes` to VRAM if not already resident; return
@@ -1247,14 +1221,10 @@ fn ensure_model_atlas_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<
     Some(slot)
 }
 
-/// Animate + render every placed model instance whose owning
-/// room matches `current_room`. Each instance:
-/// 1. parses its `LevelModelRecord` mesh asset bytes;
-/// 2. parses its current clip's `.psxanim` bytes (or holds bind
-///    pose if the model has no clips / clip out of range);
-/// 3. ensures the atlas is VRAM-resident;
-/// 4. runs the GTE-driven `submit_textured_model` path with a
-///    transform anchored at `(instance.x, instance.y, instance.z)`.
+/// Animate + render placed model instances whose owning room matches
+/// `current_room`. Meshes, clips, and atlas materials are resolved by
+/// `load_runtime_models` once at init; the frame path only chooses
+/// phase + transform and submits packets.
 ///
 /// Errors (parse failure, missing asset) skip the instance
 /// rather than crashing.
@@ -1264,6 +1234,8 @@ fn draw_model_instances(
     video_hz: u16,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
+    models: &[Option<RuntimeModelAsset>; MAX_RUNTIME_MODELS],
+    clips: &[Option<Animation<'static>>; MAX_RUNTIME_MODEL_CLIPS],
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
 ) {
@@ -1272,80 +1244,40 @@ fn draw_model_instances(
         if inst.room != current_room || drawn >= MAX_MODEL_INSTANCES {
             continue;
         }
-        let model_record = match MODELS.get(inst.model as usize) {
-            Some(m) => m,
-            None => continue,
+        let Some(runtime_model) = models.get(inst.model as usize).copied().flatten() else {
+            continue;
         };
-        let mesh_asset =
-            match find_asset_of_kind(ASSETS, model_record.mesh_asset, AssetKind::ModelMesh) {
-                Some(a) => a,
-                None => continue,
-            };
-        let model = match Model::from_bytes(mesh_asset.bytes) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        // Atlas: cooker validation guarantees `texture_asset` is
-        // `Some` for every placed model -- runtime treats a `None`
-        // as a stale manifest and skips rather than crashing.
-        let atlas_slot = match model_record.texture_asset {
-            Some(id) => match find_asset_of_kind(ASSETS, id, AssetKind::Texture) {
-                Some(asset) => match ensure_model_atlas_uploaded(asset.id, asset.bytes) {
-                    Some(slot) => slot,
-                    None => continue,
-                },
-                None => continue,
-            },
-            None => continue,
-        };
-        let material = TextureMaterial::opaque(
-            atlas_slot.clut_word,
-            atlas_slot.tpage_word,
-            (0x80, 0x80, 0x80),
-        );
         let model_options = options
             .with_depth_policy(DepthPolicy::Average)
             .with_cull_mode(CullMode::Back)
-            .with_material_layer(material);
+            .with_material_layer(runtime_model.material)
+            .with_textured_triangle_splitting(false);
 
         // Clip resolution: per-instance override → model default.
         // The cooker validates that both end up `< clip_count`,
         // so by the time we get here `clip_local` is in-range.
         let clip_local = if inst.clip == MODEL_CLIP_INHERIT {
-            model_record.default_clip
+            runtime_model.default_clip
         } else {
             inst.clip
         };
-        if clip_local >= model_record.clip_count {
-            // Defensive -- cooker guarantees this won't happen.
-            continue;
-        }
-        let global = (model_record.clip_first + clip_local) as usize;
-        let clip_record = &MODEL_CLIPS[global];
-        let Some(anim_asset) = find_asset_of_kind(
-            ASSETS,
-            clip_record.animation_asset,
-            AssetKind::ModelAnimation,
-        ) else {
-            continue;
-        };
-        let Ok(anim) = Animation::from_bytes(anim_asset.bytes) else {
+        let Some(anim) = runtime_model.clip(clips, clip_local) else {
             continue;
         };
         let phase = anim.phase_at_tick_q12(elapsed_vblanks, video_hz);
 
         // Authored instance positions are floor anchors; cooked
         // model vertices are centred around their bounds.
-        let origin = floor_anchored_model_origin(inst.x, inst.y, inst.z, model_record.world_height);
+        let origin =
+            floor_anchored_model_origin(inst.x, inst.y, inst.z, runtime_model.world_height);
         // Instance Y-axis rotation from authored yaw. PSX angle
         // units (4096 per turn) → Q12 sin/cos via the existing
         // GTE shim, then composed into a rotation matrix.
         let instance_rotation = yaw_rotation_matrix(inst.yaw as u16);
 
-        let stats = world.submit_textured_model(
+        let stats = world.submit_textured_model_primary_joints(
             triangles,
-            model,
+            runtime_model.model,
             anim,
             phase,
             *camera,
@@ -1353,7 +1285,7 @@ fn draw_model_instances(
             instance_rotation,
             unsafe { &mut MODEL_VERTICES },
             unsafe { &mut JOINT_VIEW_TRANSFORMS },
-            material,
+            runtime_model.material,
             model_options,
         );
         if stats.primitive_overflow || stats.command_overflow {
@@ -1392,7 +1324,7 @@ fn model_origin_floor_lift(world_height: u16) -> i32 {
 /// needing a dedicated texture upload.
 fn draw_entity_markers(
     entities: &[EntityRecord],
-    materials: &[TextureMaterial],
+    materials: &[WorldRenderMaterial],
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -1404,7 +1336,7 @@ fn draw_entity_markers(
     // Reuse the room's first material so we don't need a
     // dedicated marker texture. Tint override picks up the
     // existing CLUT + tpage but recolours.
-    let base = materials[0];
+    let base = materials[0].texture;
     let material = TextureMaterial::opaque(base.clut_word(), base.tpage_word(), MARKER_TINT);
     let opts = options.with_material_layer(material);
     const UVS: [(u8, u8); 4] = [(0, 0), (64, 0), (64, 64), (0, 64)];

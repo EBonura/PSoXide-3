@@ -228,8 +228,7 @@ impl CharacterMotorState {
             } else {
                 config.walk_speed
             };
-            let speed = ((base_speed as i64 * move_mag_q12 as i64) >> 12)
-                .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            let speed = q12_mul_i32(base_speed, move_mag_q12);
             let (moved, blocked) =
                 self.try_move_vector(collision, move_x_q12, move_z_q12, speed, config.radius);
 
@@ -444,10 +443,8 @@ impl CharacterMotorState {
         if speed == 0 {
             return (false, false);
         }
-        let dx = ((move_x_q12 as i64 * speed as i64) >> 12).clamp(i32::MIN as i64, i32::MAX as i64)
-            as i32;
-        let dz = ((move_z_q12 as i64 * speed as i64) >> 12).clamp(i32::MIN as i64, i32::MAX as i64)
-            as i32;
+        let dx = q12_mul_i32(move_x_q12, speed);
+        let dz = q12_mul_i32(move_z_q12, speed);
         if dx == 0 && dz == 0 {
             return (false, false);
         }
@@ -587,18 +584,14 @@ fn analog_move_vector(input: CharacterMotorInput) -> Option<(i32, i32, i32)> {
     if x == 0 && z == 0 {
         return None;
     }
-    let mag = isqrt_i64(x as i64 * x as i64 + z as i64 * z as i64);
+    let mag = isqrt_i32(square_i32_saturating(x).saturating_add(square_i32_saturating(z)));
     if mag <= 0 {
         return None;
     }
     if mag <= 4096 {
         return Some((x, z, mag));
     }
-    Some((
-        ((x as i64 * 4096) / mag as i64) as i32,
-        ((z as i64 * 4096) / mag as i64) as i32,
-        4096,
-    ))
+    Some((x * 4096 / mag, z * 4096 / mag, 4096))
 }
 
 fn yaw_from_vector_q12(dx: i32, dz: i32) -> u16 {
@@ -608,9 +601,9 @@ fn yaw_from_vector_q12(dx: i32, dz: i32) -> u16 {
     let ax = abs_i32(dx);
     let az = abs_i32(dz);
     let base = if ax <= az {
-        ((ax as i64 * 512) / az.max(1) as i64) as i32
+        ax * 512 / az.max(1)
     } else {
-        1024 - ((az as i64 * 512) / ax.max(1) as i64) as i32
+        1024 - (az * 512 / ax.max(1))
     };
     let angle = if dz >= 0 {
         if dx >= 0 {
@@ -626,13 +619,25 @@ fn yaw_from_vector_q12(dx: i32, dz: i32) -> u16 {
     (angle & 0x0FFF) as u16
 }
 
-fn isqrt_i64(value: i64) -> i32 {
+fn q12_mul_i32(a: i32, b: i32) -> i32 {
+    a.saturating_mul(b) >> 12
+}
+
+fn square_i32_saturating(value: i32) -> i32 {
+    let abs = abs_i32(value);
+    if abs > 46_340 {
+        return i32::MAX;
+    }
+    abs * abs
+}
+
+fn isqrt_i32(value: i32) -> i32 {
     if value <= 0 {
         return 0;
     }
-    let mut x = value as u64;
-    let mut r: u64 = 0;
-    let mut bit: u64 = 1u64 << 62;
+    let mut x = value as u32;
+    let mut r = 0u32;
+    let mut bit = 1u32 << 30;
     while bit > x {
         bit >>= 2;
     }
@@ -645,7 +650,7 @@ fn isqrt_i64(value: i64) -> i32 {
         }
         bit >>= 2;
     }
-    r.min(i32::MAX as u64) as i32
+    r as i32
 }
 
 fn abs_i32(value: i32) -> i32 {

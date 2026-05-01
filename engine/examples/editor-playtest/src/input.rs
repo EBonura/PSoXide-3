@@ -4,8 +4,7 @@ use super::*;
 
 pub(crate) fn motor_input(ctx: &Ctx, camera_yaw_q12: u16) -> CharacterMotorInput {
     let (strafe, forward) = local_move_axes(ctx);
-    let (move_x_q12, move_z_q12, walk) =
-        camera_relative_move_q12(strafe, forward, camera_yaw_q12);
+    let (move_x_q12, move_z_q12, walk) = camera_relative_move_q12(strafe, forward, camera_yaw_q12);
 
     CharacterMotorInput {
         turn: 0,
@@ -19,9 +18,12 @@ pub(crate) fn motor_input(ctx: &Ctx, camera_yaw_q12: u16) -> CharacterMotorInput
 
 pub(crate) fn local_move_axes(ctx: &Ctx) -> (i16, i16) {
     let (left_x, left_y) = ctx.pad.sticks.left_centered();
-    let stick_mag = isqrt(left_x as i64 * left_x as i64 + left_y as i64 * left_y as i64);
-    if stick_mag > MOVE_STICK_DEADZONE as i64 {
-        return (left_x.clamp(-STICK_MAX, STICK_MAX), (-left_y).clamp(-STICK_MAX, STICK_MAX));
+    let stick_mag = isqrt_i32(square_i16(left_x).saturating_add(square_i16(left_y)));
+    if stick_mag > MOVE_STICK_DEADZONE as i32 {
+        return (
+            left_x.clamp(-STICK_MAX, STICK_MAX),
+            (-left_y).clamp(-STICK_MAX, STICK_MAX),
+        );
     }
 
     let mut strafe = 0i16;
@@ -46,16 +48,15 @@ pub(crate) fn camera_relative_move_q12(
     forward: i16,
     camera_yaw_q12: u16,
 ) -> (i16, i16, i8) {
-    let mag = isqrt(strafe as i64 * strafe as i64 + forward as i64 * forward as i64);
-    if mag <= MOVE_STICK_DEADZONE as i64 {
+    let mag = isqrt_i32(square_i16(strafe).saturating_add(square_i16(forward)));
+    if mag <= MOVE_STICK_DEADZONE as i32 {
         return (0, 0, 0);
     }
-    let clamped_mag = mag.min(STICK_MAX as i64);
-    let scaled_mag_q12 =
-        ((clamped_mag - MOVE_STICK_DEADZONE as i64) * 4096)
-            / (STICK_MAX - MOVE_STICK_DEADZONE) as i64;
-    let local_strafe_q12 = (strafe as i64 * scaled_mag_q12 / mag) as i32;
-    let local_forward_q12 = (forward as i64 * scaled_mag_q12 / mag) as i32;
+    let clamped_mag = mag.min(STICK_MAX as i32);
+    let scaled_mag_q12 = ((clamped_mag - MOVE_STICK_DEADZONE as i32) * 4096)
+        / (STICK_MAX - MOVE_STICK_DEADZONE) as i32;
+    let local_strafe_q12 = strafe as i32 * scaled_mag_q12 / mag;
+    let local_forward_q12 = forward as i32 * scaled_mag_q12 / mag;
 
     let forward_yaw = camera_yaw_q12.wrapping_add(HALF_TURN_Q12);
     let right_yaw = forward_yaw.wrapping_sub(1024);
@@ -134,8 +135,53 @@ pub(crate) fn abs_i16(value: i16) -> i16 {
     }
 }
 
-pub(crate) fn distance_xz_sq(a: WorldVertex, b: WorldVertex) -> i64 {
-    let dx = (a.x - b.x) as i64;
-    let dz = (a.z - b.z) as i64;
-    dx * dx + dz * dz
+pub(crate) fn distance_xz_sq(a: WorldVertex, b: WorldVertex) -> i32 {
+    let dx = a.x.saturating_sub(b.x);
+    let dz = a.z.saturating_sub(b.z);
+    square_i32_saturating(dx).saturating_add(square_i32_saturating(dz))
+}
+
+fn square_i16(value: i16) -> i32 {
+    let value = value as i32;
+    value * value
+}
+
+pub(crate) fn square_i32_saturating(value: i32) -> i32 {
+    let abs = abs_i32(value);
+    if abs > 46_340 {
+        return i32::MAX;
+    }
+    abs * abs
+}
+
+pub(crate) fn isqrt_i32(value: i32) -> i32 {
+    if value <= 0 {
+        return 0;
+    }
+    let mut x = value as u32;
+    let mut r = 0u32;
+    let mut bit = 1u32 << 30;
+    while bit > x {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if x >= r + bit {
+            x -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    r as i32
+}
+
+pub(crate) fn abs_i32(value: i32) -> i32 {
+    if value == i32::MIN {
+        i32::MAX
+    } else if value < 0 {
+        -value
+    } else {
+        value
+    }
 }

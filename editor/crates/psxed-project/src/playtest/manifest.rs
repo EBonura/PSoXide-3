@@ -108,15 +108,17 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     out.push_str("/// Per-room material bindings — slot the `.psxw` stores → texture asset.\n");
     out.push_str("pub static MATERIALS: &[LevelMaterialRecord] = &[\n");
     for material in &package.materials {
+        let flags = material_flags_for_sidedness(material.face_sidedness);
         let _ = writeln!(
             out,
-            "    LevelMaterialRecord {{ room: {}, local_slot: {}, texture_asset: AssetId({}), tint_rgb: [{}, {}, {}], flags: 0 }},",
+            "    LevelMaterialRecord {{ room: {}, local_slot: {}, texture_asset: AssetId({}), tint_rgb: [{}, {}, {}], flags: {} }},",
             material.room,
             material.local_slot,
             material.texture_asset_index,
             material.tint_rgb[0],
             material.tint_rgb[1],
             material.tint_rgb[2],
+            flags,
         );
     }
     out.push_str("];\n\n");
@@ -361,6 +363,14 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n");
     out
+}
+
+const fn material_flags_for_sidedness(sidedness: crate::MaterialFaceSidedness) -> u16 {
+    match sidedness {
+        crate::MaterialFaceSidedness::Front => 0,
+        crate::MaterialFaceSidedness::Back => 1,
+        crate::MaterialFaceSidedness::Both => 2,
+    }
 }
 
 /// Default destination for the playtest example's generated

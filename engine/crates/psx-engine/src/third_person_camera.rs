@@ -14,9 +14,9 @@ use crate::{RoomCollision, WorldCamera, WorldProjection, WorldVertex};
 
 const HALF_TURN_Q12: u16 = 2048;
 const FULL_TURN_Q12: i32 = 4096;
-const WHISKER_COUNT: usize = 9;
-const RAY_STEPS_MAX: i32 = 16;
-const RAY_STEPS_MIN: i32 = 4;
+const WHISKER_COUNT: usize = 3;
+const RAY_STEPS_MAX: i32 = 8;
+const RAY_STEPS_MIN: i32 = 3;
 
 // Mirrors psxed_format::world::direction::* without adding a direct
 // psxed-format dependency just for byte constants.
@@ -337,7 +337,7 @@ fn camera_height_goal(
 }
 
 fn midpoint_i32(a: i32, b: i32) -> i32 {
-    ((a as i64 + b as i64) / 2).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    a.saturating_add(b.saturating_sub(a) / 2)
 }
 
 fn solve_camera_collision(
@@ -357,17 +357,7 @@ fn solve_camera_collision(
     };
 
     let stride = config.whisker_stride_q12 as i16;
-    let whiskers = [
-        0i16,
-        -stride,
-        stride,
-        -(stride * 2),
-        stride * 2,
-        -1024,
-        1024,
-        -2048,
-        2048,
-    ];
+    let whiskers = [0i16, -stride, stride];
     let mut best_yaw = yaw_q12;
     let mut best_distance = 0;
     let mut center_distance = 0;
@@ -376,7 +366,7 @@ fn solve_camera_collision(
     while i < WHISKER_COUNT {
         let candidate_yaw = add_signed_angle(yaw_q12, whiskers[i]);
         let candidate_pos = camera_position(focus, camera_y, config.distance, candidate_yaw);
-        let clear = probe_clear_distance(room, focus, candidate_pos, config);
+        let clear = probe_clear_distance(room, focus, candidate_pos, config.distance, config);
         if i == 0 {
             center_distance = clear;
             best_distance = clear;
@@ -400,9 +390,10 @@ fn probe_clear_distance(
     room: RoomCollision<'_, '_>,
     from: WorldVertex,
     to: WorldVertex,
+    max_distance: i32,
     config: ThirdPersonCameraConfig,
 ) -> i32 {
-    let max_distance = distance_xz(from, to).max(1);
+    let max_distance = max_distance.max(1);
     let sector = room.sector_size().max(1);
     let mut steps = (max_distance / (sector / 4).max(1)).clamp(RAY_STEPS_MIN, RAY_STEPS_MAX);
     if steps <= 0 {
@@ -417,7 +408,7 @@ fn probe_clear_distance(
             nearest = ((max_distance * i) / steps).min(nearest);
             break;
         }
-        if let Some(hit) = nearest_wall_hit_around(room, sample, from, to) {
+        if let Some(hit) = nearest_wall_hit_around(room, sample, from, to, max_distance) {
             nearest = hit.min(nearest);
             break;
         }
@@ -450,6 +441,7 @@ fn nearest_wall_hit_around(
     sample: WorldVertex,
     from: WorldVertex,
     to: WorldVertex,
+    ray_distance: i32,
 ) -> Option<i32> {
     let s = room.sector_size();
     if s <= 0 || sample.x < 0 || sample.z < 0 {
@@ -470,9 +462,15 @@ fn nearest_wall_hit_around(
                     while i < sector.wall_count() {
                         if let Some(wall) = room.sector_wall(sector, i) {
                             if wall.solid() {
-                                if let Some(hit) =
-                                    segment_wall_hit_distance(from, to, cx, cz, s, wall.direction())
-                                {
+                                if let Some(hit) = segment_wall_hit_distance(
+                                    from,
+                                    to,
+                                    ray_distance,
+                                    cx,
+                                    cz,
+                                    s,
+                                    wall.direction(),
+                                ) {
                                     nearest = Some(match nearest {
                                         Some(prev) => prev.min(hit),
                                         None => hit,
@@ -494,6 +492,7 @@ fn nearest_wall_hit_around(
 fn segment_wall_hit_distance(
     from: WorldVertex,
     to: WorldVertex,
+    ray_distance: i32,
     sx: i32,
     sz: i32,
     sector_size: i32,
@@ -505,8 +504,7 @@ fn segment_wall_hit_distance(
     let z1 = z0.saturating_add(sector_size);
     let dx = to.x.saturating_sub(from.x);
     let dz = to.z.saturating_sub(from.z);
-    let total = distance_xz(from, to);
-    if total <= 0 {
+    if ray_distance <= 0 {
         return None;
     }
     let t_q12 = match direction {
@@ -534,29 +532,27 @@ fn segment_wall_hit_distance(
         }
         _ => return None,
     }
-    Some(((total as i64 * t_q12 as i64) >> 12) as i32)
+    Some(ray_distance.saturating_mul(t_q12) >> 12)
 }
 
 fn intersect_horizontal_q12(from_z: i32, dz: i32, wall_z: i32) -> Option<i32> {
     if dz == 0 {
         return None;
     }
-    Some(
-        (((wall_z.saturating_sub(from_z)) as i64) << 12)
-            .checked_div(dz as i64)?
-            .clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-    )
+    wall_z
+        .saturating_sub(from_z)
+        .saturating_mul(4096)
+        .checked_div(dz)
 }
 
 fn intersect_vertical_q12(from_x: i32, dx: i32, wall_x: i32) -> Option<i32> {
     if dx == 0 {
         return None;
     }
-    Some(
-        (((wall_x.saturating_sub(from_x)) as i64) << 12)
-            .checked_div(dx as i64)?
-            .clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-    )
+    wall_x
+        .saturating_sub(from_x)
+        .saturating_mul(4096)
+        .checked_div(dx)
 }
 
 fn camera_position(focus: WorldVertex, camera_y: i32, distance: i32, yaw_q12: u16) -> WorldVertex {
@@ -580,10 +576,12 @@ fn camera_from_position_focus(
 ) -> WorldCamera {
     let dx = position.x.saturating_sub(focus.x);
     let dz = position.z.saturating_sub(focus.z);
-    let radius = isqrt_i64((dx as i64 * dx as i64).saturating_add(dz as i64 * dz as i64)).max(1);
+    let radius = isqrt_i32(dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz))).max(1);
     let target_dy = focus.y.saturating_sub(position.y);
-    let pitch_len = isqrt_i64(
-        (radius as i64 * radius as i64).saturating_add(target_dy as i64 * target_dy as i64),
+    let pitch_len = isqrt_i32(
+        radius
+            .saturating_mul(radius)
+            .saturating_add(target_dy.saturating_mul(target_dy)),
     )
     .max(1);
     WorldCamera {
@@ -612,9 +610,9 @@ fn yaw_to_point_q12(from: WorldVertex, to: WorldVertex) -> u16 {
     let ax = abs_i32(dx);
     let az = abs_i32(dz);
     let base = if ax <= az {
-        ((ax as i64 * 512) / az.max(1) as i64) as i32
+        ax.saturating_mul(512) / az.max(1)
     } else {
-        1024 - ((az as i64 * 512) / ax.max(1) as i64) as i32
+        1024 - (az.saturating_mul(512) / ax.max(1))
     };
     let angle = if dz >= 0 {
         if dx >= 0 {
@@ -684,23 +682,26 @@ fn lerp_vertex(from: WorldVertex, to: WorldVertex, num: i32, den: i32) -> WorldV
     )
 }
 
-fn distance_xz(a: WorldVertex, b: WorldVertex) -> i32 {
-    let dx = a.x.saturating_sub(b.x) as i64;
-    let dz = a.z.saturating_sub(b.z) as i64;
-    isqrt_i64(dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz)))
-}
-
-fn isqrt_i64(n: i64) -> i32 {
+fn isqrt_i32(n: i32) -> i32 {
     if n <= 0 {
         return 0;
     }
-    let mut x = n as u64;
-    let mut y = x.div_ceil(2);
-    while y < x {
-        x = y;
-        y = (x + (n as u64 / x)) / 2;
+    let mut bit = 1 << 30;
+    let mut rest = n;
+    let mut root = 0;
+    while bit > rest {
+        bit >>= 2;
     }
-    x.min(i32::MAX as u64) as i32
+    while bit != 0 {
+        if rest >= root + bit {
+            rest -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    root
 }
 
 fn abs_i32(value: i32) -> i32 {
@@ -743,11 +744,11 @@ mod tests {
         let from = WorldVertex::new(512, 0, 512);
         let to = WorldVertex::new(1536, 0, 512);
         assert_eq!(
-            segment_wall_hit_distance(from, to, 0, 0, 1024, DIR_EAST),
+            segment_wall_hit_distance(from, to, 1024, 0, 0, 1024, DIR_EAST),
             Some(512)
         );
         assert_eq!(
-            segment_wall_hit_distance(from, to, 0, 0, 1024, DIR_NORTH),
+            segment_wall_hit_distance(from, to, 1024, 0, 0, 1024, DIR_NORTH),
             None
         );
     }

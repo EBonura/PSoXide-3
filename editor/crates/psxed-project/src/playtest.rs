@@ -32,7 +32,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::world_cook::{cook_world_grid, CookedWorldMaterial, WorldGridCookError};
-use crate::{NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId, SceneNode, WorldGrid};
+use crate::{spatial, NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId, SceneNode};
 
 mod assets;
 mod manifest;
@@ -204,6 +204,7 @@ pub fn build_package(
                 local_slot: cooked_material.slot,
                 texture_asset_index,
                 tint_rgb: cooked_material.tint,
+                face_sidedness: cooked_material.face_sidedness,
             });
         }
         let material_count =
@@ -376,8 +377,7 @@ pub fn build_package(
                 // to world units (engine units) at cook time so
                 // the runtime record stays in one canonical
                 // unit regardless of the room's `sector_size`.
-                let radius_world =
-                    (radius * grid.sector_size as f32).clamp(1.0, u16::MAX as f32) as u16;
+                let radius_world = spatial::light_radius_record_units(grid, *radius);
                 let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u16;
                 lights.push(PlaytestLight {
                     room: room_index,
@@ -457,44 +457,50 @@ pub fn build_package(
                 report.error("internal: player spawn node kind shifted under us");
                 return (None, report);
             };
-            // Resolution: explicit assignment > sole Character
-            // resource > error. The "exactly one" rule keeps the
-            // starter project zero-config while still flagging
-            // ambiguity in projects with multiple Characters.
-            let resolved = match character {
-                Some(id) => Some(*id),
-                None => {
-                    let candidates: Vec<ResourceId> = project
-                        .resources
-                        .iter()
-                        .filter_map(|r| match &r.data {
-                            ResourceData::Character(_) => Some(r.id),
-                            _ => None,
-                        })
-                        .collect();
-                    match candidates.len() {
-                        1 => {
-                            report.warn(format!(
-                                "Player Spawn '{}' had no Character — auto-picked the only one defined",
-                                spawn_node.name,
-                            ));
-                            Some(candidates[0])
-                        }
-                        0 => {
-                            report.error(format!(
-                                "Player Spawn '{}' has no Character assigned and no Character resources exist",
-                                spawn_node.name
-                            ));
-                            None
-                        }
-                        n => {
-                            report.error(format!(
-                                "Player Spawn '{}' has no Character assigned and {n} Characters are defined — pick one explicitly",
-                                spawn_node.name
-                            ));
-                            None
-                        }
+            let resolved = match crate::resolve::resolve_spawn_character(project, *character) {
+                Ok(resolved) => {
+                    if resolved.auto_picked {
+                        report.warn(format!(
+                            "Player Spawn '{}' had no Character — auto-picked the only one defined",
+                            spawn_node.name,
+                        ));
                     }
+                    Some(resolved.id)
+                }
+                Err(crate::resolve::SpawnCharacterResolutionError::MissingExplicit(id)) => {
+                    report.error(format!(
+                        "Player Spawn '{}' references Character #{} which doesn't exist",
+                        spawn_node.name,
+                        id.raw()
+                    ));
+                    None
+                }
+                Err(crate::resolve::SpawnCharacterResolutionError::ExplicitNotCharacter(id)) => {
+                    let name = project
+                        .resource(id)
+                        .map(|r| r.name.as_str())
+                        .unwrap_or("<missing>");
+                    report.error(format!(
+                        "Player Spawn '{}' references resource '{}' which is not a Character",
+                        spawn_node.name, name
+                    ));
+                    None
+                }
+                Err(crate::resolve::SpawnCharacterResolutionError::NoCharacters) => {
+                    report.error(format!(
+                        "Player Spawn '{}' has no Character assigned and no Character resources exist",
+                        spawn_node.name
+                    ));
+                    None
+                }
+                Err(crate::resolve::SpawnCharacterResolutionError::AmbiguousCharacters {
+                    count,
+                }) => {
+                    report.error(format!(
+                        "Player Spawn '{}' has no Character assigned and {count} Characters are defined — pick one explicitly",
+                        spawn_node.name
+                    ));
+                    None
                 }
             };
             resolved
@@ -952,18 +958,10 @@ fn enclosing_room<'a>(
     None
 }
 
-/// Convert a node's editor-space transform to room-local engine units.
-fn node_room_local_position(node: &SceneNode, grid: &WorldGrid) -> [i32; 3] {
-    let s = grid.sector_size as f32;
-    // `.psxw` geometry is array-rooted at (0,0). Editor transforms
-    // are room-centre-relative, so the cooked local placement is the
-    // editor offset from the current array centre. `origin` cancels
-    // out here by design; it is emitted on LevelRoomRecord only as
-    // diagnostic editor metadata.
-    let x = (node.transform.translation[0] + grid.width as f32 * 0.5) * s;
-    let y = node.transform.translation[1] * s;
-    let z = (node.transform.translation[2] + grid.depth as f32 * 0.5) * s;
-    [x as i32, y as i32, z as i32]
+/// Convert a node's editor-space transform to cooked room-local
+/// engine units.
+fn node_room_local_position(node: &SceneNode, grid: &crate::WorldGrid) -> [i32; 3] {
+    spatial::node_cooked_room_local_origin(grid, &node.transform)
 }
 
 /// Convert an editor euler-degrees-Y rotation to a PSX angle
@@ -1001,6 +999,18 @@ mod tests {
         assert!(has_room, "starter must contain a Room");
         assert!(has_player_spawn, "starter must contain a player SpawnPoint");
         project
+    }
+
+    fn starter_light_color(project: &ProjectDocument) -> [u8; 3] {
+        project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Light { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("starter contains one light")
     }
 
     #[test]
@@ -1604,6 +1614,35 @@ mod tests {
     }
 
     #[test]
+    fn material_sidedness_reaches_playtest_manifest_flags() {
+        let mut project = ProjectDocument::starter();
+        let material = project
+            .resources
+            .iter_mut()
+            .find_map(|resource| match &mut resource.data {
+                ResourceData::Material(material) => Some(material),
+                _ => None,
+            })
+            .expect("starter has a material");
+        material.face_sidedness = crate::MaterialFaceSidedness::Back;
+        material.sync_legacy_sidedness();
+
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.expect("cooks");
+        assert!(package
+            .materials
+            .iter()
+            .any(|m| m.face_sidedness == crate::MaterialFaceSidedness::Back));
+
+        let src = render_manifest_source(&package);
+        assert!(
+            src.contains("flags: 1"),
+            "back-sided material should encode FACE_BACK in flags"
+        );
+    }
+
+    #[test]
     fn missing_texture_path_fails_with_clear_error() {
         // Point a texture resource at a bogus path; cook should
         // refuse and the error should mention the file.
@@ -1733,6 +1772,7 @@ mod tests {
         // sensible intensity_q8 derived from the editor's
         // 1.0 intensity float.
         let project = ProjectDocument::starter();
+        let expected_color = starter_light_color(&project);
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
         let package = package.expect("starter cooks");
@@ -1742,8 +1782,7 @@ mod tests {
         assert!(light.radius > 0);
         // intensity 1.0 → Q8.8 256.
         assert_eq!(light.intensity_q8, 256);
-        // Starter colour authored as (255, 236, 198).
-        assert_eq!(light.color, [255, 236, 198]);
+        assert_eq!(light.color, expected_color);
     }
 
     #[test]
@@ -1830,10 +1869,16 @@ mod tests {
     fn rendered_manifest_emits_lights_block() {
         let project = ProjectDocument::starter();
         let (package, _) = build_package(&project, &starter_project_root());
-        let src = render_manifest_source(&package.expect("cooks"));
+        let package = package.expect("cooks");
+        let color = package.lights[0].color;
+        let src = render_manifest_source(&package);
         assert!(src.contains("PointLightRecord"));
         assert!(src.contains("pub static LIGHTS"));
         assert!(src.contains("intensity_q8"));
+        assert!(src.contains(&format!(
+            "color: [{}, {}, {}]",
+            color[0], color[1], color[2]
+        )));
     }
 
     #[test]
@@ -2016,11 +2061,12 @@ mod tests {
         let crate::NodeKind::Room { grid } = &room.kind else {
             panic!("expected room");
         };
-        let s = grid.sector_size as f32;
-        (
-            ((ex + grid.width as f32 * 0.5) * s) as i32,
-            ((ez + grid.depth as f32 * 0.5) * s) as i32,
-        )
+        let transform = crate::Transform3 {
+            translation: [ex, 0.0, ez],
+            ..crate::Transform3::default()
+        };
+        let [x, _, z] = spatial::node_cooked_room_local_origin(grid, &transform);
+        (x, z)
     }
 
     #[test]

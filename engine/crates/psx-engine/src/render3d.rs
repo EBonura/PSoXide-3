@@ -34,6 +34,13 @@ const MAX_TEXTURED_HW_SPLIT_DEPTH: u8 = 5;
 const WORLD_COMMAND_NONE: u16 = u16::MAX;
 const GOURAUD_COMMAND_NONE: u16 = u16::MAX;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum WorldCommandOrdering {
+    LinkedSorted,
+    DeferredSorted,
+    Bucketed,
+}
+
 /// Canonical quad → triangle split.
 ///
 /// Quad corners arrive in perimeter order `[0, 1, 2, 3]`:
@@ -491,6 +498,13 @@ pub struct WorldSurfaceOptions {
     pub cull_mode: CullMode,
     /// Coarse tie-break layer for opaque/translucent surfaces.
     pub render_layer: WorldRenderLayer,
+    /// Split oversized projected textured triangles before packet emission.
+    ///
+    /// Room-scale quads keep this enabled because a floor/wall can span most
+    /// of the screen. Compact character meshes can disable it to stay on the
+    /// direct packet path and spend their budget on GTE transforms instead of
+    /// conservative CPU-side subdivision checks.
+    pub split_textured_triangles: bool,
 }
 
 impl WorldSurfaceOptions {
@@ -503,6 +517,7 @@ impl WorldSurfaceOptions {
             depth_bias: 0,
             cull_mode: CullMode::Back,
             render_layer: WorldRenderLayer::Opaque,
+            split_textured_triangles: true,
         }
     }
 
@@ -533,6 +548,12 @@ impl WorldSurfaceOptions {
     /// Return options using the render layer implied by `material`.
     pub const fn with_material_layer(mut self, material: TextureMaterial) -> Self {
         self.render_layer = WorldRenderLayer::for_material(material);
+        self
+    }
+
+    /// Return options with textured triangle splitting enabled/disabled.
+    pub const fn with_textured_triangle_splitting(mut self, enabled: bool) -> Self {
+        self.split_textured_triangles = enabled;
         self
     }
 }
@@ -624,8 +645,10 @@ pub struct WorldRenderPass<'a, 'ot, const OT_DEPTH: usize> {
     ot: &'a mut OtFrame<'ot, OT_DEPTH>,
     commands: &'a mut [WorldTriCommand],
     slot_heads: [u16; OT_DEPTH],
+    slot_tails: [u16; OT_DEPTH],
     command_len: usize,
     next_order: usize,
+    ordering: WorldCommandOrdering,
 }
 
 impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
@@ -635,8 +658,51 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             ot,
             commands,
             slot_heads: [WORLD_COMMAND_NONE; OT_DEPTH],
+            slot_tails: [WORLD_COMMAND_NONE; OT_DEPTH],
             command_len: 0,
             next_order: 0,
+            ordering: WorldCommandOrdering::LinkedSorted,
+        }
+    }
+
+    /// Start a world render pass that sorts submitted commands at flush.
+    ///
+    /// This keeps painter ordering comparable to [`Self::new`] while avoiding
+    /// the hot per-triangle linked-list insertion cost. It is the preferred
+    /// mode for scenes that submit a few hundred opaque world/model packets.
+    pub fn new_deferred_sorted(
+        ot: &'a mut OtFrame<'ot, OT_DEPTH>,
+        commands: &'a mut [WorldTriCommand],
+    ) -> Self {
+        Self {
+            ot,
+            commands,
+            slot_heads: [WORLD_COMMAND_NONE; OT_DEPTH],
+            slot_tails: [WORLD_COMMAND_NONE; OT_DEPTH],
+            command_len: 0,
+            next_order: 0,
+            ordering: WorldCommandOrdering::DeferredSorted,
+        }
+    }
+
+    /// Start a world render pass that appends commands into coarse OT buckets.
+    ///
+    /// This is the fastest ordered mode: it preserves submission order within
+    /// each depth slot and relies on a sufficiently deep OT for depth
+    /// separation. It avoids both per-command insertion sorting and frame-end
+    /// global sorting.
+    pub fn new_bucketed(
+        ot: &'a mut OtFrame<'ot, OT_DEPTH>,
+        commands: &'a mut [WorldTriCommand],
+    ) -> Self {
+        Self {
+            ot,
+            commands,
+            slot_heads: [WORLD_COMMAND_NONE; OT_DEPTH],
+            slot_tails: [WORLD_COMMAND_NONE; OT_DEPTH],
+            command_len: 0,
+            next_order: 0,
+            ordering: WorldCommandOrdering::Bucketed,
         }
     }
 
@@ -702,6 +768,10 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         options: WorldSurfaceOptions,
         split_depth: u8,
     ) -> WorldRenderStats {
+        if !options.split_textured_triangles {
+            return self.submit_textured_triangle_leaf(triangles, verts, material, options);
+        }
+
         let verts = [
             clamp_projected_textured_vertex(verts[0]),
             clamp_projected_textured_vertex(verts[1]),
@@ -1047,6 +1117,75 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         material: TextureMaterial,
         options: WorldSurfaceOptions,
     ) -> TexturedModelRenderStats {
+        self.submit_textured_model_impl(
+            triangles,
+            model,
+            animation,
+            frame_q12,
+            camera,
+            origin,
+            instance_rotation,
+            projected_vertices,
+            joint_view_transforms,
+            material,
+            options,
+            true,
+        )
+    }
+
+    /// Submit an animated textured model using each vertex's primary joint only.
+    ///
+    /// This is the high-throughput NPC/background-character path. It keeps
+    /// every vertex on the GTE projection fast path and ignores secondary
+    /// blend weights, trading some joint-boundary smoothness for a much lower
+    /// CPU cost.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_textured_model_primary_joints(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTextured>,
+        model: Model<'_>,
+        animation: Animation<'_>,
+        frame_q12: u32,
+        camera: WorldCamera,
+        origin: WorldVertex,
+        instance_rotation: Mat3I16,
+        projected_vertices: &mut [ProjectedVertex],
+        joint_view_transforms: &mut [JointViewTransform],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+    ) -> TexturedModelRenderStats {
+        self.submit_textured_model_impl(
+            triangles,
+            model,
+            animation,
+            frame_q12,
+            camera,
+            origin,
+            instance_rotation,
+            projected_vertices,
+            joint_view_transforms,
+            material,
+            options,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_textured_model_impl(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTextured>,
+        model: Model<'_>,
+        animation: Animation<'_>,
+        frame_q12: u32,
+        camera: WorldCamera,
+        origin: WorldVertex,
+        instance_rotation: Mat3I16,
+        projected_vertices: &mut [ProjectedVertex],
+        joint_view_transforms: &mut [JointViewTransform],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+        blend_vertices: bool,
+    ) -> TexturedModelRenderStats {
         let mut stats = TexturedModelRenderStats::default();
         let local_to_world = LocalToWorldScale::from_q12(model.local_to_world_q12());
         load_world_projection_gte(camera.projection);
@@ -1106,7 +1245,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
                 let Some(vertex) = model.vertex(global_index as u16) else {
                     break;
                 };
-                if model_vertex_uses_cpu_blend(vertex, joint_count) {
+                if blend_vertices && model_vertex_uses_cpu_blend(vertex, joint_count) {
                     projected_vertices[global_index] = project_textured_model_vertex(
                         vertex,
                         primary,
@@ -1124,7 +1263,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
                     let Some(next) = model.vertex((global_index + batch_count) as u16) else {
                         break;
                     };
-                    if model_vertex_uses_cpu_blend(next, joint_count) {
+                    if blend_vertices && model_vertex_uses_cpu_blend(next, joint_count) {
                         break;
                     }
                     batch[batch_count] = next;
@@ -1332,7 +1471,27 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         };
         self.command_len += 1;
         self.next_order = self.next_order.saturating_add(1);
-        self.insert_command_in_slot(command_index);
+        match self.ordering {
+            WorldCommandOrdering::LinkedSorted => self.insert_command_in_slot(command_index),
+            WorldCommandOrdering::DeferredSorted => {}
+            WorldCommandOrdering::Bucketed => self.append_command_in_slot(command_index),
+        }
+    }
+
+    fn append_command_in_slot(&mut self, command_index: usize) {
+        if OT_DEPTH == 0 || command_index >= WORLD_COMMAND_NONE as usize {
+            return;
+        }
+
+        let slot = self.commands[command_index].slot.index().min(OT_DEPTH - 1);
+        let command_link = command_index as u16;
+        let tail = self.slot_tails[slot];
+        if tail == WORLD_COMMAND_NONE {
+            self.slot_heads[slot] = command_link;
+        } else {
+            self.commands[tail as usize].next = command_link;
+        }
+        self.slot_tails[slot] = command_link;
     }
 
     fn insert_command_in_slot(&mut self, command_index: usize) {
@@ -1371,8 +1530,52 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         }
     }
 
+    fn reverse_bucket_links(&mut self) {
+        let mut slot = 0;
+        while slot < OT_DEPTH {
+            let mut previous = WORLD_COMMAND_NONE;
+            let mut current = self.slot_heads[slot];
+            self.slot_tails[slot] = current;
+            while current != WORLD_COMMAND_NONE {
+                let next = self.commands[current as usize].next;
+                self.commands[current as usize].next = previous;
+                previous = current;
+                current = next;
+            }
+            self.slot_heads[slot] = previous;
+            slot += 1;
+        }
+    }
+
     /// Sort and insert all submitted triangles into the ordering table.
-    pub fn flush(self) {
+    pub fn flush(mut self) {
+        if self.ordering == WorldCommandOrdering::DeferredSorted {
+            sort_world_for_ot_insert(&mut self.commands[..self.command_len]);
+            let mut command_index = 0;
+            while command_index < self.command_len {
+                let command = self.commands[command_index];
+                if !command.packet_ptr.is_null() {
+                    // SAFETY: Commands are created only from primitive
+                    // arenas borrowed by submit methods. Those packets live
+                    // until after this pass flushes and the frame submits.
+                    unsafe {
+                        self.ot
+                            .add_raw_slot(command.slot, command.packet_ptr, command.words)
+                    };
+                }
+                command_index += 1;
+            }
+            return;
+        }
+
+        if self.ordering == WorldCommandOrdering::Bucketed {
+            // OrderingTable::insert prepends packets. Bucketed mode appends
+            // submissions so reversing each bucket once here makes the final
+            // GPU DMA walk preserve same-slot submission order without doing
+            // a per-triangle sorted insertion.
+            self.reverse_bucket_links();
+        }
+
         let mut slot = 0;
         while slot < OT_DEPTH {
             let mut command_index = self.slot_heads[slot];
@@ -1780,6 +1983,29 @@ pub fn compute_joint_view_transform(
     textured_model_part_gte_transform(camera, pose, instance_rotation, local_to_world, origin)
 }
 
+/// Project one model vertex using the same GTE/CPU-blend split as
+/// [`WorldRenderPass::submit_textured_model`].
+///
+/// The caller must have already loaded the primary joint transform
+/// into the GTE. Vertices without a valid secondary blend joint use
+/// the GTE path; blend vertices use the CPU view/projection path so
+/// host previews and runtime rendering keep identical deformation.
+pub fn project_model_vertex_with_joint_transforms(
+    vertex: ModelVertex,
+    primary: JointViewTransform,
+    joint_view_transforms: &[JointViewTransform],
+    joint_count: usize,
+    projection: WorldProjection,
+) -> ProjectedVertex {
+    project_textured_model_vertex(
+        vertex,
+        primary,
+        joint_view_transforms,
+        joint_count,
+        projection,
+    )
+}
+
 fn textured_model_part_gte_transform(
     camera: WorldCamera,
     pose: JointPose,
@@ -1828,14 +2054,14 @@ fn textured_model_part_gte_transform(
 }
 
 /// Apply a Q12 rotation matrix to an i32 translation vector.
-/// Each row dot-product happens in widened i64 space so big
-/// translations don't overflow before the >>12 shift.
+/// Runtime pose translations are model-local and bounded by cooked
+/// asset scale, so keep this on the PS1's native 32-bit fast path.
 fn rotate_translation_q12(rot: &Mat3I16, t: Vec3I32) -> Vec3I32 {
     let row = |r: [i16; 3]| -> i32 {
-        let x = (r[0] as i64) * (t.x as i64);
-        let y = (r[1] as i64) * (t.y as i64);
-        let z = (r[2] as i64) * (t.z as i64);
-        ((x + y + z) >> 12) as i32
+        let x = (r[0] as i32).saturating_mul(t.x);
+        let y = (r[1] as i32).saturating_mul(t.y);
+        let z = (r[2] as i32).saturating_mul(t.z);
+        x.saturating_add(y).saturating_add(z) >> 12
     };
     Vec3I32::new(row(rot.m[0]), row(rot.m[1]), row(rot.m[2]))
 }
@@ -2283,7 +2509,6 @@ fn should_insert_gouraud_before(a: GouraudTriCommand, b: GouraudTriCommand) -> b
     a.primitive_index > b.primitive_index
 }
 
-#[cfg(test)]
 fn sort_world_for_ot_insert(commands: &mut [WorldTriCommand]) {
     let mut gap = commands.len() / 2;
     while gap > 0 {
@@ -2302,7 +2527,6 @@ fn sort_world_for_ot_insert(commands: &mut [WorldTriCommand]) {
     }
 }
 
-#[cfg(test)]
 fn should_insert_world_after(a: WorldTriCommand, b: WorldTriCommand) -> bool {
     if a.slot.index() != b.slot.index() {
         return a.slot.index() > b.slot.index();
@@ -2362,6 +2586,48 @@ mod tests {
             order,
             next: WORLD_COMMAND_NONE,
         }
+    }
+
+    #[test]
+    fn bucketed_world_pass_reverses_flush_order_for_ot_prepend() {
+        let mut ot_storage = OrderingTable::<8>::new();
+        let mut ot = OtFrame::begin(&mut ot_storage);
+        let mut commands = [WorldTriCommand::EMPTY; 3];
+        let mut pass = WorldRenderPass::new_bucketed(&mut ot, &mut commands);
+
+        pass.push_command(
+            DepthSlot::new(4),
+            100,
+            WorldRenderLayer::Opaque,
+            core::ptr::null_mut(),
+            0,
+        );
+        pass.push_command(
+            DepthSlot::new(4),
+            100,
+            WorldRenderLayer::Opaque,
+            core::ptr::null_mut(),
+            0,
+        );
+        pass.push_command(
+            DepthSlot::new(4),
+            100,
+            WorldRenderLayer::Opaque,
+            core::ptr::null_mut(),
+            0,
+        );
+
+        assert_eq!(pass.slot_heads[4], 0);
+        assert_eq!(pass.commands[0].next, 1);
+        assert_eq!(pass.commands[1].next, 2);
+        assert_eq!(pass.commands[2].next, WORLD_COMMAND_NONE);
+
+        pass.reverse_bucket_links();
+
+        assert_eq!(pass.slot_heads[4], 2);
+        assert_eq!(pass.commands[2].next, 1);
+        assert_eq!(pass.commands[1].next, 0);
+        assert_eq!(pass.commands[0].next, WORLD_COMMAND_NONE);
     }
 
     /// The canonical quad split must always share the `0`–`2`

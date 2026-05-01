@@ -10,9 +10,9 @@ use psxed_format::world;
 
 use crate::{
     GridDirection, GridHorizontalFace, GridSector, GridSplit, GridVerticalFace, GridWalls,
-    MaterialResource, ProjectDocument, PsxBlendMode, ResourceData, ResourceId, WorldGrid,
-    HEIGHT_QUANTUM, MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
-    MAX_WALL_STACK,
+    MaterialFaceSidedness, MaterialResource, ProjectDocument, PsxBlendMode, ResourceData,
+    ResourceId, WorldGrid, HEIGHT_QUANTUM, MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES,
+    MAX_ROOM_WIDTH, MAX_WALL_STACK,
 };
 
 mod coords;
@@ -350,8 +350,8 @@ pub struct CookedWorldMaterial {
     pub blend_mode: PsxBlendMode,
     /// Texture modulation tint.
     pub tint: [u8; 3],
-    /// Whether the cooker should emit both windings.
-    pub double_sided: bool,
+    /// Which side(s) should render.
+    pub face_sidedness: MaterialFaceSidedness,
 }
 
 impl CookedWorldMaterial {
@@ -362,7 +362,7 @@ impl CookedWorldMaterial {
             texture: material.texture,
             blend_mode: material.blend_mode,
             tint: material.tint,
-            double_sided: material.double_sided,
+            face_sidedness: material.sidedness(),
         }
     }
 }
@@ -890,6 +890,7 @@ mod tests {
         assert_eq!(world.depth(), cooked.depth);
         assert_eq!(world.sector_size(), cooked.sector_size);
         assert_eq!(world.material_count() as usize, cooked.materials.len());
+        assert_eq!(world.ambient_color(), grid.ambient_color);
 
         // Sector (0,0) -- the starter has a floor + perimeter walls
         // in its first populated cell, so this exercises both
@@ -1183,6 +1184,10 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes([bytes[header + 12], bytes[header + 13]]),
             cooked.wall_count()
+        );
+        assert_eq!(
+            [bytes[header + 14], bytes[header + 15], bytes[header + 16]],
+            grid.ambient_color
         );
 
         let first_sector_index = cooked

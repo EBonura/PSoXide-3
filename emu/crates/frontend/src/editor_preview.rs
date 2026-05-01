@@ -32,7 +32,8 @@ use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
 
 use psxed_project::{
-    GridDirection, GridSplit, NodeKind, ProjectDocument, ResourceData, ResourceId, WorldGrid,
+    spatial, GridDirection, GridSplit, NodeKind, ProjectDocument, ResourceData, ResourceId,
+    WorldGrid,
 };
 
 use crate::editor_textures::{EditorTextures, MaterialSlot};
@@ -57,6 +58,8 @@ const SCREEN_CX: i32 = SCREEN_W / 2;
 const SCREEN_CY: i32 = SCREEN_H / 2;
 /// Projection-plane distance (focal length). Bigger = narrower FOV.
 const PROJ_H: i32 = 320;
+const PREVIEW_PROJECTION: psx_engine::WorldProjection =
+    psx_engine::WorldProjection::new(SCREEN_CX as i16, SCREEN_CY as i16, PROJ_H, 1);
 
 /// Per-frame scratch -- primitives **and** OT must live in the same
 /// memory region. `OrderingTable` stores 24-bit chain pointers (the
@@ -194,9 +197,7 @@ fn first_room_grid(
     };
     // Geometric centre in world coords accounts for `origin` so the
     // camera reframes naturally as the grid grows in any direction.
-    let center_x = grid.origin[0] * grid.sector_size + (grid.width as i32 * grid.sector_size) / 2;
-    let center_z = grid.origin[1] * grid.sector_size + (grid.depth as i32 * grid.sector_size) / 2;
-    Some((room.id, grid, [center_x, 0, center_z]))
+    Some((room.id, grid, spatial::room_preview_center(grid)))
 }
 
 /// Configure the host-side GTE so subsequent `project_vertex` /
@@ -302,25 +303,12 @@ fn clamp_i16(value: i32) -> i16 {
     value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-/// One placed light flattened into world coords + the
-/// pre-multiplied colour×intensity_q8 the lighting accumulator
-/// uses. Built once per frame from `walk_room`.
-#[derive(Copy, Clone)]
-struct PreviewLight {
-    position: [i32; 3],
-    radius: i32,
-    /// `color × intensity` in 0..65535 per channel -- already
-    /// includes the Q8.8 multiplier so the per-face math
-    /// reduces to one >>8 shift per attenuated channel.
-    weighted_color: [u32; 3],
-}
-
 /// Walk every populated sector and emit triangles for floors,
 /// ceilings, and the walls on each cardinal edge. Faces whose
 /// material has a texture in the editor cache draw textured;
 /// everything else falls back to flat shading. Light
 /// accumulation happens per-face: the shade walks every
-/// `PreviewLight` once, attenuates by distance to the face
+/// point light once, attenuates by distance to the face
 /// centre, and modulates the base material colour.
 fn walk_room(
     project: &ProjectDocument,
@@ -423,11 +411,23 @@ fn walk_room(
 /// face's tri emit doesn't re-walk the resource table.
 #[derive(Copy, Clone)]
 enum FaceShade {
-    Flat(u8, u8, u8),
+    Flat {
+        rgb: (u8, u8, u8),
+        sidedness: psxed_project::MaterialFaceSidedness,
+    },
     Textured {
         slot: MaterialSlot,
         tint: (u8, u8, u8),
+        sidedness: psxed_project::MaterialFaceSidedness,
     },
+}
+
+impl FaceShade {
+    fn sidedness(self) -> psxed_project::MaterialFaceSidedness {
+        match self {
+            Self::Flat { sidedness, .. } | Self::Textured { sidedness, .. } => sidedness,
+        }
+    }
 }
 
 fn face_shade(
@@ -437,12 +437,20 @@ fn face_shade(
     textures: &EditorTextures,
 ) -> FaceShade {
     let tint = material_color(project, material, fallback);
+    let sidedness = material_sidedness(project, material);
     if let Some(id) = material {
         if let Some(slot) = textures.slot(id) {
-            return FaceShade::Textured { slot, tint };
+            return FaceShade::Textured {
+                slot,
+                tint,
+                sidedness,
+            };
         }
     }
-    FaceShade::Flat(tint.0, tint.1, tint.2)
+    FaceShade::Flat {
+        rgb: tint,
+        sidedness,
+    }
 }
 
 /// Walk every Light node in `project` whose enclosing room is
@@ -454,8 +462,7 @@ fn collect_preview_lights(
     project: &ProjectDocument,
     room_id: psxed_project::NodeId,
     grid: &WorldGrid,
-) -> Vec<PreviewLight> {
-    let s = grid.sector_size;
+) -> Vec<psx_engine::PointLightSample> {
     let scene = project.active_scene();
     let mut out = Vec::new();
     for node in scene.nodes() {
@@ -475,37 +482,21 @@ fn collect_preview_lights(
         if !is_descendant_of_room(scene, node.id, room_id) {
             continue;
         }
-        let pos = node.transform.translation;
-        // World position uses the same convention as
-        // `walk_entities` / `walk_model_instances`: editor
-        // translation is in *sectors relative to the room
-        // origin*, so multiply by `sector_size` and shift by
-        // half-grid. Room `origin` is baked into
-        // `cell_world_x/z` for grid faces; entities use the
-        // half-grid offset.
-        let world = [
-            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
-            (pos[1] * s as f32) as i32,
-            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
-        ];
+        let world = node_room_local_origin(grid, &node.transform);
         // Editor `radius` is in sector units; convert to
         // engine units once here so the per-face attenuation
         // math stays in world space.
-        let radius_engine = (radius * s as f32) as i32;
+        let radius_engine = spatial::light_radius_engine_units(grid, *radius);
         // Pre-multiply colour × intensity into u32 channels;
         // intensity scaled by 256 (Q8.8) keeps the per-face
         // accumulator in integer math.
         let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u32;
-        let weighted_color = [
-            color[0] as u32 * intensity_q8,
-            color[1] as u32 * intensity_q8,
-            color[2] as u32 * intensity_q8,
-        ];
-        out.push(PreviewLight {
-            position: world,
-            radius: radius_engine,
-            weighted_color,
-        });
+        out.push(psx_engine::PointLightSample::from_color_intensity_q8(
+            [world.x, world.y, world.z],
+            radius_engine,
+            *color,
+            intensity_q8,
+        ));
     }
     out
 }
@@ -555,7 +546,7 @@ fn wall_face_center(bounds: [i32; 4], edge: WallEdge, heights: [i32; 4]) -> [i32
 }
 
 /// Apply per-face lighting: ambient + linear-attenuation sum
-/// of every `PreviewLight` whose radius covers `face_center`.
+/// of every point light whose radius covers `face_center`.
 /// Final RGB clamps to 8 bits and modulates the input shade.
 /// Lighting convention (PSX-neutral):
 ///
@@ -567,94 +558,35 @@ fn wall_face_center(bounds: [i32; 4], edge: WallEdge, heights: [i32; 4]) -> [i32
 ///
 /// Both the editor preview and the runtime use this scale.
 /// Final colour = `base * light_rgb / 128`, clamped to `255`.
-pub(crate) const LIGHTING_NEUTRAL: u32 = 128;
-pub(crate) const LIGHTING_MAX: u32 = 255;
-
 fn light_face(
     base: FaceShade,
     face_center: [i32; 3],
-    lights: &[PreviewLight],
+    lights: &[psx_engine::PointLightSample],
     ambient: [u8; 3],
 ) -> FaceShade {
     let base_color = match base {
-        FaceShade::Flat(r, g, b) => (r, g, b),
+        FaceShade::Flat { rgb, .. } => rgb,
         FaceShade::Textured { tint, .. } => tint,
     };
-    // Start at room ambient -- *not* `ambient * 256`. The
-    // accumulator is the same 0..255 light_rgb space the
-    // modulate step expects: ambient = neutral 128 produces
-    // unmodified base material; ambient < 128 produces a
-    // dimmer surface; ambient > 128 brightens.
-    let mut light_rgb: [u32; 3] = [ambient[0] as u32, ambient[1] as u32, ambient[2] as u32];
-    for light in lights {
-        let dx = (face_center[0] - light.position[0]) as i64;
-        let dy = (face_center[1] - light.position[1]) as i64;
-        let dz = (face_center[2] - light.position[2]) as i64;
-        let d2 = dx * dx + dy * dy + dz * dz;
-        let r = light.radius as i64;
-        if r <= 0 || d2 >= r * r {
-            continue;
-        }
-        // Linear falloff: weight in Q8 -- `0..=256` where 256
-        // means "at the centre".
-        let d = isqrt_i64(d2);
-        let weight_q8 = (((r - d) << 8) / r) as u32;
-        for (c, channel) in light_rgb.iter_mut().enumerate() {
-            // weighted_color[c] = color[c] * intensity_q8 (up to
-            // 255 * u16::MAX). One contribution lands as
-            //   color * intensity * weight  → in 0..=255 typical
-            //   = (weighted_color * weight_q8) >> 16
-            let contrib = (light.weighted_color[c] as u64) * (weight_q8 as u64);
-            *channel = channel.saturating_add((contrib >> 16) as u32);
-        }
-    }
-    // Saturate light_rgb at 255 before modulating. Guarantees
-    // `base * light / 128` can't exceed `base * 2`, which the
-    // 8-bit clamp catches.
-    for channel in &mut light_rgb {
-        if *channel > LIGHTING_MAX {
-            *channel = LIGHTING_MAX;
-        }
-    }
-    let modulate = |base: u8, light: u32| -> u8 {
-        let blended = (base as u32 * light) / LIGHTING_NEUTRAL;
-        blended.min(255) as u8
-    };
-    let r = modulate(base_color.0, light_rgb[0]);
-    let g = modulate(base_color.1, light_rgb[1]);
-    let b = modulate(base_color.2, light_rgb[2]);
+    let (r, g, b) = psx_engine::shade_tint_with_lights(
+        base_color,
+        face_center,
+        ambient,
+        lights.iter().copied(),
+    );
     match base {
-        FaceShade::Flat(_, _, _) => FaceShade::Flat(r, g, b),
-        FaceShade::Textured { slot, .. } => FaceShade::Textured {
+        FaceShade::Flat { sidedness, .. } => FaceShade::Flat {
+            rgb: (r, g, b),
+            sidedness,
+        },
+        FaceShade::Textured {
+            slot, sidedness, ..
+        } => FaceShade::Textured {
             slot,
             tint: (r, g, b),
+            sidedness,
         },
     }
-}
-
-/// Integer square root for `i64`. Cheap iterative method;
-/// runs once per (face × light) so it's not in a hot inner
-/// loop. Returns 0 for negative input.
-fn isqrt_i64(value: i64) -> i64 {
-    if value <= 0 {
-        return 0;
-    }
-    let mut x = value as u64;
-    let mut r: u64 = 0;
-    let mut bit: u64 = 1u64 << 62;
-    while bit > x {
-        bit >>= 2;
-    }
-    while bit != 0 {
-        if x >= r + bit {
-            x -= r + bit;
-            r = (r >> 1) + bit;
-        } else {
-            r >>= 1;
-        }
-        bit >>= 2;
-    }
-    r as i64
 }
 
 /// Project the four corners of a sector-aligned horizontal face
@@ -822,30 +754,32 @@ fn push_wall_face(
     let use_br_tl = matches!(dropped_corner, Some(WallCorner::BL) | Some(WallCorner::TR));
     let (tri_a, tri_b) = if use_br_tl {
         (
-            // (BL, BR, TL) and (BR, TR, TL) -- diagonal BR-TL.
+            // (BL, TL, BR) and (BR, TL, TR) -- diagonal BR-TL,
+            // wound so the owning-cell side is the front.
             (
-                [p_bl, p_br, p_tl],
-                [uv_bl, uv_br, uv_tl],
-                [WallCorner::BL, WallCorner::BR, WallCorner::TL],
+                [p_bl, p_tl, p_br],
+                [uv_bl, uv_tl, uv_br],
+                [WallCorner::BL, WallCorner::TL, WallCorner::BR],
             ),
             (
-                [p_br, p_tr, p_tl],
-                [uv_br, uv_tr, uv_tl],
-                [WallCorner::BR, WallCorner::TR, WallCorner::TL],
+                [p_br, p_tl, p_tr],
+                [uv_br, uv_tl, uv_tr],
+                [WallCorner::BR, WallCorner::TL, WallCorner::TR],
             ),
         )
     } else {
         (
-            // (BL, BR, TR) and (BL, TR, TL) -- diagonal BL-TR.
+            // (BL, TL, TR) and (BL, TR, BR) -- diagonal BL-TR,
+            // wound so the owning-cell side is the front.
             (
-                [p_bl, p_br, p_tr],
-                [uv_bl, uv_br, uv_tr],
-                [WallCorner::BL, WallCorner::BR, WallCorner::TR],
+                [p_bl, p_tl, p_tr],
+                [uv_bl, uv_tl, uv_tr],
+                [WallCorner::BL, WallCorner::TL, WallCorner::TR],
             ),
             (
-                [p_bl, p_tr, p_tl],
-                [uv_bl, uv_tr, uv_tl],
-                [WallCorner::BL, WallCorner::TR, WallCorner::TL],
+                [p_bl, p_tr, p_br],
+                [uv_bl, uv_tr, uv_br],
+                [WallCorner::BL, WallCorner::TR, WallCorner::BR],
             ),
         )
     };
@@ -874,7 +808,6 @@ fn walk_entities(
     selected: psxed_project::NodeId,
     scratch: &mut PreviewScratch,
 ) {
-    let s = grid.sector_size;
     let scene = project.active_scene();
     for node in scene.nodes() {
         // Skip Model-backed MeshInstances -- `walk_model_instances`
@@ -891,17 +824,12 @@ fn walk_entities(
         let Some(kind_color) = entity_marker_color(&node.kind) else {
             continue;
         };
-        // Editor convention: child node transforms are in "sectors
-        // relative to the room origin." 2D viewport draws them at
-        // exactly translation; 3D viewport must scale by sector_size
-        // to match the room geometry below it.
-        let pos = node.transform.translation;
-        let entity_world = [
-            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
-            (pos[1] * s as f32) as i32,
-            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
-        ];
-        let projected = gte_scene::project_vertex(world_to_view(entity_world));
+        let entity_world = node_room_local_origin(grid, &node.transform);
+        let projected = gte_scene::project_vertex(world_to_view([
+            entity_world.x,
+            entity_world.y,
+            entity_world.z,
+        ]));
         if projected.sz == 0 {
             continue;
         }
@@ -1047,25 +975,16 @@ fn walk_model_instances(
         };
 
         // Resolve clip: explicit instance override → preview clip → default.
-        let clip_local = animation_clip
-            .or(model.preview_clip)
-            .or(model.default_clip)
-            .unwrap_or(0);
+        let clip_local =
+            psxed_project::resolve::resolve_model_instance_preview_clip(model, *animation_clip)
+                .unwrap_or(0);
         if (clip_local as usize) >= model.clips.len() {
             continue;
         }
 
-        // World position: same convention `walk_entities` uses
-        // for marker nodes -- translation is in sectors relative
-        // to the room centre, so multiply by sector_size and
-        // shift by half-grid.
-        let s = grid.sector_size;
-        let pos = node.transform.translation;
-        let origin = psx_engine::WorldVertex::new(
-            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
-            (pos[1] * s as f32) as i32,
-            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
-        );
+        // World position: same canonical room-local conversion
+        // used by entity bounds, lights, and placement picking.
+        let origin = node_room_local_origin(grid, &node.transform);
 
         let yaw_q12 = yaw_to_q12(node.transform.rotation_degrees[1]);
         let instance_rotation = yaw_rotation_q12(yaw_q12);
@@ -1195,22 +1114,14 @@ fn walk_player_spawn_preview(
         // preview / default clip if the Character has no idle
         // assigned, so the surface still renders even when the
         // Character is mid-author.
-        let clip_local = char_resource
-            .idle_clip
-            .or(model.preview_clip)
-            .or(model.default_clip)
-            .unwrap_or(0);
+        let clip_local =
+            psxed_project::resolve::resolve_character_idle_preview_clip(char_resource, model)
+                .unwrap_or(0);
         if (clip_local as usize) >= model.clips.len() {
             continue;
         }
 
-        let s = grid.sector_size;
-        let pos = node.transform.translation;
-        let origin = psx_engine::WorldVertex::new(
-            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
-            (pos[1] * s as f32) as i32,
-            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
-        );
+        let origin = node_room_local_origin(grid, &node.transform);
         let yaw_q12 = yaw_to_q12(node.transform.rotation_degrees[1]);
         let instance_rotation = yaw_rotation_q12(yaw_q12);
 
@@ -1239,19 +1150,17 @@ fn resolve_player_spawn_character(
     project: &ProjectDocument,
     explicit: Option<ResourceId>,
 ) -> Option<ResourceId> {
-    if let Some(id) = explicit {
-        return Some(id);
-    }
-    let mut found: Option<ResourceId> = None;
-    for r in &project.resources {
-        if matches!(r.data, ResourceData::Character(_)) {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(r.id);
-        }
-    }
-    found
+    psxed_project::resolve::resolve_spawn_character(project, explicit)
+        .ok()
+        .map(|resolved| resolved.id)
+}
+
+fn node_room_local_origin(
+    grid: &WorldGrid,
+    transform: &psxed_project::Transform3,
+) -> psx_engine::WorldVertex {
+    let [x, y, z] = spatial::node_preview_origin(grid, transform);
+    psx_engine::WorldVertex::new(x, y, z)
 }
 
 /// Selection gizmo for a placed model: a cyan vertical line
@@ -1451,7 +1360,13 @@ fn draw_preview_model_instance(
             };
             if let Some(slot) = projected.get_mut(global as usize) {
                 *slot =
-                    project_preview_model_vertex(v, primary, &joint_view_transforms, joint_count);
+                    projected_from_engine(psx_engine::project_model_vertex_with_joint_transforms(
+                        v,
+                        primary,
+                        &joint_view_transforms,
+                        joint_count,
+                        PREVIEW_PROJECTION,
+                    ));
             }
         }
     }
@@ -1491,67 +1406,11 @@ fn draw_preview_model_instance(
     }
 }
 
-#[derive(Clone, Copy)]
-struct PreviewViewVertex {
-    x: i32,
-    y: i32,
-    z: i32,
-}
-
-fn project_preview_model_vertex(
-    vertex: psx_asset::ModelVertex,
-    primary: psx_engine::JointViewTransform,
-    joint_view_transforms: &[psx_engine::JointViewTransform],
-    joint_count: usize,
-) -> psx_gte::scene::Projected {
-    if vertex.is_blend() && (vertex.joint1 as usize) < joint_count {
-        let secondary = joint_view_transforms[vertex.joint1 as usize];
-        let a = preview_view_transform(primary, vertex.position);
-        let b = preview_view_transform(secondary, vertex.position);
-        return project_preview_gte_view(preview_lerp_view(a, b, vertex.blend));
-    }
-
-    gte_scene::project_vertex(vertex.position)
-}
-
-fn preview_view_transform(
-    transform: psx_engine::JointViewTransform,
-    position: Vec3I16,
-) -> PreviewViewVertex {
-    let vx = position.x as i32;
-    let vy = position.y as i32;
-    let vz = position.z as i32;
-    let m = &transform.rotation.m;
-    PreviewViewVertex {
-        x: (((m[0][0] as i32) * vx + (m[0][1] as i32) * vy + (m[0][2] as i32) * vz) >> 12)
-            .saturating_add(transform.translation.x),
-        y: (((m[1][0] as i32) * vx + (m[1][1] as i32) * vy + (m[1][2] as i32) * vz) >> 12)
-            .saturating_add(transform.translation.y),
-        z: (((m[2][0] as i32) * vx + (m[2][1] as i32) * vy + (m[2][2] as i32) * vz) >> 12)
-            .saturating_add(transform.translation.z),
-    }
-}
-
-fn preview_lerp_view(a: PreviewViewVertex, b: PreviewViewVertex, t: u8) -> PreviewViewVertex {
-    let t = t as i32;
-    let inv = 256 - t;
-    PreviewViewVertex {
-        x: ((a.x.saturating_mul(inv)).saturating_add(b.x.saturating_mul(t))) >> 8,
-        y: ((a.y.saturating_mul(inv)).saturating_add(b.y.saturating_mul(t))) >> 8,
-        z: ((a.z.saturating_mul(inv)).saturating_add(b.z.saturating_mul(t))) >> 8,
-    }
-}
-
-fn project_preview_gte_view(view: PreviewViewVertex) -> psx_gte::scene::Projected {
-    if view.z <= 0 {
-        return psx_gte::scene::Projected::default();
-    }
-    let sx = SCREEN_CX + (view.x * PROJ_H) / view.z;
-    let sy = SCREEN_CY + (view.y * PROJ_H) / view.z;
+fn projected_from_engine(projected: psx_engine::ProjectedVertex) -> psx_gte::scene::Projected {
     psx_gte::scene::Projected {
-        sx: clamp_i16(sx),
-        sy: clamp_i16(sy),
-        sz: view.z.clamp(0, u16::MAX as i32) as u16,
+        sx: projected.sx,
+        sy: projected.sy,
+        sz: projected.sz.clamp(0, u16::MAX as i32) as u16,
     }
 }
 
@@ -1567,7 +1426,6 @@ fn walk_light_gizmos(
     selected: psxed_project::NodeId,
     scratch: &mut PreviewScratch,
 ) {
-    let s = grid.sector_size;
     let scene = project.active_scene();
     for node in scene.nodes() {
         let NodeKind::Light {
@@ -1578,16 +1436,12 @@ fn walk_light_gizmos(
         else {
             continue;
         };
-        let pos = node.transform.translation;
-        let center_world = [
-            ((pos[0] * s as f32) as i32).saturating_add((grid.width as i32 * s) / 2),
-            (pos[1] * s as f32) as i32,
-            ((pos[2] * s as f32) as i32).saturating_add((grid.depth as i32 * s) / 2),
-        ];
+        let center = node_room_local_origin(grid, &node.transform);
+        let center_world = [center.x, center.y, center.z];
         // Light radius is authored in *sector units*; scale to
         // engine units so the ring matches the light's actual
         // attenuation footprint.
-        let radius_engine = (radius * s as f32) as i32;
+        let radius_engine = spatial::light_radius_engine_units(grid, *radius);
         if radius_engine <= 0 {
             continue;
         }
@@ -1812,7 +1666,7 @@ fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
         NodeKind::SpawnPoint { player: true, .. } => Some((0x60, 0xE0, 0x80)),
         NodeKind::SpawnPoint { player: false, .. } => Some((0x60, 0xB8, 0xF0)),
         NodeKind::MeshInstance { .. } => Some((0xC0, 0xC8, 0xD0)),
-        NodeKind::Light { .. } => Some((0xFF, 0xD8, 0x70)),
+        NodeKind::Light { color, .. } => Some((color[0], color[1], color[2])),
         NodeKind::Trigger { .. } => Some((0xC8, 0x80, 0xE0)),
         NodeKind::Portal { .. } => Some((0xFF, 0xB0, 0x60)),
         NodeKind::AudioSource { .. } => Some((0x70, 0xD8, 0xC0)),
@@ -1869,6 +1723,19 @@ fn material_color(
     } else {
         fallback
     }
+}
+
+fn material_sidedness(
+    project: &ProjectDocument,
+    material: Option<ResourceId>,
+) -> psxed_project::MaterialFaceSidedness {
+    material
+        .and_then(|id| project.resource(id))
+        .and_then(|resource| match &resource.data {
+            ResourceData::Material(material) => Some(material.sidedness()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Squash a world-space i32 corner into the i16 the GTE V0 register
@@ -1983,19 +1850,12 @@ fn push_ghost_wall_outline(
     scratch: &mut PreviewScratch,
 ) {
     let s = grid.sector_size;
-    let x0 = wcx * s;
-    let x1 = x0 + s;
-    let z0 = wcz * s;
-    let z1 = z0 + s;
-    let (bl_xy, br_xy) = wall_xy_for(dir, x0, x1, z0, z1);
     const LIFT: i32 = 4;
-    let (nx, nz) = wall_inward_normal(dir);
-    let corners = [
-        [bl_xy.0 + LIFT * nx, 0, bl_xy.1 + LIFT * nz],
-        [br_xy.0 + LIFT * nx, 0, br_xy.1 + LIFT * nz],
-        [br_xy.0 + LIFT * nx, s, br_xy.1 + LIFT * nz],
-        [bl_xy.0 + LIFT * nx, s, bl_xy.1 + LIFT * nz],
-    ];
+    let bounds = spatial::cell_bounds_from_world_cell(wcx, wcz, s);
+    let Some(corners) = spatial::editor_wall_outline_corners(bounds, dir, [0, 0, s, s], LIFT)
+    else {
+        return;
+    };
     let projected: [psx_gte::scene::Projected; 4] = [
         gte_scene::project_vertex(world_to_view(corners[0])),
         gte_scene::project_vertex(world_to_view(corners[1])),
@@ -2298,17 +2158,15 @@ fn push_face_outline(
                 .and_then(|s| s.walls.get(dir).get(stack as usize))
                 .map(|wall| wall.heights)
                 .unwrap_or([0, 0, s, s]);
-            let (bl_xy, br_xy) = wall_xy_for(dir, x0, x1, z0, z1);
             // Inset along the wall's inward normal so the outline
             // sits inside the room rather than z-fighting the
             // wall surface when viewed from inside.
-            let (nx, nz) = wall_inward_normal(dir);
-            Some([
-                [bl_xy.0 + LIFT * nx, h[0], bl_xy.1 + LIFT * nz],
-                [br_xy.0 + LIFT * nx, h[1], br_xy.1 + LIFT * nz],
-                [br_xy.0 + LIFT * nx, h[2], br_xy.1 + LIFT * nz],
-                [bl_xy.0 + LIFT * nx, h[3], bl_xy.1 + LIFT * nz],
-            ])
+            spatial::editor_wall_outline_corners(
+                grid.cell_bounds_world(face.sx, face.sz),
+                dir,
+                h,
+                LIFT,
+            )
         }
     };
     let Some(corners) = corners else { return };
@@ -2328,32 +2186,6 @@ fn push_face_outline(
         let a = projected[i];
         let b = projected[(i + 1) % 4];
         push_screen_line(scratch, a, b, style);
-    }
-}
-
-/// World-space (x, z) endpoints of a wall on the given cardinal
-/// edge -- mirrors `push_wall_face` so picking, paint preview, and
-/// outline rendering all agree.
-fn wall_xy_for(dir: GridDirection, x0: i32, x1: i32, z0: i32, z1: i32) -> ((i32, i32), (i32, i32)) {
-    match dir {
-        GridDirection::North => ((x0, z1), (x1, z1)),
-        GridDirection::East => ((x1, z1), (x1, z0)),
-        GridDirection::South => ((x1, z0), (x0, z0)),
-        GridDirection::West => ((x0, z0), (x0, z1)),
-        _ => ((x0, z0), (x0, z0)),
-    }
-}
-
-/// Inward-facing normal (sign of x, sign of z) for the wall on
-/// `dir`. Used to inset the outline so it sits *inside* the room,
-/// not behind the wall plane.
-fn wall_inward_normal(dir: GridDirection) -> (i32, i32) {
-    match dir {
-        GridDirection::North => (0, -1),
-        GridDirection::East => (-1, 0),
-        GridDirection::South => (0, 1),
-        GridDirection::West => (1, 0),
-        _ => (0, 0),
     }
 }
 
@@ -2468,10 +2300,33 @@ fn emit_face_tri(
     uvs: [(u8, u8); 3],
     shade: FaceShade,
 ) {
-    match shade {
-        FaceShade::Flat(r, g, b) => push_tri(scratch, p, (r, g, b)),
-        FaceShade::Textured { slot, tint } => push_tex_tri(scratch, p, uvs, slot, tint),
+    if !face_side_visible(shade.sidedness(), p) {
+        return;
     }
+    match shade {
+        FaceShade::Flat { rgb, .. } => push_tri(scratch, p, rgb),
+        FaceShade::Textured { slot, tint, .. } => push_tex_tri(scratch, p, uvs, slot, tint),
+    }
+}
+
+fn face_side_visible(
+    sidedness: psxed_project::MaterialFaceSidedness,
+    p: [psx_gte::scene::Projected; 3],
+) -> bool {
+    let area = projected_area(p);
+    match sidedness {
+        psxed_project::MaterialFaceSidedness::Front => area > 0,
+        psxed_project::MaterialFaceSidedness::Back => area < 0,
+        psxed_project::MaterialFaceSidedness::Both => area != 0,
+    }
+}
+
+fn projected_area(p: [psx_gte::scene::Projected; 3]) -> i32 {
+    let ax = (p[1].sx as i32) - (p[0].sx as i32);
+    let ay = (p[1].sy as i32) - (p[0].sy as i32);
+    let bx = (p[2].sx as i32) - (p[0].sx as i32);
+    let by = (p[2].sy as i32) - (p[0].sy as i32);
+    ax * by - ay * bx
 }
 
 /// Compose a [`TriTextured`] sampling `slot`'s tpage / CLUT, stash
@@ -2545,18 +2400,69 @@ fn push_tri(scratch: &mut PreviewScratch, p: [psx_gte::scene::Projected; 3], rgb
 
 #[cfg(test)]
 mod tests {
-    use super::{floor_anchored_model_origin, light_face, FaceShade, PreviewLight};
-    use psx_engine::WorldVertex;
+    use super::{
+        face_side_visible, floor_anchored_model_origin, light_face, node_room_local_origin,
+        FaceShade,
+    };
+    use psx_engine::{PointLightSample, WorldVertex};
+    use psx_gte::scene::Projected;
+    use psxed_project::{MaterialFaceSidedness, WorldGrid};
 
     fn flat(r: u8, g: u8, b: u8) -> FaceShade {
-        FaceShade::Flat(r, g, b)
+        FaceShade::Flat {
+            rgb: (r, g, b),
+            sidedness: psxed_project::MaterialFaceSidedness::Front,
+        }
     }
 
     fn unpack(shade: FaceShade) -> (u8, u8, u8) {
         match shade {
-            FaceShade::Flat(r, g, b) => (r, g, b),
+            FaceShade::Flat { rgb, .. } => rgb,
             FaceShade::Textured { tint, .. } => tint,
         }
+    }
+
+    fn projected(sx: i16, sy: i16) -> Projected {
+        Projected { sx, sy, sz: 100 }
+    }
+
+    #[test]
+    fn face_sidedness_matches_runtime_winding_convention() {
+        let front = [projected(0, 0), projected(10, 0), projected(0, 10)];
+        let back = [front[0], front[2], front[1]];
+
+        assert!(face_side_visible(MaterialFaceSidedness::Front, front));
+        assert!(!face_side_visible(MaterialFaceSidedness::Front, back));
+        assert!(!face_side_visible(MaterialFaceSidedness::Back, front));
+        assert!(face_side_visible(MaterialFaceSidedness::Back, back));
+        assert!(face_side_visible(MaterialFaceSidedness::Both, front));
+        assert!(face_side_visible(MaterialFaceSidedness::Both, back));
+    }
+
+    #[test]
+    fn node_room_local_origin_matches_origin_aware_grid_conversion() {
+        let mut grid = WorldGrid::stone_room(4, 7, 1024, None, None);
+        grid.origin = [-1, -3];
+        let translation = [1.0, 0.25, 0.85];
+        let transform = psxed_project::Transform3 {
+            translation,
+            ..psxed_project::Transform3::default()
+        };
+
+        let origin = node_room_local_origin(&grid, &transform);
+        let expected = grid.editor_to_room_local([translation[0], translation[2]]);
+
+        assert_eq!(origin.x, expected[0] as i32);
+        assert_eq!(origin.y, 256);
+        assert_eq!(origin.z, expected[2] as i32);
+        assert_ne!(
+            (origin.x, origin.z),
+            (
+                ((translation[0] + grid.width as f32 * 0.5) * grid.sector_size as f32) as i32,
+                ((translation[2] + grid.depth as f32 * 0.5) * grid.sector_size as f32) as i32,
+            ),
+            "regression guard: old half-grid-only conversion ignores grid.origin"
+        );
     }
 
     #[test]
@@ -2601,12 +2507,7 @@ mod tests {
         // White light at the face centre with neutral base
         // should land at saturating-bright since contribution
         // (255 × 256 × 256) / 65536 = 255 dominates ambient.
-        let light = PreviewLight {
-            position: [0, 0, 0],
-            radius: 100,
-            // intensity_q8 = 256, color (255, 255, 255).
-            weighted_color: [255 * 256, 255 * 256, 255 * 256],
-        };
+        let light = PointLightSample::from_color_intensity_q8([0, 0, 0], 100, [255, 255, 255], 256);
         let lit = light_face(flat(128, 128, 128), [0, 0, 0], &[light], [32, 32, 32]);
         let (r, g, b) = unpack(lit);
         assert!(r > 200 && g > 200 && b > 200, "got ({r}, {g}, {b})");
@@ -2617,11 +2518,7 @@ mod tests {
         // Place the face well outside the light's radius; the
         // contribution must be exactly zero. Output should
         // match the no-lights case.
-        let light = PreviewLight {
-            position: [0, 0, 0],
-            radius: 100,
-            weighted_color: [255 * 256, 255 * 256, 255 * 256],
-        };
+        let light = PointLightSample::from_color_intensity_q8([0, 0, 0], 100, [255, 255, 255], 256);
         let lit = light_face(flat(128, 128, 128), [10000, 0, 0], &[light], [32, 32, 32]);
         let baseline = light_face(flat(128, 128, 128), [10000, 0, 0], &[], [32, 32, 32]);
         assert_eq!(unpack(lit), unpack(baseline));
@@ -2629,11 +2526,7 @@ mod tests {
 
     #[test]
     fn light_face_two_lights_accumulate_and_clamp() {
-        let l = PreviewLight {
-            position: [0, 0, 0],
-            radius: 100,
-            weighted_color: [255 * 256, 255 * 256, 255 * 256],
-        };
+        let l = PointLightSample::from_color_intensity_q8([0, 0, 0], 100, [255, 255, 255], 256);
         let lit = light_face(flat(255, 255, 255), [0, 0, 0], &[l, l], [128, 128, 128]);
         let (r, g, b) = unpack(lit);
         // Even with two saturating lights, output never

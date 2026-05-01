@@ -769,15 +769,13 @@ impl Gpu {
             //   0x05 -- draw offset (E5)
             // Redux masks the query to three bits and leaves the
             // latch untouched for 0, 1, 6 and 7.
-            0x10 => {
-                match value & 0x07 {
-                    0x02 => self.gpuread_latch = self.texture_window_raw,
-                    0x03 => self.gpuread_latch = self.drawing_start_raw,
-                    0x04 => self.gpuread_latch = self.drawing_end_raw,
-                    0x05 => self.gpuread_latch = self.drawing_offset_raw,
-                    _ => {}
-                }
-            }
+            0x10 => match value & 0x07 {
+                0x02 => self.gpuread_latch = self.texture_window_raw,
+                0x03 => self.gpuread_latch = self.drawing_start_raw,
+                0x04 => self.gpuread_latch = self.drawing_end_raw,
+                0x05 => self.gpuread_latch = self.drawing_offset_raw,
+                _ => {}
+            },
             // GP1 0x00 -- GPU reset. Matches Redux's `CtrlReset`:
             // clears the display-enable flag + RGB24/interlace bits
             // and resets DrawOffset, but **does not** touch the

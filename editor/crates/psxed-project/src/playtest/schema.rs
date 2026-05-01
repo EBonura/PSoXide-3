@@ -1,6 +1,6 @@
 //! Host-side package schema for embedded editor play mode.
 
-use crate::ResourceId;
+use crate::{MaterialFaceSidedness, ResourceId};
 
 /// Generated subdirectory inside the playtest example that
 /// receives `level_manifest.rs` + `rooms/` + `textures/`. Stable
@@ -97,6 +97,8 @@ pub struct PlaytestMaterial {
     pub texture_asset_index: usize,
     /// Per-material modulation tint.
     pub tint_rgb: [u8; 3],
+    /// Which side(s) of faces using this material should render.
+    pub face_sidedness: MaterialFaceSidedness,
 }
 
 /// One animation clip bound to a [`PlaytestModel`]. Carries

@@ -451,7 +451,10 @@ impl Sio0 {
         self.awaiting_ack = false;
         self.transfer_deadline = None;
         self.ack_deadline = if ack && self.ctrl & ctrl_bit::ACK_IRQ_ENABLE != 0 {
-            Some(now.saturating_add(self.transfer_ticks()).saturating_add(ack_delay_ticks))
+            Some(
+                now.saturating_add(self.transfer_ticks())
+                    .saturating_add(ack_delay_ticks),
+            )
         } else {
             None
         };
@@ -899,11 +902,7 @@ mod tests {
 
         sio.tick(10 + 0x88 * 8 - 1);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();
-        assert_eq!(
-            stat & stat_bit::IRQ,
-            0,
-            "only the SIO IRQ edge is delayed"
-        );
+        assert_eq!(stat & stat_bit::IRQ, 0, "only the SIO IRQ edge is delayed");
 
         sio.tick(10 + 0x88 * 8);
         let stat = sio.read32(Sio0::BASE + 0x4).unwrap();

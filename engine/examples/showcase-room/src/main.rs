@@ -19,8 +19,8 @@ extern crate psx_rt;
 use psx_asset::{Texture, World as AssetWorld};
 use psx_engine::{
     button, draw_room, App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena,
-    RuntimeRoom, Scene, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions,
-    WorldTriCommand, WorldVertex,
+    RuntimeRoom, Scene, WorldCamera, WorldProjection, WorldRenderMaterial, WorldRenderPass,
+    WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
@@ -153,8 +153,16 @@ impl Scene for Showcase {
 
         if let Some(room) = self.room {
             let materials = [
-                TextureMaterial::opaque(FLOOR_CLUT_WORD, FLOOR_TPAGE_WORD, NEUTRAL_TINT),
-                TextureMaterial::opaque(BRICK_CLUT_WORD, BRICK_TPAGE_WORD, NEUTRAL_TINT),
+                WorldRenderMaterial::both(TextureMaterial::opaque(
+                    FLOOR_CLUT_WORD,
+                    FLOOR_TPAGE_WORD,
+                    NEUTRAL_TINT,
+                )),
+                WorldRenderMaterial::both(TextureMaterial::opaque(
+                    BRICK_CLUT_WORD,
+                    BRICK_TPAGE_WORD,
+                    NEUTRAL_TINT,
+                )),
             ];
             let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE);
             draw_room(

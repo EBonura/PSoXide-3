@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod model_import;
 pub mod playtest;
+pub mod resolve;
+pub mod spatial;
 pub mod world_cook;
 
 /// Embedded copy of the default project's RON, baked at compile
@@ -194,6 +196,38 @@ impl PsxBlendMode {
     }
 }
 
+/// Which side of an authored face should render.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaterialFaceSidedness {
+    /// Render the face's authored/front winding only.
+    Front,
+    /// Render only the opposite side.
+    Back,
+    /// Render both sides.
+    #[default]
+    Both,
+}
+
+impl MaterialFaceSidedness {
+    /// User-facing label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Front => "Front",
+            Self::Back => "Back",
+            Self::Both => "Both",
+        }
+    }
+
+    /// Convert the old checkbox value into the new enum.
+    pub const fn from_double_sided(double_sided: bool) -> Self {
+        if double_sided {
+            Self::Both
+        } else {
+            Self::Front
+        }
+    }
+}
+
 /// Authoring material. The cooker maps this to runtime texture/material state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterialResource {
@@ -203,7 +237,13 @@ pub struct MaterialResource {
     pub blend_mode: PsxBlendMode,
     /// Texture modulation tint. `0x80` is neutral for PS1 textured polys.
     pub tint: [u8; 3],
-    /// Whether both windings should be emitted at export time.
+    /// Which side(s) of faces using this material should render.
+    #[serde(default)]
+    pub face_sidedness: MaterialFaceSidedness,
+    /// Legacy project field. New code reads/writes
+    /// [`face_sidedness`](Self::face_sidedness); this remains so older
+    /// `.ron` projects migrate without losing their two-sided setting.
+    #[serde(default)]
     pub double_sided: bool,
 }
 
@@ -214,7 +254,8 @@ impl MaterialResource {
             texture,
             blend_mode: PsxBlendMode::Opaque,
             tint: [0x80, 0x80, 0x80],
-            double_sided: false,
+            face_sidedness: MaterialFaceSidedness::Both,
+            double_sided: true,
         }
     }
 
@@ -224,8 +265,26 @@ impl MaterialResource {
             texture,
             blend_mode,
             tint: [0x80, 0x80, 0x80],
+            face_sidedness: MaterialFaceSidedness::Both,
             double_sided: true,
         }
+    }
+
+    /// Resolved sidedness. Missing `face_sidedness` defaults to
+    /// `Both` so old projects keep matching the editor preview, while
+    /// legacy `double_sided = true` still upgrades an explicit/front
+    /// value to two-sided.
+    pub const fn sidedness(&self) -> MaterialFaceSidedness {
+        if self.double_sided && matches!(self.face_sidedness, MaterialFaceSidedness::Front) {
+            MaterialFaceSidedness::Both
+        } else {
+            self.face_sidedness
+        }
+    }
+
+    /// Keep the legacy field aligned after editing `face_sidedness`.
+    pub fn sync_legacy_sidedness(&mut self) {
+        self.double_sided = matches!(self.face_sidedness, MaterialFaceSidedness::Both);
     }
 }
 
@@ -706,6 +765,14 @@ impl WorldGridBudget {
     }
 }
 
+const fn default_ambient_color() -> [u8; 3] {
+    [32, 32, 32]
+}
+
+const fn default_light_color() -> [u8; 3] {
+    [255, 240, 200]
+}
+
 /// Engine-style grid world authored by a scene node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldGrid {
@@ -726,6 +793,7 @@ pub struct WorldGrid {
     #[serde(default)]
     pub origin: [i32; 2],
     /// Room ambient color used as editor/cooker metadata.
+    #[serde(default = "default_ambient_color")]
     pub ambient_color: [u8; 3],
     /// Whether PS1 depth cue/fog should be cooked for this grid.
     pub fog_enabled: bool,
@@ -741,7 +809,7 @@ impl WorldGrid {
             sector_size,
             sectors: vec![None; len],
             origin: [0, 0],
-            ambient_color: [32, 32, 32],
+            ambient_color: default_ambient_color(),
             fog_enabled: true,
         }
     }
@@ -1371,6 +1439,7 @@ pub enum NodeKind {
     /// Simple authoring light.
     Light {
         /// RGB light colour.
+        #[serde(default = "default_light_color")]
         color: [u8; 3],
         /// Light intensity multiplier.
         intensity: f32,
@@ -2166,6 +2235,39 @@ mod tests {
             grid.width as usize * grid.depth as usize
         );
         assert!(grid.populated_sector_count() > 0);
+    }
+
+    #[test]
+    fn legacy_project_missing_light_color_and_room_ambient_uses_defaults() {
+        let source = DEFAULT_PROJECT_RON
+            .replace(
+                "kind: Light(color: (255, 236, 198), intensity: 1.0, radius: 4.0)",
+                "kind: Light(intensity: 1.0, radius: 4.0)",
+            )
+            .replace(", ambient_color: (32, 32, 32)", "");
+
+        let project = ProjectDocument::from_ron_str(&source).unwrap();
+        let light_color = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Light { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("starter has a light");
+        assert_eq!(light_color, default_light_color());
+
+        let ambient = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Room { grid } => Some(grid.ambient_color),
+                _ => None,
+            })
+            .expect("starter has a room");
+        assert_eq!(ambient, default_ambient_color());
     }
 
     #[test]

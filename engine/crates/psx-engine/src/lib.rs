@@ -51,6 +51,7 @@ pub mod angle;
 pub mod app;
 pub mod character_motor;
 pub mod frames;
+pub mod lighting;
 pub mod render;
 pub mod render3d;
 pub mod scene;
@@ -68,13 +69,18 @@ pub use character_motor::{
     CharacterMotorInput, CharacterMotorState,
 };
 pub use frames::{Frames, Ticks};
+pub use lighting::{
+    accumulate_point_lights, modulate_tint, shade_tint_with_lights, PointLightSample, LIGHTING_MAX,
+    LIGHTING_NEUTRAL,
+};
 pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
 pub use render3d::{
-    compute_joint_view_transform, CullMode, DepthPolicy, GouraudMeshOptions, GouraudRenderPass,
-    GouraudTriCommand, JointViewTransform, LocalToWorldScale, MeshRenderStats,
-    ProjectedTexturedVertex, ProjectedVertex, TexturedModelRenderStats, TexturedViewVertex,
-    ViewVertex, WorldCamera, WorldProjection, WorldRenderLayer, WorldRenderPass, WorldRenderStats,
-    WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    compute_joint_view_transform, project_model_vertex_with_joint_transforms, CullMode,
+    DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand, JointViewTransform,
+    LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex, ProjectedVertex,
+    TexturedModelRenderStats, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
+    WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,
+    WorldVertex,
 };
 // Re-export the GTE math types callers need to construct
 // arguments for `submit_textured_model` (instance rotation,
@@ -92,7 +98,10 @@ pub use world::{
     GridVerticalFace, GridWalls, GridWorld, RoomCollision, RoomRender, RuntimeRoom,
     SectorCollision, SectorRender, WallCollision, WallRender, WorldMaterialId, GRID_SECTOR_SIZE,
 };
-pub use world_render::draw_room;
+pub use world_render::{
+    draw_room, draw_room_lit, NoWorldSurfaceLighting, SurfaceSidedness, WorldRenderMaterial,
+    WorldSurfaceKind, WorldSurfaceLighting, WorldSurfaceSample,
+};
 
 /// Button-mask constants (UP, DOWN, CROSS, START, …) re-exported
 /// from `psx_pad::button` so games using `Ctx::just_pressed` /

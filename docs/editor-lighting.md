@@ -150,25 +150,19 @@ room. See
 
 ## Runtime playtest lighting
 
-`editor-playtest` accumulates lights at the **room centre** and
-modulates each room material's tint by the resulting Q8 factor.
-This is room-level "ambient" rather than per-face:
+`editor-playtest` uses the same per-face lighting convention as
+the editor preview:
 
-1. `accumulate_room_light(world_center, room_index)` walks
-   every `LIGHTS` record matching the active room.
-2. Each contribution is `color × intensity_q8 × weight` where
-   `weight` is the same linear falloff the editor preview uses,
-   evaluated at the room centre.
-3. The accumulated `(R, G, B)` modulates each material's
-   `tint_rgb` before `TextureMaterial::opaque` builds the
-   render command.
+1. `psx_engine::draw_room_lit` exposes each emitted floor,
+   ceiling, and wall surface centre through `WorldSurfaceSample`.
+2. `RuntimeRoomLighting` filters `LIGHTS` to the active room and
+   converts records to `psx_engine::PointLightSample`.
+3. `psx_engine::shade_tint_with_lights` accumulates ambient plus
+   linear point-light falloff at the surface centre, then modulates
+   the material's base `tint_rgb`.
 
-Per-face runtime lighting would need `draw_room` to take a
-lights slice and accumulate per-emitted-triangle. That's a
-deliberate follow-up -- this pass keeps the engine API stable
-while still giving authors visible feedback for radius /
-intensity / colour at runtime. The editor preview is where
-authors tune lights with full spatial accuracy.
+The shared `psx_engine::lighting` helper owns the neutral-128
+math, so the editor viewport and embedded runtime stay in lockstep.
 
 ## Validation
 
@@ -185,7 +179,7 @@ Warnings (soft):
 
 | Feature | Status |
 | ------- | ------ |
-| Per-face runtime lighting | Out of scope. Editor preview shows per-face; runtime is room-level. |
+| Per-face runtime lighting | Implemented for room floors, ceilings, and walls. |
 | Model lighting at runtime | Out of scope. Models render at full brightness; only room surfaces respond. |
 | Spotlights / directional lights / area lights | Out of scope. |
 | Shadows / shadow mapping | Out of scope. |
@@ -201,6 +195,7 @@ Warnings (soft):
 - `emu/crates/frontend/src/editor_preview.rs` --
   `walk_light_gizmos`, `collect_preview_lights`, `light_face`.
 - `engine/examples/editor-playtest/src/main.rs` --
-  `accumulate_room_light`, `modulate_tint`.
+  `RuntimeRoomLighting`.
+- `engine/crates/psx-engine/src/lighting.rs` -- shared neutral-128 lighting math.
 - `docs/editor-model-authoring.md` -- model authoring (lights
   do not yet apply to models).

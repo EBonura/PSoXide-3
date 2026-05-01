@@ -18,9 +18,8 @@
 //! - **[`Ticks`]** -- SPU-audio-rate counter (44100 Hz). Wraps at
 //!   `u32::MAX` = ~27 hours of uptime, comfortably past any
 //!   session length. Staying `u32` matches the R3000A's native
-//!   word size -- a `u64` would force every arithmetic op to be
-//!   synthesised as two 32-bit half-ops with carry, roughly 3-4×
-//!   cost with zero practical benefit at PSX timescales.
+//!   word size and avoids synthesised add-with-carry sequences
+//!   with zero practical benefit at PSX timescales.
 //!
 //! Games that need raw arithmetic call [`Frames::as_u32`] to break
 //! the newtype at the call site. Games that just want "is this a
@@ -90,9 +89,8 @@ impl Frames {
 ///
 /// `u32` at 44100 Hz wraps after ~27 hours of uptime -- comfortably
 /// past any real session. The R3000A has 32-bit native registers;
-/// a `u64` counter would force every arithmetic op to be
-/// synthesised as an add-with-carry pair, 3-4× the instruction
-/// cost, to gain coverage we can't exhaust anyway.
+/// wider counters would force every arithmetic op into carry-pair
+/// sequences, spending instruction budget on range we cannot exhaust.
 ///
 /// Reserved for engine subsystems that need finer time resolution
 /// than per-frame (audio scheduling, profiling). No `Ctx` field yet.

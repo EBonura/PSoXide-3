@@ -9,6 +9,7 @@
 
 use emulator_core::{gpu::GpuCmdLogEntry, Bus, ButtonState, Cpu};
 use psx_iso::Exe;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
@@ -35,6 +36,11 @@ fn main() {
     let sticks = std::env::var("PSOXIDE_PAD1_STICKS")
         .ok()
         .and_then(|text| parse_sticks(&text));
+    let pc_hist_enabled = std::env::var("PSOXIDE_PC_HIST")
+        .ok()
+        .is_some_and(|text| text != "0");
+    let mut pc_hist: HashMap<u32, u64> = HashMap::new();
+    let mut pc_hist_samples = 0u64;
     let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("bios");
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -74,6 +80,10 @@ fn main() {
         let gte_before = cpu.cop2().profile_snapshot();
         let host_start = Instant::now();
         while bus.irq().raise_counts()[0] < target {
+            if pc_hist_enabled {
+                *pc_hist.entry(cpu.pc()).or_insert(0) += 1;
+                pc_hist_samples = pc_hist_samples.saturating_add(1);
+            }
             if cpu.step(&mut bus).is_err() {
                 break;
             }
@@ -110,6 +120,28 @@ fn main() {
             cpu.pc(),
         );
         dump_ppm(&bus, &name, target);
+    }
+
+    if pc_hist_enabled {
+        print_pc_hist(&pc_hist, pc_hist_samples);
+    }
+}
+
+fn print_pc_hist(hist: &HashMap<u32, u64>, samples: u64) {
+    let mut sorted: Vec<(u32, u64)> = hist.iter().map(|(&pc, &count)| (pc, count)).collect();
+    sorted.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+    eprintln!("[pc-hist] samples={samples} unique={}", sorted.len());
+    let limit = std::env::var("PSOXIDE_PC_HIST_LIMIT")
+        .ok()
+        .and_then(|text| text.parse::<usize>().ok())
+        .unwrap_or(40);
+    for (pc, count) in sorted.iter().take(limit) {
+        let pct = if samples == 0 {
+            0.0
+        } else {
+            (*count as f64) * 100.0 / (samples as f64)
+        };
+        eprintln!("[pc-hist] 0x{pc:08x} {count:>10} {pct:>5.2}%");
     }
 }
 
