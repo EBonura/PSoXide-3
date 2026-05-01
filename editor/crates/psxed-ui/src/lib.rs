@@ -962,10 +962,10 @@ enum PlaceKind {
     PlayerSpawn,
     /// `SpawnPoint { player: false }`. Multiple OK.
     SpawnMarker,
-    /// `MeshInstance` referencing a [`ResourceData::Model`].
-    /// Place flow picks the selected Model resource if set,
-    /// auto-picks the only Model resource if exactly one
-    /// exists, or refuses with an actionable error otherwise.
+    /// `Entity + ModelRenderer + Animator` referencing a
+    /// [`ResourceData::Model`]. Place flow picks the selected Model
+    /// resource if set, auto-picks the only Model resource if exactly
+    /// one exists, or refuses with an actionable error otherwise.
     ModelInstance,
     /// `Light` with default color / intensity / radius.
     LightMarker,
@@ -1973,6 +1973,8 @@ impl EditorWorkspace {
         };
         let (rect, response) =
             ui.allocate_exact_size(egui::Vec2::new(w, h), egui::Sense::click_and_drag());
+        let dnd_active = egui::DragAndDrop::has_any_payload(ui.ctx());
+        let resource_drop_hovered = response.dnd_hover_payload::<ResourceId>().is_some();
 
         // Sims-style: primary button always belongs to the active
         // tool -- click-and-drag floors / walls / entities into the
@@ -2046,91 +2048,101 @@ impl EditorWorkspace {
         } else {
             None
         };
+        let dropped_resource = response
+            .dnd_release_payload::<ResourceId>()
+            .map(|payload| *payload);
+        if let Some(resource_id) = dropped_resource {
+            self.drop_resource_3d(resource_id, face_hit, hover_world);
+        }
 
         // Primary click / drag: ray-pick the cell under the cursor
         // and dispatch to the active tool. Click starts a fresh
         // drag; drag fires every frame the pointer moves; per-cell
         // dedupe keeps walls / placements from stacking when the
         // pointer dwells inside the same cell across frames.
-        if response.drag_started_by(egui::PointerButton::Primary)
-            || response.clicked_by(egui::PointerButton::Primary)
-        {
-            self.last_paint_stamp = None;
-        }
+        if !dnd_active {
+            if response.drag_started_by(egui::PointerButton::Primary)
+                || response.clicked_by(egui::PointerButton::Primary)
+            {
+                self.last_paint_stamp = None;
+            }
 
-        // Hover-track entity bounds in Select mode so the
-        // overlay can highlight the bound under the cursor
-        // before the user clicks.
-        if matches!(self.active_tool, ViewTool::Select) {
-            self.hovered_entity_node = response
-                .hover_pos()
-                .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()))
-                .map(|hit| hit.node);
+            // Hover-track entity bounds in Select mode so the
+            // overlay can highlight the bound under the cursor
+            // before the user clicks.
+            if matches!(self.active_tool, ViewTool::Select) {
+                self.hovered_entity_node = response
+                    .hover_pos()
+                    .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()))
+                    .map(|hit| hit.node);
+            } else {
+                self.hovered_entity_node = None;
+            }
+
+            // Select-tool drag-translate. Two distinct drag flows:
+            //   1. Entity bound under cursor → start `node_drag`,
+            //      move the node on its X/Z plane.
+            //   2. Otherwise (face / edge / vertex hit, or empty)
+            //      fall back to the existing primitive vertical
+            //      drag.
+            // Pure clicks (press without movement) just promote
+            // the hovered target to the selection -- no undo
+            // entry, no mutation. The first drag frame that
+            // crosses a threshold lazy-pushes undo so a
+            // press-and-release doesn't leave a stale snapshot.
+            if matches!(self.active_tool, ViewTool::Select) {
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    let entity_hit = response
+                        .interact_pointer_pos()
+                        .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()));
+                    if let Some(hit) = entity_hit {
+                        self.begin_node_drag(hit, rect);
+                    } else {
+                        self.begin_primitive_drag();
+                    }
+                }
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    if self.node_drag.is_some() {
+                        if let Some(p) = response.interact_pointer_pos() {
+                            self.update_node_drag(rect, p);
+                        }
+                    } else {
+                        let dy = response.drag_delta().y;
+                        self.update_primitive_drag(dy);
+                    }
+                }
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    if self.node_drag.is_some() {
+                        self.end_node_drag();
+                    } else {
+                        self.end_primitive_drag();
+                    }
+                }
+                if response.clicked_by(egui::PointerButton::Primary) {
+                    // Entity click takes priority over face click --
+                    // matches the drag flow above.
+                    let entity_hit = response
+                        .interact_pointer_pos()
+                        .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()));
+                    if let Some(hit) = entity_hit {
+                        self.commit_node_selection(hit.node);
+                    } else {
+                        self.commit_face_selection();
+                    }
+                }
+            } else {
+                let primary_active = response.clicked_by(egui::PointerButton::Primary)
+                    || response.dragged_by(egui::PointerButton::Primary);
+                if primary_active {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let face_hit = self.pick_face_with_hit(rect, pos);
+                        let ground = self.pick_3d_world(rect, pos);
+                        self.dispatch_paint_3d(face_hit, ground);
+                    }
+                }
+            }
         } else {
             self.hovered_entity_node = None;
-        }
-
-        // Select-tool drag-translate. Two distinct drag flows:
-        //   1. Entity bound under cursor → start `node_drag`,
-        //      move the node on its X/Z plane.
-        //   2. Otherwise (face / edge / vertex hit, or empty)
-        //      fall back to the existing primitive vertical
-        //      drag.
-        // Pure clicks (press without movement) just promote
-        // the hovered target to the selection -- no undo
-        // entry, no mutation. The first drag frame that
-        // crosses a threshold lazy-pushes undo so a
-        // press-and-release doesn't leave a stale snapshot.
-        if matches!(self.active_tool, ViewTool::Select) {
-            if response.drag_started_by(egui::PointerButton::Primary) {
-                let entity_hit = response
-                    .interact_pointer_pos()
-                    .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()));
-                if let Some(hit) = entity_hit {
-                    self.begin_node_drag(hit, rect);
-                } else {
-                    self.begin_primitive_drag();
-                }
-            }
-            if response.dragged_by(egui::PointerButton::Primary) {
-                if self.node_drag.is_some() {
-                    if let Some(p) = response.interact_pointer_pos() {
-                        self.update_node_drag(rect, p);
-                    }
-                } else {
-                    let dy = response.drag_delta().y;
-                    self.update_primitive_drag(dy);
-                }
-            }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                if self.node_drag.is_some() {
-                    self.end_node_drag();
-                } else {
-                    self.end_primitive_drag();
-                }
-            }
-            if response.clicked_by(egui::PointerButton::Primary) {
-                // Entity click takes priority over face click --
-                // matches the drag flow above.
-                let entity_hit = response
-                    .interact_pointer_pos()
-                    .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()));
-                if let Some(hit) = entity_hit {
-                    self.commit_node_selection(hit.node);
-                } else {
-                    self.commit_face_selection();
-                }
-            }
-        } else {
-            let primary_active = response.clicked_by(egui::PointerButton::Primary)
-                || response.dragged_by(egui::PointerButton::Primary);
-            if primary_active {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let face_hit = self.pick_face_with_hit(rect, pos);
-                    let ground = self.pick_3d_world(rect, pos);
-                    self.dispatch_paint_3d(face_hit, ground);
-                }
-            }
         }
 
         // Scroll = dolly. ±8% of current radius per wheel notch,
@@ -2148,6 +2160,22 @@ impl EditorWorkspace {
         egui::Image::new((viewport_3d.texture, rect.size()))
             .uv(viewport_3d.uv)
             .paint_at(ui, rect);
+        if resource_drop_hovered {
+            let painter = ui.painter_at(rect);
+            painter.rect_stroke(
+                rect.shrink(2.0),
+                2.0,
+                Stroke::new(2.0, STUDIO_ACCENT),
+                StrokeKind::Inside,
+            );
+            painter.text(
+                rect.center_top() + Vec2::new(0.0, 16.0),
+                Align2::CENTER_TOP,
+                "Drop resource into scene",
+                FontId::proportional(13.0),
+                STUDIO_ACCENT,
+            );
+        }
     }
 
     /// Play-mode 3D body -- paints the live emulator framebuffer into
@@ -2671,6 +2699,202 @@ impl EditorWorkspace {
         self.run_paint_action(tool, room_id, sx, sz, face_hit.map(|(f, _)| f), hit_world)
     }
 
+    fn drop_resource_3d(
+        &mut self,
+        resource_id: ResourceId,
+        face_hit: Option<(FaceRef, [f32; 3])>,
+        ground_hit: Option<[f32; 2]>,
+    ) {
+        if let Some((face, hit_world)) = face_hit {
+            self.drop_resource_at_room_hit(resource_id, face.room, hit_world, Some(face));
+            return;
+        }
+
+        let Some(room_id) = self.active_room_id() else {
+            self.status = "Drop needs an active Room".to_string();
+            return;
+        };
+        let Some(editor_world) = ground_hit else {
+            self.status = "Drop onto the room floor or an existing face".to_string();
+            return;
+        };
+        let Some((_sx, _sz)) = self.ensure_cell_in_grid(room_id, editor_world) else {
+            return;
+        };
+        let hit_world = self.editor_world_to_world3(room_id, editor_world);
+        self.drop_resource_at_room_hit(resource_id, room_id, hit_world, None);
+    }
+
+    fn drop_resource_2d(&mut self, resource_id: ResourceId, editor_world: [f32; 2]) {
+        let Some(room_id) = self.active_room_id() else {
+            self.status = "Drop needs an active Room".to_string();
+            return;
+        };
+        let Some((_sx, _sz)) = self.ensure_cell_in_grid(room_id, editor_world) else {
+            return;
+        };
+        let hit_world = self.editor_world_to_world3(room_id, editor_world);
+        self.drop_resource_at_room_hit(resource_id, room_id, hit_world, None);
+    }
+
+    fn drop_resource_at_room_hit(
+        &mut self,
+        resource_id: ResourceId,
+        room_id: NodeId,
+        hit_world: [f32; 3],
+        face: Option<FaceRef>,
+    ) {
+        let Some(resource) = self.project.resource(resource_id).cloned() else {
+            self.status = format!("Resource #{} no longer exists", resource_id.raw());
+            return;
+        };
+
+        match resource.data {
+            ResourceData::Model(_) => {
+                self.push_undo();
+                let node = self.create_model_entity_at_room_hit(
+                    room_id,
+                    resource_id,
+                    &resource.name,
+                    hit_world,
+                );
+                self.selected_node = node;
+                self.selected_resource = None;
+                self.selected_primitive = None;
+                self.status = format!("Created Entity from {}", resource.name);
+                self.mark_dirty();
+            }
+            ResourceData::Character(character) => {
+                self.push_undo();
+                let node = self.create_character_actor_at_room_hit(
+                    room_id,
+                    resource_id,
+                    &resource.name,
+                    character.model,
+                    character.idle_clip,
+                    character.radius,
+                    character.height,
+                    hit_world,
+                );
+                self.selected_node = node;
+                self.selected_resource = None;
+                self.selected_primitive = None;
+                self.status = format!("Created Actor from {}", resource.name);
+                self.mark_dirty();
+            }
+            ResourceData::Material(_) => {
+                let Some(face) = face else {
+                    self.status = "Drop Material onto an existing face".to_string();
+                    return;
+                };
+                if self.assign_face_material(face, Some(resource_id)) {
+                    self.selected_resource = Some(resource_id);
+                    self.selected_primitive = Some(Selection::Face(face));
+                    self.status = format!("Assigned {} to {}", resource.name, describe_face(face));
+                }
+            }
+            _ => {
+                self.status = format!(
+                    "Drag Model or Character resources into the scene; {} is not placeable",
+                    resource.data.label()
+                );
+            }
+        }
+    }
+
+    fn create_model_entity_at_room_hit(
+        &mut self,
+        room_id: NodeId,
+        model_id: ResourceId,
+        name: &str,
+        hit_world: [f32; 3],
+    ) -> NodeId {
+        let editor = self
+            .room_grid_view(room_id)
+            .map(|grid| grid.room_local_to_editor(hit_world))
+            .unwrap_or([hit_world[0], hit_world[2]]);
+        let scene = self.project.active_scene_mut();
+        let entity = scene.add_node(room_id, name.to_string(), NodeKind::Entity);
+        if let Some(node) = scene.node_mut(entity) {
+            node.transform.translation = [editor[0], 0.0, editor[1]];
+        }
+        scene.add_node(
+            entity,
+            "Model Renderer",
+            NodeKind::ModelRenderer {
+                model: Some(model_id),
+                material: None,
+            },
+        );
+        scene.add_node(
+            entity,
+            "Animator",
+            NodeKind::Animator {
+                clip: None,
+                autoplay: true,
+            },
+        );
+        entity
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_character_actor_at_room_hit(
+        &mut self,
+        room_id: NodeId,
+        character_id: ResourceId,
+        name: &str,
+        model_id: Option<ResourceId>,
+        idle_clip: Option<u16>,
+        radius: u16,
+        height: u16,
+        hit_world: [f32; 3],
+    ) -> NodeId {
+        let editor = self
+            .room_grid_view(room_id)
+            .map(|grid| grid.room_local_to_editor(hit_world))
+            .unwrap_or([hit_world[0], hit_world[2]]);
+        let scene = self.project.active_scene_mut();
+        let actor = scene.add_node(room_id, name.to_string(), NodeKind::Actor);
+        if let Some(node) = scene.node_mut(actor) {
+            node.transform.translation = [editor[0], 0.0, editor[1]];
+        }
+        if let Some(model_id) = model_id {
+            scene.add_node(
+                actor,
+                "Model Renderer",
+                NodeKind::ModelRenderer {
+                    model: Some(model_id),
+                    material: None,
+                },
+            );
+            scene.add_node(
+                actor,
+                "Animator",
+                NodeKind::Animator {
+                    clip: idle_clip,
+                    autoplay: true,
+                },
+            );
+        }
+        scene.add_node(
+            actor,
+            "Character Controller",
+            NodeKind::CharacterController {
+                character: Some(character_id),
+                player: false,
+            },
+        );
+        scene.add_node(
+            actor,
+            "Collider",
+            NodeKind::Collider {
+                shape: ColliderShape::Capsule { radius, height },
+                solid: true,
+            },
+        );
+        actor
+    }
+
     /// Build the dedupe key for the next paint dispatch. PaintWall
     /// records the targeted edge + stack so dragging across edges
     /// of the same cell stamps each one (different stamps), but
@@ -2886,14 +3110,16 @@ impl EditorWorkspace {
                     //     resource exists project-wide -- auto-pick;
                     //     (c) refuse with an actionable status.
                     match self.resolve_place_model_resource() {
-                        Ok((model_id, name)) => (
-                            name,
-                            NodeKind::MeshInstance {
-                                mesh: Some(model_id),
-                                material: None,
-                                animation_clip: None,
-                            },
-                        ),
+                        Ok((model_id, name)) => {
+                            let id = self.create_model_entity_at_room_hit(
+                                room_id, model_id, &name, hit_world,
+                            );
+                            self.selected_node = id;
+                            self.selected_resource = None;
+                            self.status = format!("Placed Model at {sx},{sz}");
+                            self.mark_dirty();
+                            return;
+                        }
                         Err(message) => {
                             self.status = message;
                             return;
@@ -4967,17 +5193,20 @@ impl EditorWorkspace {
                 let size = ui.available_size();
                 let size = Vec2::new(size.x.max(320.0), size.y.max(240.0));
                 let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+                let dnd_active = egui::DragAndDrop::has_any_payload(ui.ctx());
+                let resource_drop_hovered = response.dnd_hover_payload::<ResourceId>().is_some();
 
-                if response.dragged_by(egui::PointerButton::Middle)
-                    || response.dragged_by(egui::PointerButton::Secondary)
+                if !dnd_active
+                    && (response.dragged_by(egui::PointerButton::Middle)
+                        || response.dragged_by(egui::PointerButton::Secondary))
                 {
                     self.viewport_pan += ui.input(|input| input.pointer.delta());
                 }
-                if response.dragged_by(egui::PointerButton::Primary) {
+                if !dnd_active && response.dragged_by(egui::PointerButton::Primary) {
                     self.drag_selected_node(ui.input(|input| input.pointer.delta()));
                 }
 
-                if response.hovered() {
+                if !dnd_active && response.hovered() {
                     let scroll = ui.input(|input| input.raw_scroll_delta.y);
                     if scroll.abs() > f32::EPSILON {
                         let pointer = ui
@@ -4997,6 +5226,16 @@ impl EditorWorkspace {
                 }
 
                 let transform = ViewportTransform::new(rect, self.viewport_pan, self.viewport_zoom);
+                if let Some(resource_id) = response
+                    .dnd_release_payload::<ResourceId>()
+                    .map(|payload| *payload)
+                {
+                    if let Some(pointer) = response.interact_pointer_pos().or(response.hover_pos())
+                    {
+                        let world = transform.screen_to_world(pointer);
+                        self.drop_resource_2d(resource_id, world);
+                    }
+                }
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 0.0, STUDIO_VIEWPORT);
                 if self.show_grid {
@@ -5006,7 +5245,7 @@ impl EditorWorkspace {
                 let hits =
                     draw_scene_viewport(&painter, transform, &self.project, self.selected_node);
 
-                if response.clicked_by(egui::PointerButton::Primary) {
+                if !dnd_active && response.clicked_by(egui::PointerButton::Primary) {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let world = transform.screen_to_world(pos);
                         self.handle_viewport_click(world, &hits);
@@ -5021,6 +5260,21 @@ impl EditorWorkspace {
                     self.snap_units,
                 );
                 draw_axes_gizmo(&painter, rect);
+                if resource_drop_hovered {
+                    painter.rect_stroke(
+                        rect.shrink(2.0),
+                        2.0,
+                        Stroke::new(2.0, STUDIO_ACCENT),
+                        StrokeKind::Inside,
+                    );
+                    painter.text(
+                        rect.center_top() + Vec2::new(0.0, 16.0),
+                        Align2::CENTER_TOP,
+                        "Drop resource into scene",
+                        FontId::proportional(13.0),
+                        STUDIO_ACCENT,
+                    );
+                }
             });
     }
 
@@ -8458,7 +8712,7 @@ fn draw_resource_card(
     thumb: Option<egui::TextureId>,
 ) -> egui::Response {
     let size = Vec2::new(120.0, 155.0);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let fill = if selected {
         Color32::from_rgb(21, 50, 62)
@@ -8511,6 +8765,20 @@ fn draw_resource_card(
         FontId::monospace(10.0),
         STUDIO_TEXT_WEAK,
     );
+    if response.dragged() {
+        response.dnd_set_drag_payload::<ResourceId>(resource.id);
+        let pointer_pos = ui
+            .ctx()
+            .input(|input| input.pointer.interact_pos())
+            .unwrap_or_else(|| rect.center());
+        ui.painter().text(
+            pointer_pos + Vec2::new(12.0, 0.0),
+            Align2::LEFT_CENTER,
+            format!("{} {}", resource_lucide_icon(&resource.data), resource.name),
+            FontId::proportional(12.0),
+            STUDIO_ACCENT,
+        );
+    }
     response
 }
 
@@ -11232,6 +11500,84 @@ mod tests {
         assert!(spawn_bound.half_extents[0] > 0.0);
         assert!(spawn_bound.half_extents[1] > 0.0);
         assert!(spawn_bound.half_extents[2] > 0.0);
+    }
+
+    #[test]
+    fn dropping_model_resource_creates_component_entity() {
+        let mut workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let room = workspace.active_room_id().expect("starter has a room");
+        let model_id = workspace
+            .project
+            .resources
+            .iter()
+            .find(|resource| matches!(resource.data, ResourceData::Model(_)))
+            .expect("starter has a model")
+            .id;
+
+        workspace.drop_resource_at_room_hit(model_id, room, [512.0, 0.0, 512.0], None);
+
+        let scene = workspace.project.active_scene();
+        let entity = scene
+            .node(workspace.selected_node)
+            .expect("new entity is selected");
+        assert!(matches!(entity.kind, NodeKind::Entity));
+        assert!(entity.children.iter().any(|id| {
+            scene.node(*id).is_some_and(|child| {
+                matches!(
+                    child.kind,
+                    NodeKind::ModelRenderer {
+                        model: Some(id),
+                        ..
+                    } if id == model_id
+                )
+            })
+        }));
+        assert!(entity.children.iter().any(|id| {
+            scene
+                .node(*id)
+                .is_some_and(|child| matches!(child.kind, NodeKind::Animator { .. }))
+        }));
+        assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn dropping_character_resource_creates_actor_components() {
+        let mut workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let room = workspace.active_room_id().expect("starter has a room");
+        let character_id = workspace
+            .project
+            .resources
+            .iter()
+            .find(|resource| matches!(resource.data, ResourceData::Character(_)))
+            .expect("starter has a character")
+            .id;
+
+        workspace.drop_resource_at_room_hit(character_id, room, [512.0, 0.0, 512.0], None);
+
+        let scene = workspace.project.active_scene();
+        let actor = scene
+            .node(workspace.selected_node)
+            .expect("new actor is selected");
+        assert!(matches!(actor.kind, NodeKind::Actor));
+        assert!(actor.children.iter().any(|id| {
+            scene.node(*id).is_some_and(|child| {
+                matches!(
+                    child.kind,
+                    NodeKind::CharacterController {
+                        character: Some(id),
+                        player: false
+                    } if id == character_id
+                )
+            })
+        }));
+        assert!(actor.children.iter().any(|id| {
+            scene
+                .node(*id)
+                .is_some_and(|child| matches!(child.kind, NodeKind::Collider { .. }))
+        }));
+        assert!(workspace.is_dirty());
     }
 
     #[test]
