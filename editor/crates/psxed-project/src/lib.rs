@@ -5,6 +5,7 @@
 //! then later cooker stages flatten it into PS1-friendly world surfaces,
 //! texture pages, entity spawns, and engine data.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ron::ser::PrettyConfig;
@@ -1397,6 +1398,71 @@ pub struct Resource {
     pub data: ResourceData,
 }
 
+/// One backing-file move performed by a resource rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceFileRename {
+    /// Previous stored project path.
+    pub from: String,
+    /// New stored project path.
+    pub to: String,
+}
+
+/// Summary returned after renaming a resource and any backing files
+/// that are safe for the project to own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceRenameReport {
+    /// Files that were physically moved and whose project paths were
+    /// updated.
+    pub renamed_files: Vec<ResourceFileRename>,
+    /// Path fields that were left alone because they were empty,
+    /// missing on disk, outside the project root, or otherwise not
+    /// safe to move automatically.
+    pub skipped_files: Vec<String>,
+}
+
+/// Failure modes for [`ProjectDocument::rename_resource_with_files`].
+#[derive(Debug)]
+pub enum ResourceRenameError {
+    /// No resource with the requested id exists.
+    MissingResource(ResourceId),
+    /// Empty or whitespace-only names are refused.
+    EmptyName,
+    /// Two planned file moves would write the same destination.
+    DuplicateTarget(PathBuf),
+    /// A planned destination already exists.
+    TargetExists(PathBuf),
+    /// Filesystem operation failed.
+    Io {
+        /// Source path.
+        from: PathBuf,
+        /// Destination path.
+        to: PathBuf,
+        /// Error detail.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for ResourceRenameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingResource(id) => write!(f, "resource #{} does not exist", id.raw()),
+            Self::EmptyName => write!(f, "resource name cannot be empty"),
+            Self::DuplicateTarget(path) => {
+                write!(f, "multiple files would rename to {}", path.display())
+            }
+            Self::TargetExists(path) => write!(f, "target already exists: {}", path.display()),
+            Self::Io { from, to, detail } => write!(
+                f,
+                "failed to rename {} to {}: {detail}",
+                from.display(),
+                to.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResourceRenameError {}
+
 /// Node type used by the editor scene tree.
 ///
 /// Hierarchy convention for level authoring:
@@ -1407,6 +1473,16 @@ pub enum NodeKind {
     Node,
     /// Spatial transform node.
     Node3D,
+    /// Composed world object. The node owns transform/identity;
+    /// behaviour is expressed by component-node children such as
+    /// [`ModelRenderer`](Self::ModelRenderer),
+    /// [`Animator`](Self::Animator), and
+    /// [`Collider`](Self::Collider).
+    Entity,
+    /// Actor-style entity host. Like [`Entity`](Self::Entity), but
+    /// intended for player/NPC/enemy setups that include controller,
+    /// AI, combat, or character-profile component children.
+    Actor,
     /// Macro-node grouping every Room that belongs to one streamed
     /// region. Holds shared metadata (default fog/ambient) the
     /// editor will surface as it grows; for now it's a pure folder.
@@ -1436,6 +1512,81 @@ pub enum NodeKind {
         #[serde(default)]
         animation_clip: Option<u16>,
     },
+    /// Render a cooked [`ResourceData::Model`] from the transform
+    /// on the nearest entity/actor ancestor. This is the component
+    /// form of the legacy [`MeshInstance`](Self::MeshInstance)
+    /// node.
+    ModelRenderer {
+        /// Model resource.
+        model: Option<ResourceId>,
+        /// Optional material override for legacy/static paths.
+        /// Cooked PSX models currently carry their own atlas and
+        /// ignore this field.
+        #[serde(default)]
+        material: Option<ResourceId>,
+    },
+    /// Animation component for a model-rendering entity. `clip`
+    /// overrides the model default when set; `None` inherits the
+    /// model's runtime default.
+    Animator {
+        /// Per-instance clip override.
+        #[serde(default)]
+        clip: Option<u16>,
+        /// Whether this animation should run automatically in the
+        /// editor/playtest runtime.
+        #[serde(default = "default_true")]
+        autoplay: bool,
+    },
+    /// Collision component. The first runtime pass only cooks room
+    /// grid collision, but keeping authored collider data as a node
+    /// makes prop/interactable/NPC architecture explicit now.
+    Collider {
+        /// Collision shape in engine/editor units.
+        #[serde(default)]
+        shape: ColliderShape,
+        /// Solid colliders block movement; non-solid colliders are
+        /// trigger volumes.
+        #[serde(default = "default_true")]
+        solid: bool,
+    },
+    /// Interactable component for props such as chests, doors, and
+    /// levers. Runtime behaviour is not cooked yet; this is authoring
+    /// structure for the upcoming object pass.
+    Interactable {
+        /// UI prompt or editor-facing affordance.
+        #[serde(default)]
+        prompt: String,
+        /// Logical action id.
+        #[serde(default)]
+        action: String,
+    },
+    /// Character/controller component. When `player` is true this is
+    /// the component-tree replacement for a legacy player
+    /// [`SpawnPoint`](Self::SpawnPoint); non-player actor cooking lands
+    /// after NPC runtime records exist.
+    CharacterController {
+        /// Character resource profile.
+        #[serde(default)]
+        character: Option<ResourceId>,
+        /// Whether this actor is the player controller.
+        #[serde(default)]
+        player: bool,
+    },
+    /// AI marker component for future NPC/enemy runtime records.
+    AiController {
+        /// Logical AI profile id.
+        #[serde(default)]
+        behavior: String,
+    },
+    /// Combat stat component for actor nodes.
+    Combat {
+        /// Team/faction label.
+        #[serde(default)]
+        faction: String,
+        /// Hit points.
+        #[serde(default = "default_combat_health")]
+        health: u16,
+    },
     /// Simple authoring light.
     Light {
         /// RGB light colour.
@@ -1444,6 +1595,16 @@ pub enum NodeKind {
         /// Light intensity multiplier.
         intensity: f32,
         /// Approximate editor/runtime radius.
+        radius: f32,
+    },
+    /// Point-light component form of [`Light`](Self::Light).
+    PointLight {
+        /// RGB light colour.
+        #[serde(default = "default_light_color")]
+        color: [u8; 3],
+        /// Light intensity multiplier.
+        intensity: f32,
+        /// Approximate editor/runtime radius in sectors.
         radius: f32,
     },
     /// Spawn marker.
@@ -1494,16 +1655,81 @@ impl NodeKind {
         match self {
             Self::Node => "Node",
             Self::Node3D => "Node3D",
+            Self::Entity => "Entity",
+            Self::Actor => "Actor",
             Self::World => "World",
             Self::Room { .. } => "Room",
             Self::MeshInstance { .. } => "MeshInstance",
+            Self::ModelRenderer { .. } => "ModelRenderer",
+            Self::Animator { .. } => "Animator",
+            Self::Collider { .. } => "Collider",
+            Self::Interactable { .. } => "Interactable",
+            Self::CharacterController { .. } => "CharacterController",
+            Self::AiController { .. } => "AiController",
+            Self::Combat { .. } => "Combat",
             Self::Light { .. } => "Light",
+            Self::PointLight { .. } => "PointLight",
             Self::SpawnPoint { .. } => "SpawnPoint",
             Self::Trigger { .. } => "Trigger",
             Self::AudioSource { .. } => "AudioSource",
             Self::Portal { .. } => "Portal",
         }
     }
+
+    /// True for behaviour/component nodes that are intended to be
+    /// children of an [`Entity`](Self::Entity) or [`Actor`](Self::Actor)
+    /// host rather than independent placed objects.
+    pub const fn is_component(self: &Self) -> bool {
+        matches!(
+            self,
+            Self::ModelRenderer { .. }
+                | Self::Animator { .. }
+                | Self::Collider { .. }
+                | Self::Interactable { .. }
+                | Self::CharacterController { .. }
+                | Self::AiController { .. }
+                | Self::Combat { .. }
+                | Self::PointLight { .. }
+        )
+    }
+}
+
+/// Authored collision shape for component-node entities.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ColliderShape {
+    /// Axis-aligned box, stored as half-extents.
+    Box {
+        /// Half extents in engine/editor units.
+        half_extents: [u16; 3],
+    },
+    /// Sphere collider.
+    Sphere {
+        /// Radius in engine/editor units.
+        radius: u16,
+    },
+    /// Upright capsule.
+    Capsule {
+        /// Radius in engine/editor units.
+        radius: u16,
+        /// Height in engine/editor units.
+        height: u16,
+    },
+}
+
+impl Default for ColliderShape {
+    fn default() -> Self {
+        Self::Box {
+            half_extents: [256, 256, 256],
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_combat_health() -> u16 {
+    1
 }
 
 /// A scene-tree node.
@@ -1798,6 +2024,75 @@ impl ProjectDocument {
         self.resource(id).map(|resource| resource.name.as_str())
     }
 
+    /// Rename a resource and any project-owned backing files whose
+    /// names are derived from the resource name.
+    ///
+    /// File moves are preflighted before project data is mutated:
+    /// destinations must not already exist and duplicate destinations
+    /// are refused. Only files that already exist under `project_root`
+    /// are moved; missing paths and external absolute paths are
+    /// preserved and reported as skipped.
+    pub fn rename_resource_with_files(
+        &mut self,
+        id: ResourceId,
+        new_name: &str,
+        project_root: &Path,
+    ) -> Result<ResourceRenameReport, ResourceRenameError> {
+        let final_name = new_name.trim();
+        if final_name.is_empty() {
+            return Err(ResourceRenameError::EmptyName);
+        }
+
+        let Some(index) = self.resources.iter().position(|resource| resource.id == id) else {
+            return Err(ResourceRenameError::MissingResource(id));
+        };
+
+        let resource = self.resources[index].clone();
+        let safe_stem = resource_file_stem(final_name, resource_default_stem(&resource.data));
+        let mut plan = ResourceRenamePlan::default();
+        let mut data = resource.data.clone();
+
+        match &mut data {
+            ResourceData::Texture { psxt_path } => {
+                plan_path_rename(psxt_path, &safe_stem, "psxt", project_root, &mut plan);
+            }
+            ResourceData::Model(model) => {
+                plan_model_resource_rename(model, &safe_stem, project_root, &mut plan);
+            }
+            ResourceData::Mesh { source_path }
+            | ResourceData::Scene { source_path }
+            | ResourceData::Script { source_path }
+            | ResourceData::Audio { source_path } => {
+                let fallback_ext = resource_default_extension(&resource.data);
+                plan_path_rename(
+                    source_path,
+                    &safe_stem,
+                    fallback_ext,
+                    project_root,
+                    &mut plan,
+                );
+            }
+            ResourceData::Material(_) | ResourceData::Character(_) => {}
+        }
+
+        execute_resource_rename_plan(&plan)?;
+
+        self.resources[index].name = final_name.to_string();
+        self.resources[index].data = data;
+
+        Ok(ResourceRenameReport {
+            renamed_files: plan
+                .ops
+                .iter()
+                .map(|op| ResourceFileRename {
+                    from: op.from_stored.clone(),
+                    to: op.to_stored.clone(),
+                })
+                .collect(),
+            skipped_files: plan.skipped,
+        })
+    }
+
     /// Material resources as `(id, name)` pairs for inspector combo boxes.
     pub fn material_options(&self) -> Vec<(ResourceId, String)> {
         self.resources
@@ -1840,6 +2135,281 @@ impl ProjectDocument {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ProjectIoError> {
         let source = std::fs::read_to_string(path)?;
         Self::from_ron_str(&source)
+    }
+}
+
+#[derive(Default)]
+struct ResourceRenamePlan {
+    ops: Vec<ResourcePathRename>,
+    skipped: Vec<String>,
+}
+
+struct ResourcePathRename {
+    from_abs: PathBuf,
+    to_abs: PathBuf,
+    from_stored: String,
+    to_stored: String,
+}
+
+fn plan_path_rename(
+    stored: &mut String,
+    safe_stem: &str,
+    fallback_ext: &str,
+    project_root: &Path,
+    plan: &mut ResourceRenamePlan,
+) {
+    let original = stored.clone();
+    let Some(op) = build_path_rename(&original, safe_stem, fallback_ext, project_root, plan) else {
+        return;
+    };
+    *stored = op.to_stored.clone();
+    plan.ops.push(op);
+}
+
+fn plan_model_resource_rename(
+    model: &mut ModelResource,
+    safe_stem: &str,
+    project_root: &Path,
+    plan: &mut ResourceRenamePlan,
+) {
+    let model_path = model.model_path.clone();
+    let model_abs = model_import::resolve_path(&model_path, Some(project_root));
+    let model_dir = model_abs.parent().map(Path::to_path_buf);
+    let target_dir = model_dir
+        .as_deref()
+        .map(|dir| model_bundle_target_dir(dir, safe_stem, project_root));
+
+    if let Some(op) = build_path_rename_in_dir(
+        &model_path,
+        safe_stem,
+        "psxmdl",
+        target_dir.as_deref(),
+        project_root,
+        plan,
+    ) {
+        model.model_path = op.to_stored.clone();
+        plan.ops.push(op);
+    }
+
+    if let Some(texture_path) = &mut model.texture_path {
+        let original = texture_path.clone();
+        if let Some(op) = build_path_rename_in_dir(
+            &original,
+            safe_stem,
+            "psxt",
+            target_dir.as_deref(),
+            project_root,
+            plan,
+        ) {
+            *texture_path = op.to_stored.clone();
+            plan.ops.push(op);
+        }
+    }
+
+    let mut seen_clip_stems = HashSet::new();
+    for (index, clip) in model.clips.iter_mut().enumerate() {
+        let clip_suffix = resource_file_stem(&clip.name, "clip");
+        let mut clip_stem = format!("{safe_stem}_{clip_suffix}");
+        if !seen_clip_stems.insert(clip_stem.clone()) {
+            clip_stem = format!("{safe_stem}_{index}_{clip_suffix}");
+            seen_clip_stems.insert(clip_stem.clone());
+        }
+        let original = clip.psxanim_path.clone();
+        if let Some(op) = build_path_rename_in_dir(
+            &original,
+            &clip_stem,
+            "psxanim",
+            target_dir.as_deref(),
+            project_root,
+            plan,
+        ) {
+            clip.psxanim_path = op.to_stored.clone();
+            plan.ops.push(op);
+        }
+    }
+}
+
+fn build_path_rename(
+    stored: &str,
+    safe_stem: &str,
+    fallback_ext: &str,
+    project_root: &Path,
+    plan: &mut ResourceRenamePlan,
+) -> Option<ResourcePathRename> {
+    build_path_rename_in_dir(stored, safe_stem, fallback_ext, None, project_root, plan)
+}
+
+fn build_path_rename_in_dir(
+    stored: &str,
+    safe_stem: &str,
+    fallback_ext: &str,
+    target_dir: Option<&Path>,
+    project_root: &Path,
+    plan: &mut ResourceRenamePlan,
+) -> Option<ResourcePathRename> {
+    let trimmed = stored.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let from_abs = model_import::resolve_path(trimmed, Some(project_root));
+    if !from_abs.is_file() {
+        plan.skipped.push(trimmed.to_string());
+        return None;
+    }
+    if !path_is_project_owned(&from_abs, project_root) {
+        plan.skipped.push(trimmed.to_string());
+        return None;
+    }
+
+    let ext = from_abs
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or(fallback_ext);
+    let target_name = format!("{safe_stem}.{ext}");
+    let to_abs = target_dir
+        .map(|dir| dir.join(&target_name))
+        .unwrap_or_else(|| from_abs.with_file_name(target_name));
+
+    if from_abs == to_abs {
+        return None;
+    }
+
+    Some(ResourcePathRename {
+        from_abs,
+        to_stored: relativise_resource_path(&to_abs, project_root),
+        to_abs,
+        from_stored: trimmed.to_string(),
+    })
+}
+
+fn execute_resource_rename_plan(plan: &ResourceRenamePlan) -> Result<(), ResourceRenameError> {
+    let mut targets = HashSet::new();
+    for op in &plan.ops {
+        if !targets.insert(op.to_abs.clone()) {
+            return Err(ResourceRenameError::DuplicateTarget(op.to_abs.clone()));
+        }
+        if op.to_abs.exists() {
+            return Err(ResourceRenameError::TargetExists(op.to_abs.clone()));
+        }
+    }
+
+    let mut moved: Vec<&ResourcePathRename> = Vec::new();
+    let mut created_dirs = Vec::new();
+    for op in &plan.ops {
+        if let Some(parent) = op.to_abs.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|error| ResourceRenameError::Io {
+                    from: op.from_abs.clone(),
+                    to: op.to_abs.clone(),
+                    detail: error.to_string(),
+                })?;
+                created_dirs.push(parent.to_path_buf());
+            }
+        }
+        if let Err(error) = std::fs::rename(&op.from_abs, &op.to_abs) {
+            for done in moved.iter().rev() {
+                let _ = std::fs::rename(&done.to_abs, &done.from_abs);
+            }
+            for dir in created_dirs.iter().rev() {
+                let _ = std::fs::remove_dir(dir);
+            }
+            return Err(ResourceRenameError::Io {
+                from: op.from_abs.clone(),
+                to: op.to_abs.clone(),
+                detail: error.to_string(),
+            });
+        }
+        moved.push(op);
+    }
+
+    for op in &plan.ops {
+        if let (Some(from_parent), Some(to_parent)) = (op.from_abs.parent(), op.to_abs.parent()) {
+            if from_parent != to_parent {
+                let _ = std::fs::remove_dir(from_parent);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn model_bundle_target_dir(model_dir: &Path, safe_stem: &str, project_root: &Path) -> PathBuf {
+    let Ok(relative) = model_dir.strip_prefix(project_root) else {
+        return model_dir.to_path_buf();
+    };
+    let mut components = relative.components();
+    let is_imported_bundle = matches!(
+        (
+            components.next().and_then(|c| c.as_os_str().to_str()),
+            components.next().and_then(|c| c.as_os_str().to_str()),
+            components.next(),
+            components.next()
+        ),
+        (Some("assets"), Some("models"), Some(_), None)
+    );
+    if is_imported_bundle {
+        project_root.join("assets").join("models").join(safe_stem)
+    } else {
+        model_dir.to_path_buf()
+    }
+}
+
+fn path_is_project_owned(path: &Path, project_root: &Path) -> bool {
+    path.strip_prefix(project_root).is_ok()
+}
+
+fn relativise_resource_path(path: &Path, project_root: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn resource_file_stem(name: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_was_sep = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed
+    }
+}
+
+const fn resource_default_stem(data: &ResourceData) -> &'static str {
+    match data {
+        ResourceData::Texture { .. } => "texture",
+        ResourceData::Material(_) => "material",
+        ResourceData::Model(_) => "model",
+        ResourceData::Mesh { .. } => "mesh",
+        ResourceData::Scene { .. } => "scene",
+        ResourceData::Script { .. } => "script",
+        ResourceData::Audio { .. } => "audio",
+        ResourceData::Character(_) => "character",
+    }
+}
+
+const fn resource_default_extension(data: &ResourceData) -> &'static str {
+    match data {
+        ResourceData::Texture { .. } => "psxt",
+        ResourceData::Material(_) => "mat",
+        ResourceData::Model(_) => "psxmdl",
+        ResourceData::Mesh { .. } => "psxmesh",
+        ResourceData::Scene { .. } => "room",
+        ResourceData::Script { .. } => "script",
+        ResourceData::Audio { .. } => "vag",
+        ResourceData::Character(_) => "char",
     }
 }
 
@@ -2241,8 +2811,8 @@ mod tests {
     fn legacy_project_missing_light_color_and_room_ambient_uses_defaults() {
         let source = DEFAULT_PROJECT_RON
             .replace(
-                "kind: Light(color: (255, 236, 198), intensity: 1.0, radius: 4.0)",
-                "kind: Light(intensity: 1.0, radius: 4.0)",
+                "kind: PointLight(color: (239, 0, 65), intensity: 0.35, radius: 3.6)",
+                "kind: PointLight(intensity: 0.35, radius: 3.6)",
             )
             .replace(", ambient_color: (32, 32, 32)", "");
 
@@ -2253,6 +2823,7 @@ mod tests {
             .iter()
             .find_map(|node| match &node.kind {
                 NodeKind::Light { color, .. } => Some(*color),
+                NodeKind::PointLight { color, .. } => Some(*color),
                 _ => None,
             })
             .expect("starter has a light");
@@ -2503,6 +3074,157 @@ mod tests {
         assert_eq!(ProjectDocument::load_from_path(&path).unwrap(), project);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "psxed-project-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn resource_rename_moves_project_owned_texture_file() {
+        let root = unique_temp_dir("resource-rename-texture");
+        let texture_dir = root.join("assets").join("textures");
+        std::fs::create_dir_all(&texture_dir).unwrap();
+        std::fs::write(texture_dir.join("floor.psxt"), b"texture").unwrap();
+
+        let mut project = ProjectDocument::new("test");
+        let id = project.add_resource(
+            "Floor",
+            ResourceData::Texture {
+                psxt_path: "assets/textures/floor.psxt".to_string(),
+            },
+        );
+
+        let report = project
+            .rename_resource_with_files(id, "Stone Floor", &root)
+            .unwrap();
+
+        assert_eq!(project.resource_name(id), Some("Stone Floor"));
+        let ResourceData::Texture { psxt_path } = &project.resource(id).unwrap().data else {
+            panic!("expected texture");
+        };
+        assert_eq!(psxt_path, "assets/textures/stone_floor.psxt");
+        assert!(!texture_dir.join("floor.psxt").exists());
+        assert_eq!(
+            std::fs::read(texture_dir.join("stone_floor.psxt")).unwrap(),
+            b"texture"
+        );
+        assert_eq!(report.renamed_files.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resource_rename_moves_imported_model_bundle_files() {
+        let root = unique_temp_dir("resource-rename-model");
+        let bundle_dir = root.join("assets").join("models").join("obsidian_wraith");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("obsidian_wraith.psxmdl"), b"model").unwrap();
+        std::fs::write(bundle_dir.join("obsidian_wraith.psxt"), b"atlas").unwrap();
+        std::fs::write(bundle_dir.join("obsidian_wraith_idle.psxanim"), b"idle").unwrap();
+        std::fs::write(bundle_dir.join("obsidian_wraith_walk.psxanim"), b"walk").unwrap();
+
+        let mut project = ProjectDocument::new("test");
+        let id = project.add_resource(
+            "Obsidian Wraith",
+            ResourceData::Model(ModelResource {
+                model_path: "assets/models/obsidian_wraith/obsidian_wraith.psxmdl".to_string(),
+                texture_path: Some(
+                    "assets/models/obsidian_wraith/obsidian_wraith.psxt".to_string(),
+                ),
+                clips: vec![
+                    ModelAnimationClip {
+                        name: "idle".to_string(),
+                        psxanim_path: "assets/models/obsidian_wraith/obsidian_wraith_idle.psxanim"
+                            .to_string(),
+                    },
+                    ModelAnimationClip {
+                        name: "walk".to_string(),
+                        psxanim_path: "assets/models/obsidian_wraith/obsidian_wraith_walk.psxanim"
+                            .to_string(),
+                    },
+                ],
+                default_clip: Some(0),
+                preview_clip: Some(0),
+                world_height: 1024,
+            }),
+        );
+
+        let report = project
+            .rename_resource_with_files(id, "Hooded Wretch", &root)
+            .unwrap();
+
+        let ResourceData::Model(model) = &project.resource(id).unwrap().data else {
+            panic!("expected model");
+        };
+        assert_eq!(
+            model.model_path,
+            "assets/models/hooded_wretch/hooded_wretch.psxmdl"
+        );
+        assert_eq!(
+            model.texture_path.as_deref(),
+            Some("assets/models/hooded_wretch/hooded_wretch.psxt")
+        );
+        assert_eq!(
+            model.clips[0].psxanim_path,
+            "assets/models/hooded_wretch/hooded_wretch_idle.psxanim"
+        );
+        assert_eq!(
+            model.clips[1].psxanim_path,
+            "assets/models/hooded_wretch/hooded_wretch_walk.psxanim"
+        );
+        assert_eq!(report.renamed_files.len(), 4);
+        assert!(!bundle_dir.exists());
+        assert!(root
+            .join("assets/models/hooded_wretch/hooded_wretch.psxmdl")
+            .exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resource_rename_refuses_existing_target_without_mutating_project() {
+        let root = unique_temp_dir("resource-rename-target-exists");
+        let texture_dir = root.join("assets").join("textures");
+        std::fs::create_dir_all(&texture_dir).unwrap();
+        std::fs::write(texture_dir.join("floor.psxt"), b"old").unwrap();
+        std::fs::write(texture_dir.join("stone_floor.psxt"), b"target").unwrap();
+
+        let mut project = ProjectDocument::new("test");
+        let id = project.add_resource(
+            "Floor",
+            ResourceData::Texture {
+                psxt_path: "assets/textures/floor.psxt".to_string(),
+            },
+        );
+
+        let error = project
+            .rename_resource_with_files(id, "Stone Floor", &root)
+            .unwrap_err();
+
+        assert!(matches!(error, ResourceRenameError::TargetExists(_)));
+        assert_eq!(project.resource_name(id), Some("Floor"));
+        let ResourceData::Texture { psxt_path } = &project.resource(id).unwrap().data else {
+            panic!("expected texture");
+        };
+        assert_eq!(psxt_path, "assets/textures/floor.psxt");
+        assert_eq!(
+            std::fs::read(texture_dir.join("floor.psxt")).unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            std::fs::read(texture_dir.join("stone_floor.psxt")).unwrap(),
+            b"target"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

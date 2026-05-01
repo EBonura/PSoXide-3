@@ -38,6 +38,14 @@ impl UndoStack {
         self.redo.clear();
     }
 
+    /// Drop all undo / redo entries. Used after filesystem-backed
+    /// operations because snapshots only capture project metadata,
+    /// not file moves that have already happened on disk.
+    pub(crate) fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
     /// Pop the most recent undo entry and stash `current` on
     /// the redo stack. Returns the previous snapshot the
     /// caller should swap into the live document, or `None`

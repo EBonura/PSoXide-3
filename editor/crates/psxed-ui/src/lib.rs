@@ -23,10 +23,10 @@ use egui::{
     Align2, Color32, ColorImage, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
 use psxed_project::{
-    snap_height, GridCellBounds, GridDirection, GridHorizontalFace, GridSplit, GridVerticalFace,
-    MaterialFaceSidedness, MaterialResource, NodeId, NodeKind, NodeRow, ProjectDocument,
-    PsxBlendMode, Resource, ResourceData, ResourceId, WorldGrid, WorldGridBudget, HEIGHT_QUANTUM,
-    MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
+    snap_height, ColliderShape, GridCellBounds, GridDirection, GridHorizontalFace, GridSplit,
+    GridVerticalFace, MaterialFaceSidedness, MaterialResource, NodeId, NodeKind, NodeRow,
+    ProjectDocument, PsxBlendMode, Resource, ResourceData, ResourceId, WorldGrid, WorldGridBudget,
+    HEIGHT_QUANTUM, MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
 };
 
 const LEFT_DOCK_MAX_WIDTH: f32 = 420.0;
@@ -131,6 +131,11 @@ pub struct EditorWorkspace {
     file_filter: String,
     resource_search: String,
     resource_filter: ResourceFilter,
+    /// `Some((id, buffer))` while the resource inspector's name
+    /// field is editing. Committed resource renames may move backing
+    /// files, so they happen on focus loss / Enter rather than on
+    /// every keystroke.
+    resource_renaming: Option<(ResourceId, String)>,
     active_tool: ViewTool,
     /// Kind of node the Place tool drops on a click. Surfaces in
     /// the toolbar as a small picker visible only when
@@ -1090,6 +1095,7 @@ impl EditorWorkspace {
             file_filter: String::new(),
             resource_search: String::new(),
             resource_filter: ResourceFilter::All,
+            resource_renaming: None,
             active_tool: ViewTool::Select,
             place_kind: PlaceKind::PlayerSpawn,
             brush_material: None,
@@ -1170,6 +1176,7 @@ impl EditorWorkspace {
                 self.project = project;
                 self.selected_node = NodeId::ROOT;
                 self.selected_resource = None;
+                self.resource_renaming = None;
                 self.dirty = false;
                 self.status = format!("Reloaded {}", short_path(&self.project_dir));
                 self.select_first_room();
@@ -4515,25 +4522,61 @@ impl EditorWorkspace {
         // resolve the material → texture link.
         let crumbs = self.resource_breadcrumb(id);
 
+        let Some((resource_raw_id, current_name, resource_data)) =
+            self.project.resource(id).map(|resource| {
+                (
+                    resource.id.raw(),
+                    resource.name.clone(),
+                    resource.data.clone(),
+                )
+            })
+        else {
+            ui.weak("Resource missing");
+            return;
+        };
+
+        if !matches!(self.resource_renaming, Some((editing_id, _)) if editing_id == id) {
+            self.resource_renaming = Some((id, current_name.clone()));
+        }
+
+        let mut rename_commit: Option<String> = None;
+        let mut rename_cancelled = false;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            draw_inline_icon(
+                ui,
+                resource_lucide_icon(&resource_data),
+                resource_lucide_color(&resource_data, true),
+            );
+            ui.strong(format!("{} #{}", resource_data.label(), resource_raw_id));
+        });
+        draw_breadcrumb(ui, &crumbs, &mut nav_target);
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            if let Some((_, buffer)) = &mut self.resource_renaming {
+                let response = ui.text_edit_singleline(buffer);
+                let enter = response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let escape = response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if escape {
+                    *buffer = current_name.clone();
+                    rename_cancelled = true;
+                } else if response.lost_focus() || enter {
+                    rename_commit = Some(buffer.clone());
+                }
+            }
+        });
+        if rename_cancelled {
+            self.status = "Resource rename cancelled".to_string();
+        }
+        if let Some(name) = rename_commit {
+            self.commit_resource_rename(id, name);
+        }
+
         let Some(resource) = self.project.resource_mut(id) else {
             ui.weak("Resource missing");
             return;
         };
 
-        let mut changed = false;
-        ui.horizontal(|ui| {
-            draw_inline_icon(
-                ui,
-                resource_lucide_icon(&resource.data),
-                resource_lucide_color(&resource.data, true),
-            );
-            ui.strong(format!("{} #{}", resource.data.label(), resource.id.raw()));
-        });
-        draw_breadcrumb(ui, &crumbs, &mut nav_target);
-        ui.horizontal(|ui| {
-            ui.label("Name");
-            changed |= ui.text_edit_singleline(&mut resource.name).changed();
-        });
         ui.separator();
 
         match &mut resource.data {
@@ -5633,6 +5676,56 @@ impl EditorWorkspace {
         self.dirty = true;
     }
 
+    fn commit_resource_rename(&mut self, id: ResourceId, name: String) {
+        let Some(current_name) = self.project.resource_name(id).map(str::to_string) else {
+            self.resource_renaming = None;
+            self.status = format!("Resource #{} no longer exists", id.raw());
+            return;
+        };
+
+        let final_name = name.trim();
+        if final_name.is_empty() {
+            self.resource_renaming = Some((id, current_name));
+            self.status = "Resource name cannot be empty".to_string();
+            return;
+        }
+        if final_name == current_name {
+            self.resource_renaming = Some((id, current_name));
+            return;
+        }
+
+        let before = self.project.clone();
+        match self
+            .project
+            .rename_resource_with_files(id, final_name, &self.project_dir)
+        {
+            Ok(report) => {
+                if report.renamed_files.is_empty() {
+                    self.history.record(before);
+                } else {
+                    self.history.clear();
+                }
+                self.resource_renaming = Some((id, final_name.to_string()));
+                self.mark_dirty();
+
+                let moved = report.renamed_files.len();
+                let skipped = report.skipped_files.len();
+                self.status = match (moved, skipped) {
+                    (0, 0) => format!("Renamed {final_name}"),
+                    (m, 0) => format!("Renamed {final_name}; moved {m} file(s)"),
+                    (0, s) => format!("Renamed {final_name}; skipped {s} file path(s)"),
+                    (m, s) => {
+                        format!("Renamed {final_name}; moved {m} file(s), skipped {s} path(s)")
+                    }
+                };
+            }
+            Err(error) => {
+                self.resource_renaming = Some((id, current_name));
+                self.status = format!("Rename failed: {error}");
+            }
+        }
+    }
+
     /// Snapshot the current project before a discrete mutation.
     /// Call once per user action -- paint click, place, add/delete
     /// node, etc -- so each undo step matches one author intent.
@@ -5645,6 +5738,7 @@ impl EditorWorkspace {
         if let Some(prev) = self.history.undo(self.project.clone()) {
             self.project = prev;
             self.selected_resource = None;
+            self.resource_renaming = None;
             self.selected_sector = None;
             if self
                 .project
@@ -5665,6 +5759,7 @@ impl EditorWorkspace {
         if let Some(next) = self.history.redo(self.project.clone()) {
             self.project = next;
             self.selected_resource = None;
+            self.resource_renaming = None;
             self.selected_sector = None;
             if self
                 .project
@@ -5784,6 +5879,12 @@ fn draw_node_kind_editor(
     match kind {
         NodeKind::Node | NodeKind::Node3D => {
             ui.weak("Organisational transform node");
+        }
+        NodeKind::Entity => {
+            ui.weak("Entity host. Add component-node children for rendering, collision, interaction, lighting, or logic.");
+        }
+        NodeKind::Actor => {
+            ui.weak("Actor host. Add component-node children for character controller, AI, combat, rendering, and collision.");
         }
         NodeKind::World => {
             ui.weak("Streamed-region group; holds Room children.");
@@ -5946,6 +6047,106 @@ fn draw_node_kind_editor(
                 }
             });
         }
+        NodeKind::ModelRenderer { model, material } => {
+            ui.weak("Component: renders a Model from the parent Entity/Actor transform.");
+            let bound_model =
+                model.and_then(|id| model_options.iter().find(|(rid, _, _)| *rid == id));
+            ui.horizontal(|ui| {
+                ui.label("Model");
+                let preview = bound_model
+                    .map(|(_, name, _)| name.as_str())
+                    .unwrap_or("(none)");
+                egui::ComboBox::from_id_salt("model-renderer-model-picker")
+                    .selected_text(preview)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(model.is_none(), "(none)").clicked() {
+                            *model = None;
+                            changed = true;
+                        }
+                        for (id, name, _) in model_options {
+                            if ui.selectable_label(*model == Some(*id), name).clicked() {
+                                *model = Some(*id);
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            if model.is_some() && bound_model.is_none() {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Model resource is missing.",
+                );
+            }
+            changed |= material_picker(ui, "Material", material, material_options, nav_target);
+        }
+        NodeKind::Animator { clip, autoplay } => {
+            ui.weak("Component: controls which model animation clip plays on this entity.");
+            changed |= ui
+                .checkbox(autoplay, icons::label(icons::PLAY, "Autoplay"))
+                .changed();
+            let mut current = clip.map(|i| i as i32).unwrap_or(-1);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Clip override").color(STUDIO_TEXT_WEAK));
+                let response = ui.add(
+                    egui::DragValue::new(&mut current)
+                        .speed(0.1)
+                        .range(-1..=255)
+                        .custom_formatter(|n, _| {
+                            if n < 0.0 {
+                                "inherit".to_string()
+                            } else {
+                                format!("{}", n as i32)
+                            }
+                        }),
+                );
+                if response.changed() {
+                    *clip = if current < 0 {
+                        None
+                    } else {
+                        Some(current as u16)
+                    };
+                    changed = true;
+                }
+            });
+        }
+        NodeKind::Collider { shape, solid } => {
+            ui.weak("Component: collision authored on an Entity/Actor. Runtime prop collision is not cooked yet.");
+            changed |= ui.checkbox(solid, "Solid").changed();
+            changed |= collider_shape_editor(ui, shape);
+        }
+        NodeKind::Interactable { prompt, action } => {
+            ui.weak("Component: marks a prop/entity as interactable. Runtime interaction cooking lands later.");
+            ui.horizontal(|ui| {
+                ui.label("Prompt");
+                changed |= ui.text_edit_singleline(prompt).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Action");
+                changed |= ui.text_edit_singleline(action).changed();
+            });
+        }
+        NodeKind::CharacterController { character, player } => {
+            ui.weak("Component: binds an Actor to a Character profile. Player actors cook into the current playtest controller.");
+            changed |= ui
+                .checkbox(player, icons::label(icons::MAP_PIN, "Player controlled"))
+                .changed();
+            changed |= draw_character_selector(ui, character_options, character);
+        }
+        NodeKind::AiController { behavior } => {
+            ui.weak("Component: future NPC/enemy AI profile.");
+            ui.horizontal(|ui| {
+                ui.label("Behavior");
+                changed |= ui.text_edit_singleline(behavior).changed();
+            });
+        }
+        NodeKind::Combat { faction, health } => {
+            ui.weak("Component: future combat stats.");
+            ui.horizontal(|ui| {
+                ui.label("Faction");
+                changed |= ui.text_edit_singleline(faction).changed();
+            });
+            changed |= drag_u16(ui, "Health", health, 0, u16::MAX);
+        }
         NodeKind::Light {
             color,
             intensity,
@@ -6005,6 +6206,32 @@ fn draw_node_kind_editor(
                 ui.colored_label(
                     Color32::from_rgb(220, 160, 80),
                     "Intensity above 4.0 saturates almost every surface",
+                );
+            }
+        }
+        NodeKind::PointLight {
+            color,
+            intensity,
+            radius,
+        } => {
+            ui.weak("Component: point light emitted from the parent Entity/Actor transform.");
+            changed |= color_editor(ui, "Color", color);
+            changed |= ui
+                .add(
+                    egui::Slider::new(intensity, 0.0..=4.0)
+                        .text(icons::label(icons::SUN, "Intensity (× 1.0)")),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(radius, 0.0..=8.0)
+                        .text(icons::label(icons::WAYPOINT, "Radius (sectors)")),
+                )
+                .changed();
+            if *radius <= 0.0 {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Radius must be > 0 (cook will fail)",
                 );
             }
         }
@@ -6161,10 +6388,20 @@ fn node_lucide_icon(kind: &str, root: bool) -> char {
 
     match kind {
         "Node3D" => icons::CIRCLE_DOT,
+        "Entity" => icons::BOX,
+        "Actor" => icons::MAP_PIN,
         "World" => icons::HOUSE,
         "Room" => icons::GRID,
         "MeshInstance" => icons::BOX,
+        "ModelRenderer" => icons::BOX,
+        "Animator" => icons::PLAY,
+        "Collider" => icons::SCALE_3D,
+        "Interactable" => icons::POINTER,
+        "CharacterController" => icons::MAP_PIN,
+        "AiController" => icons::SCAN,
+        "Combat" => icons::FOCUS,
         "Light" => icons::SUN,
+        "PointLight" => icons::SUN,
         "SpawnPoint" => icons::MAP_PIN,
         "Trigger" => icons::SCAN,
         "AudioSource" => icons::AUDIO_LINES,
@@ -6182,10 +6419,20 @@ fn node_lucide_color(kind: &str, root: bool, selected: bool) -> Color32 {
     }
 
     match kind {
+        "Entity" => Color32::from_rgb(156, 174, 190),
+        "Actor" => Color32::from_rgb(110, 190, 142),
         "World" => Color32::from_rgb(232, 152, 96),
         "Room" => Color32::from_rgb(209, 118, 71),
         "MeshInstance" => Color32::from_rgb(156, 174, 190),
+        "ModelRenderer" => Color32::from_rgb(134, 168, 196),
+        "Animator" => Color32::from_rgb(126, 164, 220),
+        "Collider" => Color32::from_rgb(180, 170, 112),
+        "Interactable" => Color32::from_rgb(216, 160, 108),
+        "CharacterController" => Color32::from_rgb(104, 194, 142),
+        "AiController" => Color32::from_rgb(144, 176, 112),
+        "Combat" => Color32::from_rgb(220, 110, 110),
         "Light" => Color32::from_rgb(238, 203, 116),
+        "PointLight" => Color32::from_rgb(238, 203, 116),
         "SpawnPoint" => Color32::from_rgb(236, 188, 104),
         "Trigger" => Color32::from_rgb(190, 128, 232),
         "AudioSource" => Color32::from_rgb(104, 202, 188),
@@ -7411,6 +7658,60 @@ fn drag_u16(ui: &mut egui::Ui, label: &str, value: &mut u16, min: u16, max: u16)
     changed
 }
 
+fn collider_shape_editor(ui: &mut egui::Ui, shape: &mut ColliderShape) -> bool {
+    let mut changed = false;
+    let current = match shape {
+        ColliderShape::Box { .. } => "Box",
+        ColliderShape::Sphere { .. } => "Sphere",
+        ColliderShape::Capsule { .. } => "Capsule",
+    };
+    egui::ComboBox::from_label("Shape")
+        .selected_text(current)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(matches!(shape, ColliderShape::Box { .. }), "Box")
+                .clicked()
+            {
+                *shape = ColliderShape::Box {
+                    half_extents: [256, 256, 256],
+                };
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(shape, ColliderShape::Sphere { .. }), "Sphere")
+                .clicked()
+            {
+                *shape = ColliderShape::Sphere { radius: 256 };
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(shape, ColliderShape::Capsule { .. }), "Capsule")
+                .clicked()
+            {
+                *shape = ColliderShape::Capsule {
+                    radius: 192,
+                    height: 1024,
+                };
+                changed = true;
+            }
+        });
+    match shape {
+        ColliderShape::Box { half_extents } => {
+            changed |= drag_u16(ui, "Half X", &mut half_extents[0], 0, 8192);
+            changed |= drag_u16(ui, "Half Y", &mut half_extents[1], 0, 8192);
+            changed |= drag_u16(ui, "Half Z", &mut half_extents[2], 0, 8192);
+        }
+        ColliderShape::Sphere { radius } => {
+            changed |= drag_u16(ui, "Radius", radius, 0, 8192);
+        }
+        ColliderShape::Capsule { radius, height } => {
+            changed |= drag_u16(ui, "Radius", radius, 0, 8192);
+            changed |= drag_u16(ui, "Height", height, 0, 16384);
+        }
+    }
+    changed
+}
+
 fn drag_i32(ui: &mut egui::Ui, label: &str, value: &mut i32, min: i32, max: i32) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -7771,7 +8072,7 @@ fn label_for_drag(row: &NodeRow) -> String {
 
 /// Default `(menu label, kind template)` pairs for "Add Child" menus.
 /// Each menu entry uses the label as the new node's display name.
-fn default_addable_kinds() -> [(&'static str, NodeKind); 8] {
+fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
     [
         ("World", NodeKind::World),
         (
@@ -7780,7 +8081,65 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 8] {
                 grid: WorldGrid::empty(4, 4, 1024),
             },
         ),
+        ("Entity", NodeKind::Entity),
+        ("Actor", NodeKind::Actor),
         ("Node3D", NodeKind::Node3D),
+        (
+            "ModelRenderer",
+            NodeKind::ModelRenderer {
+                model: None,
+                material: None,
+            },
+        ),
+        (
+            "Animator",
+            NodeKind::Animator {
+                clip: None,
+                autoplay: true,
+            },
+        ),
+        (
+            "Collider",
+            NodeKind::Collider {
+                shape: ColliderShape::default(),
+                solid: true,
+            },
+        ),
+        (
+            "Interactable",
+            NodeKind::Interactable {
+                prompt: String::new(),
+                action: String::new(),
+            },
+        ),
+        (
+            "CharacterController",
+            NodeKind::CharacterController {
+                character: None,
+                player: false,
+            },
+        ),
+        (
+            "AiController",
+            NodeKind::AiController {
+                behavior: String::new(),
+            },
+        ),
+        (
+            "Combat",
+            NodeKind::Combat {
+                faction: String::new(),
+                health: 1,
+            },
+        ),
+        (
+            "PointLight",
+            NodeKind::PointLight {
+                color: [255, 240, 200],
+                intensity: 1.0,
+                radius: 4.0,
+            },
+        ),
         (
             "MeshInstance",
             NodeKind::MeshInstance {
@@ -7828,9 +8187,19 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 8] {
 fn node_draw_mode(kind: &NodeKind) -> &'static str {
     match kind {
         NodeKind::MeshInstance { .. } => "Textured Triangles",
+        NodeKind::ModelRenderer { .. } => "Render Component",
+        NodeKind::Animator { .. } => "Animation Component",
+        NodeKind::Collider { .. } => "Collision Component",
+        NodeKind::Interactable { .. } => "Interaction Component",
+        NodeKind::CharacterController { .. } => "Character Component",
+        NodeKind::AiController { .. } => "AI Component",
+        NodeKind::Combat { .. } => "Combat Component",
         NodeKind::World => "Streaming Region",
+        NodeKind::Entity => "Entity Host",
+        NodeKind::Actor => "Actor Host",
         NodeKind::Room { .. } => "Sector Grid",
         NodeKind::Light { .. } => "Editor Gizmo",
+        NodeKind::PointLight { .. } => "Light Component",
         NodeKind::SpawnPoint { .. } => "Spawn Marker",
         NodeKind::Trigger { .. } => "Trigger Volume",
         NodeKind::AudioSource { .. } => "Audio Marker",
@@ -10156,6 +10525,23 @@ fn entity_bound_kind_and_size(
 ) -> Option<(EntityBoundKind, [f32; 3])> {
     match &node.kind {
         NodeKind::Room { .. } | NodeKind::World | NodeKind::Node | NodeKind::Node3D => None,
+        NodeKind::ModelRenderer { .. }
+        | NodeKind::Animator { .. }
+        | NodeKind::Collider { .. }
+        | NodeKind::Interactable { .. }
+        | NodeKind::CharacterController { .. }
+        | NodeKind::AiController { .. }
+        | NodeKind::Combat { .. }
+        | NodeKind::PointLight { .. } => None,
+        NodeKind::Entity | NodeKind::Actor => {
+            if let Some(model) = entity_model_resource(workspace, node) {
+                let h = (model.world_height as f32).max(256.0);
+                let half_h = h * 0.5;
+                let half_xz = (h / 3.0).max(192.0);
+                return Some((EntityBoundKind::Model, [half_xz, half_h, half_xz]));
+            }
+            Some((EntityBoundKind::MeshFallback, [256.0, 256.0, 256.0]))
+        }
         NodeKind::MeshInstance { mesh, .. } => {
             // Model-backed instance: scale the bound to the
             // model's `world_height` so a Wraith reads as a
@@ -10183,6 +10569,46 @@ fn entity_bound_kind_and_size(
         NodeKind::Portal { .. } => Some((EntityBoundKind::Portal, [256.0, 256.0, 64.0])),
         NodeKind::AudioSource { .. } => Some((EntityBoundKind::AudioSource, [128.0, 128.0, 128.0])),
     }
+}
+
+fn entity_model_resource<'a>(
+    workspace: &'a EditorWorkspace,
+    node: &psxed_project::SceneNode,
+) -> Option<&'a psxed_project::ModelResource> {
+    let scene = workspace.project.active_scene();
+    node.children
+        .iter()
+        .filter_map(|id| scene.node(*id))
+        .find_map(|child| match &child.kind {
+            NodeKind::ModelRenderer {
+                model: Some(id), ..
+            } => workspace
+                .project
+                .resource(*id)
+                .and_then(|resource| match &resource.data {
+                    ResourceData::Model(model) => Some(model),
+                    _ => None,
+                }),
+            NodeKind::CharacterController {
+                character: Some(id),
+                ..
+            } => workspace
+                .project
+                .resource(*id)
+                .and_then(|resource| match &resource.data {
+                    ResourceData::Character(character) => character.model.and_then(|model_id| {
+                        workspace
+                            .project
+                            .resource(model_id)
+                            .and_then(|model_resource| match &model_resource.data {
+                                ResourceData::Model(model) => Some(model),
+                                _ => None,
+                            })
+                    }),
+                    _ => None,
+                }),
+            _ => None,
+        })
 }
 
 fn collect_room_options(project: &ProjectDocument) -> Vec<(NodeId, String)> {
@@ -10706,18 +11132,29 @@ mod tests {
         assert!(!circle.contains([2.6, 2.0]));
     }
 
+    fn starter_player_actor(scene: &psxed_project::Scene) -> &psxed_project::SceneNode {
+        scene
+            .nodes()
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::Actor)
+                    && node.children.iter().any(|id| {
+                        scene.node(*id).is_some_and(|child| {
+                            matches!(
+                                child.kind,
+                                NodeKind::CharacterController { player: true, .. }
+                            )
+                        })
+                    })
+            })
+            .expect("starter has a player Actor")
+    }
+
     #[test]
     fn dragging_selected_node_moves_it_in_xz_space() {
         let mut workspace =
             EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
-        let spawn = workspace
-            .project
-            .active_scene()
-            .nodes()
-            .iter()
-            .find(|node| node.name == "Player Spawn")
-            .unwrap()
-            .id;
+        let spawn = starter_player_actor(workspace.project.active_scene()).id;
         let start = workspace
             .project
             .active_scene()
@@ -10746,12 +11183,7 @@ mod tests {
             .find(|node| matches!(node.kind, NodeKind::Room { .. }))
             .expect("starter scene has a Room")
             .id;
-        let spawn = scene
-            .nodes()
-            .iter()
-            .find(|node| matches!(node.kind, NodeKind::SpawnPoint { .. }))
-            .expect("starter scene has a SpawnPoint")
-            .id;
+        let spawn = starter_player_actor(scene).id;
         let resource = workspace
             .project
             .resources
@@ -10785,19 +11217,18 @@ mod tests {
             "starter scene should expose at least one selectable entity bound"
         );
         let scene = workspace.project.active_scene();
-        // Player Spawn always exists in the starter project; its
+        // Player Actor always exists in the starter project; its
         // bound should land in the active Room with a positive
         // half-extent on every axis.
-        let spawn = scene
-            .nodes()
-            .iter()
-            .find(|node| matches!(node.kind, NodeKind::SpawnPoint { .. }))
-            .expect("starter has a SpawnPoint");
+        let spawn = starter_player_actor(scene);
         let spawn_bound = bounds
             .iter()
             .find(|b| b.node == spawn.id)
-            .expect("SpawnPoint bound was emitted");
-        assert!(matches!(spawn_bound.kind, EntityBoundKind::SpawnPoint));
+            .expect("player actor bound was emitted");
+        assert!(matches!(
+            spawn_bound.kind,
+            EntityBoundKind::Model | EntityBoundKind::MeshFallback
+        ));
         assert!(spawn_bound.half_extents[0] > 0.0);
         assert!(spawn_bound.half_extents[1] > 0.0);
         assert!(spawn_bound.half_extents[2] > 0.0);
@@ -10810,9 +11241,14 @@ mod tests {
         let bounds = workspace.collect_entity_bounds(workspace.active_room_id());
         let target = bounds
             .iter()
-            .find(|b| matches!(b.kind, EntityBoundKind::SpawnPoint))
+            .find(|b| {
+                matches!(
+                    b.kind,
+                    EntityBoundKind::Model | EntityBoundKind::MeshFallback
+                )
+            })
             .copied()
-            .expect("starter SpawnPoint produces a bound");
+            .expect("starter player Actor produces a bound");
         // Cast a ray straight at the bound's centre from far
         // outside it; ray_intersects_aabb is the primitive
         // pick_entity_bound calls into.

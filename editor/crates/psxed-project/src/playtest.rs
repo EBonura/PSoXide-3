@@ -28,7 +28,7 @@
 //! care. The residency manager already tracks RAM/VRAM membership
 //! independently of where bytes live.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::world_cook::{cook_world_grid, CookedWorldMaterial, WorldGridCookError};
@@ -45,6 +45,12 @@ use assets::{
 
 pub use manifest::{cook_to_dir, default_generated_dir, render_manifest_source, write_package};
 pub use schema::*;
+
+struct PlayerSpawnCandidate<'a> {
+    node: &'a SceneNode,
+    room_index: u16,
+    character: Option<ResourceId>,
+}
 
 /// Build a playtest package from `project`. Validates the scene
 /// tree, cooks every Room with non-empty geometry, resolves
@@ -227,25 +233,31 @@ pub fn build_package(
     }
 
     // Pass 3: spawn + entities + model instances + lights.
-    let mut player_spawns: Vec<(NodeId, &SceneNode, u16)> = Vec::new();
+    let mut player_spawns: Vec<PlayerSpawnCandidate<'_>> = Vec::new();
     let mut entities: Vec<PlaytestEntity> = Vec::new();
     let mut models: Vec<PlaytestModel> = Vec::new();
     let mut model_clips: Vec<PlaytestModelClip> = Vec::new();
     let mut model_instances: Vec<PlaytestModelInstance> = Vec::new();
     let mut lights: Vec<PlaytestLight> = Vec::new();
     // ResourceId → index into `models` for instance dedup.
-    let mut model_for_resource: std::collections::HashMap<ResourceId, u16> =
-        std::collections::HashMap::new();
+    let mut model_for_resource: HashMap<ResourceId, u16> = HashMap::new();
     let mut warned_unsupported: HashSet<&'static str> = HashSet::new();
 
     for node in scene.nodes() {
         if node.id == scene.root || matches!(node.kind, NodeKind::Room { .. }) {
             continue;
         }
+        if node.kind.is_component() {
+            continue;
+        }
         let Some((room_node, room_index)) = enclosing_room(scene, node, &node_to_room_index) else {
             if !matches!(
                 node.kind,
-                NodeKind::Node | NodeKind::Node3D | NodeKind::World
+                NodeKind::Node
+                    | NodeKind::Node3D
+                    | NodeKind::Entity
+                    | NodeKind::Actor
+                    | NodeKind::World
             ) {
                 report.warn(format!(
                     "{} '{}' has no enclosing Room — dropped",
@@ -262,8 +274,77 @@ pub fn build_package(
         let yaw = yaw_from_degrees(node.transform.rotation_degrees[1]);
 
         match &node.kind {
+            NodeKind::Entity | NodeKind::Actor => {
+                if let Some((model_resource_id, _material)) = component_model_renderer(scene, node)
+                    .and_then(|(model, material)| {
+                        model
+                            .and_then(|id| {
+                                project
+                                    .resource(id)
+                                    .filter(|r| matches!(r.data, ResourceData::Model(_)))
+                                    .map(|_| id)
+                            })
+                            .map(|id| (id, material))
+                    })
+                {
+                    let clip = component_animator(scene, node).and_then(|anim| anim.clip);
+                    if !push_model_instance_for_resource(
+                        project,
+                        project_root,
+                        node.name.as_str(),
+                        model_resource_id,
+                        clip,
+                        room_index,
+                        pos,
+                        yaw,
+                        &mut assets,
+                        &mut models,
+                        &mut model_clips,
+                        &mut model_instances,
+                        &mut model_for_resource,
+                        &mut report,
+                    ) {
+                        return (None, report);
+                    }
+                }
+
+                for light in component_point_lights(scene, node) {
+                    if !push_point_light(
+                        node.name.as_str(),
+                        grid,
+                        room_index,
+                        pos,
+                        light.color,
+                        light.intensity,
+                        light.radius,
+                        &mut lights,
+                        &mut report,
+                    ) {
+                        return (None, report);
+                    }
+                }
+
+                if let Some(controller) = component_character_controller(scene, node) {
+                    if controller.player {
+                        player_spawns.push(PlayerSpawnCandidate {
+                            node,
+                            room_index,
+                            character: controller.character,
+                        });
+                    } else if warned_unsupported.insert("NonPlayerActor") {
+                        report.warn("Non-player Actor components are skipped in this pass");
+                    }
+                }
+            }
             NodeKind::SpawnPoint { player: true, .. } => {
-                player_spawns.push((node.id, node, room_index));
+                let NodeKind::SpawnPoint { character, .. } = &node.kind else {
+                    unreachable!();
+                };
+                player_spawns.push(PlayerSpawnCandidate {
+                    node,
+                    room_index,
+                    character: *character,
+                });
             }
             NodeKind::SpawnPoint { player: false, .. } => {
                 entities.push(PlaytestEntity {
@@ -298,43 +379,24 @@ pub fn build_package(
                         .map(|_| id)
                 });
                 if let Some(model_resource_id) = model_id {
-                    let model_index = match register_model_for_instance(
+                    if !push_model_instance_for_resource(
                         project,
                         project_root,
+                        node.name.as_str(),
                         model_resource_id,
+                        *animation_clip,
+                        room_index,
+                        pos,
+                        yaw,
                         &mut assets,
                         &mut models,
                         &mut model_clips,
+                        &mut model_instances,
                         &mut model_for_resource,
                         &mut report,
                     ) {
-                        Some(i) => i,
-                        None => return (None, report),
-                    };
-                    let model = &models[model_index as usize];
-                    let clip = match *animation_clip {
-                        Some(idx) => {
-                            if idx >= model.clip_count {
-                                report.error(format!(
-                                    "MeshInstance '{}' clip override {idx} out of range (model has {})",
-                                    node.name, model.clip_count
-                                ));
-                                return (None, report);
-                            }
-                            idx
-                        }
-                        None => MODEL_CLIP_INHERIT,
-                    };
-                    model_instances.push(PlaytestModelInstance {
-                        room: room_index,
-                        model: model_index,
-                        clip,
-                        x: pos[0],
-                        y: pos[1],
-                        z: pos[2],
-                        yaw,
-                        flags: 0,
-                    });
+                        return (None, report);
+                    }
                 } else {
                     // Legacy / unbound MeshInstance → marker
                     // (matches the pre-Model-resource behaviour).
@@ -355,39 +417,19 @@ pub fn build_package(
                 intensity,
                 radius,
             } => {
-                // Reject obviously broken lights at cook time
-                // -- radius 0 contributes nothing, negative
-                // intensity is meaningless. Clamp the rest into
-                // the wire format's u16 ranges.
-                if *radius <= 0.0 {
-                    report.error(format!(
-                        "Light '{}' has radius {} (must be > 0)",
-                        node.name, radius
-                    ));
+                if !push_point_light(
+                    node.name.as_str(),
+                    grid,
+                    room_index,
+                    pos,
+                    *color,
+                    *intensity,
+                    *radius,
+                    &mut lights,
+                    &mut report,
+                ) {
                     return (None, report);
                 }
-                if !intensity.is_finite() || *intensity < 0.0 {
-                    report.error(format!(
-                        "Light '{}' has invalid intensity {}",
-                        node.name, intensity
-                    ));
-                    return (None, report);
-                }
-                // Editor radius is in *sector units* -- convert
-                // to world units (engine units) at cook time so
-                // the runtime record stays in one canonical
-                // unit regardless of the room's `sector_size`.
-                let radius_world = spatial::light_radius_record_units(grid, *radius);
-                let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u16;
-                lights.push(PlaytestLight {
-                    room: room_index,
-                    x: pos[0],
-                    y: pos[1],
-                    z: pos[2],
-                    radius: radius_world,
-                    intensity_q8,
-                    color: *color,
-                });
             }
             NodeKind::Trigger { .. } => {
                 if warned_unsupported.insert("Trigger") {
@@ -404,7 +446,18 @@ pub fn build_package(
                     report.warn("Portal nodes are skipped (no streaming yet)");
                 }
             }
-            NodeKind::Node | NodeKind::Node3D | NodeKind::World | NodeKind::Room { .. } => {}
+            NodeKind::Node
+            | NodeKind::Node3D
+            | NodeKind::World
+            | NodeKind::Room { .. }
+            | NodeKind::ModelRenderer { .. }
+            | NodeKind::Animator { .. }
+            | NodeKind::Collider { .. }
+            | NodeKind::Interactable { .. }
+            | NodeKind::CharacterController { .. }
+            | NodeKind::AiController { .. }
+            | NodeKind::Combat { .. }
+            | NodeKind::PointLight { .. } => {}
         }
     }
 
@@ -414,7 +467,9 @@ pub fn build_package(
             None
         }
         1 => {
-            let (_, node, room_index) = player_spawns[0];
+            let candidate = &player_spawns[0];
+            let node = candidate.node;
+            let room_index = candidate.room_index;
             let NodeKind::Room { grid } = &room_nodes
                 .iter()
                 .find(|r| node_to_room_index.get(&r.id) == Some(&room_index))
@@ -452,12 +507,12 @@ pub fn build_package(
     // dedupe path handles their backing models too.
     let mut characters: Vec<PlaytestCharacter> = Vec::new();
     let player_controller = match (spawn, &player_spawns[..]) {
-        (Some(spawn_record), [(_, spawn_node, _)]) => {
-            let NodeKind::SpawnPoint { character, .. } = &spawn_node.kind else {
-                report.error("internal: player spawn node kind shifted under us");
-                return (None, report);
-            };
-            let resolved = match crate::resolve::resolve_spawn_character(project, *character) {
+        (Some(spawn_record), [candidate]) => {
+            let spawn_node = candidate.node;
+            let resolved = match crate::resolve::resolve_spawn_character(
+                project,
+                candidate.character,
+            ) {
                 Ok(resolved) => {
                     if resolved.auto_picked {
                         report.warn(format!(
@@ -940,6 +995,179 @@ fn register_model_for_instance(
     Some(model_index)
 }
 
+fn push_model_instance_for_resource(
+    project: &ProjectDocument,
+    project_root: &Path,
+    node_name: &str,
+    model_resource_id: ResourceId,
+    clip_override: Option<u16>,
+    room_index: u16,
+    pos: [i32; 3],
+    yaw: i16,
+    assets: &mut Vec<PlaytestAsset>,
+    models: &mut Vec<PlaytestModel>,
+    model_clips: &mut Vec<PlaytestModelClip>,
+    model_instances: &mut Vec<PlaytestModelInstance>,
+    model_for_resource: &mut HashMap<ResourceId, u16>,
+    report: &mut PlaytestValidationReport,
+) -> bool {
+    let Some(model_index) = register_model_for_instance(
+        project,
+        project_root,
+        model_resource_id,
+        assets,
+        models,
+        model_clips,
+        model_for_resource,
+        report,
+    ) else {
+        return false;
+    };
+    let model = &models[model_index as usize];
+    let clip = match clip_override {
+        Some(idx) => {
+            if idx >= model.clip_count {
+                report.error(format!(
+                    "Model instance '{node_name}' clip override {idx} out of range (model has {})",
+                    model.clip_count
+                ));
+                return false;
+            }
+            idx
+        }
+        None => MODEL_CLIP_INHERIT,
+    };
+    model_instances.push(PlaytestModelInstance {
+        room: room_index,
+        model: model_index,
+        clip,
+        x: pos[0],
+        y: pos[1],
+        z: pos[2],
+        yaw,
+        flags: 0,
+    });
+    true
+}
+
+#[derive(Clone, Copy)]
+struct AnimatorComponent {
+    clip: Option<u16>,
+}
+
+#[derive(Clone, Copy)]
+struct CharacterControllerComponent {
+    character: Option<ResourceId>,
+    player: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PointLightComponent {
+    color: [u8; 3],
+    intensity: f32,
+    radius: f32,
+}
+
+fn component_model_renderer(
+    scene: &crate::Scene,
+    host: &SceneNode,
+) -> Option<(Option<ResourceId>, Option<ResourceId>)> {
+    component_children(scene, host).find_map(|node| match &node.kind {
+        NodeKind::ModelRenderer { model, material } => Some((*model, *material)),
+        _ => None,
+    })
+}
+
+fn component_animator(scene: &crate::Scene, host: &SceneNode) -> Option<AnimatorComponent> {
+    component_children(scene, host).find_map(|node| match &node.kind {
+        NodeKind::Animator { clip, .. } => Some(AnimatorComponent { clip: *clip }),
+        _ => None,
+    })
+}
+
+fn component_character_controller(
+    scene: &crate::Scene,
+    host: &SceneNode,
+) -> Option<CharacterControllerComponent> {
+    component_children(scene, host).find_map(|node| match &node.kind {
+        NodeKind::CharacterController { character, player } => Some(CharacterControllerComponent {
+            character: *character,
+            player: *player,
+        }),
+        _ => None,
+    })
+}
+
+fn component_point_lights(scene: &crate::Scene, host: &SceneNode) -> Vec<PointLightComponent> {
+    component_children(scene, host)
+        .filter_map(|node| match &node.kind {
+            NodeKind::PointLight {
+                color,
+                intensity,
+                radius,
+            } => Some(PointLightComponent {
+                color: *color,
+                intensity: *intensity,
+                radius: *radius,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn component_children<'a>(
+    scene: &'a crate::Scene,
+    host: &'a SceneNode,
+) -> impl Iterator<Item = &'a SceneNode> + 'a {
+    host.children
+        .iter()
+        .filter_map(|id| scene.node(*id))
+        .filter(|node| node.kind.is_component())
+}
+
+fn push_point_light(
+    node_name: &str,
+    grid: &crate::WorldGrid,
+    room_index: u16,
+    pos: [i32; 3],
+    color: [u8; 3],
+    intensity: f32,
+    radius: f32,
+    lights: &mut Vec<PlaytestLight>,
+    report: &mut PlaytestValidationReport,
+) -> bool {
+    // Reject obviously broken lights at cook time -- radius 0
+    // contributes nothing, negative intensity is meaningless.
+    // Clamp the rest into the wire format's u16 ranges.
+    if radius <= 0.0 {
+        report.error(format!(
+            "Light '{node_name}' has radius {radius} (must be > 0)"
+        ));
+        return false;
+    }
+    if !intensity.is_finite() || intensity < 0.0 {
+        report.error(format!(
+            "Light '{node_name}' has invalid intensity {intensity}"
+        ));
+        return false;
+    }
+    // Editor radius is in *sector units* -- convert to world
+    // units (engine units) at cook time so the runtime record
+    // stays in one canonical unit regardless of room sector size.
+    let radius_world = spatial::light_radius_record_units(grid, radius);
+    let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u16;
+    lights.push(PlaytestLight {
+        room: room_index,
+        x: pos[0],
+        y: pos[1],
+        z: pos[2],
+        radius: radius_world,
+        intensity_q8,
+        color,
+    });
+    true
+}
+
 /// Resolve a path the same way the texture loader does so the
 /// model writer / runtime stay in lockstep.
 fn enclosing_room<'a>(
@@ -992,13 +1220,85 @@ mod tests {
             .nodes()
             .iter()
             .any(|n| matches!(n.kind, NodeKind::Room { .. }));
-        let has_player_spawn = scene
+        let has_player_spawn = scene.nodes().iter().any(|n| is_player_spawn_node(scene, n));
+        assert!(has_room, "starter must contain a Room");
+        assert!(
+            has_player_spawn,
+            "starter must contain a player spawn actor"
+        );
+        project
+    }
+
+    fn is_player_spawn_node(scene: &crate::Scene, node: &SceneNode) -> bool {
+        match &node.kind {
+            NodeKind::SpawnPoint { player: true, .. } => true,
+            NodeKind::Actor | NodeKind::Entity => node.children.iter().any(|id| {
+                scene.node(*id).is_some_and(|child| {
+                    matches!(
+                        child.kind,
+                        NodeKind::CharacterController { player: true, .. }
+                    )
+                })
+            }),
+            _ => false,
+        }
+    }
+
+    fn player_spawn_node_id(project: &ProjectDocument) -> NodeId {
+        let scene = project.active_scene();
+        scene
             .nodes()
             .iter()
-            .any(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true, .. }));
-        assert!(has_room, "starter must contain a Room");
-        assert!(has_player_spawn, "starter must contain a player SpawnPoint");
-        project
+            .find(|node| is_player_spawn_node(scene, node))
+            .expect("starter has a player spawn actor")
+            .id
+    }
+
+    fn player_controller_component_id(project: &ProjectDocument) -> NodeId {
+        let scene = project.active_scene();
+        scene
+            .nodes()
+            .iter()
+            .find(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::CharacterController { player: true, .. }
+                )
+            })
+            .expect("starter has a player CharacterController")
+            .id
+    }
+
+    fn demote_player_spawns(project: &mut ProjectDocument) {
+        let scene = project.active_scene_mut();
+        let ids: Vec<NodeId> = scene
+            .nodes()
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::SpawnPoint { player: true, .. }
+                        | NodeKind::CharacterController { player: true, .. }
+                )
+            })
+            .map(|node| node.id)
+            .collect();
+        for id in ids {
+            let Some(node) = scene.node_mut(id) else {
+                continue;
+            };
+            match &mut node.kind {
+                NodeKind::SpawnPoint { player, character } if *player => {
+                    *player = false;
+                    *character = None;
+                }
+                NodeKind::CharacterController { player, character } if *player => {
+                    *player = false;
+                    *character = None;
+                }
+                _ => {}
+            }
+        }
     }
 
     fn starter_light_color(project: &ProjectDocument) -> [u8; 3] {
@@ -1008,6 +1308,7 @@ mod tests {
             .iter()
             .find_map(|node| match &node.kind {
                 NodeKind::Light { color, .. } => Some(*color),
+                NodeKind::PointLight { color, .. } => Some(*color),
                 _ => None,
             })
             .expect("starter contains one light")
@@ -1020,10 +1321,71 @@ mod tests {
             .iter()
             .find_map(|node| match &node.kind {
                 NodeKind::Light { intensity, .. } => Some(*intensity),
+                NodeKind::PointLight { intensity, .. } => Some(*intensity),
                 _ => None,
             })
             .expect("starter contains one light");
         (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u16
+    }
+
+    fn starter_light_ids(project: &ProjectDocument) -> Vec<NodeId> {
+        project
+            .active_scene()
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Light { .. } | NodeKind::PointLight { .. }))
+            .map(|n| n.id)
+            .collect()
+    }
+
+    fn placed_model_host_ids(project: &ProjectDocument) -> Vec<NodeId> {
+        let scene = project.active_scene();
+        scene
+            .nodes()
+            .iter()
+            .filter(|node| match &node.kind {
+                NodeKind::MeshInstance { mesh: Some(_), .. } => true,
+                NodeKind::Entity | NodeKind::Actor => node.children.iter().any(|id| {
+                    scene.node(*id).is_some_and(|child| {
+                        matches!(child.kind, NodeKind::ModelRenderer { model: Some(_), .. })
+                    })
+                }),
+                _ => false,
+            })
+            .map(|n| n.id)
+            .collect()
+    }
+
+    fn set_first_model_instance_clip(project: &mut ProjectDocument, clip_index: u16) {
+        let scene = project.active_scene_mut();
+        let ids: Vec<NodeId> = scene
+            .nodes()
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::MeshInstance { .. } | NodeKind::Animator { .. }
+                )
+            })
+            .map(|node| node.id)
+            .collect();
+        for id in ids {
+            let Some(node) = scene.node_mut(id) else {
+                continue;
+            };
+            match &mut node.kind {
+                NodeKind::MeshInstance { animation_clip, .. } => {
+                    *animation_clip = Some(clip_index);
+                    return;
+                }
+                NodeKind::Animator { clip, .. } => {
+                    *clip = Some(clip_index);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("starter has a model animation override node");
     }
 
     #[test]
@@ -1102,13 +1464,8 @@ mod tests {
         // before cooking and assert residency still picks up the
         // Wraith mesh + atlas + clips via the player path.
         let mut project = project_with_one_room();
+        let placed_ids = placed_model_host_ids(&project);
         let scene = project.active_scene_mut();
-        let placed_ids: Vec<NodeId> = scene
-            .nodes()
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::MeshInstance { mesh: Some(_), .. }))
-            .map(|n| n.id)
-            .collect();
         for id in placed_ids {
             scene.remove_node(id);
         }
@@ -1243,15 +1600,9 @@ mod tests {
         // Starter has exactly one Character. Clear the spawn's
         // explicit reference; cooker should auto-pick + warn.
         let mut project = project_with_one_room();
-        let scene = project.active_scene();
-        let spawn_id = scene
-            .nodes()
-            .iter()
-            .find(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true, .. }))
-            .map(|n| n.id)
-            .expect("starter has player spawn");
-        if let Some(node) = project.active_scene_mut().node_mut(spawn_id) {
-            if let NodeKind::SpawnPoint { character, .. } = &mut node.kind {
+        let controller_id = player_controller_component_id(&project);
+        if let Some(node) = project.active_scene_mut().node_mut(controller_id) {
+            if let NodeKind::CharacterController { character, .. } = &mut node.kind {
                 *character = None;
             }
         }
@@ -1442,21 +1793,7 @@ mod tests {
     #[test]
     fn project_with_no_player_spawn_fails_validation() {
         let mut project = ProjectDocument::starter();
-        let scene = project.active_scene_mut();
-        let ids: Vec<NodeId> = scene
-            .nodes()
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true, .. }))
-            .map(|n| n.id)
-            .collect();
-        for id in ids {
-            if let Some(node) = scene.node_mut(id) {
-                node.kind = NodeKind::SpawnPoint {
-                    player: false,
-                    character: None,
-                };
-            }
-        }
+        demote_player_spawns(&mut project);
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(package.is_none());
         assert!(report.errors.iter().any(|e| e.contains("player")));
@@ -1709,19 +2046,7 @@ mod tests {
         // clip count → cook refuses with an explicit error
         // mentioning the offending node.
         let mut project = ProjectDocument::starter();
-        let scene = project.active_scene_mut();
-        // Find existing Wraith MeshInstance and bump its clip.
-        let id = scene
-            .nodes()
-            .iter()
-            .find(|n| matches!(n.kind, NodeKind::MeshInstance { .. }))
-            .map(|n| n.id)
-            .expect("starter has a MeshInstance");
-        if let Some(node) = scene.node_mut(id) {
-            if let NodeKind::MeshInstance { animation_clip, .. } = &mut node.kind {
-                *animation_clip = Some(999);
-            }
-        }
+        set_first_model_instance_clip(&mut project, 999);
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(package.is_none());
         assert!(
@@ -1801,18 +2126,15 @@ mod tests {
     #[test]
     fn light_with_zero_radius_fails() {
         let mut project = ProjectDocument::starter();
-        let ids: Vec<NodeId> = project
-            .active_scene()
-            .nodes()
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Light { .. }))
-            .map(|n| n.id)
-            .collect();
+        let ids = starter_light_ids(&project);
         let scene = project.active_scene_mut();
         for id in ids {
             if let Some(node) = scene.node_mut(id) {
-                if let NodeKind::Light { radius, .. } = &mut node.kind {
-                    *radius = 0.0;
+                match &mut node.kind {
+                    NodeKind::Light { radius, .. } | NodeKind::PointLight { radius, .. } => {
+                        *radius = 0.0;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1828,18 +2150,15 @@ mod tests {
     #[test]
     fn light_with_negative_intensity_fails() {
         let mut project = ProjectDocument::starter();
-        let ids: Vec<NodeId> = project
-            .active_scene()
-            .nodes()
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Light { .. }))
-            .map(|n| n.id)
-            .collect();
+        let ids = starter_light_ids(&project);
         let scene = project.active_scene_mut();
         for id in ids {
             if let Some(node) = scene.node_mut(id) {
-                if let NodeKind::Light { intensity, .. } = &mut node.kind {
-                    *intensity = -0.5;
+                match &mut node.kind {
+                    NodeKind::Light { intensity, .. } | NodeKind::PointLight { intensity, .. } => {
+                        *intensity = -0.5;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1857,18 +2176,15 @@ mod tests {
         // Author a 4-sector radius; with sector_size=1024 the
         // cooked record must store 4096 world units.
         let mut project = ProjectDocument::starter();
-        let ids: Vec<NodeId> = project
-            .active_scene()
-            .nodes()
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Light { .. }))
-            .map(|n| n.id)
-            .collect();
+        let ids = starter_light_ids(&project);
         let scene = project.active_scene_mut();
         for id in ids {
             if let Some(node) = scene.node_mut(id) {
-                if let NodeKind::Light { radius, .. } = &mut node.kind {
-                    *radius = 4.0;
+                match &mut node.kind {
+                    NodeKind::Light { radius, .. } | NodeKind::PointLight { radius, .. } => {
+                        *radius = 4.0;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2050,12 +2366,7 @@ mod tests {
                 .iter()
                 .find(|n| matches!(n.kind, crate::NodeKind::Room { .. }))
                 .expect("starter has a room");
-            let spawn = scene
-                .nodes()
-                .iter()
-                .find(|n| matches!(n.kind, crate::NodeKind::SpawnPoint { player: true, .. }))
-                .expect("starter has a player spawn");
-            (room.id, spawn.id)
+            (room.id, player_spawn_node_id(&project))
         };
         if let Some(node) = project.active_scene_mut().node_mut(spawn_id) {
             node.transform.translation = [ex, 0.0, ez];

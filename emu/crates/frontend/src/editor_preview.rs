@@ -32,8 +32,8 @@ use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
 
 use psxed_project::{
-    spatial, GridDirection, GridSplit, NodeKind, ProjectDocument, ResourceData, ResourceId,
-    WorldGrid,
+    spatial, GridDirection, GridSplit, NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId,
+    Scene, SceneNode, Transform3, WorldGrid,
 };
 
 use crate::editor_textures::{EditorTextures, MaterialSlot};
@@ -453,11 +453,11 @@ fn face_shade(
     }
 }
 
-/// Walk every Light node in `project` whose enclosing room is
-/// the active grid and pre-multiply its colour×intensity_q8.
-/// Lights authored outside any Room (no enclosing parent) are
-/// skipped silently -- the cooker warns about those, the
-/// preview just doesn't render them.
+/// Walk every legacy Light and component PointLight whose
+/// enclosing room is the active grid and pre-multiply its
+/// colour×intensity_q8. Lights authored outside any Room (no
+/// enclosing parent) are skipped silently -- the cooker warns
+/// about those, the preview just doesn't render them.
 fn collect_preview_lights(
     project: &ProjectDocument,
     room_id: psxed_project::NodeId,
@@ -465,40 +465,231 @@ fn collect_preview_lights(
 ) -> Vec<psx_engine::PointLightSample> {
     let scene = project.active_scene();
     let mut out = Vec::new();
-    for node in scene.nodes() {
-        let NodeKind::Light {
-            color,
-            intensity,
-            radius,
-        } = &node.kind
-        else {
-            continue;
-        };
-        if *radius <= 0.0 || !intensity.is_finite() || *intensity < 0.0 {
-            continue;
-        }
+    for light in preview_lights(scene) {
         // Filter by enclosing Room -- a light authored under
         // some other Room must not bleed into this one.
-        if !is_descendant_of_room(scene, node.id, room_id) {
+        if !is_descendant_of_room(scene, light.host_id, room_id) {
             continue;
         }
-        let world = node_room_local_origin(grid, &node.transform);
-        // Editor `radius` is in sector units; convert to
-        // engine units once here so the per-face attenuation
-        // math stays in world space.
-        let radius_engine = spatial::light_radius_engine_units(grid, *radius);
-        // Pre-multiply colour × intensity into u32 channels;
-        // intensity scaled by 256 (Q8.8) keeps the per-face
-        // accumulator in integer math.
-        let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u32;
-        out.push(psx_engine::PointLightSample::from_rgb_intensity(
-            [world.x, world.y, world.z],
-            radius_engine,
-            psx_engine::Rgb8::from_array(*color),
-            psx_engine::Q8::from_raw(intensity_q8),
-        ));
+        push_preview_light_sample(
+            &mut out,
+            grid,
+            &light.transform,
+            light.color,
+            light.intensity,
+            light.radius,
+        );
     }
     out
+}
+
+fn push_preview_light_sample(
+    out: &mut Vec<psx_engine::PointLightSample>,
+    grid: &WorldGrid,
+    transform: &Transform3,
+    color: [u8; 3],
+    intensity: f32,
+    radius: f32,
+) {
+    if radius <= 0.0 || !intensity.is_finite() || intensity < 0.0 {
+        return;
+    }
+    let world = node_room_local_origin(grid, transform);
+    // Editor `radius` is in sector units; convert to
+    // engine units once here so the per-face attenuation
+    // math stays in world space.
+    let radius_engine = spatial::light_radius_engine_units(grid, radius);
+    // Pre-multiply colour × intensity into u32 channels;
+    // intensity scaled by 256 (Q8.8) keeps the per-face
+    // accumulator in integer math.
+    let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u32;
+    out.push(psx_engine::PointLightSample::from_rgb_intensity(
+        [world.x, world.y, world.z],
+        radius_engine,
+        psx_engine::Rgb8::from_array(color),
+        psx_engine::Q8::from_raw(intensity_q8),
+    ));
+}
+
+#[derive(Clone, Copy)]
+struct PreviewLightMeta {
+    host_id: NodeId,
+    component_id: Option<NodeId>,
+    transform: Transform3,
+    color: [u8; 3],
+    intensity: f32,
+    radius: f32,
+}
+
+fn preview_lights(scene: &Scene) -> Vec<PreviewLightMeta> {
+    let mut out = Vec::new();
+    for node in scene.nodes() {
+        match &node.kind {
+            NodeKind::Light {
+                color,
+                intensity,
+                radius,
+            } => {
+                out.push(PreviewLightMeta {
+                    host_id: node.id,
+                    component_id: None,
+                    transform: node.transform,
+                    color: *color,
+                    intensity: *intensity,
+                    radius: *radius,
+                });
+            }
+            NodeKind::Entity | NodeKind::Actor => {
+                for child in component_children(scene, node) {
+                    let NodeKind::PointLight {
+                        color,
+                        intensity,
+                        radius,
+                    } = &child.kind
+                    else {
+                        continue;
+                    };
+                    out.push(PreviewLightMeta {
+                        host_id: node.id,
+                        component_id: Some(child.id),
+                        transform: node.transform,
+                        color: *color,
+                        intensity: *intensity,
+                        radius: *radius,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn component_children<'a>(
+    scene: &'a Scene,
+    host: &'a SceneNode,
+) -> impl Iterator<Item = &'a SceneNode> + 'a {
+    host.children.iter().filter_map(|id| scene.node(*id))
+}
+
+#[derive(Clone, Copy)]
+struct PreviewModelReference {
+    model_id: ResourceId,
+    clip_override: Option<u16>,
+    renderer_node: Option<NodeId>,
+    animator_node: Option<NodeId>,
+}
+
+fn preview_model_reference(scene: &Scene, node: &SceneNode) -> Option<PreviewModelReference> {
+    match &node.kind {
+        NodeKind::MeshInstance {
+            mesh: Some(model_id),
+            animation_clip,
+            ..
+        } => Some(PreviewModelReference {
+            model_id: *model_id,
+            clip_override: *animation_clip,
+            renderer_node: None,
+            animator_node: None,
+        }),
+        NodeKind::Entity | NodeKind::Actor => {
+            let mut renderer = None;
+            let mut animator = None;
+            for child in component_children(scene, node) {
+                match &child.kind {
+                    NodeKind::ModelRenderer {
+                        model: Some(model_id),
+                        ..
+                    } if renderer.is_none() => {
+                        renderer = Some((child.id, *model_id));
+                    }
+                    NodeKind::Animator { clip, .. } if animator.is_none() => {
+                        animator = Some((child.id, *clip));
+                    }
+                    _ => {}
+                }
+            }
+            renderer.map(|(renderer_node, model_id)| PreviewModelReference {
+                model_id,
+                clip_override: animator.and_then(|(_, clip)| clip),
+                renderer_node: Some(renderer_node),
+                animator_node: animator.map(|(node_id, _)| node_id),
+            })
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreviewPlayerReference {
+    character: Option<ResourceId>,
+    controller_node: Option<NodeId>,
+}
+
+fn preview_player_reference(scene: &Scene, node: &SceneNode) -> Option<PreviewPlayerReference> {
+    match &node.kind {
+        NodeKind::SpawnPoint {
+            player: true,
+            character,
+        } => Some(PreviewPlayerReference {
+            character: *character,
+            controller_node: None,
+        }),
+        NodeKind::Entity | NodeKind::Actor => component_children(scene, node).find_map(|child| {
+            let NodeKind::CharacterController {
+                character,
+                player: true,
+            } = &child.kind
+            else {
+                return None;
+            };
+            Some(PreviewPlayerReference {
+                character: *character,
+                controller_node: Some(child.id),
+            })
+        }),
+        _ => None,
+    }
+}
+
+fn preview_reference_selected(
+    selected: NodeId,
+    host_id: NodeId,
+    component_a: Option<NodeId>,
+    component_b: Option<NodeId>,
+) -> bool {
+    selected == host_id || component_a == Some(selected) || component_b == Some(selected)
+}
+
+fn host_renders_as_preview_model(
+    project: &ProjectDocument,
+    scene: &Scene,
+    node: &SceneNode,
+) -> bool {
+    if let Some(reference) = preview_model_reference(scene, node) {
+        return project
+            .resource(reference.model_id)
+            .is_some_and(|resource| matches!(&resource.data, ResourceData::Model(_)));
+    }
+    if let Some(reference) = preview_player_reference(scene, node) {
+        let Some(character_id) = resolve_player_spawn_character(project, reference.character)
+        else {
+            return false;
+        };
+        let Some(character_resource) = project.resource(character_id) else {
+            return false;
+        };
+        let ResourceData::Character(character) = &character_resource.data else {
+            return false;
+        };
+        let Some(model_id) = character.model else {
+            return false;
+        };
+        return project
+            .resource(model_id)
+            .is_some_and(|resource| matches!(&resource.data, ResourceData::Model(_)));
+    }
+    false
 }
 
 /// Walk parent links from `node_id` looking for `room_id`.
@@ -811,16 +1002,11 @@ fn walk_entities(
 ) {
     let scene = project.active_scene();
     for node in scene.nodes() {
-        // Skip Model-backed MeshInstances -- `walk_model_instances`
-        // renders them as real textured models. Without this guard
-        // they'd get *both* a marker square and the real model on
-        // top of each other.
-        if let NodeKind::MeshInstance { mesh: Some(id), .. } = &node.kind {
-            if let Some(resource) = project.resource(*id) {
-                if matches!(resource.data, ResourceData::Model(_)) {
-                    continue;
-                }
-            }
+        // Skip nodes that the model-preview pass renders as real
+        // textured characters/models. Without this guard they'd get
+        // both a marker square and the real model on top of each other.
+        if host_renders_as_preview_model(project, scene, node) {
+            continue;
         }
         let Some(kind_color) = entity_marker_color(&node.kind) else {
             continue;
@@ -876,10 +1062,10 @@ fn walk_entities(
     }
 }
 
-/// Cap on placed Model-backed MeshInstance nodes the editor
-/// preview will render in one frame. Excess instances skip
-/// silently (the manifest hasn't filtered them) -- keeps a
-/// runaway scene from busting the per-frame budget.
+/// Cap on placed model-rendering nodes the editor preview will
+/// render in one frame. Excess instances skip silently (the
+/// manifest hasn't filtered them) -- keeps a runaway scene from
+/// busting the per-frame budget.
 const MAX_PREVIEW_MODEL_INSTANCES: usize = 8;
 /// Cap on joints any one previewed model can carry. Matches
 /// the runtime `JOINT_CAP` so a model that renders in
@@ -914,12 +1100,13 @@ struct PreviewModelInstance<'a> {
     instance_rotation: Mat3I16,
 }
 
-/// Render every Model-backed `MeshInstance` in the scene as a
-/// real textured animated model. Mirrors the runtime path in
-/// `editor-playtest`: parse `.psxmdl` + `.psxt` + `.psxanim`,
-/// upload atlas (lazily -- done by `EditorTextures::refresh_models`),
-/// compose joint transforms via `compute_joint_view_transform`,
-/// project per-vertex, emit textured triangles into the OT.
+/// Render every Model-backed legacy `MeshInstance` or component
+/// `Entity`/`Actor` in the scene as a real textured animated model.
+/// Mirrors the runtime path in `editor-playtest`: parse `.psxmdl`
+/// + `.psxt` + `.psxanim`, upload atlas (lazily -- done by
+/// `EditorTextures::refresh_models`), compose joint transforms via
+/// `compute_joint_view_transform`, project per-vertex, emit textured
+/// triangles into the OT.
 ///
 /// Models with bad/missing data are skipped silently -- the
 /// editor inspector + cook validation surface those errors
@@ -950,15 +1137,10 @@ fn walk_model_instances(
         if instances_meta.len() >= MAX_PREVIEW_MODEL_INSTANCES {
             break;
         }
-        let NodeKind::MeshInstance {
-            mesh: Some(mesh_id),
-            animation_clip,
-            ..
-        } = &node.kind
-        else {
+        let Some(reference) = preview_model_reference(scene, node) else {
             continue;
         };
-        let Some(model_resource) = project.resource(*mesh_id) else {
+        let Some(model_resource) = project.resource(reference.model_id) else {
             continue;
         };
         let ResourceData::Model(model) = &model_resource.data else {
@@ -971,14 +1153,16 @@ fn walk_model_instances(
         // Atlas slot must already be uploaded (refresh_models
         // ran earlier in the frame). Skip if not -- lets the
         // user know visually that the atlas is broken.
-        let Some(atlas_slot) = textures.model_atlas_slot(*mesh_id) else {
+        let Some(atlas_slot) = textures.model_atlas_slot(reference.model_id) else {
             continue;
         };
 
         // Resolve clip: explicit instance override → preview clip → default.
-        let clip_local =
-            psxed_project::resolve::resolve_model_instance_preview_clip(model, *animation_clip)
-                .unwrap_or(0);
+        let clip_local = psxed_project::resolve::resolve_model_instance_preview_clip(
+            model,
+            reference.clip_override,
+        )
+        .unwrap_or(0);
         if (clip_local as usize) >= model.clips.len() {
             continue;
         }
@@ -991,12 +1175,17 @@ fn walk_model_instances(
         let instance_rotation = yaw_rotation_q12(yaw_q12);
 
         instances_meta.push(InstanceMeta {
-            mesh_id: *mesh_id,
+            mesh_id: reference.model_id,
             clip_local,
             origin,
             instance_rotation,
             atlas: atlas_slot,
-            is_selected: node.id == selected,
+            is_selected: preview_reference_selected(
+                selected,
+                node.id,
+                reference.renderer_node,
+                reference.animator_node,
+            ),
             yaw_q12,
             world_height: model.world_height as i32,
         });
@@ -1051,13 +1240,12 @@ fn walk_model_instances(
     }
 }
 
-/// For every Player Spawn (`SpawnPoint { player: true, .. }`),
-/// resolve its `character` link to a Model + idle clip and
-/// queue an `InstanceMeta` so the same render path placed
-/// model instances follow renders the character at the spawn.
-/// `(mesh_id, clip_local)` is the cache key -- different player
-/// idle clips and different placed-instance clips each resolve
-/// to their own animation entry.
+/// For every legacy Player Spawn or component player controller,
+/// resolve its `character` link to a Model + idle clip and queue
+/// an `InstanceMeta` so the same render path placed model instances
+/// follow renders the character at the spawn. `(mesh_id, clip_local)`
+/// is the cache key -- different player idle clips and different
+/// placed-instance clips each resolve to their own animation entry.
 ///
 /// Resolution rule mirrors the cooker:
 /// 1. Explicit `character` assignment wins.
@@ -1077,14 +1265,11 @@ fn walk_player_spawn_preview(
         if instances_meta.len() >= MAX_PREVIEW_MODEL_INSTANCES {
             break;
         }
-        let NodeKind::SpawnPoint {
-            player: true,
-            character,
-        } = &node.kind
-        else {
+        let Some(reference) = preview_player_reference(scene, node) else {
             continue;
         };
-        let Some(character_id) = resolve_player_spawn_character(project, *character) else {
+        let Some(character_id) = resolve_player_spawn_character(project, reference.character)
+        else {
             continue;
         };
         let Some(character_resource) = project.resource(character_id) else {
@@ -1132,10 +1317,15 @@ fn walk_player_spawn_preview(
             origin,
             instance_rotation,
             atlas: atlas_slot,
-            // Spawn node is selected, not the model -- but the
-            // preview gizmo still helps designers see *which*
-            // spawn they have selected.
-            is_selected: node.id == selected,
+            // Host/controller node is selected, not the model --
+            // but the preview gizmo still helps designers see
+            // which spawn/controller they have selected.
+            is_selected: preview_reference_selected(
+                selected,
+                node.id,
+                reference.controller_node,
+                None,
+            ),
             yaw_q12,
             world_height: model.world_height as i32,
         });
@@ -1415,12 +1605,11 @@ fn projected_from_engine(projected: psx_engine::ProjectedVertex) -> psx_gte::sce
     }
 }
 
-/// Draw a horizontal radius ring at floor level for every
-/// `NodeKind::Light` in the scene. Selected lights get a
-/// thicker, brighter ring; unselected lights get a thin one
-/// in the light's own colour. Marker squares + selection
-/// gizmos are still drawn by `walk_entities` (the ring is
-/// additive).
+/// Draw a horizontal radius ring at floor level for every legacy
+/// Light and component PointLight in the scene. Selected lights get
+/// a thicker, brighter ring; unselected lights get a thin one in
+/// the light's own colour. Marker squares + selection gizmos are
+/// still drawn by `walk_entities` (the ring is additive).
 fn walk_light_gizmos(
     project: &ProjectDocument,
     grid: &WorldGrid,
@@ -1428,26 +1617,22 @@ fn walk_light_gizmos(
     scratch: &mut PreviewScratch,
 ) {
     let scene = project.active_scene();
-    for node in scene.nodes() {
-        let NodeKind::Light {
-            color,
-            intensity: _,
-            radius,
-        } = &node.kind
-        else {
+    for light in preview_lights(scene) {
+        if light.radius <= 0.0 {
             continue;
-        };
-        let center = node_room_local_origin(grid, &node.transform);
+        }
+        let center = node_room_local_origin(grid, &light.transform);
         let center_world = [center.x, center.y, center.z];
         // Light radius is authored in *sector units*; scale to
         // engine units so the ring matches the light's actual
         // attenuation footprint.
-        let radius_engine = spatial::light_radius_engine_units(grid, *radius);
+        let radius_engine = spatial::light_radius_engine_units(grid, light.radius);
         if radius_engine <= 0 {
             continue;
         }
 
-        let is_selected = node.id == selected;
+        let is_selected =
+            preview_reference_selected(selected, light.host_id, light.component_id, None);
         let style = if is_selected {
             FaceOutlineStyle {
                 rgb: (0xFF, 0xE0, 0x80),
@@ -1457,7 +1642,11 @@ fn walk_light_gizmos(
             // Tint the unlit ring toward the authored colour
             // so multiple lights in a room read at a glance.
             FaceOutlineStyle {
-                rgb: (color[0].max(0x40), color[1].max(0x40), color[2].max(0x40)),
+                rgb: (
+                    light.color[0].max(0x40),
+                    light.color[1].max(0x40),
+                    light.color[2].max(0x40),
+                ),
                 thickness_px: 1,
             }
         };
@@ -1667,11 +1856,24 @@ fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
         NodeKind::SpawnPoint { player: true, .. } => Some((0x60, 0xE0, 0x80)),
         NodeKind::SpawnPoint { player: false, .. } => Some((0x60, 0xB8, 0xF0)),
         NodeKind::MeshInstance { .. } => Some((0xC0, 0xC8, 0xD0)),
+        NodeKind::Entity => Some((0xA0, 0xB0, 0xC0)),
+        NodeKind::Actor => Some((0x60, 0xE0, 0x80)),
         NodeKind::Light { color, .. } => Some((color[0], color[1], color[2])),
         NodeKind::Trigger { .. } => Some((0xC8, 0x80, 0xE0)),
         NodeKind::Portal { .. } => Some((0xFF, 0xB0, 0x60)),
         NodeKind::AudioSource { .. } => Some((0x70, 0xD8, 0xC0)),
-        NodeKind::Room { .. } | NodeKind::World | NodeKind::Node | NodeKind::Node3D => None,
+        NodeKind::ModelRenderer { .. }
+        | NodeKind::Animator { .. }
+        | NodeKind::Collider { .. }
+        | NodeKind::Interactable { .. }
+        | NodeKind::CharacterController { .. }
+        | NodeKind::AiController { .. }
+        | NodeKind::Combat { .. }
+        | NodeKind::PointLight { .. }
+        | NodeKind::Room { .. }
+        | NodeKind::World
+        | NodeKind::Node
+        | NodeKind::Node3D => None,
     }
 }
 
@@ -2403,11 +2605,13 @@ fn push_tri(scratch: &mut PreviewScratch, p: [psx_gte::scene::Projected; 3], rgb
 mod tests {
     use super::{
         face_side_visible, floor_anchored_model_origin, light_face, node_room_local_origin,
-        FaceShade,
+        preview_lights, preview_model_reference, preview_player_reference, FaceShade,
     };
     use psx_engine::{PointLightSample, WorldVertex};
     use psx_gte::scene::Projected;
-    use psxed_project::{MaterialFaceSidedness, WorldGrid};
+    use psxed_project::{
+        MaterialFaceSidedness, NodeKind, ProjectDocument, ResourceData, WorldGrid,
+    };
 
     fn flat(r: u8, g: u8, b: u8) -> FaceShade {
         FaceShade::Flat {
@@ -2425,6 +2629,98 @@ mod tests {
 
     fn projected(sx: i16, sy: i16) -> Projected {
         Projected { sx, sy, sz: 100 }
+    }
+
+    #[test]
+    fn component_model_reference_reads_renderer_and_animator_children() {
+        let mut project = ProjectDocument::new("test");
+        let model_id = project.add_resource(
+            "Dummy",
+            ResourceData::Texture {
+                psxt_path: "dummy.psxt".to_string(),
+            },
+        );
+        let scene = project.active_scene_mut();
+        let actor = scene.add_node(scene.root, "Enemy", NodeKind::Actor);
+        let renderer = scene.add_node(
+            actor,
+            "Model Renderer",
+            NodeKind::ModelRenderer {
+                model: Some(model_id),
+                material: None,
+            },
+        );
+        let animator = scene.add_node(
+            actor,
+            "Animator",
+            NodeKind::Animator {
+                clip: Some(3),
+                autoplay: true,
+            },
+        );
+
+        let scene = project.active_scene();
+        let reference = preview_model_reference(scene, scene.node(actor).unwrap()).unwrap();
+
+        assert_eq!(reference.model_id, model_id);
+        assert_eq!(reference.clip_override, Some(3));
+        assert_eq!(reference.renderer_node, Some(renderer));
+        assert_eq!(reference.animator_node, Some(animator));
+    }
+
+    #[test]
+    fn component_player_reference_reads_controller_child() {
+        let mut project = ProjectDocument::new("test");
+        let character_id = project.add_resource(
+            "Dummy",
+            ResourceData::Texture {
+                psxt_path: "dummy.psxt".to_string(),
+            },
+        );
+        let scene = project.active_scene_mut();
+        let actor = scene.add_node(scene.root, "Player", NodeKind::Actor);
+        let controller = scene.add_node(
+            actor,
+            "Character Controller",
+            NodeKind::CharacterController {
+                character: Some(character_id),
+                player: true,
+            },
+        );
+
+        let scene = project.active_scene();
+        let reference = preview_player_reference(scene, scene.node(actor).unwrap()).unwrap();
+
+        assert_eq!(reference.character, Some(character_id));
+        assert_eq!(reference.controller_node, Some(controller));
+    }
+
+    #[test]
+    fn component_point_light_uses_host_transform() {
+        let mut project = ProjectDocument::new("test");
+        let scene = project.active_scene_mut();
+        let host = scene.add_node(scene.root, "Lamp", NodeKind::Entity);
+        scene.node_mut(host).unwrap().transform.translation = [2.0, 0.5, 3.0];
+        let light = scene.add_node(
+            host,
+            "Point Light",
+            NodeKind::PointLight {
+                color: [1, 2, 3],
+                intensity: 0.75,
+                radius: 4.0,
+            },
+        );
+        scene.node_mut(light).unwrap().transform.translation = [99.0, 99.0, 99.0];
+
+        let lights = preview_lights(project.active_scene());
+
+        assert_eq!(lights.len(), 1);
+        assert_eq!(lights[0].host_id, host);
+        assert_eq!(lights[0].component_id, Some(light));
+        assert_eq!(lights[0].transform.translation, [2.0, 0.5, 3.0]);
+        assert_eq!(lights[0].color, [1, 2, 3]);
+        assert_eq!(lights[0].intensity, 0.75);
+        assert_eq!(lights[0].radius, 4.0);
     }
 
     #[test]
