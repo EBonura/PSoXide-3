@@ -15,6 +15,7 @@ pub mod model_import;
 pub mod playtest;
 pub mod resolve;
 pub mod spatial;
+pub mod streaming;
 pub mod world_cook;
 
 /// Embedded copy of the default project's RON, baked at compile
@@ -766,6 +767,13 @@ impl WorldGridBudget {
     }
 }
 
+const ASSET_HEADER_BYTES: usize = 12;
+const WORLD_HEADER_BYTES: usize = 20;
+const V1_SECTOR_BYTES: usize = 44;
+const V1_WALL_BYTES: usize = 24;
+const FUTURE_COMPACT_SECTOR_BYTES: usize = 28;
+const FUTURE_COMPACT_WALL_BYTES: usize = 12;
+
 const fn default_ambient_color() -> [u8; 3] {
     [32, 32, 32]
 }
@@ -910,26 +918,53 @@ impl WorldGrid {
     /// budgets so authors notice when they're approaching PSX
     /// limits before cook time.
     pub fn budget(&self) -> WorldGridBudget {
+        self.budget_for_rect(0, 0, self.width, self.depth)
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of one rectangular grid area. The rectangle is in
+    /// array-sector coordinates, not world-origin-adjusted cells.
+    /// Returns `None` for empty or out-of-bounds rectangles.
+    pub fn budget_for_rect(
+        &self,
+        x: u16,
+        z: u16,
+        width: u16,
+        depth: u16,
+    ) -> Option<WorldGridBudget> {
+        if width == 0 || depth == 0 {
+            return None;
+        }
+        let x1 = x.checked_add(width)?;
+        let z1 = z.checked_add(depth)?;
+        if x1 > self.width || z1 > self.depth {
+            return None;
+        }
         let mut b = WorldGridBudget {
-            width: self.width,
-            depth: self.depth,
-            total_cells: (self.width as usize) * (self.depth as usize),
+            width,
+            depth,
+            total_cells: (width as usize) * (depth as usize),
             ..Default::default()
         };
-        for sector in self.sectors.iter().flatten() {
-            b.populated_cells += 1;
-            if sector.floor.is_some() {
-                b.floors += 1;
-                b.triangles += 2;
-            }
-            if sector.ceiling.is_some() {
-                b.ceilings += 1;
-                b.triangles += 2;
-            }
-            for direction in GridDirection::ALL {
-                let count = sector.walls.get(direction).len();
-                b.walls += count;
-                b.triangles += count * 2;
+        for sx in x..x1 {
+            for sz in z..z1 {
+                let Some(sector) = self.sector(sx, sz) else {
+                    continue;
+                };
+                b.populated_cells += 1;
+                if sector.floor.is_some() {
+                    b.floors += 1;
+                    b.triangles += 2;
+                }
+                if sector.ceiling.is_some() {
+                    b.ceilings += 1;
+                    b.triangles += 2;
+                }
+                for direction in GridDirection::ALL {
+                    let count = sector.walls.get(direction).len();
+                    b.walls += count;
+                    b.triangles += count * 2;
+                }
             }
         }
         // v1 wire layout (matches `psxed_format::world` records):
@@ -938,16 +973,10 @@ impl WorldGrid {
         // so the byte count uses `total_cells`. Using
         // `populated_cells` here was the original bug: it under-
         // reported the wire size by ~44 B per empty cell.
-        const ASSET_HEADER_BYTES: usize = 12;
-        const WORLD_HEADER_BYTES: usize = 20;
-        const V1_SECTOR_BYTES: usize = 44;
-        const V1_WALL_BYTES: usize = 24;
         // Target compact-format sizes for the planning estimate.
         // See `docs/world-format-roadmap.md`. Plain numeric
         // constants rather than struct sizes so this block doesn't
         // pretend a v2 format exists in code.
-        const FUTURE_COMPACT_SECTOR_BYTES: usize = 28;
-        const FUTURE_COMPACT_WALL_BYTES: usize = 12;
         b.psxw_v1_bytes = ASSET_HEADER_BYTES
             + WORLD_HEADER_BYTES
             + b.total_cells * V1_SECTOR_BYTES
@@ -956,7 +985,7 @@ impl WorldGrid {
             + WORLD_HEADER_BYTES
             + b.total_cells * FUTURE_COMPACT_SECTOR_BYTES
             + b.walls * FUTURE_COMPACT_WALL_BYTES;
-        b
+        Some(b)
     }
 
     /// World-space X coordinate of the left edge of column `sx`

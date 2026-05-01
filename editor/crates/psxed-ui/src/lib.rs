@@ -16,11 +16,14 @@ pub use play_mode::{
 use crate::history::UndoStack;
 use crate::style::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use egui::{
     Align2, Color32, ColorImage, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
+};
+use psxed_project::streaming::{
+    collect_scene_resource_use, plan_generated_chunks, SceneResourceUse, StreamingChunkConfig,
 };
 use psxed_project::{
     snap_height, ColliderShape, GridCellBounds, GridDirection, GridHorizontalFace, GridSplit,
@@ -4208,13 +4211,14 @@ impl EditorWorkspace {
                 // Phase 3: per-sector inspector. Owns its own borrow of the
                 // project so it can edit the active Room's grid.
                 if let Some(room_id) = active_room {
-                    // Room budget panel -- same data the cooker
-                    // uses, surfaced here so authors notice when
-                    // they're approaching the PSX cap before cook
-                    // time refuses the room.
-                    let budget = self.room_grid_view(room_id).map(|grid| grid.budget());
-                    if let Some(budget) = budget {
-                        draw_room_budget(ui, budget);
+                    if let Some(grid) = self.room_grid_view(room_id) {
+                        draw_streaming_budget(
+                            ui,
+                            &self.project,
+                            self.project_root(),
+                            room_id,
+                            grid,
+                        );
                     }
                     if let Some((sx, sz)) = selected_sector {
                         if draw_sector_inspector(
@@ -4245,13 +4249,6 @@ impl EditorWorkspace {
                     }
                     return;
                 };
-
-                if matches!(node.kind, NodeKind::Room { .. }) {
-                    if let NodeKind::Room { grid } = &node.kind {
-                        let budget = grid.budget();
-                        draw_room_budget(ui, budget);
-                    }
-                }
 
                 egui::CollapsingHeader::new(icons::label(icons::BOX, "Render"))
                     .default_open(false)
@@ -8114,6 +8111,10 @@ fn drag_i32(ui: &mut egui::Ui, label: &str, value: &mut i32, min: i32, max: i32)
 }
 
 fn human_bytes(n: u32) -> String {
+    human_bytes_u64(n as u64)
+}
+
+fn human_bytes_u64(n: u64) -> String {
     if n < 1024 {
         format!("{} B", n)
     } else if n < 1024 * 1024 {
@@ -11197,71 +11198,288 @@ fn collect_character_options(project: &ProjectDocument) -> Vec<(ResourceId, Stri
         .collect()
 }
 
+fn draw_streaming_budget(
+    ui: &mut egui::Ui,
+    project: &ProjectDocument,
+    project_root: &Path,
+    room_id: NodeId,
+    grid: &WorldGrid,
+) {
+    let config = StreamingChunkConfig::default();
+    let plan = plan_generated_chunks(grid, config);
+    let resource_use = collect_scene_resource_use(project);
+    let file_budget = resource_file_budget(project, project_root, &resource_use);
+    let over = plan.over_budget_count() > 0;
+    let header = if over {
+        icons::label(icons::TRASH, "Streaming Budget — over limit")
+    } else {
+        icons::label(icons::SCAN, "Streaming Budget")
+    };
+
+    egui::CollapsingHeader::new(header)
+        .default_open(true)
+        .show(ui, |ui| {
+            draw_budget_row(
+                ui,
+                "Generated chunks",
+                format!("{}", plan.chunk_count()),
+                over,
+            );
+            draw_budget_row(
+                ui,
+                "Target chunk",
+                format!("{}×{} sectors", config.target_width, config.target_depth),
+                false,
+            );
+            if let Some(chunk) = plan.largest_psxw_chunk() {
+                draw_budget_row(
+                    ui,
+                    "Largest chunk",
+                    format!(
+                        "#{} {}×{}, {}",
+                        chunk.index,
+                        chunk.size[0],
+                        chunk.size[1],
+                        human_bytes(chunk.budget.psxw_v1_bytes as u32)
+                    ),
+                    chunk.over_budget,
+                );
+            }
+            if let Some(chunk) = plan.largest_triangle_chunk() {
+                draw_budget_row(
+                    ui,
+                    "Most triangles",
+                    format!(
+                        "#{} {} / {}",
+                        chunk.index, chunk.budget.triangles, MAX_ROOM_TRIANGLES
+                    ),
+                    chunk.budget.triangles > MAX_ROOM_TRIANGLES,
+                );
+            }
+
+            ui.add_space(4.0);
+            draw_room_budget_rows(ui, grid.budget());
+
+            ui.add_space(4.0);
+            ui.separator();
+            draw_budget_row(
+                ui,
+                "Scene resources",
+                resource_count_summary(&resource_use),
+                false,
+            );
+            draw_budget_row(
+                ui,
+                "Scene components",
+                component_count_summary(&resource_use),
+                false,
+            );
+            draw_budget_row(
+                ui,
+                "Referenced files",
+                format!(
+                    "{} across {} files",
+                    human_bytes_u64(file_budget.bytes),
+                    file_budget.files
+                ),
+                false,
+            );
+            if file_budget.missing > 0 {
+                draw_budget_row(
+                    ui,
+                    "Missing files",
+                    format!("{}", file_budget.missing),
+                    true,
+                );
+            }
+
+            ui.add_space(4.0);
+            egui::Grid::new(format!("streaming_chunks_{}", room_id.raw()))
+                .num_columns(5)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label(RichText::new("#").color(STUDIO_TEXT_WEAK));
+                    ui.label(RichText::new("Origin").color(STUDIO_TEXT_WEAK));
+                    ui.label(RichText::new("Size").color(STUDIO_TEXT_WEAK));
+                    ui.label(RichText::new("Tris").color(STUDIO_TEXT_WEAK));
+                    ui.label(RichText::new(".psxw").color(STUDIO_TEXT_WEAK));
+                    ui.end_row();
+
+                    for chunk in plan.chunks.iter().take(8) {
+                        let color = chunk
+                            .over_budget
+                            .then_some(Color32::from_rgb(0xE0, 0x60, 0x60));
+                        let text = |value: String| {
+                            let text = RichText::new(value).monospace();
+                            if let Some(color) = color {
+                                text.color(color)
+                            } else {
+                                text
+                            }
+                        };
+                        ui.label(text(format!("{}", chunk.index)));
+                        ui.label(text(format!(
+                            "{},{}",
+                            chunk.world_origin[0], chunk.world_origin[1]
+                        )));
+                        ui.label(text(format!("{}×{}", chunk.size[0], chunk.size[1])));
+                        ui.label(text(format!("{}", chunk.budget.triangles)));
+                        ui.label(text(human_bytes(chunk.budget.psxw_v1_bytes as u32)));
+                        ui.end_row();
+                    }
+                });
+            if plan.chunks.len() > 8 {
+                ui.weak(format!("{} more chunks", plan.chunks.len() - 8));
+            }
+        });
+}
+
+#[derive(Default)]
+struct ResourceFileBudget {
+    files: usize,
+    bytes: u64,
+    missing: usize,
+}
+
+fn resource_file_budget(
+    project: &ProjectDocument,
+    project_root: &Path,
+    resource_use: &SceneResourceUse,
+) -> ResourceFileBudget {
+    let mut budget = ResourceFileBudget::default();
+    let mut seen = HashSet::new();
+    for id in resource_use
+        .textures
+        .iter()
+        .chain(resource_use.models.iter())
+        .chain(resource_use.meshes.iter())
+        .chain(resource_use.audio.iter())
+    {
+        let Some(resource) = project.resource(*id) else {
+            continue;
+        };
+        match &resource.data {
+            ResourceData::Texture { psxt_path } => {
+                add_resource_file(project_root, psxt_path, &mut budget, &mut seen);
+            }
+            ResourceData::Model(model) => {
+                add_resource_file(project_root, &model.model_path, &mut budget, &mut seen);
+                if let Some(texture_path) = &model.texture_path {
+                    add_resource_file(project_root, texture_path, &mut budget, &mut seen);
+                }
+                for clip in &model.clips {
+                    add_resource_file(project_root, &clip.psxanim_path, &mut budget, &mut seen);
+                }
+            }
+            ResourceData::Mesh { source_path }
+            | ResourceData::Scene { source_path }
+            | ResourceData::Script { source_path }
+            | ResourceData::Audio { source_path } => {
+                add_resource_file(project_root, source_path, &mut budget, &mut seen);
+            }
+            ResourceData::Material(_) | ResourceData::Character(_) => {}
+        }
+    }
+    budget
+}
+
+fn add_resource_file(
+    project_root: &Path,
+    stored: &str,
+    budget: &mut ResourceFileBudget,
+    seen: &mut HashSet<PathBuf>,
+) {
+    if stored.trim().is_empty() {
+        return;
+    }
+    let abs = psxed_project::model_import::resolve_path(stored, Some(project_root));
+    if !seen.insert(abs.clone()) {
+        return;
+    }
+    match std::fs::metadata(&abs) {
+        Ok(metadata) if metadata.is_file() => {
+            budget.files += 1;
+            budget.bytes = budget.bytes.saturating_add(metadata.len());
+        }
+        _ => budget.missing += 1,
+    }
+}
+
+fn resource_count_summary(resource_use: &SceneResourceUse) -> String {
+    format!(
+        "{} model, {} character, {} material, {} texture, {} audio",
+        resource_use.models.len(),
+        resource_use.characters.len(),
+        resource_use.materials.len(),
+        resource_use.textures.len(),
+        resource_use.audio.len()
+    )
+}
+
+fn component_count_summary(resource_use: &SceneResourceUse) -> String {
+    format!(
+        "{} renderer, {} controller, {} collider, {} light, {} interactable",
+        resource_use.model_instances,
+        resource_use.character_controllers,
+        resource_use.colliders,
+        resource_use.lights,
+        resource_use.interactables
+    )
+}
+
+fn draw_budget_row(ui: &mut egui::Ui, key: &str, val: String, hot: bool) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(key).color(STUDIO_TEXT_WEAK));
+        let txt = RichText::new(val).monospace();
+        ui.label(if hot {
+            txt.color(Color32::from_rgb(0xE0, 0x60, 0x60))
+        } else {
+            txt
+        });
+    });
+}
+
+fn draw_room_budget_rows(ui: &mut egui::Ui, budget: WorldGridBudget) {
+    draw_budget_row(
+        ui,
+        "Cells",
+        format!(
+            "{} populated / {} total",
+            budget.populated_cells, budget.total_cells
+        ),
+        budget.total_cells > (MAX_ROOM_WIDTH as usize) * (MAX_ROOM_DEPTH as usize),
+    );
+    draw_budget_row(ui, "Floors", format!("{}", budget.floors), false);
+    draw_budget_row(ui, "Ceilings", format!("{}", budget.ceilings), false);
+    draw_budget_row(ui, "Walls", format!("{}", budget.walls), false);
+    draw_budget_row(
+        ui,
+        "Triangles",
+        format!("{} / {}", budget.triangles, MAX_ROOM_TRIANGLES),
+        budget.triangles > MAX_ROOM_TRIANGLES,
+    );
+    draw_budget_row(
+        ui,
+        ".psxw v1",
+        format!(
+            "{} / {}",
+            human_bytes(budget.psxw_v1_bytes as u32),
+            human_bytes(MAX_ROOM_BYTES as u32)
+        ),
+        budget.psxw_v1_bytes > MAX_ROOM_BYTES,
+    );
+    draw_budget_row(
+        ui,
+        ".psxw v2 est.",
+        human_bytes(budget.future_compact_estimated_bytes as u32).to_string(),
+        budget.future_compact_estimated_bytes > MAX_ROOM_BYTES,
+    );
+}
+
 /// Per-cell inspector for one sector inside the active Room.
 ///
 /// Renders a CollapsingHeader with floor/ceiling toggles, a single
 /// flat height per face (corner authoring lands later), a material
-/// Render the room-budget summary block. Counts on the left,
-/// hard caps on the right; rows tinted red once they cross.
-/// Surfaces both `.psxw` v1 and v2-estimate sizes so authors
-/// can see what the format change is buying.
-fn draw_room_budget(ui: &mut egui::Ui, budget: WorldGridBudget) {
-    let over = budget.over_budget();
-    let header = if over {
-        icons::label(icons::TRASH, "Budget — over limit")
-    } else {
-        icons::label(icons::SCAN, "Budget")
-    };
-    egui::CollapsingHeader::new(header)
-        .default_open(over)
-        .show(ui, |ui| {
-            let row = |ui: &mut egui::Ui, key: &str, val: String, hot: bool| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(key).color(STUDIO_TEXT_WEAK));
-                    let txt = RichText::new(val).monospace();
-                    ui.label(if hot {
-                        txt.color(Color32::from_rgb(0xE0, 0x60, 0x60))
-                    } else {
-                        txt
-                    });
-                });
-            };
-            row(
-                ui,
-                "Cells",
-                format!(
-                    "{} populated / {} total",
-                    budget.populated_cells, budget.total_cells
-                ),
-                budget.total_cells > (MAX_ROOM_WIDTH as usize) * (MAX_ROOM_DEPTH as usize),
-            );
-            row(ui, "Floors", format!("{}", budget.floors), false);
-            row(ui, "Ceilings", format!("{}", budget.ceilings), false);
-            row(ui, "Walls", format!("{}", budget.walls), false);
-            row(
-                ui,
-                "Triangles",
-                format!("{} / {}", budget.triangles, MAX_ROOM_TRIANGLES),
-                budget.triangles > MAX_ROOM_TRIANGLES,
-            );
-            row(
-                ui,
-                ".psxw v1",
-                format!(
-                    "{} / {}",
-                    human_bytes(budget.psxw_v1_bytes as u32),
-                    human_bytes(MAX_ROOM_BYTES as u32)
-                ),
-                budget.psxw_v1_bytes > MAX_ROOM_BYTES,
-            );
-            row(
-                ui,
-                ".psxw v2 est.",
-                human_bytes(budget.future_compact_estimated_bytes as u32).to_string(),
-                budget.future_compact_estimated_bytes > MAX_ROOM_BYTES,
-            );
-        });
-}
 
 /// dropdown for each face, and a row of toggles for the four
 /// cardinal walls. Returns `true` if any field changed so the
