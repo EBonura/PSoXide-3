@@ -18,8 +18,9 @@ extern crate psx_rt;
 use psx_asset::{Animation, Model, Texture};
 use psx_engine::{
     button, Angle, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange,
-    JointViewTransform, Mat3I16, OtFrame, PrimitiveArena, ProjectedVertex, Scene, WorldCamera,
-    WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    JointViewTransform, Mat3I16, OtDepth, OtFrame, PrimitiveArena, ProjectedVertex, Scene,
+    WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
+    WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
@@ -127,7 +128,7 @@ const PROJECTION: WorldProjection =
     WorldProjection::new(SCREEN_CX as i16, SCREEN_CY as i16, PROJ_FOCAL, NEAR_Z);
 
 const OT_DEPTH: usize = 128;
-const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 2);
+const WORLD_BAND: DepthBand = OtDepth::<OT_DEPTH>::band(0, OT_DEPTH - 2);
 
 /// Model texture lives in a dedicated 8bpp page well clear of the
 /// font atlas at x=320. Re-upload happens on every model swap.

@@ -491,11 +491,11 @@ fn collect_preview_lights(
         // intensity scaled by 256 (Q8.8) keeps the per-face
         // accumulator in integer math.
         let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u32;
-        out.push(psx_engine::PointLightSample::from_color_intensity_q8(
+        out.push(psx_engine::PointLightSample::from_rgb_intensity(
             [world.x, world.y, world.z],
             radius_engine,
-            *color,
-            intensity_q8,
+            psx_engine::Rgb8::from_array(*color),
+            psx_engine::Q8::from_raw(intensity_q8),
         ));
     }
     out
@@ -568,12 +568,13 @@ fn light_face(
         FaceShade::Flat { rgb, .. } => rgb,
         FaceShade::Textured { tint, .. } => tint,
     };
-    let (r, g, b) = psx_engine::shade_tint_with_lights(
-        base_color,
+    let (r, g, b) = psx_engine::shade_material_tint_with_lights(
+        psx_engine::MaterialTint::from_tuple(base_color),
         face_center,
-        ambient,
+        psx_engine::Rgb8::from_array(ambient),
         lights.iter().copied(),
-    );
+    )
+    .to_tuple();
     match base {
         FaceShade::Flat { sidedness, .. } => FaceShade::Flat {
             rgb: (r, g, b),

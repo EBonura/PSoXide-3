@@ -18,9 +18,9 @@ extern crate psx_rt;
 
 use psx_asset::{Texture, World as AssetWorld};
 use psx_engine::{
-    button, draw_room, Angle, App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena,
-    RuntimeRoom, Scene, WorldCamera, WorldProjection, WorldRenderMaterial, WorldRenderPass,
-    WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    button, draw_room, Angle, App, Config, Ctx, DepthBand, DepthRange, OtDepth, OtFrame,
+    PrimitiveArena, RuntimeRoom, Scene, WorldCamera, WorldProjection, WorldRenderMaterial,
+    WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
@@ -71,7 +71,7 @@ const CAMERA_START_YAW: Angle = Angle::from_q12(220);
 const CAMERA_YAW_STEP_Q12: i16 = 12;
 
 const OT_DEPTH: usize = 64;
-const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 1);
+const WORLD_BAND: DepthBand = OtDepth::<OT_DEPTH>::whole_band();
 const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, FAR_Z);
 
 // 3×3 floors + 12 perimeter walls = 21 quads = 42 triangles.

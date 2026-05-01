@@ -54,7 +54,7 @@
 extern crate psx_rt;
 
 use psx_asset::Texture;
-use psx_engine::{App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena, Scene};
+use psx_engine::{App, Config, Ctx, DepthBand, DepthRange, OtDepth, OtFrame, PrimitiveArena, Scene};
 use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{QuadGouraud, TriTexturedGouraud};
@@ -77,7 +77,7 @@ const PROJ_H: u16 = 280;
 /// range so 32 slots is more than enough to avoid far-ring
 /// triangles overlapping near-ring ones.
 const OT_DEPTH: usize = 32;
-const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 2);
+const WORLD_BAND: DepthBand = OtDepth::<OT_DEPTH>::band(0, OT_DEPTH - 2);
 const GTE_OTZ_RANGE: DepthRange = DepthRange::new(0, ((OT_DEPTH - 2) as i32) << 10);
 
 // ----------------------------------------------------------------------

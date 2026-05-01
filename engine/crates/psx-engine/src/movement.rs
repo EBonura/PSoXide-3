@@ -7,6 +7,151 @@
 
 use crate::{Angle, Q12};
 
+/// One centred analog input axis.
+///
+/// Values use the conventional PSX/gamepad centred range:
+/// negative is left/up depending on the physical axis, positive is
+/// right/down, and zero is centred. The type deliberately does not
+/// bake in a direction name; call sites decide whether an axis is
+/// strafe, forward, yaw, height, and so on.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputAxis {
+    raw: i16,
+}
+
+impl InputAxis {
+    /// Centred input.
+    pub const ZERO: Self = Self { raw: 0 };
+
+    /// Build from a centred raw axis value.
+    pub const fn new(raw: i16) -> Self {
+        Self { raw }
+    }
+
+    /// Raw centred value.
+    pub const fn raw(self) -> i16 {
+        self.raw
+    }
+
+    /// Same physical axis with inverted sign.
+    pub const fn inverted(self) -> Self {
+        Self {
+            raw: self.raw.wrapping_neg(),
+        }
+    }
+
+    /// Clamp symmetrically to `[-max, max]`.
+    pub fn clamped(self, max: i16) -> Self {
+        let max = max.max(0);
+        Self {
+            raw: self.raw.clamp(-max, max),
+        }
+    }
+
+    /// Absolute magnitude, saturating `i16::MIN` to `i16::MAX`.
+    pub const fn magnitude(self) -> i16 {
+        if self.raw == i16::MIN {
+            i16::MAX
+        } else if self.raw < 0 {
+            -self.raw
+        } else {
+            self.raw
+        }
+    }
+
+    /// Convert this axis into a signed per-frame step after deadzone.
+    pub fn scaled_step(self, profile: InputAxisProfile, max_step: i16) -> i16 {
+        let magnitude = self.magnitude().min(profile.axis_max());
+        let deadzone = profile.deadzone();
+        if magnitude <= deadzone {
+            return 0;
+        }
+        let sign = if self.raw < 0 { -1 } else { 1 };
+        let effective = magnitude.saturating_sub(deadzone) as i32;
+        let range = (profile.axis_max() - deadzone) as i32;
+        (sign * effective * max_step as i32 / range) as i16
+    }
+}
+
+/// Two centred analog input axes.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputVector {
+    /// Horizontal/local-X axis.
+    pub x: InputAxis,
+    /// Vertical/local-Y axis.
+    pub y: InputAxis,
+}
+
+impl InputVector {
+    /// Both axes centred.
+    pub const ZERO: Self = Self {
+        x: InputAxis::ZERO,
+        y: InputAxis::ZERO,
+    };
+
+    /// Build from typed axes.
+    pub const fn new(x: InputAxis, y: InputAxis) -> Self {
+        Self { x, y }
+    }
+
+    /// Build from raw centred axis values.
+    pub const fn from_centered(x: i16, y: i16) -> Self {
+        Self::new(InputAxis::new(x), InputAxis::new(y))
+    }
+
+    /// Return raw centred axis values.
+    pub const fn raw(self) -> (i16, i16) {
+        (self.x.raw(), self.y.raw())
+    }
+
+    /// Clamp both axes symmetrically to `[-max, max]`.
+    pub fn clamped(self, max: i16) -> Self {
+        Self::new(self.x.clamped(max), self.y.clamped(max))
+    }
+
+    /// Squared 2D magnitude in raw axis units.
+    pub fn magnitude_squared(self) -> i32 {
+        square_i16(self.x.raw()).saturating_add(square_i16(self.y.raw()))
+    }
+}
+
+/// Deadzone and maximum magnitude for a centred input axis/vector.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InputAxisProfile {
+    deadzone: i16,
+    axis_max: i16,
+}
+
+impl InputAxisProfile {
+    /// Build a profile. Negative deadzones are clamped to zero; a
+    /// max not larger than the deadzone is raised to `deadzone + 1`
+    /// so normalization never divides by zero.
+    pub const fn new(deadzone: i16, axis_max: i16) -> Self {
+        let deadzone = if deadzone < 0 { 0 } else { deadzone };
+        let min_axis_max = if deadzone == i16::MAX {
+            i16::MAX
+        } else {
+            deadzone + 1
+        };
+        let axis_max = if axis_max < min_axis_max {
+            min_axis_max
+        } else {
+            axis_max
+        };
+        Self { deadzone, axis_max }
+    }
+
+    /// Deadzone threshold.
+    pub const fn deadzone(self) -> i16 {
+        self.deadzone
+    }
+
+    /// Maximum useful centred axis magnitude.
+    pub const fn axis_max(self) -> i16 {
+        self.axis_max
+    }
+}
+
 /// World-space movement intent produced from camera-relative input.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CameraRelativeMove {
@@ -34,8 +179,23 @@ pub fn camera_relative_move(
     deadzone: i16,
     axis_max: i16,
 ) -> CameraRelativeMove {
-    let deadzone = deadzone.max(0);
-    let axis_max = axis_max.max(deadzone.saturating_add(1));
+    camera_relative_move_axes(
+        InputVector::from_centered(strafe, forward),
+        camera_yaw,
+        InputAxisProfile::new(deadzone, axis_max),
+    )
+}
+
+/// Convert typed local stick axes into a world-space camera-relative
+/// movement vector.
+pub fn camera_relative_move_axes(
+    axes: InputVector,
+    camera_yaw: Angle,
+    profile: InputAxisProfile,
+) -> CameraRelativeMove {
+    let (strafe, forward) = axes.raw();
+    let deadzone = profile.deadzone();
+    let axis_max = profile.axis_max();
     let mag = isqrt_i32(square_i16(strafe).saturating_add(square_i16(forward)));
     if mag <= deadzone as i32 {
         return CameraRelativeMove::default();
@@ -181,5 +341,12 @@ mod tests {
             camera_relative_move(4, -4, Angle::HALF, DEADZONE, AXIS_MAX),
             CameraRelativeMove::default()
         );
+    }
+
+    #[test]
+    fn input_axis_scaled_step_clamps_to_profile_max() {
+        let profile = InputAxisProfile::new(8, 64);
+        assert_eq!(InputAxis::new(32767).scaled_step(profile, 12), 12);
+        assert_eq!(InputAxis::new(-32768).scaled_step(profile, 12), -12);
     }
 }

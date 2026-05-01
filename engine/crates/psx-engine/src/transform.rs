@@ -20,11 +20,17 @@
 //! because the SDK's `Mat3I16::mul` is the only composition op and
 //! taking "scale × rotation" through that would saturate.
 //!
-//! This module introduces two engine-level types that shift those
+//! This module introduces engine-level types that shift those
 //! concerns back into the type system:
 //!
-//! - [`Vec3World`] -- a position in **world space**, Q19.12. Cannot be
-//!   mixed up with a mesh-local `Vec3I16` or a GTE colour register.
+//! - [`RoomPoint`] -- a point in cooked-room coordinates, used by
+//!   gameplay/collision/lights after editor-to-runtime conversion.
+//! - [`WorldVertex`] -- a raw CPU-renderer vertex in whatever unit
+//!   scale the active [`WorldProjection`][crate::WorldProjection]
+//!   expects.
+//! - [`Vec3World`] -- a position in **GTE world translation space**,
+//!   Q19.12. Cannot be mixed up with a mesh-local `Vec3I16` or a GTE
+//!   colour register.
 //! - [`ActorTransform`] -- a pose for one "actor" (game object) -- its
 //!   world-space position, rotation, and uniform scale. A single
 //!   [`ActorTransform::load_gte`] call composes them into the
@@ -59,6 +65,105 @@ use crate::Q12;
 
 use psx_gte::math::{Mat3I16, Vec3I32};
 use psx_gte::scene;
+
+/// Runtime room-local point used by gameplay/camera systems.
+///
+/// A `RoomPoint` is intentionally distinct from [`WorldVertex`].
+/// `WorldVertex` is the renderer's raw submission space: any caller
+/// may choose its scale and origin as long as vertices, camera, and
+/// projection agree. `RoomPoint` means cooked-room coordinates after
+/// editor-to-runtime conversion, the same space used by room
+/// collision, point lights, characters, and embedded playtest
+/// entities.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoomPoint {
+    /// Room-local X.
+    pub x: i32,
+    /// Room-local Y.
+    pub y: i32,
+    /// Room-local Z.
+    pub z: i32,
+}
+
+impl RoomPoint {
+    /// Room origin.
+    pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
+
+    /// Build a room-local point.
+    pub const fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Return the point as raw `[x, y, z]` channels.
+    pub const fn to_array(self) -> [i32; 3] {
+        [self.x, self.y, self.z]
+    }
+
+    /// Build a room-local point from raw `[x, y, z]` channels.
+    pub const fn from_array(channels: [i32; 3]) -> Self {
+        Self::new(channels[0], channels[1], channels[2])
+    }
+
+    /// Convert to the renderer's raw world vertex at the boundary
+    /// where room-space geometry is submitted.
+    pub const fn to_world_vertex(self) -> WorldVertex {
+        WorldVertex::new(self.x, self.y, self.z)
+    }
+
+    /// Build from a raw renderer vertex at a call site that has
+    /// already established the vertex is room-local.
+    pub const fn from_world_vertex(vertex: WorldVertex) -> Self {
+        Self::new(vertex.x, vertex.y, vertex.z)
+    }
+
+    /// Return this point with a different Y coordinate.
+    pub const fn with_y(self, y: i32) -> Self {
+        Self::new(self.x, y, self.z)
+    }
+}
+
+impl From<RoomPoint> for WorldVertex {
+    fn from(point: RoomPoint) -> Self {
+        point.to_world_vertex()
+    }
+}
+
+/// CPU-side world-space vertex used by [`WorldCamera`][crate::WorldCamera].
+///
+/// This is intentionally raw integer space rather than [`Vec3World`]'s
+/// Q19.12 GTE translation space. CPU-projected editor/debug/material
+/// surfaces often use compact authored coordinates and a matching focal
+/// length; callers choose that scale as long as every vertex, camera
+/// position, and [`WorldProjection`][crate::WorldProjection] uses the
+/// same unit.
+///
+/// Gameplay code that is specifically operating inside a cooked room
+/// should prefer [`RoomPoint`] and convert here only at render
+/// submission boundaries.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorldVertex {
+    /// World-space X.
+    pub x: i32,
+    /// World-space Y.
+    pub y: i32,
+    /// World-space Z.
+    pub z: i32,
+}
+
+impl WorldVertex {
+    /// Origin.
+    pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
+
+    /// Build a world-space vertex.
+    pub const fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Return the vertex as raw `[x, y, z]` channels.
+    pub const fn to_array(self) -> [i32; 3] {
+        [self.x, self.y, self.z]
+    }
+}
 
 /// A position in world space. Stored as raw Q19.12 per-axis `i32`
 /// -- the same representation the GTE's translation register (TR,

@@ -34,7 +34,7 @@ extern crate psx_rt;
 use psx_asset::Mesh;
 use psx_engine::{
     ActorTransform, App, Config, Ctx, DepthBand, DepthPolicy, DepthRange, GouraudMeshOptions,
-    GouraudRenderPass, GouraudTriCommand, OtFrame, PrimitiveArena, Scene, Vec3World,
+    GouraudRenderPass, GouraudTriCommand, OtDepth, OtFrame, PrimitiveArena, Scene, Vec3World,
 };
 use psx_font::{fonts::BASIC_8X16, FontAtlas};
 use psx_fx::{LcgRng, ParticlePool, ShakeState};
@@ -60,7 +60,7 @@ const SCREEN_H: i16 = 240;
 const OT_DEPTH: usize = 128;
 const BG_SLOT: usize = OT_DEPTH - 1;
 const STAR_SLOT: usize = OT_DEPTH - 2;
-const WORLD_BAND: DepthBand = DepthBand::new(3, OT_DEPTH - 3);
+const WORLD_BAND: DepthBand = OtDepth::<OT_DEPTH>::band(3, OT_DEPTH - 3);
 const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(0x1800, 0x7800);
 const SPARK_SLOT: usize = 2;
 

@@ -78,18 +78,23 @@ pub use character_motor::{
 pub use fixed::{Q12, Q8};
 pub use frames::{Frames, Ticks};
 pub use lighting::{
-    accumulate_point_lights, modulate_tint, shade_tint_with_lights, PointLightSample, LIGHTING_MAX,
-    LIGHTING_NEUTRAL,
+    accumulate_point_lights, accumulate_point_lights_rgb, modulate_material_tint, modulate_tint,
+    shade_material_tint_with_lights, shade_tint_with_lights, LightingRgb, MaterialTint,
+    PointLightSample, Rgb8, LIGHTING_MAX, LIGHTING_NEUTRAL,
 };
-pub use movement::{camera_relative_move, camera_relative_move_q12, CameraRelativeMove};
-pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
+pub use movement::{
+    camera_relative_move, camera_relative_move_axes, camera_relative_move_q12, CameraRelativeMove,
+    InputAxis, InputAxisProfile, InputVector,
+};
+pub use render::{
+    CameraDepth, DepthBand, DepthRange, DepthSlot, GpuPacket, OtDepth, OtFrame, PrimitiveArena,
+};
 pub use render3d::{
     compute_joint_view_transform, project_model_vertex_with_joint_transforms, CullMode,
     DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand, JointViewTransform,
-    LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex, ProjectedVertex, RoomPoint,
+    LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex, ProjectedVertex,
     TexturedModelRenderStats, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
     WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,
-    WorldVertex,
 };
 // Re-export the GTE math types callers need to construct
 // arguments for `submit_textured_model` (instance rotation,
@@ -101,7 +106,7 @@ pub use third_person_camera::{
     ThirdPersonCameraState, ThirdPersonCameraTarget,
 };
 pub use time::EngineTime;
-pub use transform::{ActorTransform, Vec3World};
+pub use transform::{ActorTransform, RoomPoint, Vec3World, WorldVertex};
 pub use world::{
     GridCoord, GridDirection, GridFloorSample, GridHorizontalFace, GridRoom, GridSector, GridSplit,
     GridVerticalFace, GridWalls, GridWorld, RoomCollision, RoomRender, RuntimeRoom,

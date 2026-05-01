@@ -31,10 +31,10 @@ extern crate psx_rt;
 
 use psx_asset::{Animation, Model, Texture, World as AssetWorld};
 use psx_engine::{
-    button, draw_room_lit, shade_tint_with_lights, Angle, App, CharacterMotorAnim,
-    CharacterMotorConfig, CharacterMotorInput, CharacterMotorState, Config, Ctx, CullMode,
-    DepthBand, DepthPolicy, DepthRange, JointViewTransform, Mat3I16, OtFrame, PointLightSample,
-    PrimitiveArena, ProjectedVertex, RoomPoint, RuntimeRoom, Scene, ThirdPersonCameraConfig,
+    button, draw_room_lit, Angle, App, CharacterMotorAnim, CharacterMotorConfig,
+    CharacterMotorInput, CharacterMotorState, Config, Ctx, CullMode, DepthBand, DepthPolicy,
+    DepthRange, JointViewTransform, Mat3I16, MaterialTint, OtDepth, OtFrame, PointLightSample,
+    PrimitiveArena, ProjectedVertex, Rgb8, RoomPoint, RuntimeRoom, Scene, ThirdPersonCameraConfig,
     ThirdPersonCameraInput, ThirdPersonCameraState, ThirdPersonCameraTarget, WorldCamera,
     WorldProjection, WorldRenderMaterial, WorldRenderPass, WorldSurfaceLighting,
     WorldSurfaceOptions, WorldSurfaceSample, WorldTriCommand, WorldVertex, Q8,
@@ -147,7 +147,7 @@ const FALLBACK_PLAYER_SPEED: i32 = 32;
 const RUN_BUTTON: u16 = button::CIRCLE;
 
 const OT_DEPTH: usize = 512;
-const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 1);
+const WORLD_BAND: DepthBand = OtDepth::<OT_DEPTH>::whole_band();
 const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, FAR_Z);
 
 const MAX_TEXTURED_TRIS: usize = 4096;
@@ -521,9 +521,12 @@ impl Scene for Playtest {
         }
         if self.free_orbit {
             let (right_x, right_y) = ctx.pad.sticks.right_centered();
-            self.orbit_yaw = self.orbit_yaw.add_signed_q12(stick_to_yaw_delta(right_x));
-            self.orbit_radius = (self.orbit_radius + stick_to_radius_delta(right_y))
-                .clamp(CAMERA_RADIUS_MIN, CAMERA_RADIUS_MAX);
+            self.orbit_yaw = self
+                .orbit_yaw
+                .add_signed_q12(stick_to_yaw_delta(psx_engine::InputAxis::new(right_x)));
+            self.orbit_radius = (self.orbit_radius
+                + stick_to_radius_delta(psx_engine::InputAxis::new(right_y)))
+            .clamp(CAMERA_RADIUS_MIN, CAMERA_RADIUS_MAX);
             if ctx.is_held(button::RIGHT) {
                 self.orbit_yaw = self.orbit_yaw.add(CAMERA_YAW_STEP);
             }
@@ -626,7 +629,7 @@ impl Scene for Playtest {
             let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE);
             let lighting = RuntimeRoomLighting {
                 room_index: self.room_index,
-                ambient: room.render().ambient_color(),
+                ambient: Rgb8::from_array(room.render().ambient_color()),
             };
             draw_room_lit(
                 room.render(),
@@ -787,7 +790,7 @@ impl Playtest {
         let (_, right_y) = ctx.pad.sticks.right_centered();
         self.camera_height_offset = self
             .camera_height_offset
-            .saturating_add(stick_to_height_delta(right_y))
+            .saturating_add(stick_to_height_delta(psx_engine::InputAxis::new(right_y)))
             .clamp(CAMERA_HEIGHT_OFFSET_MIN, CAMERA_HEIGHT_OFFSET_MAX);
     }
 
@@ -1048,7 +1051,7 @@ fn build_room_materials(
 #[derive(Copy, Clone)]
 struct RuntimeRoomLighting {
     room_index: RoomIndex,
-    ambient: [u8; 3],
+    ambient: Rgb8,
 }
 
 impl WorldSurfaceLighting for RuntimeRoomLighting {
@@ -1061,19 +1064,20 @@ impl WorldSurfaceLighting for RuntimeRoomLighting {
             .iter()
             .filter(|light| light.room == self.room_index)
             .map(|light| {
-                PointLightSample::from_color_intensity(
+                PointLightSample::from_rgb_intensity(
                     [light.x, light.y, light.z],
                     light.radius as i32,
-                    light.color,
+                    Rgb8::from_array(light.color),
                     Q8::from_raw_u16(light.intensity_q8),
                 )
             });
-        let tint = shade_tint_with_lights(
-            material.texture.tint(),
-            [sample.center.x, sample.center.y, sample.center.z],
+        let tint = psx_engine::shade_material_tint_with_lights(
+            MaterialTint::from_tuple(material.texture.tint()),
+            sample.center.to_array(),
             self.ambient,
             lights,
-        );
+        )
+        .to_tuple();
         material.with_tint(tint)
     }
 }

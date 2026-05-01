@@ -14,9 +14,9 @@ extern crate psx_rt;
 
 use psx_asset::Texture;
 use psx_engine::{
-    button, Angle, App, Config, Ctx, CullMode, DepthBand, DepthRange, OtFrame, PrimitiveArena,
-    Scene, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
-    WorldVertex,
+    button, Angle, App, Config, Ctx, CullMode, DepthBand, DepthRange, OtDepth, OtFrame,
+    PrimitiveArena, Scene, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions,
+    WorldTriCommand, WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{
@@ -76,7 +76,7 @@ const BLEND_COUNT: u8 = 5;
 const ROOM_EDGES: [i32; 4] = [-ROOM_HALF, -100, 100, ROOM_HALF];
 const WALL_Y_EDGES: [i32; 3] = [0, WALL_TOP / 2, WALL_TOP];
 const OT_DEPTH: usize = 64;
-const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 1);
+const WORLD_BAND: DepthBand = OtDepth::<OT_DEPTH>::whole_band();
 const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, CAMERA_RADIUS_MAX + ROOM_HALF + 80);
 const MAX_TEXTURED_TRIS: usize = 192;
 

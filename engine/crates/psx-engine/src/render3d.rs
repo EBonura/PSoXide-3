@@ -12,8 +12,8 @@
 //! frame's opaque mesh triangles share one depth policy and one
 //! deterministic OT insertion order.
 
-use crate::render::{DepthBand, DepthRange, DepthSlot, OtFrame, PrimitiveArena};
-use crate::{Angle, Q12};
+use crate::render::{CameraDepth, DepthBand, DepthRange, DepthSlot, OtFrame, PrimitiveArena};
+use crate::{Angle, WorldVertex, Q12};
 use psx_asset::{Animation, JointPose, Mesh, Model, ModelFaceCorner, ModelVertex};
 use psx_gpu::{
     material::TextureMaterial,
@@ -133,90 +133,6 @@ impl ViewVertex {
     pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
 
     /// Build a camera-space vertex.
-    pub const fn new(x: i32, y: i32, z: i32) -> Self {
-        Self { x, y, z }
-    }
-}
-
-/// Runtime room-local point used by gameplay/camera systems.
-///
-/// A `RoomPoint` is intentionally distinct from [`WorldVertex`].
-/// `WorldVertex` is the renderer's raw submission space: any caller
-/// may choose its scale and origin as long as vertices, camera, and
-/// projection agree. `RoomPoint` means cooked-room coordinates after
-/// editor-to-runtime conversion, the same space used by room
-/// collision, point lights, characters, and embedded playtest
-/// entities.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct RoomPoint {
-    /// Room-local X.
-    pub x: i32,
-    /// Room-local Y.
-    pub y: i32,
-    /// Room-local Z.
-    pub z: i32,
-}
-
-impl RoomPoint {
-    /// Room origin.
-    pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
-
-    /// Build a room-local point.
-    pub const fn new(x: i32, y: i32, z: i32) -> Self {
-        Self { x, y, z }
-    }
-
-    /// Convert to the renderer's raw world vertex at the boundary
-    /// where room-space geometry is submitted.
-    pub const fn to_world_vertex(self) -> WorldVertex {
-        WorldVertex::new(self.x, self.y, self.z)
-    }
-
-    /// Build from a raw renderer vertex at a call site that has
-    /// already established the vertex is room-local.
-    pub const fn from_world_vertex(vertex: WorldVertex) -> Self {
-        Self::new(vertex.x, vertex.y, vertex.z)
-    }
-
-    /// Return this point with a different Y coordinate.
-    pub const fn with_y(self, y: i32) -> Self {
-        Self::new(self.x, y, self.z)
-    }
-}
-
-impl From<RoomPoint> for WorldVertex {
-    fn from(point: RoomPoint) -> Self {
-        point.to_world_vertex()
-    }
-}
-
-/// CPU-side world-space vertex used by [`WorldCamera`].
-///
-/// This is intentionally raw integer space rather than
-/// [`Vec3World`][crate::Vec3World]'s Q19.12 GTE translation space.
-/// CPU-projected editor/debug/material surfaces often use compact
-/// authored coordinates and a matching focal length; callers choose
-/// that scale as long as every vertex, camera position, and
-/// [`WorldProjection`] uses the same unit.
-///
-/// Gameplay code that is specifically operating inside a cooked room
-/// should prefer [`RoomPoint`] and convert here only at render
-/// submission boundaries.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct WorldVertex {
-    /// World-space X.
-    pub x: i32,
-    /// World-space Y.
-    pub y: i32,
-    /// World-space Z.
-    pub z: i32,
-}
-
-impl WorldVertex {
-    /// Origin.
-    pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
-
-    /// Build a world-space vertex.
     pub const fn new(x: i32, y: i32, z: i32) -> Self {
         Self { x, y, z }
     }
@@ -945,19 +861,21 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             return stats;
         };
 
-        let depth = options
-            .depth_policy
-            .depth_values(
-                verts[0].projected.sz,
-                verts[1].projected.sz,
-                verts[2].projected.sz,
-            )
-            .saturating_add(options.depth_bias);
+        let depth = CameraDepth::new(
+            options
+                .depth_policy
+                .depth_values(
+                    verts[0].projected.sz,
+                    verts[1].projected.sz,
+                    verts[2].projected.sz,
+                )
+                .saturating_add(options.depth_bias),
+        );
         self.push_command(
             options
                 .depth_band
-                .slot::<OT_DEPTH>(options.depth_range, depth),
-            depth,
+                .slot_depth::<OT_DEPTH>(options.depth_range, depth),
+            depth.raw(),
             if material.is_translucent() {
                 WorldRenderLayer::Transparent
             } else {
@@ -1499,15 +1417,13 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             return stats;
         };
 
-        let depth = options
-            .depth_policy
-            .depth(verts)
-            .saturating_add(options.depth_bias);
+        let depth =
+            CameraDepth::new(options.depth_policy.depth(verts)).saturating_add(options.depth_bias);
         self.push_command(
             options
                 .depth_band
-                .slot::<OT_DEPTH>(options.depth_range, depth),
-            depth,
+                .slot_depth::<OT_DEPTH>(options.depth_range, depth),
+            depth.raw(),
             options.render_layer,
             tri as *mut TriGouraud as *mut u32,
             TriGouraud::WORDS,
@@ -1921,16 +1837,14 @@ impl<'a, 'ot, 'arena, const OT_DEPTH: usize> GouraudRenderPass<'a, 'ot, 'arena, 
                 break;
             };
 
-            let depth = options
-                .depth_policy
-                .depth(verts)
+            let depth = CameraDepth::new(options.depth_policy.depth(verts))
                 .saturating_add(options.depth_bias);
             let command_index = self.command_len;
             self.commands[command_index] = GouraudTriCommand {
                 slot: options
                     .depth_band
-                    .slot::<OT_DEPTH>(options.depth_range, depth),
-                depth,
+                    .slot_depth::<OT_DEPTH>(options.depth_range, depth),
+                depth: depth.raw(),
                 primitive_index,
                 next: GOURAUD_COMMAND_NONE,
             };
@@ -2620,6 +2534,7 @@ fn should_insert_world_before(a: WorldTriCommand, b: WorldTriCommand) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RoomPoint;
     use psx_gpu::material::BlendMode;
     use psx_gpu::ot::OrderingTable;
 

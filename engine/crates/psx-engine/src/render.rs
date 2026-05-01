@@ -48,6 +48,73 @@ impl_gpu_packet!(
     Sprite,
 );
 
+/// Camera-space depth used for ordering-table mapping.
+///
+/// This is the post-projection-space `z` scalar used by renderer
+/// passes to choose an OT slot. It is intentionally separate from raw
+/// world Z coordinates: a higher camera depth is farther from the
+/// camera and should map toward the back of the ordering table.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CameraDepth {
+    raw: i32,
+}
+
+impl CameraDepth {
+    /// Zero depth.
+    pub const ZERO: Self = Self { raw: 0 };
+
+    /// Build from a raw camera-space depth.
+    pub const fn new(raw: i32) -> Self {
+        Self { raw }
+    }
+
+    /// Raw camera-space depth.
+    pub const fn raw(self) -> i32 {
+        self.raw
+    }
+
+    /// Add a signed bias with saturation.
+    pub const fn saturating_add(self, bias: i32) -> Self {
+        Self::new(self.raw.saturating_add(bias))
+    }
+}
+
+/// Type-level ordering-table depth helper.
+///
+/// `OtDepth<N>` names the number of slots carried by an
+/// [`OrderingTable<N>`] / [`OtFrame<N>`], so constants can request
+/// common bands without repeating `OT_DEPTH - 1` by hand.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OtDepth<const DEPTH: usize>;
+
+impl<const DEPTH: usize> OtDepth<DEPTH> {
+    /// Number of OT slots.
+    pub const SLOT_COUNT: usize = DEPTH;
+
+    /// Nearest/front slot.
+    pub const FRONT_SLOT: DepthSlot = DepthSlot::new(0);
+
+    /// Farthest/back slot, clamped for zero-depth tables.
+    pub const BACK_SLOT: DepthSlot = if DEPTH == 0 {
+        DepthSlot::new(0)
+    } else {
+        DepthSlot::new(DEPTH - 1)
+    };
+
+    /// Whole-table band.
+    pub const fn whole_band() -> DepthBand {
+        DepthBand::new(Self::FRONT_SLOT.index(), Self::BACK_SLOT.index())
+    }
+
+    /// Build an inclusive band clamped to this table depth.
+    pub const fn band(front: usize, back: usize) -> DepthBand {
+        let max_slot = Self::BACK_SLOT.index();
+        let front = if front > max_slot { max_slot } else { front };
+        let back = if back > max_slot { max_slot } else { back };
+        DepthBand::new(front, back)
+    }
+}
+
 /// A clamped ordering-table slot.
 ///
 /// Higher slot indices are farther from the camera and are submitted
@@ -79,8 +146,8 @@ impl DepthSlot {
 /// (back). Depths outside the range clamp.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DepthRange {
-    near: i32,
-    far: i32,
+    near: CameraDepth,
+    far: CameraDepth,
 }
 
 impl DepthRange {
@@ -90,22 +157,42 @@ impl DepthRange {
     /// division by zero and makes invalid ranges fail visually
     /// conservative.
     pub const fn new(near: i32, far: i32) -> Self {
+        Self::from_depths(CameraDepth::new(near), CameraDepth::new(far))
+    }
+
+    /// Create from typed camera-space depths.
+    pub const fn from_depths(near: CameraDepth, far: CameraDepth) -> Self {
         Self { near, far }
     }
 
     /// Front depth.
     pub const fn near(self) -> i32 {
-        self.near
+        self.near.raw()
     }
 
     /// Back depth.
     pub const fn far(self) -> i32 {
+        self.far.raw()
+    }
+
+    /// Typed front depth.
+    pub const fn near_depth(self) -> CameraDepth {
+        self.near
+    }
+
+    /// Typed back depth.
+    pub const fn far_depth(self) -> CameraDepth {
         self.far
     }
 
     /// Map `depth` into an OT slot for a table with `DEPTH` slots.
     pub fn slot<const DEPTH: usize>(self, depth: i32) -> DepthSlot {
-        DepthBand::whole().slot::<DEPTH>(self, depth)
+        self.slot_depth::<DEPTH>(CameraDepth::new(depth))
+    }
+
+    /// Map typed `depth` into an OT slot for a table with `DEPTH` slots.
+    pub fn slot_depth<const DEPTH: usize>(self, depth: CameraDepth) -> DepthSlot {
+        DepthBand::whole().slot_depth::<DEPTH>(self, depth)
     }
 }
 
@@ -151,6 +238,15 @@ impl DepthBand {
 
     /// Map `depth` through `range` into this inclusive band.
     pub fn slot<const DEPTH: usize>(self, range: DepthRange, depth: i32) -> DepthSlot {
+        self.slot_depth::<DEPTH>(range, CameraDepth::new(depth))
+    }
+
+    /// Map typed `depth` through `range` into this inclusive band.
+    pub fn slot_depth<const DEPTH: usize>(
+        self,
+        range: DepthRange,
+        depth: CameraDepth,
+    ) -> DepthSlot {
         if DEPTH == 0 {
             return DepthSlot::new(0);
         }
@@ -158,15 +254,18 @@ impl DepthBand {
         let max_slot = DEPTH - 1;
         let front = self.front.min(max_slot);
         let back = self.back.min(max_slot);
-        if back <= front || range.far <= range.near || depth <= range.near {
+        let near = range.near.raw();
+        let far = range.far.raw();
+        let depth = depth.raw();
+        if back <= front || far <= near || depth <= near {
             return DepthSlot::new(front);
         }
-        if depth >= range.far {
+        if depth >= far {
             return DepthSlot::new(back);
         }
 
-        let span = range.far - range.near;
-        let offset = depth - range.near;
+        let span = far - near;
+        let offset = depth - near;
         let band_slots = (back - front) as i32;
         DepthSlot::new(front + ((offset.saturating_mul(band_slots)) / span) as usize)
     }
@@ -237,13 +336,36 @@ impl<'a, const DEPTH: usize> OtFrame<'a, DEPTH> {
     /// Map camera-space `depth` through `range` and insert the
     /// primitive into the resulting OT slot.
     pub fn add_depth<T>(&mut self, range: DepthRange, depth: i32, prim: &mut T, words: u8) {
-        self.add_slot(range.slot::<DEPTH>(depth), prim, words);
+        self.add_camera_depth(range, CameraDepth::new(depth), prim, words);
+    }
+
+    /// Map typed camera-space `depth` through `range` and insert the
+    /// primitive into the resulting OT slot.
+    pub fn add_camera_depth<T>(
+        &mut self,
+        range: DepthRange,
+        depth: CameraDepth,
+        prim: &mut T,
+        words: u8,
+    ) {
+        self.add_slot(range.slot_depth::<DEPTH>(depth), prim, words);
     }
 
     /// Map camera-space `depth` through `range` and insert a known
     /// SDK GPU packet into the resulting OT slot.
     pub fn add_packet_depth<T: GpuPacket>(&mut self, range: DepthRange, depth: i32, prim: &mut T) {
-        self.add_packet_slot(range.slot::<DEPTH>(depth), prim);
+        self.add_packet_camera_depth(range, CameraDepth::new(depth), prim);
+    }
+
+    /// Map typed camera-space `depth` through `range` and insert a
+    /// known SDK GPU packet into the resulting OT slot.
+    pub fn add_packet_camera_depth<T: GpuPacket>(
+        &mut self,
+        range: DepthRange,
+        depth: CameraDepth,
+        prim: &mut T,
+    ) {
+        self.add_packet_slot(range.slot_depth::<DEPTH>(depth), prim);
     }
 
     /// Submit this frame's ordering table via DMA linked-list mode.
@@ -366,6 +488,27 @@ mod tests {
     fn invalid_depth_range_maps_front() {
         let range = DepthRange::new(100, 100);
         assert_eq!(range.slot::<8>(500).index(), 0);
+    }
+
+    #[test]
+    fn typed_depth_range_matches_raw_mapping() {
+        let range = DepthRange::from_depths(CameraDepth::new(100), CameraDepth::new(900));
+        assert_eq!(range.near_depth(), CameraDepth::new(100));
+        assert_eq!(range.far_depth(), CameraDepth::new(900));
+        assert_eq!(range.slot_depth::<8>(CameraDepth::new(500)).index(), 3);
+        assert_eq!(
+            CameraDepth::new(500).saturating_add(400),
+            CameraDepth::new(900)
+        );
+    }
+
+    #[test]
+    fn ot_depth_builds_table_sized_bands() {
+        assert_eq!(OtDepth::<8>::SLOT_COUNT, 8);
+        assert_eq!(OtDepth::<8>::BACK_SLOT.index(), 7);
+        assert_eq!(OtDepth::<8>::whole_band(), DepthBand::new(0, 7));
+        assert_eq!(OtDepth::<8>::band(2, 99), DepthBand::new(2, 7));
+        assert_eq!(OtDepth::<0>::whole_band(), DepthBand::new(0, 0));
     }
 
     #[test]
