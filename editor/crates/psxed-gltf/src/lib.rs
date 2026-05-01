@@ -449,6 +449,11 @@ pub struct RigidModelConfig {
     /// automatically; this value only determines the recommended
     /// local-to-world scale stored in the `.psxmdl` header.
     pub world_height: u16,
+    /// Restore root-joint translations to their bind-pose value
+    /// while sampling clips. Meshy-style exports often bake noisy
+    /// hip/root location keys into otherwise in-place clips; this
+    /// option removes that root-motion bias at import time.
+    pub normalize_root_translation: bool,
 }
 
 impl Default for RigidModelConfig {
@@ -459,6 +464,7 @@ impl Default for RigidModelConfig {
             texture_depth: psxed_format::texture::Depth::Bit8,
             animation_fps: 15,
             world_height: DEFAULT_MODEL_WORLD_HEIGHT,
+            normalize_root_translation: false,
         }
     }
 }
@@ -561,6 +567,7 @@ fn convert_rigid_model_document(
 
     let parents = build_parent_indices(document);
     let base_trs = collect_base_trs(document);
+    let root_joint_nodes = root_joint_nodes(&joints, &parents);
     let inverse_bind_matrices = read_inverse_bind_matrices(&skin, buffers, joints.len());
     if inverse_bind_matrices.len() != joints.len() {
         return Err(Error::BadSkin(
@@ -579,9 +586,11 @@ fn convert_rigid_model_document(
         &source,
         &parents,
         &base_trs,
+        &root_joint_nodes,
         &joints,
         &inverse_bind_matrices,
         cfg.animation_fps,
+        cfg.normalize_root_translation,
     )?;
     let bounds = ModelBounds::from_min_max(
         precision_bounds.min,
@@ -608,10 +617,12 @@ fn convert_rigid_model_document(
         buffers,
         &parents,
         &base_trs,
+        &root_joint_nodes,
         &joints,
         &inverse_bind_matrices,
         &bounds,
         cfg.animation_fps,
+        cfg.normalize_root_translation,
     )?;
 
     let animation_bytes = clips.iter().map(|c| c.bytes.len()).sum();
@@ -787,9 +798,11 @@ fn collect_precision_bounds(
     source: &SkinnedSourceMesh,
     parents: &[Option<usize>],
     base_trs: &[Trs],
+    root_joint_nodes: &[usize],
     joints: &[usize],
     inverse_bind_matrices: &[[[f32; 4]; 4]],
     fps: u16,
+    normalize_root_translation: bool,
 ) -> Result<PrecisionBounds, Error> {
     let mut bounds = BoundsAccumulator::new();
     include_pose_bounds(
@@ -819,6 +832,9 @@ fn collect_precision_bounds(
             let mut frame_trs = base_trs.to_vec();
             for channel in &channels {
                 channel.apply(time, &mut frame_trs);
+            }
+            if normalize_root_translation {
+                restore_root_translations(&mut frame_trs, base_trs, root_joint_nodes);
             }
             include_pose_bounds(
                 &mut bounds,
@@ -1129,6 +1145,27 @@ fn build_parent_indices(document: &gltf::Document) -> Vec<Option<usize>> {
         }
     }
     parents
+}
+
+fn root_joint_nodes(joints: &[usize], parents: &[Option<usize>]) -> Vec<usize> {
+    let mut is_joint = vec![false; parents.len()];
+    for node in joints.iter().copied() {
+        if let Some(slot) = is_joint.get_mut(node) {
+            *slot = true;
+        }
+    }
+    joints
+        .iter()
+        .copied()
+        .filter(|node| {
+            parents
+                .get(*node)
+                .copied()
+                .flatten()
+                .and_then(|parent| is_joint.get(parent).copied())
+                != Some(true)
+        })
+        .collect()
 }
 
 fn collect_base_trs(document: &gltf::Document) -> Vec<Trs> {
@@ -1523,10 +1560,12 @@ fn cook_all_animations(
     buffers: &[gltf::buffer::Data],
     parents: &[Option<usize>],
     base_trs: &[Trs],
+    root_joint_nodes: &[usize],
     joints: &[usize],
     inverse_bind_matrices: &[[[f32; 4]; 4]],
     bounds: &ModelBounds,
     fps: u16,
+    normalize_root_translation: bool,
 ) -> Result<Vec<CookedClip>, Error> {
     let mut clips = Vec::new();
     for (index, animation) in document.animations().enumerate() {
@@ -1541,12 +1580,14 @@ fn cook_all_animations(
             &channels,
             parents,
             base_trs,
+            root_joint_nodes,
             joints,
             inverse_bind_matrices,
             bounds,
             min_time,
             max_time,
             fps,
+            normalize_root_translation,
         )?
         else {
             continue;
@@ -1568,12 +1609,14 @@ fn cook_animation_bytes(
     channels: &[AnimationChannel],
     parents: &[Option<usize>],
     base_trs: &[Trs],
+    root_joint_nodes: &[usize],
     joints: &[usize],
     inverse_bind_matrices: &[[[f32; 4]; 4]],
     bounds: &ModelBounds,
     min_time: f32,
     max_time: f32,
     fps: u16,
+    normalize_root_translation: bool,
 ) -> Result<Option<Vec<u8>>, Error> {
     let duration = max_time - min_time;
     let frame_count = (duration * fps as f32).round() as usize + 1;
@@ -1599,6 +1642,9 @@ fn cook_animation_bytes(
         let mut frame_trs = base_trs.to_vec();
         for channel in channels {
             channel.apply(time, &mut frame_trs);
+        }
+        if normalize_root_translation {
+            restore_root_translations(&mut frame_trs, base_trs, root_joint_nodes);
         }
         let locals: Vec<[[f32; 4]; 4]> = frame_trs.iter().map(|trs| trs.matrix()).collect();
         let globals = compute_global_matrices(parents, &locals);
@@ -1660,6 +1706,18 @@ impl AnimationChannel {
                 target.scale = sample_vec3(&self.times, values, time, self.interpolation);
             }
         }
+    }
+}
+
+fn restore_root_translations(frame_trs: &mut [Trs], base_trs: &[Trs], root_joint_nodes: &[usize]) {
+    for node_index in root_joint_nodes.iter().copied() {
+        let Some(frame) = frame_trs.get_mut(node_index) else {
+            continue;
+        };
+        let Some(base) = base_trs.get(node_index) else {
+            continue;
+        };
+        frame.translation = base.translation;
     }
 }
 
@@ -2032,6 +2090,36 @@ mod tests {
         assert_eq!(model.face(1).unwrap().corners[0].vertex_index, 0);
         assert_eq!(model.face(1).unwrap().corners[1].vertex_index, 2);
         assert_eq!(model.face(1).unwrap().corners[2].vertex_index, 1);
+    }
+
+    #[test]
+    fn root_translation_normalization_restores_bind_pose_translation() {
+        let base = vec![
+            Trs {
+                translation: [0.25, 1.0, -0.5],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0, 1.0, 1.0],
+            },
+            Trs {
+                translation: [2.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0, 1.0, 1.0],
+            },
+        ];
+        let mut frame = base.clone();
+        frame[0].translation = [-4.0, 3.0, 9.0];
+        frame[1].translation = [8.0, 1.0, 2.0];
+
+        restore_root_translations(&mut frame, &base, &[0]);
+
+        assert_eq!(frame[0].translation, base[0].translation);
+        assert_eq!(frame[1].translation, [8.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn root_joint_nodes_skips_children_of_other_skin_joints() {
+        let parents = vec![None, Some(0), Some(1), Some(0)];
+        assert_eq!(root_joint_nodes(&[1, 2, 3], &parents), vec![1, 3]);
     }
 
     fn minimal_triangle_glb() -> Vec<u8> {

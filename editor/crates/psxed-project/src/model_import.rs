@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 
 use crate::{ModelAnimationClip, ModelResource, ProjectDocument, ResourceData, ResourceId};
 
+pub use psxed_format::texture::Depth as TextureDepth;
+pub use psxed_gltf::{RigidModelConfig, RigidModelPackage, RigidModelReport};
+
 /// Header-derived statistics about a `.psxmdl` blob, suitable
 /// for editor inspector display. Computed by walking the model
 /// vertex table once for bounds; everything else is a header
@@ -551,6 +554,22 @@ pub fn import_glb_model(
     }
 
     register_cooked_model_bundle(project, &bundle_dir, output_name, Some(project_root))
+}
+
+/// Convert a GLB/glTF into the cooked model package without
+/// writing files or mutating a project. The editor uses this for
+/// the import preview dialog so authors can inspect the baked
+/// model, atlas, and animation clips before committing the bundle.
+pub fn preview_glb_model(
+    source_path: &Path,
+    config: psxed_gltf::RigidModelConfig,
+) -> Result<psxed_gltf::RigidModelPackage, ModelImportError> {
+    psxed_gltf::convert_rigid_model_path(source_path, &config).map_err(|e| {
+        ModelImportError::GlbConversionFailed {
+            source: source_path.to_path_buf(),
+            detail: format!("{e}"),
+        }
+    })
 }
 
 /// Derive a clip display name from a `.psxanim` path. Strips the

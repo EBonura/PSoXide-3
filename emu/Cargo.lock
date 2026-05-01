@@ -3016,8 +3016,10 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "psx-asset",
+ "psx-engine",
  "psx-gte",
  "psxed-project",
+ "rfd",
 ]
 
 [[package]]

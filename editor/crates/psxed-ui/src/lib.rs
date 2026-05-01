@@ -5,6 +5,7 @@
 
 mod history;
 mod icons;
+mod model_import_preview;
 mod play_mode;
 mod style;
 
@@ -27,6 +28,9 @@ use psxed_project::{
     PsxBlendMode, Resource, ResourceData, ResourceId, WorldGrid, WorldGridBudget, HEIGHT_QUANTUM,
     MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH,
 };
+
+const LEFT_DOCK_MAX_WIDTH: f32 = 420.0;
+const LEFT_DOCK_LABEL_CHARS: usize = 34;
 
 /// Discrete action a scene-tree row can produce in one frame.
 ///
@@ -159,6 +163,8 @@ pub struct EditorWorkspace {
     /// re-decoding. Keyed on the *Texture* resource id; Materials
     /// follow `material.texture` to the same key.
     texture_thumbs: HashMap<ResourceId, ThumbnailEntry>,
+    model_import_dialog: ModelImportDialog,
+    model_import_retired_textures: Vec<(u8, egui::TextureHandle)>,
     dirty: bool,
     status: String,
     /// One-shot request emitted by the editor UI for the frontend
@@ -175,6 +181,76 @@ struct ThumbnailEntry {
     signature: String,
     handle: egui::TextureHandle,
     stats: PsxtStats,
+}
+
+struct ModelImportDialog {
+    open: bool,
+    source_path: String,
+    output_name: String,
+    texture_width: i32,
+    texture_height: i32,
+    animation_fps: i32,
+    world_height: i32,
+    normalize_root_translation: bool,
+    selected_clip: usize,
+    preview_yaw_q12: i32,
+    preview_pitch_q12: i32,
+    preview_radius: i32,
+    show_animation_root: bool,
+    status: Option<ModelImportStatus>,
+    preview: Option<ModelImportPreview>,
+}
+
+impl Default for ModelImportDialog {
+    fn default() -> Self {
+        Self {
+            open: false,
+            source_path: String::new(),
+            output_name: String::new(),
+            texture_width: 128,
+            texture_height: 128,
+            animation_fps: 15,
+            world_height: 1024,
+            normalize_root_translation: true,
+            selected_clip: 0,
+            preview_yaw_q12: 340,
+            preview_pitch_q12: 350,
+            preview_radius: 1536,
+            show_animation_root: true,
+            status: None,
+            preview: None,
+        }
+    }
+}
+
+enum ModelImportStatus {
+    Info(String),
+    Error(String),
+}
+
+struct ModelImportPreview {
+    model_bytes: Vec<u8>,
+    report: psxed_project::model_import::RigidModelReport,
+    atlas: Option<(egui::TextureHandle, PsxtStats)>,
+    atlas_image: Option<ColorImage>,
+    animated_texture: Option<egui::TextureHandle>,
+    world_height: i32,
+    clips: Vec<ModelImportClipPreview>,
+}
+
+struct ModelImportClipPreview {
+    name: String,
+    frames: usize,
+    bytes: Vec<u8>,
+    byte_len: usize,
+    root_motion: Option<RootMotionStats>,
+}
+
+#[derive(Copy, Clone)]
+struct RootMotionStats {
+    min: [i32; 3],
+    max: [i32; 3],
+    mean: [i32; 3],
 }
 
 /// Decoded metadata for one `.psxt` blob. Cheap to compute
@@ -1033,6 +1109,8 @@ impl EditorWorkspace {
             viewport_3d_pitch: 256,
             viewport_3d_radius: 6144,
             texture_thumbs: HashMap::new(),
+            model_import_dialog: ModelImportDialog::default(),
+            model_import_retired_textures: Vec::new(),
             dirty: false,
             status: "Editor ready".to_string(),
             pending_playtest_request: None,
@@ -1347,6 +1425,15 @@ impl EditorWorkspace {
         playtest_status: EditorPlaytestStatus,
     ) {
         apply_studio_visuals(ctx);
+        self.model_import_retired_textures
+            .retain_mut(|(frames, _)| {
+                if *frames == 0 {
+                    false
+                } else {
+                    *frames -= 1;
+                    true
+                }
+            });
         let playtest_captured = matches!(
             playtest_status,
             EditorPlaytestStatus::Running {
@@ -1363,6 +1450,7 @@ impl EditorWorkspace {
         self.draw_content_browser(ctx);
         self.draw_viewport(ctx, viewport_3d, playtest_status);
         self.draw_new_project_dialog(ctx);
+        self.draw_model_import_dialog(ctx);
     }
 
     /// Modal for the File → New Project flow. Pops over the editor
@@ -1434,6 +1522,420 @@ impl EditorWorkspace {
             self.new_project_dialog_open = false;
             self.new_project_error = None;
         }
+    }
+
+    fn draw_model_import_dialog(&mut self, ctx: &egui::Context) {
+        if !self.model_import_dialog.open {
+            return;
+        }
+
+        enum Action {
+            BrowseSource,
+            Preview,
+            Import,
+            Close,
+        }
+
+        let mut action: Option<Action> = None;
+        let dialog = &mut self.model_import_dialog;
+        egui::Window::new(icons::label(icons::FILE_PLUS, "Import Model"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(1160.0)
+            .default_height(820.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_size(Vec2::new(980.0, 620.0));
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(300.0);
+                        ui.label(RichText::new("Source").strong());
+                        ui.label(RichText::new("GLB/glTF path").color(STUDIO_TEXT_WEAK).small());
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dialog.source_path)
+                                    .desired_width(210.0),
+                            );
+                            if ui
+                                .button(icons::label(icons::FOLDER, "Browse"))
+                                .on_hover_text("Choose a .glb or .gltf file")
+                                .clicked()
+                            {
+                                action = Some(Action::BrowseSource);
+                            }
+                        });
+                        ui.label(RichText::new("Resource name").color(STUDIO_TEXT_WEAK).small());
+                        ui.text_edit_singleline(&mut dialog.output_name);
+                        if dialog.output_name.trim().is_empty() {
+                            ui.label(
+                                RichText::new("Uses the source file name when blank.")
+                                    .color(STUDIO_TEXT_WEAK)
+                                    .small(),
+                            );
+                        }
+
+                        ui.separator();
+                        ui.label(RichText::new("Bake Settings").strong());
+                        ui.horizontal(|ui| {
+                            ui.label("Atlas");
+                            ui.add(
+                                egui::DragValue::new(&mut dialog.texture_width)
+                                    .range(16..=512)
+                                    .speed(8.0),
+                            );
+                            ui.label("×");
+                            ui.add(
+                                egui::DragValue::new(&mut dialog.texture_height)
+                                    .range(16..=512)
+                                    .speed(8.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Anim Hz");
+                            ui.add(
+                                egui::DragValue::new(&mut dialog.animation_fps)
+                                    .range(1..=60)
+                                    .speed(1.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("World height");
+                            ui.add(
+                                egui::DragValue::new(&mut dialog.world_height)
+                                    .range(128..=8192)
+                                    .speed(16.0),
+                            );
+                        });
+                        ui.checkbox(
+                            &mut dialog.normalize_root_translation,
+                            "Center animation root",
+                        )
+                        .on_hover_text(
+                            "Restores root-joint translation to bind pose while baking clips. Useful for Meshy exports with noisy Hips location keys.",
+                        );
+                        ui.label(
+                            RichText::new("Texture depth: 8bpp indexed")
+                                .color(STUDIO_TEXT_WEAK)
+                                .small(),
+                        );
+
+                        ui.separator();
+                        ui.label(RichText::new("Preview").strong());
+                        ui.horizontal(|ui| {
+                            ui.label("Yaw");
+                            ui.add(
+                                egui::DragValue::new(&mut dialog.preview_yaw_q12)
+                                    .range(0..=4095)
+                                    .speed(8.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Pitch");
+                            ui.add(
+                                egui::DragValue::new(&mut dialog.preview_pitch_q12)
+                                    .range(64..=960)
+                                    .speed(6.0),
+                            );
+                        });
+                        ui.add(
+                            egui::Slider::new(&mut dialog.preview_radius, 640..=4096)
+                                .text("Distance"),
+                        );
+                        ui.checkbox(&mut dialog.show_animation_root, "Root marker");
+                        if ui.button(icons::label(icons::ROTATE_CCW, "Reset View")).clicked() {
+                            dialog.preview_yaw_q12 = 340;
+                            dialog.preview_pitch_q12 = 350;
+                            dialog.preview_radius = 1536;
+                            dialog.show_animation_root = true;
+                        }
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button(icons::label(icons::SCAN, "Cook Preview")).clicked() {
+                                action = Some(Action::Preview);
+                            }
+                            if ui.button(icons::label(icons::PLUS, "Import")).clicked() {
+                                action = Some(Action::Import);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(Action::Close);
+                            }
+                        });
+
+                        if let Some(status) = &dialog.status {
+                            ui.add_space(6.0);
+                            match status {
+                                ModelImportStatus::Info(text) => {
+                                    ui.label(RichText::new(text).color(STUDIO_TEXT_WEAK).small());
+                                }
+                                ModelImportStatus::Error(text) => {
+                                    ui.label(
+                                        RichText::new(text)
+                                            .color(Color32::from_rgb(220, 120, 100))
+                                            .small(),
+                                    );
+                                }
+                            }
+                        }
+                    });
+
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_min_width(700.0);
+                        if let Some(preview) = &mut dialog.preview {
+                            draw_model_import_preview(
+                                ui,
+                                preview,
+                                &mut dialog.selected_clip,
+                                &mut dialog.preview_yaw_q12,
+                                &mut dialog.preview_pitch_q12,
+                                &mut dialog.preview_radius,
+                                dialog.show_animation_root,
+                            );
+                        } else {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(160.0);
+                                ui.label(RichText::new("Cook a preview").strong());
+                                ui.label(
+                                    RichText::new(
+                                        "The preview shows the cooked model, atlas, clips, and root-motion stats before files are written.",
+                                    )
+                                    .color(STUDIO_TEXT_WEAK)
+                                    .small(),
+                                );
+                            });
+                        }
+                    });
+                });
+
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    action = Some(Action::Close);
+                }
+            });
+
+        match action {
+            Some(Action::BrowseSource) => {
+                if self.choose_model_import_source() {
+                    self.run_model_import_preview(ctx);
+                }
+            }
+            Some(Action::Preview) => self.run_model_import_preview(ctx),
+            Some(Action::Import) => self.commit_model_import(),
+            Some(Action::Close) => self.close_model_import_dialog(),
+            None => {}
+        }
+    }
+
+    fn close_model_import_dialog(&mut self) {
+        self.model_import_dialog.open = false;
+        self.retire_model_import_preview();
+    }
+
+    fn retire_model_import_preview(&mut self) {
+        if let Some(preview) = self.model_import_dialog.preview.take() {
+            if let Some((handle, _)) = preview.atlas {
+                self.model_import_retired_textures.push((2, handle));
+            }
+            if let Some(handle) = preview.animated_texture {
+                self.model_import_retired_textures.push((2, handle));
+            }
+        }
+    }
+
+    fn set_model_import_preview(&mut self, preview: ModelImportPreview) {
+        self.retire_model_import_preview();
+        self.model_import_dialog.preview = Some(preview);
+    }
+
+    fn run_model_import_preview(&mut self, ctx: &egui::Context) {
+        let source = self.model_import_source_path();
+        if source.as_os_str().is_empty() {
+            self.model_import_dialog.status = Some(ModelImportStatus::Error(
+                "Choose a GLB/glTF source path.".to_string(),
+            ));
+            return;
+        }
+        let config = self.model_import_config();
+        let world_height = config.world_height as i32;
+        match psxed_project::model_import::preview_glb_model(&source, config) {
+            Ok(package) => {
+                let decoded_atlas = package
+                    .texture
+                    .as_ref()
+                    .and_then(|bytes| decode_psxt_thumbnail(bytes));
+                let atlas_image = decoded_atlas.as_ref().map(|(image, _)| image.clone());
+                let atlas = decoded_atlas.map(|(image, stats)| {
+                    let handle = ctx.load_texture(
+                        "model-import-atlas-preview",
+                        image,
+                        egui::TextureOptions::NEAREST,
+                    );
+                    (handle, stats)
+                });
+                let clips = package
+                    .clips
+                    .iter()
+                    .map(|clip| ModelImportClipPreview {
+                        name: clip
+                            .source_name
+                            .as_deref()
+                            .unwrap_or(&clip.sanitized_name)
+                            .to_string(),
+                        frames: clip.frames,
+                        byte_len: clip.bytes.len(),
+                        bytes: clip.bytes.clone(),
+                        root_motion: root_motion_stats(&clip.bytes, 0),
+                    })
+                    .collect();
+                let clip_count = package.clips.len();
+                self.set_model_import_preview(ModelImportPreview {
+                    model_bytes: package.model,
+                    report: package.report,
+                    atlas,
+                    atlas_image,
+                    animated_texture: None,
+                    world_height,
+                    clips,
+                });
+                self.model_import_dialog.selected_clip = self
+                    .model_import_dialog
+                    .selected_clip
+                    .min(clip_count.saturating_sub(1));
+                self.model_import_dialog.status = Some(ModelImportStatus::Info(format!(
+                    "Preview cooked: {clip_count} clip(s){}",
+                    if self.model_import_dialog.normalize_root_translation {
+                        ", root centered"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+            Err(error) => {
+                self.retire_model_import_preview();
+                self.model_import_dialog.status =
+                    Some(ModelImportStatus::Error(format!("Preview failed: {error}")));
+            }
+        }
+    }
+
+    fn choose_model_import_source(&mut self) -> bool {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Choose GLB/glTF model")
+            .add_filter("glTF model", &["glb", "gltf"]);
+        let current = self.model_import_source_path();
+        if let Some(dir) = Self::path_parent_or_self(&current) {
+            dialog = dialog.set_directory(dir);
+        } else if self.project_dir.is_dir() {
+            dialog = dialog.set_directory(&self.project_dir);
+        }
+
+        let Some(path) = dialog.pick_file() else {
+            return false;
+        };
+
+        self.model_import_dialog.source_path = Self::display_project_path(&path, &self.project_dir);
+        if self.model_import_dialog.output_name.trim().is_empty() {
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                self.model_import_dialog.output_name = stem.to_string();
+            }
+        }
+        self.retire_model_import_preview();
+        self.model_import_dialog.selected_clip = 0;
+        self.model_import_dialog.status = Some(ModelImportStatus::Info(format!(
+            "Selected source: {}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("model")
+        )));
+        true
+    }
+
+    fn commit_model_import(&mut self) {
+        let source = self.model_import_source_path();
+        if source.as_os_str().is_empty() {
+            self.model_import_dialog.status = Some(ModelImportStatus::Error(
+                "Choose a GLB/glTF source path.".to_string(),
+            ));
+            return;
+        }
+        let output_name = self.model_import_output_name(&source);
+        let config = self.model_import_config();
+        match psxed_project::model_import::import_glb_model(
+            &mut self.project,
+            &source,
+            &output_name,
+            &self.project_dir,
+            config,
+        ) {
+            Ok(id) => {
+                self.selected_resource = Some(id);
+                self.selected_node = NodeId::ROOT;
+                self.selected_primitive = None;
+                self.close_model_import_dialog();
+                self.status = format!("Imported model {output_name}");
+                self.mark_dirty();
+            }
+            Err(error) => {
+                self.model_import_dialog.status =
+                    Some(ModelImportStatus::Error(format!("Import failed: {error}")));
+            }
+        }
+    }
+
+    fn model_import_config(&self) -> psxed_project::model_import::RigidModelConfig {
+        psxed_project::model_import::RigidModelConfig {
+            texture_width: self.model_import_dialog.texture_width.clamp(16, 512) as u16,
+            texture_height: self.model_import_dialog.texture_height.clamp(16, 512) as u16,
+            texture_depth: psxed_project::model_import::TextureDepth::Bit8,
+            animation_fps: self.model_import_dialog.animation_fps.clamp(1, 60) as u16,
+            world_height: self.model_import_dialog.world_height.clamp(128, 8192) as u16,
+            normalize_root_translation: self.model_import_dialog.normalize_root_translation,
+        }
+    }
+
+    fn model_import_source_path(&self) -> PathBuf {
+        let trimmed = self.model_import_dialog.source_path.trim();
+        if trimmed.is_empty() {
+            return PathBuf::new();
+        }
+        let path = Path::new(trimmed);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.project_dir.join(path)
+        }
+    }
+
+    fn model_import_output_name(&self, source: &Path) -> String {
+        let trimmed = self.model_import_dialog.output_name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| "model".to_string())
+    }
+
+    fn path_parent_or_self(path: &Path) -> Option<PathBuf> {
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        if path.is_dir() {
+            Some(path.to_path_buf())
+        } else {
+            path.parent().map(Path::to_path_buf)
+        }
+    }
+
+    fn display_project_path(path: &Path, project_dir: &Path) -> String {
+        if let Ok(relative) = path.strip_prefix(project_dir) {
+            if !relative.as_os_str().is_empty() {
+                return relative.to_string_lossy().into_owned();
+            }
+        }
+        path.to_string_lossy().into_owned()
     }
 
     /// 3D viewport body -- paints the HwRenderer texture into the
@@ -3009,8 +3511,7 @@ impl EditorWorkspace {
     fn apply_tree_action(&mut self, action: TreeAction) {
         match action {
             TreeAction::Select(id) => {
-                self.selected_node = id;
-                self.selected_resource = None;
+                self.commit_node_selection(id);
                 self.renaming = None;
                 // No-op when `id` isn't a Room -- keeps the camera
                 // put while the user clicks through entity nodes.
@@ -3018,9 +3519,10 @@ impl EditorWorkspace {
             }
             TreeAction::BeginRename(id) => {
                 if let Some(node) = self.project.active_scene().node(id) {
-                    self.renaming = Some((id, node.name.clone()));
+                    let name = node.name.clone();
+                    self.commit_node_selection(id);
+                    self.renaming = Some((id, name));
                     self.pending_rename_focus = true;
-                    self.selected_node = id;
                 }
             }
             TreeAction::CommitRename(id, name) => {
@@ -3227,6 +3729,7 @@ impl EditorWorkspace {
             .resizable(true)
             .default_width(280.0)
             .min_width(220.0)
+            .max_width(LEFT_DOCK_MAX_WIDTH)
             .frame(dock_frame())
             .show(ctx, |ui| {
                 section_frame().show(ui, |ui| self.draw_scene_tree_panel(ui));
@@ -4204,6 +4707,15 @@ impl EditorWorkspace {
                         self.status = "Added model".to_string();
                         self.mark_dirty();
                     }
+                    if ui
+                        .button(icons::label(icons::FILE_PLUS, "Import Model"))
+                        .on_hover_text(
+                            "Open the GLB/glTF model import preview with atlas, clip, and root-centering controls.",
+                        )
+                        .clicked()
+                    {
+                        self.open_model_import_dialog();
+                    }
                 });
                 ui.separator();
                 self.draw_resources_tab(ui);
@@ -5110,6 +5622,13 @@ impl EditorWorkspace {
         self.new_project_error = None;
     }
 
+    fn open_model_import_dialog(&mut self) {
+        self.model_import_dialog.open = true;
+        self.model_import_dialog.status = None;
+        self.retire_model_import_preview();
+        self.model_import_dialog.selected_clip = 0;
+    }
+
     fn mark_dirty(&mut self) {
         self.dirty = true;
     }
@@ -5679,6 +6198,350 @@ fn draw_inline_icon(ui: &mut egui::Ui, icon: char, color: Color32) {
     ui.label(icons::text(icon, 16.0).color(color));
 }
 
+fn draw_model_import_preview(
+    ui: &mut egui::Ui,
+    preview: &mut ModelImportPreview,
+    selected_clip: &mut usize,
+    preview_yaw_q12: &mut i32,
+    preview_pitch_q12: &mut i32,
+    preview_radius: &mut i32,
+    show_animation_root: bool,
+) {
+    ui.label(RichText::new("Cooked Model").strong());
+    if !draw_model_animated_import_preview(
+        ui,
+        preview,
+        *selected_clip,
+        preview_yaw_q12,
+        preview_pitch_q12,
+        preview_radius,
+        show_animation_root,
+    ) {
+        draw_model_wireframe_preview(ui, &preview.model_bytes);
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Atlas").strong());
+            match &preview.atlas {
+                Some((handle, stats)) => {
+                    draw_psxt_preview_block(ui, Some((handle.id(), *stats)));
+                }
+                None => {
+                    draw_psxt_preview_block(ui, None);
+                }
+            }
+        });
+    });
+
+    ui.separator();
+    egui::Grid::new("model-import-stats")
+        .num_columns(4)
+        .spacing([10.0, 3.0])
+        .show(ui, |ui| {
+            stat_cell(ui, "Source verts", preview.report.source_vertices);
+            stat_cell(ui, "Cooked verts", preview.report.cooked_vertices);
+            ui.end_row();
+            stat_cell(ui, "Faces", preview.report.faces);
+            stat_cell(ui, "Parts", preview.report.parts);
+            ui.end_row();
+            stat_cell(ui, "Joints", preview.report.joints);
+            stat_cell(ui, "Local height", preview.report.local_height);
+            ui.end_row();
+            stat_cell(ui, "Model bytes", preview.report.model_bytes);
+            stat_cell(ui, "Anim bytes", preview.report.animation_bytes);
+            ui.end_row();
+        });
+
+    ui.separator();
+    ui.label(RichText::new("Baked Animation Clips").strong());
+    if preview.clips.is_empty() {
+        ui.weak("No animation clips found in the source.");
+        return;
+    }
+    *selected_clip = (*selected_clip).min(preview.clips.len().saturating_sub(1));
+    egui::ScrollArea::vertical()
+        .max_height(150.0)
+        .show(ui, |ui| {
+            for (index, clip) in preview.clips.iter().enumerate() {
+                let root = clip
+                    .root_motion
+                    .map(root_motion_brief)
+                    .unwrap_or_else(|| "root n/a".to_string());
+                let label = format!(
+                    "{}  ·  {} frames  ·  {}  ·  {}",
+                    clip.name,
+                    clip.frames,
+                    human_bytes(clip.byte_len as u32),
+                    root
+                );
+                if ui
+                    .selectable_label(*selected_clip == index, label)
+                    .clicked()
+                {
+                    *selected_clip = index;
+                }
+            }
+        });
+    if let Some(clip) = preview.clips.get(*selected_clip) {
+        egui::CollapsingHeader::new(icons::label(icons::MOVE, "Root Motion"))
+            .default_open(true)
+            .show(ui, |ui| match clip.root_motion {
+                Some(stats) => draw_root_motion_stats(ui, stats),
+                None => {
+                    ui.weak("Clip could not be parsed for root-motion stats.");
+                }
+            });
+    }
+}
+
+fn draw_model_animated_import_preview(
+    ui: &mut egui::Ui,
+    preview: &mut ModelImportPreview,
+    selected_clip: usize,
+    preview_yaw_q12: &mut i32,
+    preview_pitch_q12: &mut i32,
+    preview_radius: &mut i32,
+    show_animation_root: bool,
+) -> bool {
+    let Some(atlas) = preview.atlas_image.as_ref() else {
+        return false;
+    };
+    let Some(clip) = preview.clips.get(selected_clip) else {
+        return false;
+    };
+
+    let width = ui.available_width().clamp(560.0, 820.0);
+    let height = width
+        * (model_import_preview::PREVIEW_HEIGHT as f32
+            / model_import_preview::PREVIEW_WIDTH as f32);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::drag());
+    if response.dragged() {
+        let delta = ui.input(|i| i.pointer.delta());
+        *preview_yaw_q12 = (*preview_yaw_q12 + (delta.x * 6.0) as i32).rem_euclid(4096);
+        *preview_pitch_q12 = (*preview_pitch_q12 + (delta.y * 4.0) as i32).clamp(64, 960);
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+
+    let options = model_import_preview::ImportPreviewOptions {
+        world_height: preview.world_height,
+        time_seconds: ui.input(|i| i.time),
+        yaw_q12: (*preview_yaw_q12).rem_euclid(4096) as u16,
+        pitch_q12: (*preview_pitch_q12).rem_euclid(4096) as u16,
+        radius: *preview_radius,
+        show_animation_root,
+    };
+    let Some(image) = model_import_preview::render_import_model_preview_with_options(
+        &preview.model_bytes,
+        &clip.bytes,
+        atlas,
+        options,
+    ) else {
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, STUDIO_PANEL);
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "preview failed",
+            FontId::proportional(12.0),
+            Color32::from_rgb(220, 120, 100),
+        );
+        return true;
+    };
+
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
+
+    let texture_id = match &mut preview.animated_texture {
+        Some(handle) => {
+            handle.set(image, egui::TextureOptions::NEAREST);
+            handle.id()
+        }
+        None => {
+            let handle = ui.ctx().load_texture(
+                "model-import-animated-preview",
+                image,
+                egui::TextureOptions::NEAREST,
+            );
+            let id = handle.id();
+            preview.animated_texture = Some(handle);
+            id
+        }
+    };
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, STUDIO_PANEL);
+    painter.image(
+        texture_id,
+        rect,
+        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    painter.rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(1.0, STUDIO_BORDER),
+        StrokeKind::Inside,
+    );
+    true
+}
+
+fn stat_cell(ui: &mut egui::Ui, label: &str, value: usize) {
+    ui.label(RichText::new(label).color(STUDIO_TEXT_WEAK).small());
+    ui.label(RichText::new(value.to_string()).monospace());
+}
+
+fn draw_model_wireframe_preview(ui: &mut egui::Ui, model_bytes: &[u8]) {
+    let width = ui.available_width().min(520.0).max(280.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 280.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, STUDIO_PANEL);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(1.0, STUDIO_BORDER),
+        StrokeKind::Inside,
+    );
+
+    let Ok(model) = psx_asset::Model::from_bytes(model_bytes) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "model parse failed",
+            FontId::proportional(12.0),
+            Color32::from_rgb(220, 120, 100),
+        );
+        return;
+    };
+
+    let mut projected = Vec::with_capacity(model.vertex_count() as usize);
+    let mut min = [f32::INFINITY, f32::INFINITY];
+    let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+    for i in 0..model.vertex_count() {
+        let Some(vertex) = model.vertex(i) else {
+            projected.push([0.0, 0.0]);
+            continue;
+        };
+        let x = vertex.position.x as f32;
+        let y = vertex.position.y as f32;
+        let z = vertex.position.z as f32;
+        // Lightweight isometric-ish preview: no renderer, just enough
+        // shape to confirm centering, scale, and triangle continuity.
+        let p = [x - z * 0.45, -y + z * 0.22];
+        min[0] = min[0].min(p[0]);
+        min[1] = min[1].min(p[1]);
+        max[0] = max[0].max(p[0]);
+        max[1] = max[1].max(p[1]);
+        projected.push(p);
+    }
+    let span_x = (max[0] - min[0]).max(1.0);
+    let span_y = (max[1] - min[1]).max(1.0);
+    let scale = ((rect.width() - 28.0) / span_x)
+        .min((rect.height() - 28.0) / span_y)
+        .max(0.001);
+    let to_screen = |p: [f32; 2]| -> Pos2 {
+        Pos2::new(
+            rect.center().x + (p[0] - (min[0] + max[0]) * 0.5) * scale,
+            rect.center().y + (p[1] - (min[1] + max[1]) * 0.5) * scale,
+        )
+    };
+
+    let face_count = model.face_count();
+    let stride = ((face_count as usize) / 900).max(1);
+    for face_index in (0..face_count).step_by(stride) {
+        let Some(face) = model.face(face_index) else {
+            continue;
+        };
+        let a = projected
+            .get(face.corners[0].vertex_index as usize)
+            .copied();
+        let b = projected
+            .get(face.corners[1].vertex_index as usize)
+            .copied();
+        let c = projected
+            .get(face.corners[2].vertex_index as usize)
+            .copied();
+        let (Some(a), Some(b), Some(c)) = (a, b, c) else {
+            continue;
+        };
+        let stroke = Stroke::new(1.0, Color32::from_rgb(150, 170, 185));
+        let pa = to_screen(a);
+        let pb = to_screen(b);
+        let pc = to_screen(c);
+        painter.line_segment([pa, pb], stroke);
+        painter.line_segment([pb, pc], stroke);
+        painter.line_segment([pc, pa], stroke);
+    }
+}
+
+fn root_motion_stats(bytes: &[u8], joint_index: u16) -> Option<RootMotionStats> {
+    let anim = psx_asset::Animation::from_bytes(bytes).ok()?;
+    if joint_index >= anim.joint_count() {
+        return None;
+    }
+    let mut min = [i32::MAX; 3];
+    let mut max = [i32::MIN; 3];
+    let mut sum = [0i64; 3];
+    let mut count = 0i64;
+    for frame in 0..anim.frame_count() {
+        let pose = anim.pose(frame, joint_index)?;
+        let values = [pose.translation.x, pose.translation.y, pose.translation.z];
+        for axis in 0..3 {
+            min[axis] = min[axis].min(values[axis]);
+            max[axis] = max[axis].max(values[axis]);
+            sum[axis] += values[axis] as i64;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(RootMotionStats {
+        min,
+        max,
+        mean: [
+            (sum[0] / count) as i32,
+            (sum[1] / count) as i32,
+            (sum[2] / count) as i32,
+        ],
+    })
+}
+
+fn root_motion_brief(stats: RootMotionStats) -> String {
+    let span_x = stats.max[0].saturating_sub(stats.min[0]).abs();
+    let span_y = stats.max[1].saturating_sub(stats.min[1]).abs();
+    let span_z = stats.max[2].saturating_sub(stats.min[2]).abs();
+    format!("root span {span_x}/{span_y}/{span_z}")
+}
+
+fn draw_root_motion_stats(ui: &mut egui::Ui, stats: RootMotionStats) {
+    egui::Grid::new("model-import-root-motion")
+        .num_columns(4)
+        .spacing([8.0, 3.0])
+        .show(ui, |ui| {
+            ui.label("");
+            ui.label(RichText::new("min").color(STUDIO_TEXT_WEAK).small());
+            ui.label(RichText::new("max").color(STUDIO_TEXT_WEAK).small());
+            ui.label(RichText::new("mean").color(STUDIO_TEXT_WEAK).small());
+            ui.end_row();
+            for (axis, name) in ["X", "Y", "Z"].iter().enumerate() {
+                ui.label(*name);
+                ui.label(RichText::new(stats.min[axis].to_string()).monospace());
+                ui.label(RichText::new(stats.max[axis].to_string()).monospace());
+                ui.label(RichText::new(stats.mean[axis].to_string()).monospace());
+                ui.end_row();
+            }
+        });
+    ui.label(
+        RichText::new("Values are cooked Q12 pose-translation units for root joint 0.")
+            .color(STUDIO_TEXT_WEAK)
+            .small(),
+    );
+}
+
 /// Inspector preview header: a 128×128 image of the linked PSXT
 /// (centered, NEAREST-sampled so individual texels are visible at
 /// editor scale) above a one-line summary. Falls back to a
@@ -5849,7 +6712,7 @@ fn draw_model_resource_editor(
 
             ui.label(
                 RichText::new(
-                    "GLB import (psxed_project::model_import::import_glb_model) is wired in code; UI button lands when the editor adds a native file picker.",
+                    "Use Resources -> Import Model for GLB/glTF preview, root-centering, and bundle import.",
                 )
                 .color(STUDIO_TEXT_WEAK)
                 .small(),
@@ -6573,6 +7436,31 @@ fn human_bytes(n: u32) -> String {
     }
 }
 
+fn dock_label_limit(depth: usize) -> usize {
+    LEFT_DOCK_LABEL_CHARS
+        .saturating_sub(depth.saturating_mul(2))
+        .max(18)
+}
+
+fn compact_middle(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars || max_chars < 8 {
+        return text.to_string();
+    }
+
+    let marker = "...";
+    let room = max_chars.saturating_sub(marker.len());
+    let head = room.saturating_mul(2) / 3;
+    let tail = room.saturating_sub(head);
+    let mut out = String::with_capacity(text.len().min(max_chars + marker.len()));
+    out.extend(text.chars().take(head));
+    out.push_str(marker);
+    let mut suffix = text.chars().rev().take(tail).collect::<Vec<_>>();
+    suffix.reverse();
+    out.extend(suffix);
+    out
+}
+
 fn draw_scene_node_row(
     ui: &mut egui::Ui,
     row: &NodeRow,
@@ -6675,6 +7563,12 @@ fn draw_scene_node_row(
     } else {
         row.name.clone()
     };
+    let display_label = compact_middle(&label, dock_label_limit(row.depth));
+    let response = if !in_rename && display_label != label {
+        response.on_hover_text(label.clone())
+    } else {
+        response
+    };
     let text_left = icon_rect.right() + 7.0;
     let text_pos = Pos2::new(text_left, rect.center().y);
 
@@ -6704,18 +7598,31 @@ fn draw_scene_node_row(
             }
         }
     } else {
-        painter.text(
-            text_pos,
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(13.0),
-            text_color,
-        );
+        let name_clip_right = if row.id != NodeId::ROOT {
+            (rect.right() - 142.0).max(text_left + 72.0)
+        } else {
+            rect.right() - 28.0
+        };
+        painter
+            .with_clip_rect(Rect::from_min_max(
+                Pos2::new(text_left, rect.top()),
+                Pos2::new(name_clip_right, rect.bottom()),
+            ))
+            .text(
+                text_pos,
+                Align2::LEFT_CENTER,
+                display_label,
+                FontId::proportional(13.0),
+                text_color,
+            );
     }
 
     if !in_rename && row.id != NodeId::ROOT {
         painter.text(
-            Pos2::new(text_pos.x + 118.0, rect.center().y),
+            Pos2::new(
+                (rect.right() - 136.0).max(text_pos.x + 78.0),
+                rect.center().y,
+            ),
             Align2::LEFT_CENTER,
             row.kind,
             FontId::proportional(11.0),
@@ -7031,14 +7938,22 @@ fn draw_project_file_row(
     let mut clicked = false;
     ui.horizontal(|ui| {
         ui.add_space(row.depth as f32 * 14.0);
-        let label = icons::label(row.icon, &row.name);
+        let display_name = compact_middle(&row.name, dock_label_limit(row.depth));
+        let label = icons::label(row.icon, &display_name);
+        let label_was_compacted = display_name != row.name;
         if row.folder {
-            ui.label(RichText::new(label).color(STUDIO_TEXT_WEAK));
-        } else if ui
-            .selectable_label(row.resource == selected_resource, label)
-            .clicked()
-        {
-            clicked = true;
+            let response = ui.label(RichText::new(label).color(STUDIO_TEXT_WEAK));
+            if label_was_compacted {
+                response.on_hover_text(row.name.clone());
+            }
+        } else {
+            let response = ui.selectable_label(row.resource == selected_resource, label);
+            if response.clicked() {
+                clicked = true;
+            }
+            if label_was_compacted {
+                response.on_hover_text(row.name.clone());
+            }
         }
     });
     clicked
@@ -9821,6 +10736,46 @@ mod tests {
     }
 
     #[test]
+    fn scene_tree_select_clears_inspector_shadow_selection() {
+        let mut workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let scene = workspace.project.active_scene();
+        let room = scene
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Room { .. }))
+            .expect("starter scene has a Room")
+            .id;
+        let spawn = scene
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::SpawnPoint { .. }))
+            .expect("starter scene has a SpawnPoint")
+            .id;
+        let resource = workspace
+            .project
+            .resources
+            .first()
+            .expect("starter project has resources")
+            .id;
+
+        workspace.selected_node = NodeId::ROOT;
+        workspace.selected_resource = Some(resource);
+        workspace.selected_primitive = Some(Selection::Face(FaceRef {
+            room,
+            sx: 0,
+            sz: 0,
+            kind: FaceKind::Floor,
+        }));
+
+        workspace.apply_tree_action(TreeAction::Select(spawn));
+
+        assert_eq!(workspace.selected_node, spawn);
+        assert_eq!(workspace.selected_primitive, None);
+        assert_eq!(workspace.selected_resource, None);
+    }
+
+    #[test]
     fn collect_entity_bounds_covers_starter_scene_entities() {
         let workspace =
             EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
@@ -9883,6 +10838,17 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.name == "brick.mat" && row.resource.is_some()));
+    }
+
+    #[test]
+    fn compact_middle_keeps_long_asset_names_dock_sized() {
+        let name = "meshy_ai_obsidian_wraith_biped_meshy_ai_meshy_merged_animations.psxmdl";
+        let compact = compact_middle(name, 32);
+
+        assert!(compact.chars().count() <= 32);
+        assert!(compact.starts_with("meshy_ai"));
+        assert!(compact.ends_with(".psxmdl"));
+        assert!(compact.contains("..."));
     }
 
     #[test]

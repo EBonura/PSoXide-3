@@ -207,7 +207,7 @@ pub fn camera_relative_move_axes(
     let local_forward = scaled_mag.mul_ratio(forward as i32, mag);
 
     let forward_yaw = camera_yaw.add(Angle::HALF);
-    let right_yaw = forward_yaw.add(Angle::QUARTER);
+    let right_yaw = forward_yaw.sub(Angle::QUARTER);
     let world_x = forward_yaw
         .sin()
         .mul_q12(local_forward)
@@ -306,7 +306,10 @@ mod tests {
 
     #[test]
     fn strafe_right_matches_screen_right() {
-        let movement = camera_relative_move(AXIS_MAX, 0, Angle::HALF, DEADZONE, AXIS_MAX);
+        // Camera yaw is the orbit direction from the player to the
+        // camera. At ZERO the camera is north of the player, looking
+        // south, so screen-right is world +X.
+        let movement = camera_relative_move(AXIS_MAX, 0, Angle::ZERO, DEADZONE, AXIS_MAX);
         assert_eq!(
             movement,
             CameraRelativeMove {
@@ -316,7 +319,9 @@ mod tests {
             }
         );
 
-        let movement = camera_relative_move(AXIS_MAX, 0, Angle::ZERO, DEADZONE, AXIS_MAX);
+        // At HALF the camera is south of the player, looking north,
+        // so screen-right is world -X.
+        let movement = camera_relative_move(AXIS_MAX, 0, Angle::HALF, DEADZONE, AXIS_MAX);
         assert_eq!(
             movement,
             CameraRelativeMove {
@@ -328,9 +333,45 @@ mod tests {
     }
 
     #[test]
+    fn strafe_right_matches_screen_right_on_all_cardinal_camera_yaws() {
+        assert_eq!(
+            camera_relative_move(AXIS_MAX, 0, Angle::ZERO, DEADZONE, AXIS_MAX),
+            CameraRelativeMove {
+                x: Q12::ONE,
+                z: Q12::ZERO,
+                forward: 0,
+            }
+        );
+        assert_eq!(
+            camera_relative_move(AXIS_MAX, 0, Angle::QUARTER, DEADZONE, AXIS_MAX),
+            CameraRelativeMove {
+                x: Q12::ZERO,
+                z: Q12::NEG_ONE,
+                forward: 0,
+            }
+        );
+        assert_eq!(
+            camera_relative_move(AXIS_MAX, 0, Angle::HALF, DEADZONE, AXIS_MAX),
+            CameraRelativeMove {
+                x: Q12::NEG_ONE,
+                z: Q12::ZERO,
+                forward: 0,
+            }
+        );
+        assert_eq!(
+            camera_relative_move(AXIS_MAX, 0, Angle::THREE_QUARTER, DEADZONE, AXIS_MAX),
+            CameraRelativeMove {
+                x: Q12::ZERO,
+                z: Q12::ONE,
+                forward: 0,
+            }
+        );
+    }
+
+    #[test]
     fn diagonal_input_is_normalized() {
         let movement = camera_relative_move(AXIS_MAX, AXIS_MAX, Angle::HALF, DEADZONE, AXIS_MAX);
-        assert!(movement.x.raw() > 2800 && movement.x.raw() < 3000);
+        assert!(movement.x.raw() < -2800 && movement.x.raw() > -3000);
         assert!(movement.z.raw() > 2800 && movement.z.raw() < 3000);
         assert_eq!(movement.forward, 1);
     }

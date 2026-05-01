@@ -12,5 +12,7 @@ egui = "0.31"
 # editor-workspace `workspace = true` it doesn't have. Same trick
 # psx-engine uses for its sdk crates.
 psx-asset = { path = "../../../sdk/crates/psx-asset" }
+psx-engine = { path = "../../../engine/crates/psx-engine" }
 psx-gte = { path = "../../../sdk/crates/psx-gte" }
 psxed-project = { path = "../psxed-project" }
+rfd = { version = "0.15", default-features = false }

@@ -41,6 +41,8 @@
 //!   --texture-depth 4|8|15  Target texture depth (default 8).
 //!   --anim-fps N          Fixed animation sample rate (default 15).
 //!   --world-height N      Suggested engine/world height (default 1024).
+//!   --center-animation-root
+//!                         Freeze root-joint translation while sampling clips.
 //! ```
 //!
 //! ## `tex` -- PNG/JPG → `.psxt`
@@ -126,6 +128,7 @@ GLB-MODEL SUBCOMMAND:
                           [--texture-depth 4|8|15] (default 8)
                           [--anim-fps N]           (default 15)
                           [--world-height N]       (default 1024)
+                          [--center-animation-root]
 
 TEX SUBCOMMAND:
     psxed tex <input.png|.jpg|.bmp> -o <output.psxt>
@@ -298,6 +301,7 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
     let mut texture_depth = psxed_format::texture::Depth::Bit8;
     let mut animation_fps: u16 = 15;
     let mut world_height: u16 = 1024;
+    let mut normalize_root_translation = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -352,6 +356,9 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| format!("invalid --world-height value: {val}"))?;
             }
+            "--center-animation-root" | "--normalize-root-translation" => {
+                normalize_root_translation = true;
+            }
             a if a.starts_with('-') => {
                 return Err(format!("unknown flag: {a}\n\n{USAGE}"));
             }
@@ -375,6 +382,7 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
         texture_depth,
         animation_fps,
         world_height,
+        normalize_root_translation,
     };
     let package =
         psxed_gltf::convert_rigid_model_path(&input, &cfg).map_err(|e| format!("convert: {e}"))?;
