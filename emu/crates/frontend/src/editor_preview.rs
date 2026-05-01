@@ -265,10 +265,10 @@ fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) -> psx_en
     psx_engine::WorldCamera::from_basis(
         psx_engine::WorldProjection::new(SCREEN_CX as i16, SCREEN_CY as i16, PROJ_H, 32),
         psx_engine::WorldVertex::new(cam_x, cam_y, cam_z),
-        sin_y,
-        cos_y,
-        sin_p,
-        cos_p,
+        psx_engine::Q12::from_raw(sin_y),
+        psx_engine::Q12::from_raw(cos_y),
+        psx_engine::Q12::from_raw(sin_p),
+        psx_engine::Q12::from_raw(cos_p),
     )
 }
 

@@ -6,9 +6,7 @@
 //! Inputs are intent-shaped rather than pad-shaped so callers can feed
 //! either player controls or future behaviour-tree output.
 
-use psx_math::{cos_q12, sin_q12};
-
-use crate::{RoomCollision, WorldVertex};
+use crate::{Angle, RoomCollision, RoomPoint, Q12};
 
 const DEFAULT_STAMINA_MAX_Q12: i32 = 4096;
 const SPLIT_NE_SW: u8 = 1;
@@ -23,8 +21,8 @@ pub struct CharacterMotorConfig {
     pub walk_speed: i32,
     /// Sprint speed in world units per frame.
     pub run_speed: i32,
-    /// Turn speed in 4096-units-per-turn angle space, per frame.
-    pub yaw_step_q12: u16,
+    /// Turn speed per frame.
+    pub yaw_step: Angle,
     /// Maximum stamina, in Q12-style arbitrary units.
     pub stamina_max_q12: i32,
     /// Minimum stamina required to start sprinting.
@@ -57,17 +55,12 @@ pub struct CharacterMotorConfig {
 
 impl CharacterMotorConfig {
     /// Build a motor config from authored Character movement fields.
-    pub const fn character(
-        radius: i32,
-        walk_speed: i32,
-        run_speed: i32,
-        yaw_step_q12: u16,
-    ) -> Self {
+    pub const fn character(radius: i32, walk_speed: i32, run_speed: i32, yaw_step: Angle) -> Self {
         Self {
             radius,
             walk_speed,
             run_speed,
-            yaw_step_q12,
+            yaw_step,
             stamina_max_q12: DEFAULT_STAMINA_MAX_Q12,
             sprint_min_q12: 384,
             sprint_drain_q12: 48,
@@ -93,14 +86,14 @@ pub struct CharacterMotorInput {
     pub turn: i8,
     /// Signed forward/back intent. Negative backs up, positive walks forward.
     pub walk: i8,
-    /// World-space analog X movement intent in Q12 units. `4096`
-    /// is full-strength movement to +X. When either analog movement
+    /// World-space analog X movement intent. [`Q12::ONE`] is
+    /// full-strength movement to +X. When either analog movement
     /// component is non-zero, the motor uses this vector instead of
     /// tank-style `turn` / `walk`.
-    pub move_x_q12: i16,
-    /// World-space analog Z movement intent in Q12 units. `4096`
-    /// is full-strength movement to +Z.
-    pub move_z_q12: i16,
+    pub move_x: Q12,
+    /// World-space analog Z movement intent. [`Q12::ONE`] is
+    /// full-strength movement to +Z.
+    pub move_z: Q12,
     /// True while the actor wants to spend stamina on sprinting.
     pub sprint: bool,
     /// Rising-edge evade request. The motor chooses roll vs backstep
@@ -145,9 +138,9 @@ pub enum CharacterMotorAnim {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CharacterMotorFrame {
     /// Current root position.
-    pub position: WorldVertex,
-    /// Current facing yaw in 4096-units-per-turn angle space.
-    pub yaw_q12: u16,
+    pub position: RoomPoint,
+    /// Current facing yaw.
+    pub yaw: Angle,
     /// Animation intent for this frame.
     pub anim: CharacterMotorAnim,
     /// Current fixed action, if any.
@@ -169,35 +162,35 @@ pub struct CharacterMotorFrame {
 /// Runtime character motor state.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CharacterMotorState {
-    position: WorldVertex,
-    yaw_q12: u16,
+    position: RoomPoint,
+    yaw: Angle,
     stamina_q12: i32,
     action: CharacterMotorAction,
     action_frame: u8,
-    action_yaw_q12: u16,
+    action_yaw: Angle,
 }
 
 impl CharacterMotorState {
     /// Create a motor at a root position and yaw.
-    pub const fn new(position: WorldVertex, yaw_q12: u16) -> Self {
+    pub const fn new(position: RoomPoint, yaw: Angle) -> Self {
         Self {
             position,
-            yaw_q12,
+            yaw,
             stamina_q12: DEFAULT_STAMINA_MAX_Q12,
             action: CharacterMotorAction::Idle,
             action_frame: 0,
-            action_yaw_q12: yaw_q12,
+            action_yaw: yaw,
         }
     }
 
     /// Reset position, yaw, stamina, and any in-progress action.
-    pub fn snap_to(&mut self, position: WorldVertex, yaw_q12: u16) {
+    pub fn snap_to(&mut self, position: RoomPoint, yaw: Angle) {
         self.position = position;
-        self.yaw_q12 = yaw_q12;
+        self.yaw = yaw;
         self.stamina_q12 = DEFAULT_STAMINA_MAX_Q12;
         self.action = CharacterMotorAction::Idle;
         self.action_frame = 0;
-        self.action_yaw_q12 = yaw_q12;
+        self.action_yaw = yaw;
     }
 
     /// Advance the motor by one frame.
@@ -219,8 +212,8 @@ impl CharacterMotorState {
             return self.update_action(collision, config);
         }
 
-        if let Some((move_x_q12, move_z_q12, move_mag_q12)) = analog_move_vector(input) {
-            self.yaw_q12 = yaw_from_vector_q12(move_x_q12, move_z_q12);
+        if let Some((move_x, move_z, move_mag)) = analog_move_vector(input) {
+            self.yaw = yaw_from_vector(move_x, move_z);
             let wants_sprint = input.sprint;
             let sprinting = wants_sprint && self.stamina_q12 >= config.sprint_min_q12;
             let base_speed = if sprinting {
@@ -228,9 +221,9 @@ impl CharacterMotorState {
             } else {
                 config.walk_speed
             };
-            let speed = q12_mul_i32(base_speed, move_mag_q12);
+            let speed = move_mag.mul_i32(base_speed);
             let (moved, blocked) =
-                self.try_move_vector(collision, move_x_q12, move_z_q12, speed, config.radius);
+                self.try_move_vector(collision, move_x, move_z, speed, config.radius);
 
             if sprinting && moved {
                 self.stamina_q12 = self
@@ -261,9 +254,9 @@ impl CharacterMotorState {
         }
 
         if input.turn > 0 {
-            self.yaw_q12 = self.yaw_q12.wrapping_add(config.yaw_step_q12);
+            self.yaw = self.yaw.add(config.yaw_step);
         } else if input.turn < 0 {
-            self.yaw_q12 = self.yaw_q12.wrapping_sub(config.yaw_step_q12);
+            self.yaw = self.yaw.sub(config.yaw_step);
         }
 
         let moving_intent = input.walk != 0;
@@ -312,13 +305,13 @@ impl CharacterMotorState {
     }
 
     /// Current root position.
-    pub const fn position(&self) -> WorldVertex {
+    pub const fn position(&self) -> RoomPoint {
         self.position
     }
 
     /// Current facing yaw.
-    pub const fn yaw_q12(&self) -> u16 {
-        self.yaw_q12
+    pub const fn yaw(&self) -> Angle {
+        self.yaw
     }
 
     /// Current stamina value.
@@ -333,8 +326,8 @@ impl CharacterMotorState {
 
     fn try_start_evade(&mut self, input: CharacterMotorInput, config: CharacterMotorConfig) {
         let analog = analog_move_vector(input);
-        if let Some((move_x_q12, move_z_q12, _)) = analog {
-            self.yaw_q12 = yaw_from_vector_q12(move_x_q12, move_z_q12);
+        if let Some((move_x, move_z, _)) = analog {
+            self.yaw = yaw_from_vector(move_x, move_z);
         }
         let action = if analog.is_none() && input.walk < 0 {
             CharacterMotorAction::Backstep
@@ -352,7 +345,7 @@ impl CharacterMotorState {
         self.stamina_q12 -= cost;
         self.action = action;
         self.action_frame = 0;
-        self.action_yaw_q12 = self.yaw_q12;
+        self.action_yaw = self.yaw;
     }
 
     fn update_action(
@@ -368,7 +361,7 @@ impl CharacterMotorState {
 
         let (moved, blocked) = if active {
             let signed_speed = profile.speed.saturating_mul(profile.direction as i32);
-            self.try_move_at_yaw(collision, self.action_yaw_q12, signed_speed, config.radius)
+            self.try_move_at_yaw(collision, self.action_yaw, signed_speed, config.radius)
         } else {
             (false, false)
         };
@@ -396,29 +389,29 @@ impl CharacterMotorState {
         signed_speed: i32,
         radius: i32,
     ) -> (bool, bool) {
-        self.try_move_at_yaw(collision, self.yaw_q12, signed_speed, radius)
+        self.try_move_at_yaw(collision, self.yaw, signed_speed, radius)
     }
 
     fn try_move_at_yaw(
         &mut self,
         collision: Option<RoomCollision<'_, '_>>,
-        yaw_q12: u16,
+        yaw: Angle,
         signed_speed: i32,
         radius: i32,
     ) -> (bool, bool) {
         if signed_speed == 0 {
             return (false, false);
         }
-        let sin_yaw = sin_q12(yaw_q12);
-        let cos_yaw = cos_q12(yaw_q12);
-        let target = WorldVertex::new(
+        let sin_yaw = yaw.sin();
+        let cos_yaw = yaw.cos();
+        let target = RoomPoint::new(
             self.position
                 .x
-                .saturating_add((sin_yaw.saturating_mul(signed_speed)) >> 12),
+                .saturating_add(sin_yaw.mul_i32(signed_speed)),
             self.position.y,
             self.position
                 .z
-                .saturating_add((cos_yaw.saturating_mul(signed_speed)) >> 12),
+                .saturating_add(cos_yaw.mul_i32(signed_speed)),
         );
 
         let Some(room) = collision else {
@@ -428,27 +421,27 @@ impl CharacterMotorState {
         let Some(height) = stand_height(room, target.x, target.z, radius) else {
             return (false, true);
         };
-        self.position = WorldVertex::new(target.x, height, target.z);
+        self.position = target.with_y(height);
         (true, false)
     }
 
     fn try_move_vector(
         &mut self,
         collision: Option<RoomCollision<'_, '_>>,
-        move_x_q12: i32,
-        move_z_q12: i32,
+        move_x: Q12,
+        move_z: Q12,
         speed: i32,
         radius: i32,
     ) -> (bool, bool) {
         if speed == 0 {
             return (false, false);
         }
-        let dx = q12_mul_i32(move_x_q12, speed);
-        let dz = q12_mul_i32(move_z_q12, speed);
+        let dx = move_x.mul_i32(speed);
+        let dz = move_z.mul_i32(speed);
         if dx == 0 && dz == 0 {
             return (false, false);
         }
-        let target = WorldVertex::new(
+        let target = RoomPoint::new(
             self.position.x.saturating_add(dx),
             self.position.y,
             self.position.z.saturating_add(dz),
@@ -461,7 +454,7 @@ impl CharacterMotorState {
         let Some(height) = stand_height(room, target.x, target.z, radius) else {
             return (false, true);
         };
-        self.position = WorldVertex::new(target.x, height, target.z);
+        self.position = target.with_y(height);
         (true, false)
     }
 
@@ -494,7 +487,7 @@ impl CharacterMotorState {
     ) -> CharacterMotorFrame {
         CharacterMotorFrame {
             position: self.position,
-            yaw_q12: self.yaw_q12,
+            yaw: self.yaw,
             anim,
             action,
             moved,
@@ -554,7 +547,9 @@ fn normalize_config(mut config: CharacterMotorConfig) -> CharacterMotorConfig {
     config.radius = config.radius.max(0);
     config.walk_speed = config.walk_speed.max(0);
     config.run_speed = config.run_speed.max(config.walk_speed);
-    config.yaw_step_q12 = config.yaw_step_q12.max(1);
+    if config.yaw_step == Angle::ZERO {
+        config.yaw_step = Angle::from_q12(1);
+    }
     config.stamina_max_q12 = config.stamina_max_q12.max(1);
     config.sprint_min_q12 = config.sprint_min_q12.clamp(0, config.stamina_max_q12);
     config.sprint_drain_q12 = config.sprint_drain_q12.max(0);
@@ -578,9 +573,9 @@ fn normalize_config(mut config: CharacterMotorConfig) -> CharacterMotorConfig {
     config
 }
 
-fn analog_move_vector(input: CharacterMotorInput) -> Option<(i32, i32, i32)> {
-    let x = input.move_x_q12 as i32;
-    let z = input.move_z_q12 as i32;
+fn analog_move_vector(input: CharacterMotorInput) -> Option<(Q12, Q12, Q12)> {
+    let x = input.move_x.raw();
+    let z = input.move_z.raw();
     if x == 0 && z == 0 {
         return None;
     }
@@ -588,15 +583,21 @@ fn analog_move_vector(input: CharacterMotorInput) -> Option<(i32, i32, i32)> {
     if mag <= 0 {
         return None;
     }
-    if mag <= 4096 {
-        return Some((x, z, mag));
+    if mag <= Q12::SCALE {
+        return Some((input.move_x, input.move_z, Q12::from_raw(mag)));
     }
-    Some((x * 4096 / mag, z * 4096 / mag, 4096))
+    Some((
+        Q12::ONE.mul_ratio(x, mag),
+        Q12::ONE.mul_ratio(z, mag),
+        Q12::ONE,
+    ))
 }
 
-fn yaw_from_vector_q12(dx: i32, dz: i32) -> u16 {
+fn yaw_from_vector(dx: Q12, dz: Q12) -> Angle {
+    let dx = dx.raw();
+    let dz = dz.raw();
     if dx == 0 && dz == 0 {
-        return 0;
+        return Angle::ZERO;
     }
     let ax = abs_i32(dx);
     let az = abs_i32(dz);
@@ -616,11 +617,7 @@ fn yaw_from_vector_q12(dx: i32, dz: i32) -> u16 {
     } else {
         2048 + base
     };
-    (angle & 0x0FFF) as u16
-}
-
-fn q12_mul_i32(a: i32, b: i32) -> i32 {
-    a.saturating_mul(b) >> 12
+    Angle::from_q12((angle & 0x0FFF) as u16)
 }
 
 fn square_i32_saturating(value: i32) -> i32 {
@@ -735,12 +732,12 @@ mod tests {
     use super::*;
 
     fn config() -> CharacterMotorConfig {
-        CharacterMotorConfig::character(64, 32, 64, 16)
+        CharacterMotorConfig::character(64, 32, 64, Angle::from_q12(16))
     }
 
     #[test]
     fn forward_input_moves_along_yaw() {
-        let mut motor = CharacterMotorState::new(WorldVertex::ZERO, 0);
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
         let frame = motor.update(
             None,
             CharacterMotorInput {
@@ -749,14 +746,14 @@ mod tests {
             },
             config(),
         );
-        assert_eq!(frame.position, WorldVertex::new(0, 0, 32));
+        assert_eq!(frame.position, RoomPoint::new(0, 0, 32));
         assert_eq!(frame.anim, CharacterMotorAnim::Walk);
         assert!(frame.moved);
     }
 
     #[test]
     fn turn_input_wraps_yaw() {
-        let mut motor = CharacterMotorState::new(WorldVertex::ZERO, 0);
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
         let frame = motor.update(
             None,
             CharacterMotorInput {
@@ -765,67 +762,67 @@ mod tests {
             },
             config(),
         );
-        assert_eq!(frame.yaw_q12, 0u16.wrapping_sub(16));
+        assert_eq!(frame.yaw, Angle::ZERO.add_signed_q12(-16));
     }
 
     #[test]
     fn analog_vector_moves_without_tank_turning() {
-        let mut motor = CharacterMotorState::new(WorldVertex::ZERO, 0);
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
         let frame = motor.update(
             None,
             CharacterMotorInput {
-                move_x_q12: 4096,
-                move_z_q12: 0,
+                move_x: Q12::ONE,
+                move_z: Q12::ZERO,
                 walk: 1,
                 ..CharacterMotorInput::default()
             },
             config(),
         );
-        assert_eq!(frame.position, WorldVertex::new(32, 0, 0));
-        assert_eq!(frame.yaw_q12, 1024);
+        assert_eq!(frame.position, RoomPoint::new(32, 0, 0));
+        assert_eq!(frame.yaw, Angle::QUARTER);
         assert_eq!(frame.anim, CharacterMotorAnim::Walk);
         assert!(frame.moved);
     }
 
     #[test]
     fn analog_vector_scales_speed_by_magnitude() {
-        let mut motor = CharacterMotorState::new(WorldVertex::ZERO, 0);
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
         let frame = motor.update(
             None,
             CharacterMotorInput {
-                move_x_q12: 2048,
-                move_z_q12: 0,
+                move_x: Q12::HALF,
+                move_z: Q12::ZERO,
                 walk: 1,
                 ..CharacterMotorInput::default()
             },
             config(),
         );
-        assert_eq!(frame.position, WorldVertex::new(8, 0, 0));
-        assert_eq!(frame.yaw_q12, 1024);
+        assert_eq!(frame.position, RoomPoint::new(8, 0, 0));
+        assert_eq!(frame.yaw, Angle::QUARTER);
     }
 
     #[test]
     fn analog_sprint_reports_run() {
-        let mut motor = CharacterMotorState::new(WorldVertex::ZERO, 0);
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
         let frame = motor.update(
             None,
             CharacterMotorInput {
-                move_x_q12: 4096,
-                move_z_q12: 0,
+                move_x: Q12::ONE,
+                move_z: Q12::ZERO,
                 walk: 1,
                 sprint: true,
                 ..CharacterMotorInput::default()
             },
             config(),
         );
-        assert_eq!(frame.position, WorldVertex::new(64, 0, 0));
+        assert_eq!(frame.position, RoomPoint::new(64, 0, 0));
         assert_eq!(frame.anim, CharacterMotorAnim::Run);
         assert!(frame.sprinting);
     }
 
     #[test]
     fn sprint_consumes_stamina_and_reports_run() {
-        let mut motor = CharacterMotorState::new(WorldVertex::ZERO, 0);
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
         let frame = motor.update(
             None,
             CharacterMotorInput {
@@ -835,7 +832,7 @@ mod tests {
             },
             config(),
         );
-        assert_eq!(frame.position, WorldVertex::new(0, 0, 64));
+        assert_eq!(frame.position, RoomPoint::new(0, 0, 64));
         assert_eq!(frame.anim, CharacterMotorAnim::Run);
         assert!(frame.sprinting);
         assert!(frame.stamina_q12 < DEFAULT_STAMINA_MAX_Q12);
@@ -843,7 +840,7 @@ mod tests {
 
     #[test]
     fn evade_starts_roll_with_invulnerability() {
-        let mut motor = CharacterMotorState::new(WorldVertex::ZERO, 0);
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
         let frame = motor.update(
             None,
             CharacterMotorInput {
@@ -856,12 +853,12 @@ mod tests {
         assert_eq!(frame.action, CharacterMotorAction::Roll);
         assert_eq!(frame.anim, CharacterMotorAnim::Roll);
         assert!(frame.invulnerable);
-        assert_eq!(frame.position, WorldVertex::new(0, 0, 96));
+        assert_eq!(frame.position, RoomPoint::new(0, 0, 96));
     }
 
     #[test]
     fn backwards_evade_starts_backstep() {
-        let mut motor = CharacterMotorState::new(WorldVertex::ZERO, 0);
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
         let frame = motor.update(
             None,
             CharacterMotorInput {
@@ -873,6 +870,6 @@ mod tests {
         );
         assert_eq!(frame.action, CharacterMotorAction::Backstep);
         assert_eq!(frame.anim, CharacterMotorAnim::Backstep);
-        assert_eq!(frame.position, WorldVertex::new(0, 0, -72));
+        assert_eq!(frame.position, RoomPoint::new(0, 0, -72));
     }
 }

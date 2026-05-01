@@ -33,6 +33,134 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssetId(pub u16);
 
+macro_rules! typed_index {
+    ($(#[$meta:meta])* pub struct $name:ident;) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub u16);
+
+        impl $name {
+            /// Zero index.
+            pub const ZERO: Self = Self(0);
+
+            /// Build from raw manifest storage.
+            pub const fn new(raw: u16) -> Self {
+                Self(raw)
+            }
+
+            /// Return raw manifest storage.
+            pub const fn raw(self) -> u16 {
+                self.0
+            }
+
+            /// Convert to `usize` for slice indexing.
+            pub const fn to_usize(self) -> usize {
+                self.0 as usize
+            }
+        }
+    };
+}
+
+typed_index! {
+    /// Index into the generated `ROOMS` table.
+    pub struct RoomIndex;
+}
+
+typed_index! {
+    /// Index into the generated `MATERIALS` table.
+    pub struct MaterialIndex;
+}
+
+typed_index! {
+    /// Local material slot stored inside a cooked `.psxw` face.
+    pub struct MaterialSlot;
+}
+
+typed_index! {
+    /// Index into the generated `MODELS` table.
+    pub struct ModelIndex;
+}
+
+typed_index! {
+    /// Index into the generated global `MODEL_CLIPS` table.
+    pub struct ModelClipTableIndex;
+}
+
+typed_index! {
+    /// Clip index local to one model's clip slice.
+    pub struct ModelClipIndex;
+}
+
+typed_index! {
+    /// Index into the generated `CHARACTERS` table.
+    pub struct CharacterIndex;
+}
+
+typed_index! {
+    /// Runtime resource slot for entity records.
+    pub struct ResourceSlot;
+}
+
+/// Optional local model-clip index.
+///
+/// Used for both "no authored clip" character fields and "inherit
+/// the model default" model-instance fields. The named constants keep
+/// those call sites readable while preserving the compact `u16`
+/// manifest representation.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OptionalModelClipIndex(pub u16);
+
+impl OptionalModelClipIndex {
+    /// Sentinel for "no clip authored".
+    pub const NONE: Self = Self(u16::MAX);
+    /// Sentinel for "inherit the owning model's default clip".
+    pub const INHERIT: Self = Self(u16::MAX);
+
+    /// Build an optional value that contains a local clip index.
+    pub const fn some(index: ModelClipIndex) -> Self {
+        Self(index.raw())
+    }
+
+    /// Build directly from raw manifest storage.
+    pub const fn from_raw(raw: u16) -> Self {
+        Self(raw)
+    }
+
+    /// Return raw manifest storage.
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+
+    /// Return `true` when a real local clip index is present.
+    pub const fn is_some(self) -> bool {
+        self.0 != u16::MAX
+    }
+
+    /// Return `true` when this stores the sentinel value.
+    pub const fn is_none(self) -> bool {
+        self.0 == u16::MAX
+    }
+
+    /// Convert to a local clip index if present.
+    pub const fn to_option(self) -> Option<ModelClipIndex> {
+        if self.is_some() {
+            Some(ModelClipIndex(self.0))
+        } else {
+            None
+        }
+    }
+
+    /// Return the contained clip index, or `fallback` for the sentinel.
+    pub const fn unwrap_or(self, fallback: ModelClipIndex) -> ModelClipIndex {
+        match self.to_option() {
+            Some(index) => index,
+            None => fallback,
+        }
+    }
+}
+
 /// Coarse asset class -- the runtime branches on this to pick a
 /// loader (`World::from_bytes` for rooms, `Texture::from_bytes`
 /// for textures). Restricted to the variants generated *and*
@@ -98,7 +226,7 @@ pub struct LevelRoomRecord {
     pub sector_size: i32,
     /// First index into the global `MATERIALS` table for this
     /// room's material slice.
-    pub material_first: u16,
+    pub material_first: MaterialIndex,
     /// Number of `LevelMaterialRecord`s in this room's slice.
     /// Matches the cooked `.psxw`'s material count.
     pub material_count: u16,
@@ -114,10 +242,10 @@ pub struct LevelRoomRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LevelMaterialRecord {
     /// Owning room index in [`LevelRoomRecord`] order.
-    pub room: u16,
+    pub room: RoomIndex,
     /// Cooked-world local material slot. Matches the value the
     /// `.psxw` stores per-face / per-wall.
-    pub local_slot: u16,
+    pub local_slot: MaterialSlot,
     /// Texture asset bound at this slot.
     pub texture_asset: AssetId,
     /// Per-material modulation tint. Renderer multiplies the
@@ -173,7 +301,7 @@ impl LevelMaterialRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoomResidencyRecord {
     /// Owning room index.
-    pub room: u16,
+    pub room: RoomIndex,
     /// Assets that must be RAM-resident before render.
     pub required_ram: &'static [AssetId],
     /// Assets that must be VRAM-resident (uploaded textures).
@@ -192,7 +320,7 @@ pub struct RoomResidencyRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayerSpawnRecord {
     /// Owning room index.
-    pub room: u16,
+    pub room: RoomIndex,
     /// Room-local X.
     pub x: i32,
     /// Y (typically 0 for floor-anchored spawns).
@@ -222,7 +350,7 @@ pub enum EntityKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntityRecord {
     /// Owning room index.
-    pub room: u16,
+    pub room: RoomIndex,
     /// Entity kind.
     pub kind: EntityKind,
     /// Room-local X.
@@ -234,7 +362,7 @@ pub struct EntityRecord {
     /// Yaw, PSX angle units.
     pub yaw: i16,
     /// Resource slot (0 if unused -- e.g. for `Marker`).
-    pub resource_slot: u16,
+    pub resource_slot: ResourceSlot,
     /// Reserved.
     pub flags: u16,
 }
@@ -245,7 +373,7 @@ pub struct EntityRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LevelModelClipRecord {
     /// Owning model index in [`LevelModelRecord`] order.
-    pub model: u16,
+    pub model: ModelIndex,
     /// Display name -- surfaces in editor logs / debug HUDs.
     pub name: &'static str,
     /// Cooked `.psxanim` asset.
@@ -268,7 +396,7 @@ pub struct LevelModelRecord {
     /// textured animated models only.
     pub texture_asset: Option<AssetId>,
     /// First index into the global `MODEL_CLIPS` table.
-    pub clip_first: u16,
+    pub clip_first: ModelClipTableIndex,
     /// Number of clips in this model's slice.
     pub clip_count: u16,
     /// Default clip index *within this model's slice* -- runtime
@@ -276,7 +404,7 @@ pub struct LevelModelRecord {
     /// Cooker validation guarantees this resolves to a valid
     /// clip; the runtime never has to fall back to bind pose
     /// (no bind-pose path exists in this pass).
-    pub default_clip: u16,
+    pub default_clip: ModelClipIndex,
     /// Suggested world-space height (engine units) -- mirrors
     /// the `.psxmdl` header's `local_to_world` hint.
     pub world_height: u16,
@@ -290,12 +418,12 @@ pub struct LevelModelRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LevelModelInstanceRecord {
     /// Owning room index.
-    pub room: u16,
+    pub room: RoomIndex,
     /// Model index in [`LevelModelRecord`] order.
-    pub model: u16,
+    pub model: ModelIndex,
     /// Per-instance clip override, or `0xFFFF` to inherit the
     /// model's `default_clip`.
-    pub clip: u16,
+    pub clip: OptionalModelClipIndex,
     /// Room-local X.
     pub x: i32,
     /// Y.
@@ -310,7 +438,7 @@ pub struct LevelModelInstanceRecord {
 
 /// Sentinel for [`LevelModelInstanceRecord::clip`] meaning
 /// "inherit model default".
-pub const MODEL_CLIP_INHERIT: u16 = 0xFFFF;
+pub const MODEL_CLIP_INHERIT: OptionalModelClipIndex = OptionalModelClipIndex::INHERIT;
 
 /// One placed point light. Coordinates are room-local engine
 /// units (same convention as model instances and player
@@ -328,7 +456,7 @@ pub const MODEL_CLIP_INHERIT: u16 = 0xFFFF;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointLightRecord {
     /// Owning room index.
-    pub room: u16,
+    pub room: RoomIndex,
     /// Room-local X.
     pub x: i32,
     /// Y.
@@ -351,7 +479,7 @@ pub struct PointLightRecord {
 /// (`run_clip` / `turn_clip`). The runtime treats this as
 /// "no clip authored for this role" and falls back to walk /
 /// idle as appropriate.
-pub const CHARACTER_CLIP_NONE: u16 = u16::MAX;
+pub const CHARACTER_CLIP_NONE: OptionalModelClipIndex = OptionalModelClipIndex::NONE;
 
 /// Gameplay character -- backing model + role-clip mapping +
 /// capsule / camera / controller defaults. Layered on top of
@@ -363,20 +491,20 @@ pub struct LevelCharacterRecord {
     /// Index into [`LevelModelRecord`] this character renders
     /// as. The cooker guarantees this resolves; runtime trusts
     /// the contract.
-    pub model: u16,
+    pub model: ModelIndex,
     /// Idle clip index *within the model's clip slice*. The
     /// cooker rejects characters whose idle clip is out of
     /// range -- runtime never has to fall back to bind pose.
-    pub idle_clip: u16,
+    pub idle_clip: ModelClipIndex,
     /// Walk clip index within the model's clip slice. Required
     /// (same validation as `idle_clip`).
-    pub walk_clip: u16,
+    pub walk_clip: ModelClipIndex,
     /// Optional run clip index. [`CHARACTER_CLIP_NONE`] means
     /// "no run clip authored -- runtime should fall back to
     /// `walk_clip` when the controller wants to run".
-    pub run_clip: u16,
+    pub run_clip: OptionalModelClipIndex,
     /// Optional turn clip index. Same sentinel as `run_clip`.
-    pub turn_clip: u16,
+    pub turn_clip: OptionalModelClipIndex,
     /// Capsule radius in engine units. Used by collision +
     /// any future debug draw.
     pub radius: u16,
@@ -410,7 +538,7 @@ pub struct PlayerControllerRecord {
     /// runtime can look at one record to bring up the player.
     pub spawn: PlayerSpawnRecord,
     /// Index into [`LevelCharacterRecord`] driving the player.
-    pub character: u16,
+    pub character: CharacterIndex,
     /// Reserved.
     pub flags: u16,
 }
@@ -654,7 +782,7 @@ mod tests {
     fn residency_marks_missing_then_resident() {
         let mut r = ResidencyManager::<4, 4>::new();
         let room = RoomResidencyRecord {
-            room: 0,
+            room: RoomIndex::ZERO,
             required_ram: &[AssetId(0)],
             required_vram: &[AssetId(1), AssetId(2)],
             warm_ram: &[],
@@ -686,7 +814,7 @@ mod tests {
     fn residency_overflow_is_reported_not_silent() {
         let mut r = ResidencyManager::<2, 2>::new();
         let room = RoomResidencyRecord {
-            room: 0,
+            room: RoomIndex::ZERO,
             required_ram: &[AssetId(1), AssetId(2), AssetId(3)],
             required_vram: &[],
             warm_ram: &[],

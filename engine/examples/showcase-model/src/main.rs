@@ -17,9 +17,9 @@ extern crate psx_rt;
 
 use psx_asset::{Animation, Model, Texture};
 use psx_engine::{
-    button, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange, JointViewTransform,
-    Mat3I16, OtFrame, PrimitiveArena, ProjectedVertex, Scene, WorldCamera, WorldProjection,
-    WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
+    button, Angle, App, Config, Ctx, CullMode, DepthBand, DepthPolicy, DepthRange,
+    JointViewTransform, Mat3I16, OtFrame, PrimitiveArena, ProjectedVertex, Scene, WorldCamera,
+    WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
@@ -147,9 +147,9 @@ const CAMERA_RADIUS_START: i32 = 2048;
 const CAMERA_RADIUS_MIN: i32 = 1152;
 const CAMERA_RADIUS_MAX: i32 = 4096;
 const CAMERA_RADIUS_STEP: i32 = 128;
-const CAMERA_YAW_STEP_PER_VBLANK: u16 = 32;
-const CAMERA_PITCH_STEP_PER_VBLANK: u16 = 24;
-const CAMERA_PITCH_START: u16 = 350;
+const CAMERA_YAW_STEP_PER_VBLANK_Q12: i16 = 32;
+const CAMERA_PITCH_STEP_PER_VBLANK_Q12: i16 = 24;
+const CAMERA_PITCH_START: Angle = Angle::from_q12(350);
 const WORLD_DEPTH_RANGE: DepthRange =
     DepthRange::new(NEAR_Z, CAMERA_RADIUS_MAX + MODEL_WORLD_HEIGHT * 2);
 
@@ -179,8 +179,8 @@ struct ModelShowcase {
     model: Option<Model<'static>>,
     animations: [Option<Animation<'static>>; MAX_CLIPS],
     clip_origin_vblanks: u32,
-    camera_yaw: u16,
-    camera_pitch: u16,
+    camera_yaw: Angle,
+    camera_pitch: Angle,
     camera_radius: i32,
     font: Option<FontAtlas>,
 }
@@ -209,22 +209,22 @@ impl Scene for ModelShowcase {
         if ctx.is_held(button::LEFT) {
             self.camera_yaw = self
                 .camera_yaw
-                .wrapping_sub(scale_u16(CAMERA_YAW_STEP_PER_VBLANK, dt));
+                .add_signed_q12(-scale_i16(CAMERA_YAW_STEP_PER_VBLANK_Q12, dt));
         }
         if ctx.is_held(button::RIGHT) {
             self.camera_yaw = self
                 .camera_yaw
-                .wrapping_add(scale_u16(CAMERA_YAW_STEP_PER_VBLANK, dt));
+                .add_signed_q12(scale_i16(CAMERA_YAW_STEP_PER_VBLANK_Q12, dt));
         }
         if ctx.is_held(button::UP) {
             self.camera_pitch = self
                 .camera_pitch
-                .wrapping_add(scale_u16(CAMERA_PITCH_STEP_PER_VBLANK, dt));
+                .add_signed_q12(scale_i16(CAMERA_PITCH_STEP_PER_VBLANK_Q12, dt));
         }
         if ctx.is_held(button::DOWN) {
             self.camera_pitch = self
                 .camera_pitch
-                .wrapping_sub(scale_u16(CAMERA_PITCH_STEP_PER_VBLANK, dt));
+                .add_signed_q12(-scale_i16(CAMERA_PITCH_STEP_PER_VBLANK_Q12, dt));
         }
         if ctx.is_held(button::TRIANGLE) {
             self.camera_radius =
@@ -298,7 +298,7 @@ impl ModelShowcase {
             model: None,
             animations: [const { None }; MAX_CLIPS],
             clip_origin_vblanks: 0,
-            camera_yaw: 0,
+            camera_yaw: Angle::ZERO,
             camera_pitch: CAMERA_PITCH_START,
             camera_radius: CAMERA_RADIUS_START,
             font: None,
@@ -334,8 +334,9 @@ impl ModelShowcase {
     }
 }
 
-fn scale_u16(value: u16, scale: u16) -> u16 {
-    value.saturating_mul(scale)
+fn scale_i16(value: i16, scale: u16) -> i16 {
+    let scaled = (value as i32).saturating_mul(scale as i32);
+    scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 fn scale_i32(value: i32, scale: u16) -> i32 {

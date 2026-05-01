@@ -14,8 +14,8 @@ extern crate psx_rt;
 
 use psx_asset::Texture;
 use psx_engine::{
-    button, App, Config, Ctx, CullMode, DepthBand, DepthRange, OtFrame, PrimitiveArena, Scene,
-    WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
+    button, Angle, App, Config, Ctx, CullMode, DepthBand, DepthRange, OtFrame, PrimitiveArena,
+    Scene, WorldCamera, WorldProjection, WorldRenderPass, WorldSurfaceOptions, WorldTriCommand,
     WorldVertex,
 };
 use psx_font::{fonts::BASIC, FontAtlas};
@@ -57,8 +57,8 @@ const CAMERA_START_RADIUS: i32 = 260;
 const CAMERA_RADIUS_MIN: i32 = 150;
 const CAMERA_RADIUS_MAX: i32 = 900;
 const CAMERA_RADIUS_STEP: i32 = 12;
-const CAMERA_START_YAW: u16 = 220;
-const CAMERA_YAW_STEP: u16 = 12;
+const CAMERA_START_YAW: Angle = Angle::from_q12(220);
+const CAMERA_YAW_STEP_Q12: i16 = 12;
 
 const ROOM_HALF: i32 = 300;
 const WALL_TOP: i32 = 176;
@@ -98,7 +98,7 @@ struct Showcase {
     font: Option<FontAtlas>,
     sample_idx: u8,
     blend_idx: u8,
-    camera_yaw: u16,
+    camera_yaw: Angle,
     camera_radius: i32,
 }
 
@@ -110,10 +110,10 @@ impl Scene for Showcase {
 
     fn update(&mut self, ctx: &mut Ctx) {
         if ctx.is_held(button::RIGHT) {
-            self.camera_yaw = self.camera_yaw.wrapping_add(CAMERA_YAW_STEP);
+            self.camera_yaw = self.camera_yaw.add_signed_q12(CAMERA_YAW_STEP_Q12);
         }
         if ctx.is_held(button::LEFT) {
-            self.camera_yaw = self.camera_yaw.wrapping_sub(CAMERA_YAW_STEP);
+            self.camera_yaw = self.camera_yaw.add_signed_q12(-CAMERA_YAW_STEP_Q12);
         }
         if ctx.is_held(button::UP) {
             self.camera_radius = (self.camera_radius - CAMERA_RADIUS_STEP).max(CAMERA_RADIUS_MIN);
@@ -270,7 +270,7 @@ fn upload_blend_clut(rect: VramRect, bytes: &[u8]) {
     upload_bytes(rect, &marked[..bytes.len()]);
 }
 
-fn camera_for(yaw: u16, radius: i32) -> WorldCamera {
+fn camera_for(yaw: Angle, radius: i32) -> WorldCamera {
     WorldCamera::orbit_yaw(
         PROJECTION,
         WorldVertex::new(CAMERA_TARGET_X, CAMERA_TARGET_Y, CAMERA_TARGET_Z),

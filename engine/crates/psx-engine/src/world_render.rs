@@ -10,7 +10,7 @@
 use psx_gpu::{material::TextureMaterial, prim::TriTextured};
 
 use crate::{
-    render3d::CullMode, PrimitiveArena, RoomRender, WorldCamera, WorldRenderPass,
+    render3d::CullMode, PrimitiveArena, RoomPoint, RoomRender, WorldCamera, WorldRenderPass,
     WorldSurfaceOptions, WorldVertex,
 };
 
@@ -98,7 +98,7 @@ pub struct WorldSurfaceSample {
     pub sz: u16,
     /// Surface centre in the same room-local world coordinates as
     /// the emitted vertices.
-    pub center: WorldVertex,
+    pub center: RoomPoint,
 }
 
 /// Hook used by [`draw_room_lit`] to vary material tint per room
@@ -589,10 +589,10 @@ const fn cell_bounds(sx: u16, sz: u16, sector_size: i32) -> (i32, i32, i32, i32)
     (x0, x1, z0, z1)
 }
 
-fn horizontal_face_center(sx: u16, sz: u16, sector_size: i32, heights: [i32; 4]) -> WorldVertex {
+fn horizontal_face_center(sx: u16, sz: u16, sector_size: i32, heights: [i32; 4]) -> RoomPoint {
     let (x0, x1, z0, z1) = cell_bounds(sx, sz, sector_size);
     let cy = average4_i32(heights[0], heights[1], heights[2], heights[3]);
-    WorldVertex::new((x0 + x1) / 2, cy, (z0 + z1) / 2)
+    RoomPoint::new((x0 + x1) / 2, cy, (z0 + z1) / 2)
 }
 
 fn wall_face_center(
@@ -601,9 +601,9 @@ fn wall_face_center(
     sector_size: i32,
     direction: u8,
     heights: [i32; 4],
-) -> Option<WorldVertex> {
+) -> Option<RoomPoint> {
     let verts = inward_wall_vertices(sx, sz, sector_size, direction, heights)?;
-    Some(WorldVertex::new(
+    Some(RoomPoint::new(
         average4_i32(verts[0].x, verts[1].x, verts[2].x, verts[3].x),
         average4_i32(verts[0].y, verts[1].y, verts[2].y, verts[3].y),
         average4_i32(verts[0].z, verts[1].z, verts[2].z, verts[3].z),
@@ -663,7 +663,8 @@ fn reverse_quad_winding<T: Copy>(corners: [T; 4]) -> [T; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProjectedVertex, WorldProjection};
+    use crate::Angle;
+    use crate::{ProjectedVertex, WorldProjection, Q12};
 
     /// Helper: the two indices both triangles in `[t0, t1]`
     /// share form the diagonal of the split. Returned sorted
@@ -742,19 +743,47 @@ mod tests {
         let cases = [
             (
                 DIR_NORTH,
-                WorldCamera::from_basis(projection, center, 0, 4096, 0, 4096),
+                WorldCamera::from_basis(
+                    projection,
+                    center,
+                    Q12::ZERO,
+                    Q12::ONE,
+                    Q12::ZERO,
+                    Q12::ONE,
+                ),
             ),
             (
                 DIR_EAST,
-                WorldCamera::from_basis(projection, center, -4096, 0, 0, 4096),
+                WorldCamera::from_basis(
+                    projection,
+                    center,
+                    Q12::NEG_ONE,
+                    Q12::ZERO,
+                    Q12::ZERO,
+                    Q12::ONE,
+                ),
             ),
             (
                 DIR_SOUTH,
-                WorldCamera::from_basis(projection, center, 0, -4096, 0, 4096),
+                WorldCamera::from_basis(
+                    projection,
+                    center,
+                    Q12::ZERO,
+                    Q12::NEG_ONE,
+                    Q12::ZERO,
+                    Q12::ONE,
+                ),
             ),
             (
                 DIR_WEST,
-                WorldCamera::from_basis(projection, center, 4096, 0, 0, 4096),
+                WorldCamera::from_basis(
+                    projection,
+                    center,
+                    Q12::ONE,
+                    Q12::ZERO,
+                    Q12::ZERO,
+                    Q12::ONE,
+                ),
             ),
         ];
 
@@ -776,8 +805,13 @@ mod tests {
     #[test]
     fn floors_face_playable_interior() {
         let projection = WorldProjection::new(160, 120, 200, 16);
-        let camera =
-            WorldCamera::orbit_yaw(projection, WorldVertex::new(512, 0, 512), 1100, 2048, 0);
+        let camera = WorldCamera::orbit_yaw(
+            projection,
+            WorldVertex::new(512, 0, 512),
+            1100,
+            2048,
+            Angle::ZERO,
+        );
         let verts = [
             WorldVertex::new(0, 0, 0),
             WorldVertex::new(1024, 0, 0),
@@ -809,7 +843,7 @@ mod tests {
     fn horizontal_face_center_uses_cell_midpoint_and_average_height() {
         assert_eq!(
             horizontal_face_center(2, 3, 1024, [0, 512, 1024, 512]),
-            WorldVertex::new(2560, 512, 3584)
+            RoomPoint::new(2560, 512, 3584)
         );
     }
 
@@ -817,11 +851,11 @@ mod tests {
     fn wall_face_center_uses_emitted_runtime_wall_geometry() {
         assert_eq!(
             wall_face_center(0, 0, 1024, DIR_EAST, [0, 0, 1024, 1024]),
-            Some(WorldVertex::new(1024, 512, 512))
+            Some(RoomPoint::new(1024, 512, 512))
         );
         assert_eq!(
             wall_face_center(0, 0, 1024, DIR_NORTH, [0, 0, 1024, 1024]),
-            Some(WorldVertex::new(512, 512, 0))
+            Some(RoomPoint::new(512, 512, 0))
         );
     }
 

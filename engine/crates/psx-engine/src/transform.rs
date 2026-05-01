@@ -45,14 +45,17 @@
 //!
 //! # Scale semantics
 //!
-//! `ActorTransform::scale` is a **uniform** Q3.12 factor. `0x1000`
-//! is 1.0× (identity); `0x0800` halves mesh size, `0x2000` doubles
-//! it, and so on. Non-uniform (per-axis) scale is deliberately out
-//! of scope -- every engine example that's wanted scale so far has
-//! wanted it uniform, and folding per-axis scale into the rotation
-//! matrix interacts badly with normal transforms (distorts
-//! lighting). If a non-uniform case comes up later, we add it; in
-//! the meantime this keeps the type narrow.
+//! `ActorTransform::scale` is a **uniform** [`Q12`] factor.
+//! [`Q12::ONE`] is 1.0× (identity); `Q12::from_raw(0x0800)` halves
+//! mesh size, `Q12::from_raw(0x2000)` doubles it, and so on.
+//! Non-uniform (per-axis) scale is deliberately out of scope -- every
+//! engine example that's wanted scale so far has wanted it uniform,
+//! and folding per-axis scale into the rotation matrix interacts
+//! badly with normal transforms (distorts lighting). If a non-uniform
+//! case comes up later, we add it; in the meantime this keeps the type
+//! narrow.
+
+use crate::Q12;
 
 use psx_gte::math::{Mat3I16, Vec3I32};
 use psx_gte::scene;
@@ -151,11 +154,11 @@ pub struct ActorTransform {
     /// matrix -- composable through [`Mat3I16::mul`] when building
     /// multi-axis tumbles on the way in.
     pub rotation: Mat3I16,
-    /// Uniform scale, Q3.12. `0x1000` = 1.0× (identity). The
+    /// Uniform scale, Q3.12. [`Q12::ONE`] = 1.0× (identity). The
     /// [`load_gte`][Self::load_gte] path multiplies this into each
     /// cell of `rotation` before uploading, so the vertex shader
     /// path runs at "just rotation" cost.
-    pub scale: i16,
+    pub scale: Q12,
 }
 
 impl ActorTransform {
@@ -165,7 +168,7 @@ impl ActorTransform {
     pub const IDENTITY: ActorTransform = ActorTransform {
         position: Vec3World::ZERO,
         rotation: Mat3I16::IDENTITY,
-        scale: 0x1000,
+        scale: Q12::ONE,
     };
 
     /// Start from [`Self::IDENTITY`] at the given world position.
@@ -177,7 +180,7 @@ impl ActorTransform {
         ActorTransform {
             position,
             rotation: Mat3I16::IDENTITY,
-            scale: 0x1000,
+            scale: Q12::ONE,
         }
     }
 
@@ -190,12 +193,20 @@ impl ActorTransform {
         self
     }
 
-    /// Replace the uniform scale. `0x1000` = 1.0×, `0x0800` = 0.5×,
-    /// `0x2000` = 2.0×. Naming is `_q12` so the caller can't miss
-    /// the fixed-point contract.
+    /// Replace the uniform scale.
+    #[inline]
+    pub const fn with_scale(mut self, scale: Q12) -> ActorTransform {
+        self.scale = scale;
+        self
+    }
+
+    /// Replace the uniform scale from raw Q12 storage.
+    ///
+    /// Kept for generated/example code that still stores scale as a
+    /// raw header value.
     #[inline]
     pub const fn with_scale_q12(mut self, scale_q12: i16) -> ActorTransform {
-        self.scale = scale_q12;
+        self.scale = Q12::from_raw_i16(scale_q12);
         self
     }
 
@@ -210,7 +221,7 @@ impl ActorTransform {
     /// CPU and GTE paths see bit-identical matrices.
     #[inline]
     pub fn scaled_rotation(&self) -> Mat3I16 {
-        scale_mat_uniform(&self.rotation, self.scale as i32)
+        scale_mat_uniform(&self.rotation, self.scale)
     }
 
     /// Compose `rotation × uniform_scale` and upload along with the
@@ -240,7 +251,7 @@ impl ActorTransform {
 /// it's engine-policy scaling math, not a hardware-register
 /// abstraction, so it stays in the engine crate alongside
 /// [`ActorTransform`].
-fn scale_mat_uniform(m: &Mat3I16, scale_q12: i32) -> Mat3I16 {
+fn scale_mat_uniform(m: &Mat3I16, scale: Q12) -> Mat3I16 {
     let mut out = [[0i16; 3]; 3];
     // Unrolled 3×3 keeps the code-path branchless + inline-friendly.
     // Values pre-shift fit in `i32` (16-bit × 16-bit); the Q3.12
@@ -249,7 +260,7 @@ fn scale_mat_uniform(m: &Mat3I16, scale_q12: i32) -> Mat3I16 {
     while i < 3 {
         let mut j = 0;
         while j < 3 {
-            let v = ((m.m[i][j] as i32) * scale_q12) >> 12;
+            let v = scale.mul_i32(m.m[i][j] as i32);
             // Clamp to `i16` so pathologically large scale factors
             // saturate cleanly instead of wrapping.
             out[i][j] = if v > i16::MAX as i32 {
@@ -315,7 +326,7 @@ mod tests {
         let t = ActorTransform::IDENTITY;
         assert_eq!(t.position, Vec3World::ZERO);
         assert_eq!(t.rotation, Mat3I16::IDENTITY);
-        assert_eq!(t.scale, 0x1000);
+        assert_eq!(t.scale, Q12::ONE);
     }
 
     #[test]
@@ -324,7 +335,7 @@ mod tests {
         let t = ActorTransform::at(p);
         assert_eq!(t.position, p);
         assert_eq!(t.rotation, Mat3I16::IDENTITY);
-        assert_eq!(t.scale, 0x1000);
+        assert_eq!(t.scale, Q12::ONE);
     }
 
     #[test]
@@ -336,7 +347,10 @@ mod tests {
         // `scaled_rotation` must return exactly what `load_gte`
         // would upload -- i.e. the same byte output the old hand-
         // rolled `scale_mat` helpers produced.
-        assert_eq!(t.scaled_rotation(), scale_mat_uniform(&rot, 0x0800));
+        assert_eq!(
+            t.scaled_rotation(),
+            scale_mat_uniform(&rot, Q12::from_raw(0x0800))
+        );
     }
 
     #[test]
@@ -359,7 +373,7 @@ mod tests {
         assert_eq!(t.position.y, 0x2000);
         assert_eq!(t.position.z, 0x3000);
         assert_eq!(t.rotation, rot);
-        assert_eq!(t.scale, 0x0800);
+        assert_eq!(t.scale, Q12::from_raw(0x0800));
     }
 
     // ------------------------------------------------------------------
@@ -369,13 +383,13 @@ mod tests {
     #[test]
     fn scale_mat_uniform_identity_scale_preserves_matrix() {
         let rot = Mat3I16::rotate_y(32);
-        let out = scale_mat_uniform(&rot, 0x1000);
+        let out = scale_mat_uniform(&rot, Q12::ONE);
         assert_eq!(out, rot, "scaling by 1.0× must not change any cell");
     }
 
     #[test]
     fn scale_mat_uniform_half_shrinks_every_cell() {
-        let out = scale_mat_uniform(&Mat3I16::IDENTITY, 0x0800);
+        let out = scale_mat_uniform(&Mat3I16::IDENTITY, Q12::from_raw(0x0800));
         // 0x1000 × 0x0800 >> 12 = 0x0800.
         assert_eq!(out.m[0][0], 0x0800);
         assert_eq!(out.m[1][1], 0x0800);
@@ -387,7 +401,7 @@ mod tests {
 
     #[test]
     fn scale_mat_uniform_double_grows_diagonal() {
-        let out = scale_mat_uniform(&Mat3I16::IDENTITY, 0x2000);
+        let out = scale_mat_uniform(&Mat3I16::IDENTITY, Q12::from_raw(0x2000));
         // 0x1000 × 0x2000 >> 12 = 0x2000 -- still in i16 range.
         assert_eq!(out.m[0][0], 0x2000);
         assert_eq!(out.m[1][1], 0x2000);
@@ -399,7 +413,7 @@ mod tests {
         // 0x1000 × 0x1_0000 >> 12 = 0x1_0000 -- one above i16::MAX.
         // The clamp must prevent a wrap-around sign flip that would
         // silently mirror the actor.
-        let out = scale_mat_uniform(&Mat3I16::IDENTITY, 0x1_0000);
+        let out = scale_mat_uniform(&Mat3I16::IDENTITY, Q12::from_raw(0x1_0000));
         assert_eq!(out.m[0][0], i16::MAX);
     }
 
@@ -410,7 +424,7 @@ mod tests {
         let m = Mat3I16 {
             m: [[0x1000, -0x0800, 0], [0, 0x1000, 0], [0, 0, 0x1000]],
         };
-        let out = scale_mat_uniform(&m, 0x0800);
+        let out = scale_mat_uniform(&m, Q12::from_raw(0x0800));
         // 0x1000 × 0x0800 >> 12 = 0x0800 on the diagonal.
         assert_eq!(out.m[0][0], 0x0800);
         // -0x0800 × 0x0800 >> 12 = -0x0400 off-diagonal.

@@ -42,6 +42,10 @@
 //!   `sin_q12` expects. Converting explicitly at the call site
 //!   makes the unit hop visible in reviews.
 
+use crate::fixed::Q12;
+
+use psx_math::{cos_q12, sin_q12};
+
 /// Fixed-point angle, Q0.16 -- one revolution = `0x10000`, which
 /// wraps to `0x0000`. See [module docs](crate::angle) for the
 /// rationale.
@@ -70,6 +74,19 @@ impl Angle {
     /// `Angle::from_turns_q16(0x4000)` = quarter turn.
     pub const fn from_turns_q16(q16: u16) -> Angle {
         Angle(q16)
+    }
+
+    /// Build from a Q0.12 value (`4096` units per revolution), the
+    /// unit consumed by [`psx_math::sincos::sin_q12`] /
+    /// [`psx_math::sincos::cos_q12`].
+    pub const fn from_q12(q12: u16) -> Angle {
+        Angle((q12 & 0x0FFF) << 4)
+    }
+
+    /// Build from the 256-per-revolution unit consumed by
+    /// [`psx_gte::math::Mat3I16::rotate_y`] and friends.
+    pub const fn from_rotate_y_arg(arg: u16) -> Angle {
+        Angle((arg & 0x00FF) << 8)
     }
 
     /// Build from an integer-degree value, `0..360`. Inputs ≥ 360
@@ -115,6 +132,11 @@ impl Angle {
         Angle(self.0.wrapping_sub(other.0))
     }
 
+    /// Add a signed Q0.12 delta, wrapping at one revolution.
+    pub const fn add_signed_q12(self, delta_q12: i16) -> Angle {
+        Angle(((self.0 as i32 + ((delta_q12 as i32) << 4)) & 0xFFFF) as u16)
+    }
+
     /// Multiply this per-frame delta by an integer frame count.
     /// Typical use: `Angle::per_frames(256).mul_frame(s.frame)` to
     /// get the current rotation angle from a monotonic frame
@@ -141,6 +163,67 @@ impl Angle {
     /// (4096-per-revolution).
     pub const fn sin_q12_arg(self) -> u16 {
         (self.0 >> 4) & 0xFFF
+    }
+
+    /// Alias for [`Angle::sin_q12_arg`] when the caller is not
+    /// feeding a trig function directly.
+    pub const fn as_q12(self) -> u16 {
+        self.sin_q12_arg()
+    }
+
+    /// Sine in Q12 fixed point.
+    pub fn sin_q12(self) -> i32 {
+        sin_q12(self.sin_q12_arg())
+    }
+
+    /// Sine as a typed Q12 scalar.
+    pub fn sin(self) -> Q12 {
+        Q12::from_raw(self.sin_q12())
+    }
+
+    /// Cosine in Q12 fixed point.
+    pub fn cos_q12(self) -> i32 {
+        cos_q12(self.sin_q12_arg())
+    }
+
+    /// Cosine as a typed Q12 scalar.
+    pub fn cos(self) -> Q12 {
+        Q12::from_raw(self.cos_q12())
+    }
+
+    /// Shortest signed delta to `target`, expressed in Q0.12 angle
+    /// units. Positive means turn forward, negative means turn
+    /// backward.
+    pub const fn shortest_delta_q12(self, target: Angle) -> i16 {
+        let mut delta = ((target.sin_q12_arg() as i32 - self.sin_q12_arg() as i32) & 0x0FFF) as i16;
+        if delta > 2048 {
+            delta -= 4096;
+        }
+        delta
+    }
+
+    /// Step from `self` toward `target` by at most `step_q12`
+    /// Q0.12 units, taking the shortest wrapping path.
+    pub const fn approach_q12(self, target: Angle, step_q12: u16) -> Angle {
+        let delta = self.shortest_delta_q12(target);
+        let step = step_q12 as i16;
+        if abs_i16_const(delta) <= step {
+            target
+        } else if delta > 0 {
+            self.add_signed_q12(step)
+        } else {
+            self.add_signed_q12(-step)
+        }
+    }
+}
+
+const fn abs_i16_const(value: i16) -> i16 {
+    if value == i16::MIN {
+        i16::MAX
+    } else if value < 0 {
+        -value
+    } else {
+        value
     }
 }
 
@@ -199,6 +282,32 @@ mod tests {
         assert_eq!(Angle::QUARTER.sin_q12_arg(), 0x400);
         // Q0.16 = 0x8000 → Q0.12 = 0x800.
         assert_eq!(Angle::HALF.sin_q12_arg(), 0x800);
+    }
+
+    #[test]
+    fn q12_constructor_round_trips() {
+        assert_eq!(Angle::from_q12(0).sin_q12_arg(), 0);
+        assert_eq!(Angle::from_q12(1024), Angle::QUARTER);
+        assert_eq!(Angle::from_q12(4096), Angle::ZERO);
+        assert_eq!(Angle::from_q12(5120), Angle::QUARTER);
+    }
+
+    #[test]
+    fn signed_q12_add_wraps() {
+        assert_eq!(Angle::from_q12(4090).add_signed_q12(8), Angle::from_q12(2));
+        assert_eq!(Angle::from_q12(4).add_signed_q12(-8), Angle::from_q12(4092));
+    }
+
+    #[test]
+    fn approach_q12_takes_shortest_wrapping_path() {
+        assert_eq!(
+            Angle::from_q12(4090).approach_q12(Angle::from_q12(8), 16),
+            Angle::from_q12(8)
+        );
+        assert_eq!(
+            Angle::from_q12(20).approach_q12(Angle::from_q12(4000), 16),
+            Angle::from_q12(4)
+        );
     }
 
     #[test]

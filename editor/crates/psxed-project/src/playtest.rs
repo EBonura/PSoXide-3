@@ -1013,6 +1013,19 @@ mod tests {
             .expect("starter contains one light")
     }
 
+    fn starter_light_intensity_q8(project: &ProjectDocument) -> u16 {
+        let intensity = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Light { intensity, .. } => Some(*intensity),
+                _ => None,
+            })
+            .expect("starter contains one light");
+        (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u16
+    }
+
     #[test]
     fn tracked_editor_playtest_manifest_is_placeholder() {
         let manifest = std::fs::read_to_string(default_generated_dir().join(MANIFEST_FILENAME))
@@ -1770,9 +1783,10 @@ mod tests {
         // Starter Stone Room ships with a "Preview Light" node.
         // It should now appear in `package.lights` with a
         // sensible intensity_q8 derived from the editor's
-        // 1.0 intensity float.
+        // authored intensity float.
         let project = ProjectDocument::starter();
         let expected_color = starter_light_color(&project);
+        let expected_intensity_q8 = starter_light_intensity_q8(&project);
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
         let package = package.expect("starter cooks");
@@ -1780,8 +1794,7 @@ mod tests {
         let light = package.lights[0];
         assert_eq!(light.room, 0);
         assert!(light.radius > 0);
-        // intensity 1.0 → Q8.8 256.
-        assert_eq!(light.intensity_q8, 256);
+        assert_eq!(light.intensity_q8, expected_intensity_q8);
         assert_eq!(light.color, expected_color);
     }
 

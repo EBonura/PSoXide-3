@@ -8,12 +8,8 @@
 //! framing, and a small fan of "whisker" probes that tries to rotate
 //! around walls before falling back to pulling the camera closer.
 
-use psx_math::{cos_q12, sin_q12};
+use crate::{Angle, RoomCollision, RoomPoint, WorldCamera, WorldProjection, Q12};
 
-use crate::{RoomCollision, WorldCamera, WorldProjection, WorldVertex};
-
-const HALF_TURN_Q12: u16 = 2048;
-const FULL_TURN_Q12: i32 = 4096;
 const WHISKER_COUNT: usize = 3;
 const RAY_STEPS_MAX: i32 = 8;
 const RAY_STEPS_MIN: i32 = 3;
@@ -40,14 +36,14 @@ pub struct ThirdPersonCameraConfig {
     pub target_height: i32,
     /// Extra clearance kept between the camera ray and blocking geometry.
     pub collision_margin: i32,
-    /// Angular stride between whisker rays, in 4096-units-per-turn angles.
-    pub whisker_stride_q12: u16,
+    /// Angular stride between whisker rays.
+    pub whisker_stride: Angle,
     /// Frames before auto-alignment resumes after manual camera input.
     pub manual_cooldown_frames: u8,
     /// Maximum auto-align yaw movement per frame.
-    pub auto_align_step_q12: u16,
+    pub auto_align_step: Angle,
     /// Maximum collision-driven yaw movement per frame.
-    pub collision_yaw_step_q12: u16,
+    pub collision_yaw_step: Angle,
     /// Position lag strength as a power-of-two divisor.
     pub position_lag_shift: u8,
     /// Focus lag strength as a power-of-two divisor.
@@ -66,10 +62,10 @@ impl ThirdPersonCameraConfig {
             height,
             target_height,
             collision_margin: 160,
-            whisker_stride_q12: 112,
+            whisker_stride: Angle::from_q12(112),
             manual_cooldown_frames: 42,
-            auto_align_step_q12: 18,
-            collision_yaw_step_q12: 42,
+            auto_align_step: Angle::from_q12(18),
+            collision_yaw_step: Angle::from_q12(42),
             position_lag_shift: 2,
             focus_lag_shift: 2,
             distance_lag_shift: 3,
@@ -80,7 +76,7 @@ impl ThirdPersonCameraConfig {
 /// Per-frame camera input.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThirdPersonCameraInput {
-    /// Signed manual yaw delta in 4096-units-per-turn angle space.
+    /// Signed manual yaw delta in Q0.12 angle units.
     pub yaw_delta_q12: i16,
     /// When true, force the camera to begin easing back behind the player.
     pub recenter: bool,
@@ -90,13 +86,13 @@ pub struct ThirdPersonCameraInput {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ThirdPersonCameraTarget {
     /// Player/root position in room-local world units.
-    pub player: WorldVertex,
-    /// Player facing yaw, in 4096-units-per-turn angle space.
-    pub player_yaw_q12: u16,
+    pub player: RoomPoint,
+    /// Player facing yaw.
+    pub player_yaw: Angle,
     /// True while the player is intentionally moving.
     pub moving: bool,
     /// Optional lock-on target position in room-local world units.
-    pub lock_target: Option<WorldVertex>,
+    pub lock_target: Option<RoomPoint>,
 }
 
 /// Camera solve result for the current frame.
@@ -105,9 +101,9 @@ pub struct ThirdPersonCameraFrame {
     /// Render camera ready for world/model draw calls.
     pub camera: WorldCamera,
     /// Lagged focus point used by the camera.
-    pub focus: WorldVertex,
-    /// Camera orbit yaw, in 4096-units-per-turn angle space.
-    pub yaw_q12: u16,
+    pub focus: RoomPoint,
+    /// Camera orbit yaw.
+    pub yaw: Angle,
     /// Current camera distance after collision.
     pub distance: i32,
     /// True when the camera was shortened by collision this frame.
@@ -119,10 +115,10 @@ pub struct ThirdPersonCameraFrame {
 /// Runtime state for the third-person camera.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ThirdPersonCameraState {
-    yaw_q12: u16,
+    yaw: Angle,
     distance: i32,
-    position: WorldVertex,
-    focus: WorldVertex,
+    position: RoomPoint,
+    focus: RoomPoint,
     manual_cooldown: u8,
     initialized: bool,
     last_pull_in: bool,
@@ -131,12 +127,12 @@ pub struct ThirdPersonCameraState {
 
 impl ThirdPersonCameraState {
     /// Create a camera state with an initial orbit yaw.
-    pub const fn new(yaw_q12: u16) -> Self {
+    pub const fn new(yaw: Angle) -> Self {
         Self {
-            yaw_q12,
+            yaw,
             distance: 0,
-            position: WorldVertex::ZERO,
-            focus: WorldVertex::ZERO,
+            position: RoomPoint::ZERO,
+            focus: RoomPoint::ZERO,
             manual_cooldown: 0,
             initialized: false,
             last_pull_in: false,
@@ -151,7 +147,7 @@ impl ThirdPersonCameraState {
         config: ThirdPersonCameraConfig,
     ) {
         let config = normalize_config(config);
-        self.yaw_q12 = target.player_yaw_q12.wrapping_add(HALF_TURN_Q12);
+        self.yaw = target.player_yaw.add(Angle::HALF);
         self.distance = config
             .distance
             .clamp(config.min_distance, config.max_distance);
@@ -160,7 +156,7 @@ impl ThirdPersonCameraState {
             self.focus,
             target.player.y.saturating_add(config.height),
             self.distance,
-            self.yaw_q12,
+            self.yaw,
         );
         self.manual_cooldown = 0;
         self.initialized = true;
@@ -186,37 +182,36 @@ impl ThirdPersonCameraState {
         let camera_y = camera_height_goal(focus_goal, target, config);
 
         if input.yaw_delta_q12 != 0 {
-            self.yaw_q12 = add_signed_angle(self.yaw_q12, input.yaw_delta_q12);
+            self.yaw = self.yaw.add_signed_q12(input.yaw_delta_q12);
             self.manual_cooldown = config.manual_cooldown_frames;
         } else if self.manual_cooldown != 0 {
             self.manual_cooldown -= 1;
         }
 
-        let player_back_yaw = target.player_yaw_q12.wrapping_add(HALF_TURN_Q12);
+        let player_back_yaw = target.player_yaw.add(Angle::HALF);
         let desired_yaw = if let Some(lock) = target.lock_target {
-            yaw_to_point_q12(target.player, lock).wrapping_add(HALF_TURN_Q12)
+            yaw_to_point(target.player, lock).add(Angle::HALF)
         } else if input.recenter || (target.moving && self.manual_cooldown == 0) {
             player_back_yaw
         } else {
-            self.yaw_q12
+            self.yaw
         };
-        self.yaw_q12 = approach_angle(self.yaw_q12, desired_yaw, config.auto_align_step_q12);
+        self.yaw = self
+            .yaw
+            .approach_q12(desired_yaw, config.auto_align_step.as_q12());
 
         let collision_solve =
-            solve_camera_collision(collision, focus_goal, camera_y, self.yaw_q12, config);
+            solve_camera_collision(collision, focus_goal, camera_y, self.yaw, config);
         let rotated_to_clear_path = collision_solve.rotated
             && collision_solve
                 .distance
                 .saturating_add(config.collision_margin)
                 >= config.distance;
-        self.yaw_q12 = if rotated_to_clear_path {
-            collision_solve.yaw_q12
+        self.yaw = if rotated_to_clear_path {
+            collision_solve.yaw
         } else {
-            approach_angle(
-                self.yaw_q12,
-                collision_solve.yaw_q12,
-                config.collision_yaw_step_q12,
-            )
+            self.yaw
+                .approach_q12(collision_solve.yaw, config.collision_yaw_step.as_q12())
         };
 
         if collision_solve.distance < self.distance {
@@ -239,7 +234,7 @@ impl ThirdPersonCameraState {
             approach_vertex_shift(self.focus, focus_goal, config.focus_lag_shift)
         };
 
-        let desired_position = camera_position(self.focus, camera_y, self.distance, self.yaw_q12);
+        let desired_position = camera_position(self.focus, camera_y, self.distance, self.yaw);
         if collision_solve.pull_in || collision_solve.rotated {
             self.position = desired_position;
         } else {
@@ -252,7 +247,7 @@ impl ThirdPersonCameraState {
         ThirdPersonCameraFrame {
             camera: camera_from_position_focus(projection, self.position, self.focus),
             focus: self.focus,
-            yaw_q12: self.yaw_q12,
+            yaw: self.yaw,
             distance: self.distance,
             collision_pull_in: self.last_pull_in,
             collision_rotated: self.last_rotated,
@@ -260,24 +255,24 @@ impl ThirdPersonCameraState {
     }
 
     /// Current orbit yaw.
-    pub const fn yaw_q12(&self) -> u16 {
-        self.yaw_q12
+    pub const fn yaw(&self) -> Angle {
+        self.yaw
     }
 
     /// Current camera position.
-    pub const fn position(&self) -> WorldVertex {
+    pub const fn position(&self) -> RoomPoint {
         self.position
     }
 
     /// Current lagged focus point.
-    pub const fn focus(&self) -> WorldVertex {
+    pub const fn focus(&self) -> RoomPoint {
         self.focus
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct CollisionSolve {
-    yaw_q12: u16,
+    yaw: Angle,
     distance: i32,
     pull_in: bool,
     rotated: bool,
@@ -290,27 +285,33 @@ fn normalize_config(mut config: ThirdPersonCameraConfig) -> ThirdPersonCameraCon
         .distance
         .clamp(config.min_distance, config.max_distance);
     config.collision_margin = config.collision_margin.max(0);
-    config.whisker_stride_q12 = config.whisker_stride_q12.max(1);
-    config.auto_align_step_q12 = config.auto_align_step_q12.max(1);
-    config.collision_yaw_step_q12 = config.collision_yaw_step_q12.max(1);
+    if config.whisker_stride == Angle::ZERO {
+        config.whisker_stride = Angle::from_q12(1);
+    }
+    if config.auto_align_step == Angle::ZERO {
+        config.auto_align_step = Angle::from_q12(1);
+    }
+    if config.collision_yaw_step == Angle::ZERO {
+        config.collision_yaw_step = Angle::from_q12(1);
+    }
     config.position_lag_shift = config.position_lag_shift.min(6);
     config.focus_lag_shift = config.focus_lag_shift.min(6);
     config.distance_lag_shift = config.distance_lag_shift.min(6);
     config
 }
 
-fn player_focus(player: WorldVertex, target_height: i32) -> WorldVertex {
-    WorldVertex::new(player.x, player.y.saturating_add(target_height), player.z)
+fn player_focus(player: RoomPoint, target_height: i32) -> RoomPoint {
+    RoomPoint::new(player.x, player.y.saturating_add(target_height), player.z)
 }
 
 fn camera_focus_goal(
     target: ThirdPersonCameraTarget,
     config: ThirdPersonCameraConfig,
-) -> WorldVertex {
+) -> RoomPoint {
     let player = player_focus(target.player, config.target_height);
     if let Some(lock) = target.lock_target {
         let lock_focus = player_focus(lock, config.target_height / 2);
-        WorldVertex::new(
+        RoomPoint::new(
             midpoint_i32(player.x, lock_focus.x),
             midpoint_i32(player.y, lock_focus.y),
             midpoint_i32(player.z, lock_focus.z),
@@ -321,7 +322,7 @@ fn camera_focus_goal(
 }
 
 fn camera_height_goal(
-    focus: WorldVertex,
+    focus: RoomPoint,
     target: ThirdPersonCameraTarget,
     config: ThirdPersonCameraConfig,
 ) -> i32 {
@@ -342,29 +343,29 @@ fn midpoint_i32(a: i32, b: i32) -> i32 {
 
 fn solve_camera_collision(
     collision: Option<RoomCollision<'_, '_>>,
-    focus: WorldVertex,
+    focus: RoomPoint,
     camera_y: i32,
-    yaw_q12: u16,
+    yaw: Angle,
     config: ThirdPersonCameraConfig,
 ) -> CollisionSolve {
     let Some(room) = collision else {
         return CollisionSolve {
-            yaw_q12,
+            yaw,
             distance: config.distance,
             pull_in: false,
             rotated: false,
         };
     };
 
-    let stride = config.whisker_stride_q12 as i16;
+    let stride = config.whisker_stride.as_q12() as i16;
     let whiskers = [0i16, -stride, stride];
-    let mut best_yaw = yaw_q12;
+    let mut best_yaw = yaw;
     let mut best_distance = 0;
     let mut center_distance = 0;
 
     let mut i = 0;
     while i < WHISKER_COUNT {
-        let candidate_yaw = add_signed_angle(yaw_q12, whiskers[i]);
+        let candidate_yaw = yaw.add_signed_q12(whiskers[i]);
         let candidate_pos = camera_position(focus, camera_y, config.distance, candidate_yaw);
         let clear = probe_clear_distance(room, focus, candidate_pos, config.distance, config);
         if i == 0 {
@@ -379,17 +380,17 @@ fn solve_camera_collision(
 
     let distance = best_distance.clamp(config.min_distance, config.distance);
     CollisionSolve {
-        yaw_q12: best_yaw,
+        yaw: best_yaw,
         distance,
         pull_in: distance < config.distance,
-        rotated: best_yaw != yaw_q12 && best_distance > center_distance,
+        rotated: best_yaw != yaw && best_distance > center_distance,
     }
 }
 
 fn probe_clear_distance(
     room: RoomCollision<'_, '_>,
-    from: WorldVertex,
-    to: WorldVertex,
+    from: RoomPoint,
+    to: RoomPoint,
     max_distance: i32,
     config: ThirdPersonCameraConfig,
 ) -> i32 {
@@ -420,7 +421,7 @@ fn probe_clear_distance(
         .clamp(config.min_distance, config.distance)
 }
 
-fn point_outside_camera_space(room: RoomCollision<'_, '_>, point: WorldVertex) -> bool {
+fn point_outside_camera_space(room: RoomCollision<'_, '_>, point: RoomPoint) -> bool {
     let s = room.sector_size();
     if s <= 0 || point.x < 0 || point.z < 0 {
         return true;
@@ -438,9 +439,9 @@ fn point_outside_camera_space(room: RoomCollision<'_, '_>, point: WorldVertex) -
 
 fn nearest_wall_hit_around(
     room: RoomCollision<'_, '_>,
-    sample: WorldVertex,
-    from: WorldVertex,
-    to: WorldVertex,
+    sample: RoomPoint,
+    from: RoomPoint,
+    to: RoomPoint,
     ray_distance: i32,
 ) -> Option<i32> {
     let s = room.sector_size();
@@ -490,8 +491,8 @@ fn nearest_wall_hit_around(
 }
 
 fn segment_wall_hit_distance(
-    from: WorldVertex,
-    to: WorldVertex,
+    from: RoomPoint,
+    to: RoomPoint,
     ray_distance: i32,
     sx: i32,
     sz: i32,
@@ -514,11 +515,12 @@ fn segment_wall_hit_distance(
         DIR_WEST => intersect_vertical_q12(from.x, dx, x0),
         _ => None,
     }?;
-    if !(0..=4096).contains(&t_q12) {
+    if !(0..=Q12::SCALE).contains(&t_q12) {
         return None;
     }
-    let x_at = from.x.saturating_add((dx.saturating_mul(t_q12)) >> 12);
-    let z_at = from.z.saturating_add((dz.saturating_mul(t_q12)) >> 12);
+    let t = Q12::from_raw(t_q12);
+    let x_at = from.x.saturating_add(t.mul_i32(dx));
+    let z_at = from.z.saturating_add(t.mul_i32(dz));
     match direction {
         DIR_NORTH | DIR_SOUTH => {
             if x_at < x0 || x_at > x1 {
@@ -532,7 +534,7 @@ fn segment_wall_hit_distance(
         }
         _ => return None,
     }
-    Some(ray_distance.saturating_mul(t_q12) >> 12)
+    Some(t.mul_i32(ray_distance))
 }
 
 fn intersect_horizontal_q12(from_z: i32, dz: i32, wall_z: i32) -> Option<i32> {
@@ -541,7 +543,7 @@ fn intersect_horizontal_q12(from_z: i32, dz: i32, wall_z: i32) -> Option<i32> {
     }
     wall_z
         .saturating_sub(from_z)
-        .saturating_mul(4096)
+        .saturating_mul(Q12::SCALE)
         .checked_div(dz)
 }
 
@@ -551,28 +553,24 @@ fn intersect_vertical_q12(from_x: i32, dx: i32, wall_x: i32) -> Option<i32> {
     }
     wall_x
         .saturating_sub(from_x)
-        .saturating_mul(4096)
+        .saturating_mul(Q12::SCALE)
         .checked_div(dx)
 }
 
-fn camera_position(focus: WorldVertex, camera_y: i32, distance: i32, yaw_q12: u16) -> WorldVertex {
-    let sin_yaw = sin_q12(yaw_q12);
-    let cos_yaw = cos_q12(yaw_q12);
-    WorldVertex::new(
-        focus
-            .x
-            .saturating_add((sin_yaw.saturating_mul(distance)) >> 12),
+fn camera_position(focus: RoomPoint, camera_y: i32, distance: i32, yaw: Angle) -> RoomPoint {
+    let sin_yaw = yaw.sin();
+    let cos_yaw = yaw.cos();
+    RoomPoint::new(
+        focus.x.saturating_add(sin_yaw.mul_i32(distance)),
         camera_y,
-        focus
-            .z
-            .saturating_add((cos_yaw.saturating_mul(distance)) >> 12),
+        focus.z.saturating_add(cos_yaw.mul_i32(distance)),
     )
 }
 
 fn camera_from_position_focus(
     projection: WorldProjection,
-    position: WorldVertex,
-    focus: WorldVertex,
+    position: RoomPoint,
+    focus: RoomPoint,
 ) -> WorldCamera {
     let dx = position.x.saturating_sub(focus.x);
     let dz = position.z.saturating_sub(focus.z);
@@ -585,27 +583,20 @@ fn camera_from_position_focus(
     )
     .max(1);
     WorldCamera {
-        position,
+        position: position.to_world_vertex(),
         projection,
-        sin_yaw: q12_ratio_i32(dx, radius),
-        cos_yaw: q12_ratio_i32(dz, radius),
-        sin_pitch: q12_ratio_i32(target_dy, pitch_len),
-        cos_pitch: q12_ratio_i32(radius, pitch_len),
+        sin_yaw: Q12::from_ratio(dx, radius),
+        cos_yaw: Q12::from_ratio(dz, radius),
+        sin_pitch: Q12::from_ratio(target_dy, pitch_len),
+        cos_pitch: Q12::from_ratio(radius, pitch_len),
     }
 }
 
-fn q12_ratio_i32(numerator: i32, denominator: i32) -> i32 {
-    if denominator == 0 {
-        return 0;
-    }
-    numerator.saturating_mul(4096) / denominator
-}
-
-fn yaw_to_point_q12(from: WorldVertex, to: WorldVertex) -> u16 {
+fn yaw_to_point(from: RoomPoint, to: RoomPoint) -> Angle {
     let dx = to.x.saturating_sub(from.x);
     let dz = to.z.saturating_sub(from.z);
     if dx == 0 && dz == 0 {
-        return 0;
+        return Angle::ZERO;
     }
     let ax = abs_i32(dx);
     let az = abs_i32(dz);
@@ -618,38 +609,14 @@ fn yaw_to_point_q12(from: WorldVertex, to: WorldVertex) -> u16 {
         if dx >= 0 {
             base
         } else {
-            FULL_TURN_Q12 - base
+            4096 - base
         }
     } else if dx >= 0 {
         2048 - base
     } else {
         2048 + base
     };
-    (angle & 0x0FFF) as u16
-}
-
-fn add_signed_angle(angle: u16, delta: i16) -> u16 {
-    ((angle as i32 + delta as i32) & 0x0FFF) as u16
-}
-
-fn approach_angle(current: u16, target: u16, step: u16) -> u16 {
-    let delta = shortest_angle_delta(current, target);
-    let step = step as i16;
-    if abs_i16(delta) <= step {
-        target
-    } else if delta > 0 {
-        add_signed_angle(current, step)
-    } else {
-        add_signed_angle(current, -step)
-    }
-}
-
-fn shortest_angle_delta(current: u16, target: u16) -> i16 {
-    let mut delta = ((target as i32 - current as i32) & 0x0FFF) as i16;
-    if delta > 2048 {
-        delta -= 4096;
-    }
-    delta
+    Angle::from_q12((angle & 0x0FFF) as u16)
 }
 
 fn approach_i32_shift(current: i32, target: i32, shift: u8) -> i32 {
@@ -666,16 +633,16 @@ fn approach_i32_shift(current: i32, target: i32, shift: u8) -> i32 {
     }
 }
 
-fn approach_vertex_shift(current: WorldVertex, target: WorldVertex, shift: u8) -> WorldVertex {
-    WorldVertex::new(
+fn approach_vertex_shift(current: RoomPoint, target: RoomPoint, shift: u8) -> RoomPoint {
+    RoomPoint::new(
         approach_i32_shift(current.x, target.x, shift),
         approach_i32_shift(current.y, target.y, shift),
         approach_i32_shift(current.z, target.z, shift),
     )
 }
 
-fn lerp_vertex(from: WorldVertex, to: WorldVertex, num: i32, den: i32) -> WorldVertex {
-    WorldVertex::new(
+fn lerp_vertex(from: RoomPoint, to: RoomPoint, num: i32, den: i32) -> RoomPoint {
+    RoomPoint::new(
         from.x + ((to.x - from.x) * num) / den,
         from.y + ((to.y - from.y) * num) / den,
         from.z + ((to.z - from.z) * num) / den,
@@ -712,37 +679,41 @@ fn abs_i32(value: i32) -> i32 {
     }
 }
 
-fn abs_i16(value: i16) -> i16 {
-    if value == i16::MIN {
-        i16::MAX
-    } else {
-        value.abs()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn yaw_to_point_matches_cardinal_axes() {
-        let origin = WorldVertex::ZERO;
-        assert_eq!(yaw_to_point_q12(origin, WorldVertex::new(0, 0, 10)), 0);
-        assert_eq!(yaw_to_point_q12(origin, WorldVertex::new(10, 0, 0)), 1024);
-        assert_eq!(yaw_to_point_q12(origin, WorldVertex::new(0, 0, -10)), 2048);
-        assert_eq!(yaw_to_point_q12(origin, WorldVertex::new(-10, 0, 0)), 3072);
+        let origin = RoomPoint::ZERO;
+        assert_eq!(yaw_to_point(origin, RoomPoint::new(0, 0, 10)), Angle::ZERO);
+        assert_eq!(
+            yaw_to_point(origin, RoomPoint::new(10, 0, 0)),
+            Angle::QUARTER
+        );
+        assert_eq!(yaw_to_point(origin, RoomPoint::new(0, 0, -10)), Angle::HALF);
+        assert_eq!(
+            yaw_to_point(origin, RoomPoint::new(-10, 0, 0)),
+            Angle::THREE_QUARTER
+        );
     }
 
     #[test]
     fn approach_angle_takes_shortest_wrapping_path() {
-        assert_eq!(approach_angle(4090, 8, 16), 8);
-        assert_eq!(approach_angle(20, 4000, 16), 4);
+        assert_eq!(
+            Angle::from_q12(4090).approach_q12(Angle::from_q12(8), 16),
+            Angle::from_q12(8)
+        );
+        assert_eq!(
+            Angle::from_q12(20).approach_q12(Angle::from_q12(4000), 16),
+            Angle::from_q12(4)
+        );
     }
 
     #[test]
     fn segment_wall_hit_finds_cardinal_crossing() {
-        let from = WorldVertex::new(512, 0, 512);
-        let to = WorldVertex::new(1536, 0, 512);
+        let from = RoomPoint::new(512, 0, 512);
+        let to = RoomPoint::new(1536, 0, 512);
         assert_eq!(
             segment_wall_hit_distance(from, to, 1024, 0, 0, 1024, DIR_EAST),
             Some(512)
@@ -755,11 +726,11 @@ mod tests {
 
     #[test]
     fn manual_input_sets_cooldown_and_prevents_auto_align() {
-        let mut camera = ThirdPersonCameraState::new(HALF_TURN_Q12);
+        let mut camera = ThirdPersonCameraState::new(Angle::HALF);
         let config = ThirdPersonCameraConfig::character(1400, 700, 0);
         let target = ThirdPersonCameraTarget {
-            player: WorldVertex::ZERO,
-            player_yaw_q12: 0,
+            player: RoomPoint::ZERO,
+            player_yaw: Angle::ZERO,
             moving: true,
             lock_target: None,
         };
@@ -773,7 +744,7 @@ mod tests {
             },
             config,
         );
-        assert_eq!(frame.yaw_q12, HALF_TURN_Q12 + 128);
+        assert_eq!(frame.yaw, Angle::HALF.add_signed_q12(128));
         let frame = camera.update(
             WorldProjection::new(160, 120, 320, 64),
             None,
@@ -781,16 +752,16 @@ mod tests {
             ThirdPersonCameraInput::default(),
             config,
         );
-        assert_eq!(frame.yaw_q12, HALF_TURN_Q12 + 128);
+        assert_eq!(frame.yaw, Angle::HALF.add_signed_q12(128));
     }
 
     #[test]
     fn character_height_offsets_raise_camera_and_focus() {
-        let mut camera = ThirdPersonCameraState::new(HALF_TURN_Q12);
+        let mut camera = ThirdPersonCameraState::new(Angle::HALF);
         let config = ThirdPersonCameraConfig::character(1400, 700, 400);
         let target = ThirdPersonCameraTarget {
-            player: WorldVertex::new(128, 32, -64),
-            player_yaw_q12: 0,
+            player: RoomPoint::new(128, 32, -64),
+            player_yaw: Angle::ZERO,
             moving: false,
             lock_target: None,
         };

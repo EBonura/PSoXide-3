@@ -15,6 +15,8 @@
 //! Keeping the arithmetic here prevents the authoring viewport and
 //! embedded play mode from drifting apart.
 
+use crate::Q8;
+
 /// Neutral lighting value: a material renders at its base tint.
 pub const LIGHTING_NEUTRAL: u32 = 128;
 
@@ -29,28 +31,39 @@ pub struct PointLightSample {
     pub position: [i32; 3],
     /// Cutoff radius in engine units.
     pub radius: i32,
-    /// `color * intensity_q8` per channel.
+    /// `color * intensity.raw()` per channel.
     pub weighted_color: [u32; 3],
 }
 
 impl PointLightSample {
-    /// Build a sample from 8-bit RGB and Q8.8 intensity
+    /// Build a sample from 8-bit RGB and typed Q8.8 intensity.
+    pub fn from_color_intensity(
+        position: [i32; 3],
+        radius: i32,
+        color: [u8; 3],
+        intensity: Q8,
+    ) -> Self {
+        let intensity = intensity.raw();
+        Self {
+            position,
+            radius,
+            weighted_color: [
+                (color[0] as u32).saturating_mul(intensity),
+                (color[1] as u32).saturating_mul(intensity),
+                (color[2] as u32).saturating_mul(intensity),
+            ],
+        }
+    }
+
+    /// Build a sample from 8-bit RGB and raw Q8.8 intensity
     /// (`256 == 1.0`).
-    pub const fn from_color_intensity_q8(
+    pub fn from_color_intensity_q8(
         position: [i32; 3],
         radius: i32,
         color: [u8; 3],
         intensity_q8: u32,
     ) -> Self {
-        Self {
-            position,
-            radius,
-            weighted_color: [
-                color[0] as u32 * intensity_q8,
-                color[1] as u32 * intensity_q8,
-                color[2] as u32 * intensity_q8,
-            ],
-        }
+        Self::from_color_intensity(position, radius, color, Q8::from_raw(intensity_q8))
     }
 }
 
@@ -65,20 +78,20 @@ where
 {
     let mut light_rgb: [u32; 3] = [ambient[0] as u32, ambient[1] as u32, ambient[2] as u32];
     for light in lights {
-        let Some(weight_q8) = point_light_weight_q8(point, light.position, light.radius) else {
+        let Some(weight) = point_light_weight(point, light.position, light.radius) else {
             continue;
         };
-        // `weighted_color = color * intensity_q8`; `weight_q8` is
+        // `weighted_color = color * intensity.raw()`; `weight` is
         // distance falloff. Both are Q8 inputs, so shift by 16. This
         // deliberately stays in 32-bit arithmetic: generated light
         // intensity is u16, and the PS1 MIPS target handles this path
         // much more predictably than widened arithmetic.
         light_rgb[0] =
-            light_rgb[0].saturating_add(light.weighted_color[0].saturating_mul(weight_q8) >> 16);
+            light_rgb[0].saturating_add(light.weighted_color[0].saturating_mul(weight.raw()) >> 16);
         light_rgb[1] =
-            light_rgb[1].saturating_add(light.weighted_color[1].saturating_mul(weight_q8) >> 16);
+            light_rgb[1].saturating_add(light.weighted_color[1].saturating_mul(weight.raw()) >> 16);
         light_rgb[2] =
-            light_rgb[2].saturating_add(light.weighted_color[2].saturating_mul(weight_q8) >> 16);
+            light_rgb[2].saturating_add(light.weighted_color[2].saturating_mul(weight.raw()) >> 16);
     }
     (
         light_rgb[0].min(LIGHTING_MAX),
@@ -114,7 +127,7 @@ where
     modulate_tint(base, accumulate_point_lights(point, ambient, lights))
 }
 
-fn point_light_weight_q8(point: [i32; 3], light_position: [i32; 3], radius: i32) -> Option<u32> {
+fn point_light_weight(point: [i32; 3], light_position: [i32; 3], radius: i32) -> Option<Q8> {
     if radius <= 0 {
         return None;
     }
@@ -136,7 +149,7 @@ fn point_light_weight_q8(point: [i32; 3], light_position: [i32; 3], radius: i32)
     }
 
     let d = isqrt_u32(d2);
-    Some(((radius - d) << 8) / radius)
+    Some(Q8::from_ratio(radius - d, radius))
 }
 
 fn abs_diff_u32(a: i32, b: i32) -> u32 {
@@ -190,14 +203,16 @@ mod tests {
 
     #[test]
     fn point_light_inside_radius_brightens() {
-        let light = PointLightSample::from_color_intensity_q8([0, 0, 0], 100, [255, 255, 255], 256);
+        let light =
+            PointLightSample::from_color_intensity([0, 0, 0], 100, [255, 255, 255], Q8::ONE);
         let lit = shade_tint_with_lights((128, 128, 128), [0, 0, 0], [32, 32, 32], [light]);
         assert!(lit.0 > 200 && lit.1 > 200 && lit.2 > 200, "got {:?}", lit);
     }
 
     #[test]
     fn point_light_outside_radius_contributes_zero() {
-        let light = PointLightSample::from_color_intensity_q8([0, 0, 0], 100, [255, 255, 255], 256);
+        let light =
+            PointLightSample::from_color_intensity([0, 0, 0], 100, [255, 255, 255], Q8::ONE);
         let lit = shade_tint_with_lights((128, 128, 128), [10_000, 0, 0], [32, 32, 32], [light]);
         let baseline = shade_tint_with_lights((128, 128, 128), [10_000, 0, 0], [32, 32, 32], []);
         assert_eq!(lit, baseline);
@@ -205,7 +220,8 @@ mod tests {
 
     #[test]
     fn two_lights_accumulate_and_clamp() {
-        let light = PointLightSample::from_color_intensity_q8([0, 0, 0], 100, [255, 255, 255], 256);
+        let light =
+            PointLightSample::from_color_intensity([0, 0, 0], 100, [255, 255, 255], Q8::ONE);
         let lit =
             shade_tint_with_lights((255, 255, 255), [0, 0, 0], [128, 128, 128], [light, light]);
         assert_eq!(lit, (255, 255, 255));
@@ -213,8 +229,12 @@ mod tests {
 
     #[test]
     fn low_intensity_colored_light_does_not_saturate() {
-        let light =
-            PointLightSample::from_color_intensity_q8([4374, 1024, 4165], 3686, [239, 0, 65], 89);
+        let light = PointLightSample::from_color_intensity(
+            [4374, 1024, 4165],
+            3686,
+            [239, 0, 65],
+            Q8::from_raw(89),
+        );
         let lit =
             shade_tint_with_lights((128, 128, 128), [4374, 1024, 4165], [32, 32, 32], [light]);
         assert_eq!(lit, (115, 32, 54));

@@ -12,6 +12,8 @@
 //! frame's opaque mesh triangles share one depth policy and one
 //! deterministic OT insertion order.
 
+use crate::render::{DepthBand, DepthRange, DepthSlot, OtFrame, PrimitiveArena};
+use crate::{Angle, Q12};
 use psx_asset::{Animation, JointPose, Mesh, Model, ModelFaceCorner, ModelVertex};
 use psx_gpu::{
     material::TextureMaterial,
@@ -22,9 +24,6 @@ use psx_gte::{
     math::{Mat3I16, Vec3I16, Vec3I32},
     scene,
 };
-use psx_math::{cos_q12, sin_q12};
-
-use crate::render::{DepthBand, DepthRange, DepthSlot, OtFrame, PrimitiveArena};
 
 const PSX_VERTEX_MIN: i16 = -1024;
 const PSX_VERTEX_MAX: i16 = 1023;
@@ -139,6 +138,58 @@ impl ViewVertex {
     }
 }
 
+/// Runtime room-local point used by gameplay/camera systems.
+///
+/// A `RoomPoint` is intentionally distinct from [`WorldVertex`].
+/// `WorldVertex` is the renderer's raw submission space: any caller
+/// may choose its scale and origin as long as vertices, camera, and
+/// projection agree. `RoomPoint` means cooked-room coordinates after
+/// editor-to-runtime conversion, the same space used by room
+/// collision, point lights, characters, and embedded playtest
+/// entities.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoomPoint {
+    /// Room-local X.
+    pub x: i32,
+    /// Room-local Y.
+    pub y: i32,
+    /// Room-local Z.
+    pub z: i32,
+}
+
+impl RoomPoint {
+    /// Room origin.
+    pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
+
+    /// Build a room-local point.
+    pub const fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Convert to the renderer's raw world vertex at the boundary
+    /// where room-space geometry is submitted.
+    pub const fn to_world_vertex(self) -> WorldVertex {
+        WorldVertex::new(self.x, self.y, self.z)
+    }
+
+    /// Build from a raw renderer vertex at a call site that has
+    /// already established the vertex is room-local.
+    pub const fn from_world_vertex(vertex: WorldVertex) -> Self {
+        Self::new(vertex.x, vertex.y, vertex.z)
+    }
+
+    /// Return this point with a different Y coordinate.
+    pub const fn with_y(self, y: i32) -> Self {
+        Self::new(self.x, y, self.z)
+    }
+}
+
+impl From<RoomPoint> for WorldVertex {
+    fn from(point: RoomPoint) -> Self {
+        point.to_world_vertex()
+    }
+}
+
 /// CPU-side world-space vertex used by [`WorldCamera`].
 ///
 /// This is intentionally raw integer space rather than
@@ -147,6 +198,10 @@ impl ViewVertex {
 /// authored coordinates and a matching focal length; callers choose
 /// that scale as long as every vertex, camera position, and
 /// [`WorldProjection`] uses the same unit.
+///
+/// Gameplay code that is specifically operating inside a cooked room
+/// should prefer [`RoomPoint`] and convert here only at render
+/// submission boundaries.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorldVertex {
     /// World-space X.
@@ -175,12 +230,12 @@ impl WorldVertex {
 /// multiplication on the PS1 runtime path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LocalToWorldScale {
-    q12: i32,
+    scale: Q12,
 }
 
 impl LocalToWorldScale {
     /// Identity scale.
-    pub const IDENTITY: Self = Self { q12: 0x1000 };
+    pub const IDENTITY: Self = Self { scale: Q12::ONE };
 
     /// Build from a Q12 header value. Zero means unspecified and maps to
     /// identity for compatibility with older cooked blobs.
@@ -188,20 +243,27 @@ impl LocalToWorldScale {
         if q12 == 0 {
             Self::IDENTITY
         } else {
-            Self { q12: q12 as i32 }
+            Self {
+                scale: Q12::from_raw(q12 as i32),
+            }
         }
     }
 
     /// Raw Q12 scale value.
     pub const fn q12(self) -> u16 {
-        self.q12 as u16
+        self.scale.raw() as u16
+    }
+
+    /// Typed Q12 scale value.
+    pub const fn scale(self) -> Q12 {
+        self.scale
     }
 
     /// Apply the scale to one signed coordinate.
     pub fn apply(self, value: i32) -> i32 {
         let whole = value >> 12;
         let frac = value - (whole << 12);
-        whole.saturating_mul(self.q12) + ((frac * self.q12) >> 12)
+        whole.saturating_mul(self.scale.raw()) + self.scale.mul_i32(frac)
     }
 }
 
@@ -327,14 +389,14 @@ pub struct WorldCamera {
     pub projection: WorldProjection,
     /// Camera position in the same world units as submitted surfaces.
     pub position: WorldVertex,
-    /// Sine of yaw, Q0.12.
-    pub sin_yaw: i32,
-    /// Cosine of yaw, Q0.12.
-    pub cos_yaw: i32,
-    /// Sine of pitch, Q0.12.
-    pub sin_pitch: i32,
-    /// Cosine of pitch, Q0.12.
-    pub cos_pitch: i32,
+    /// Sine of yaw.
+    pub sin_yaw: Q12,
+    /// Cosine of yaw.
+    pub cos_yaw: Q12,
+    /// Sine of pitch.
+    pub sin_pitch: Q12,
+    /// Cosine of pitch.
+    pub cos_pitch: Q12,
 }
 
 impl WorldCamera {
@@ -342,10 +404,10 @@ impl WorldCamera {
     pub const fn from_basis(
         projection: WorldProjection,
         position: WorldVertex,
-        sin_yaw: i32,
-        cos_yaw: i32,
-        sin_pitch: i32,
-        cos_pitch: i32,
+        sin_yaw: Q12,
+        cos_yaw: Q12,
+        sin_pitch: Q12,
+        cos_pitch: Q12,
     ) -> Self {
         Self {
             projection,
@@ -359,62 +421,61 @@ impl WorldCamera {
 
     /// Build a camera on a horizontal orbit that looks at `target`.
     ///
-    /// `yaw_q12` is the argument consumed by [`sin_q12`] /
-    /// [`cos_q12`]: 4096 units per full turn. `camera_y` is the
-    /// camera's absolute world-space height. Pitch is derived from
-    /// `target.y - camera_y`, so dollying the radius keeps the target
-    /// centred without per-frame call-site math.
+    /// `yaw` is the orbit direction from target to camera. `camera_y`
+    /// is the camera's absolute world-space height. Pitch is derived
+    /// from `target.y - camera_y`, so dollying the radius keeps the
+    /// target centred without per-frame call-site math.
     pub fn orbit_yaw(
         projection: WorldProjection,
         target: WorldVertex,
         camera_y: i32,
         radius: i32,
-        yaw_q12: u16,
+        yaw: Angle,
     ) -> Self {
-        let sin_yaw = sin_q12(yaw_q12);
-        let cos_yaw = cos_q12(yaw_q12);
+        let sin_yaw = yaw.sin();
+        let cos_yaw = yaw.cos();
         let target_dy = target.y - camera_y;
         let pitch_len =
             isqrt_i32(radius.saturating_mul(radius) + target_dy.saturating_mul(target_dy)).max(1);
         Self {
             projection,
             position: WorldVertex::new(
-                target.x + ((sin_yaw * radius) >> 12),
+                target.x + sin_yaw.mul_i32(radius),
                 camera_y,
-                target.z + ((cos_yaw * radius) >> 12),
+                target.z + cos_yaw.mul_i32(radius),
             ),
             sin_yaw,
             cos_yaw,
-            sin_pitch: (target_dy * 4096) / pitch_len,
-            cos_pitch: (radius * 4096) / pitch_len,
+            sin_pitch: Q12::from_ratio(target_dy, pitch_len),
+            cos_pitch: Q12::from_ratio(radius, pitch_len),
         }
     }
 
     /// Build a camera on a full spherical orbit around `target`.
     ///
-    /// `yaw_q12` and `pitch_q12` use 4096 units per full turn. The
-    /// camera sits at constant `radius` from `target` and looks at it
-    /// directly: positive `pitch_q12` raises the camera above the
-    /// target so the view tilts down. Pitch wraps freely, so the orbit
-    /// can pass through the poles and view the model upside-down.
+    /// `yaw` and `pitch` are canonical engine angles. The camera sits
+    /// at constant `radius` from `target` and looks at it directly:
+    /// positive `pitch` raises the camera above the target so the view
+    /// tilts down. Pitch wraps freely, so the orbit can pass through
+    /// the poles and view the model upside-down.
     pub fn orbit(
         projection: WorldProjection,
         target: WorldVertex,
         radius: i32,
-        yaw_q12: u16,
-        pitch_q12: u16,
+        yaw: Angle,
+        pitch: Angle,
     ) -> Self {
-        let sin_yaw = sin_q12(yaw_q12);
-        let cos_yaw = cos_q12(yaw_q12);
-        let sin_pitch = sin_q12(pitch_q12);
-        let cos_pitch = cos_q12(pitch_q12);
-        let horiz = (radius * cos_pitch) >> 12;
+        let sin_yaw = yaw.sin();
+        let cos_yaw = yaw.cos();
+        let sin_pitch = pitch.sin();
+        let cos_pitch = pitch.cos();
+        let horiz = cos_pitch.mul_i32(radius);
         Self {
             projection,
             position: WorldVertex::new(
-                target.x + ((horiz * sin_yaw) >> 12),
-                target.y - ((radius * sin_pitch) >> 12),
-                target.z + ((horiz * cos_yaw) >> 12),
+                target.x + sin_yaw.mul_i32(horiz),
+                target.y - sin_pitch.mul_i32(radius),
+                target.z + cos_yaw.mul_i32(horiz),
             ),
             sin_yaw,
             cos_yaw,
@@ -429,10 +490,14 @@ impl WorldCamera {
         let dy = vertex.y - self.position.y;
         let dz = vertex.z - self.position.z;
 
-        let x1 = ((dx * self.cos_yaw) - (dz * self.sin_yaw)) >> 12;
-        let z1 = ((-dx * self.sin_yaw) - (dz * self.cos_yaw)) >> 12;
-        let y2 = ((dy * self.cos_pitch) - (z1 * self.sin_pitch)) >> 12;
-        let z2 = ((dy * self.sin_pitch) + (z1 * self.cos_pitch)) >> 12;
+        let sin_yaw = self.sin_yaw.raw();
+        let cos_yaw = self.cos_yaw.raw();
+        let sin_pitch = self.sin_pitch.raw();
+        let cos_pitch = self.cos_pitch.raw();
+        let x1 = ((dx * cos_yaw) - (dz * sin_yaw)) >> 12;
+        let z1 = ((-dx * sin_yaw) - (dz * cos_yaw)) >> 12;
+        let y2 = ((dy * cos_pitch) - (z1 * sin_pitch)) >> 12;
+        let z2 = ((dy * sin_pitch) + (z1 * cos_pitch)) >> 12;
 
         ViewVertex::new(x1, y2, z2)
     }
@@ -2067,22 +2132,26 @@ fn rotate_translation_q12(rot: &Mat3I16, t: Vec3I32) -> Vec3I32 {
 }
 
 fn camera_gte_view_matrix(camera: WorldCamera) -> Mat3I16 {
-    let sy_sp = q12_mul_i32(camera.sin_yaw, camera.sin_pitch);
-    let cy_sp = q12_mul_i32(camera.cos_yaw, camera.sin_pitch);
-    let sy_cp = q12_mul_i32(camera.sin_yaw, camera.cos_pitch);
-    let cy_cp = q12_mul_i32(camera.cos_yaw, camera.cos_pitch);
+    let sy_sp = camera.sin_yaw.mul_q12(camera.sin_pitch).raw();
+    let cy_sp = camera.cos_yaw.mul_q12(camera.sin_pitch).raw();
+    let sy_cp = camera.sin_yaw.mul_q12(camera.cos_pitch).raw();
+    let cy_cp = camera.cos_yaw.mul_q12(camera.cos_pitch).raw();
 
     Mat3I16 {
         m: [
-            [clamp_i16(camera.cos_yaw), 0, clamp_i16(-camera.sin_yaw)],
+            [
+                clamp_i16(camera.cos_yaw.raw()),
+                0,
+                clamp_i16(-camera.sin_yaw.raw()),
+            ],
             [
                 clamp_i16(-sy_sp),
-                clamp_i16(-camera.cos_pitch),
+                clamp_i16(-camera.cos_pitch.raw()),
                 clamp_i16(-cy_sp),
             ],
             [
                 clamp_i16(-sy_cp),
-                clamp_i16(camera.sin_pitch),
+                clamp_i16(camera.sin_pitch.raw()),
                 clamp_i16(-cy_cp),
             ],
         ],
@@ -2090,13 +2159,13 @@ fn camera_gte_view_matrix(camera: WorldCamera) -> Mat3I16 {
 }
 
 fn scaled_pose_matrix(pose: JointPose, local_to_world: LocalToWorldScale) -> Mat3I16 {
-    let scale = local_to_world.q12() as i32;
+    let scale = local_to_world.scale();
     let mut out = [[0i16; 3]; 3];
     let mut row = 0;
     while row < 3 {
         let mut col = 0;
         while col < 3 {
-            out[row][col] = clamp_i16(q12_mul_i32(pose.matrix[col][row] as i32, scale));
+            out[row][col] = clamp_i16(scale.mul_i32(pose.matrix[col][row] as i32));
             col += 1;
         }
         row += 1;
@@ -2224,10 +2293,6 @@ fn lerp_view_vertex(a: ViewVertex, b: ViewVertex, t: u8) -> ViewVertex {
         ((a.y.saturating_mul(inv)).saturating_add(b.y.saturating_mul(t))) >> 8,
         ((a.z.saturating_mul(inv)).saturating_add(b.z.saturating_mul(t))) >> 8,
     )
-}
-
-fn q12_mul_i32(a: i32, b: i32) -> i32 {
-    a.saturating_mul(b) >> 12
 }
 
 fn back_facing(verts: [ProjectedLit; 3]) -> bool {
@@ -2865,7 +2930,7 @@ mod tests {
         let projection = WorldProjection::new(160, 120, 200, 40);
         let target = WorldVertex::new(0, -90, 0);
 
-        let camera = WorldCamera::orbit_yaw(projection, target, 0, 120, 0);
+        let camera = WorldCamera::orbit_yaw(projection, target, 0, 120, Angle::ZERO);
         let projected = camera.project_world(target).expect("target in front");
 
         assert_eq!(projected.sx, 160);
@@ -2876,7 +2941,7 @@ mod tests {
     #[test]
     fn world_camera_projects_world_quad() {
         let projection = WorldProjection::new(160, 120, 200, 40);
-        let camera = WorldCamera::orbit_yaw(projection, WorldVertex::ZERO, 0, 200, 0);
+        let camera = WorldCamera::orbit_yaw(projection, WorldVertex::ZERO, 0, 200, Angle::ZERO);
 
         let projected = camera.project_world_quad([
             WorldVertex::new(-10, 10, 0),
@@ -2892,7 +2957,7 @@ mod tests {
     fn textured_model_gte_transform_matches_world_camera_projection() {
         let projection = WorldProjection::new(160, 118, 320, 48);
         let target = WorldVertex::new(0, 512, 0);
-        let camera = WorldCamera::orbit_yaw(projection, target, 1120, 2048, 220);
+        let camera = WorldCamera::orbit_yaw(projection, target, 1120, 2048, Angle::from_q12(220));
         let pose = JointPose {
             matrix: [[0x1000, 0, 0], [0, 0x1000, 0], [0, 0, 0x1000]],
             translation: Vec3I32::new(20, -16, 32),
@@ -2974,6 +3039,19 @@ mod tests {
                 .with_material_layer(transparent)
                 .render_layer,
             WorldRenderLayer::Transparent
+        );
+    }
+
+    #[test]
+    fn room_point_converts_to_raw_world_vertex_only_at_boundary() {
+        let point = RoomPoint::new(12, -34, 56);
+        let vertex = point.to_world_vertex();
+
+        assert_eq!(vertex, WorldVertex::new(12, -34, 56));
+        assert_eq!(RoomPoint::from_world_vertex(vertex), point);
+        assert_eq!(
+            core::mem::size_of::<RoomPoint>(),
+            core::mem::size_of::<WorldVertex>()
         );
     }
 

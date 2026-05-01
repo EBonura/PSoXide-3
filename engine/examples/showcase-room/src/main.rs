@@ -18,7 +18,7 @@ extern crate psx_rt;
 
 use psx_asset::{Texture, World as AssetWorld};
 use psx_engine::{
-    button, draw_room, App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena,
+    button, draw_room, Angle, App, Config, Ctx, DepthBand, DepthRange, OtFrame, PrimitiveArena,
     RuntimeRoom, Scene, WorldCamera, WorldProjection, WorldRenderMaterial, WorldRenderPass,
     WorldSurfaceOptions, WorldTriCommand, WorldVertex,
 };
@@ -67,8 +67,8 @@ const CAMERA_START_RADIUS: i32 = 2400;
 const CAMERA_RADIUS_MIN: i32 = 1200;
 const CAMERA_RADIUS_MAX: i32 = 4800;
 const CAMERA_RADIUS_STEP: i32 = 64;
-const CAMERA_START_YAW: u16 = 220;
-const CAMERA_YAW_STEP: u16 = 12;
+const CAMERA_START_YAW: Angle = Angle::from_q12(220);
+const CAMERA_YAW_STEP_Q12: i16 = 12;
 
 const OT_DEPTH: usize = 64;
 const WORLD_BAND: DepthBand = DepthBand::new(0, OT_DEPTH - 1);
@@ -98,7 +98,7 @@ struct Showcase {
     /// constructor stays legal. Render falls through silently
     /// if parsing failed -- no panic on hardware.
     room: Option<RuntimeRoom<'static>>,
-    camera_yaw: u16,
+    camera_yaw: Angle,
     camera_radius: i32,
 }
 
@@ -125,10 +125,10 @@ impl Scene for Showcase {
 
     fn update(&mut self, ctx: &mut Ctx) {
         if ctx.is_held(button::RIGHT) {
-            self.camera_yaw = self.camera_yaw.wrapping_add(CAMERA_YAW_STEP);
+            self.camera_yaw = self.camera_yaw.add_signed_q12(CAMERA_YAW_STEP_Q12);
         }
         if ctx.is_held(button::LEFT) {
-            self.camera_yaw = self.camera_yaw.wrapping_sub(CAMERA_YAW_STEP);
+            self.camera_yaw = self.camera_yaw.add_signed_q12(-CAMERA_YAW_STEP_Q12);
         }
         if ctx.is_held(button::UP) {
             self.camera_radius = (self.camera_radius - CAMERA_RADIUS_STEP).max(CAMERA_RADIUS_MIN);

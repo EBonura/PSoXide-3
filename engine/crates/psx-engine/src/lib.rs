@@ -11,6 +11,11 @@
 //! - a canonical [`Angle`] unit so we stop hitting the recurring
 //!   "256-per-revolution vs 4096-per-revolution" angle-mismatch bug
 //!   that cost an afternoon on showcase-fog's light orbit;
+//! - typed coordinate-space wrappers like [`RoomPoint`] so gameplay
+//!   room-local positions do not quietly mix with raw renderer
+//!   submission vertices;
+//! - typed fixed-point scalars like [`Q12`] and [`Q8`] so movement,
+//!   light intensity, and falloff code can name its unit scale;
 //! - render helpers for ordering-table frames and fixed primitive
 //!   arenas, so games can build PS1 painter's-algorithm command
 //!   streams without rewriting OT ceremony in every scene.
@@ -50,8 +55,10 @@
 pub mod angle;
 pub mod app;
 pub mod character_motor;
+pub mod fixed;
 pub mod frames;
 pub mod lighting;
+pub mod movement;
 pub mod render;
 pub mod render3d;
 pub mod scene;
@@ -68,16 +75,18 @@ pub use character_motor::{
     CharacterMotorAction, CharacterMotorAnim, CharacterMotorConfig, CharacterMotorFrame,
     CharacterMotorInput, CharacterMotorState,
 };
+pub use fixed::{Q12, Q8};
 pub use frames::{Frames, Ticks};
 pub use lighting::{
     accumulate_point_lights, modulate_tint, shade_tint_with_lights, PointLightSample, LIGHTING_MAX,
     LIGHTING_NEUTRAL,
 };
+pub use movement::{camera_relative_move, camera_relative_move_q12, CameraRelativeMove};
 pub use render::{DepthBand, DepthRange, DepthSlot, GpuPacket, OtFrame, PrimitiveArena};
 pub use render3d::{
     compute_joint_view_transform, project_model_vertex_with_joint_transforms, CullMode,
     DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand, JointViewTransform,
-    LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex, ProjectedVertex,
+    LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex, ProjectedVertex, RoomPoint,
     TexturedModelRenderStats, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
     WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,
     WorldVertex,

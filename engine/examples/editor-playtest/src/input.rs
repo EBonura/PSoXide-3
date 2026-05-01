@@ -1,16 +1,19 @@
 //! Player movement and camera input helpers.
 
+use psx_engine::{camera_relative_move, Angle, RoomPoint};
+
 use super::*;
 
-pub(crate) fn motor_input(ctx: &Ctx, camera_yaw_q12: u16) -> CharacterMotorInput {
+pub(crate) fn motor_input(ctx: &Ctx, camera_yaw: Angle) -> CharacterMotorInput {
     let (strafe, forward) = local_move_axes(ctx);
-    let (move_x_q12, move_z_q12, walk) = camera_relative_move_q12(strafe, forward, camera_yaw_q12);
+    let movement =
+        camera_relative_move(strafe, forward, camera_yaw, MOVE_STICK_DEADZONE, STICK_MAX);
 
     CharacterMotorInput {
         turn: 0,
-        walk,
-        move_x_q12,
-        move_z_q12,
+        walk: movement.forward,
+        move_x: movement.x,
+        move_z: movement.z,
         sprint: ctx.is_held(RUN_BUTTON),
         evade: false,
     }
@@ -41,39 +44,6 @@ pub(crate) fn local_move_axes(ctx: &Ctx) -> (i16, i16) {
         forward -= STICK_MAX;
     }
     (strafe, forward)
-}
-
-pub(crate) fn camera_relative_move_q12(
-    strafe: i16,
-    forward: i16,
-    camera_yaw_q12: u16,
-) -> (i16, i16, i8) {
-    let mag = isqrt_i32(square_i16(strafe).saturating_add(square_i16(forward)));
-    if mag <= MOVE_STICK_DEADZONE as i32 {
-        return (0, 0, 0);
-    }
-    let clamped_mag = mag.min(STICK_MAX as i32);
-    let scaled_mag_q12 = ((clamped_mag - MOVE_STICK_DEADZONE as i32) * 4096)
-        / (STICK_MAX - MOVE_STICK_DEADZONE) as i32;
-    let local_strafe_q12 = strafe as i32 * scaled_mag_q12 / mag;
-    let local_forward_q12 = forward as i32 * scaled_mag_q12 / mag;
-
-    let forward_yaw = camera_yaw_q12.wrapping_add(HALF_TURN_Q12);
-    let right_yaw = forward_yaw.wrapping_sub(1024);
-    let world_x = (((sin_1_3_12(forward_yaw) as i32) * local_forward_q12)
-        + ((sin_1_3_12(right_yaw) as i32) * local_strafe_q12))
-        >> 12;
-    let world_z = (((cos_1_3_12(forward_yaw) as i32) * local_forward_q12)
-        + ((cos_1_3_12(right_yaw) as i32) * local_strafe_q12))
-        >> 12;
-    let walk = if forward < -MOVE_STICK_DEADZONE {
-        -1
-    } else if forward > MOVE_STICK_DEADZONE {
-        1
-    } else {
-        0
-    };
-    (clamp_i16(world_x), clamp_i16(world_z), walk)
 }
 
 pub(crate) fn player_anim_from_motor(anim: CharacterMotorAnim) -> PlayerAnim {
@@ -117,10 +87,6 @@ pub(crate) fn stick_axis_delta(axis: i16, max_step: i16) -> i16 {
     (sign * effective * max_step as i32 / range) as i16
 }
 
-pub(crate) fn add_signed_q12(angle: u16, delta: i16) -> u16 {
-    ((angle as i32 + delta as i32) & 0x0FFF) as u16
-}
-
 pub(crate) fn clamp_i16(value: i32) -> i16 {
     value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
@@ -135,7 +101,7 @@ pub(crate) fn abs_i16(value: i16) -> i16 {
     }
 }
 
-pub(crate) fn distance_xz_sq(a: WorldVertex, b: WorldVertex) -> i32 {
+pub(crate) fn distance_xz_sq(a: RoomPoint, b: RoomPoint) -> i32 {
     let dx = a.x.saturating_sub(b.x);
     let dz = a.z.saturating_sub(b.z);
     square_i32_saturating(dx).saturating_add(square_i32_saturating(dz))

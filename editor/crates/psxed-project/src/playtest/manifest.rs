@@ -111,7 +111,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         let flags = material_flags_for_sidedness(material.face_sidedness);
         let _ = writeln!(
             out,
-            "    LevelMaterialRecord {{ room: {}, local_slot: {}, texture_asset: AssetId({}), tint_rgb: [{}, {}, {}], flags: {} }},",
+            "    LevelMaterialRecord {{ room: RoomIndex({}), local_slot: MaterialSlot({}), texture_asset: AssetId({}), tint_rgb: [{}, {}, {}], flags: {} }},",
             material.room,
             material.local_slot,
             material.texture_asset_index,
@@ -128,7 +128,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     for room in &package.rooms {
         let _ = writeln!(
             out,
-            "    LevelRoomRecord {{ name: {:?}, world_asset: AssetId({}), origin_x: {}, origin_z: {}, sector_size: {}, material_first: {}, material_count: {}, flags: 0 }},",
+            "    LevelRoomRecord {{ name: {:?}, world_asset: AssetId({}), origin_x: {}, origin_z: {}, sector_size: {}, material_first: MaterialIndex({}), material_count: {}, flags: 0 }},",
             room.name,
             room.world_asset_index,
             room.origin_x,
@@ -217,7 +217,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     for (i, _room) in package.rooms.iter().enumerate() {
         let _ = writeln!(
             out,
-            "    RoomResidencyRecord {{ room: {i}, required_ram: ROOM_{i}_REQUIRED_RAM, required_vram: ROOM_{i}_REQUIRED_VRAM, warm_ram: &[], warm_vram: &[] }},",
+            "    RoomResidencyRecord {{ room: RoomIndex({i}), required_ram: ROOM_{i}_REQUIRED_RAM, required_vram: ROOM_{i}_REQUIRED_VRAM, warm_ram: &[], warm_vram: &[] }},",
         );
     }
     out.push_str("];\n\n");
@@ -232,7 +232,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     });
     let _ = writeln!(
         out,
-        "/// Player spawn.\npub static PLAYER_SPAWN: PlayerSpawnRecord = PlayerSpawnRecord {{ room: {}, x: {}, y: {}, z: {}, yaw: {}, flags: {} }};",
+        "/// Player spawn.\npub static PLAYER_SPAWN: PlayerSpawnRecord = PlayerSpawnRecord {{ room: RoomIndex({}), x: {}, y: {}, z: {}, yaw: {}, flags: {} }};",
         spawn.room, spawn.x, spawn.y, spawn.z, spawn.yaw, spawn.flags
     );
     out.push('\n');
@@ -245,7 +245,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     for clip in &package.model_clips {
         let _ = writeln!(
             out,
-            "    LevelModelClipRecord {{ model: {}, name: {:?}, animation_asset: AssetId({}) }},",
+            "    LevelModelClipRecord {{ model: ModelIndex({}), name: {:?}, animation_asset: AssetId({}) }},",
             clip.model, clip.name, clip.animation_asset_index,
         );
     }
@@ -260,7 +260,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         };
         let _ = writeln!(
             out,
-            "    LevelModelRecord {{ name: {:?}, mesh_asset: AssetId({}), texture_asset: {texture}, clip_first: {}, clip_count: {}, default_clip: {}, world_height: {}, flags: 0 }},",
+            "    LevelModelRecord {{ name: {:?}, mesh_asset: AssetId({}), texture_asset: {texture}, clip_first: ModelClipTableIndex({}), clip_count: {}, default_clip: ModelClipIndex({}), world_height: {}, flags: 0 }},",
             model.name,
             model.mesh_asset_index,
             model.clip_first,
@@ -274,10 +274,18 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     out.push_str("/// Placed model instances, room-local coordinates.\n");
     out.push_str("pub static MODEL_INSTANCES: &[LevelModelInstanceRecord] = &[\n");
     for inst in &package.model_instances {
+        let clip = if inst.clip == MODEL_CLIP_INHERIT {
+            "MODEL_CLIP_INHERIT".to_string()
+        } else {
+            format!(
+                "OptionalModelClipIndex::some(ModelClipIndex({}))",
+                inst.clip
+            )
+        };
         let _ = writeln!(
             out,
-            "    LevelModelInstanceRecord {{ room: {}, model: {}, clip: {}, x: {}, y: {}, z: {}, yaw: {}, flags: {} }},",
-            inst.room, inst.model, inst.clip, inst.x, inst.y, inst.z, inst.yaw, inst.flags,
+            "    LevelModelInstanceRecord {{ room: RoomIndex({}), model: ModelIndex({}), clip: {clip}, x: {}, y: {}, z: {}, yaw: {}, flags: {} }},",
+            inst.room, inst.model, inst.x, inst.y, inst.z, inst.yaw, inst.flags,
         );
     }
     out.push_str("];\n\n");
@@ -287,7 +295,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     for light in &package.lights {
         let _ = writeln!(
             out,
-            "    PointLightRecord {{ room: {}, x: {}, y: {}, z: {}, radius: {}, intensity_q8: {}, color: [{}, {}, {}], flags: 0 }},",
+            "    PointLightRecord {{ room: RoomIndex({}), x: {}, y: {}, z: {}, radius: {}, intensity_q8: {}, color: [{}, {}, {}], flags: 0 }},",
             light.room,
             light.x,
             light.y,
@@ -308,12 +316,12 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
             if slot == CHARACTER_CLIP_NONE {
                 "CHARACTER_CLIP_NONE".to_string()
             } else {
-                format!("{slot}")
+                format!("OptionalModelClipIndex::some(ModelClipIndex({slot}))")
             }
         };
         let _ = writeln!(
             out,
-            "    LevelCharacterRecord {{ model: {}, idle_clip: {}, walk_clip: {}, run_clip: {}, turn_clip: {}, radius: {}, height: {}, walk_speed: {}, run_speed: {}, turn_speed_degrees_per_second: {}, camera_distance: {}, camera_height: {}, camera_target_height: {}, flags: 0 }},",
+            "    LevelCharacterRecord {{ model: ModelIndex({}), idle_clip: ModelClipIndex({}), walk_clip: ModelClipIndex({}), run_clip: {}, turn_clip: {}, radius: {}, height: {}, walk_speed: {}, run_speed: {}, turn_speed_degrees_per_second: {}, camera_distance: {}, camera_height: {}, camera_target_height: {}, flags: 0 }},",
             character.model,
             character.idle_clip,
             character.walk_clip,
@@ -335,7 +343,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         Some(pc) => {
             let _ = writeln!(
                 out,
-                "/// Player controller — spawn + Character that drives the player.\npub static PLAYER_CONTROLLER: Option<PlayerControllerRecord> = Some(PlayerControllerRecord {{ spawn: PlayerSpawnRecord {{ room: {}, x: {}, y: {}, z: {}, yaw: {}, flags: {} }}, character: {}, flags: 0 }});",
+                "/// Player controller — spawn + Character that drives the player.\npub static PLAYER_CONTROLLER: Option<PlayerControllerRecord> = Some(PlayerControllerRecord {{ spawn: PlayerSpawnRecord {{ room: RoomIndex({}), x: {}, y: {}, z: {}, yaw: {}, flags: {} }}, character: CharacterIndex({}), flags: 0 }});",
                 pc.spawn.room, pc.spawn.x, pc.spawn.y, pc.spawn.z, pc.spawn.yaw, pc.spawn.flags, pc.character,
             );
         }
@@ -357,7 +365,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         };
         let _ = writeln!(
             out,
-            "    EntityRecord {{ room: {}, kind: {kind}, x: {}, y: {}, z: {}, yaw: {}, resource_slot: {}, flags: {} }},",
+            "    EntityRecord {{ room: RoomIndex({}), kind: {kind}, x: {}, y: {}, z: {}, yaw: {}, resource_slot: ResourceSlot({}), flags: {} }},",
             entity.room, entity.x, entity.y, entity.z, entity.yaw, entity.resource_slot, entity.flags
         );
     }
@@ -504,6 +512,7 @@ use psx_level::{
     AssetId,
     AssetKind,
     CHARACTER_CLIP_NONE,
+    CharacterIndex,
     EntityKind,
     EntityRecord,
     LevelAssetRecord,
@@ -513,9 +522,18 @@ use psx_level::{
     LevelModelInstanceRecord,
     LevelModelRecord,
     LevelRoomRecord,
+    MaterialIndex,
+    MaterialSlot,
+    MODEL_CLIP_INHERIT,
+    ModelClipIndex,
+    ModelClipTableIndex,
+    ModelIndex,
     PlayerControllerRecord,
     PlayerSpawnRecord,
     PointLightRecord,
+    OptionalModelClipIndex,
+    ResourceSlot,
+    RoomIndex,
     RoomResidencyRecord,
 };
 
