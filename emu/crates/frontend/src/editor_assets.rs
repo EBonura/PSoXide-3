@@ -321,6 +321,7 @@ mod tests {
                 preview_clip: Some(0),
                 world_height: 1024,
                 scale_q8: [psxed_project::MODEL_SCALE_ONE_Q8; 3],
+                attachments: Vec::new(),
             }),
         );
         (project, id)
@@ -441,6 +442,7 @@ mod tests {
                 preview_clip: None,
                 world_height: 1024,
                 scale_q8: [psxed_project::MODEL_SCALE_ONE_Q8; 3],
+                attachments: Vec::new(),
             }),
         );
 

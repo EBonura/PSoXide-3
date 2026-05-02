@@ -72,9 +72,9 @@ pub(super) fn validate_grid_budget(grid: &WorldGrid) -> Result<(), WorldGridCook
             limit: MAX_ROOM_TRIANGLES,
         });
     }
-    if budget.psxw_v1_bytes > MAX_ROOM_BYTES {
+    if budget.psxw_bytes > MAX_ROOM_BYTES {
         return Err(WorldGridCookError::RoomByteBudgetExceeded {
-            bytes: budget.psxw_v1_bytes,
+            bytes: budget.psxw_bytes,
             limit: MAX_ROOM_BYTES,
         });
     }

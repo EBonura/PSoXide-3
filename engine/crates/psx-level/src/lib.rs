@@ -87,10 +87,23 @@ typed_index! {
     pub struct ModelClipTableIndex;
 }
 
+typed_index! {
+    /// Index into the generated `MODEL_SOCKETS` table.
+    pub struct ModelSocketIndex;
+}
+
 /// Room record flags.
 pub mod room_flags {
     /// Per-room fog/depth cue is enabled.
     pub const FOG_ENABLED: u16 = 1 << 0;
+}
+
+/// Equipment record flags.
+pub mod equipment_flags {
+    /// Equipment belongs to the player controller and should follow
+    /// the live player transform/animation instead of the baked
+    /// authoring transform.
+    pub const PLAYER: u16 = 1 << 0;
 }
 
 typed_index! {
@@ -427,9 +440,30 @@ pub struct LevelModelRecord {
     /// clip; the runtime never has to fall back to bind pose
     /// (no bind-pose path exists in this pass).
     pub default_clip: ModelClipIndex,
+    /// First index into the generated `MODEL_SOCKETS` table.
+    pub socket_first: ModelSocketIndex,
+    /// Number of sockets in this model's slice.
+    pub socket_count: u16,
     /// Suggested world-space height (engine units) -- mirrors
     /// the `.psxmdl` header's `local_to_world` hint.
     pub world_height: u16,
+    /// Reserved.
+    pub flags: u16,
+}
+
+/// One named attachment socket authored on a model resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelModelSocketRecord {
+    /// Owning model index.
+    pub model: ModelIndex,
+    /// Display/runtime lookup name.
+    pub name: &'static str,
+    /// Joint index in the cooked model skeleton.
+    pub joint: u16,
+    /// Local translation relative to that joint pose.
+    pub translation: [i32; 3],
+    /// Local Euler rotation in Q12 turn units, X/Y/Z.
+    pub rotation_q12: [i16; 3],
     /// Reserved.
     pub flags: u16,
 }

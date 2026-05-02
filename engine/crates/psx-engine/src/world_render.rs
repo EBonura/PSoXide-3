@@ -3,7 +3,7 @@
 //! Walks a [`RoomRender`] and emits its floors / ceilings / walls
 //! through [`WorldRenderPass::submit_textured_quad`]. Material slot
 //! → runtime material is provided by the caller because the
-//! current `.psxw` (VERSION 1) doesn't embed a material table.
+//! current `.psxw` (VERSION 2) doesn't embed a material table.
 //! See `docs/world-format-roadmap.md` for the future compact
 //! format that will let this helper resolve materials itself.
 
@@ -187,11 +187,8 @@ const SPLIT_NW_SE: u8 = 0;
 /// `psxed_format::world::split::NORTH_EAST_SOUTH_WEST`.
 const SPLIT_NE_SW: u8 = 1;
 
-/// Texture-page-relative tile size used by the helper. v1 records
-/// don't carry per-face UV info, so floors / ceilings / walls
-/// all UV-tile a single 64×64 patch over the quad. Per-face UVs
-/// would land alongside the future compact material table -- see
-/// `docs/world-format-roadmap.md`.
+/// Texture-page-relative tile size used by legacy v1 helper tests.
+#[cfg(test)]
 const TILE_UV: u8 = 64;
 
 /// Direction id for the north edge.
@@ -205,7 +202,7 @@ const DIR_EAST: u8 = 1;
 const DIR_SOUTH: u8 = 2;
 const DIR_WEST: u8 = 3;
 
-const FLOOR_UVS: [(u8, u8); 4] = [(0, 0), (TILE_UV, 0), (TILE_UV, TILE_UV), (0, TILE_UV)];
+#[cfg(test)]
 const WALL_UVS: [(u8, u8); 4] = [(0, TILE_UV), (TILE_UV, TILE_UV), (TILE_UV, 0), (0, 0)];
 
 /// Walk every populated sector of `room`, emitting one textured
@@ -411,6 +408,7 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                     sector_size,
                     sector.floor_heights(),
                     sector.floor_split(),
+                    sector.floor_uvs(),
                     material,
                     camera,
                     options,
@@ -445,6 +443,7 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                     sector_size,
                     sector.ceiling_heights(),
                     sector.ceiling_split(),
+                    sector.ceiling_uvs(),
                     material,
                     camera,
                     options,
@@ -483,6 +482,7 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                     sector_size,
                     wall.direction(),
                     wall.heights(),
+                    wall.uvs(),
                     material,
                     camera,
                     options,
@@ -585,6 +585,7 @@ fn emit_floor<const OT: usize>(
     sector_size: i32,
     heights: [i32; 4],
     split: u8,
+    uvs: [(u8, u8); 4],
     material: WorldRenderMaterial,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
@@ -604,7 +605,7 @@ fn emit_floor<const OT: usize>(
         CullMode::Back,
         material,
         verts,
-        FLOOR_UVS,
+        uvs,
         split,
         triangles,
         world,
@@ -621,6 +622,7 @@ fn emit_ceiling<const OT: usize>(
     sector_size: i32,
     heights: [i32; 4],
     split: u8,
+    uvs: [(u8, u8); 4],
     material: WorldRenderMaterial,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
@@ -640,7 +642,7 @@ fn emit_ceiling<const OT: usize>(
         CullMode::Back,
         material,
         verts,
-        reverse_quad_winding(FLOOR_UVS),
+        reverse_quad_winding(uvs),
         split,
         triangles,
         world,
@@ -658,6 +660,7 @@ fn emit_wall<const OT: usize>(
     sector_size: i32,
     direction: u8,
     heights: [i32; 4],
+    uvs: [(u8, u8); 4],
     material: WorldRenderMaterial,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
@@ -673,7 +676,7 @@ fn emit_wall<const OT: usize>(
         CullMode::Back,
         material,
         verts,
-        inward_wall_uvs(),
+        reverse_quad_winding(uvs),
         triangles,
         world,
     );
@@ -887,6 +890,7 @@ fn inward_wall_vertices(
     Some(reverse_quad_winding(bl_br_tr_tl))
 }
 
+#[cfg(test)]
 fn inward_wall_uvs() -> [(u8, u8); 4] {
     reverse_quad_winding(WALL_UVS)
 }

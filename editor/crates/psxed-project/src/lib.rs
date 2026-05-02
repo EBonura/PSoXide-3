@@ -301,6 +301,168 @@ pub enum GridSplit {
     NorthEastSouthWest,
 }
 
+/// Quarter-turn texture rotation for authored grid faces.
+///
+/// PS1 textured polygons carry per-corner 8-bit UVs, not a texture
+/// matrix, so these rotations are represented by rewriting the UVs
+/// sent with each face.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GridUvRotation {
+    /// No texture rotation.
+    #[default]
+    Deg0,
+    /// Rotate texture coordinates 90 degrees clockwise on the face.
+    Deg90,
+    /// Rotate texture coordinates 180 degrees.
+    Deg180,
+    /// Rotate texture coordinates 270 degrees clockwise on the face.
+    Deg270,
+}
+
+/// Non-destructive texture-coordinate transform for one grid face.
+///
+/// `offset` is in PS1 texels and is applied after flip/rotation. It
+/// wraps in the 8-bit UV coordinate space, which matches packet-level
+/// PS1 UVs; seamless repeated scrolling still needs texture-window
+/// support or an intentionally repeated texture page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GridUvTransform {
+    /// Signed `[u, v]` texel offset.
+    #[serde(default)]
+    pub offset: [i16; 2],
+    /// Quarter-turn rotation.
+    #[serde(default)]
+    pub rotation: GridUvRotation,
+    /// Mirror horizontally before rotation.
+    #[serde(default)]
+    pub flip_u: bool,
+    /// Mirror vertically before rotation.
+    #[serde(default)]
+    pub flip_v: bool,
+}
+
+impl GridUvTransform {
+    /// Identity transform.
+    pub const IDENTITY: Self = Self {
+        offset: [0, 0],
+        rotation: GridUvRotation::Deg0,
+        flip_u: false,
+        flip_v: false,
+    };
+
+    /// `true` when this transform leaves UVs unchanged.
+    pub const fn is_identity(&self) -> bool {
+        self.offset[0] == 0
+            && self.offset[1] == 0
+            && matches!(self.rotation, GridUvRotation::Deg0)
+            && !self.flip_u
+            && !self.flip_v
+    }
+
+    /// Apply the transform to a quad's corner UVs.
+    ///
+    /// The input order can be any perimeter order (`[NW, NE, SE, SW]`
+    /// for floors or `[BL, BR, TR, TL]` for walls); the transform is
+    /// computed inside the UV rectangle spanned by those four points.
+    pub fn apply_to_quad(self, uvs: [(u8, u8); 4]) -> [(u8, u8); 4] {
+        if self.is_identity() {
+            return uvs;
+        }
+        let bounds = uv_bounds(uvs);
+        [
+            self.apply_one(uvs[0], bounds),
+            self.apply_one(uvs[1], bounds),
+            self.apply_one(uvs[2], bounds),
+            self.apply_one(uvs[3], bounds),
+        ]
+    }
+
+    fn apply_one(self, uv: (u8, u8), bounds: UvBounds) -> (u8, u8) {
+        let width = bounds.max_u - bounds.min_u;
+        let height = bounds.max_v - bounds.min_v;
+        if width == 0 || height == 0 {
+            return (
+                wrap_uv(uv.0 as i32 + self.offset[0] as i32),
+                wrap_uv(uv.1 as i32 + self.offset[1] as i32),
+            );
+        }
+
+        let mut u = uv.0 as i32 - bounds.min_u;
+        let mut v = uv.1 as i32 - bounds.min_v;
+        if self.flip_u {
+            u = width - u;
+        }
+        if self.flip_v {
+            v = height - v;
+        }
+
+        let (u, v) = match self.rotation {
+            GridUvRotation::Deg0 => (u, v),
+            GridUvRotation::Deg90 => (
+                width - scale_rounded(v, width, height),
+                scale_rounded(u, height, width),
+            ),
+            GridUvRotation::Deg180 => (width - u, height - v),
+            GridUvRotation::Deg270 => (
+                scale_rounded(v, width, height),
+                height - scale_rounded(u, height, width),
+            ),
+        };
+
+        (
+            wrap_uv(bounds.min_u + u + self.offset[0] as i32),
+            wrap_uv(bounds.min_v + v + self.offset[1] as i32),
+        )
+    }
+}
+
+impl Default for GridUvTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UvBounds {
+    min_u: i32,
+    max_u: i32,
+    min_v: i32,
+    max_v: i32,
+}
+
+fn uv_bounds(uvs: [(u8, u8); 4]) -> UvBounds {
+    let mut min_u = uvs[0].0 as i32;
+    let mut max_u = min_u;
+    let mut min_v = uvs[0].1 as i32;
+    let mut max_v = min_v;
+    for (u, v) in uvs {
+        let u = u as i32;
+        let v = v as i32;
+        min_u = min_u.min(u);
+        max_u = max_u.max(u);
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    UvBounds {
+        min_u,
+        max_u,
+        min_v,
+        max_v,
+    }
+}
+
+fn scale_rounded(value: i32, numerator: i32, denominator: i32) -> i32 {
+    if denominator == 0 {
+        0
+    } else {
+        (value.saturating_mul(numerator) + denominator / 2) / denominator
+    }
+}
+
+fn wrap_uv(value: i32) -> u8 {
+    value.rem_euclid(256) as u8
+}
+
 /// Floor / ceiling corner index. Maps directly to the
 /// `[NW, NE, SE, SW]` order every height array uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +575,18 @@ impl GridDirection {
         matches!(self, Self::North | Self::East | Self::South | Self::West)
     }
 
+    /// Opposite cardinal edge. Diagonals do not have a single
+    /// opposite perimeter edge.
+    pub const fn opposite_cardinal(self) -> Option<Self> {
+        match self {
+            Self::North => Some(Self::South),
+            Self::East => Some(Self::West),
+            Self::South => Some(Self::North),
+            Self::West => Some(Self::East),
+            Self::NorthWestSouthEast | Self::NorthEastSouthWest => None,
+        }
+    }
+
     /// Canonical physical edge claimed by this authored cardinal
     /// direction. Editor authoring uses North=+Z and South=-Z;
     /// this key lets opposing-cell wall claims collide without
@@ -503,6 +677,9 @@ pub struct GridHorizontalFace {
     pub split: GridSplit,
     /// Material used by the face.
     pub material: Option<ResourceId>,
+    /// Non-destructive texture-coordinate transform.
+    #[serde(default, skip_serializing_if = "GridUvTransform::is_identity")]
+    pub uv: GridUvTransform,
     /// Whether character collision treats this face as walkable.
     pub walkable: bool,
     /// `Some(corner)` when one corner has been deleted, turning
@@ -521,6 +698,7 @@ impl GridHorizontalFace {
             heights: [height, height, height, height],
             split: GridSplit::NorthWestSouthEast,
             material,
+            uv: GridUvTransform::IDENTITY,
             walkable: true,
             dropped_corner: None,
         }
@@ -554,6 +732,9 @@ pub struct GridVerticalFace {
     pub heights: [i32; 4],
     /// Material used by the wall.
     pub material: Option<ResourceId>,
+    /// Non-destructive texture-coordinate transform.
+    #[serde(default, skip_serializing_if = "GridUvTransform::is_identity")]
+    pub uv: GridUvTransform,
     /// Whether collision treats this wall as blocking.
     pub solid: bool,
     /// `Some(corner)` when one wall corner has been deleted,
@@ -563,14 +744,21 @@ pub struct GridVerticalFace {
 }
 
 impl GridVerticalFace {
-    /// Flat wall from `bottom` to `top`.
-    pub const fn flat(bottom: i32, top: i32, material: Option<ResourceId>) -> Self {
+    /// Wall from explicit per-corner heights in `[BL, BR, TR, TL]`
+    /// order.
+    pub const fn with_heights(heights: [i32; 4], material: Option<ResourceId>) -> Self {
         Self {
-            heights: [bottom, bottom, top, top],
+            heights,
             material,
+            uv: GridUvTransform::IDENTITY,
             solid: true,
             dropped_corner: None,
         }
+    }
+
+    /// Flat wall from `bottom` to `top`.
+    pub const fn flat(bottom: i32, top: i32, material: Option<ResourceId>) -> Self {
+        Self::with_heights([bottom, bottom, top, top], material)
     }
 
     pub fn drop_corner(&mut self, corner: WallCorner) {
@@ -583,6 +771,25 @@ impl GridVerticalFace {
 
     pub const fn is_triangle(&self) -> bool {
         self.dropped_corner.is_some()
+    }
+}
+
+/// Array-sector rectangle enclosing authored grid geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldGridFootprint {
+    pub x: u16,
+    pub z: u16,
+    pub width: u16,
+    pub depth: u16,
+}
+
+impl WorldGridFootprint {
+    pub fn end_x(self) -> u16 {
+        self.x + self.width
+    }
+
+    pub fn end_z(self) -> u16 {
+        self.z + self.depth
     }
 }
 
@@ -681,6 +888,35 @@ impl GridSector {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HorizontalSurface {
+    Floor,
+    Ceiling,
+}
+
+impl HorizontalSurface {
+    fn edge_heights(self, sector: &GridSector, direction: GridDirection) -> Option<[i32; 2]> {
+        let heights = match self {
+            Self::Floor => sector.floor.as_ref()?.heights,
+            Self::Ceiling => sector.ceiling.as_ref()?.heights,
+        };
+        horizontal_edge_heights_for_wall(heights, direction)
+    }
+}
+
+fn horizontal_edge_heights_for_wall(
+    heights: [i32; 4],
+    direction: GridDirection,
+) -> Option<[i32; 2]> {
+    match direction {
+        GridDirection::North => Some([heights[Corner::NW.idx()], heights[Corner::NE.idx()]]),
+        GridDirection::East => Some([heights[Corner::NE.idx()], heights[Corner::SE.idx()]]),
+        GridDirection::South => Some([heights[Corner::SE.idx()], heights[Corner::SW.idx()]]),
+        GridDirection::West => Some([heights[Corner::SW.idx()], heights[Corner::NW.idx()]]),
+        GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => None,
+    }
+}
+
 /// Hard caps on a single room's authoring shape. The cooker
 /// rejects past these, and the editor inspector warns as the
 /// budget approaches them -- both to keep the cooked `.psxw`
@@ -772,7 +1008,7 @@ pub struct WorldGridBudget {
     pub width: u16,
     /// Grid depth in sectors.
     pub depth: u16,
-    /// `width * depth`. v1 `.psxw` stores a sector record for
+    /// `width * depth`. `.psxw` stores a sector record for
     /// every cell whether it's populated or not, so this is
     /// what the wire-size formula multiplies against.
     pub total_cells: usize,
@@ -784,10 +1020,9 @@ pub struct WorldGridBudget {
     pub ceilings: usize,
     pub walls: usize,
     pub triangles: usize,
-    /// `.psxw` v1 wire size with 44-byte sectors / 24-byte
-    /// walls. v1 stores a record for **every** cell, so this
+    /// Current `.psxw` wire size. The format stores a record for **every** cell, so this
     /// uses `total_cells`, not `populated_cells`.
-    pub psxw_v1_bytes: usize,
+    pub psxw_bytes: usize,
     /// Estimated size if we shipped the future compact format
     /// described in `docs/world-format-roadmap.md` (28-byte
     /// sectors, 12-byte walls). Surfaced as a planning aid, not
@@ -803,14 +1038,14 @@ impl WorldGridBudget {
         self.width > MAX_ROOM_WIDTH
             || self.depth > MAX_ROOM_DEPTH
             || self.triangles > MAX_ROOM_TRIANGLES
-            || self.psxw_v1_bytes > MAX_ROOM_BYTES
+            || self.psxw_bytes > MAX_ROOM_BYTES
     }
 }
 
 const ASSET_HEADER_BYTES: usize = 12;
 const WORLD_HEADER_BYTES: usize = 20;
-const V1_SECTOR_BYTES: usize = 44;
-const V1_WALL_BYTES: usize = 24;
+const PSXW_SECTOR_BYTES: usize = psxed_format::world::SectorRecord::SIZE;
+const PSXW_WALL_BYTES: usize = psxed_format::world::WallRecord::SIZE;
 const FUTURE_COMPACT_SECTOR_BYTES: usize = 28;
 const FUTURE_COMPACT_WALL_BYTES: usize = 12;
 
@@ -972,15 +1207,214 @@ impl WorldGrid {
         }
     }
 
-    /// Number of populated sectors.
-    pub fn populated_sector_count(&self) -> usize {
-        self.sectors.iter().flatten().count()
+    /// Add a wall whose bottom edge follows the floor edge under
+    /// it and whose top edge follows the ceiling edge when present.
+    /// Missing ceilings fall back to the room's default sector
+    /// height, matching the old wall-paint default.
+    pub fn add_wall_aligned_to_surfaces(
+        &mut self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+        material: Option<ResourceId>,
+    ) {
+        let heights = self.wall_heights_aligned_to_surfaces(x, z, direction);
+        if let Some(sector) = self.ensure_sector(x, z) {
+            sector
+                .walls
+                .get_mut(direction)
+                .push(GridVerticalFace::with_heights(heights, material));
+        }
     }
 
-    /// Snapshot of this grid's authoring footprint + cooked-byte
-    /// estimate. Used by the editor inspector to surface room
-    /// budgets so authors notice when they're approaching PSX
-    /// limits before cook time.
+    /// Candidate wall heights for editor placement on a cardinal
+    /// edge. The returned order is `[BL, BR, TR, TL]`.
+    pub fn wall_heights_aligned_to_surfaces(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+    ) -> [i32; 4] {
+        let bottom = self
+            .floor_edge_heights_for_wall(x, z, direction)
+            .unwrap_or([0, 0]);
+        let top = self
+            .ceiling_edge_heights_for_wall(x, z, direction)
+            .unwrap_or_else(|| {
+                [
+                    self.sector_size.max(bottom[0].saturating_add(1)),
+                    self.sector_size.max(bottom[1].saturating_add(1)),
+                ]
+            });
+        [bottom[0], bottom[1], top[1], top[0]]
+    }
+
+    /// Same as [`Self::wall_heights_aligned_to_surfaces`], but
+    /// addressed by world-cell coordinates so hover previews can
+    /// match clicks that will auto-grow the grid on commit.
+    pub fn wall_heights_aligned_to_surfaces_for_world_cell(
+        &self,
+        wcx: i32,
+        wcz: i32,
+        direction: GridDirection,
+    ) -> [i32; 4] {
+        let bottom = self
+            .horizontal_edge_heights_for_world_wall(wcx, wcz, direction, HorizontalSurface::Floor)
+            .unwrap_or([0, 0]);
+        let top = self
+            .horizontal_edge_heights_for_world_wall(wcx, wcz, direction, HorizontalSurface::Ceiling)
+            .unwrap_or_else(|| {
+                [
+                    self.sector_size.max(bottom[0].saturating_add(1)),
+                    self.sector_size.max(bottom[1].saturating_add(1)),
+                ]
+            });
+        [bottom[0], bottom[1], top[1], top[0]]
+    }
+
+    fn floor_edge_heights_for_wall(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+    ) -> Option<[i32; 2]> {
+        self.horizontal_edge_heights_for_wall(x, z, direction, HorizontalSurface::Floor)
+    }
+
+    fn ceiling_edge_heights_for_wall(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+    ) -> Option<[i32; 2]> {
+        self.horizontal_edge_heights_for_wall(x, z, direction, HorizontalSurface::Ceiling)
+    }
+
+    fn horizontal_edge_heights_for_wall(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+        surface: HorizontalSurface,
+    ) -> Option<[i32; 2]> {
+        if let Some(heights) = self
+            .sector(x, z)
+            .and_then(|sector| surface.edge_heights(sector, direction))
+        {
+            return Some(heights);
+        }
+
+        let (nx, nz, opposite) = self.neighbor_across_cardinal_edge(x, z, direction)?;
+        let mut heights = self
+            .sector(nx, nz)
+            .and_then(|sector| surface.edge_heights(sector, opposite))?;
+        heights.swap(0, 1);
+        Some(heights)
+    }
+
+    fn neighbor_across_cardinal_edge(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+    ) -> Option<(u16, u16, GridDirection)> {
+        let opposite = direction.opposite_cardinal()?;
+        let (nx, nz) = match direction {
+            GridDirection::North => (x, z.checked_add(1)?),
+            GridDirection::East => (x.checked_add(1)?, z),
+            GridDirection::South => (x, z.checked_sub(1)?),
+            GridDirection::West => (x.checked_sub(1)?, z),
+            GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => return None,
+        };
+        (nx < self.width && nz < self.depth).then_some((nx, nz, opposite))
+    }
+
+    fn horizontal_edge_heights_for_world_wall(
+        &self,
+        wcx: i32,
+        wcz: i32,
+        direction: GridDirection,
+        surface: HorizontalSurface,
+    ) -> Option<[i32; 2]> {
+        if let Some((sx, sz)) = self.world_cell_to_array(wcx, wcz) {
+            if let Some(heights) = self
+                .sector(sx, sz)
+                .and_then(|sector| surface.edge_heights(sector, direction))
+            {
+                return Some(heights);
+            }
+        }
+
+        let opposite = direction.opposite_cardinal()?;
+        let (nwcx, nwcz) = match direction {
+            GridDirection::North => (wcx, wcz.saturating_add(1)),
+            GridDirection::East => (wcx.saturating_add(1), wcz),
+            GridDirection::South => (wcx, wcz.saturating_sub(1)),
+            GridDirection::West => (wcx.saturating_sub(1), wcz),
+            GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => return None,
+        };
+        let (sx, sz) = self.world_cell_to_array(nwcx, nwcz)?;
+        let mut heights = self
+            .sector(sx, sz)
+            .and_then(|sector| surface.edge_heights(sector, opposite))?;
+        heights.swap(0, 1);
+        Some(heights)
+    }
+
+    /// Number of populated sectors.
+    pub fn populated_sector_count(&self) -> usize {
+        self.sectors
+            .iter()
+            .flatten()
+            .filter(|sector| sector.has_geometry())
+            .count()
+    }
+
+    /// Rectangle enclosing every sector that emits authored
+    /// geometry. Empty allocated cells are capacity, not room
+    /// footprint, so they do not influence bounds or streaming
+    /// subdivision.
+    pub fn authored_footprint(&self) -> Option<WorldGridFootprint> {
+        let mut min_x = self.width;
+        let mut min_z = self.depth;
+        let mut max_x = 0u16;
+        let mut max_z = 0u16;
+        let mut found = false;
+        for x in 0..self.width {
+            for z in 0..self.depth {
+                let Some(sector) = self.sector(x, z) else {
+                    continue;
+                };
+                if !sector.has_geometry() {
+                    continue;
+                }
+                found = true;
+                min_x = min_x.min(x);
+                min_z = min_z.min(z);
+                max_x = max_x.max(x);
+                max_z = max_z.max(z);
+            }
+        }
+        found.then_some(WorldGridFootprint {
+            x: min_x,
+            z: min_z,
+            width: max_x - min_x + 1,
+            depth: max_z - min_z + 1,
+        })
+    }
+
+    /// Budget for the authored footprint only. This is the number
+    /// authors care about when sparse grid allocation has grown past
+    /// the currently placed tiles.
+    pub fn authored_budget(&self) -> WorldGridBudget {
+        self.authored_footprint()
+            .and_then(|f| self.budget_for_rect(f.x, f.z, f.width, f.depth))
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of the allocated grid rectangle + cooked-byte
+    /// estimate. Use [`Self::authored_budget`] when empty capacity
+    /// should not count as room footprint.
     pub fn budget(&self) -> WorldGridBudget {
         self.budget_for_rect(0, 0, self.width, self.depth)
             .unwrap_or_default()
@@ -1015,6 +1449,9 @@ impl WorldGrid {
                 let Some(sector) = self.sector(sx, sz) else {
                     continue;
                 };
+                if !sector.has_geometry() {
+                    continue;
+                }
                 b.populated_cells += 1;
                 if sector.floor.is_some() {
                     b.floors += 1;
@@ -1031,20 +1468,19 @@ impl WorldGrid {
                 }
             }
         }
-        // v1 wire layout (matches `psxed_format::world` records):
-        //   AssetHeader = 12, WorldHeader = 20, Sector = 44, Wall = 24.
-        // v1 stores a sector record for every cell -- empty or not --
-        // so the byte count uses `total_cells`. Using
+        // Active wire layout (matches `psxed_format::world` records).
+        // `.psxw` stores a sector record for every cell -- empty or
+        // not -- so the byte count uses `total_cells`. Using
         // `populated_cells` here was the original bug: it under-
-        // reported the wire size by ~44 B per empty cell.
+        // reported the wire size by one sector record per empty cell.
         // Target compact-format sizes for the planning estimate.
         // See `docs/world-format-roadmap.md`. Plain numeric
         // constants rather than struct sizes so this block doesn't
         // pretend a v2 format exists in code.
-        b.psxw_v1_bytes = ASSET_HEADER_BYTES
+        b.psxw_bytes = ASSET_HEADER_BYTES
             + WORLD_HEADER_BYTES
-            + b.total_cells * V1_SECTOR_BYTES
-            + b.walls * V1_WALL_BYTES;
+            + b.total_cells * PSXW_SECTOR_BYTES
+            + b.walls * PSXW_WALL_BYTES;
         b.future_compact_estimated_bytes = ASSET_HEADER_BYTES
             + WORLD_HEADER_BYTES
             + b.total_cells * FUTURE_COMPACT_SECTOR_BYTES
@@ -3389,8 +3825,11 @@ mod tests {
         project.save_to_path(&path).unwrap();
 
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("kind: World(sector_size: 1024),"));
-        assert!(saved.contains("sector_size: 1024"));
+        let expected_sector_size = project.world_sector_size_for_node(room_id);
+        assert!(saved.contains(&format!(
+            "kind: World(sector_size: {expected_sector_size}),"
+        )));
+        assert!(saved.contains(&format!("sector_size: {expected_sector_size}")));
         assert!(!saved.contains("sector_size: 2030"));
 
         let loaded = ProjectDocument::load_from_path(&path).unwrap();
@@ -3398,7 +3837,7 @@ mod tests {
         let NodeKind::Room { grid } = &scene.node(room_id).unwrap().kind else {
             panic!("expected Room");
         };
-        assert_eq!(grid.sector_size, 1024);
+        assert_eq!(grid.sector_size, expected_sector_size);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3458,6 +3897,61 @@ mod tests {
             bounds.wall_endpoints_xz(GridDirection::South),
             Some(([2048, 1024], [1024, 1024]))
         );
+    }
+
+    #[test]
+    fn wall_placement_aligns_bottom_edge_to_floor_vertices() {
+        let mut grid = WorldGrid::empty(1, 1, 1024);
+        let mut floor = GridHorizontalFace::flat(0, None);
+        floor.heights = [128, 256, 384, 512];
+        grid.ensure_sector(0, 0).unwrap().floor = Some(floor);
+
+        grid.add_wall_aligned_to_surfaces(0, 0, GridDirection::North, None);
+
+        let wall = grid
+            .sector(0, 0)
+            .unwrap()
+            .walls
+            .get(GridDirection::North)
+            .first()
+            .unwrap();
+        assert_eq!(wall.heights, [128, 256, 1024, 1024]);
+    }
+
+    #[test]
+    fn wall_placement_aligns_top_edge_to_ceiling_vertices() {
+        let mut grid = WorldGrid::empty(1, 1, 1024);
+        let mut floor = GridHorizontalFace::flat(0, None);
+        floor.heights = [128, 256, 384, 512];
+        let mut ceiling = GridHorizontalFace::flat(1024, None);
+        ceiling.heights = [900, 1000, 1100, 1200];
+        let sector = grid.ensure_sector(0, 0).unwrap();
+        sector.floor = Some(floor);
+        sector.ceiling = Some(ceiling);
+
+        grid.add_wall_aligned_to_surfaces(0, 0, GridDirection::East, None);
+
+        let wall = grid
+            .sector(0, 0)
+            .unwrap()
+            .walls
+            .get(GridDirection::East)
+            .first()
+            .unwrap();
+        assert_eq!(wall.heights, [256, 384, 1100, 1000]);
+    }
+
+    #[test]
+    fn off_grid_wall_preview_samples_adjacent_floor_edge() {
+        let mut grid = WorldGrid::empty(1, 1, 1024);
+        let mut floor = GridHorizontalFace::flat(0, None);
+        floor.heights = [128, 256, 384, 512];
+        grid.ensure_sector(0, 0).unwrap().floor = Some(floor);
+
+        let heights =
+            grid.wall_heights_aligned_to_surfaces_for_world_cell(1, 0, GridDirection::West);
+
+        assert_eq!(heights, [384, 256, 1024, 1024]);
     }
 
     #[test]
@@ -3577,6 +4071,32 @@ mod tests {
     }
 
     #[test]
+    fn authored_footprint_ignores_empty_allocation() {
+        let mut grid = WorldGrid::empty(8, 6, 1024);
+        let _ = grid.ensure_sector(0, 0);
+        grid.set_floor(2, 1, 0, None);
+        grid.add_wall(5, 4, GridDirection::North, 0, 1024, None);
+
+        let footprint = grid.authored_footprint().expect("authored geometry");
+        assert_eq!(
+            footprint,
+            WorldGridFootprint {
+                x: 2,
+                z: 1,
+                width: 4,
+                depth: 4,
+            }
+        );
+        assert_eq!(grid.populated_sector_count(), 2);
+
+        let budget = grid.authored_budget();
+        assert_eq!(budget.width, 4);
+        assert_eq!(budget.depth, 4);
+        assert_eq!(budget.total_cells, 16);
+        assert_eq!(budget.populated_cells, 2);
+    }
+
+    #[test]
     fn budget_empty_grid_reports_no_geometry() {
         let grid = WorldGrid::empty(3, 3, 1024);
         let b = grid.budget();
@@ -3589,10 +4109,11 @@ mod tests {
         assert_eq!(b.walls, 0);
         assert_eq!(b.triangles, 0);
         // AssetHeader (12) + WorldHeader (20) + 9 sector records.
-        // v1 stores a record per cell whether populated or not, so
-        // an "empty" 3×3 still costs 9 * 44 = 396 B in sector
-        // records on top of the headers.
-        assert_eq!(b.psxw_v1_bytes, 12 + 20 + 9 * 44);
+        // `.psxw` stores a record per cell whether populated or not.
+        assert_eq!(
+            b.psxw_bytes,
+            12 + 20 + 9 * psxed_format::world::SectorRecord::SIZE
+        );
         assert_eq!(b.future_compact_estimated_bytes, 12 + 20 + 9 * 28);
         assert!(!b.over_budget());
     }
@@ -3608,10 +4129,9 @@ mod tests {
         assert_eq!(b.walls, 12);
         // 2 tris per face: 9 floors + 12 walls = 21 faces.
         assert_eq!(b.triangles, 42);
-        // v2 should be strictly smaller than v1 once any geometry
-        // exists -- the size delta is the whole point of the v2
-        // record reshape.
-        assert!(b.future_compact_estimated_bytes < b.psxw_v1_bytes);
+        // The future compact estimate should be strictly smaller
+        // than the active format once any geometry exists.
+        assert!(b.future_compact_estimated_bytes < b.psxw_bytes);
         assert!(!b.over_budget());
     }
 
@@ -3630,9 +4150,9 @@ mod tests {
         assert_eq!(b.floors, 1024);
         assert_eq!(b.triangles, 2048);
         assert!(b.triangles <= MAX_ROOM_TRIANGLES);
-        // v1: 32 + 1024 * 44 = 45088 -- over the 64KiB cap on the
-        // wall-stack-heavy worst case but fine on floors-only.
-        // v2: 32 + 1024 * 28 = 28704 -- well under cap.
+        // Active format remains under the byte cap for floors-only;
+        // the wall-stack-heavy worst case is what pushes rooms over.
+        assert!(b.psxw_bytes <= MAX_ROOM_BYTES);
         assert!(b.future_compact_estimated_bytes <= MAX_ROOM_BYTES);
         assert!(!b.over_budget());
     }
@@ -3688,6 +4208,10 @@ mod tests {
             &r.data,
             ResourceData::Texture { psxt_path } if psxt_path.ends_with("brick-wall.psxt")
         )));
+        assert!(project.resources.iter().any(|r| matches!(
+            &r.data,
+            ResourceData::Texture { psxt_path } if psxt_path.ends_with("dirt.psxt")
+        )));
         // Starter ships the obsidian wraith model so users can
         // place + playtest a real animated character without
         // running the import flow first.
@@ -3708,8 +4232,21 @@ mod tests {
 
     #[test]
     fn legacy_world_and_actor_project_ron_migrates_to_world_sector_and_entity() {
+        let starter = ProjectDocument::from_ron_str(DEFAULT_PROJECT_RON).unwrap();
+        let starter_world_sector_size = starter
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::World { sector_size } => Some(*sector_size),
+                _ => None,
+            })
+            .expect("starter world exists");
         let legacy = DEFAULT_PROJECT_RON
-            .replace("kind: World(sector_size: 1024),", "kind: World,")
+            .replace(
+                &format!("kind: World(sector_size: {starter_world_sector_size}),"),
+                "kind: World,",
+            )
             .replacen("kind: Entity,", "kind: Actor,", 1);
 
         let project = ProjectDocument::from_ron_str(&legacy).unwrap();
@@ -3726,8 +4263,8 @@ mod tests {
         let migrated = scene
             .nodes()
             .iter()
-            .find(|node| node.name == "Player")
-            .expect("starter player exists");
+            .find(|node| node.name == "Wraith Hero")
+            .expect("starter player entity exists");
         assert!(matches!(&migrated.kind, NodeKind::Entity));
     }
 
@@ -3755,6 +4292,9 @@ mod tests {
         assert!(default_project_dir()
             .join("assets/textures/floor.psxt")
             .is_file());
+        assert!(default_project_dir()
+            .join("assets/textures/dirt.psxt")
+            .is_file());
     }
 
     #[test]
@@ -3762,13 +4302,14 @@ mod tests {
         let project = ProjectDocument::starter();
 
         assert_eq!(project.scenes.len(), 1);
-        // 2 textures + 2 materials = 4.
-        assert!(project.resources.len() >= 4);
+        // Starter includes room textures/materials plus gameplay
+        // resources for the animated character and weapon path.
+        assert!(project.resources.len() >= 10);
         assert!(project
             .active_scene()
             .hierarchy_rows()
             .iter()
-            .any(|row| row.name == "Stone Room"));
+            .any(|row| row.name == "Room"));
         let grid = project
             .active_scene()
             .nodes()
@@ -3789,12 +4330,53 @@ mod tests {
 
     #[test]
     fn legacy_project_missing_light_color_and_room_ambient_uses_defaults() {
+        let starter = ProjectDocument::from_ron_str(DEFAULT_PROJECT_RON).unwrap();
+        let light = starter
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Light {
+                    color,
+                    intensity,
+                    radius,
+                }
+                | NodeKind::PointLight {
+                    color,
+                    intensity,
+                    radius,
+                } => Some((*color, *intensity, *radius)),
+                _ => None,
+            })
+            .expect("starter has a light");
+        let room = starter
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Room { grid } => Some(grid),
+                _ => None,
+            })
+            .expect("starter has a room");
         let source = DEFAULT_PROJECT_RON
             .replace(
-                "kind: PointLight(color: (239, 0, 65), intensity: 0.35, radius: 3.6)",
-                "kind: PointLight(intensity: 0.35, radius: 3.6)",
+                &format!(
+                    "kind: Light(color: ({}, {}, {}), intensity: {}, radius: {})",
+                    light.0[0], light.0[1], light.0[2], light.1, light.2
+                ),
+                &format!("kind: Light(intensity: {}, radius: {})", light.1, light.2),
             )
-            .replace(", ambient_color: (28, 32, 28)", "");
+            .replace(
+                &format!(
+                    ", ambient_color: ({}, {}, {})",
+                    room.ambient_color[0], room.ambient_color[1], room.ambient_color[2]
+                ),
+                "",
+            )
+            .replace(
+                &format!(", fog_near: {}, fog_far: {}", room.fog_near, room.fog_far),
+                "",
+            );
 
         let project = ProjectDocument::from_ron_str(&source).unwrap();
         let light_color = project
@@ -3912,7 +4494,7 @@ mod tests {
         let project = ProjectDocument::starter();
         let ron = project.to_ron_string().unwrap();
 
-        assert!(ron.contains("Stone Room"));
+        assert!(ron.contains("Room"));
         assert_eq!(ProjectDocument::from_ron_str(&ron).unwrap(), project);
     }
 
@@ -4443,5 +5025,35 @@ mod tests {
         wall.drop_corner(WallCorner::TL);
         assert!(wall.is_triangle());
         assert_eq!(wall.dropped_corner, Some(WallCorner::TL));
+    }
+
+    #[test]
+    fn grid_uv_transform_rotates_quad_without_rebaking_texture() {
+        let transform = GridUvTransform {
+            offset: [0, 0],
+            rotation: GridUvRotation::Deg90,
+            flip_u: false,
+            flip_v: false,
+        };
+
+        assert_eq!(
+            transform.apply_to_quad([(0, 0), (64, 0), (64, 64), (0, 64)]),
+            [(64, 0), (64, 64), (0, 64), (0, 0)]
+        );
+    }
+
+    #[test]
+    fn grid_uv_transform_flips_and_wraps_ps1_uv_offsets() {
+        let transform = GridUvTransform {
+            offset: [-8, 12],
+            rotation: GridUvRotation::Deg0,
+            flip_u: true,
+            flip_v: false,
+        };
+
+        assert_eq!(
+            transform.apply_to_quad([(0, 0), (64, 0), (64, 64), (0, 64)]),
+            [(56, 12), (248, 12), (248, 76), (56, 76)]
+        );
     }
 }

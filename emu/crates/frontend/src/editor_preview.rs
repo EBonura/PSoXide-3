@@ -4,7 +4,7 @@
 //! [`HwRenderer`](psx_gpu_render::HwRenderer) the same way runtime
 //! PS1 code does:
 //!
-//! 1. Configure the GTE for an orbit camera (RT / TR / OFX / OFY / H).
+//! 1. Configure the GTE for the editor camera (RT / TR / OFX / OFY / H).
 //! 2. For every populated sector with a floor, project the four
 //!    corners through the host GTE shim ([`psx_gte::scene::project_vertex`]).
 //! 3. Emit two `TriFlat` packets per floor, coloured from the
@@ -28,9 +28,11 @@ use psx_gpu::prim::TriTextured;
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
 
+use psxed_project::playtest::playtest_streaming_chunk_config;
+use psxed_project::streaming::plan_generated_chunks;
 use psxed_project::{
-    spatial, GridDirection, GridSplit, NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId,
-    Scene, SceneNode, Transform3, WorldGrid,
+    spatial, GridDirection, GridSplit, GridUvTransform, NodeId, NodeKind, ProjectDocument,
+    ResourceData, ResourceId, Scene, SceneNode, Transform3, WorldGrid,
 };
 
 use crate::editor_textures::{EditorTextures, MaterialSlot};
@@ -129,10 +131,12 @@ pub struct EditorPreviewFrame {
 pub fn build_phase1_frame(
     project: &ProjectDocument,
     camera: ViewportCameraState,
+    preview_fog: bool,
     selected: psxed_project::NodeId,
     hovered_primitive: Option<psxed_ui::Selection>,
     selected_primitive: Option<psxed_ui::Selection>,
     selected_primitives: &[psxed_ui::Selection],
+    selected_bounds: Option<([f32; 3], [f32; 3])>,
     selected_sector_faces: &[psxed_ui::FaceRef],
     paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     entity_bounds: &[psxed_ui::EntityBounds],
@@ -155,7 +159,17 @@ pub fn build_phase1_frame(
 
     push_clear(&mut scratch);
     let world_camera = setup_gte_for_camera(camera);
-    walk_room(project, room_id, grid, textures, &mut scratch);
+    let fog = PreviewFog::from_grid(grid, preview_fog);
+    walk_room(
+        project,
+        room_id,
+        grid,
+        textures,
+        world_camera,
+        fog,
+        &mut scratch,
+    );
+    push_streaming_chunk_boundaries(grid, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
     walk_light_gizmos(project, grid, selected, hovered_entity_node, &mut scratch);
 
@@ -202,6 +216,9 @@ pub fn build_phase1_frame(
     // would project entity bound lines into junk.
     let _ = setup_gte_for_camera(camera);
     walk_entity_bounds(entity_bounds, selected, hovered_entity_node, &mut scratch);
+    if let Some((center, half_extents)) = selected_bounds {
+        push_aabb_wireframe(&mut scratch, center, half_extents, ENTITY_BOUND_SELECTED);
+    }
 
     // SAFETY: `scratch.tris` lives until end of this function (the
     // mutex guard keeps it alive); the OT chain pointers reference
@@ -228,26 +245,19 @@ fn first_room_grid(project: &ProjectDocument) -> Option<(psxed_project::NodeId, 
 
 /// Configure the host-side GTE so subsequent `project_vertex` /
 /// `project_triangle` calls produce screen-space coords for the
-/// requested orbit camera.
+/// requested editor camera.
 fn setup_gte_for_camera(camera: ViewportCameraState) -> psx_engine::WorldCamera {
-    let target = camera.target;
-    // Orbit camera world position: target offset by radius along the
-    // unit vector implied by yaw + pitch. Pitch positive = camera
-    // raised above the target, looking down.
-    let r = camera.radius;
     let cos_p = psx_gte::transform::cos_1_3_12(camera.pitch_q12) as i32;
     let sin_p = psx_gte::transform::sin_1_3_12(camera.pitch_q12) as i32;
     let cos_y = psx_gte::transform::cos_1_3_12(camera.yaw_q12) as i32;
     let sin_y = psx_gte::transform::sin_1_3_12(camera.yaw_q12) as i32;
-    let horiz = (r * cos_p) >> 12;
-    let cam_x = target[0] + ((horiz * sin_y) >> 12);
-    let cam_y = target[1] - ((r * sin_p) >> 12);
-    let cam_z = target[2] + ((horiz * cos_y) >> 12);
+    let anchor = camera.anchor_i32();
+    let [cam_x, cam_y, cam_z] = camera.position_i32();
 
     // View rotation: world →camera. Built so that:
     //   row0 = right (= +X in camera space)
     //   row1 = -up   (PSX screen Y points down, so we flip)
-    //   row2 = forward (= +Z in camera space; camera looks toward target)
+    //   row2 = forward (= +Z in camera space; camera looks along view direction)
     // Matches `psx_engine::render3d::camera_gte_view_matrix`.
     let view = Mat3I16 {
         m: [
@@ -265,22 +275,21 @@ fn setup_gte_for_camera(camera: ViewportCameraState) -> psx_engine::WorldCamera 
         ],
     };
 
-    // Vertex emit will subtract `target` from each world coord
+    // Vertex emit will subtract `anchor` from each world coord
     // (see `world_to_view`), so anything inside ±i16 of the
-    // camera target is safe to GTE-project. Compose the GTE
+    // camera anchor is safe to GTE-project. Compose the GTE
     // translation around that anchor: view·(anchor - cam_world)
     // = view·(-cam_local) where cam_local lives entirely within
-    // the (small) orbit-radius range. This is the fix for the
-    // 64×1024 = 65 536 > i16::MAX overflow the prior code's
-    // saturating clamp would silently corrupt.
-    let cam_local = [cam_x - target[0], cam_y - target[1], cam_z - target[2]];
+    // a small local range. Orbit anchors on its target; Free anchors
+    // on its position, which keeps large authored rooms camera-local.
+    let cam_local = [cam_x - anchor[0], cam_y - anchor[1], cam_z - anchor[2]];
     let tr = Vec3I32::new(
         -dot_view_world(view.m[0], cam_local),
         -dot_view_world(view.m[1], cam_local),
         -dot_view_world(view.m[2], cam_local),
     );
 
-    set_view_anchor(target);
+    set_view_anchor(anchor);
     gte_scene::load_rotation(&view);
     gte_scene::load_translation(tr);
     gte_scene::set_screen_offset(SCREEN_CX << 16, SCREEN_CY << 16);
@@ -301,7 +310,7 @@ fn setup_gte_for_camera(camera: ViewportCameraState) -> psx_engine::WorldCamera 
 
 /// Shared anchor that `world_to_view` subtracts from each vertex
 /// before squashing to `i16`. Set per-frame by
-/// `setup_gte_for_camera` to the camera target so the emitted
+/// `setup_gte_for_camera` to the camera anchor so the emitted
 /// vertices stay anchor-relative -- the GTE absorbs the offset via
 /// its translation register. Without this, a single 32-sector
 /// room (32 × 1024 = 32 768) sits exactly on the i16 cliff.
@@ -342,6 +351,8 @@ fn walk_room(
     room_id: psxed_project::NodeId,
     grid: &WorldGrid,
     textures: &EditorTextures,
+    camera: psx_engine::WorldCamera,
+    fog: PreviewFog,
     scratch: &mut PreviewScratch,
 ) {
     let s = grid.sector_size;
@@ -369,12 +380,14 @@ fn walk_room(
                     &lights,
                     ambient,
                 );
+                let shade = fog.apply_shade(shade, face_depth(camera, center));
                 push_horizontal_face(
                     scratch,
                     [x0, x1, z0, z1],
                     floor.heights,
                     floor.split,
                     floor.dropped_corner,
+                    floor.uv,
                     shade,
                     /* flip_winding */ false,
                 );
@@ -387,12 +400,14 @@ fn walk_room(
                     &lights,
                     ambient,
                 );
+                let shade = fog.apply_shade(shade, face_depth(camera, center));
                 push_horizontal_face(
                     scratch,
                     [x0, x1, z0, z1],
                     ceiling.heights,
                     ceiling.split,
                     ceiling.dropped_corner,
+                    ceiling.uv,
                     shade,
                     // Ceiling normal points down; flipping the winding
                     // keeps backface-cullers happy and pins the inside
@@ -415,12 +430,14 @@ fn walk_room(
                         &lights,
                         ambient,
                     );
+                    let shade = fog.apply_shade(shade, face_depth(camera, center));
                     push_wall_face(
                         scratch,
                         [x0, x1, z0, z1],
                         edge,
                         face.heights,
                         face.dropped_corner,
+                        face.uv,
                         shade,
                     );
                 }
@@ -478,6 +495,69 @@ fn face_shade(
         rgb: tint,
         sidedness,
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PreviewFog {
+    enabled: bool,
+    rgb: (u8, u8, u8),
+    near: i32,
+    far: i32,
+}
+
+impl PreviewFog {
+    fn from_grid(grid: &WorldGrid, preview_enabled: bool) -> Self {
+        Self {
+            enabled: preview_enabled && grid.fog_enabled,
+            rgb: (grid.fog_color[0], grid.fog_color[1], grid.fog_color[2]),
+            near: grid.fog_near,
+            far: grid.fog_far,
+        }
+    }
+
+    fn apply_shade(self, shade: FaceShade, depth: i32) -> FaceShade {
+        match shade {
+            FaceShade::Flat { rgb, sidedness } => FaceShade::Flat {
+                rgb: self.apply_rgb(rgb, depth),
+                sidedness,
+            },
+            FaceShade::Textured {
+                slot,
+                tint,
+                sidedness,
+            } => FaceShade::Textured {
+                slot,
+                tint: self.apply_rgb(tint, depth),
+                sidedness,
+            },
+        }
+    }
+
+    fn apply_rgb(self, rgb: (u8, u8, u8), depth: i32) -> (u8, u8, u8) {
+        if !self.enabled || self.far <= self.near || depth <= self.near {
+            return rgb;
+        }
+        let weight =
+            (((depth - self.near).saturating_mul(256)) / (self.far - self.near)).clamp(0, 256);
+        let keep = 256 - weight;
+        (
+            fog_blend_channel(rgb.0, self.rgb.0, keep, weight),
+            fog_blend_channel(rgb.1, self.rgb.1, keep, weight),
+            fog_blend_channel(rgb.2, self.rgb.2, keep, weight),
+        )
+    }
+}
+
+fn fog_blend_channel(src: u8, fog: u8, keep: i32, weight: i32) -> u8 {
+    (((src as i32) * keep + (fog as i32) * weight) / 256).clamp(0, 255) as u8
+}
+
+fn face_depth(camera: psx_engine::WorldCamera, center: [i32; 3]) -> i32 {
+    camera
+        .view_vertex(psx_engine::WorldVertex::new(
+            center[0], center[1], center[2],
+        ))
+        .z
 }
 
 /// Walk every legacy Light and component PointLight whose
@@ -821,6 +901,7 @@ fn push_horizontal_face(
     heights: [i32; 4],
     split: GridSplit,
     dropped_corner: Option<psxed_project::Corner>,
+    uv_transform: GridUvTransform,
     shade: FaceShade,
     flip_winding: bool,
 ) {
@@ -830,26 +911,14 @@ fn push_horizontal_face(
     let p_ne = gte_scene::project_vertex(world_to_view([x1, heights[1], z1]));
     let p_se = gte_scene::project_vertex(world_to_view([x1, heights[2], z0]));
     let p_sw = gte_scene::project_vertex(world_to_view([x0, heights[3], z0]));
-    let (uv_nw, uv_ne, uv_se, uv_sw);
-    let max_u;
-    let max_v;
-    if let FaceShade::Textured { slot, .. } = shade {
-        max_u = slot.width.saturating_sub(1);
-        max_v = slot.height.saturating_sub(1);
-        uv_nw = (0u8, 0u8);
-        uv_ne = (max_u, 0);
-        uv_se = (max_u, max_v);
-        uv_sw = (0, max_v);
+    let (uv_nw, uv_ne, uv_se, uv_sw) = if let FaceShade::Textured { slot, .. } = shade {
+        let max_u = slot.width.saturating_sub(1);
+        let max_v = slot.height.saturating_sub(1);
+        ((0u8, 0u8), (max_u, 0), (max_u, max_v), (0, max_v))
     } else {
-        max_u = 0;
-        max_v = 0;
-        uv_nw = (0, 0);
-        uv_ne = (0, 0);
-        uv_se = (0, 0);
-        uv_sw = (0, 0);
-    }
-    let _ = max_u;
-    let _ = max_v;
+        ((0, 0), (0, 0), (0, 0), (0, 0))
+    };
+    let [uv_nw, uv_ne, uv_se, uv_sw] = uv_transform.apply_to_quad([uv_nw, uv_ne, uv_se, uv_sw]);
 
     // Per split, pick the two triangles. Triangle A is the
     // perimeter walk's "first" half, B the "second" -- under
@@ -942,6 +1011,7 @@ fn push_wall_face(
     edge: WallEdge,
     heights: [i32; 4],
     dropped_corner: Option<psxed_project::WallCorner>,
+    uv_transform: GridUvTransform,
     shade: FaceShade,
 ) {
     use psxed_project::WallCorner;
@@ -966,6 +1036,7 @@ fn push_wall_face(
     } else {
         ((0, 0), (0, 0), (0, 0), (0, 0))
     };
+    let [uv_bl, uv_br, uv_tr, uv_tl] = uv_transform.apply_to_quad([uv_bl, uv_br, uv_tr, uv_tl]);
 
     // Two diagonals to choose between. `BlTr` is the renderer's
     // legacy split; switch to `BrTl` only when BL or TR is the
@@ -2156,7 +2227,12 @@ fn push_paint_preview(
             // outline ourselves -- `push_face_outline` short-
             // circuits when sx/sz are out of grid bounds.
             if sx == u16::MAX || sz == u16::MAX {
-                push_ghost_wall_outline(grid, world_cell_x, world_cell_z, dir, scratch);
+                let heights = grid.wall_heights_aligned_to_surfaces_for_world_cell(
+                    world_cell_x,
+                    world_cell_z,
+                    dir,
+                );
+                push_ghost_wall_outline(grid, world_cell_x, world_cell_z, dir, heights, scratch);
             } else {
                 push_face_outline(grid, face, FACE_OUTLINE_WALL_PAINT, scratch);
             }
@@ -2187,22 +2263,21 @@ fn push_cell_ghost_outline(grid: &WorldGrid, wcx: i32, wcz: i32, scratch: &mut P
     }
 }
 
-/// Outline a wall at world-cell `(wcx, wcz)` on edge `dir` with
-/// default heights `[0, 0, sector_size, sector_size]`. Used when
-/// `push_face_outline`'s array-bound check rejects an off-grid
+/// Outline a wall at world-cell `(wcx, wcz)` on edge `dir`. Used
+/// when `push_face_outline`'s array-bound check rejects an off-grid
 /// ghost so the user still sees where the wall will land.
 fn push_ghost_wall_outline(
     grid: &WorldGrid,
     wcx: i32,
     wcz: i32,
     dir: GridDirection,
+    heights: [i32; 4],
     scratch: &mut PreviewScratch,
 ) {
     let s = grid.sector_size;
     const LIFT: i32 = 4;
     let bounds = spatial::cell_bounds_from_world_cell(wcx, wcz, s);
-    let Some(corners) = spatial::editor_wall_outline_corners(bounds, dir, [0, 0, s, s], LIFT)
-    else {
+    let Some(corners) = spatial::editor_wall_outline_corners(bounds, dir, heights, LIFT) else {
         return;
     };
     let projected: [psx_gte::scene::Projected; 4] = [
@@ -2250,6 +2325,10 @@ const FACE_OUTLINE_WALL_PAINT: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0x60, 0xFF, 0x90),
     thickness_px: EDITOR_PREVIEW_PAINT_STROKE_WIDTH,
 };
+const STREAMING_CHUNK_BOUNDARY: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0x60, 0xFF, 0xC4),
+    thickness_px: 2.0,
+};
 
 #[derive(Copy, Clone)]
 struct FaceOutlineStyle {
@@ -2294,6 +2373,38 @@ fn push_selection_outline(
         }
         psxed_ui::Selection::Vertex(vertex) => {
             push_vertex_outline(grid, vertex, role.face_style(), scratch);
+        }
+    }
+}
+
+fn push_streaming_chunk_boundaries(grid: &WorldGrid, scratch: &mut PreviewScratch) {
+    let plan = plan_generated_chunks(grid, playtest_streaming_chunk_config());
+    if plan.chunk_count() <= 1 {
+        return;
+    }
+    let s = grid.sector_size;
+    let y = 10;
+    for chunk in plan.chunks {
+        let x0 = chunk.world_origin[0] * s;
+        let z0 = chunk.world_origin[1] * s;
+        let x1 = x0 + chunk.size[0] as i32 * s;
+        let z1 = z0 + chunk.size[1] as i32 * s;
+        let projected: [psx_gte::scene::Projected; 4] = [
+            gte_scene::project_vertex(world_to_view([x0, y, z1])),
+            gte_scene::project_vertex(world_to_view([x1, y, z1])),
+            gte_scene::project_vertex(world_to_view([x1, y, z0])),
+            gte_scene::project_vertex(world_to_view([x0, y, z0])),
+        ];
+        if projected.iter().any(|p| p.sz == 0) {
+            continue;
+        }
+        for i in 0..4 {
+            push_screen_line(
+                scratch,
+                projected[i],
+                projected[(i + 1) % 4],
+                STREAMING_CHUNK_BOUNDARY,
+            );
         }
     }
 }
@@ -2504,14 +2615,10 @@ fn push_face_outline(
             ]
         }),
         psxed_ui::FaceKind::Wall { dir, stack } => {
-            // Default ghost heights span the full sector when the
-            // wall doesn't exist yet -- used by the PaintWall
-            // hover preview to outline where a brand-new wall
-            // would land.
             let h = sector
                 .and_then(|s| s.walls.get(dir).get(stack as usize))
                 .map(|wall| wall.heights)
-                .unwrap_or([0, 0, s, s]);
+                .unwrap_or_else(|| grid.wall_heights_aligned_to_surfaces(face.sx, face.sz, dir));
             // Inset along the wall's inward normal so the outline
             // sits inside the room rather than z-fighting the
             // wall surface when viewed from inside.
@@ -2724,7 +2831,8 @@ fn push_tri(scratch: &mut PreviewScratch, p: [psx_gte::scene::Projected; 3], rgb
 mod tests {
     use super::{
         face_side_visible, floor_anchored_model_origin, light_face, node_room_local_origin,
-        preview_lights, preview_model_reference, preview_player_reference, FaceShade,
+        preview_lights, preview_model_reference, preview_player_reference, FaceShade, MaterialSlot,
+        PreviewFog,
     };
     use psx_engine::{PointLightSample, WorldVertex};
     use psx_gte::scene::Projected;
@@ -2743,6 +2851,15 @@ mod tests {
         match shade {
             FaceShade::Flat { rgb, .. } => rgb,
             FaceShade::Textured { tint, .. } => tint,
+        }
+    }
+
+    fn fog(rgb: (u8, u8, u8), near: i32, far: i32) -> PreviewFog {
+        PreviewFog {
+            enabled: true,
+            rgb,
+            near,
+            far,
         }
     }
 
@@ -2891,6 +3008,38 @@ mod tests {
     fn floor_anchored_model_origin_ignores_negative_height() {
         let origin = floor_anchored_model_origin(WorldVertex::new(10, 32, 20), -128);
         assert_eq!(origin, WorldVertex::new(10, 32, 20));
+    }
+
+    #[test]
+    fn preview_fog_blends_after_near_plane() {
+        let fog = fog((10, 20, 30), 100, 300);
+
+        assert_eq!(fog.apply_rgb((110, 120, 130), 100), (110, 120, 130));
+        assert_eq!(fog.apply_rgb((110, 120, 130), 200), (60, 70, 80));
+        assert_eq!(fog.apply_rgb((110, 120, 130), 300), (10, 20, 30));
+        assert_eq!(fog.apply_rgb((110, 120, 130), 900), (10, 20, 30));
+    }
+
+    #[test]
+    fn preview_fog_applies_to_flat_and_textured_tints() {
+        let fog = fog((0, 0, 0), 0, 256);
+        let flat = fog.apply_shade(flat(128, 64, 32), 128);
+        let textured = fog.apply_shade(
+            FaceShade::Textured {
+                slot: MaterialSlot {
+                    tpage_word: 0,
+                    clut_word: 0,
+                    width: 16,
+                    height: 16,
+                },
+                tint: (128, 64, 32),
+                sidedness: psxed_project::MaterialFaceSidedness::Front,
+            },
+            128,
+        );
+
+        assert_eq!(unpack(flat), (64, 32, 16));
+        assert_eq!(unpack(textured), (64, 32, 16));
     }
 
     #[test]

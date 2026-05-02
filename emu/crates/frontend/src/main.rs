@@ -743,11 +743,13 @@ impl ApplicationHandler for Shell {
                 // paints the live emulator framebuffer instead.
                 if !state.embedded_playtest_running() {
                     let editor_camera = state.editor.viewport_3d_camera();
+                    let editor_preview_fog = state.editor.preview_fog_enabled();
                     let editor_selected = state.editor.selected_node_id();
                     let editor_root = state.editor.project_root();
                     let editor_hover = state.editor.hovered_primitive();
                     let editor_selection = state.editor.selected_primitive();
                     let editor_selected_primitives = state.editor.selected_primitives();
+                    let editor_selected_bounds = state.editor.selected_bounds_3d();
                     let editor_selected_sector_faces = state.editor.selected_sector_faces();
                     let editor_paint_preview = state.editor.paint_target_preview();
                     let editor_active_room = state.editor.active_room_id();
@@ -758,10 +760,12 @@ impl ApplicationHandler for Shell {
                         state.editor.project(),
                         editor_root,
                         editor_camera,
+                        editor_preview_fog,
                         editor_selected,
                         editor_hover,
                         editor_selection,
                         &editor_selected_primitives,
+                        editor_selected_bounds,
                         &editor_selected_sector_faces,
                         editor_paint_preview,
                         &editor_entity_bounds,

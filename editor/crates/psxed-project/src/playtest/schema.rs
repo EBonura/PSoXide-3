@@ -124,6 +124,21 @@ pub struct PlaytestModelClip {
     pub animation_asset_index: usize,
 }
 
+/// One named model attachment socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaytestModelSocket {
+    /// Owning model index.
+    pub model: u16,
+    /// Socket name used by Equipment records.
+    pub name: String,
+    /// Joint index in the cooked model skeleton.
+    pub joint: u16,
+    /// Local translation relative to the joint pose.
+    pub translation: [i32; 3],
+    /// Local Euler rotation in Q12 turns: X/Y/Z.
+    pub rotation_q12: [i16; 3],
+}
+
 /// One cooked PSX model included in the playtest package. A
 /// [`ResourceData::Model`] referenced by any placed instance is
 /// promoted into one `PlaytestModel`; multiple instances share
@@ -155,6 +170,10 @@ pub struct PlaytestModel {
     /// Cooker validation guarantees this is `< clip_count`,
     /// so the runtime always has a clip to play.
     pub default_clip: u16,
+    /// First index in [`PlaytestPackage::model_sockets`].
+    pub socket_first: u16,
+    /// Number of sockets on this model.
+    pub socket_count: u16,
     /// World-space height (engine units) -- propagated from the
     /// editor resource.
     pub world_height: u16,
@@ -264,6 +283,8 @@ pub struct PlaytestEquipment {
     pub character_socket: String,
     /// Weapon grip/pivot to align.
     pub weapon_grip: String,
+    /// Runtime flags. Bit 0 = follows the live player controller.
+    pub flags: u16,
 }
 
 /// One placed point light, room-local engine units. Mirrors
@@ -408,6 +429,8 @@ pub struct PlaytestPackage {
     pub models: Vec<PlaytestModel>,
     /// Per-model clip records ordered as `(model, clip_index)`.
     pub model_clips: Vec<PlaytestModelClip>,
+    /// Per-model socket records ordered as `(model, socket_index)`.
+    pub model_sockets: Vec<PlaytestModelSocket>,
     /// Placed model instances, room-local coordinates.
     pub model_instances: Vec<PlaytestModelInstance>,
     /// Weapon hitboxes, shared by [`Self::weapons`].

@@ -27,7 +27,7 @@ pub struct StreamingChunkConfig {
     pub max_depth: u16,
     /// Absolute maximum triangle estimate accepted by the current cooker.
     pub max_triangles: usize,
-    /// Absolute maximum `.psxw` v1 byte estimate accepted by the cooker.
+    /// Absolute maximum `.psxw` byte estimate accepted by the cooker.
     pub max_bytes: usize,
 }
 
@@ -60,7 +60,7 @@ impl StreamingChunkConfig {
         budget.width > self.max_width
             || budget.depth > self.max_depth
             || budget.triangles > self.max_triangles
-            || budget.psxw_v1_bytes > self.max_bytes
+            || budget.psxw_bytes > self.max_bytes
     }
 }
 
@@ -105,11 +105,11 @@ impl GeneratedChunkPlan {
         self.chunks.iter().filter(|chunk| chunk.over_budget).count()
     }
 
-    /// Chunk with the largest `.psxw` v1 byte estimate.
+    /// Chunk with the largest `.psxw` byte estimate.
     pub fn largest_psxw_chunk(&self) -> Option<&GeneratedChunk> {
         self.chunks
             .iter()
-            .max_by_key(|chunk| chunk.budget.psxw_v1_bytes)
+            .max_by_key(|chunk| chunk.budget.psxw_bytes)
     }
 
     /// Chunk with the largest triangle estimate.
@@ -132,15 +132,16 @@ struct Rect {
 pub fn plan_generated_chunks(grid: &WorldGrid, config: StreamingChunkConfig) -> GeneratedChunkPlan {
     let config = config.normalized();
     let mut rects = Vec::new();
-    if grid.width > 0 && grid.depth > 0 {
+    let footprint = grid.authored_footprint();
+    if let Some(footprint) = footprint {
         split_rect(
             grid,
             config,
             Rect {
-                x: 0,
-                z: 0,
-                width: grid.width,
-                depth: grid.depth,
+                x: footprint.x,
+                z: footprint.z,
+                width: footprint.width,
+                depth: footprint.depth,
             },
             &mut rects,
         );
@@ -167,8 +168,17 @@ pub fn plan_generated_chunks(grid: &WorldGrid, config: StreamingChunkConfig) -> 
 
     GeneratedChunkPlan {
         config,
-        source_origin: grid.origin,
-        source_size: [grid.width, grid.depth],
+        source_origin: footprint
+            .map(|footprint| {
+                [
+                    grid.origin[0] + footprint.x as i32,
+                    grid.origin[1] + footprint.z as i32,
+                ]
+            })
+            .unwrap_or(grid.origin),
+        source_size: footprint
+            .map(|footprint| [footprint.width, footprint.depth])
+            .unwrap_or([0, 0]),
         chunks,
     }
 }
@@ -462,6 +472,22 @@ mod tests {
                 .sum::<usize>(),
             40 * 16
         );
+    }
+
+    #[test]
+    fn generated_chunks_use_authored_footprint() {
+        let mut grid = WorldGrid::empty(40, 16, 1024);
+        grid.set_floor(10, 4, 0, None);
+        grid.set_floor(13, 6, 0, None);
+        let plan = plan_generated_chunks(&grid, StreamingChunkConfig::default());
+
+        assert_eq!(plan.chunk_count(), 1);
+        assert_eq!(plan.source_origin, [10, 4]);
+        assert_eq!(plan.source_size, [4, 3]);
+        assert_eq!(plan.chunks[0].array_origin, [10, 4]);
+        assert_eq!(plan.chunks[0].world_origin, [10, 4]);
+        assert_eq!(plan.chunks[0].size, [4, 3]);
+        assert_eq!(plan.chunks[0].budget.total_cells, 12);
     }
 
     #[test]

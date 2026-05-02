@@ -679,9 +679,19 @@ impl SectorRender {
         self.0.floor_heights()
     }
 
+    /// Floor UVs `[NW, NE, SE, SW]` for textured vertex emission.
+    pub fn floor_uvs(self) -> [(u8, u8); 4] {
+        self.0.floor_uvs().corners()
+    }
+
     /// Ceiling corner heights `[NW, NE, SE, SW]` for vertex emission.
     pub fn ceiling_heights(self) -> [i32; 4] {
         self.0.ceiling_heights()
+    }
+
+    /// Ceiling UVs `[NW, NE, SE, SW]` for textured vertex emission.
+    pub fn ceiling_uvs(self) -> [(u8, u8); 4] {
+        self.0.ceiling_uvs().corners()
     }
 
     /// First global wall index for this sector.
@@ -765,6 +775,11 @@ impl WallRender {
     /// Wall heights `[bottom-left, bottom-right, top-right, top-left]`.
     pub fn heights(self) -> [i32; 4] {
         self.0.heights()
+    }
+
+    /// Wall UVs `[bottom-left, bottom-right, top-right, top-left]`.
+    pub fn uvs(self) -> [(u8, u8); 4] {
+        self.0.uvs().corners()
     }
 }
 

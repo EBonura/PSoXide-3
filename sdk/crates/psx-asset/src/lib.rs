@@ -1048,6 +1048,8 @@ impl<'a> Texture<'a> {
 pub struct World<'a> {
     sectors: &'a [u8],
     walls: &'a [u8],
+    sector_record_size: usize,
+    wall_record_size: usize,
     width: u16,
     depth: u16,
     sector_size: i32,
@@ -1057,10 +1059,31 @@ pub struct World<'a> {
     flags: u8,
 }
 
+/// Four PS1 UV coordinates for one world quad.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WorldQuadUvs {
+    corners: [(u8, u8); 4],
+}
+
+impl WorldQuadUvs {
+    /// Build a quad UV record from face-corner coordinates.
+    pub const fn new(corners: [(u8, u8); 4]) -> Self {
+        Self { corners }
+    }
+
+    /// Return UVs as face-corner coordinates.
+    pub const fn corners(self) -> [(u8, u8); 4] {
+        self.corners
+    }
+}
+
+const WORLD_V1_SECTOR_RECORD_SIZE: usize = 44;
+const WORLD_V1_WALL_RECORD_SIZE: usize = 24;
+
 impl<'a> World<'a> {
     /// Parse a cooked `.psxw` blob.
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, ParseError> {
-        use psxed_format::world::{WorldHeader, MAGIC, VERSION};
+        use psxed_format::world::{WorldHeader, MAGIC, VERSION, VERSION_V1};
 
         if bytes.len() < psxed_format::AssetHeader::SIZE {
             return Err(ParseError::Truncated);
@@ -1070,9 +1093,17 @@ impl<'a> World<'a> {
             return Err(ParseError::WrongMagic);
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != VERSION {
+        if version != VERSION && version != VERSION_V1 {
             return Err(ParseError::UnsupportedVersion(version));
         }
+        let (sector_record_size, wall_record_size) = if version == VERSION_V1 {
+            (WORLD_V1_SECTOR_RECORD_SIZE, WORLD_V1_WALL_RECORD_SIZE)
+        } else {
+            (
+                psxed_format::world::SectorRecord::SIZE,
+                psxed_format::world::WallRecord::SIZE,
+            )
+        };
         let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let payload_start = psxed_format::AssetHeader::SIZE;
         let actual_payload = bytes.len().saturating_sub(payload_start);
@@ -1105,7 +1136,7 @@ impl<'a> World<'a> {
 
         let mut off = payload_start + WorldHeader::SIZE;
         let sector_bytes = (sector_count as usize)
-            .checked_mul(psxed_format::world::SectorRecord::SIZE)
+            .checked_mul(sector_record_size)
             .ok_or(ParseError::TableOverflow)?;
         if off + sector_bytes > bytes.len() {
             return Err(ParseError::TableOverflow);
@@ -1114,7 +1145,7 @@ impl<'a> World<'a> {
         off += sector_bytes;
 
         let wall_bytes = (wall_count as usize)
-            .checked_mul(psxed_format::world::WallRecord::SIZE)
+            .checked_mul(wall_record_size)
             .ok_or(ParseError::TableOverflow)?;
         if off + wall_bytes > bytes.len() {
             return Err(ParseError::TableOverflow);
@@ -1125,11 +1156,13 @@ impl<'a> World<'a> {
             return Err(ParseError::InvalidWorldLayout);
         }
 
-        validate_sector_wall_ranges(sectors, wall_count)?;
+        validate_sector_wall_ranges(sectors, sector_record_size, wall_count)?;
 
         Ok(Self {
             sectors,
             walls,
+            sector_record_size,
+            wall_record_size,
             width,
             depth,
             sector_size,
@@ -1198,7 +1231,7 @@ impl<'a> World<'a> {
 
     /// Sector record by flat `[x * depth + z]` index, including empty cells.
     pub fn sector_record(&self, index: usize) -> Option<WorldSector> {
-        let size = psxed_format::world::SectorRecord::SIZE;
+        let size = self.sector_record_size;
         let base = index.checked_mul(size)?;
         let end = base.checked_add(size)?;
         let bytes = self.sectors.get(base..end)?;
@@ -1210,7 +1243,7 @@ impl<'a> World<'a> {
         if index >= self.wall_count {
             return None;
         }
-        let size = psxed_format::world::WallRecord::SIZE;
+        let size = self.wall_record_size;
         let base = index as usize * size;
         let end = base.checked_add(size)?;
         let bytes = self.walls.get(base..end)?;
@@ -1238,10 +1271,13 @@ pub struct WorldSector {
     wall_count: u16,
     floor_heights: [i32; 4],
     ceiling_heights: [i32; 4],
+    floor_uvs: WorldQuadUvs,
+    ceiling_uvs: WorldQuadUvs,
 }
 
 impl WorldSector {
     fn decode(bytes: &[u8]) -> Self {
+        let has_v2_uvs = bytes.len() >= psxed_format::world::SectorRecord::SIZE;
         Self {
             flags: bytes[0],
             floor_split: bytes[1],
@@ -1252,6 +1288,16 @@ impl WorldSector {
             wall_count: read_u16(bytes, 10),
             floor_heights: read_i32x4(bytes, 12),
             ceiling_heights: read_i32x4(bytes, 28),
+            floor_uvs: if has_v2_uvs {
+                read_world_uvs(bytes, 44)
+            } else {
+                WorldQuadUvs::new(psxed_format::world::FLOOR_UVS)
+            },
+            ceiling_uvs: if has_v2_uvs {
+                read_world_uvs(bytes, 52)
+            } else {
+                WorldQuadUvs::new(psxed_format::world::FLOOR_UVS)
+            },
         }
     }
 
@@ -1297,6 +1343,12 @@ impl WorldSector {
         self.floor_heights
     }
 
+    /// Floor UVs `[NW, NE, SE, SW]`.
+    #[inline]
+    pub fn floor_uvs(&self) -> WorldQuadUvs {
+        self.floor_uvs
+    }
+
     /// Ceiling diagonal split id.
     #[inline]
     pub fn ceiling_split(&self) -> u8 {
@@ -1313,6 +1365,12 @@ impl WorldSector {
     #[inline]
     pub fn ceiling_heights(&self) -> [i32; 4] {
         self.ceiling_heights
+    }
+
+    /// Ceiling UVs `[NW, NE, SE, SW]`.
+    #[inline]
+    pub fn ceiling_uvs(&self) -> WorldQuadUvs {
+        self.ceiling_uvs
     }
 
     /// First global wall index for this sector.
@@ -1335,15 +1393,22 @@ pub struct WorldWall {
     flags: u8,
     material: u16,
     heights: [i32; 4],
+    uvs: WorldQuadUvs,
 }
 
 impl WorldWall {
     fn decode(bytes: &[u8]) -> Self {
+        let has_v2_uvs = bytes.len() >= psxed_format::world::WallRecord::SIZE;
         Self {
             direction: bytes[0],
             flags: bytes[1],
             material: read_u16(bytes, 4),
             heights: read_i32x4(bytes, 8),
+            uvs: if has_v2_uvs {
+                read_world_uvs(bytes, 24)
+            } else {
+                WorldQuadUvs::new(psxed_format::world::WALL_UVS)
+            },
         }
     }
 
@@ -1369,6 +1434,12 @@ impl WorldWall {
     #[inline]
     pub fn heights(&self) -> [i32; 4] {
         self.heights
+    }
+
+    /// Wall UVs `[bottom-left, bottom-right, top-right, top-left]`.
+    #[inline]
+    pub fn uvs(&self) -> WorldQuadUvs {
+        self.uvs
     }
 }
 
@@ -1482,8 +1553,22 @@ fn read_i32x4(bytes: &[u8], offset: usize) -> [i32; 4] {
     ]
 }
 
-fn validate_sector_wall_ranges(sectors: &[u8], wall_count: u16) -> Result<(), ParseError> {
-    let size = psxed_format::world::SectorRecord::SIZE;
+#[inline]
+fn read_world_uvs(bytes: &[u8], offset: usize) -> WorldQuadUvs {
+    WorldQuadUvs::new([
+        (bytes[offset], bytes[offset + 1]),
+        (bytes[offset + 2], bytes[offset + 3]),
+        (bytes[offset + 4], bytes[offset + 5]),
+        (bytes[offset + 6], bytes[offset + 7]),
+    ])
+}
+
+fn validate_sector_wall_ranges(
+    sectors: &[u8],
+    sector_record_size: usize,
+    wall_count: u16,
+) -> Result<(), ParseError> {
+    let size = sector_record_size;
     let count = sectors.len() / size;
     for index in 0..count {
         let base = index * size;
@@ -1535,32 +1620,58 @@ mod tests {
         ));
     }
 
-    /// Pin the `.psxw` parser to v1 only. The compact format
-    /// described in `docs/world-format-roadmap.md` will eventually
-    /// claim VERSION = 2, but it isn't emitted or parsed today --
-    /// any blob claiming v2 must be rejected, not silently
-    /// accepted via a future `_ =>` arm slipping into the parser.
+    /// Pin the `.psxw` parser to the versions it intentionally
+    /// supports. v1 is legacy compatibility and v2 is current; any
+    /// newer blob must be rejected.
     #[test]
-    fn world_rejects_version_two() {
+    fn world_rejects_version_three() {
         let mut bad = [0u8; 12];
         bad[0..4].copy_from_slice(&psxed_format::world::MAGIC);
-        bad[4..6].copy_from_slice(&2u16.to_le_bytes());
+        bad[4..6].copy_from_slice(&3u16.to_le_bytes());
         // Payload length 0 -- won't matter; version check fires first.
         bad[8..12].copy_from_slice(&0u32.to_le_bytes());
         assert!(matches!(
             World::from_bytes(&bad),
-            Err(ParseError::UnsupportedVersion(2))
+            Err(ParseError::UnsupportedVersion(3))
         ));
     }
 
-    /// Sizes the cooker / runtime have agreed on for VERSION 1.
+    /// Sizes the cooker / runtime have agreed on for VERSION 2.
     /// Drift would invalidate every committed `.psxw` blob, so
     /// pin them at the format crate's records, not the wire.
     #[test]
-    fn world_v1_record_sizes_match_contract() {
+    fn world_v2_record_sizes_match_contract() {
         assert_eq!(psxed_format::world::WorldHeader::SIZE, 20);
-        assert_eq!(psxed_format::world::SectorRecord::SIZE, 44);
-        assert_eq!(psxed_format::world::WallRecord::SIZE, 24);
+        assert_eq!(psxed_format::world::QuadUvRecord::SIZE, 8);
+        assert_eq!(psxed_format::world::SectorRecord::SIZE, 60);
+        assert_eq!(psxed_format::world::WallRecord::SIZE, 32);
+    }
+
+    #[test]
+    fn world_v1_synthesizes_default_uvs() {
+        use psxed_format::world;
+
+        const WORLD_V1_LEN: usize = psxed_format::AssetHeader::SIZE
+            + psxed_format::world::WorldHeader::SIZE
+            + WORLD_V1_SECTOR_RECORD_SIZE;
+        let payload_len = (world::WorldHeader::SIZE + WORLD_V1_SECTOR_RECORD_SIZE) as u32;
+        let mut buf = [0u8; WORLD_V1_LEN];
+        buf[0..4].copy_from_slice(&world::MAGIC);
+        buf[4..6].copy_from_slice(&world::VERSION_V1.to_le_bytes());
+        buf[8..12].copy_from_slice(&payload_len.to_le_bytes());
+        buf[12..14].copy_from_slice(&1u16.to_le_bytes());
+        buf[14..16].copy_from_slice(&1u16.to_le_bytes());
+        buf[16..20].copy_from_slice(&world::SECTOR_SIZE.to_le_bytes());
+        buf[20..22].copy_from_slice(&1u16.to_le_bytes());
+
+        let sector = psxed_format::AssetHeader::SIZE + world::WorldHeader::SIZE;
+        buf[sector] = world::sector_flags::HAS_FLOOR;
+        buf[sector + 4..sector + 6].copy_from_slice(&0u16.to_le_bytes());
+        buf[sector + 6..sector + 8].copy_from_slice(&world::NO_MATERIAL.to_le_bytes());
+
+        let world = World::from_bytes(&buf).expect("legacy world parses");
+        let sector = world.sector(0, 0).unwrap();
+        assert_eq!(sector.floor_uvs().corners(), psxed_format::world::FLOOR_UVS);
     }
 
     #[test]
@@ -1764,9 +1875,13 @@ mod tests {
     fn world_round_trip_1x1_with_wall() {
         use psxed_format::world;
 
+        const WORLD_ROUND_TRIP_LEN: usize = psxed_format::AssetHeader::SIZE
+            + psxed_format::world::WorldHeader::SIZE
+            + psxed_format::world::SectorRecord::SIZE
+            + psxed_format::world::WallRecord::SIZE;
         let payload_len =
             (world::WorldHeader::SIZE + world::SectorRecord::SIZE + world::WallRecord::SIZE) as u32;
-        let mut buf = [0u8; 12 + 20 + 44 + 24];
+        let mut buf = [0u8; WORLD_ROUND_TRIP_LEN];
         buf[0..4].copy_from_slice(&world::MAGIC);
         buf[4..6].copy_from_slice(&world::VERSION.to_le_bytes());
         buf[6..8].copy_from_slice(&0u16.to_le_bytes());
@@ -1788,6 +1903,10 @@ mod tests {
         buf[sector + 6..sector + 8].copy_from_slice(&world::NO_MATERIAL.to_le_bytes());
         buf[sector + 8..sector + 10].copy_from_slice(&0u16.to_le_bytes());
         buf[sector + 10..sector + 12].copy_from_slice(&1u16.to_le_bytes());
+        for (i, (u, v)) in world::FLOOR_UVS.iter().copied().enumerate() {
+            buf[sector + 44 + i * 2] = u;
+            buf[sector + 45 + i * 2] = v;
+        }
 
         let wall = sector + world::SectorRecord::SIZE;
         buf[wall] = world::direction::NORTH;
@@ -1797,6 +1916,10 @@ mod tests {
         buf[wall + 12..wall + 16].copy_from_slice(&0i32.to_le_bytes());
         buf[wall + 16..wall + 20].copy_from_slice(&1024i32.to_le_bytes());
         buf[wall + 20..wall + 24].copy_from_slice(&1024i32.to_le_bytes());
+        for (i, (u, v)) in world::WALL_UVS.iter().copied().enumerate() {
+            buf[wall + 24 + i * 2] = u;
+            buf[wall + 25 + i * 2] = v;
+        }
 
         let world = World::from_bytes(&buf).expect("parse world");
         assert_eq!(world.width(), 1);
@@ -1813,12 +1936,14 @@ mod tests {
         assert_eq!(sector.floor_material(), Some(0));
         assert_eq!(sector.ceiling_material(), None);
         assert_eq!(sector.wall_count(), 1);
+        assert_eq!(sector.floor_uvs().corners(), world::FLOOR_UVS);
 
         let wall = world.sector_wall(sector, 0).unwrap();
         assert_eq!(wall.direction(), psxed_format::world::direction::NORTH);
         assert!(wall.solid());
         assert_eq!(wall.material(), 1);
         assert_eq!(wall.heights(), [0, 0, 1024, 1024]);
+        assert_eq!(wall.uvs().corners(), world::WALL_UVS);
     }
 
     #[test]
@@ -1845,7 +1970,9 @@ mod tests {
         use psxed_format::world;
 
         let payload_len = (world::WorldHeader::SIZE + world::SectorRecord::SIZE) as u32;
-        let mut buf = [0u8; 12 + 20 + 44];
+        let mut buf = [0u8; psxed_format::AssetHeader::SIZE
+            + psxed_format::world::WorldHeader::SIZE
+            + psxed_format::world::SectorRecord::SIZE];
         buf[0..4].copy_from_slice(&world::MAGIC);
         buf[4..6].copy_from_slice(&world::VERSION.to_le_bytes());
         buf[8..12].copy_from_slice(&payload_len.to_le_bytes());

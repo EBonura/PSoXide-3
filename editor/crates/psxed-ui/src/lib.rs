@@ -23,16 +23,17 @@ use std::path::{Path, PathBuf};
 use egui::{
     Align2, Color32, ColorImage, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
+use psxed_project::playtest::playtest_streaming_chunk_config;
 use psxed_project::streaming::{
-    collect_scene_resource_use, plan_generated_chunks, SceneResourceUse, StreamingChunkConfig,
+    collect_scene_resource_use, plan_generated_chunks, SceneResourceUse,
 };
 use psxed_project::{
     snap_height, ColliderShape, GridCellBounds, GridDirection, GridHorizontalFace, GridSplit,
-    GridVerticalFace, MaterialFaceSidedness, MaterialResource, NodeId, NodeKind, NodeRow,
-    ProjectDocument, PsxBlendMode, Resource, ResourceData, ResourceId, WorldGrid, WorldGridBudget,
-    DEFAULT_WORLD_SECTOR_SIZE, HEIGHT_QUANTUM, MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES,
-    MAX_ROOM_WIDTH, MAX_WORLD_SECTOR_SIZE, MIN_WORLD_SECTOR_SIZE, MODEL_SCALE_ONE_Q8,
-    WORLD_SECTOR_SIZE_QUANTUM,
+    GridUvRotation, GridUvTransform, GridVerticalFace, MaterialFaceSidedness, MaterialResource,
+    NodeId, NodeKind, NodeRow, ProjectDocument, PsxBlendMode, Resource, ResourceData, ResourceId,
+    WorldGrid, WorldGridBudget, DEFAULT_WORLD_SECTOR_SIZE, HEIGHT_QUANTUM, MAX_ROOM_BYTES,
+    MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH, MAX_WORLD_SECTOR_SIZE,
+    MIN_WORLD_SECTOR_SIZE, MODEL_SCALE_ONE_Q8, WORLD_SECTOR_SIZE_QUANTUM,
 };
 
 const LEFT_DOCK_MAX_WIDTH: f32 = 420.0;
@@ -42,6 +43,7 @@ const EDITOR_OUTLINE_STROKE_WIDTH: f32 = 1.25;
 const EDITOR_SELECTED_OUTLINE_STROKE_WIDTH: f32 = 3.0;
 const EDITOR_OUTLINE_ACCENT: Color32 = Color32::from_rgb(165, 238, 255);
 const EDITOR_OUTLINE_GOLD: Color32 = Color32::from_rgb(255, 238, 150);
+const EGUI_TEXTURE_RETIRE_FRAMES: u8 = 2;
 
 /// Discrete action a scene-tree row can produce in one frame.
 ///
@@ -185,6 +187,7 @@ pub struct EditorWorkspace {
     snap_to_grid: bool,
     snap_units: u16,
     show_grid: bool,
+    preview_fog: bool,
     view_2d: bool,
     left_dock_open: bool,
     inspector_open: bool,
@@ -192,14 +195,18 @@ pub struct EditorWorkspace {
     viewport_pan: Vec2,
     viewport_zoom: f32,
     last_viewport_size: Vec2,
-    /// Orbit camera for the 3D viewport. Yaw + pitch in 4096-per-turn
-    /// Q12 units (matching `psx_engine::WorldCamera::orbit`); radius
-    /// and target in preview world units. Drag on the 3D panel rotates
-    /// yaw/pitch around the current target; scroll changes radius.
+    /// Camera mode for the 3D viewport. Orbit preserves the original
+    /// target/radius camera; Free stores an explicit world position
+    /// and uses the same yaw/pitch angle convention for look.
+    viewport_3d_camera_mode: ViewportCameraMode,
     viewport_3d_yaw: u16,
     viewport_3d_pitch: u16,
     viewport_3d_radius: i32,
     viewport_3d_target: [i32; 3],
+    viewport_3d_free_yaw: u16,
+    viewport_3d_free_pitch: u16,
+    viewport_3d_free_position: [i32; 3],
+    viewport_3d_free_initialized: bool,
     /// Decoded `.psxt` thumbnails for the resources panel. Built
     /// lazily once per Texture resource (or whenever its `psxt_path`
     /// changes); the egui texture handle stays alive across frames
@@ -977,20 +984,33 @@ pub struct PhysicalVertex {
     pub members: Vec<FaceCornerRef>,
 }
 
+/// Camera style used by the editor's 3D viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportCameraMode {
+    /// Original target/radius orbit camera.
+    Orbit,
+    /// Explicit-position fly camera.
+    Free,
+}
+
 /// Snapshot of the editor's 3D viewport camera, handed to the
 /// frontend each frame so it can drive the editor-owned `HwRenderer`
-/// from the same orbit state the editor's drag input updates.
+/// from the same state the editor's viewport input updates.
 #[derive(Debug, Clone, Copy)]
 pub struct ViewportCameraState {
+    /// Active camera style.
+    pub mode: ViewportCameraMode,
     /// Yaw, 4096 per full revolution.
     pub yaw_q12: u16,
-    /// Pitch, 4096 per full revolution; positive raises the camera
-    /// above the target so the view tilts down.
+    /// Pitch, 4096 per full revolution. For Orbit, positive raises
+    /// the camera above the target; for Free, positive looks up.
     pub pitch_q12: u16,
     /// Distance from the camera to the orbit target, world units.
     pub radius: i32,
     /// Orbit target in editor preview world units.
     pub target: [i32; 3],
+    /// Free-camera position in editor preview world units.
+    pub position: [i32; 3],
 }
 
 /// Floating-point camera basis used by editor picking.
@@ -1016,25 +1036,54 @@ impl ViewportCameraState {
         ]
     }
 
-    /// Orbit camera basis around the camera state's preview-world
-    /// target.
+    /// Camera position as floating-point preview-world coordinates.
+    pub fn position_f32(self) -> [f32; 3] {
+        match self.mode {
+            ViewportCameraMode::Orbit => {
+                orbit_camera_position_f32(self.yaw_q12, self.pitch_q12, self.radius, self.target)
+            }
+            ViewportCameraMode::Free => [
+                self.position[0] as f32,
+                self.position[1] as f32,
+                self.position[2] as f32,
+            ],
+        }
+    }
+
+    /// Integer camera position for fixed-point preview render paths.
+    pub fn position_i32(self) -> [i32; 3] {
+        match self.mode {
+            ViewportCameraMode::Orbit => {
+                orbit_camera_position_i32(self.yaw_q12, self.pitch_q12, self.radius, self.target)
+            }
+            ViewportCameraMode::Free => self.position,
+        }
+    }
+
+    /// Anchor subtracted from emitted room vertices before GTE
+    /// projection. Orbit uses the target; Free uses the camera
+    /// position so large authored rooms remain camera-local.
+    pub fn anchor_i32(self) -> [i32; 3] {
+        match self.mode {
+            ViewportCameraMode::Orbit => self.target,
+            ViewportCameraMode::Free => self.position,
+        }
+    }
+
+    /// Camera basis in preview-world coordinates.
     pub fn basis(self) -> ViewportCameraBasis {
-        let target_world = self.target_f32();
-        let radius = self.radius as f32;
-        let cos_p = psx_gte::transform::cos_1_3_12(self.pitch_q12) as f32 / 4096.0;
-        let sin_p = psx_gte::transform::sin_1_3_12(self.pitch_q12) as f32 / 4096.0;
-        let cos_y = psx_gte::transform::cos_1_3_12(self.yaw_q12) as f32 / 4096.0;
-        let sin_y = psx_gte::transform::sin_1_3_12(self.yaw_q12) as f32 / 4096.0;
-        let position = [
-            target_world[0] + radius * cos_p * sin_y,
-            target_world[1] - radius * sin_p,
-            target_world[2] + radius * cos_p * cos_y,
-        ];
-        let forward = normalize3([
-            target_world[0] - position[0],
-            target_world[1] - position[1],
-            target_world[2] - position[2],
-        ]);
+        let position = self.position_f32();
+        let forward = match self.mode {
+            ViewportCameraMode::Orbit => {
+                let target_world = self.target_f32();
+                normalize3([
+                    target_world[0] - position[0],
+                    target_world[1] - position[1],
+                    target_world[2] - position[2],
+                ])
+            }
+            ViewportCameraMode::Free => camera_forward_from_angles(self.yaw_q12, self.pitch_q12),
+        };
         let right = normalize3(cross3(forward, [0.0, 1.0, 0.0]));
         let up = cross3(right, forward);
         ViewportCameraBasis {
@@ -1252,6 +1301,7 @@ impl EditorWorkspace {
             snap_to_grid: true,
             snap_units: 16,
             show_grid: true,
+            preview_fog: true,
             // Default to the 3D preview so the bit-faithful HwRenderer
             // is the first thing the user sees on opening the editor.
             // The 2D top-down view stays one toolbar click away.
@@ -1265,10 +1315,15 @@ impl EditorWorkspace {
             // Default orbit: ~22° pitch above the target, looking
             // toward +Z, radius wide enough to frame a 4×4 stone room
             // at the cooker's standard 1024-unit sector size.
+            viewport_3d_camera_mode: ViewportCameraMode::Orbit,
             viewport_3d_yaw: 256,
             viewport_3d_pitch: 256,
             viewport_3d_radius: 6144,
             viewport_3d_target: [0, 512, 0],
+            viewport_3d_free_yaw: 256,
+            viewport_3d_free_pitch: 256,
+            viewport_3d_free_position: orbit_camera_position_i32(256, 256, 6144, [0, 512, 0]),
+            viewport_3d_free_initialized: false,
             texture_thumbs: HashMap::new(),
             texture_import_dialog: TextureImportDialog::default(),
             model_import_dialog: ModelImportDialog::default(),
@@ -1320,6 +1375,12 @@ impl EditorWorkspace {
         }
         self.save()?;
         Ok(true)
+    }
+
+    fn save_project_from_ui(&mut self) {
+        if let Err(error) = self.save() {
+            self.status = format!("Save failed: {error}");
+        }
     }
 
     /// Re-read `<project_dir>/project.ron` from disk, discarding
@@ -1411,12 +1472,12 @@ impl EditorWorkspace {
         let Some((center, half)) = self.room_bounds_3d(room_id) else {
             return;
         };
-        self.focus_3d_on_bounds(center, half);
         // Default 3/4 view: yaw 8/64 turn (45° off the +Z axis),
         // pitch 4/64 (~22° looking down). Mirrors the showcase
         // demos' first-frame angle.
         self.viewport_3d_yaw = 256;
         self.viewport_3d_pitch = 256;
+        self.focus_3d_on_bounds(center, half);
     }
 
     /// Move the 3D orbit target onto `center` and choose a radius
@@ -1428,6 +1489,9 @@ impl EditorWorkspace {
             round_to_i32(center[2]),
         ];
         self.viewport_3d_radius = frame_radius_for_3d_bounds(half);
+        if self.viewport_3d_camera_mode == ViewportCameraMode::Free {
+            self.sync_free_camera_to_orbit();
+        }
     }
 
     fn room_bounds_3d(&self, room_id: NodeId) -> Option<([f32; 3], [f32; 3])> {
@@ -1436,17 +1500,40 @@ impl EditorWorkspace {
         let NodeKind::Room { grid } = &room.kind else {
             return None;
         };
-        let x0 = grid.cell_world_x(0) as f32;
-        let x1 = grid.cell_world_x(grid.width) as f32;
-        let z0 = grid.cell_world_z(0) as f32;
-        let z1 = grid.cell_world_z(grid.depth) as f32;
+        let footprint = grid.authored_footprint()?;
+        let x0 = grid.cell_world_x(footprint.x) as f32;
+        let x1 = grid.cell_world_x(footprint.end_x()) as f32;
+        let z0 = grid.cell_world_z(footprint.z) as f32;
+        let z1 = grid.cell_world_z(footprint.end_z()) as f32;
         let mut min_y: f32 = 0.0;
         let mut max_y = grid.sector_size as f32;
-        for sx in 0..grid.width {
-            for sz in 0..grid.depth {
-                if let Some((center, half)) = Self::sector_bounds_3d_for_grid(grid, sx, sz) {
-                    min_y = min_y.min(center[1] - half[1]);
-                    max_y = max_y.max(center[1] + half[1]);
+        for sx in footprint.x..footprint.end_x() {
+            for sz in footprint.z..footprint.end_z() {
+                let Some(sector) = grid.sector(sx, sz) else {
+                    continue;
+                };
+                if !sector.has_geometry() {
+                    continue;
+                }
+                if let Some(face) = &sector.floor {
+                    for y in face.heights {
+                        min_y = min_y.min(y as f32);
+                        max_y = max_y.max(y as f32);
+                    }
+                }
+                if let Some(face) = &sector.ceiling {
+                    for y in face.heights {
+                        min_y = min_y.min(y as f32);
+                        max_y = max_y.max(y as f32);
+                    }
+                }
+                for dir in GridDirection::ALL {
+                    for wall in sector.walls.get(dir) {
+                        for y in wall.heights {
+                            min_y = min_y.min(y as f32);
+                            max_y = max_y.max(y as f32);
+                        }
+                    }
                 }
             }
         }
@@ -1699,7 +1786,7 @@ impl EditorWorkspace {
             }
         );
         if !playtest_captured {
-            self.handle_global_shortcuts(ctx);
+            self.handle_global_shortcuts(ctx, playtest_status);
         }
         self.draw_action_bar(ctx, playtest_status);
         self.draw_left_dock(ctx);
@@ -1989,8 +2076,13 @@ impl EditorWorkspace {
 
     fn retire_texture_import_preview(&mut self) {
         if let Some(preview) = self.texture_import_dialog.preview.take() {
-            self.import_retired_textures.push((2, preview.handle));
+            self.retire_egui_texture(preview.handle);
         }
+    }
+
+    fn retire_egui_texture(&mut self, handle: egui::TextureHandle) {
+        self.import_retired_textures
+            .push((EGUI_TEXTURE_RETIRE_FRAMES, handle));
     }
 
     fn set_texture_import_preview(&mut self, preview: TextureImportPreview) {
@@ -2371,10 +2463,10 @@ impl EditorWorkspace {
     fn retire_model_import_preview(&mut self) {
         if let Some(preview) = self.model_import_dialog.preview.take() {
             if let Some((handle, _)) = preview.atlas {
-                self.import_retired_textures.push((2, handle));
+                self.retire_egui_texture(handle);
             }
             if let Some(handle) = preview.animated_texture {
-                self.import_retired_textures.push((2, handle));
+                self.retire_egui_texture(handle);
             }
         }
     }
@@ -2578,7 +2670,7 @@ impl EditorWorkspace {
 
     /// 3D viewport body -- paints the HwRenderer texture into the
     /// central area's working space and turns pointer input into
-    /// orbit-camera updates. Called from `draw_viewport` when the
+    /// camera updates. Called from `draw_viewport` when the
     /// user has toggled the 2D / 3D switch on the toolbar to 3D.
     fn draw_viewport_3d_body(
         &mut self,
@@ -2589,10 +2681,21 @@ impl EditorWorkspace {
             ui.label(icons::text(icons::BOX, 14.0).color(STUDIO_ACCENT));
             ui.label(RichText::new("3D Preview").strong().color(STUDIO_TEXT));
             ui.separator();
-            ui.weak(format!(
-                "yaw {} pitch {} r {}",
-                self.viewport_3d_yaw, self.viewport_3d_pitch, self.viewport_3d_radius
-            ));
+            match self.viewport_3d_camera_mode {
+                ViewportCameraMode::Orbit => {
+                    ui.weak(format!(
+                        "Orbit yaw {} pitch {} r {}",
+                        self.viewport_3d_yaw, self.viewport_3d_pitch, self.viewport_3d_radius
+                    ));
+                }
+                ViewportCameraMode::Free => {
+                    let [x, y, z] = self.viewport_3d_free_position;
+                    ui.weak(format!(
+                        "Free x {x} y {y} z {z} yaw {} pitch {}",
+                        self.viewport_3d_free_yaw, self.viewport_3d_free_pitch
+                    ));
+                }
+            }
         });
         ui.separator();
         let avail = ui.available_size();
@@ -2609,23 +2712,13 @@ impl EditorWorkspace {
 
         // Sims-style: primary button always belongs to the active
         // tool -- click-and-drag floors / walls / entities into the
-        // world. Camera orbit lives on middle / secondary so the
+        // world. Camera movement lives on middle / secondary so the
         // user can reframe mid-edit without giving up the tool.
         if response.dragged_by(egui::PointerButton::Middle)
             || response.dragged_by(egui::PointerButton::Secondary)
         {
-            // 0.5 px → 1 q12-step keeps the orbit responsive without
-            // making a small wrist flick spin the camera multiple
-            // turns. Earlier 1.5x felt over-eager; this lands around
-            // ~3° per 100 pixels of drag.
-            const ORBIT_DRAG_STEP: f32 = 0.5;
-            let delta = response.drag_delta();
-            self.viewport_3d_yaw = self
-                .viewport_3d_yaw
-                .wrapping_add((delta.x * ORBIT_DRAG_STEP) as i16 as u16);
-            self.viewport_3d_pitch = self
-                .viewport_3d_pitch
-                .wrapping_add((delta.y * ORBIT_DRAG_STEP) as i16 as u16);
+            let delta = ui.input(|input| input.pointer.delta());
+            self.rotate_viewport_3d_camera(delta);
         }
 
         // Hover tracking: every frame the pointer is over the panel,
@@ -2653,6 +2746,14 @@ impl EditorWorkspace {
                 | ViewTool::Erase
                 | ViewTool::Place
         );
+        let select_tool = matches!(self.active_tool, ViewTool::Select);
+        let hover_entity_hit = if select_tool {
+            response
+                .hover_pos()
+                .and_then(|pointer| self.pick_entity_bound(rect, pointer, hover_room))
+        } else {
+            None
+        };
         // Face hover ray-tests every floor / wall / ceiling in the
         // active Room and reports the closest hit. Used by Select
         // for the outline UI, AND by paint tools to anchor their
@@ -2662,14 +2763,15 @@ impl EditorWorkspace {
         let face_hit = response
             .hover_pos()
             .and_then(|pointer| self.pick_face_with_hit(rect, pointer));
-        // Hover-track via the unified selection. `pick_primitive`
-        // (added below) maps the same face-hit to a finer
-        // primitive when the selection mode demands one. For now
-        // the hover always carries a `Selection::Face` -- the
-        // hover preview ignores edge / vertex modes until the
-        // mode-aware pick replaces this line.
-        self.hovered_primitive =
-            face_hit.map(|(face, hit)| self.pick_primitive_from_hit(face, hit));
+        // Hover-track via the unified primitive selection, but let
+        // entity bounds occlude the grid hover in Select mode. Click
+        // and drag already give entity bounds priority; the hover
+        // affordance should match that hit-testing model.
+        self.hovered_primitive = if hover_entity_hit.is_some() {
+            None
+        } else {
+            face_hit.map(|(face, hit)| self.pick_primitive_from_hit(face, hit))
+        };
         // Paint preview: world-cell coords let the ghost outline
         // appear over cells outside the current grid, exactly
         // where the auto-grow would create them.
@@ -2701,11 +2803,8 @@ impl EditorWorkspace {
             // Hover-track entity bounds in Select mode so the
             // overlay can highlight the bound under the cursor
             // before the user clicks.
-            if matches!(self.active_tool, ViewTool::Select) {
-                self.hovered_entity_node = response
-                    .hover_pos()
-                    .and_then(|p| self.pick_entity_bound(rect, p, self.active_room_id()))
-                    .map(|hit| hit.node);
+            if select_tool {
+                self.hovered_entity_node = hover_entity_hit.map(|hit| hit.node);
             } else {
                 self.hovered_entity_node = None;
             }
@@ -2721,7 +2820,7 @@ impl EditorWorkspace {
             // entry, no mutation. The first drag frame that
             // crosses a threshold lazy-pushes undo so a
             // press-and-release doesn't leave a stale snapshot.
-            if matches!(self.active_tool, ViewTool::Select) {
+            if select_tool {
                 if response.drag_started_by(egui::PointerButton::Primary) {
                     let entity_hit = response
                         .interact_pointer_pos()
@@ -2778,15 +2877,11 @@ impl EditorWorkspace {
             self.hovered_entity_node = None;
         }
 
-        // Scroll = dolly. ±8% of current radius per wheel notch,
-        // clamped so the camera can't pass through the target or
-        // escape the world entirely.
         if response.hovered() {
+            self.update_free_camera_keyboard(ui);
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll.abs() > f32::EPSILON {
-                let factor = if scroll > 0.0 { 0.92 } else { 1.08 };
-                self.viewport_3d_radius =
-                    ((self.viewport_3d_radius as f32) * factor).clamp(512.0, 262_144.0) as i32;
+                self.scroll_viewport_3d_camera(scroll);
             }
         }
 
@@ -2810,6 +2905,113 @@ impl EditorWorkspace {
                 STUDIO_ACCENT,
             );
         }
+    }
+
+    fn rotate_viewport_3d_camera(&mut self, delta: Vec2) {
+        // 0.5 px -> 1 q12-step keeps the viewport responsive without
+        // making a small wrist flick spin the camera multiple turns.
+        const CAMERA_DRAG_STEP: f32 = 0.5;
+        let yaw_delta = (delta.x * CAMERA_DRAG_STEP) as i16 as u16;
+        let pitch_delta = (delta.y * CAMERA_DRAG_STEP) as i32;
+        match self.viewport_3d_camera_mode {
+            ViewportCameraMode::Orbit => {
+                self.viewport_3d_yaw = self.viewport_3d_yaw.wrapping_add(yaw_delta);
+                self.viewport_3d_pitch = self
+                    .viewport_3d_pitch
+                    .wrapping_add(pitch_delta as i16 as u16);
+            }
+            ViewportCameraMode::Free => {
+                self.viewport_3d_free_yaw = self.viewport_3d_free_yaw.wrapping_sub(yaw_delta);
+                self.viewport_3d_free_pitch =
+                    add_q12_signed_clamped(self.viewport_3d_free_pitch, -pitch_delta, -960, 960);
+                self.viewport_3d_free_initialized = true;
+            }
+        }
+    }
+
+    fn scroll_viewport_3d_camera(&mut self, scroll: f32) {
+        match self.viewport_3d_camera_mode {
+            ViewportCameraMode::Orbit => {
+                // Scroll = dolly. +/-8% of current radius per wheel
+                // notch, clamped so the camera can't pass through the
+                // target or escape the world entirely.
+                let factor = if scroll > 0.0 { 0.92 } else { 1.08 };
+                self.viewport_3d_radius =
+                    ((self.viewport_3d_radius as f32) * factor).clamp(512.0, 262_144.0) as i32;
+            }
+            ViewportCameraMode::Free => {
+                let amount = (scroll * 8.0).clamp(-4096.0, 4096.0);
+                self.move_free_camera_local(amount, 0.0, 0.0);
+            }
+        }
+    }
+
+    fn update_free_camera_keyboard(&mut self, ui: &egui::Ui) {
+        if self.viewport_3d_camera_mode != ViewportCameraMode::Free {
+            return;
+        }
+        if ui.ctx().memory(|memory| memory.focused().is_some()) {
+            return;
+        }
+
+        let (forward, right, vertical, speed) = ui.input(|input| {
+            let axis = |positive: egui::Key, negative: egui::Key| {
+                (input.key_down(positive) as i8 - input.key_down(negative) as i8) as f32
+            };
+            let speed = if input.modifiers.shift { 512.0 } else { 128.0 };
+            (
+                axis(egui::Key::W, egui::Key::S),
+                axis(egui::Key::D, egui::Key::A),
+                axis(egui::Key::Q, egui::Key::E),
+                speed,
+            )
+        });
+        if forward.abs() <= f32::EPSILON
+            && right.abs() <= f32::EPSILON
+            && vertical.abs() <= f32::EPSILON
+        {
+            return;
+        }
+
+        self.move_free_camera_local(forward * speed, right * speed, vertical * speed);
+        ui.ctx().request_repaint();
+    }
+
+    fn move_free_camera_local(&mut self, forward: f32, right: f32, vertical_y: f32) {
+        let basis = self.viewport_3d_camera().basis();
+        let delta = [
+            basis.forward[0] * forward + basis.right[0] * right,
+            basis.forward[1] * forward + basis.right[1] * right + vertical_y,
+            basis.forward[2] * forward + basis.right[2] * right,
+        ];
+        self.move_free_camera_world(delta);
+    }
+
+    fn move_free_camera_world(&mut self, delta: [f32; 3]) {
+        for (axis, amount) in delta.into_iter().enumerate() {
+            self.viewport_3d_free_position[axis] =
+                round_to_i32(self.viewport_3d_free_position[axis] as f32 + amount);
+        }
+        self.viewport_3d_free_initialized = true;
+    }
+
+    fn set_viewport_3d_camera_mode(&mut self, mode: ViewportCameraMode) {
+        if mode == ViewportCameraMode::Free && !self.viewport_3d_free_initialized {
+            self.sync_free_camera_to_orbit();
+        }
+        self.viewport_3d_camera_mode = mode;
+    }
+
+    fn sync_free_camera_to_orbit(&mut self) {
+        self.viewport_3d_free_yaw = self.viewport_3d_yaw;
+        self.viewport_3d_free_pitch = self.viewport_3d_pitch;
+        self.viewport_3d_free_position = orbit_camera_position_i32(
+            self.viewport_3d_yaw,
+            self.viewport_3d_pitch,
+            self.viewport_3d_radius,
+            self.viewport_3d_target,
+        );
+        self.viewport_3d_free_initialized = true;
     }
 
     fn draw_viewport_3d_overlay_lines(
@@ -2911,15 +3113,34 @@ impl EditorWorkspace {
         );
     }
 
-    /// Snapshot of the orbit camera the frontend needs to drive the
+    /// Snapshot of the 3D camera the frontend needs to drive the
     /// editor's HwRenderer this frame.
     pub fn viewport_3d_camera(&self) -> ViewportCameraState {
-        ViewportCameraState {
-            yaw_q12: self.viewport_3d_yaw,
-            pitch_q12: self.viewport_3d_pitch,
-            radius: self.viewport_3d_radius,
-            target: self.viewport_3d_target,
+        match self.viewport_3d_camera_mode {
+            ViewportCameraMode::Orbit => ViewportCameraState {
+                mode: ViewportCameraMode::Orbit,
+                yaw_q12: self.viewport_3d_yaw,
+                pitch_q12: self.viewport_3d_pitch,
+                radius: self.viewport_3d_radius,
+                target: self.viewport_3d_target,
+                position: self.viewport_3d_free_position,
+            },
+            ViewportCameraMode::Free => ViewportCameraState {
+                mode: ViewportCameraMode::Free,
+                yaw_q12: self.viewport_3d_free_yaw,
+                pitch_q12: self.viewport_3d_free_pitch,
+                radius: self.viewport_3d_radius,
+                target: self.viewport_3d_target,
+                position: self.viewport_3d_free_position,
+            },
         }
+    }
+
+    /// Whether the editor preview should visualize authored room fog.
+    /// This is an editor-only view option; it does not change the
+    /// room's cooked `fog_enabled` setting.
+    pub fn preview_fog_enabled(&self) -> bool {
+        self.preview_fog
     }
 
     /// Currently-selected scene node. The frontend reads this so the
@@ -2947,6 +3168,13 @@ impl EditorWorkspace {
     /// selections which are exposed separately as floor faces.
     pub fn selected_primitives(&self) -> Vec<Selection> {
         self.selected_primitive_targets()
+    }
+
+    /// World-space selected bounds for the 3D preview. Unlike
+    /// viewport framing, this intentionally does not fall back to
+    /// the active Room when nothing is selected.
+    pub fn selected_bounds_3d(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.selected_frame_bounds_3d()
     }
 
     /// Selected floor tiles as face refs for the 3D preview overlay.
@@ -4102,7 +4330,7 @@ impl EditorWorkspace {
                         hit_world[0] - cell_center[0],
                         hit_world[2] - cell_center[1],
                     );
-                    grid.add_wall(sx, sz, dir, 0, sector_size_i, wall_mat);
+                    grid.add_wall_aligned_to_surfaces(sx, sz, dir, wall_mat);
                     format!("Added {} wall at {sx},{sz}", direction_label(dir))
                 }
             }
@@ -4158,15 +4386,73 @@ impl EditorWorkspace {
     }
 
     /// Reassign `face`'s material in-place. Marks the project
-    /// dirty if the field actually moved. Used by the
-    /// resource-card click flow when a face is selected, so
-    /// picking a different material in the bottom panel
-    /// retargets the selected surface (Sims-style).
+    /// dirty if the field actually moved. Used by drag/drop flows
+    /// and by the resource-card click path for single-face edits.
     fn assign_face_material(&mut self, face: FaceRef, material: Option<ResourceId>) -> bool {
         if self.face_material(face) == material {
             return false;
         }
         self.push_undo();
+        let updated = self.assign_face_material_no_undo(face, material);
+        if updated {
+            self.mark_dirty();
+        }
+        updated
+    }
+
+    /// Reassign every selected face in one undo step. Edges and
+    /// vertices are intentionally ignored here: materials bind to
+    /// actual face surfaces, while those modes edit topology/height.
+    fn assign_selected_faces_material(&mut self, material: Option<ResourceId>) -> usize {
+        let faces = self.selected_face_targets();
+        if faces.is_empty() {
+            return 0;
+        }
+        let needs_update = faces
+            .iter()
+            .any(|face| self.face_material(*face) != material);
+        if !needs_update {
+            return 0;
+        }
+        self.push_undo();
+        let mut updated = 0usize;
+        for face in faces {
+            if self.assign_face_material_no_undo(face, material) {
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            self.mark_dirty();
+        }
+        updated
+    }
+
+    fn selected_face_targets(&self) -> Vec<FaceRef> {
+        let mut faces = Vec::new();
+        for face in self.selected_sector_faces() {
+            if !faces.contains(&face) {
+                faces.push(face);
+            }
+        }
+        for selection in self.selected_primitive_targets() {
+            let Selection::Face(face) = selection else {
+                continue;
+            };
+            if !faces.contains(&face) {
+                faces.push(face);
+            }
+        }
+        faces
+    }
+
+    fn assign_face_material_no_undo(
+        &mut self,
+        face: FaceRef,
+        material: Option<ResourceId>,
+    ) -> bool {
+        if self.face_material(face) == material {
+            return false;
+        }
         let scene = self.project.active_scene_mut();
         let Some(node) = scene.node_mut(face.room) else {
             return false;
@@ -4174,10 +4460,10 @@ impl EditorWorkspace {
         let NodeKind::Room { grid } = &mut node.kind else {
             return false;
         };
-        let Some(sector) = grid.ensure_sector(face.sx, face.sz) else {
+        let Some(sector) = grid.sector_mut(face.sx, face.sz) else {
             return false;
         };
-        let updated = match face.kind {
+        match face.kind {
             FaceKind::Floor => sector
                 .floor
                 .as_mut()
@@ -4194,11 +4480,7 @@ impl EditorWorkspace {
                 .get_mut(stack as usize)
                 .map(|w| w.material = material)
                 .is_some(),
-        };
-        if updated {
-            self.mark_dirty();
         }
-        updated
     }
 
     /// Build the camera ray in world units for the given pointer
@@ -4488,14 +4770,33 @@ impl EditorWorkspace {
 
     /// Top-level keyboard shortcut handler. Cleared via `consume_*`
     /// so child widgets never see the same chord.
-    fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
-        let undo_chord = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
-        let redo_chord = egui::KeyboardShortcut::new(
-            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
-            egui::Key::Z,
-        );
-        let consume_undo = ctx.input_mut(|input| input.consume_shortcut(&undo_chord));
-        let consume_redo = ctx.input_mut(|input| input.consume_shortcut(&redo_chord));
+    fn handle_global_shortcuts(
+        &mut self,
+        ctx: &egui::Context,
+        playtest_status: EditorPlaytestStatus,
+    ) {
+        let consume_save = consume_command_shortcut(ctx, egui::Key::S);
+        let consume_new = consume_command_shortcut(ctx, egui::Key::N);
+        let consume_reload = consume_command_shortcut(ctx, egui::Key::R);
+        let consume_build = consume_command_shortcut(ctx, egui::Key::B);
+        let consume_play = consume_command_shortcut(ctx, egui::Key::Enter);
+        let consume_redo = consume_command_shift_shortcut(ctx, egui::Key::Z);
+        let consume_undo = consume_command_shortcut(ctx, egui::Key::Z);
+        if consume_save {
+            self.save_project_from_ui();
+        }
+        if consume_new {
+            self.open_new_project_dialog();
+        }
+        if consume_reload {
+            self.reload();
+        }
+        if consume_build {
+            self.pending_playtest_request = Some(EditorPlaytestRequest::BakeProjectBuild);
+        }
+        if consume_play {
+            self.request_play_or_rebuild(playtest_status);
+        }
         if consume_redo {
             self.do_redo();
         } else if consume_undo {
@@ -4505,7 +4806,8 @@ impl EditorWorkspace {
         // F2 / Delete only fire when no widget owns focus -- so they
         // don't fight TextEdit content while the user is typing.
         let focus_taken = ctx.memory(|m| m.focused().is_some());
-        if !focus_taken {
+        let modifiers = ctx.input(|i| i.modifiers);
+        if bare_shortcuts_available(focus_taken, modifiers) {
             let f2 = ctx.input_mut(|i| i.key_pressed(egui::Key::F2));
             if f2 && self.selected_node != NodeId::ROOT {
                 self.apply_tree_action(TreeAction::BeginRename(self.selected_node), &[]);
@@ -4745,6 +5047,14 @@ impl EditorWorkspace {
         }
     }
 
+    fn request_play_or_rebuild(&mut self, playtest_status: EditorPlaytestStatus) {
+        self.pending_playtest_request = Some(if playtest_status.is_active() {
+            EditorPlaytestRequest::Rebuild
+        } else {
+            EditorPlaytestRequest::Play
+        });
+    }
+
     fn draw_action_bar(&mut self, ctx: &egui::Context, playtest_status: EditorPlaytestStatus) {
         egui::TopBottomPanel::top("psxed_action_bar")
             .exact_height(42.0)
@@ -4752,18 +5062,25 @@ impl EditorWorkspace {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.menu_button(icons::label(icons::FILE, "File"), |ui| {
-                        if ui.button("New Project...").clicked() {
+                        if ui
+                            .button(menu_label("New Project...", &command_shortcut_text("N")))
+                            .clicked()
+                        {
                             self.open_new_project_dialog();
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("Save").clicked() {
-                            if let Err(error) = self.save() {
-                                self.status = format!("Save failed: {error}");
-                            }
+                        if ui
+                            .button(menu_label("Save", &command_shortcut_text("S")))
+                            .clicked()
+                        {
+                            self.save_project_from_ui();
                             ui.close_menu();
                         }
-                        if ui.button("Reload").clicked() {
+                        if ui
+                            .button(menu_label("Reload", &command_shortcut_text("R")))
+                            .clicked()
+                        {
                             self.reload();
                             ui.close_menu();
                         }
@@ -4798,19 +5115,28 @@ impl EditorWorkspace {
                     if ui
                         .button(icons::label(icons::FILE_PLUS, "New"))
                         .on_hover_text(
-                            "Create a new project in editor/projects/<name>/ from the default template.",
+                            format!(
+                                "Create a new project in editor/projects/<name>/ from the default template. Shortcut: {}.",
+                                command_shortcut_text("N")
+                            ),
                         )
                         .clicked()
                     {
                         self.open_new_project_dialog();
                     }
-                    if ui.button(icons::label(icons::SAVE, "Save")).clicked() {
-                        if let Err(error) = self.save() {
-                            self.status = format!("Save failed: {error}");
-                        }
+                    if ui
+                        .button(icons::label(icons::SAVE, "Save"))
+                        .on_hover_text(format!("Save the project. Shortcut: {}.", command_shortcut_text("S")))
+                        .clicked()
+                    {
+                        self.save_project_from_ui();
                     }
                     if ui
                         .button(icons::label(icons::ROTATE_CCW, "Reload"))
+                        .on_hover_text(format!(
+                            "Reload project.ron from disk. Shortcut: {}.",
+                            command_shortcut_text("R")
+                        ))
                         .clicked()
                     {
                         self.reload();
@@ -4831,7 +5157,10 @@ impl EditorWorkspace {
                     if ui
                         .button(icons::label(icons::BOX, "Build"))
                         .on_hover_text(
-                            "Cook and build the current project into the launcher Projects list.",
+                            format!(
+                                "Cook and build the current project into the launcher Projects list. Shortcut: {}.",
+                                command_shortcut_text("B")
+                            ),
                         )
                         .clicked()
                     {
@@ -4846,15 +5175,14 @@ impl EditorWorkspace {
                     if ui
                         .button(icons::label(icons::PLAY, play_label))
                         .on_hover_text(
-                            "Cook the active scene, build editor-playtest, and run it inside the 3D viewport.",
+                            format!(
+                                "Cook the active scene, build editor-playtest, and run it inside the 3D viewport. Shortcut: {}.",
+                                command_shortcut_text("Enter")
+                            ),
                         )
                         .clicked()
                     {
-                        self.pending_playtest_request = Some(if playtest_active {
-                            EditorPlaytestRequest::Rebuild
-                        } else {
-                            EditorPlaytestRequest::Play
-                        });
+                        self.request_play_or_rebuild(playtest_status);
                     }
                     if playtest_active
                         && ui
@@ -5587,6 +5915,11 @@ impl EditorWorkspace {
                     .show(ui, |ui| {
                         changed |= height_row("Height", &mut face_data.heights, ui);
                     });
+                egui::CollapsingHeader::new(icons::label(icons::GRID, "UV"))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        changed |= uv_transform_controls(&mut face_data.uv, ui);
+                    });
             }
             FaceKind::Ceiling => {
                 let Some(face_data) = sector.ceiling.as_mut() else {
@@ -5608,6 +5941,11 @@ impl EditorWorkspace {
                     .default_open(true)
                     .show(ui, |ui| {
                         changed |= height_row("Height", &mut face_data.heights, ui);
+                    });
+                egui::CollapsingHeader::new(icons::label(icons::GRID, "UV"))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        changed |= uv_transform_controls(&mut face_data.uv, ui);
                     });
             }
             FaceKind::Wall { dir, stack } => {
@@ -5656,6 +5994,11 @@ impl EditorWorkspace {
                                 changed = true;
                             }
                         });
+                    });
+                egui::CollapsingHeader::new(icons::label(icons::GRID, "UV"))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        changed |= uv_transform_controls(&mut wall.uv, ui);
                     });
                 let _ = sector_size;
             }
@@ -5738,6 +6081,7 @@ impl EditorWorkspace {
         // borrow on `resource_mut` is live.
         let character_ctx = build_character_editor_context(&self.project);
         let model_options = collect_model_options(&self.project);
+        let attachment_socket_names = collect_attachment_socket_names(&self.project);
 
         // Build the breadcrumb before the mutable borrow on
         // `resource_mut` -- we need other resources by id to
@@ -5886,7 +6230,12 @@ impl EditorWorkspace {
                 changed |= draw_character_resource_editor(ui, character, &character_ctx);
             }
             ResourceData::Weapon(weapon) => {
-                changed |= draw_weapon_resource_editor(ui, weapon, &model_options);
+                changed |= draw_weapon_resource_editor(
+                    ui,
+                    weapon,
+                    &model_options,
+                    &attachment_socket_names,
+                );
             }
             ResourceData::Mesh { source_path }
             | ResourceData::Scene { source_path }
@@ -5953,24 +6302,6 @@ impl EditorWorkspace {
                         self.mark_dirty();
                     }
                     if ui
-                        .button(icons::label(icons::PLUS, "Texture"))
-                        .on_hover_text("Add a Texture resource pointing at a cooked .psxt blob.")
-                        .clicked()
-                    {
-                        let id = self.project.add_resource(
-                            "New Texture",
-                            ResourceData::Texture {
-                                psxt_path: String::new(),
-                            },
-                        );
-                        self.replace_resource_selection(id);
-                        self.clear_node_selection_state();
-                        self.clear_primitive_selection_state();
-                        self.clear_sector_selection();
-                        self.status = "Added texture".to_string();
-                        self.mark_dirty();
-                    }
-                    if ui
                         .button(icons::label(icons::FILE_PLUS, "Import Texture"))
                         .on_hover_text(
                             "Open the PNG/JPG/BMP texture import preview with PSXT cook settings.",
@@ -5978,35 +6309,6 @@ impl EditorWorkspace {
                         .clicked()
                     {
                         self.open_texture_import_dialog();
-                    }
-                    if ui
-                        .button(icons::label(icons::PLUS, "Model"))
-                        .on_hover_text(
-                            "Add an empty Model resource. Use the inspector's \
-                             'Register Cooked Folder' button to populate it from \
-                             an existing bundle, or fill in the paths by hand.",
-                        )
-                        .clicked()
-                    {
-                        let id = self.project.add_resource(
-                            "New Model",
-                            ResourceData::Model(psxed_project::ModelResource {
-                                model_path: String::new(),
-                                texture_path: None,
-                                clips: Vec::new(),
-                                default_clip: None,
-                                preview_clip: None,
-                                world_height: 1024,
-                                scale_q8: [MODEL_SCALE_ONE_Q8; 3],
-                                attachments: Vec::new(),
-                            }),
-                        );
-                        self.replace_resource_selection(id);
-                        self.clear_node_selection_state();
-                        self.clear_primitive_selection_state();
-                        self.clear_sector_selection();
-                        self.status = "Added model".to_string();
-                        self.mark_dirty();
                     }
                     if ui
                         .button(icons::label(icons::FILE_PLUS, "Import Model"))
@@ -6054,63 +6356,97 @@ impl EditorWorkspace {
     /// signature; rebuilds when the path moves or the file is newly
     /// readable.
     fn refresh_texture_thumbs(&mut self, ctx: &egui::Context) {
-        // Clone so the immutable borrow on `self` released here
-        // doesn't fight the mutable borrow on `self.texture_thumbs`
-        // we need below.
+        // Snapshot resource id + path first so cache mutation below
+        // cannot fight the immutable project-resource walk.
         let project_root = self.project_dir.clone();
-        let mut alive: Vec<ResourceId> = Vec::new();
-        for resource in self.project.resources.iter() {
-            // Texture resources point straight at a `.psxt`;
-            // Model resources have a `texture_path` field -- both
-            // share the same on-disk format and decoder, so the
-            // thumbnail cache treats them uniformly.
-            let psxt_path: &str = match &resource.data {
-                ResourceData::Texture { psxt_path } => psxt_path.as_str(),
-                ResourceData::Model(model) => match &model.texture_path {
-                    Some(p) => p.as_str(),
-                    None => continue,
-                },
-                _ => continue,
-            };
-            alive.push(resource.id);
-            if let Some(entry) = self.texture_thumbs.get(&resource.id) {
-                if entry.signature == psxt_path {
+        let sources: Vec<(ResourceId, String)> = self
+            .project
+            .resources
+            .iter()
+            .filter_map(|resource| {
+                // Texture resources point straight at a `.psxt`;
+                // Model resources have a `texture_path` field -- both
+                // share the same on-disk format and decoder, so the
+                // thumbnail cache treats them uniformly.
+                let psxt_path = match &resource.data {
+                    ResourceData::Texture { psxt_path } => psxt_path.as_str(),
+                    ResourceData::Model(model) => model.texture_path.as_deref()?,
+                    _ => return None,
+                };
+                Some((resource.id, psxt_path.to_string()))
+            })
+            .collect();
+        let alive: HashSet<ResourceId> = sources.iter().map(|(id, _)| *id).collect();
+        for (id, psxt_path) in sources {
+            if let Some(entry) = self.texture_thumbs.get(&id) {
+                if entry.signature == psxt_path.as_str() {
                     continue;
                 }
             }
             if psxt_path.is_empty() {
-                self.texture_thumbs.remove(&resource.id);
+                self.remove_texture_thumb(id);
                 continue;
             }
-            let abs = if Path::new(psxt_path).is_absolute() {
-                PathBuf::from(psxt_path)
+            let abs = if Path::new(psxt_path.as_str()).is_absolute() {
+                PathBuf::from(psxt_path.as_str())
             } else {
-                project_root.join(psxt_path)
+                project_root.join(psxt_path.as_str())
             };
             let Some((image, stats)) = std::fs::read(&abs)
                 .ok()
                 .and_then(|bytes| decode_psxt_thumbnail(&bytes))
             else {
-                self.texture_thumbs.remove(&resource.id);
+                self.remove_texture_thumb(id);
                 continue;
             };
+            self.set_texture_thumb(ctx, id, psxt_path, image, stats);
+        }
+        // Drop entries for Texture / Model resources that no longer
+        // exist -- keeps the cache from growing across delete + re-add.
+        let stale: Vec<ResourceId> = self
+            .texture_thumbs
+            .keys()
+            .copied()
+            .filter(|id| !alive.contains(id))
+            .collect();
+        for id in stale {
+            self.remove_texture_thumb(id);
+        }
+    }
+
+    fn set_texture_thumb(
+        &mut self,
+        ctx: &egui::Context,
+        id: ResourceId,
+        signature: String,
+        image: ColorImage,
+        stats: PsxtStats,
+    ) {
+        if let Some(entry) = self.texture_thumbs.get_mut(&id) {
+            entry.handle.set(image, egui::TextureOptions::NEAREST);
+            entry.signature = signature;
+            entry.stats = stats;
+        } else {
             let handle = ctx.load_texture(
-                format!("psxt-thumb-{}", resource.id.raw()),
+                format!("psxt-thumb-{}", id.raw()),
                 image,
                 egui::TextureOptions::NEAREST,
             );
             self.texture_thumbs.insert(
-                resource.id,
+                id,
                 ThumbnailEntry {
-                    signature: psxt_path.to_string(),
+                    signature,
                     handle,
                     stats,
                 },
             );
         }
-        // Drop entries for Texture resources that no longer exist --
-        // keeps the cache from growing across delete + re-add.
-        self.texture_thumbs.retain(|id, _| alive.contains(id));
+    }
+
+    fn remove_texture_thumb(&mut self, id: ResourceId) {
+        if let Some(entry) = self.texture_thumbs.remove(&id) {
+            self.retire_egui_texture(entry.handle);
+        }
     }
 
     /// Resolve the underlying Texture id for a Material, or the
@@ -6207,26 +6543,42 @@ impl EditorWorkspace {
                     });
                 if let Some(click) = clicked {
                     // Sims-style: with a face selected, clicking a
-                    // Material card retargets the face's material
-                    // rather than swapping the inspector. Texture
-                    // / non-Material clicks still navigate normally.
+                    // Material card retargets the selected face set's
+                    // material rather than swapping the inspector.
+                    // Texture / non-Material clicks still navigate
+                    // normally.
                     let id = click.id;
                     let is_material = matches!(
                         self.project.resource(id).map(|r| &r.data),
                         Some(ResourceData::Material(_))
                     );
-                    let face_for_assign =
-                        self.selected_primitive
-                            .and_then(|s| s.as_face())
-                            .filter(|_| {
-                                is_material
-                                    && !click.modifiers.shift
-                                    && !click.modifiers.ctrl
-                                    && !click.modifiers.command
-                            });
-                    if let Some(face) = face_for_assign {
-                        if self.assign_face_material(face, Some(id)) {
-                            self.status = format!("Assigned material to {}", describe_face(face));
+                    let plain_click =
+                        !click.modifiers.shift && !click.modifiers.ctrl && !click.modifiers.command;
+                    let selected_faces = if is_material && plain_click {
+                        self.selected_face_targets()
+                    } else {
+                        Vec::new()
+                    };
+                    if !selected_faces.is_empty() {
+                        let updated = self.assign_selected_faces_material(Some(id));
+                        match (selected_faces.as_slice(), updated) {
+                            (_, 0) => {
+                                self.status =
+                                    "Material already assigned to selected faces".to_string();
+                            }
+                            ([face], 1) => {
+                                self.status =
+                                    format!("Assigned material to {}", describe_face(*face));
+                            }
+                            (_, n) if n == selected_faces.len() => {
+                                self.status = format!("Assigned material to {n} selected faces");
+                            }
+                            (_, n) => {
+                                self.status = format!(
+                                    "Assigned material to {n}/{} selected faces",
+                                    selected_faces.len()
+                                );
+                            }
                         }
                         self.replace_resource_selection(id);
                     } else {
@@ -6504,6 +6856,33 @@ impl EditorWorkspace {
                 );
                 ui.separator();
                 ui.checkbox(&mut self.show_grid, icons::label(icons::GRID, "Grid"));
+                ui.add_enabled_ui(!self.view_2d, |ui| {
+                    ui.toggle_value(&mut self.preview_fog, icons::label(icons::EYE, "Fog"))
+                        .on_hover_text("Toggle authored room fog in the editor 3D preview.");
+                });
+                ui.separator();
+                ui.add_enabled_ui(!self.view_2d, |ui| {
+                    if ui
+                        .selectable_label(
+                            self.viewport_3d_camera_mode == ViewportCameraMode::Orbit,
+                            icons::label(icons::ROTATE_3D, "Orbit"),
+                        )
+                        .on_hover_text("Use the target/radius orbit camera.")
+                        .clicked()
+                    {
+                        self.set_viewport_3d_camera_mode(ViewportCameraMode::Orbit);
+                    }
+                    if ui
+                        .selectable_label(
+                            self.viewport_3d_camera_mode == ViewportCameraMode::Free,
+                            icons::label(icons::MOVE, "Free"),
+                        )
+                        .on_hover_text("Use the free camera. Right/middle drag looks; WASD moves.")
+                        .clicked()
+                    {
+                        self.set_viewport_3d_camera_mode(ViewportCameraMode::Free);
+                    }
+                });
                 ui.separator();
                 ui.selectable_value(&mut self.view_2d, true, icons::label(icons::GRID, "2D"));
                 ui.selectable_value(&mut self.view_2d, false, icons::label(icons::BOX, "3D"));
@@ -7132,7 +7511,7 @@ impl EditorWorkspace {
             if self.brush_material == Some(id) {
                 self.brush_material = None;
             }
-            self.texture_thumbs.remove(&id);
+            self.remove_texture_thumb(id);
             match self
                 .project
                 .delete_resource_with_files(id, &self.project_dir)
@@ -7237,8 +7616,12 @@ impl EditorWorkspace {
         let node = scene.node(id)?;
         match &node.kind {
             NodeKind::Room { grid } => {
+                let (local_center, half) = grid_authored_editor_center_half(grid)?;
                 let center = node_world(node);
-                Some((center, [grid.width as f32 * 0.5, grid.depth as f32 * 0.5]))
+                Some((
+                    [center[0] + local_center[0], center[1] + local_center[1]],
+                    half,
+                ))
             }
             _ => Some((node_world(node), [0.75, 0.75])),
         }
@@ -8017,6 +8400,13 @@ impl EditorWorkspace {
     }
 
     fn current_frame_bounds_3d(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.selected_frame_bounds_3d().or_else(|| {
+            self.active_room_id()
+                .and_then(|room_id| self.room_bounds_3d(room_id))
+        })
+    }
+
+    fn selected_frame_bounds_3d(&self) -> Option<([f32; 3], [f32; 3])> {
         let mut bounds: Option<(f32, f32, f32, f32, f32, f32)> = None;
         for &(room, sx, sz) in &self.selected_sectors {
             if let Some((center, half)) = self.sector_bounds_3d(room, sx, sz) {
@@ -8064,8 +8454,7 @@ impl EditorWorkspace {
         if let Some(bounds) = self.node_frame_bounds_3d(self.selected_node) {
             return Some(bounds);
         }
-        self.active_room_id()
-            .and_then(|room_id| self.room_bounds_3d(room_id))
+        None
     }
 
     fn selection_bounds_3d(&self, selection: Selection) -> Option<([f32; 3], [f32; 3])> {
@@ -8142,14 +8531,8 @@ impl EditorWorkspace {
             return None;
         }
         let center = node_world(node);
-        let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
-        Some((
-            [
-                center[0] - half[0] + sx as f32 + 0.5,
-                center[1] - half[1] + sz as f32 + 0.5,
-            ],
-            [0.5, 0.5],
-        ))
+        let local = grid_cell_editor_center(grid, sx, sz);
+        Some(([center[0] + local[0], center[1] + local[1]], [0.5, 0.5]))
     }
 
     fn drag_selected_node(&mut self, screen_delta: Vec2) {
@@ -8649,7 +9032,7 @@ fn draw_node_kind_editor(
                 }
             });
         }
-        NodeKind::ModelRenderer { model, material } => {
+        NodeKind::ModelRenderer { model, material: _ } => {
             ui.weak("Component: renders a Model from the parent Entity transform.");
             let bound_model =
                 model.and_then(|id| model_options.iter().find(|(rid, _, _)| *rid == id));
@@ -8679,7 +9062,6 @@ fn draw_node_kind_editor(
                     "Model resource is missing.",
                 );
             }
-            changed |= material_picker(ui, "Material", material, material_options, nav_target);
         }
         NodeKind::Animator { clip, autoplay } => {
             ui.weak("Component: controls which model animation clip plays on this entity.");
@@ -9524,6 +9906,15 @@ fn draw_model_resource_editor(
         draw_psxt_preview_block(ui, preview_thumb);
     }
 
+    // Live-parse the model once for both socket validation and the
+    // stats block. Cheap on every inspector frame for current target
+    // model sizes; a cache can land when authoring scales beyond that.
+    let model_path =
+        psxed_project::model_import::resolve_path(&model.model_path, Some(project_root));
+    let model_stats = std::fs::read(&model_path)
+        .ok()
+        .and_then(|b| psxed_project::model_import::model_stats_from_bytes(&b).ok());
+
     egui::CollapsingHeader::new(icons::label(icons::FOLDER, "Bundle helpers"))
         .default_open(false)
         .show(ui, |ui| {
@@ -9626,17 +10017,13 @@ fn draw_model_resource_editor(
         .default_open(true)
         .show(ui, |ui| {
             ui.weak("Sockets bind equipment/VFX to a cooked joint plus an integer local offset.");
-            changed |= attachment_socket_list_editor(ui, &mut model.attachments);
+            changed |= attachment_socket_list_editor(
+                ui,
+                &mut model.attachments,
+                model_stats.as_ref().map(|stats| stats.joint_count),
+            );
         });
 
-    // Live-parse the model + clips for stats. Cheap on every
-    // inspector frame for the model sizes this editor targets;
-    // a cache lands when authoring scales beyond that.
-    let model_path =
-        psxed_project::model_import::resolve_path(&model.model_path, Some(project_root));
-    let model_stats = std::fs::read(&model_path)
-        .ok()
-        .and_then(|b| psxed_project::model_import::model_stats_from_bytes(&b).ok());
     if let Some(stats) = &model_stats {
         egui::CollapsingHeader::new(icons::label(icons::SCAN, "Stats"))
             .default_open(true)
@@ -10433,9 +10820,27 @@ fn model_scale_axis_editor(ui: &mut egui::Ui, label: &str, value: &mut u16) -> b
 fn attachment_socket_list_editor(
     ui: &mut egui::Ui,
     sockets: &mut Vec<psxed_project::AttachmentSocket>,
+    joint_count: Option<u16>,
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
+    let issues = attachment_socket_issue_counts(sockets, joint_count);
+    if let Some(joint_count) = joint_count {
+        ui.label(
+            RichText::new(format!("Rig joints: {joint_count}"))
+                .color(STUDIO_TEXT_WEAK)
+                .small(),
+        );
+    }
+    if issues.empty_names > 0 || issues.duplicate_names > 0 || issues.invalid_joints > 0 {
+        ui.colored_label(
+            Color32::from_rgb(220, 160, 80),
+            format!(
+                "{} empty names, {} duplicate names, {} invalid joints",
+                issues.empty_names, issues.duplicate_names, issues.invalid_joints
+            ),
+        );
+    }
     for (index, socket) in sockets.iter_mut().enumerate() {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -10449,7 +10854,21 @@ fn attachment_socket_list_editor(
                     remove = Some(index);
                 }
             });
-            changed |= drag_u16(ui, "Joint", &mut socket.joint, 0, u16::MAX);
+            let max_joint = joint_count
+                .map(|count| count.saturating_sub(1))
+                .unwrap_or(u16::MAX);
+            changed |= drag_u16(ui, "Joint", &mut socket.joint, 0, max_joint);
+            if let Some(count) = joint_count {
+                if socket.joint >= count {
+                    ui.colored_label(
+                        Color32::from_rgb(220, 120, 100),
+                        format!(
+                            "Joint {} is outside this model's 0..{} range",
+                            socket.joint, count
+                        ),
+                    );
+                }
+            }
             changed |= int_vec3_editor(ui, "Offset", &mut socket.translation, -32768, 32767, 8.0);
             changed |= q12_rotation_editor(ui, "Rotation", &mut socket.rotation_q12);
         });
@@ -10468,10 +10887,38 @@ fn attachment_socket_list_editor(
     changed
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AttachmentSocketIssueCounts {
+    empty_names: usize,
+    duplicate_names: usize,
+    invalid_joints: usize,
+}
+
+fn attachment_socket_issue_counts(
+    sockets: &[psxed_project::AttachmentSocket],
+    joint_count: Option<u16>,
+) -> AttachmentSocketIssueCounts {
+    let mut out = AttachmentSocketIssueCounts::default();
+    let mut names = HashSet::new();
+    for socket in sockets {
+        let name = socket.name.trim();
+        if name.is_empty() {
+            out.empty_names += 1;
+        } else if !names.insert(name.to_ascii_lowercase()) {
+            out.duplicate_names += 1;
+        }
+        if joint_count.is_some_and(|count| socket.joint >= count) {
+            out.invalid_joints += 1;
+        }
+    }
+    out
+}
+
 fn draw_weapon_resource_editor(
     ui: &mut egui::Ui,
     weapon: &mut psxed_project::WeaponResource,
     model_options: &[(ResourceId, String, Vec<String>)],
+    known_socket_names: &[String],
 ) -> bool {
     let mut changed = false;
 
@@ -10479,12 +10926,12 @@ fn draw_weapon_resource_editor(
         .default_open(true)
         .show(ui, |ui| {
             changed |= model_resource_picker(ui, "Model", &mut weapon.model, model_options);
-            ui.horizontal(|ui| {
-                ui.label("Character Socket");
-                changed |= ui
-                    .text_edit_singleline(&mut weapon.default_character_socket)
-                    .changed();
-            });
+            changed |= socket_name_picker(
+                ui,
+                "Character Socket",
+                &mut weapon.default_character_socket,
+                known_socket_names,
+            );
         });
 
     egui::CollapsingHeader::new(icons::label(icons::WAYPOINT, "Grip"))
@@ -10512,7 +10959,144 @@ fn draw_weapon_resource_editor(
             changed |= weapon_hitbox_list_editor(ui, &mut weapon.hitboxes);
         });
 
+    egui::CollapsingHeader::new(icons::label(icons::WAYPOINT, "Attachment Lab"))
+        .default_open(true)
+        .show(ui, |ui| {
+            draw_weapon_attachment_lab(ui, weapon, known_socket_names);
+        });
+
     changed
+}
+
+fn socket_name_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    known_socket_names: &[String],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        changed |= ui.text_edit_singleline(value).changed();
+        if !known_socket_names.is_empty() {
+            egui::ComboBox::from_id_salt(ui.id().with(label))
+                .selected_text("Known")
+                .show_ui(ui, |ui| {
+                    for name in known_socket_names {
+                        if ui.selectable_label(value == name, name).clicked() {
+                            *value = name.clone();
+                            changed = true;
+                        }
+                    }
+                });
+        }
+    });
+    changed
+}
+
+fn draw_weapon_attachment_lab(
+    ui: &mut egui::Ui,
+    weapon: &psxed_project::WeaponResource,
+    known_socket_names: &[String],
+) {
+    let summary = weapon_attachment_summary(weapon, known_socket_names);
+    ui.horizontal_wrapped(|ui| {
+        attachment_lab_metric(ui, "Hitboxes", summary.hitbox_count.to_string());
+        attachment_lab_metric(ui, "Active window", summary.active_window_label);
+        attachment_lab_metric(ui, "Max reach", format!("{} u", summary.max_reach));
+    });
+    for warning in summary.warnings {
+        ui.colored_label(Color32::from_rgb(220, 160, 80), warning);
+    }
+}
+
+fn attachment_lab_metric(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.group(|ui| {
+        ui.label(RichText::new(label).color(STUDIO_TEXT_WEAK).small());
+        ui.label(RichText::new(value).monospace());
+    });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WeaponAttachmentSummary {
+    hitbox_count: usize,
+    active_window_label: String,
+    max_reach: i32,
+    warnings: Vec<String>,
+}
+
+fn weapon_attachment_summary(
+    weapon: &psxed_project::WeaponResource,
+    known_socket_names: &[String],
+) -> WeaponAttachmentSummary {
+    let mut warnings = Vec::new();
+    let socket_name = weapon.default_character_socket.trim();
+    if socket_name.is_empty() {
+        warnings.push("Default character socket is empty.".to_string());
+    } else if !known_socket_names.is_empty()
+        && !known_socket_names.iter().any(|name| name == socket_name)
+    {
+        warnings.push(format!(
+            "No current model resource defines socket \"{socket_name}\"."
+        ));
+    }
+    if weapon.grip.name.trim().is_empty() {
+        warnings.push("Weapon grip name is empty.".to_string());
+    }
+    if weapon.model.is_none() {
+        warnings.push("Weapon has no visual model assigned.".to_string());
+    }
+    if weapon.hitboxes.is_empty() {
+        warnings.push("Weapon has no hitboxes.".to_string());
+    }
+
+    let active_start = weapon
+        .hitboxes
+        .iter()
+        .map(|hitbox| hitbox.active_start_frame)
+        .min();
+    let active_end = weapon
+        .hitboxes
+        .iter()
+        .map(|hitbox| hitbox.active_end_frame)
+        .max();
+    let active_window_label = match (active_start, active_end) {
+        (Some(start), Some(end)) => format!("{start}..{end}"),
+        _ => "none".to_string(),
+    };
+    let max_reach = weapon
+        .hitboxes
+        .iter()
+        .map(|hitbox| weapon_hitbox_max_reach(&hitbox.shape))
+        .max()
+        .unwrap_or(0);
+
+    WeaponAttachmentSummary {
+        hitbox_count: weapon.hitboxes.len(),
+        active_window_label,
+        max_reach,
+        warnings,
+    }
+}
+
+fn weapon_hitbox_max_reach(shape: &psxed_project::WeaponHitShape) -> i32 {
+    match shape {
+        psxed_project::WeaponHitShape::Box {
+            center,
+            half_extents,
+        } => center
+            .iter()
+            .zip(half_extents.iter())
+            .map(|(c, h)| c.abs().saturating_add(*h as i32))
+            .max()
+            .unwrap_or(0),
+        psxed_project::WeaponHitShape::Capsule { start, end, radius } => start
+            .iter()
+            .chain(end.iter())
+            .map(|v| v.abs().saturating_add(*radius as i32))
+            .max()
+            .unwrap_or(0),
+    }
 }
 
 fn model_resource_picker(
@@ -11765,17 +12349,15 @@ fn draw_resource_preview(
             } else {
                 draw_texture_like_preview(painter, preview, resource);
             }
-            let tint = Color32::from_rgba_unmultiplied(
-                material.tint[0].saturating_mul(2),
-                material.tint[1].saturating_mul(2),
-                material.tint[2].saturating_mul(2),
-                if material.blend_mode == PsxBlendMode::Opaque {
-                    55
-                } else {
-                    110
-                },
-            );
-            painter.rect_filled(preview.shrink(8.0), 2.0, tint);
+            if material.tint != [0x80, 0x80, 0x80] {
+                let tint = Color32::from_rgba_unmultiplied(
+                    material.tint[0].saturating_mul(2),
+                    material.tint[1].saturating_mul(2),
+                    material.tint[2].saturating_mul(2),
+                    48,
+                );
+                painter.rect_filled(preview, 2.0, tint);
+            }
         }
         ResourceData::Texture { .. } => {
             if let Some(id) = thumb {
@@ -12413,8 +12995,14 @@ fn draw_room(
         return;
     };
 
-    let center = node_world(node);
-    let half = [grid.width as f32 * 0.5, grid.depth as f32 * 0.5];
+    let node_center = node_world(node);
+    let Some((local_center, half)) = grid_authored_editor_center_half(grid) else {
+        return;
+    };
+    let center = [
+        node_center[0] + local_center[0],
+        node_center[1] + local_center[1],
+    ];
     let outline = transform.world_rect_to_screen(center, half);
     hits.push(ViewportHit::rect(node.id, node.name.clone(), center, half));
     painter.rect_filled(outline, 0.0, darken(STUDIO_ROOM_FLOOR, 28));
@@ -12424,17 +13012,22 @@ fn draw_room(
             let Some(sector) = grid.sector(x, z) else {
                 continue;
             };
+            if !sector.has_geometry() {
+                continue;
+            }
+            let local_tile_center = grid_cell_editor_center(grid, x, z);
             let tile_center = [
-                center[0] - half[0] + x as f32 + 0.5,
-                center[1] - half[1] + z as f32 + 0.5,
+                node_center[0] + local_tile_center[0],
+                node_center[1] + local_tile_center[1],
             ];
             let screen_rect = transform.world_rect_to_screen(tile_center, [0.5, 0.5]);
             if !screen_rect.intersects(transform.rect) {
                 continue;
             }
-            let floor_material = sector.floor.as_ref().and_then(|floor| floor.material);
-            let floor_color = material_color(project, floor_material, SurfaceRole::Floor);
-            draw_floor_tile(painter, screen_rect, floor_color, x as i32, z as i32);
+            if let Some(floor) = &sector.floor {
+                let floor_color = material_color(project, floor.material, SurfaceRole::Floor);
+                draw_floor_tile(painter, screen_rect, floor_color, x as i32, z as i32);
+            }
             if selected_sectors.contains(&(node.id, x, z)) {
                 painter.rect_filled(
                     screen_rect.shrink(2.0),
@@ -12454,10 +13047,11 @@ fn draw_room(
                 tile_center,
                 [0.5, 0.5],
             ));
-            draw_grid_sector_walls(painter, transform, project, center, half, x, z, sector);
+            draw_grid_sector_walls(painter, transform, project, tile_center, sector);
         }
     }
 
+    draw_streaming_chunk_boundaries_2d(painter, transform, grid, node_center);
     painter.rect_stroke(outline, 0.0, selected_stroke(selected), StrokeKind::Outside);
     painter.text(
         transform.world_to_screen([center[0] - half[0], center[1] + half[1]])
@@ -12469,18 +13063,42 @@ fn draw_room(
     );
 }
 
+fn draw_streaming_chunk_boundaries_2d(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    grid: &WorldGrid,
+    node_center: [f32; 2],
+) {
+    let plan = plan_generated_chunks(grid, playtest_streaming_chunk_config());
+    if plan.chunk_count() <= 1 {
+        return;
+    }
+    let stroke = Stroke::new(2.0, Color32::from_rgb(96, 255, 196));
+    for chunk in plan.chunks {
+        let (local_center, chunk_half) =
+            grid_rect_editor_center_half(grid, chunk.array_origin, chunk.size);
+        let chunk_center = [
+            node_center[0] + local_center[0],
+            node_center[1] + local_center[1],
+        ];
+        let rect = transform.world_rect_to_screen(chunk_center, chunk_half);
+        if rect.intersects(transform.rect) {
+            painter.rect_stroke(rect, 0.0, stroke, StrokeKind::Inside);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_grid_sector_walls(
     painter: &egui::Painter,
     transform: ViewportTransform,
     project: &ProjectDocument,
-    center: [f32; 2],
-    half: [f32; 2],
-    x: u16,
-    z: u16,
+    tile_center: [f32; 2],
     sector: &psxed_project::GridSector,
 ) {
     let wall_thickness = 0.18;
+    let min_x = tile_center[0] - 0.5;
+    let min_z = tile_center[1] - 0.5;
     for direction in GridDirection::CARDINAL {
         let walls = sector.walls.get(direction);
         if walls.is_empty() {
@@ -12488,8 +13106,6 @@ fn draw_grid_sector_walls(
         }
         let material = walls.first().and_then(|wall| wall.material);
         let wall_color = material_color(project, material, SurfaceRole::Wall);
-        let min_x = center[0] - half[0] + x as f32;
-        let min_z = center[1] - half[1] + z as f32;
         let (wall_center, wall_half) = match direction {
             GridDirection::North => (
                 [min_x + 0.5, min_z + 1.0 + wall_thickness * 0.5],
@@ -12528,8 +13144,6 @@ fn draw_grid_sector_walls(
         if sector.walls.get(direction).is_empty() {
             continue;
         }
-        let min_x = center[0] - half[0] + x as f32;
-        let min_z = center[1] - half[1] + z as f32;
         let a = if nw_to_se {
             transform.world_to_screen([min_x, min_z + 1.0])
         } else {
@@ -12894,6 +13508,37 @@ fn node_world(node: &psxed_project::SceneNode) -> [f32; 2] {
     [node.transform.translation[0], node.transform.translation[2]]
 }
 
+fn grid_cell_editor_center(grid: &WorldGrid, sx: u16, sz: u16) -> [f32; 2] {
+    [
+        sx as f32 + 0.5 - grid.width as f32 * 0.5,
+        sz as f32 + 0.5 - grid.depth as f32 * 0.5,
+    ]
+}
+
+fn grid_rect_editor_center_half(
+    grid: &WorldGrid,
+    array_origin: [u16; 2],
+    size: [u16; 2],
+) -> ([f32; 2], [f32; 2]) {
+    let half = [size[0] as f32 * 0.5, size[1] as f32 * 0.5];
+    (
+        [
+            array_origin[0] as f32 + half[0] - grid.width as f32 * 0.5,
+            array_origin[1] as f32 + half[1] - grid.depth as f32 * 0.5,
+        ],
+        half,
+    )
+}
+
+fn grid_authored_editor_center_half(grid: &WorldGrid) -> Option<([f32; 2], [f32; 2])> {
+    let footprint = grid.authored_footprint()?;
+    Some(grid_rect_editor_center_half(
+        grid,
+        [footprint.x, footprint.z],
+        [footprint.width, footprint.depth],
+    ))
+}
+
 fn merge_bounds(bounds: &mut Option<(f32, f32, f32, f32)>, center: [f32; 2], half: [f32; 2]) {
     let next = (
         center[0] - half[0],
@@ -12962,13 +13607,99 @@ fn bounds_3d_to_center_half(bounds: (f32, f32, f32, f32, f32, f32)) -> ([f32; 3]
     )
 }
 
+fn command_shortcut(key: egui::Key) -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key)
+}
+
+fn command_shift_shortcut(key: egui::Key) -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), key)
+}
+
+fn consume_command_shortcut(ctx: &egui::Context, key: egui::Key) -> bool {
+    let shortcut = command_shortcut(key);
+    ctx.input_mut(|input| input.consume_shortcut(&shortcut))
+}
+
+fn consume_command_shift_shortcut(ctx: &egui::Context, key: egui::Key) -> bool {
+    let shortcut = command_shift_shortcut(key);
+    ctx.input_mut(|input| input.consume_shortcut(&shortcut))
+}
+
+fn command_shortcut_text(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("Cmd+{key}")
+    } else {
+        format!("Ctrl+{key}")
+    }
+}
+
+fn menu_label(label: &str, shortcut: &str) -> String {
+    format!("{label}    {shortcut}")
+}
+
+fn bare_shortcuts_available(focus_taken: bool, modifiers: egui::Modifiers) -> bool {
+    !focus_taken && !modifiers.command && !modifiers.ctrl
+}
+
 fn frame_radius_for_3d_bounds(half: [f32; 3]) -> i32 {
     let extent = half[0].max(half[1]).max(half[2]).max(128.0);
     (extent * 3.2).clamp(512.0, 262_144.0) as i32
 }
 
+fn orbit_camera_position_f32(
+    yaw_q12: u16,
+    pitch_q12: u16,
+    radius: i32,
+    target: [i32; 3],
+) -> [f32; 3] {
+    let radius = radius as f32;
+    let cos_p = psx_gte::transform::cos_1_3_12(pitch_q12) as f32 / 4096.0;
+    let sin_p = psx_gte::transform::sin_1_3_12(pitch_q12) as f32 / 4096.0;
+    let cos_y = psx_gte::transform::cos_1_3_12(yaw_q12) as f32 / 4096.0;
+    let sin_y = psx_gte::transform::sin_1_3_12(yaw_q12) as f32 / 4096.0;
+    [
+        target[0] as f32 + radius * cos_p * sin_y,
+        target[1] as f32 - radius * sin_p,
+        target[2] as f32 + radius * cos_p * cos_y,
+    ]
+}
+
+fn orbit_camera_position_i32(
+    yaw_q12: u16,
+    pitch_q12: u16,
+    radius: i32,
+    target: [i32; 3],
+) -> [i32; 3] {
+    orbit_camera_position_f32(yaw_q12, pitch_q12, radius, target).map(round_to_i32)
+}
+
+fn camera_forward_from_angles(yaw_q12: u16, pitch_q12: u16) -> [f32; 3] {
+    let cos_p = psx_gte::transform::cos_1_3_12(pitch_q12) as f32 / 4096.0;
+    let sin_p = psx_gte::transform::sin_1_3_12(pitch_q12) as f32 / 4096.0;
+    let cos_y = psx_gte::transform::cos_1_3_12(yaw_q12) as f32 / 4096.0;
+    let sin_y = psx_gte::transform::sin_1_3_12(yaw_q12) as f32 / 4096.0;
+    normalize3([-cos_p * sin_y, sin_p, -cos_p * cos_y])
+}
+
 fn round_to_i32(value: f32) -> i32 {
     value.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32
+}
+
+fn add_q12_signed_clamped(value: u16, delta: i32, min: i32, max: i32) -> u16 {
+    signed_to_q12((q12_to_signed(value) + delta).clamp(min, max))
+}
+
+fn q12_to_signed(value: u16) -> i32 {
+    let raw = value as i32;
+    if raw >= 2048 {
+        raw - 4096
+    } else {
+        raw
+    }
+}
+
+fn signed_to_q12(value: i32) -> u16 {
+    value.rem_euclid(4096) as u16
 }
 
 fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -14070,6 +14801,23 @@ fn collect_model_options(project: &ProjectDocument) -> Vec<(ResourceId, String, 
         .collect()
 }
 
+fn collect_attachment_socket_names(project: &ProjectDocument) -> Vec<String> {
+    let mut names: Vec<String> = project
+        .resources
+        .iter()
+        .filter_map(|resource| match &resource.data {
+            ResourceData::Model(model) => Some(model),
+            _ => None,
+        })
+        .flat_map(|model| model.attachments.iter().map(|socket| socket.name.trim()))
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string())
+        .collect();
+    names.sort_by_key(|name| name.to_ascii_lowercase());
+    names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    names
+}
+
 /// Collect every Character resource as `(id, name)`. The
 /// player-spawn inspector uses this to populate its picker.
 fn collect_character_options(project: &ProjectDocument) -> Vec<(ResourceId, String)> {
@@ -14102,7 +14850,7 @@ fn draw_streaming_budget(
     room_id: NodeId,
     grid: &WorldGrid,
 ) {
-    let config = StreamingChunkConfig::default();
+    let config = playtest_streaming_chunk_config();
     let plan = plan_generated_chunks(grid, config);
     let resource_use = collect_scene_resource_use(project);
     let file_budget = resource_file_budget(project, project_root, &resource_use);
@@ -14128,6 +14876,16 @@ fn draw_streaming_budget(
                 format!("{}×{} sectors", config.target_width, config.target_depth),
                 false,
             );
+            draw_budget_row(
+                ui,
+                "Authored footprint",
+                format!(
+                    "{}×{} sectors (runtime cap {}×{} per generated chunk)",
+                    plan.source_size[0], plan.source_size[1], MAX_ROOM_WIDTH, MAX_ROOM_DEPTH
+                ),
+                false,
+            );
+            ui.weak("Embedded Play cooks this Room as generated chunks.");
             if let Some(chunk) = plan.largest_psxw_chunk() {
                 draw_budget_row(
                     ui,
@@ -14137,7 +14895,7 @@ fn draw_streaming_budget(
                         chunk.index,
                         chunk.size[0],
                         chunk.size[1],
-                        human_bytes(chunk.budget.psxw_v1_bytes as u32)
+                        human_bytes(chunk.budget.psxw_bytes as u32)
                     ),
                     chunk.over_budget,
                 );
@@ -14155,7 +14913,7 @@ fn draw_streaming_budget(
             }
 
             ui.add_space(4.0);
-            draw_room_budget_rows(ui, grid.budget());
+            draw_room_budget_rows(ui, grid.authored_budget());
 
             ui.add_space(4.0);
             ui.separator();
@@ -14221,7 +14979,7 @@ fn draw_streaming_budget(
                         )));
                         ui.label(text(format!("{}×{}", chunk.size[0], chunk.size[1])));
                         ui.label(text(format!("{}", chunk.budget.triangles)));
-                        ui.label(text(human_bytes(chunk.budget.psxw_v1_bytes as u32)));
+                        ui.label(text(human_bytes(chunk.budget.psxw_bytes as u32)));
                         ui.end_row();
                     }
                 });
@@ -14357,17 +15115,17 @@ fn draw_room_budget_rows(ui: &mut egui::Ui, budget: WorldGridBudget) {
     );
     draw_budget_row(
         ui,
-        ".psxw v1",
+        ".psxw",
         format!(
             "{} / {}",
-            human_bytes(budget.psxw_v1_bytes as u32),
+            human_bytes(budget.psxw_bytes as u32),
             human_bytes(MAX_ROOM_BYTES as u32)
         ),
-        budget.psxw_v1_bytes > MAX_ROOM_BYTES,
+        budget.psxw_bytes > MAX_ROOM_BYTES,
     );
     draw_budget_row(
         ui,
-        ".psxw v2 est.",
+        ".psxw compact est.",
         human_bytes(budget.future_compact_estimated_bytes as u32).to_string(),
         budget.future_compact_estimated_bytes > MAX_ROOM_BYTES,
     );
@@ -14570,6 +15328,40 @@ fn wall_stack_row(
     changed
 }
 
+fn uv_transform_controls(uv: &mut GridUvTransform, ui: &mut egui::Ui) -> bool {
+    let before = *uv;
+
+    ui.horizontal(|ui| {
+        ui.label("Offset");
+        ui.label("U");
+        ui.add(egui::DragValue::new(&mut uv.offset[0]).speed(1.0));
+        ui.label("V");
+        ui.add(egui::DragValue::new(&mut uv.offset[1]).speed(1.0));
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Rotate");
+        ui.selectable_value(&mut uv.rotation, GridUvRotation::Deg0, "0");
+        ui.selectable_value(&mut uv.rotation, GridUvRotation::Deg90, "90");
+        ui.selectable_value(&mut uv.rotation, GridUvRotation::Deg180, "180");
+        ui.selectable_value(&mut uv.rotation, GridUvRotation::Deg270, "270");
+    });
+
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut uv.flip_u, "Flip U");
+        ui.checkbox(&mut uv.flip_v, "Flip V");
+        if ui
+            .small_button("Reset")
+            .on_hover_text("Reset this face's UV offset, rotation, and flips.")
+            .clicked()
+        {
+            *uv = GridUvTransform::IDENTITY;
+        }
+    });
+
+    *uv != before
+}
+
 /// Editable row for a `[NW, NE, SE, SW]` corner-height array.
 ///
 /// Renders one DragValue when the four corners agree (the common
@@ -14700,6 +15492,68 @@ fn material_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_vec3_approx(actual: [f32; 3], expected: [f32; 3]) {
+        for axis in 0..3 {
+            assert!(
+                (actual[axis] - expected[axis]).abs() < 0.001,
+                "axis {axis}: expected {}, got {}",
+                expected[axis],
+                actual[axis]
+            );
+        }
+    }
+
+    #[test]
+    fn free_camera_center_ray_uses_position_and_forward_basis() {
+        let camera = ViewportCameraState {
+            mode: ViewportCameraMode::Free,
+            yaw_q12: 0,
+            pitch_q12: 0,
+            radius: 1000,
+            target: [0, 0, 0],
+            position: [10, 20, 30],
+        };
+
+        let (origin, dir) = camera.ray_for_normalized_panel_point(0.0, 0.0);
+
+        assert_vec3_approx(origin, [10.0, 20.0, 30.0]);
+        assert_vec3_approx(dir, [0.0, 0.0, -1.0]);
+        assert_eq!(camera.anchor_i32(), [10, 20, 30]);
+        assert_eq!(camera.position_i32(), [10, 20, 30]);
+    }
+
+    #[test]
+    fn orbit_camera_keeps_target_anchor() {
+        let camera = ViewportCameraState {
+            mode: ViewportCameraMode::Orbit,
+            yaw_q12: 0,
+            pitch_q12: 0,
+            radius: 1000,
+            target: [10, 20, 30],
+            position: [0, 0, 0],
+        };
+
+        let (origin, dir) = camera.ray_for_normalized_panel_point(0.0, 0.0);
+
+        assert_vec3_approx(origin, [10.0, 20.0, 1030.0]);
+        assert_vec3_approx(dir, [0.0, 0.0, -1.0]);
+        assert_eq!(camera.anchor_i32(), [10, 20, 30]);
+        assert_eq!(camera.position_i32(), [10, 20, 1030]);
+    }
+
+    #[test]
+    fn command_modifier_blocks_bare_shortcuts() {
+        assert!(bare_shortcuts_available(false, egui::Modifiers::NONE));
+        assert!(!bare_shortcuts_available(true, egui::Modifiers::NONE));
+        assert!(!bare_shortcuts_available(false, egui::Modifiers::COMMAND));
+        assert!(!bare_shortcuts_available(false, egui::Modifiers::CTRL));
+    }
+
+    #[test]
+    fn menu_labels_include_discoverable_shortcut_text() {
+        assert_eq!(menu_label("Save", "Cmd+S"), "Save    Cmd+S");
+    }
 
     #[test]
     fn open_directory_saves_and_reloads_project() {
@@ -15070,6 +15924,70 @@ mod tests {
     }
 
     #[test]
+    fn material_click_assignment_updates_all_selected_floor_faces() {
+        let mut project = ProjectDocument::new("materials");
+        let original = project.add_resource(
+            "Original",
+            ResourceData::Material(MaterialResource::opaque(None)),
+        );
+        let target = project.add_resource(
+            "Target",
+            ResourceData::Material(MaterialResource::opaque(None)),
+        );
+        let room = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "Room",
+            NodeKind::Room {
+                grid: WorldGrid::stone_room(2, 1, 1024, Some(original), None),
+            },
+        );
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+        let mut ctrl = egui::Modifiers::NONE;
+        ctrl.ctrl = true;
+
+        workspace.select_sector((room, 0, 0), egui::Modifiers::NONE);
+        workspace.select_sector((room, 1, 0), ctrl);
+
+        let selected = workspace.selected_face_targets();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(workspace.assign_selected_faces_material(Some(target)), 2);
+
+        for sx in 0..=1 {
+            assert_eq!(
+                workspace.face_material(FaceRef {
+                    room,
+                    sx,
+                    sz: 0,
+                    kind: FaceKind::Floor,
+                }),
+                Some(target)
+            );
+        }
+        assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn selected_room_bounds_follow_authored_tiles() {
+        let mut project = ProjectDocument::new("bounds");
+        let mut grid = WorldGrid::empty(6, 6, 1024);
+        grid.set_floor(1, 2, 0, None);
+        grid.set_floor(3, 4, 0, None);
+        let room =
+            project
+                .active_scene_mut()
+                .add_node(NodeId::ROOT, "Room", NodeKind::Room { grid });
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+
+        workspace.replace_node_selection(room);
+
+        let (center, half) = workspace
+            .selected_bounds_3d()
+            .expect("selected room has bounds");
+        assert_eq!(center, [2560.0, 512.0, 3584.0]);
+        assert_eq!(half, [1536.0, 512.0, 1536.0]);
+    }
+
+    #[test]
     fn ctrl_selected_vertices_drag_together() {
         let mut workspace =
             EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
@@ -15306,6 +16224,122 @@ mod tests {
                 .is_some_and(|child| matches!(child.kind, NodeKind::Collider { .. }))
         }));
         assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn dropping_weapon_resource_creates_equipment_entity() {
+        let mut project = ProjectDocument::new("weapon-drop");
+        let weapon = project.add_resource(
+            "Practice Sword",
+            ResourceData::Weapon(psxed_project::WeaponResource {
+                default_character_socket: "right_hand_grip".to_string(),
+                grip: psxed_project::WeaponGrip {
+                    name: "grip".to_string(),
+                    ..psxed_project::WeaponGrip::default()
+                },
+                ..psxed_project::WeaponResource::default()
+            }),
+        );
+        let room = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "Room",
+            NodeKind::Room {
+                grid: WorldGrid::empty(2, 2, 1024),
+            },
+        );
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+
+        workspace.drop_resource_at_room_hit(weapon, room, [512.0, 0.0, 512.0], None);
+
+        let scene = workspace.project.active_scene();
+        let entity = scene
+            .node(workspace.selected_node)
+            .expect("new entity is selected");
+        assert!(matches!(entity.kind, NodeKind::Entity));
+        assert!(entity.children.iter().any(|id| {
+            scene.node(*id).is_some_and(|child| {
+                matches!(
+                    &child.kind,
+                    NodeKind::Equipment {
+                        weapon: Some(id),
+                        character_socket,
+                        weapon_grip,
+                    } if *id == weapon
+                        && character_socket == "right_hand_grip"
+                        && weapon_grip == "grip"
+                )
+            })
+        }));
+        assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn attachment_socket_issue_counts_catches_authoring_errors() {
+        let sockets = vec![
+            psxed_project::AttachmentSocket {
+                name: "right_hand_grip".to_string(),
+                joint: 2,
+                translation: [0, 0, 0],
+                rotation_q12: [0, 0, 0],
+            },
+            psxed_project::AttachmentSocket {
+                name: "Right_Hand_Grip".to_string(),
+                joint: 8,
+                translation: [0, 0, 0],
+                rotation_q12: [0, 0, 0],
+            },
+            psxed_project::AttachmentSocket {
+                name: " ".to_string(),
+                joint: 0,
+                translation: [0, 0, 0],
+                rotation_q12: [0, 0, 0],
+            },
+        ];
+
+        assert_eq!(
+            attachment_socket_issue_counts(&sockets, Some(4)),
+            AttachmentSocketIssueCounts {
+                empty_names: 1,
+                duplicate_names: 1,
+                invalid_joints: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn weapon_attachment_summary_reports_socket_and_reach() {
+        let weapon = psxed_project::WeaponResource {
+            model: None,
+            default_character_socket: "missing_socket".to_string(),
+            grip: psxed_project::WeaponGrip {
+                name: "grip".to_string(),
+                translation: [0, 0, 0],
+                rotation_q12: [0, 0, 0],
+            },
+            hitboxes: vec![psxed_project::WeaponHitbox {
+                name: "blade".to_string(),
+                shape: psxed_project::WeaponHitShape::Capsule {
+                    start: [0, 0, 0],
+                    end: [0, 640, 0],
+                    radius: 32,
+                },
+                active_start_frame: 4,
+                active_end_frame: 12,
+            }],
+        };
+
+        let summary = weapon_attachment_summary(&weapon, &["right_hand_grip".to_string()]);
+        assert_eq!(summary.hitbox_count, 1);
+        assert_eq!(summary.active_window_label, "4..12");
+        assert_eq!(summary.max_reach, 672);
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("missing_socket")));
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("visual model")));
     }
 
     #[test]

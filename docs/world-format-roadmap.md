@@ -1,11 +1,10 @@
 # `.psxw` Format Roadmap
 
-The active world wire format is **VERSION = 1**. It's the only
-shape `psxed-project` cooks and the only shape
-`psx_asset::World::from_bytes` accepts. The compact format
-sketched below is **not in `psxed-format`** as Rust types -- it
-lives here, in docs, until both producer and consumer support
-it together.
+The active world wire format is **VERSION = 2**. It's the shape
+`psxed-project` cooks and the main shape `psx_asset::World::from_bytes`
+accepts; the parser also keeps v1 compatibility for older blobs. The compact
+format sketched below is **not in `psxed-format`** as Rust types -- it lives
+here, in docs, until both producer and consumer support it together.
 
 ## The rule
 
@@ -21,19 +20,21 @@ runtime. Speculative records that meet none of those points
 clutter that contract and trick callers into thinking a future
 format already works. They go in this doc instead.
 
-## Active format -- VERSION 1
+## Active format -- VERSION 2
 
 ```
 AssetHeader               12 B
 WorldHeader               20 B
-SectorRecord[]            44 B each, width * depth records (dense)
-WallRecord[]              24 B each, wall_count records
+SectorRecord[]            60 B each, width * depth records (dense)
+WallRecord[]              32 B each, wall_count records
 ```
 
 Properties:
 
 - Floor / ceiling / wall heights are `[i32; 4]` per face -- 16 B
   per height set.
+- Floor / ceiling / wall UVs are four packed PS1 `[u, v]` byte pairs
+  per face -- 8 B per face.
 - A sector record exists for **every** cell, populated or not.
   The runtime parser rejects a blob when
   `sector_count != width * depth`.
@@ -43,7 +44,7 @@ Properties:
 - Diagonal walls and cells outside the 32×32 / 2048-tri / 64
   KiB caps are rejected at cook time.
 
-The `WorldGridBudget::psxw_v1_bytes` figure is exact for this
+The `WorldGridBudget::psxw_bytes` figure is exact for this
 format.
 
 ## Future compact format
@@ -51,8 +52,8 @@ format.
 The goals -- driven by PSX RAM budget, not aesthetics:
 
 - Room-local `[i16; 4]` heights -- 8 B per set instead of 16.
-- 28 B sector record (down from 44).
-- 12 B wall record (down from 24).
+- 28 B sector record (down from 60).
+- 12 B wall record (down from 32).
 - Embedded material table or explicit material-bank reference,
   so a `.psxw` is self-resolving.
 - FloorData-style sparse sector logic stream for triggers /
@@ -62,11 +63,11 @@ The goals -- driven by PSX RAM budget, not aesthetics:
 
 The reduction targets give roughly:
 
-| Record       | v1     | future | savings |
+| Record       | active | future | savings |
 | ------------ | ------ | ------ | ------- |
 | WorldHeader  |  20 B  |  20 B  |   --     |
-| Sector       |  44 B  |  28 B  | 36 %    |
-| Wall         |  24 B  |  12 B  | 50 %    |
+| Sector       |  60 B  |  28 B  | 53 %    |
+| Wall         |  32 B  |  12 B  | 62 %    |
 
 `WorldGridBudget::future_compact_estimated_bytes` shows the
 compact estimate **as a planning aid**. No live `.psxw` is ever

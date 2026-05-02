@@ -91,8 +91,9 @@ pub use render::{
     CameraDepth, DepthBand, DepthRange, DepthSlot, GpuPacket, OtDepth, OtFrame, PrimitiveArena,
 };
 pub use render3d::{
-    compute_joint_view_transform, project_model_vertex_with_joint_transforms, CullMode,
-    DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand, JointViewTransform,
+    compute_joint_view_transform, compute_joint_world_transform,
+    project_model_vertex_with_joint_transforms, CullMode, DepthPolicy, GouraudMeshOptions,
+    GouraudRenderPass, GouraudTriCommand, JointViewTransform, JointWorldTransform,
     LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex, ProjectedVertex,
     TexturedModelRenderStats, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
     WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,

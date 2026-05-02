@@ -16,6 +16,15 @@ pub(super) const fn runtime_horizontal_heights(heights: [i32; 4]) -> [i32; 4] {
     ]
 }
 
+pub(super) const fn runtime_horizontal_uvs(uvs: [(u8, u8); 4]) -> [(u8, u8); 4] {
+    [
+        uvs[world::CORNER_SW],
+        uvs[world::CORNER_SE],
+        uvs[world::CORNER_NE],
+        uvs[world::CORNER_NW],
+    ]
+}
+
 pub(super) const fn runtime_horizontal_split(split: GridSplit) -> GridSplit {
     match split {
         GridSplit::NorthWestSouthEast => GridSplit::NorthEastSouthWest,
@@ -45,5 +54,14 @@ pub(super) const fn runtime_wall_heights(heights: [i32; 4]) -> [i32; 4] {
         heights[world::WALL_BOTTOM_LEFT],
         heights[world::WALL_TOP_LEFT],
         heights[world::WALL_TOP_RIGHT],
+    ]
+}
+
+pub(super) const fn runtime_wall_uvs(uvs: [(u8, u8); 4]) -> [(u8, u8); 4] {
+    [
+        uvs[world::WALL_BOTTOM_RIGHT],
+        uvs[world::WALL_BOTTOM_LEFT],
+        uvs[world::WALL_TOP_LEFT],
+        uvs[world::WALL_TOP_RIGHT],
     ]
 }

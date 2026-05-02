@@ -31,8 +31,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::streaming::{plan_generated_chunks, StreamingChunkConfig};
 use crate::world_cook::{cook_world_grid, CookedWorldMaterial, WorldGridCookError};
-use crate::{spatial, NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId, SceneNode};
+use crate::{
+    spatial, NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId, SceneNode, WorldGrid,
+};
 
 mod assets;
 mod manifest;
@@ -49,7 +52,26 @@ pub use schema::*;
 struct PlayerSpawnCandidate<'a> {
     node: &'a SceneNode,
     room_index: u16,
+    position: [i32; 3],
     character: Option<ResourceId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthoredRoomChunk {
+    room_index: u16,
+    array_origin: [u16; 2],
+    world_origin: [i32; 2],
+    size: [u16; 2],
+}
+
+/// Chunking policy used by Embedded Play. Authored Rooms may grow
+/// beyond the runtime room cap, but each generated `.psxw` still
+/// respects the current runtime limits.
+pub fn playtest_streaming_chunk_config() -> StreamingChunkConfig {
+    let mut config = StreamingChunkConfig::default();
+    config.target_width = config.max_width;
+    config.target_depth = config.max_depth;
+    config
 }
 
 /// Build a playtest package from `project`. Validates the scene
@@ -92,8 +114,7 @@ pub fn build_package(
     // only use it for presence tests.
     let mut texture_asset_for_resource: std::collections::HashMap<ResourceId, usize> =
         std::collections::HashMap::new();
-    let mut node_to_room_index: std::collections::HashMap<NodeId, u16> =
-        std::collections::HashMap::new();
+    let mut room_chunks_by_node: HashMap<NodeId, Vec<AuthoredRoomChunk>> = HashMap::new();
 
     for room_node in &room_nodes {
         let NodeKind::Room { grid } = &room_node.kind else {
@@ -106,133 +127,151 @@ pub fn build_package(
             ));
             continue;
         }
-        let cooked = match cook_world_grid(project, grid) {
-            Ok(c) => c,
-            Err(e) => {
-                report.error(cook_error_for_node(&room_node.name, e));
-                return (None, report);
+        let plan = plan_generated_chunks(grid, playtest_streaming_chunk_config());
+        let chunk_count = plan.chunk_count();
+        for chunk in plan.chunks {
+            let Some(chunk_grid) = grid_rect(grid, chunk.array_origin, chunk.size) else {
+                continue;
+            };
+            if chunk_grid.populated_sector_count() == 0 {
+                continue;
             }
-        };
-        let bytes = match cooked.to_psxw_bytes() {
-            Ok(b) => b,
-            Err(e) => {
-                report.error(cook_error_for_node(&room_node.name, e));
-                return (None, report);
-            }
-        };
-
-        let room_index = u16::try_from(rooms.len()).unwrap_or(u16::MAX);
-        node_to_room_index.insert(room_node.id, room_index);
-
-        // Room asset goes into the master table first (ahead of
-        // any material textures discovered while walking it).
-        let world_asset_index = assets.len();
-        assets.push(PlaytestAsset {
-            kind: PlaytestAssetKind::RoomWorld,
-            bytes,
-            filename: format!("room_{:03}.psxw", room_index),
-            source_label: room_node.name.clone(),
-        });
-
-        // Walk material slots in slot order. The cooker emits
-        // CookedWorldMaterial per resolved slot id; we build
-        // PlaytestMaterial mirrors keyed to (room, local_slot)
-        // and register each unique texture asset on first use.
-        let material_first = u16::try_from(materials.len()).unwrap_or(u16::MAX);
-        let mut sorted_materials: Vec<&CookedWorldMaterial> = cooked.materials.iter().collect();
-        sorted_materials.sort_by_key(|m| m.slot);
-
-        for cooked_material in sorted_materials {
-            let texture_id = match cooked_material.texture {
-                Some(id) => id,
-                None => {
-                    report.error(format!(
-                        "Room '{}' material slot {} has no texture (resource #{})",
-                        room_node.name,
-                        cooked_material.slot,
-                        cooked_material.source.raw(),
-                    ));
+            let cooked = match cook_world_grid(project, &chunk_grid) {
+                Ok(c) => c,
+                Err(e) => {
+                    report.error(cook_error_for_node(&room_node.name, e));
                     return (None, report);
                 }
             };
-            let texture_resource = match find_resource(project, texture_id) {
-                Some(r) => r,
-                None => {
-                    report.error(format!(
-                        "Room '{}' material slot {} references missing texture resource #{}",
-                        room_node.name,
-                        cooked_material.slot,
-                        texture_id.raw(),
-                    ));
+            let bytes = match cooked.to_psxw_bytes() {
+                Ok(b) => b,
+                Err(e) => {
+                    report.error(cook_error_for_node(&room_node.name, e));
                     return (None, report);
                 }
             };
-            let texture_asset_index =
-                if let Some(&existing) = texture_asset_for_resource.get(&texture_id) {
-                    existing
-                } else {
-                    let bytes = match load_texture_bytes(texture_resource, project_root) {
-                        Ok(b) => b,
-                        Err(msg) => {
+
+            let room_index = u16::try_from(rooms.len()).unwrap_or(u16::MAX);
+            room_chunks_by_node
+                .entry(room_node.id)
+                .or_default()
+                .push(AuthoredRoomChunk {
+                    room_index,
+                    array_origin: chunk.array_origin,
+                    world_origin: chunk.world_origin,
+                    size: chunk.size,
+                });
+
+            // Room asset goes into the master table first (ahead of
+            // any material textures discovered while walking it).
+            let world_asset_index = assets.len();
+            assets.push(PlaytestAsset {
+                kind: PlaytestAssetKind::RoomWorld,
+                bytes,
+                filename: format!("room_{:03}.psxw", room_index),
+                source_label: chunk_room_name(&room_node.name, chunk_count, chunk.index),
+            });
+
+            // Walk material slots in slot order. The cooker emits
+            // CookedWorldMaterial per resolved slot id; we build
+            // PlaytestMaterial mirrors keyed to (room, local_slot)
+            // and register each unique texture asset on first use.
+            let material_first = u16::try_from(materials.len()).unwrap_or(u16::MAX);
+            let mut sorted_materials: Vec<&CookedWorldMaterial> = cooked.materials.iter().collect();
+            sorted_materials.sort_by_key(|m| m.slot);
+
+            for cooked_material in sorted_materials {
+                let texture_id = match cooked_material.texture {
+                    Some(id) => id,
+                    None => {
+                        report.error(format!(
+                            "Room '{}' material slot {} has no texture (resource #{})",
+                            room_node.name,
+                            cooked_material.slot,
+                            cooked_material.source.raw(),
+                        ));
+                        return (None, report);
+                    }
+                };
+                let texture_resource = match find_resource(project, texture_id) {
+                    Some(r) => r,
+                    None => {
+                        report.error(format!(
+                            "Room '{}' material slot {} references missing texture resource #{}",
+                            room_node.name,
+                            cooked_material.slot,
+                            texture_id.raw(),
+                        ));
+                        return (None, report);
+                    }
+                };
+                let texture_asset_index =
+                    if let Some(&existing) = texture_asset_for_resource.get(&texture_id) {
+                        existing
+                    } else {
+                        let bytes = match load_texture_bytes(texture_resource, project_root) {
+                            Ok(b) => b,
+                            Err(msg) => {
+                                report.error(format!(
+                                    "Room '{}' material slot {}: {}",
+                                    room_node.name, cooked_material.slot, msg,
+                                ));
+                                return (None, report);
+                            }
+                        };
+                        // Room materials must be 4bpp (16-entry CLUT) --
+                        // both the editor preview's material upload
+                        // path and the runtime room material slots
+                        // assume the 4bpp tpage layout. Loud failure
+                        // here beats wrong-colour rendering at runtime.
+                        if let Err(msg) = expect_room_material_depth(texture_resource, &bytes) {
                             report.error(format!(
                                 "Room '{}' material slot {}: {}",
                                 room_node.name, cooked_material.slot, msg,
                             ));
                             return (None, report);
                         }
+                        let texture_index = texture_asset_for_resource.len();
+                        let new_index = assets.len();
+                        assets.push(PlaytestAsset {
+                            kind: PlaytestAssetKind::Texture,
+                            bytes,
+                            filename: format!("texture_{:03}.psxt", texture_index),
+                            source_label: texture_resource.name.clone(),
+                        });
+                        texture_asset_for_resource.insert(texture_id, new_index);
+                        new_index
                     };
-                    // Room materials must be 4bpp (16-entry CLUT) --
-                    // both the editor preview's material upload
-                    // path and the runtime room material slots
-                    // assume the 4bpp tpage layout. Loud failure
-                    // here beats wrong-colour rendering at runtime.
-                    if let Err(msg) = expect_room_material_depth(texture_resource, &bytes) {
-                        report.error(format!(
-                            "Room '{}' material slot {}: {}",
-                            room_node.name, cooked_material.slot, msg,
-                        ));
-                        return (None, report);
-                    }
-                    let texture_index = texture_asset_for_resource.len();
-                    let new_index = assets.len();
-                    assets.push(PlaytestAsset {
-                        kind: PlaytestAssetKind::Texture,
-                        bytes,
-                        filename: format!("texture_{:03}.psxt", texture_index),
-                        source_label: texture_resource.name.clone(),
-                    });
-                    texture_asset_for_resource.insert(texture_id, new_index);
-                    new_index
-                };
 
-            materials.push(PlaytestMaterial {
-                room: room_index,
-                local_slot: cooked_material.slot,
-                texture_asset_index,
-                tint_rgb: cooked_material.tint,
-                face_sidedness: cooked_material.face_sidedness,
+                materials.push(PlaytestMaterial {
+                    room: room_index,
+                    local_slot: cooked_material.slot,
+                    texture_asset_index,
+                    tint_rgb: cooked_material.tint,
+                    face_sidedness: cooked_material.face_sidedness,
+                });
+            }
+            let material_count =
+                u16::try_from(materials.len() - material_first as usize).unwrap_or(u16::MAX);
+
+            rooms.push(PlaytestRoom {
+                name: chunk_room_name(&room_node.name, chunk_count, chunk.index),
+                world_asset_index,
+                origin_x: chunk_grid.origin[0],
+                origin_z: chunk_grid.origin[1],
+                sector_size: chunk_grid.sector_size,
+                material_first,
+                material_count,
+                fog_rgb: chunk_grid.fog_color,
+                fog_near: chunk_grid.fog_near,
+                fog_far: chunk_grid.fog_far,
+                flags: if chunk_grid.fog_enabled {
+                    psx_level::room_flags::FOG_ENABLED
+                } else {
+                    0
+                },
             });
         }
-        let material_count =
-            u16::try_from(materials.len() - material_first as usize).unwrap_or(u16::MAX);
-
-        rooms.push(PlaytestRoom {
-            name: room_node.name.clone(),
-            world_asset_index,
-            origin_x: grid.origin[0],
-            origin_z: grid.origin[1],
-            sector_size: grid.sector_size,
-            material_first,
-            material_count,
-            fog_rgb: grid.fog_color,
-            fog_near: grid.fog_near,
-            fog_far: grid.fog_far,
-            flags: if grid.fog_enabled {
-                psx_level::room_flags::FOG_ENABLED
-            } else {
-                0
-            },
-        });
     }
 
     if rooms.is_empty() {
@@ -245,6 +284,7 @@ pub fn build_package(
     let mut entities: Vec<PlaytestEntity> = Vec::new();
     let mut models: Vec<PlaytestModel> = Vec::new();
     let mut model_clips: Vec<PlaytestModelClip> = Vec::new();
+    let mut model_sockets: Vec<PlaytestModelSocket> = Vec::new();
     let mut model_instances: Vec<PlaytestModelInstance> = Vec::new();
     let mut weapon_hitboxes: Vec<PlaytestWeaponHitbox> = Vec::new();
     let mut weapons: Vec<PlaytestWeapon> = Vec::new();
@@ -262,7 +302,7 @@ pub fn build_package(
         if node.kind.is_component() {
             continue;
         }
-        let Some((room_node, room_index)) = enclosing_room(scene, node, &node_to_room_index) else {
+        let Some(room_node) = enclosing_room(scene, node) else {
             if !matches!(
                 node.kind,
                 NodeKind::Node | NodeKind::Node3D | NodeKind::Entity | NodeKind::World { .. }
@@ -278,7 +318,25 @@ pub fn build_package(
         let NodeKind::Room { grid } = &room_node.kind else {
             continue;
         };
-        let pos = node_room_local_position(node, grid);
+        let Some(chunk) = room_chunks_by_node
+            .get(&room_node.id)
+            .and_then(|chunks| chunk_for_node(node, grid, chunks))
+        else {
+            if !matches!(
+                node.kind,
+                NodeKind::Node | NodeKind::Node3D | NodeKind::Entity | NodeKind::World { .. }
+            ) {
+                report.warn(format!(
+                    "{} '{}' is outside cooked Room '{}' chunks — dropped",
+                    node.kind.label(),
+                    node.name,
+                    room_node.name
+                ));
+            }
+            continue;
+        };
+        let room_index = chunk.room_index;
+        let pos = node_chunk_local_position(node, grid, chunk);
         let yaw = yaw_from_degrees(node.transform.rotation_degrees[1]);
 
         match &node.kind {
@@ -308,6 +366,7 @@ pub fn build_package(
                         &mut assets,
                         &mut models,
                         &mut model_clips,
+                        &mut model_sockets,
                         &mut model_instances,
                         &mut model_for_resource,
                         &mut report,
@@ -332,11 +391,13 @@ pub fn build_package(
                     }
                 }
 
-                if let Some(controller) = component_character_controller(scene, node) {
+                let character_controller = component_character_controller(scene, node);
+                if let Some(controller) = character_controller {
                     if controller.player {
                         player_spawns.push(PlayerSpawnCandidate {
                             node,
                             room_index,
+                            position: pos,
                             character: controller.character,
                         });
                     } else if warned_unsupported.insert("NonPlayerEntity") {
@@ -355,6 +416,7 @@ pub fn build_package(
                             &mut assets,
                             &mut models,
                             &mut model_clips,
+                            &mut model_sockets,
                             &mut model_for_resource,
                             &mut weapon_hitboxes,
                             &mut weapons,
@@ -372,6 +434,13 @@ pub fn build_package(
                             yaw,
                             character_socket: equipped.character_socket.to_string(),
                             weapon_grip: equipped.weapon_grip.to_string(),
+                            flags: if character_controller
+                                .is_some_and(|controller| controller.player)
+                            {
+                                psx_level::equipment_flags::PLAYER
+                            } else {
+                                0
+                            },
                         });
                     } else if warned_unsupported.insert("UnboundEquipment") {
                         report.warn("Equipment components with no Weapon are skipped");
@@ -385,6 +454,7 @@ pub fn build_package(
                 player_spawns.push(PlayerSpawnCandidate {
                     node,
                     room_index,
+                    position: pos,
                     character: *character,
                 });
             }
@@ -433,6 +503,7 @@ pub fn build_package(
                         &mut assets,
                         &mut models,
                         &mut model_clips,
+                        &mut model_sockets,
                         &mut model_instances,
                         &mut model_for_resource,
                         &mut report,
@@ -513,16 +584,7 @@ pub fn build_package(
             let candidate = &player_spawns[0];
             let node = candidate.node;
             let room_index = candidate.room_index;
-            let NodeKind::Room { grid } = &room_nodes
-                .iter()
-                .find(|r| node_to_room_index.get(&r.id) == Some(&room_index))
-                .expect("room index resolved above")
-                .kind
-            else {
-                report.error("internal: player spawn's room kind shifted under us");
-                return (None, report);
-            };
-            let pos = node_room_local_position(node, grid);
+            let pos = candidate.position;
             Some(PlaytestSpawn {
                 room: room_index,
                 x: pos[0],
@@ -611,6 +673,7 @@ pub fn build_package(
                         &mut assets,
                         &mut models,
                         &mut model_clips,
+                        &mut model_sockets,
                         &mut model_for_resource,
                         &mut characters,
                         &mut report,
@@ -635,6 +698,7 @@ pub fn build_package(
             materials,
             models,
             model_clips,
+            model_sockets,
             model_instances,
             weapon_hitboxes,
             weapons,
@@ -663,6 +727,7 @@ fn cook_player_character(
     assets: &mut Vec<PlaytestAsset>,
     models: &mut Vec<PlaytestModel>,
     model_clips: &mut Vec<PlaytestModelClip>,
+    model_sockets: &mut Vec<PlaytestModelSocket>,
     model_for_resource: &mut std::collections::HashMap<ResourceId, u16>,
     characters: &mut Vec<PlaytestCharacter>,
     report: &mut PlaytestValidationReport,
@@ -706,6 +771,7 @@ fn cook_player_character(
         assets,
         models,
         model_clips,
+        model_sockets,
         model_for_resource,
         report,
     )?;
@@ -833,6 +899,7 @@ fn register_model_for_instance(
     assets: &mut Vec<PlaytestAsset>,
     models: &mut Vec<PlaytestModel>,
     model_clips: &mut Vec<PlaytestModelClip>,
+    model_sockets: &mut Vec<PlaytestModelSocket>,
     model_for_resource: &mut std::collections::HashMap<ResourceId, u16>,
     report: &mut PlaytestValidationReport,
 ) -> Option<u16> {
@@ -1027,6 +1094,45 @@ fn register_model_for_instance(
         None => 0,
     };
 
+    let socket_first = u16::try_from(model_sockets.len()).unwrap_or(u16::MAX);
+    let mut seen_sockets: Vec<&str> = Vec::new();
+    for socket in &model.attachments {
+        if socket.name.trim().is_empty() {
+            report.error(format!(
+                "Model '{}' has an attachment socket with no name",
+                resource.name
+            ));
+            return None;
+        }
+        if socket.joint >= model_joint_count {
+            report.error(format!(
+                "Model '{}' socket '{}' references joint {}, but the model has {} joints",
+                resource.name, socket.name, socket.joint, model_joint_count
+            ));
+            return None;
+        }
+        if seen_sockets
+            .iter()
+            .any(|name| *name == socket.name.as_str())
+        {
+            report.error(format!(
+                "Model '{}' has duplicate attachment socket '{}'",
+                resource.name, socket.name
+            ));
+            return None;
+        }
+        seen_sockets.push(socket.name.as_str());
+        model_sockets.push(PlaytestModelSocket {
+            model: model_index,
+            name: socket.name.clone(),
+            joint: socket.joint,
+            translation: socket.translation,
+            rotation_q12: socket.rotation_q12,
+        });
+    }
+    let socket_count =
+        u16::try_from(model_sockets.len() - socket_first as usize).unwrap_or(u16::MAX);
+
     models.push(PlaytestModel {
         name: resource.name.clone(),
         source_resource: model_resource_id,
@@ -1035,6 +1141,8 @@ fn register_model_for_instance(
         clip_first,
         clip_count,
         default_clip,
+        socket_first,
+        socket_count,
         world_height: model.world_height,
     });
     model_for_resource.insert(model_resource_id, model_index);
@@ -1053,6 +1161,7 @@ fn push_model_instance_for_resource(
     assets: &mut Vec<PlaytestAsset>,
     models: &mut Vec<PlaytestModel>,
     model_clips: &mut Vec<PlaytestModelClip>,
+    model_sockets: &mut Vec<PlaytestModelSocket>,
     model_instances: &mut Vec<PlaytestModelInstance>,
     model_for_resource: &mut HashMap<ResourceId, u16>,
     report: &mut PlaytestValidationReport,
@@ -1064,6 +1173,7 @@ fn push_model_instance_for_resource(
         assets,
         models,
         model_clips,
+        model_sockets,
         model_for_resource,
         report,
     ) else {
@@ -1104,6 +1214,7 @@ fn register_weapon_for_equipment(
     assets: &mut Vec<PlaytestAsset>,
     models: &mut Vec<PlaytestModel>,
     model_clips: &mut Vec<PlaytestModelClip>,
+    model_sockets: &mut Vec<PlaytestModelSocket>,
     model_for_resource: &mut HashMap<ResourceId, u16>,
     weapon_hitboxes: &mut Vec<PlaytestWeaponHitbox>,
     weapons: &mut Vec<PlaytestWeapon>,
@@ -1136,6 +1247,7 @@ fn register_weapon_for_equipment(
             assets,
             models,
             model_clips,
+            model_sockets,
             model_for_resource,
             report,
         )?),
@@ -1328,28 +1440,93 @@ fn push_point_light(
     true
 }
 
-/// Resolve a path the same way the texture loader does so the
-/// model writer / runtime stay in lockstep.
-fn enclosing_room<'a>(
-    scene: &'a crate::Scene,
-    node: &'a SceneNode,
-    node_to_room_index: &std::collections::HashMap<NodeId, u16>,
-) -> Option<(&'a SceneNode, u16)> {
+fn grid_rect(grid: &WorldGrid, origin: [u16; 2], size: [u16; 2]) -> Option<WorldGrid> {
+    if size[0] == 0 || size[1] == 0 {
+        return None;
+    }
+    let end_x = origin[0].checked_add(size[0])?;
+    let end_z = origin[1].checked_add(size[1])?;
+    if end_x > grid.width || end_z > grid.depth {
+        return None;
+    }
+
+    let mut out = WorldGrid::empty(size[0], size[1], grid.sector_size);
+    out.origin = [
+        grid.origin[0] + origin[0] as i32,
+        grid.origin[1] + origin[1] as i32,
+    ];
+    out.ambient_color = grid.ambient_color;
+    out.fog_enabled = grid.fog_enabled;
+    out.fog_color = grid.fog_color;
+    out.fog_near = grid.fog_near;
+    out.fog_far = grid.fog_far;
+
+    for x in 0..size[0] {
+        for z in 0..size[1] {
+            let src = grid.sector_index(origin[0] + x, origin[1] + z)?;
+            let dst = out.sector_index(x, z)?;
+            out.sectors[dst] = grid.sectors[src].clone();
+        }
+    }
+    Some(out)
+}
+
+fn chunk_room_name(room_name: &str, chunk_count: usize, chunk_index: usize) -> String {
+    if chunk_count <= 1 {
+        room_name.to_string()
+    } else {
+        format!("{room_name} / Chunk {chunk_index}")
+    }
+}
+
+fn enclosing_room<'a>(scene: &'a crate::Scene, node: &'a SceneNode) -> Option<&'a SceneNode> {
     let mut current = node.parent;
     while let Some(parent_id) = current {
         let parent = scene.node(parent_id)?;
-        if let Some(&room_index) = node_to_room_index.get(&parent.id) {
-            return Some((parent, room_index));
+        if matches!(parent.kind, NodeKind::Room { .. }) {
+            return Some(parent);
         }
         current = parent.parent;
     }
     None
 }
 
-/// Convert a node's editor-space transform to cooked room-local
-/// engine units.
-fn node_room_local_position(node: &SceneNode, grid: &crate::WorldGrid) -> [i32; 3] {
-    spatial::node_cooked_room_local_origin(grid, &node.transform)
+fn chunk_for_node<'a>(
+    node: &SceneNode,
+    grid: &WorldGrid,
+    chunks: &'a [AuthoredRoomChunk],
+) -> Option<&'a AuthoredRoomChunk> {
+    let world_cells =
+        grid.editor_to_world_cells([node.transform.translation[0], node.transform.translation[2]]);
+    let wcx = world_cells[0].floor() as i32;
+    let wcz = world_cells[1].floor() as i32;
+    let (sx, sz) = grid.world_cell_to_array(wcx, wcz)?;
+    chunks.iter().find(|chunk| {
+        let x0 = chunk.array_origin[0];
+        let z0 = chunk.array_origin[1];
+        let x1 = x0.saturating_add(chunk.size[0]);
+        let z1 = z0.saturating_add(chunk.size[1]);
+        sx >= x0 && sx < x1 && sz >= z0 && sz < z1
+    })
+}
+
+/// Convert a node's editor-space transform to its generated
+/// runtime chunk-local coordinates. The authored Room may be
+/// arbitrary-size; the cooked `.psxw` for one chunk is still
+/// array-rooted at that chunk's origin.
+fn node_chunk_local_position(
+    node: &SceneNode,
+    grid: &WorldGrid,
+    chunk: &AuthoredRoomChunk,
+) -> [i32; 3] {
+    let world_cells =
+        grid.editor_to_world_cells([node.transform.translation[0], node.transform.translation[2]]);
+    let s = grid.sector_size as f32;
+    [
+        ((world_cells[0] - chunk.world_origin[0] as f32) * s) as i32,
+        (node.transform.translation[1] * s) as i32,
+        ((world_cells[1] - chunk.world_origin[1] as f32) * s) as i32,
+    ]
 }
 
 /// Convert an editor euler-degrees-Y rotation to a PSX angle
@@ -1498,22 +1675,17 @@ mod tests {
             .collect()
     }
 
-    fn placed_model_host_ids(project: &ProjectDocument) -> Vec<NodeId> {
-        let scene = project.active_scene();
-        scene
+    fn remove_model_renderer_components(project: &mut ProjectDocument) {
+        let scene = project.active_scene_mut();
+        let ids: Vec<NodeId> = scene
             .nodes()
             .iter()
-            .filter(|node| match &node.kind {
-                NodeKind::MeshInstance { mesh: Some(_), .. } => true,
-                NodeKind::Entity => node.children.iter().any(|id| {
-                    scene.node(*id).is_some_and(|child| {
-                        matches!(child.kind, NodeKind::ModelRenderer { model: Some(_), .. })
-                    })
-                }),
-                _ => false,
-            })
-            .map(|n| n.id)
-            .collect()
+            .filter(|node| matches!(node.kind, NodeKind::ModelRenderer { model: Some(_), .. }))
+            .map(|node| node.id)
+            .collect();
+        for id in ids {
+            scene.remove_node(id);
+        }
     }
 
     fn set_first_model_instance_clip(project: &mut ProjectDocument, clip_index: u16) {
@@ -1558,6 +1730,9 @@ mod tests {
         );
         assert!(manifest.contains("pub static ASSETS: &[LevelAssetRecord] = &[];"));
         assert!(manifest.contains("pub static ROOMS: &[LevelRoomRecord] = &[];"));
+        assert!(manifest.contains("pub static MODEL_SOCKETS: &[LevelModelSocketRecord] = &[];"));
+        assert!(manifest.contains("pub static WEAPONS: &[LevelWeaponRecord] = &[];"));
+        assert!(manifest.contains("pub static EQUIPMENT: &[EquipmentRecord] = &[];"));
         assert!(manifest.contains("pub static ROOM_RESIDENCY: &[RoomResidencyRecord] = &[];"));
     }
 
@@ -1570,6 +1745,52 @@ mod tests {
         assert_eq!(package.rooms.len(), 1);
         assert_eq!(package.room_asset_count(), 1);
         assert!(package.spawn.is_some());
+    }
+
+    #[test]
+    fn oversized_authored_room_cooks_into_runtime_chunks() {
+        let mut project = project_with_one_room();
+        let floor_material = project
+            .resources
+            .iter()
+            .find(|resource| matches!(resource.data, ResourceData::Material(_)))
+            .expect("starter has a room material")
+            .id;
+        let room_id = {
+            let scene = project.active_scene();
+            scene
+                .nodes()
+                .iter()
+                .find(|n| matches!(n.kind, NodeKind::Room { .. }))
+                .expect("starter has a room")
+                .id
+        };
+        if let Some(room) = project.active_scene_mut().node_mut(room_id) {
+            let NodeKind::Room { grid } = &mut room.kind else {
+                panic!("starter room is a room");
+            };
+            *grid = crate::WorldGrid::empty(
+                1,
+                crate::MAX_ROOM_DEPTH + 8,
+                crate::DEFAULT_WORLD_SECTOR_SIZE,
+            );
+            for z in 0..grid.depth {
+                grid.set_floor(0, z, 0, Some(floor_material));
+            }
+        }
+        let spawn_id = player_spawn_node_id(&project);
+        if let Some(spawn) = project.active_scene_mut().node_mut(spawn_id) {
+            spawn.transform.translation = [0.0, 0.0, 0.0];
+        }
+
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.expect("package returned on ok report");
+        assert_eq!(package.rooms.len(), 2);
+        assert_eq!(package.room_asset_count(), 2);
+        assert!(package
+            .spawn
+            .is_some_and(|spawn| (spawn.room as usize) < package.rooms.len()));
     }
 
     #[test]
@@ -1624,11 +1845,7 @@ mod tests {
         // before cooking and assert residency still picks up the
         // Wraith mesh + atlas + clips via the player path.
         let mut project = project_with_one_room();
-        let placed_ids = placed_model_host_ids(&project);
-        let scene = project.active_scene_mut();
-        for id in placed_ids {
-            scene.remove_node(id);
-        }
+        remove_model_renderer_components(&mut project);
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
         let package = package.expect("package returned on ok report");
@@ -1865,14 +2082,13 @@ mod tests {
     }
 
     #[test]
-    fn starter_project_emits_three_textures() {
-        // Stone room uses floor + brick (room materials, deduped
-        // across many cells) plus the obsidian wraith atlas
-        // (model). Three distinct texture assets total.
+    fn starter_project_emits_expected_texture_assets() {
+        // Starter currently cooks three room textures plus the
+        // obsidian wraith atlas.
         let project = project_with_one_room();
         let (package, _) = build_package(&project, &starter_project_root());
         let package = package.expect("starter cooks");
-        assert_eq!(package.texture_asset_count(), 3);
+        assert_eq!(package.texture_asset_count(), 4);
     }
 
     #[test]
@@ -1881,7 +2097,7 @@ mod tests {
         let (package, _) = build_package(&project, &starter_project_root());
         let package = package.expect("starter cooks");
         assert_eq!(package.models.len(), 1);
-        assert_eq!(package.model_instances.len(), 2);
+        assert_eq!(package.model_instances.len(), 1);
         assert!(!package.model_clips.is_empty());
         assert_eq!(package.model_mesh_asset_count(), 1);
         assert_eq!(
@@ -2021,14 +2237,16 @@ mod tests {
             .expect("room blob written");
         assert_eq!(&blob[0..4], b"PSXW");
 
-        // Texture blobs landed too -- the starter has 2.
+        // Room texture blobs land in generated/textures. Model
+        // atlases are stored under generated/models/<model>/.
         assert!(dir
             .join(TEXTURES_DIRNAME)
             .join("texture_000.psxt")
             .is_file());
         assert!(dir
-            .join(TEXTURES_DIRNAME)
-            .join("texture_001.psxt")
+            .join(MODELS_DIRNAME)
+            .join("model_000_obsidian_wraith")
+            .join("atlas.psxt")
             .is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2098,7 +2316,12 @@ mod tests {
             .expect("starter has a room");
         if let Some(node) = scene.node_mut(room_id) {
             if let NodeKind::Room { grid } = &mut node.kind {
-                for sector in grid.sectors.iter_mut().flatten() {
+                for (index, sector) in grid.sectors.iter_mut().flatten().enumerate() {
+                    if index % 2 == 0 {
+                        if let Some(floor) = &mut sector.floor {
+                            floor.material = Some(new_material_id);
+                        }
+                    }
                     for dir in crate::GridDirection::CARDINAL {
                         for wall in sector.walls.get_mut(dir).iter_mut() {
                             wall.material = Some(new_material_id);
@@ -2116,11 +2339,22 @@ mod tests {
         // one more texture so the total is 2 -- what we're
         // testing here is that walls don't double-count their
         // shared floor texture, not the absolute count.
-        assert_eq!(package.materials.len(), 2);
-        assert_eq!(
-            package.materials[0].texture_asset_index,
-            package.materials[1].texture_asset_index,
+        let floor_texture_slots: Vec<_> = package
+            .materials
+            .iter()
+            .filter(|material| {
+                let asset = &package.assets[material.texture_asset_index];
+                asset.filename == "texture_000.psxt"
+            })
+            .collect();
+        assert!(
+            floor_texture_slots.len() >= 2,
+            "expected at least two cooked material slots to share floor.psxt"
         );
+        let first_floor_asset = floor_texture_slots[0].texture_asset_index;
+        assert!(floor_texture_slots
+            .iter()
+            .all(|material| material.texture_asset_index == first_floor_asset));
     }
 
     #[test]
@@ -2333,9 +2567,18 @@ mod tests {
 
     #[test]
     fn light_radius_converts_sectors_to_world_units() {
-        // Author a 4-sector radius; with sector_size=1024 the
-        // cooked record must store 4096 world units.
+        // Author a 4-sector radius; cook stores world units using
+        // the room's current sector size.
         let mut project = ProjectDocument::starter();
+        let sector_size = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Room { grid } => Some(grid.sector_size),
+                _ => None,
+            })
+            .expect("starter has a room");
         let ids = starter_light_ids(&project);
         let scene = project.active_scene_mut();
         for id in ids {
@@ -2351,7 +2594,7 @@ mod tests {
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
         let package = package.expect("cooks");
-        assert_eq!(package.lights[0].radius, 4096);
+        assert_eq!(package.lights[0].radius, (sector_size * 4) as u16);
     }
 
     #[test]
@@ -2429,6 +2672,7 @@ mod tests {
         let scene = project.active_scene_mut();
         let mut grid = crate::WorldGrid::empty(2, 2, 1024);
         grid.set_floor(0, 0, 0, Some(material));
+        grid.set_floor(1, 1, 0, Some(material));
         let room = scene.add_node(scene.root, "Room", NodeKind::Room { grid });
         let entity = scene.add_node(room, "Player", NodeKind::Entity);
         if let Some(node) = scene.node_mut(entity) {
@@ -2474,11 +2718,22 @@ mod tests {
         assert_eq!(package.weapons.len(), 1);
         assert_eq!(package.equipment.len(), 1);
         assert_eq!(package.weapon_hitboxes.len(), 1);
+        assert_eq!(package.model_sockets.len(), 1);
+        assert_eq!(package.models[0].socket_first, 0);
+        assert_eq!(package.models[0].socket_count, 1);
+        assert_eq!(package.model_sockets[0].name, "right_hand_grip");
+        assert_eq!(package.model_sockets[0].joint, 0);
         assert_eq!(package.weapons[0].model, Some(0));
         assert_eq!(package.weapons[0].grip_translation, [8, 16, 0]);
         assert_eq!(package.equipment[0].weapon, 0);
+        assert_eq!(
+            package.equipment[0].flags & psx_level::equipment_flags::PLAYER,
+            psx_level::equipment_flags::PLAYER
+        );
 
         let src = render_manifest_source(&package);
+        assert!(src.contains("pub static MODEL_SOCKETS"));
+        assert!(src.contains("LevelModelSocketRecord"));
         assert!(src.contains("pub static WEAPONS"));
         assert!(src.contains("pub static EQUIPMENT"));
         assert!(src.contains("WeaponHitShapeRecord::Capsule"));
@@ -2532,11 +2787,20 @@ mod tests {
         // model's 8bpp atlas, which lives at the same project.
         // Cook should refuse the room material 8bpp depth.
         let mut project = ProjectDocument::starter();
-        // Rewire `brick-wall.psxt` resource to the wraith atlas
-        // path so it parses but with the wrong CLUT entry count.
+        // Rewire the actually-used starter room texture to the
+        // wraith atlas path so it parses but with the wrong CLUT
+        // entry count.
+        let used_texture = project
+            .resources
+            .iter()
+            .find_map(|resource| match &resource.data {
+                ResourceData::Material(material) => material.texture,
+                _ => None,
+            })
+            .expect("starter has a used room texture");
         for resource in project.resources.iter_mut() {
             if let ResourceData::Texture { psxt_path } = &mut resource.data {
-                if psxt_path.ends_with("brick-wall.psxt") {
+                if resource.id == used_texture {
                     *psxt_path = "assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt"
                         .to_string();
                 }
@@ -2606,7 +2870,7 @@ mod tests {
         let (package, _) = build_package(&project, &starter_project_root());
         let package = package.expect("cooks");
         assert_eq!(package.models.len(), 1);
-        assert_eq!(package.model_instances.len(), 3);
+        assert_eq!(package.model_instances.len(), 2);
         // Both instances point at the same model index.
         assert_eq!(
             package.model_instances[0].model,
@@ -2648,9 +2912,11 @@ mod tests {
         (project, room_id, spawn_id)
     }
 
-    fn expected_room_local_xz(
+    fn expected_package_room_local_xz(
         project: &ProjectDocument,
         room_id: NodeId,
+        package: &PlaytestPackage,
+        package_room: u16,
         ex: f32,
         ez: f32,
     ) -> (i32, i32) {
@@ -2659,12 +2925,13 @@ mod tests {
         let crate::NodeKind::Room { grid } = &room.kind else {
             panic!("expected room");
         };
-        let transform = crate::Transform3 {
-            translation: [ex, 0.0, ez],
-            ..crate::Transform3::default()
-        };
-        let [x, _, z] = spatial::node_cooked_room_local_origin(grid, &transform);
-        (x, z)
+        let cooked_room = &package.rooms[package_room as usize];
+        let world_cells = grid.editor_to_world_cells([ex, ez]);
+        let s = cooked_room.sector_size as f32;
+        (
+            ((world_cells[0] - cooked_room.origin_x as f32) * s) as i32,
+            ((world_cells[1] - cooked_room.origin_z as f32) * s) as i32,
+        )
     }
 
     #[test]
@@ -2672,58 +2939,78 @@ mod tests {
         let (project, room_id, _) = project_with_spawn_at(0.0, 0.0);
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
-        let spawn = package.unwrap().spawn.unwrap();
+        let package = package.unwrap();
+        let spawn = package.spawn.unwrap();
         assert_eq!(
             (spawn.x, spawn.z),
-            expected_room_local_xz(&project, room_id, 0.0, 0.0)
+            expected_package_room_local_xz(&project, room_id, &package, spawn.room, 0.0, 0.0)
         );
     }
 
     #[test]
     fn spawn_after_negative_grow_lands_in_same_physical_cell() {
         let (mut project, room_id, _) = project_with_spawn_at(-1.0, 0.0);
+        let floor_material = project
+            .resources
+            .iter()
+            .find(|resource| matches!(resource.data, ResourceData::Material(_)))
+            .expect("starter has a room material")
+            .id;
 
         let (pre, _) = build_package(&project, &starter_project_root());
-        let pre_spawn = pre.unwrap().spawn.unwrap();
+        let pre = pre.unwrap();
+        let pre_spawn = pre.spawn.unwrap();
         assert_eq!(
             (pre_spawn.x, pre_spawn.z),
-            expected_room_local_xz(&project, room_id, -1.0, 0.0)
+            expected_package_room_local_xz(&project, room_id, &pre, pre_spawn.room, -1.0, 0.0)
         );
 
         let scene = project.active_scene_mut();
         if let Some(node) = scene.node_mut(room_id) {
             if let crate::NodeKind::Room { grid } = &mut node.kind {
-                grid.extend_to_include(-1, 0);
+                let (sx, sz) = grid.extend_to_include(-1, 0);
+                grid.set_floor(sx, sz, 0, Some(floor_material));
             }
         }
 
         let (post, report) = build_package(&project, &starter_project_root());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
-        let post_spawn = post.unwrap().spawn.unwrap();
+        let post = post.unwrap();
+        let post_spawn = post.spawn.unwrap();
         assert_eq!(
             (post_spawn.x, post_spawn.z),
-            expected_room_local_xz(&project, room_id, -1.0, 0.0)
+            expected_package_room_local_xz(&project, room_id, &post, post_spawn.room, -1.0, 0.0)
         );
     }
 
     #[test]
     fn entity_after_negative_grow_uses_same_array_relative_formula() {
         let (mut project, room_id, _) = project_with_spawn_at(0.0, 0.0);
+        let floor_material = project
+            .resources
+            .iter()
+            .find(|resource| matches!(resource.data, ResourceData::Material(_)))
+            .expect("starter has a room material")
+            .id;
         let scene = project.active_scene_mut();
         let entity_id = scene.add_node(
             room_id,
             "Marker",
-            crate::NodeKind::SpawnPoint {
-                player: false,
-                character: None,
+            crate::NodeKind::MeshInstance {
+                mesh: None,
+                material: None,
+                animation_clip: None,
             },
         );
         if let Some(node) = scene.node_mut(entity_id) {
-            node.transform.translation = [1.0, 0.0, -1.0];
+            node.transform.translation = [0.0, 0.0, 0.0];
         }
         if let Some(node) = scene.node_mut(room_id) {
             if let crate::NodeKind::Room { grid } = &mut node.kind {
                 grid.extend_to_include(0, -1);
+                if let Some((sx, sz)) = grid.editor_cells_to_array([0.0, 0.0]) {
+                    grid.set_floor(sx, sz, 0, Some(floor_material));
+                }
             }
         }
 
@@ -2734,7 +3021,7 @@ mod tests {
         let e = package.entities[0];
         assert_eq!(
             (e.x, e.z),
-            expected_room_local_xz(&project, room_id, 1.0, -1.0)
+            expected_package_room_local_xz(&project, room_id, &package, e.room, 0.0, 0.0)
         );
     }
 

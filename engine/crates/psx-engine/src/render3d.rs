@@ -248,6 +248,27 @@ impl JointViewTransform {
     };
 }
 
+/// Per-joint room/world transform for gameplay attachment points.
+///
+/// Unlike [`JointViewTransform`], this is not camera-relative. It is
+/// the model instance's oriented joint pose in room-local world units,
+/// suitable for composing sockets, weapon grips, and hit volumes.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct JointWorldTransform {
+    /// Instance × joint rotation, Q12.
+    pub rotation: Mat3I16,
+    /// Joint origin in room-local world units.
+    pub translation: WorldVertex,
+}
+
+impl JointWorldTransform {
+    /// All-zero transform suitable for fallbacks/static scratch.
+    pub const ZERO: Self = Self {
+        rotation: Mat3I16::ZERO,
+        translation: WorldVertex::ZERO,
+    };
+}
+
 /// Perspective projection settings for world-space render passes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WorldProjection {
@@ -2074,6 +2095,37 @@ pub fn compute_joint_view_transform(
     textured_model_part_gte_transform(camera, pose, instance_rotation, local_to_world, origin)
 }
 
+/// Compose the world-space transform for one animated model joint.
+///
+/// This shares the same `instance × pose_model_to_world` math used by
+/// [`WorldRenderPass::submit_textured_model`], but stops before camera
+/// view composition so gameplay systems can attach child objects to
+/// animated joints.
+pub fn compute_joint_world_transform(
+    pose: JointPose,
+    instance_rotation: Mat3I16,
+    local_to_world: LocalToWorldScale,
+    origin: WorldVertex,
+) -> JointWorldTransform {
+    let model = scaled_pose_matrix(pose, local_to_world);
+    let rotation = mat3_mul_q12(&instance_rotation, &model);
+    let scaled_pose_translation = Vec3I32::new(
+        local_to_world.apply(pose.translation.x),
+        local_to_world.apply(pose.translation.y),
+        local_to_world.apply(pose.translation.z),
+    );
+    let rotated_pose_translation =
+        rotate_translation_q12(&instance_rotation, scaled_pose_translation);
+    JointWorldTransform {
+        rotation,
+        translation: WorldVertex::new(
+            origin.x.saturating_add(rotated_pose_translation.x),
+            origin.y.saturating_add(rotated_pose_translation.y),
+            origin.z.saturating_add(rotated_pose_translation.z),
+        ),
+    }
+}
+
 /// Project one model vertex using the same GTE/CPU-blend split as
 /// [`WorldRenderPass::submit_textured_model`].
 ///
@@ -2866,6 +2918,24 @@ mod tests {
         let identity = LocalToWorldScale::from_q12(0);
         assert_eq!(identity.q12(), 0x1000);
         assert_eq!(identity.apply(-12345), -12345);
+    }
+
+    #[test]
+    fn joint_world_transform_stops_before_camera_view() {
+        let pose = JointPose {
+            matrix: Mat3I16::IDENTITY.m,
+            translation: Vec3I32::new(256, 128, -64),
+        };
+        let origin = WorldVertex::new(1000, 2000, 3000);
+        let joint = compute_joint_world_transform(
+            pose,
+            Mat3I16::IDENTITY,
+            LocalToWorldScale::IDENTITY,
+            origin,
+        );
+
+        assert_eq!(joint.rotation, Mat3I16::IDENTITY);
+        assert_eq!(joint.translation, WorldVertex::new(1256, 2128, 2936));
     }
 
     #[test]

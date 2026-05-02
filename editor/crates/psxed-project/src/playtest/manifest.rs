@@ -276,6 +276,25 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n\n");
 
+    out.push_str("/// Model attachment sockets, ordered by model.\n");
+    out.push_str("pub static MODEL_SOCKETS: &[LevelModelSocketRecord] = &[\n");
+    for socket in &package.model_sockets {
+        let _ = writeln!(
+            out,
+            "    LevelModelSocketRecord {{ model: ModelIndex({}), name: {:?}, joint: {}, translation: [{}, {}, {}], rotation_q12: [{}, {}, {}], flags: 0 }},",
+            socket.model,
+            socket.name,
+            socket.joint,
+            socket.translation[0],
+            socket.translation[1],
+            socket.translation[2],
+            socket.rotation_q12[0],
+            socket.rotation_q12[1],
+            socket.rotation_q12[2],
+        );
+    }
+    out.push_str("];\n\n");
+
     out.push_str("/// Cooked models — instances reference these by index.\n");
     out.push_str("pub static MODELS: &[LevelModelRecord] = &[\n");
     for model in &package.models {
@@ -285,12 +304,14 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         };
         let _ = writeln!(
             out,
-            "    LevelModelRecord {{ name: {:?}, mesh_asset: AssetId({}), texture_asset: {texture}, clip_first: ModelClipTableIndex({}), clip_count: {}, default_clip: ModelClipIndex({}), world_height: {}, flags: 0 }},",
+            "    LevelModelRecord {{ name: {:?}, mesh_asset: AssetId({}), texture_asset: {texture}, clip_first: ModelClipTableIndex({}), clip_count: {}, default_clip: ModelClipIndex({}), socket_first: ModelSocketIndex({}), socket_count: {}, world_height: {}, flags: 0 }},",
             model.name,
             model.mesh_asset_index,
             model.clip_first,
             model.clip_count,
             model.default_clip,
+            model.socket_first,
+            model.socket_count,
             model.world_height,
         );
     }
@@ -357,7 +378,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     for equipment in &package.equipment {
         let _ = writeln!(
             out,
-            "    EquipmentRecord {{ room: RoomIndex({}), weapon: WeaponIndex({}), x: {}, y: {}, z: {}, yaw: {}, character_socket: {:?}, weapon_grip: {:?}, flags: 0 }},",
+            "    EquipmentRecord {{ room: RoomIndex({}), weapon: WeaponIndex({}), x: {}, y: {}, z: {}, yaw: {}, character_socket: {:?}, weapon_grip: {:?}, flags: {} }},",
             equipment.room,
             equipment.weapon,
             equipment.x,
@@ -366,6 +387,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
             equipment.yaw,
             equipment.character_socket,
             equipment.weapon_grip,
+            equipment.flags,
         );
     }
     out.push_str("];\n\n");
@@ -618,6 +640,7 @@ use psx_level::{
     LevelModelClipRecord,
     LevelModelInstanceRecord,
     LevelModelRecord,
+    LevelModelSocketRecord,
     LevelRoomRecord,
     LevelWeaponRecord,
     MaterialIndex,
@@ -626,6 +649,7 @@ use psx_level::{
     ModelClipIndex,
     ModelClipTableIndex,
     ModelIndex,
+    ModelSocketIndex,
     PlayerControllerRecord,
     PlayerSpawnRecord,
     PointLightRecord,

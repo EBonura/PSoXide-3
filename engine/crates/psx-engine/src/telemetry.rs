@@ -25,6 +25,8 @@ pub mod stage {
     pub const MODEL_INSTANCES: u16 = 8;
     /// Player model rendering.
     pub const PLAYER: u16 = 9;
+    /// Player-attached equipment / weapon rendering and hit-volume evaluation.
+    pub const EQUIPMENT: u16 = 12;
     /// Deferred world-command sort and OT insertion.
     pub const WORLD_FLUSH: u16 = 10;
     /// Ordering-table DMA submission.
@@ -65,6 +67,20 @@ pub mod counter {
     pub const ROOM_CELLS_CULLED: u16 = 15;
     /// Room floor/ceiling/wall surfaces considered for projection.
     pub const ROOM_SURFACES_CONSIDERED: u16 = 16;
+    /// Player-attached equipment visuals drawn.
+    pub const EQUIPMENT_DRAWS: u16 = 17;
+    /// Active weapon hitboxes this frame.
+    pub const EQUIPMENT_ACTIVE_HITBOXES: u16 = 18;
+    /// Entity marker hits found by active weapon hitboxes.
+    pub const EQUIPMENT_TARGET_HITS: u16 = 19;
+    /// Vertices projected for equipment models.
+    pub const EQUIPMENT_PROJECTED_VERTICES: u16 = 20;
+    /// Triangles submitted for equipment models.
+    pub const EQUIPMENT_SUBMITTED_TRIS: u16 = 21;
+    /// Triangles culled for equipment models.
+    pub const EQUIPMENT_CULLED_TRIS: u16 = 22;
+    /// Triangles dropped for equipment models.
+    pub const EQUIPMENT_DROPPED_TRIS: u16 = 23;
 }
 
 const EVENT_KIND_FRAME_BEGIN: u8 = 1;

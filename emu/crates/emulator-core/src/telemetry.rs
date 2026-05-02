@@ -41,6 +41,8 @@ pub mod stage {
     pub const MODEL_INSTANCES: u16 = 8;
     /// Player model rendering.
     pub const PLAYER: u16 = 9;
+    /// Player-attached equipment / weapon rendering and hit-volume evaluation.
+    pub const EQUIPMENT: u16 = 12;
     /// Deferred world-command sort and OT insertion.
     pub const WORLD_FLUSH: u16 = 10;
     /// Ordering-table DMA submission.
@@ -48,7 +50,7 @@ pub mod stage {
 }
 
 /// Number of stage slots, including index zero for unknown/reserved ids.
-pub const STAGE_COUNT: usize = 12;
+pub const STAGE_COUNT: usize = 13;
 
 /// Runtime counter id constants shared with `psx-engine::telemetry`.
 pub mod counter {
@@ -84,10 +86,24 @@ pub mod counter {
     pub const ROOM_CELLS_CULLED: u16 = 15;
     /// Room floor/ceiling/wall surfaces considered for projection.
     pub const ROOM_SURFACES_CONSIDERED: u16 = 16;
+    /// Player-attached equipment visuals drawn.
+    pub const EQUIPMENT_DRAWS: u16 = 17;
+    /// Active weapon hitboxes this frame.
+    pub const EQUIPMENT_ACTIVE_HITBOXES: u16 = 18;
+    /// Entity marker hits found by active weapon hitboxes.
+    pub const EQUIPMENT_TARGET_HITS: u16 = 19;
+    /// Vertices projected for equipment models.
+    pub const EQUIPMENT_PROJECTED_VERTICES: u16 = 20;
+    /// Triangles submitted for equipment models.
+    pub const EQUIPMENT_SUBMITTED_TRIS: u16 = 21;
+    /// Triangles culled for equipment models.
+    pub const EQUIPMENT_CULLED_TRIS: u16 = 22;
+    /// Triangles dropped for equipment models.
+    pub const EQUIPMENT_DROPPED_TRIS: u16 = 23;
 }
 
 /// Number of counter slots, including index zero for unknown/reserved ids.
-pub const COUNTER_COUNT: usize = 17;
+pub const COUNTER_COUNT: usize = 24;
 
 /// Telemetry event kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,6 +303,7 @@ pub fn stage_name(id: u16) -> &'static str {
         stage::ENTITY_MARKERS => "entity markers",
         stage::MODEL_INSTANCES => "model instances",
         stage::PLAYER => "player",
+        stage::EQUIPMENT => "equipment",
         stage::WORLD_FLUSH => "world flush/sort",
         stage::OT_SUBMIT => "ot submit",
         _ => "unknown",
@@ -312,6 +329,13 @@ pub fn counter_name(id: u16) -> &'static str {
         counter::ROOM_CELLS_DRAWN => "room cells drawn",
         counter::ROOM_CELLS_CULLED => "room cells culled",
         counter::ROOM_SURFACES_CONSIDERED => "room surfaces",
+        counter::EQUIPMENT_DRAWS => "equipment draws",
+        counter::EQUIPMENT_ACTIVE_HITBOXES => "weapon hitboxes",
+        counter::EQUIPMENT_TARGET_HITS => "weapon hits",
+        counter::EQUIPMENT_PROJECTED_VERTICES => "equipment verts",
+        counter::EQUIPMENT_SUBMITTED_TRIS => "equipment tris",
+        counter::EQUIPMENT_CULLED_TRIS => "equipment culled",
+        counter::EQUIPMENT_DROPPED_TRIS => "equipment dropped",
         _ => "unknown",
     }
 }

@@ -21,8 +21,8 @@ mod materials;
 mod validation;
 
 use coords::{
-    runtime_horizontal_heights, runtime_horizontal_split, runtime_wall_direction,
-    runtime_wall_heights,
+    runtime_horizontal_heights, runtime_horizontal_split, runtime_horizontal_uvs,
+    runtime_wall_direction, runtime_wall_heights, runtime_wall_uvs,
 };
 use encode::encode_cooked_world_grid_psxw;
 use materials::material_slot;
@@ -214,7 +214,7 @@ pub enum WorldGridCookError {
         quantum: i32,
     },
     /// A face has a `dropped_corner` set -- the editor models it
-    /// as a triangle, but the v1 `.psxw` wire format only carries
+    /// as a triangle, but the current `.psxw` wire format only carries
     /// quad faces. Render / pick / collision in the editor live
     /// preview already honour the drop, but the cooked runtime
     /// payload doesn't have a slot for it yet.
@@ -332,7 +332,7 @@ impl std::fmt::Display for WorldGridCookError {
             ),
             Self::TriangleFaceNotSupported { x, z, face } => write!(
                 f,
-                "sector {x},{z} {face} is a triangle (dropped corner); v1 .psxw only carries quad faces"
+                "sector {x},{z} {face} is a triangle (dropped corner); .psxw only carries quad faces"
             ),
         }
     }
@@ -379,6 +379,8 @@ pub struct CookedGridHorizontalFace {
     pub split: GridSplit,
     /// Runtime material slot.
     pub material: u16,
+    /// Runtime UVs `[NW, NE, SE, SW]`.
+    pub uvs: [(u8, u8); 4],
     /// Whether collision treats this face as walkable.
     pub walkable: bool,
 }
@@ -390,6 +392,8 @@ pub struct CookedGridVerticalFace {
     pub heights: [i32; 4],
     /// Runtime material slot.
     pub material: u16,
+    /// Runtime UVs `[bottom-left, bottom-right, top-right, top-left]`.
+    pub uvs: [(u8, u8); 4],
     /// Whether collision treats this wall as blocking.
     pub solid: bool,
 }
@@ -453,7 +457,7 @@ pub struct CookedWorldGrid {
     /// Whether PS1 depth cue/fog should be enabled.
     pub fog_enabled: bool,
     /// Authored depth-cue far color. Kept in the cook model even
-    /// while the v1 `.psxw` payload only persists the enable flag.
+    /// while the current `.psxw` payload only persists the enable flag.
     pub fog_color: [u8; 3],
     /// Authored fog start distance in engine units.
     pub fog_near: i32,
@@ -637,6 +641,7 @@ fn cook_horizontal_face(
             materials,
             material_slots,
         )?,
+        uvs: runtime_horizontal_uvs(face.uv.apply_to_quad(world::FLOOR_UVS)),
         walkable: face.walkable,
     })
 }
@@ -689,6 +694,7 @@ fn cook_walls(
                 .push(CookedGridVerticalFace {
                     heights: runtime_wall_heights(wall.heights),
                     material,
+                    uvs: runtime_wall_uvs(wall.uv.apply_to_quad(world::WALL_UVS)),
                     solid: wall.solid,
                 });
         }
@@ -699,7 +705,7 @@ fn cook_walls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Corner, NodeKind, ResourceData, WallCorner};
+    use crate::{Corner, GridUvRotation, GridUvTransform, NodeKind, ResourceData, WallCorner};
 
     fn starter_grid(project: &ProjectDocument) -> WorldGrid {
         project
@@ -721,6 +727,30 @@ mod tests {
             .expect("starter floor has material")
     }
 
+    fn texture_named(project: &ProjectDocument, suffix: &str) -> ResourceId {
+        project
+            .resources
+            .iter()
+            .find_map(|resource| match &resource.data {
+                ResourceData::Texture { psxt_path } if psxt_path.ends_with(suffix) => {
+                    Some(resource.id)
+                }
+                _ => None,
+            })
+            .expect("starter texture exists")
+    }
+
+    fn material_for_texture(
+        project: &mut ProjectDocument,
+        name: &str,
+        texture: ResourceId,
+    ) -> ResourceId {
+        project.add_resource(
+            name,
+            ResourceData::Material(crate::MaterialResource::opaque(Some(texture))),
+        )
+    }
+
     fn first_populated_cooked_sector(cooked: &CookedWorldGrid) -> &CookedGridSector {
         cooked
             .sectors
@@ -728,6 +758,23 @@ mod tests {
             .flatten()
             .next()
             .expect("starter has populated sector")
+    }
+
+    fn authored_geometry_sector_count(grid: &WorldGrid) -> usize {
+        grid.sectors
+            .iter()
+            .flatten()
+            .filter(|sector| sector.has_geometry())
+            .count()
+    }
+
+    fn cooked_wall_count(sector: &CookedGridSector) -> usize {
+        sector.walls.north.len()
+            + sector.walls.east.len()
+            + sector.walls.south.len()
+            + sector.walls.west.len()
+            + sector.walls.north_west_south_east.len()
+            + sector.walls.north_east_south_west.len()
     }
 
     #[test]
@@ -739,28 +786,18 @@ mod tests {
 
         assert_eq!(cooked.width, grid.width);
         assert_eq!(cooked.depth, grid.depth);
-        assert_eq!(cooked.sector_size, world::SECTOR_SIZE);
+        assert_eq!(cooked.sector_size, grid.sector_size);
         assert_eq!(
             cooked.populated_sector_count(),
-            grid.populated_sector_count()
+            authored_geometry_sector_count(&grid)
         );
-        assert_eq!(cooked.materials.len(), 2);
-        assert_eq!(cooked.materials[0].slot, 0);
-        assert_eq!(cooked.materials[1].slot, 1);
+        assert_eq!(cooked.materials.len(), 3);
+        for (idx, material) in cooked.materials.iter().enumerate() {
+            assert_eq!(material.slot, idx as u16);
+        }
         let first_sector = first_populated_cooked_sector(&cooked);
         assert!(first_sector.floor.is_some());
         assert_eq!(first_sector.floor.unwrap().material, 0);
-        let walls = &first_sector.walls;
-        let first_wall_material = [
-            walls.north.as_slice(),
-            walls.east.as_slice(),
-            walls.south.as_slice(),
-            walls.west.as_slice(),
-        ]
-        .into_iter()
-        .find_map(|walls| walls.first())
-        .map(|wall| wall.material);
-        assert_eq!(first_wall_material, Some(1));
     }
 
     #[test]
@@ -781,6 +818,38 @@ mod tests {
 
         assert_eq!(cooked_floor.heights, [128, 96, 64, 32]);
         assert_eq!(cooked_floor.split, GridSplit::NorthEastSouthWest);
+    }
+
+    #[test]
+    fn cook_bakes_horizontal_uv_transform_to_runtime_uvs() {
+        let project = ProjectDocument::starter();
+        let material = first_floor_material(&starter_grid(&project));
+        let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
+        grid.set_floor(0, 0, 0, Some(material));
+        let floor_uv = GridUvTransform {
+            offset: [3, -2],
+            rotation: GridUvRotation::Deg90,
+            flip_u: false,
+            flip_v: true,
+        };
+        grid.sector_mut(0, 0)
+            .and_then(|sector| sector.floor.as_mut())
+            .expect("floor exists")
+            .uv = floor_uv;
+
+        let cooked = cook_world_grid(&project, &grid).unwrap();
+        let cooked_floor = cooked.sectors[0].as_ref().unwrap().floor.unwrap();
+        let bytes = encode_world_grid_psxw(&project, &grid).unwrap();
+        let world = psx_asset::World::from_bytes(&bytes).expect("psxw parses");
+
+        assert_eq!(
+            cooked_floor.uvs,
+            runtime_horizontal_uvs(floor_uv.apply_to_quad(world::FLOOR_UVS))
+        );
+        assert_eq!(
+            world.sector(0, 0).unwrap().floor_uvs().corners(),
+            cooked_floor.uvs
+        );
     }
 
     #[test]
@@ -807,6 +876,51 @@ mod tests {
 
         assert!(cooked_walls.north.is_empty());
         assert_eq!(cooked_walls.south[0].heights, [64, 32, 128, 96]);
+    }
+
+    #[test]
+    fn cook_bakes_wall_uv_transform_to_runtime_uvs() {
+        let project = ProjectDocument::starter();
+        let material = first_floor_material(&starter_grid(&project));
+        let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
+        grid.add_wall(
+            0,
+            0,
+            GridDirection::North,
+            0,
+            world::SECTOR_SIZE,
+            Some(material),
+        );
+        let wall_uv = GridUvTransform {
+            offset: [-5, 7],
+            rotation: GridUvRotation::Deg180,
+            flip_u: true,
+            flip_v: false,
+        };
+        grid.sector_mut(0, 0)
+            .and_then(|sector| sector.walls.get_mut(GridDirection::North).first_mut())
+            .expect("north wall exists")
+            .uv = wall_uv;
+
+        let cooked = cook_world_grid(&project, &grid).unwrap();
+        let cooked_wall = cooked.sectors[0]
+            .as_ref()
+            .unwrap()
+            .walls
+            .south
+            .first()
+            .copied()
+            .expect("north editor wall cooks to runtime south");
+        let bytes = encode_world_grid_psxw(&project, &grid).unwrap();
+        let world = psx_asset::World::from_bytes(&bytes).expect("psxw parses");
+        let sector = world.sector(0, 0).unwrap();
+        let parsed_wall = world.sector_wall(sector, 0).unwrap();
+
+        assert_eq!(
+            cooked_wall.uvs,
+            runtime_wall_uvs(wall_uv.apply_to_quad(world::WALL_UVS))
+        );
+        assert_eq!(parsed_wall.uvs().corners(), cooked_wall.uvs);
     }
 
     #[test]
@@ -904,8 +1018,12 @@ mod tests {
         // decodes the same dimensions / sector / wall counts the
         // cooker reported. Regresses the v1 byte layout against
         // both producer and consumer in one assertion.
-        let project = ProjectDocument::starter();
-        let grid = starter_grid(&project);
+        let mut project = ProjectDocument::starter();
+        let floor_texture = texture_named(&project, "floor.psxt");
+        let brick_texture = texture_named(&project, "brick-wall.psxt");
+        let floor = material_for_texture(&mut project, "Floor Slot", floor_texture);
+        let wall = material_for_texture(&mut project, "Brick Slot", brick_texture);
+        let grid = WorldGrid::stone_room(2, 2, 1024, Some(floor), Some(wall));
         let cooked = cook_world_grid(&project, &grid).unwrap();
         let bytes = encode_world_grid_psxw(&project, &grid).unwrap();
 
@@ -945,8 +1063,12 @@ mod tests {
         // while iterating sectors `[x * depth + z]`. If a future
         // reshape flips that order, both this test and the
         // example's build.rs assertion fail loud.
-        let project = ProjectDocument::starter();
-        let grid = starter_grid(&project);
+        let mut project = ProjectDocument::starter();
+        let floor_texture = texture_named(&project, "floor.psxt");
+        let brick_texture = texture_named(&project, "brick-wall.psxt");
+        let floor = material_for_texture(&mut project, "Floor Slot", floor_texture);
+        let wall = material_for_texture(&mut project, "Brick Slot", brick_texture);
+        let grid = WorldGrid::stone_room(2, 2, 1024, Some(floor), Some(wall));
         let cooked = cook_world_grid(&project, &grid).unwrap();
 
         assert_eq!(cooked.materials.len(), 2);
@@ -1095,7 +1217,7 @@ mod tests {
     #[test]
     fn rejects_triangle_floor() {
         // Drop a corner on the starter floor and confirm the
-        // cooker refuses it: v1 .psxw doesn't carry triangles.
+        // cooker refuses it: .psxw doesn't carry triangles.
         let project = ProjectDocument::starter();
         let mut grid = WorldGrid::stone_room(1, 1, world::SECTOR_SIZE, None, None);
         if let Some(sector) = grid.sector_mut(0, 0) {
@@ -1195,7 +1317,7 @@ mod tests {
                 bytes[header + 6],
                 bytes[header + 7],
             ]),
-            world::SECTOR_SIZE
+            grid.sector_size
         );
         assert_eq!(
             u16::from_le_bytes([bytes[header + 8], bytes[header + 9]]),
@@ -1231,7 +1353,7 @@ mod tests {
         );
         assert_eq!(
             u16::from_le_bytes([bytes[sector + 10], bytes[sector + 11]]),
-            2
+            cooked_wall_count(first_populated_cooked_sector(&cooked)) as u16
         );
     }
 }
