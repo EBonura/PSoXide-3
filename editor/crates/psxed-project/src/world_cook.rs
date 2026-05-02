@@ -828,6 +828,7 @@ mod tests {
         grid.set_floor(0, 0, 0, Some(material));
         let floor_uv = GridUvTransform {
             offset: [3, -2],
+            span: [0, 0],
             rotation: GridUvRotation::Deg90,
             flip_u: false,
             flip_v: true,
@@ -893,6 +894,7 @@ mod tests {
         );
         let wall_uv = GridUvTransform {
             offset: [-5, 7],
+            span: [0, 0],
             rotation: GridUvRotation::Deg180,
             flip_u: true,
             flip_v: false,

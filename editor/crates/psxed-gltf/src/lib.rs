@@ -454,6 +454,13 @@ pub struct RigidModelConfig {
     /// hip/root location keys into otherwise in-place clips; this
     /// option removes that root-motion bias at import time.
     pub normalize_root_translation: bool,
+    /// Remove animated scale from cooked joint pose matrices.
+    ///
+    /// The runtime format treats sampled pose matrices as rigid
+    /// transforms. Baking glTF scale keys into those matrices makes
+    /// the whole model visibly grow or shrink when switching clips, so
+    /// imported animations strip basis scale by default.
+    pub strip_animation_scale: bool,
 }
 
 impl Default for RigidModelConfig {
@@ -465,6 +472,7 @@ impl Default for RigidModelConfig {
             animation_fps: 15,
             world_height: DEFAULT_MODEL_WORLD_HEIGHT,
             normalize_root_translation: false,
+            strip_animation_scale: true,
         }
     }
 }
@@ -591,6 +599,7 @@ fn convert_rigid_model_document(
         &inverse_bind_matrices,
         cfg.animation_fps,
         cfg.normalize_root_translation,
+        cfg.strip_animation_scale,
     )?;
     let bounds = ModelBounds::from_min_max(
         precision_bounds.min,
@@ -623,6 +632,7 @@ fn convert_rigid_model_document(
         &bounds,
         cfg.animation_fps,
         cfg.normalize_root_translation,
+        cfg.strip_animation_scale,
     )?;
 
     let animation_bytes = clips.iter().map(|c| c.bytes.len()).sum();
@@ -803,6 +813,7 @@ fn collect_precision_bounds(
     inverse_bind_matrices: &[[[f32; 4]; 4]],
     fps: u16,
     normalize_root_translation: bool,
+    strip_animation_scale: bool,
 ) -> Result<PrecisionBounds, Error> {
     let mut bounds = BoundsAccumulator::new();
     include_pose_bounds(
@@ -812,6 +823,7 @@ fn collect_precision_bounds(
         parents,
         joints,
         inverse_bind_matrices,
+        strip_animation_scale,
     );
 
     for animation in document.animations() {
@@ -843,6 +855,7 @@ fn collect_precision_bounds(
                 parents,
                 joints,
                 inverse_bind_matrices,
+                strip_animation_scale,
             );
         }
     }
@@ -873,6 +886,7 @@ fn include_pose_bounds(
     parents: &[Option<usize>],
     joints: &[usize],
     inverse_bind_matrices: &[[[f32; 4]; 4]],
+    strip_animation_scale: bool,
 ) {
     let locals: Vec<[[f32; 4]; 4]> = trs.iter().map(|trs| trs.matrix()).collect();
     let globals = compute_global_matrices(parents, &locals);
@@ -881,7 +895,12 @@ fn include_pose_bounds(
         .copied()
         .enumerate()
         .map(|(joint_index, node_index)| {
-            mul_matrix(&globals[node_index], &inverse_bind_matrices[joint_index])
+            let skin = mul_matrix(&globals[node_index], &inverse_bind_matrices[joint_index]);
+            if strip_animation_scale {
+                strip_pose_scale(skin)
+            } else {
+                skin
+            }
         })
         .collect();
 
@@ -1566,6 +1585,7 @@ fn cook_all_animations(
     bounds: &ModelBounds,
     fps: u16,
     normalize_root_translation: bool,
+    strip_animation_scale: bool,
 ) -> Result<Vec<CookedClip>, Error> {
     let mut clips = Vec::new();
     for (index, animation) in document.animations().enumerate() {
@@ -1588,6 +1608,7 @@ fn cook_all_animations(
             max_time,
             fps,
             normalize_root_translation,
+            strip_animation_scale,
         )?
         else {
             continue;
@@ -1617,6 +1638,7 @@ fn cook_animation_bytes(
     max_time: f32,
     fps: u16,
     normalize_root_translation: bool,
+    strip_animation_scale: bool,
 ) -> Result<Option<Vec<u8>>, Error> {
     let duration = max_time - min_time;
     let frame_count = (duration * fps as f32).round() as usize + 1;
@@ -1649,7 +1671,10 @@ fn cook_animation_bytes(
         let locals: Vec<[[f32; 4]; 4]> = frame_trs.iter().map(|trs| trs.matrix()).collect();
         let globals = compute_global_matrices(parents, &locals);
         for (joint_index, node_index) in joints.iter().copied().enumerate() {
-            let skin = mul_matrix(&globals[node_index], &inverse_bind_matrices[joint_index]);
+            let mut skin = mul_matrix(&globals[node_index], &inverse_bind_matrices[joint_index]);
+            if strip_animation_scale {
+                skin = strip_pose_scale(skin);
+            }
             append_pose_record(&mut out, &skin, bounds);
         }
     }
@@ -1839,6 +1864,19 @@ fn compose_trs(translation: [f32; 3], rotation: [f32; 4], scale: [f32; 3]) -> [[
         [r02 * scale[2], r12 * scale[2], r22 * scale[2], 0.0],
         [translation[0], translation[1], translation[2], 1.0],
     ]
+}
+
+fn strip_pose_scale(mut matrix: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    for column in matrix.iter_mut().take(3) {
+        let len_sq = column[0] * column[0] + column[1] * column[1] + column[2] * column[2];
+        if len_sq > 0.000001 {
+            let inv_len = len_sq.sqrt().recip();
+            column[0] *= inv_len;
+            column[1] *= inv_len;
+            column[2] *= inv_len;
+        }
+    }
+    matrix
 }
 
 fn append_pose_record(out: &mut Vec<u8>, skin_matrix: &[[f32; 4]; 4], bounds: &ModelBounds) {
@@ -2117,6 +2155,64 @@ mod tests {
     }
 
     #[test]
+    fn cooked_animation_pose_scale_is_stripped_when_enabled() {
+        let channels = vec![AnimationChannel {
+            node_index: 0,
+            interpolation: Interpolation::Linear,
+            times: vec![0.0, 1.0],
+            values: ChannelValues::Scale(vec![[2.0, 2.0, 2.0], [2.0, 2.0, 2.0]]),
+        }];
+        let parents = [None];
+        let base_trs = [Trs {
+            translation: [0.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0, 1.0, 1.0],
+        }];
+        let joints = [0usize];
+        let inverse_bind_matrices = [identity_matrix()];
+        let bounds =
+            ModelBounds::from_min_max([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0], 30_000.0).unwrap();
+
+        let stripped = cook_animation_bytes(
+            &channels,
+            &parents,
+            &base_trs,
+            &joints,
+            &joints,
+            &inverse_bind_matrices,
+            &bounds,
+            0.0,
+            1.0,
+            1,
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let kept = cook_animation_bytes(
+            &channels,
+            &parents,
+            &base_trs,
+            &joints,
+            &joints,
+            &inverse_bind_matrices,
+            &bounds,
+            0.0,
+            1.0,
+            1,
+            false,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(first_pose_matrix_component(&stripped, 0), 4096);
+        assert_eq!(first_pose_matrix_component(&stripped, 4), 4096);
+        assert_eq!(first_pose_matrix_component(&stripped, 8), 4096);
+        assert_eq!(first_pose_matrix_component(&kept, 0), 8192);
+    }
+
+    #[test]
     fn root_joint_nodes_skips_children_of_other_skin_joints() {
         let parents = vec![None, Some(0), Some(1), Some(0)];
         assert_eq!(root_joint_nodes(&[1, 2, 3], &parents), vec![1, 3]);
@@ -2182,6 +2278,13 @@ mod tests {
             bytes.push(pad);
         }
         bytes
+    }
+
+    fn first_pose_matrix_component(bytes: &[u8], component: usize) -> i16 {
+        let offset = psxed_format::AssetHeader::SIZE
+            + psxed_format::animation::AnimationHeader::SIZE
+            + component * 2;
+        i16::from_le_bytes([bytes[offset], bytes[offset + 1]])
     }
 
     fn test_source_vertex(position: [f32; 3]) -> SourceVertex {

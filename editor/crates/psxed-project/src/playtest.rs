@@ -341,37 +341,42 @@ pub fn build_package(
 
         match &node.kind {
             NodeKind::Entity => {
-                if let Some((model_resource_id, _material)) = component_model_renderer(scene, node)
-                    .and_then(|(model, material)| {
-                        model
-                            .and_then(|id| {
-                                project
-                                    .resource(id)
-                                    .filter(|r| matches!(r.data, ResourceData::Model(_)))
-                                    .map(|_| id)
-                            })
-                            .map(|id| (id, material))
-                    })
-                {
-                    let clip = component_animator(scene, node).and_then(|anim| anim.clip);
-                    if !push_model_instance_for_resource(
-                        project,
-                        project_root,
-                        node.name.as_str(),
-                        model_resource_id,
-                        clip,
-                        room_index,
-                        pos,
-                        yaw,
-                        &mut assets,
-                        &mut models,
-                        &mut model_clips,
-                        &mut model_sockets,
-                        &mut model_instances,
-                        &mut model_for_resource,
-                        &mut report,
-                    ) {
-                        return (None, report);
+                let character_controller = component_character_controller(scene, node);
+                let is_player_controlled =
+                    character_controller.is_some_and(|controller| controller.player);
+                if !is_player_controlled {
+                    if let Some((model_resource_id, _material)) =
+                        component_model_renderer(scene, node).and_then(|(model, material)| {
+                            model
+                                .and_then(|id| {
+                                    project
+                                        .resource(id)
+                                        .filter(|r| matches!(r.data, ResourceData::Model(_)))
+                                        .map(|_| id)
+                                })
+                                .map(|id| (id, material))
+                        })
+                    {
+                        let clip = component_animator(scene, node).and_then(|anim| anim.clip);
+                        if !push_model_instance_for_resource(
+                            project,
+                            project_root,
+                            node.name.as_str(),
+                            model_resource_id,
+                            clip,
+                            room_index,
+                            pos,
+                            yaw,
+                            &mut assets,
+                            &mut models,
+                            &mut model_clips,
+                            &mut model_sockets,
+                            &mut model_instances,
+                            &mut model_for_resource,
+                            &mut report,
+                        ) {
+                            return (None, report);
+                        }
                     }
                 }
 
@@ -391,7 +396,6 @@ pub fn build_package(
                     }
                 }
 
-                let character_controller = component_character_controller(scene, node);
                 if let Some(controller) = character_controller {
                     if controller.player {
                         player_spawns.push(PlayerSpawnCandidate {
@@ -434,9 +438,7 @@ pub fn build_package(
                             yaw,
                             character_socket: equipped.character_socket.to_string(),
                             weapon_grip: equipped.weapon_grip.to_string(),
-                            flags: if character_controller
-                                .is_some_and(|controller| controller.player)
-                            {
+                            flags: if is_player_controlled {
                                 psx_level::equipment_flags::PLAYER
                             } else {
                                 0
@@ -1689,35 +1691,45 @@ mod tests {
     }
 
     fn set_first_model_instance_clip(project: &mut ProjectDocument, clip_index: u16) {
+        let model_id = project
+            .resources
+            .iter()
+            .find_map(|r| match &r.data {
+                ResourceData::Model(_) => Some(r.id),
+                _ => None,
+            })
+            .expect("starter has Model");
         let scene = project.active_scene_mut();
         let ids: Vec<NodeId> = scene
             .nodes()
             .iter()
-            .filter(|node| {
-                matches!(
-                    node.kind,
-                    NodeKind::MeshInstance { .. } | NodeKind::Animator { .. }
-                )
-            })
+            .filter(|node| matches!(node.kind, NodeKind::MeshInstance { .. }))
             .map(|node| node.id)
             .collect();
         for id in ids {
             let Some(node) = scene.node_mut(id) else {
                 continue;
             };
-            match &mut node.kind {
-                NodeKind::MeshInstance { animation_clip, .. } => {
-                    *animation_clip = Some(clip_index);
-                    return;
-                }
-                NodeKind::Animator { clip, .. } => {
-                    *clip = Some(clip_index);
-                    return;
-                }
-                _ => {}
+            if let NodeKind::MeshInstance { animation_clip, .. } = &mut node.kind {
+                *animation_clip = Some(clip_index);
+                return;
             }
         }
-        panic!("starter has a model animation override node");
+        let room_id = scene
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::Room { .. }))
+            .map(|n| n.id)
+            .expect("starter has Room");
+        scene.add_node(
+            room_id,
+            "Invalid Clip Model",
+            NodeKind::MeshInstance {
+                mesh: Some(model_id),
+                material: None,
+                animation_clip: Some(clip_index),
+            },
+        );
     }
 
     #[test]
@@ -1819,22 +1831,25 @@ mod tests {
     }
 
     #[test]
-    fn player_character_model_is_deduplicated_with_placed_meshinstance() {
-        // Starter includes both a Wraith MeshInstance (id 6 in
-        // the scene) and a Wraith-Hero Character resource -- they
-        // share the same Model resource. The cooker must register
-        // the model once (in `models`), not twice.
+    fn player_character_model_is_deduplicated_with_renderer_component() {
+        // Starter includes both a Wraith ModelRenderer component
+        // and a Wraith-Hero Character resource on the player
+        // entity. The cooker must register the model once, but
+        // must not also emit a static model instance for the
+        // player-controlled renderer.
         let project = project_with_one_room();
         let (package, _report) = build_package(&project, &starter_project_root());
         let package = package.expect("starter cooks");
         assert_eq!(
             package.models.len(),
             1,
-            "shared model should be registered once across MeshInstance + Character"
+            "shared model should be registered once across ModelRenderer + Character"
         );
-        // Player character + placed instance both reference model index 0.
+        // The player character references the model; the authored
+        // renderer component is consumed by the player path, not
+        // emitted as a second static draw.
         assert_eq!(package.characters[0].model, 0);
-        assert!(package.model_instances.iter().any(|inst| inst.model == 0));
+        assert!(package.model_instances.is_empty());
     }
 
     #[test]
@@ -2097,7 +2112,7 @@ mod tests {
         let (package, _) = build_package(&project, &starter_project_root());
         let package = package.expect("starter cooks");
         assert_eq!(package.models.len(), 1);
-        assert_eq!(package.model_instances.len(), 1);
+        assert_eq!(package.model_instances.len(), 0);
         assert!(!package.model_clips.is_empty());
         assert_eq!(package.model_mesh_asset_count(), 1);
         assert_eq!(
@@ -2837,10 +2852,10 @@ mod tests {
 
     #[test]
     fn two_instances_of_one_model_dedup_to_one_record() {
-        // Add a second MeshInstance that references the same
-        // model resource as the starter's Wraith. The cook
-        // emits two `model_instances` but only one
-        // `models[]` entry.
+        // Add two explicit MeshInstances that reference the same
+        // model resource as the starter's player Wraith. The cook
+        // emits two `model_instances` but only one `models[]`
+        // entry.
         let mut project = ProjectDocument::starter();
         // Resolve the starter's Wraith resource id.
         let model_id = project
@@ -2858,15 +2873,17 @@ mod tests {
             .find(|n| matches!(n.kind, NodeKind::Room { .. }))
             .map(|n| n.id)
             .unwrap();
-        scene.add_node(
-            room_id,
-            "Wraith2",
-            NodeKind::MeshInstance {
-                mesh: Some(model_id),
-                material: None,
-                animation_clip: None,
-            },
-        );
+        for name in ["Wraith2", "Wraith3"] {
+            scene.add_node(
+                room_id,
+                name,
+                NodeKind::MeshInstance {
+                    mesh: Some(model_id),
+                    material: None,
+                    animation_clip: None,
+                },
+            );
+        }
         let (package, _) = build_package(&project, &starter_project_root());
         let package = package.expect("cooks");
         assert_eq!(package.models.len(), 1);

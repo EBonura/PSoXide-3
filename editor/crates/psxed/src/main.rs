@@ -383,6 +383,7 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
         animation_fps,
         world_height,
         normalize_root_translation,
+        strip_animation_scale: true,
     };
     let package =
         psxed_gltf::convert_rigid_model_path(&input, &cfg).map_err(|e| format!("convert: {e}"))?;

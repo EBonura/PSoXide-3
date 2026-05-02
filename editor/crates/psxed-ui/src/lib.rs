@@ -27,6 +27,7 @@ use psxed_project::playtest::playtest_streaming_chunk_config;
 use psxed_project::streaming::{
     collect_scene_resource_use, plan_generated_chunks, SceneResourceUse,
 };
+use psxed_project::world_cook::{self, WorldGridCookError, WorldGridFaceKind};
 use psxed_project::{
     snap_height, ColliderShape, GridCellBounds, GridDirection, GridHorizontalFace, GridSplit,
     GridUvRotation, GridUvTransform, GridVerticalFace, MaterialFaceSidedness, MaterialResource,
@@ -122,6 +123,12 @@ pub struct EditorWorkspace {
     /// remains the active/inspected item; this list is the editable
     /// set used by overlay, delete, and drag.
     selected_primitives: Vec<Selection>,
+    /// Red authoring-error overlays populated when cook/playtest
+    /// validation can map a failure back to concrete grid faces.
+    validation_issue_primitives: Vec<Selection>,
+    /// Room-level validation failures that don't have a finer face
+    /// target, such as budget or dimension errors.
+    validation_issue_rooms: HashSet<NodeId>,
     /// Active drag-translate stroke. Set on drag-start over a
     /// primitive in Select mode, mutated by every drag frame, and
     /// cleared on release. Records pre-drag heights of every
@@ -638,6 +645,85 @@ impl Selection {
             _ => None,
         }
     }
+}
+
+fn grid_rect_for_validation_issue(
+    grid: &WorldGrid,
+    origin: [u16; 2],
+    size: [u16; 2],
+) -> Option<WorldGrid> {
+    let mut out = WorldGrid::empty(size[0], size[1], grid.sector_size);
+    out.origin = [
+        grid.origin[0] + origin[0] as i32,
+        grid.origin[1] + origin[1] as i32,
+    ];
+    out.ambient_color = grid.ambient_color;
+    out.fog_enabled = grid.fog_enabled;
+    out.fog_color = grid.fog_color;
+    out.fog_near = grid.fog_near;
+    out.fog_far = grid.fog_far;
+
+    for x in 0..size[0] {
+        for z in 0..size[1] {
+            let src = grid.sector_index(origin[0] + x, origin[1] + z)?;
+            let dst = out.sector_index(x, z)?;
+            out.sectors[dst] = grid.sectors[src].clone();
+        }
+    }
+    Some(out)
+}
+
+fn world_cook_error_primitives(
+    room: NodeId,
+    error: &WorldGridCookError,
+    array_origin: [u16; 2],
+) -> Vec<Selection> {
+    let face = |x: u16, z: u16, kind: WorldGridFaceKind| {
+        world_cook_face_selection(room, x + array_origin[0], z + array_origin[1], kind)
+    };
+
+    match *error {
+        WorldGridCookError::UnassignedMaterial { x, z, face: kind } => vec![face(x, z, kind)],
+        WorldGridCookError::InvalidWallHeights {
+            x, z, direction, ..
+        }
+        | WorldGridCookError::UnsupportedDiagonalWall { x, z, direction }
+        | WorldGridCookError::WallStackExceeded {
+            x, z, direction, ..
+        } => vec![face(x, z, WorldGridFaceKind::Wall(direction))],
+        WorldGridCookError::DuplicatePhysicalWall {
+            x,
+            z,
+            direction,
+            other_x,
+            other_z,
+            other_direction,
+        } => vec![
+            face(x, z, WorldGridFaceKind::Wall(direction)),
+            face(other_x, other_z, WorldGridFaceKind::Wall(other_direction)),
+        ],
+        WorldGridCookError::HeightNotQuantized {
+            x, z, face: kind, ..
+        }
+        | WorldGridCookError::TriangleFaceNotSupported { x, z, face: kind } => {
+            vec![face(x, z, kind)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn world_cook_face_selection(
+    room: NodeId,
+    sx: u16,
+    sz: u16,
+    kind: WorldGridFaceKind,
+) -> Selection {
+    let kind = match kind {
+        WorldGridFaceKind::Floor => FaceKind::Floor,
+        WorldGridFaceKind::Ceiling => FaceKind::Ceiling,
+        WorldGridFaceKind::Wall(dir) => FaceKind::Wall { dir, stack: 0 },
+    };
+    Selection::Face(FaceRef { room, sx, sz, kind })
 }
 
 /// Kind label for an [`EntityBounds`]. Drives picking
@@ -1281,6 +1367,8 @@ impl EditorWorkspace {
             hovered_primitive: None,
             selected_primitive: None,
             selected_primitives: Vec::new(),
+            validation_issue_primitives: Vec::new(),
+            validation_issue_rooms: HashSet::new(),
             primitive_drag: None,
             hovered_entity_node: None,
             node_drag: None,
@@ -1614,6 +1702,7 @@ impl EditorWorkspace {
     /// `WorldGridCookError`).
     pub fn cook_world_to_disk(&mut self) -> Result<String, String> {
         self.project.normalize_loaded();
+        self.clear_validation_issues();
         let cooked_dir = self.project_dir.join("cooked");
         std::fs::create_dir_all(&cooked_dir)
             .map_err(|error| format!("mkdir {}: {error}", cooked_dir.display()))?;
@@ -1640,7 +1729,10 @@ impl EditorWorkspace {
                 continue;
             };
             let bytes = psxed_project::world_cook::encode_world_grid_psxw(&self.project, grid)
-                .map_err(|error| format!("cook \"{room_name}\": {error}"))?;
+                .map_err(|error| {
+                    self.record_world_cook_error(*room_id, &error, [0, 0]);
+                    format!("cook \"{room_name}\": {error}")
+                })?;
             let filename = sanitise_room_filename(room_name);
             let path = cooked_dir.join(format!("{filename}.psxw"));
             std::fs::write(&path, &bytes)
@@ -1667,10 +1759,11 @@ impl EditorWorkspace {
     /// processes from this path; instead the status string
     /// hands back the exact command to run.
     #[allow(clippy::too_many_arguments)]
-    pub fn cook_playtest_to_disk(&self) -> Result<String, String> {
+    pub fn cook_playtest_to_disk(&mut self) -> Result<String, String> {
         let dir = psxed_project::playtest::default_generated_dir();
         let mut project = self.project.clone();
         project.normalize_loaded();
+        self.clear_validation_issues();
         // Re-run build_package up front to grab the asset/material
         // counts for the status string. cook_to_dir does this
         // internally too; the duplicate cost is negligible
@@ -1695,6 +1788,7 @@ impl EditorWorkspace {
         let report = psxed_project::playtest::cook_to_dir(&project, &self.project_dir, &dir)
             .map_err(|e| format!("write playtest output: {e}"))?;
         if !report.is_ok() {
+            self.record_first_playtest_world_cook_issue(&project);
             return Err(format!(
                 "playtest validation failed: {}",
                 report.errors.join("; ")
@@ -2620,6 +2714,7 @@ impl EditorWorkspace {
             animation_fps: self.model_import_dialog.animation_fps.clamp(1, 60) as u16,
             world_height: self.model_import_dialog.world_height.clamp(128, 8192) as u16,
             normalize_root_translation: self.model_import_dialog.normalize_root_translation,
+            strip_animation_scale: true,
         }
     }
 
@@ -3170,6 +3265,12 @@ impl EditorWorkspace {
         self.selected_primitive_targets()
     }
 
+    /// Grid primitives currently flagged by the last failed cook or
+    /// playtest validation pass. The frontend draws these in red.
+    pub fn validation_issue_primitives(&self) -> Vec<Selection> {
+        self.validation_issue_primitives.clone()
+    }
+
     /// World-space selected bounds for the 3D preview. Unlike
     /// viewport framing, this intentionally does not fall back to
     /// the active Room when nothing is selected.
@@ -3649,6 +3750,99 @@ impl EditorWorkspace {
         self.selected_sectors.contains(&sector).then_some(sector)
     }
 
+    fn select_wall_face_span(&mut self, selection: Selection, modifiers: egui::Modifiers) -> bool {
+        let Selection::Face(current) = selection else {
+            return false;
+        };
+        let FaceKind::Wall { dir, stack } = current.kind else {
+            return false;
+        };
+        let Some(anchor) = self.wall_face_selection_anchor() else {
+            return false;
+        };
+        let FaceKind::Wall {
+            dir: anchor_dir,
+            stack: anchor_stack,
+        } = anchor.kind
+        else {
+            return false;
+        };
+        if anchor.room != current.room || anchor_dir != dir || anchor_stack != stack {
+            return false;
+        }
+
+        let Some((min_x, max_x, min_z, max_z)) = wall_span_bounds(anchor, current, dir) else {
+            return false;
+        };
+        let selections =
+            self.existing_wall_span_faces(current.room, dir, stack, min_x, max_x, min_z, max_z);
+        if selections.is_empty() {
+            return false;
+        }
+
+        let additive = modifiers.command || modifiers.ctrl;
+        self.clear_sector_selection();
+        self.clear_node_selection_state();
+        if !additive {
+            self.selected_primitives.clear();
+        }
+        for span_selection in selections {
+            self.push_selected_primitive_unique(span_selection);
+        }
+        self.selected_primitive = Some(selection);
+        self.update_primitive_resource_selection();
+        self.status = match self.selected_primitives.len() {
+            0 => "Cleared primitive selection".to_string(),
+            1 => format!("Selected {}", describe_selection(selection)),
+            count => format!("Selected {count} walls"),
+        };
+        true
+    }
+
+    fn wall_face_selection_anchor(&self) -> Option<FaceRef> {
+        self.selected_primitives
+            .iter()
+            .copied()
+            .find_map(selection_wall_face)
+            .or_else(|| self.selected_primitive.and_then(selection_wall_face))
+    }
+
+    fn existing_wall_span_faces(
+        &self,
+        room: NodeId,
+        dir: GridDirection,
+        stack: u8,
+        min_x: u16,
+        max_x: u16,
+        min_z: u16,
+        max_z: u16,
+    ) -> Vec<Selection> {
+        let scene = self.project.active_scene();
+        let Some(node) = scene.node(room) else {
+            return Vec::new();
+        };
+        let NodeKind::Room { grid } = &node.kind else {
+            return Vec::new();
+        };
+        let mut selections = Vec::new();
+        for sx in min_x..=max_x {
+            for sz in min_z..=max_z {
+                let has_wall = grid
+                    .sector(sx, sz)
+                    .is_some_and(|sector| sector.walls.get(dir).get(stack as usize).is_some());
+                if has_wall {
+                    selections.push(Selection::Face(FaceRef {
+                        room,
+                        sx,
+                        sz,
+                        kind: FaceKind::Wall { dir, stack },
+                    }));
+                }
+            }
+        }
+        selections
+    }
+
     fn apply_primitive_selection_modifiers(
         &mut self,
         selection: Selection,
@@ -3656,6 +3850,9 @@ impl EditorWorkspace {
     ) {
         let toggle = modifiers.command || modifiers.ctrl;
         if (modifiers.shift || toggle) && self.select_floor_face_tile(selection, modifiers) {
+            return;
+        }
+        if modifiers.shift && self.select_wall_face_span(selection, modifiers) {
             return;
         }
 
@@ -4502,6 +4699,72 @@ impl EditorWorkspace {
             self.viewport_3d_camera()
                 .ray_for_normalized_panel_point(nx, ny),
         )
+    }
+
+    fn clear_validation_issues(&mut self) {
+        self.validation_issue_primitives.clear();
+        self.validation_issue_rooms.clear();
+    }
+
+    fn record_first_playtest_world_cook_issue(&mut self, project: &ProjectDocument) {
+        let scene = project.active_scene();
+        let mut room_nodes: Vec<_> = scene
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Room { .. }))
+            .collect();
+        room_nodes.sort_by_key(|node| node.id.raw());
+
+        for room_node in room_nodes {
+            let NodeKind::Room { grid } = &room_node.kind else {
+                continue;
+            };
+            if grid.populated_sector_count() == 0 {
+                continue;
+            }
+            let plan = plan_generated_chunks(grid, playtest_streaming_chunk_config());
+            for chunk in plan.chunks {
+                let Some(chunk_grid) =
+                    grid_rect_for_validation_issue(grid, chunk.array_origin, chunk.size)
+                else {
+                    continue;
+                };
+                match world_cook::cook_world_grid(project, &chunk_grid) {
+                    Ok(cooked) => {
+                        if let Err(error) = cooked.to_psxw_bytes() {
+                            self.record_world_cook_error(
+                                room_node.id,
+                                &error,
+                                chunk.array_origin,
+                            );
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        self.record_world_cook_error(room_node.id, &error, chunk.array_origin);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_world_cook_error(
+        &mut self,
+        room: NodeId,
+        error: &WorldGridCookError,
+        array_origin: [u16; 2],
+    ) {
+        let mapped = world_cook_error_primitives(room, error, array_origin);
+        if mapped.is_empty() {
+            self.validation_issue_rooms.insert(room);
+        } else {
+            for selection in mapped {
+                if !self.validation_issue_primitives.contains(&selection) {
+                    self.validation_issue_primitives.push(selection);
+                }
+            }
+        }
     }
 
     /// Map a `(face, world-hit)` pair from `pick_face_with_hit`
@@ -5893,6 +6156,7 @@ impl EditorWorkspace {
         };
 
         let mut changed = false;
+        let mut status_message: Option<String> = None;
         match face.kind {
             FaceKind::Floor => {
                 let Some(face_data) = sector.floor.as_mut() else {
@@ -5950,60 +6214,111 @@ impl EditorWorkspace {
             }
             FaceKind::Wall { dir, stack } => {
                 let walls = sector.walls.get_mut(dir);
-                let Some(wall) = walls.get_mut(stack as usize) else {
-                    ui.weak("Wall stack entry was removed");
-                    return;
-                };
-                egui::CollapsingHeader::new(icons::label(icons::BLEND, "Material"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        changed |= material_picker(
-                            ui,
-                            "    Material",
-                            &mut wall.material,
-                            &material_options,
-                            &mut nav_target,
-                        );
-                    });
-                egui::CollapsingHeader::new(icons::label(icons::MOVE, "Span"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("    Bottom");
-                            let mut bot = wall.heights[0];
+                let mut split_wall = false;
+                {
+                    let Some(wall) = walls.get_mut(stack as usize) else {
+                        ui.weak("Wall stack entry was removed");
+                        return;
+                    };
+                    egui::CollapsingHeader::new(icons::label(icons::BLEND, "Material"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            changed |= material_picker(
+                                ui,
+                                "    Material",
+                                &mut wall.material,
+                                &material_options,
+                                &mut nav_target,
+                            );
+                        });
+                    egui::CollapsingHeader::new(icons::label(icons::MOVE, "Span"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("    Bottom");
+                                let mut bot = wall.heights[0];
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut bot).speed(HEIGHT_QUANTUM as f32),
+                                    )
+                                    .changed()
+                                {
+                                    let bot = snap_height(bot);
+                                    wall.heights[0] = bot;
+                                    wall.heights[1] = bot;
+                                    changed = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("    Top");
+                                let mut top = wall.heights[2];
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut top).speed(HEIGHT_QUANTUM as f32),
+                                    )
+                                    .changed()
+                                {
+                                    let top = snap_height(top);
+                                    wall.heights[2] = top;
+                                    wall.heights[3] = top;
+                                    changed = true;
+                                }
+                            });
                             if ui
-                                .add(egui::DragValue::new(&mut bot).speed(HEIGHT_QUANTUM as f32))
-                                .changed()
+                                .button("Split by sector height")
+                                .on_hover_text(
+                                    "Replace this wall with sector-height stack segments. UV settings are preserved.",
+                                )
+                                .clicked()
                             {
-                                let bot = snap_height(bot);
-                                wall.heights[0] = bot;
-                                wall.heights[1] = bot;
-                                changed = true;
+                                split_wall = true;
                             }
                         });
-                        ui.horizontal(|ui| {
-                            ui.label("    Top");
-                            let mut top = wall.heights[2];
+                    egui::CollapsingHeader::new(icons::label(icons::GRID, "UV"))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            changed |= uv_transform_controls(&mut wall.uv, ui);
                             if ui
-                                .add(egui::DragValue::new(&mut top).speed(HEIGHT_QUANTUM as f32))
-                                .changed()
+                                .button("Autotile")
+                                .on_hover_text(
+                                    "Set this wall's UV span so one grid sector maps to one texture tile. Geometry is unchanged.",
+                                )
+                                .clicked()
                             {
-                                let top = snap_height(top);
-                                wall.heights[2] = top;
-                                wall.heights[3] = top;
-                                changed = true;
+                                let before = wall.uv;
+                                let clamped = wall.autotile_uv(sector_size);
+                                if wall.uv != before {
+                                    changed = true;
+                                }
+                                status_message = Some(if clamped {
+                                    "Autotiled wall UV span; V was clamped to the PS1 8-bit UV range"
+                                        .to_string()
+                                } else {
+                                    "Autotiled wall UV span".to_string()
+                                });
                             }
                         });
-                    });
-                egui::CollapsingHeader::new(icons::label(icons::GRID, "UV"))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        changed |= uv_transform_controls(&mut wall.uv, ui);
-                    });
-                let _ = sector_size;
+                }
+                if split_wall {
+                    if let Some(wall) = walls.get(stack as usize).cloned() {
+                        let segments = wall.split_into_height_segments(sector_size);
+                        let replacement_count = segments.len();
+                        if replacement_count > 1 {
+                            walls.splice(stack as usize..=stack as usize, segments);
+                            status_message =
+                                Some(format!("Split wall into {replacement_count} segment(s)"));
+                            changed = true;
+                        } else {
+                            status_message = Some("Wall did not need splitting".to_string());
+                        }
+                    }
+                }
             }
         }
 
+        if let Some(message) = status_message {
+            self.status = message;
+        }
         if changed {
             self.mark_dirty();
         }
@@ -6674,6 +6989,8 @@ impl EditorWorkspace {
                     self.selected_node,
                     &self.selected_nodes,
                     &self.selected_sectors,
+                    &self.validation_issue_primitives,
+                    &self.validation_issue_rooms,
                 );
 
                 let pointer_world = response
@@ -8277,6 +8594,7 @@ impl EditorWorkspace {
 
     fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.clear_validation_issues();
     }
 
     fn commit_resource_rename(&mut self, id: ResourceId, name: String) {
@@ -13778,6 +14096,35 @@ pub fn describe_selection(selection: Selection) -> String {
     }
 }
 
+fn selection_wall_face(selection: Selection) -> Option<FaceRef> {
+    let Selection::Face(face) = selection else {
+        return None;
+    };
+    matches!(face.kind, FaceKind::Wall { .. }).then_some(face)
+}
+
+fn wall_span_bounds(
+    anchor: FaceRef,
+    current: FaceRef,
+    dir: GridDirection,
+) -> Option<(u16, u16, u16, u16)> {
+    match dir {
+        GridDirection::North | GridDirection::South if anchor.sz == current.sz => Some((
+            anchor.sx.min(current.sx),
+            anchor.sx.max(current.sx),
+            anchor.sz,
+            anchor.sz,
+        )),
+        GridDirection::East | GridDirection::West if anchor.sx == current.sx => Some((
+            anchor.sx,
+            anchor.sx,
+            anchor.sz.min(current.sz),
+            anchor.sz.max(current.sz),
+        )),
+        _ => None,
+    }
+}
+
 fn selection_sector(selection: Selection) -> (NodeId, u16, u16) {
     match selection {
         Selection::Face(face) => (face.room, face.sx, face.sz),
@@ -14854,6 +15201,7 @@ fn draw_streaming_budget(
     let plan = plan_generated_chunks(grid, config);
     let resource_use = collect_scene_resource_use(project);
     let file_budget = resource_file_budget(project, project_root, &resource_use);
+    let vram_budget = runtime_vram_budget(project, project_root, &resource_use);
     let over = plan.over_budget_count() > 0;
     let header = if over {
         icons::label(icons::TRASH, "Streaming Budget — over limit")
@@ -14939,11 +15287,29 @@ fn draw_streaming_budget(
                 ),
                 false,
             );
+            draw_budget_row(
+                ui,
+                "Runtime texture VRAM",
+                format!(
+                    "{} across {} textures",
+                    human_bytes_u64(vram_budget.bytes),
+                    vram_budget.textures
+                ),
+                false,
+            );
             if file_budget.missing > 0 {
                 draw_budget_row(
                     ui,
                     "Missing files",
                     format!("{}", file_budget.missing),
+                    true,
+                );
+            }
+            if vram_budget.missing > 0 {
+                draw_budget_row(
+                    ui,
+                    "Unresolved VRAM textures",
+                    format!("{}", vram_budget.missing),
                     true,
                 );
             }
@@ -14996,6 +15362,13 @@ struct ResourceFileBudget {
     missing: usize,
 }
 
+#[derive(Default)]
+struct RuntimeVramBudget {
+    textures: usize,
+    bytes: u64,
+    missing: usize,
+}
+
 fn resource_file_budget(
     project: &ProjectDocument,
     project_root: &Path,
@@ -15036,6 +15409,66 @@ fn resource_file_budget(
         }
     }
     budget
+}
+
+fn runtime_vram_budget(
+    project: &ProjectDocument,
+    project_root: &Path,
+    resource_use: &SceneResourceUse,
+) -> RuntimeVramBudget {
+    let mut budget = RuntimeVramBudget::default();
+    let mut seen = HashSet::new();
+
+    for id in &resource_use.textures {
+        let Some(resource) = project.resource(*id) else {
+            continue;
+        };
+        if let ResourceData::Texture { psxt_path } = &resource.data {
+            add_runtime_texture_vram(project_root, psxt_path, true, &mut budget, &mut seen);
+        }
+    }
+
+    for id in &resource_use.models {
+        let Some(resource) = project.resource(*id) else {
+            continue;
+        };
+        let ResourceData::Model(model) = &resource.data else {
+            continue;
+        };
+        if let Some(texture_path) = &model.texture_path {
+            add_runtime_texture_vram(project_root, texture_path, false, &mut budget, &mut seen);
+        }
+    }
+
+    budget
+}
+
+fn add_runtime_texture_vram(
+    project_root: &Path,
+    stored: &str,
+    _room_material: bool,
+    budget: &mut RuntimeVramBudget,
+    seen: &mut HashSet<PathBuf>,
+) {
+    if stored.trim().is_empty() {
+        return;
+    }
+    let abs = psxed_project::model_import::resolve_path(stored, Some(project_root));
+    if !seen.insert(abs.clone()) {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(&abs) else {
+        budget.missing += 1;
+        return;
+    };
+    let Ok(texture) = psx_asset::Texture::from_bytes(&bytes) else {
+        budget.missing += 1;
+        return;
+    };
+
+    budget.textures += 1;
+    let bytes = texture.pixel_bytes().len() as u64 + texture.clut_bytes().len() as u64;
+    budget.bytes = budget.bytes.saturating_add(bytes);
 }
 
 fn add_resource_file(
@@ -15340,6 +15773,24 @@ fn uv_transform_controls(uv: &mut GridUvTransform, ui: &mut egui::Ui) -> bool {
     });
 
     ui.horizontal(|ui| {
+        ui.label("Span");
+        ui.label("U");
+        ui.add(
+            egui::DragValue::new(&mut uv.span[0])
+                .speed(1.0)
+                .range(0..=255),
+        )
+        .on_hover_text("0 uses the material's native U span.");
+        ui.label("V");
+        ui.add(
+            egui::DragValue::new(&mut uv.span[1])
+                .speed(1.0)
+                .range(0..=255),
+        )
+        .on_hover_text("0 uses the material's native V span.");
+    });
+
+    ui.horizontal(|ui| {
         ui.label("Rotate");
         ui.selectable_value(&mut uv.rotation, GridUvRotation::Deg0, "0");
         ui.selectable_value(&mut uv.rotation, GridUvRotation::Deg90, "90");
@@ -15352,7 +15803,7 @@ fn uv_transform_controls(uv: &mut GridUvTransform, ui: &mut egui::Ui) -> bool {
         ui.checkbox(&mut uv.flip_v, "Flip V");
         if ui
             .small_button("Reset")
-            .on_hover_text("Reset this face's UV offset, rotation, and flips.")
+            .on_hover_text("Reset this face's UV offset, span, rotation, and flips.")
             .clicked()
         {
             *uv = GridUvTransform::IDENTITY;
@@ -15921,6 +16372,83 @@ mod tests {
             }
         }
         assert_eq!(workspace.selected_sector, Some((1, 1)));
+    }
+
+    #[test]
+    fn shift_selects_wall_span_from_anchor() {
+        let mut project = ProjectDocument::new("wall-span");
+        let mut grid = WorldGrid::empty(4, 1, 1024);
+        for sx in 0..4 {
+            grid.add_wall(sx, 0, GridDirection::North, 0, 1024, None);
+        }
+        let room =
+            project
+                .active_scene_mut()
+                .add_node(NodeId::ROOT, "Room", NodeKind::Room { grid });
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+        let wall_at = |sx| {
+            Selection::Face(FaceRef {
+                room,
+                sx,
+                sz: 0,
+                kind: FaceKind::Wall {
+                    dir: GridDirection::North,
+                    stack: 0,
+                },
+            })
+        };
+
+        let mut shift = egui::Modifiers::NONE;
+        shift.shift = true;
+        workspace.apply_primitive_selection_modifiers(wall_at(0), egui::Modifiers::NONE);
+        workspace.apply_primitive_selection_modifiers(wall_at(3), shift);
+
+        assert_eq!(workspace.selected_primitives.len(), 4);
+        for sx in 0..4 {
+            assert!(workspace.selected_primitives.contains(&wall_at(sx)));
+        }
+        assert_eq!(workspace.selected_primitive, Some(wall_at(3)));
+    }
+
+    #[test]
+    fn runtime_vram_budget_counts_compact_room_texture_and_model_atlas() {
+        let mut project = ProjectDocument::new("vram-budget");
+        let floor = project.add_resource(
+            "Floor Texture",
+            ResourceData::Texture {
+                psxt_path: "assets/textures/floor.psxt".to_string(),
+            },
+        );
+        let model = project.add_resource(
+            "Obsidian Wraith",
+            ResourceData::Model(psxed_project::ModelResource {
+                model_path: "assets/models/obsidian_wraith/obsidian_wraith.psxmdl".to_string(),
+                texture_path: Some(
+                    "assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt".to_string(),
+                ),
+                clips: Vec::new(),
+                default_clip: None,
+                preview_clip: None,
+                world_height: 1024,
+                scale_q8: [MODEL_SCALE_ONE_Q8; 3],
+                attachments: Vec::new(),
+            }),
+        );
+        let resource_use = SceneResourceUse {
+            textures: vec![floor],
+            models: vec![model],
+            ..SceneResourceUse::default()
+        };
+
+        let budget = runtime_vram_budget(
+            &project,
+            &psxed_project::default_project_dir(),
+            &resource_use,
+        );
+
+        assert_eq!(budget.textures, 2);
+        assert_eq!(budget.missing, 0);
+        assert_eq!(budget.bytes, 16 * 64 * 2 + 16 * 2 + 64 * 128 * 2 + 256 * 2);
     }
 
     #[test]

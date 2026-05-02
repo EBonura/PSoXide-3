@@ -15,17 +15,17 @@
 
 use core::ptr;
 
-use emulator_core::gpu::GpuCmdLogEntry;
+use emulator_core::gpu::{gp0_command_word_count, GpuCmdLogEntry};
 use psx_gpu::ot::OrderingTable;
 
 /// Walk `ot` in DMA submission order and produce one
-/// [`GpuCmdLogEntry`] per primitive packet.
+/// [`GpuCmdLogEntry`] per GP0 command.
 ///
-/// Each entry's `fifo` is a freshly-cloned `Vec<u32>` containing the
-/// `words` data words that follow the OT tag (i.e. the actual GP0
-/// command starting at its opcode byte). `opcode` is the top byte of
-/// the first FIFO word; `index` is the packet's position in walk
-/// order.
+/// Each OT packet may contain more than one GP0 command; for example
+/// windowed textured triangles are emitted as `E2 + 24h` inside one
+/// DMA packet so the texture-window state stays adjacent to the
+/// primitive. Each returned entry's `fifo` contains exactly one decoded
+/// GP0 command, matching the emulator's live command log.
 ///
 /// # Safety
 /// Same invariant `OrderingTable::iter_packets` requires: every
@@ -35,26 +35,34 @@ use psx_gpu::ot::OrderingTable;
 /// chains must too.
 pub unsafe fn build_cmd_log<const N: usize>(ot: &OrderingTable<N>) -> Vec<GpuCmdLogEntry> {
     let mut log = Vec::new();
+    let mut command_index = 0u32;
     // SAFETY: contract above forwards directly to iter_packets.
     let iter = unsafe { ot.iter_packets() };
-    for (index, (packet_ptr, words)) in iter.enumerate() {
-        let mut fifo = Vec::with_capacity(words as usize);
+    for (packet_ptr, words) in iter {
+        let mut packet = Vec::with_capacity(words as usize);
         for offset in 1..=(words as usize) {
             // SAFETY: packet[1..=words] is alive per the iter contract;
             // each word is u32-aligned because OT primitives are u32
             // aligned by `repr(C, align(4))`.
             let word = unsafe { ptr::read_volatile(packet_ptr.add(offset)) };
-            fifo.push(word);
+            packet.push(word);
         }
-        let opcode = fifo
-            .first()
-            .map(|&first| ((first >> 24) & 0xFF) as u8)
-            .unwrap_or(0);
-        log.push(GpuCmdLogEntry {
-            index: u32::try_from(index).unwrap_or(u32::MAX),
-            opcode,
-            fifo,
-        });
+
+        let mut offset = 0usize;
+        while offset < packet.len() {
+            let opcode = ((packet[offset] >> 24) & 0xFF) as u8;
+            let command_words = gp0_command_word_count(opcode)
+                .max(1)
+                .min(packet.len() - offset);
+            let fifo = packet[offset..offset + command_words].to_vec();
+            log.push(GpuCmdLogEntry {
+                index: command_index,
+                opcode,
+                fifo,
+            });
+            command_index = command_index.saturating_add(1);
+            offset += command_words;
+        }
     }
     log
 }
@@ -110,5 +118,37 @@ mod tests {
         // `b` was inserted last and prepends to the chain head.
         assert_eq!(log[0].opcode, 0xBB);
         assert_eq!(log[1].opcode, 0xAA);
+    }
+
+    /// A single DMA packet can legally contain multiple GP0 commands.
+    /// The host renderer consumes command-log entries, so the adapter
+    /// must split the FIFO words before translation.
+    #[test]
+    fn build_cmd_log_splits_multi_command_packets() {
+        let mut ot: OrderingTable<8> = OrderingTable::new();
+        ot.clear();
+
+        let mut packet: [u32; 9] = [
+            0,
+            0xE204_2318,
+            0x2480_8080,
+            0x0001_0002,
+            0x0000_0000,
+            0x0003_0004,
+            0x0000_0000,
+            0x0005_0006,
+            0x0000_0000,
+        ];
+        unsafe {
+            ot.insert(2, packet.as_mut_ptr(), 8);
+        }
+
+        let log = unsafe { build_cmd_log(&ot) };
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].opcode, 0xE2);
+        assert_eq!(log[0].fifo, vec![0xE204_2318]);
+        assert_eq!(log[1].opcode, 0x24);
+        assert_eq!(log[1].fifo.len(), 7);
+        assert_eq!(log[1].index, 1);
     }
 }

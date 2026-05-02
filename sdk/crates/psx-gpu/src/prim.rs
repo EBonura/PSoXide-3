@@ -230,14 +230,19 @@ impl LineMono {
     }
 }
 
-/// Textured triangle with a single flat tint. 8 words (tag + 7 data).
+/// Textured triangle with a single flat tint. 9 words (tag + 8 data).
 ///
-/// Vertex + UV pairs; CLUT rides in vertex 0's UV high word, tpage
-/// in vertex 1's UV high word (PSX-SPX convention for GP0 0x24).
+/// The first data word is GP0(E2) texture-window state, followed by
+/// vertex + UV pairs; CLUT rides in vertex 0's UV high word, tpage in
+/// vertex 1's UV high word (PSX-SPX convention for GP0 0x24). Emitting
+/// E2 per triangle keeps windowed world materials from leaking state to
+/// model triangles when the ordering table interleaves both.
 #[repr(C, align(4))]
 pub struct TriTextured {
     /// OT linkage.
     pub tag: u32,
+    /// GP0(E2) texture-window command.
+    pub tex_window: u32,
     /// `0x24000000 | tint` header.
     pub color_cmd: u32,
     /// Vertex 0 position.
@@ -256,7 +261,7 @@ pub struct TriTextured {
 
 impl TriTextured {
     /// Data-word count.
-    pub const WORDS: u8 = 7;
+    pub const WORDS: u8 = 8;
 
     /// Build a textured triangle. `tint = (128, 128, 128)` leaves
     /// texels unmodulated.
@@ -279,6 +284,7 @@ impl TriTextured {
     ) -> Self {
         Self {
             tag: 0,
+            tex_window: material.texture_window_word(),
             color_cmd: material.flat_textured_polygon_header(false),
             v0: pack_vertex(verts[0].0, verts[0].1),
             uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, material.clut_word()),

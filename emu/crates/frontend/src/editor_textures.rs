@@ -1,10 +1,9 @@
 //! Editor preview textures.
 //!
-//! Generates a small procedural 4bpp texture per project Material
-//! resource and uploads it into the editor `HwRenderer`'s VRAM. A
-//! cache keyed on `ResourceId` records the resulting (tpage, CLUT)
-//! words so the editor preview can emit `TriTextured` packets that
-//! sample the right region.
+//! Generates or uploads a 4bpp texture per project Material resource
+//! into the editor `HwRenderer`'s VRAM. A cache keyed on `ResourceId`
+//! records the resulting (tpage, CLUT) words so the editor preview can
+//! emit `TriTextured` packets that sample the right region.
 //!
 //! Why procedural: real cooked textures from project PNGs land later
 //! once the editor's asset pipeline is hooked up end-to-end. Until
@@ -17,8 +16,9 @@
 //!
 //! ```text
 //!   y = 0      ▶ 320×240 frame buffer (sub-rect the editor paints)
-//!   y = 0      ▶ tpages 5..15  -- 4bpp 64×64 textures, one per material
-//!                packed left-to-right starting at x = 320
+//!   y = 0      ▶ tpages 5..15  -- 4bpp room material pages, one per
+//!                material, physically tiled from the native texture
+//!                and packed left-to-right starting at x = 320
 //!   y = 480    ▶ CLUT row, 16 halfwords per palette
 //! ```
 
@@ -28,6 +28,9 @@ use std::path::{Path, PathBuf};
 use psx_asset::Texture;
 use psx_gpu_render::{VRAM_HEIGHT, VRAM_WIDTH};
 use psxed_project::{MaterialResource, ProjectDocument, Resource, ResourceData, ResourceId};
+
+const ROOM_TPAGE_HALFWORDS: usize = 64;
+const ROOM_TPAGE_TEXEL_HEIGHT: usize = 256;
 
 /// Cached tpage/CLUT for one Material resource.
 #[derive(Debug, Clone, Copy)]
@@ -211,25 +214,15 @@ impl EditorTextures {
         let clut_x = self.next_clut_x;
         let clut_y = 480;
 
-        // Pixel halfwords: copy raw little-endian bytes from
-        // `pixel_bytes` into VRAM. The runtime path's
-        // `psx_vram::upload_bytes` does the same -- we mirror it on
-        // host because the editor's `HwRenderer` reads VRAM as
-        // halfwords through `R16Uint`.
-        let halfwords_per_row = texture.halfwords_per_row() as usize;
-        let height_px = texture.height() as usize;
-        let pixel_bytes = texture.pixel_bytes();
-        if pixel_bytes.len() < halfwords_per_row * height_px * 2 {
+        // Room material autotiling expands UVs beyond the native
+        // texture rectangle. The PSX only wraps inside a texture
+        // page, so mirror the runtime upload by physically repeating
+        // the source texture across the whole 4bpp tpage.
+        if texture.clut_entries() != 16 {
             return None;
         }
-        for row in 0..height_px {
-            for hw in 0..halfwords_per_row {
-                let off = (row * halfwords_per_row + hw) * 2;
-                let word = u16::from_le_bytes([pixel_bytes[off], pixel_bytes[off + 1]]);
-                let vram_idx =
-                    (tpage_y as usize + row) * VRAM_WIDTH as usize + tpage_x as usize + hw;
-                self.vram[vram_idx] = word;
-            }
+        if !self.upload_tiled_4bpp_texture(tpage_x, tpage_y, &texture) {
+            return None;
         }
 
         // CLUT halfwords: 16 entries for 4bpp. The editor allocates
@@ -238,9 +231,6 @@ impl EditorTextures {
         // declared CLUT entry count rather than the depth enum so
         // the only psx-asset surface this file touches is `Texture`.
         let clut_bytes = texture.clut_bytes();
-        if texture.clut_entries() != 16 {
-            return None;
-        }
         if !clut_bytes.is_empty() {
             for i in 0..16 {
                 let off = i * 2;
@@ -270,6 +260,35 @@ impl EditorTextures {
         Some(slot)
     }
 
+    fn upload_tiled_4bpp_texture(&mut self, tpage_x: u16, tpage_y: u16, texture: &Texture) -> bool {
+        let halfwords_per_row = texture.halfwords_per_row() as usize;
+        let height_px = texture.height() as usize;
+        if halfwords_per_row == 0
+            || halfwords_per_row > ROOM_TPAGE_HALFWORDS
+            || height_px == 0
+            || height_px > ROOM_TPAGE_TEXEL_HEIGHT
+        {
+            return false;
+        }
+
+        let pixel_bytes = texture.pixel_bytes();
+        if pixel_bytes.len() < halfwords_per_row * height_px * 2 {
+            return false;
+        }
+        for row in 0..ROOM_TPAGE_TEXEL_HEIGHT {
+            let src_row = row % height_px;
+            for hw in 0..ROOM_TPAGE_HALFWORDS {
+                let src_hw = hw % halfwords_per_row;
+                let off = (src_row * halfwords_per_row + src_hw) * 2;
+                let word = u16::from_le_bytes([pixel_bytes[off], pixel_bytes[off + 1]]);
+                let vram_idx =
+                    (tpage_y as usize + row) * VRAM_WIDTH as usize + tpage_x as usize + hw;
+                self.vram[vram_idx] = word;
+            }
+        }
+        true
+    }
+
     /// Stamp a name-keyed procedural pattern (brick / stone / wood /
     /// metal / glass / default checker) into the next free slot.
     /// Always returns a valid slot -- assumes the caller already
@@ -294,18 +313,22 @@ impl EditorTextures {
         slot
     }
 
-    /// Pack a 4bpp 64×64 pattern into VRAM at `(x, y)` (halfword
-    /// coords). The pattern is 64 wide × 64 tall = 16 halfwords ×
-    /// 64 rows; each halfword carries four 4bpp pixels (low nibble
-    /// = leftmost).
+    /// Pack a 4bpp 64×64 pattern into a full 4bpp tpage at `(x, y)`
+    /// (halfword coords), repeating it across 256×256 texels. Each
+    /// halfword carries four 4bpp pixels (low nibble = leftmost).
     fn upload_4bpp(&mut self, tpage_x: u16, tpage_y: u16, pixels: &[u8]) {
-        let halfwords_per_row = 16usize;
-        for row in 0..64usize {
-            for hw in 0..halfwords_per_row {
-                let p0 = pixels[row * 64 + hw * 4] & 0x0F;
-                let p1 = pixels[row * 64 + hw * 4 + 1] & 0x0F;
-                let p2 = pixels[row * 64 + hw * 4 + 2] & 0x0F;
-                let p3 = pixels[row * 64 + hw * 4 + 3] & 0x0F;
+        let source_texels_per_row = 64usize;
+        let source_rows = 64usize;
+        let source_halfwords_per_row = source_texels_per_row / 4;
+        for row in 0..ROOM_TPAGE_TEXEL_HEIGHT {
+            let src_row = row % source_rows;
+            for hw in 0..ROOM_TPAGE_HALFWORDS {
+                let src_hw = hw % source_halfwords_per_row;
+                let src = src_row * source_texels_per_row + src_hw * 4;
+                let p0 = pixels[src] & 0x0F;
+                let p1 = pixels[src + 1] & 0x0F;
+                let p2 = pixels[src + 2] & 0x0F;
+                let p3 = pixels[src + 3] & 0x0F;
                 let word =
                     (p0 as u16) | ((p1 as u16) << 4) | ((p2 as u16) << 8) | ((p3 as u16) << 12);
                 let vram_idx =
@@ -807,7 +830,8 @@ fn align_up_to(value: u16, boundary: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::align_up_to;
+    use super::{align_up_to, EditorTextures, ROOM_TPAGE_HALFWORDS, ROOM_TPAGE_TEXEL_HEIGHT};
+    use psx_gpu_render::VRAM_WIDTH;
 
     #[test]
     fn align_up_to_handles_aligned_and_misaligned_values() {
@@ -821,5 +845,36 @@ mod tests {
         // Boundary 0 is a no-op (defensive -- the allocator
         // only ever passes 64).
         assert_eq!(align_up_to(33, 0), 33);
+    }
+
+    #[test]
+    fn procedural_room_texture_upload_repeats_across_full_4bpp_page() {
+        let mut pixels = vec![0u8; 64 * 64];
+        for row in 0..64usize {
+            for hw in 0..16usize {
+                let base = ((row ^ hw) & 0x0F) as u8;
+                let src = row * 64 + hw * 4;
+                pixels[src] = base;
+                pixels[src + 1] = base.wrapping_add(1) & 0x0F;
+                pixels[src + 2] = base.wrapping_add(2) & 0x0F;
+                pixels[src + 3] = base.wrapping_add(3) & 0x0F;
+            }
+        }
+
+        let mut textures = EditorTextures::new();
+        let tpage_x = 320u16;
+        textures.upload_4bpp(tpage_x, 0, &pixels);
+
+        let word_at = |row: usize, hw: usize| -> u16 {
+            textures.vram[row * VRAM_WIDTH as usize + tpage_x as usize + hw]
+        };
+        assert_eq!(word_at(0, 0), word_at(64, 0));
+        assert_eq!(word_at(0, 0), word_at(0, 16));
+        assert_eq!(word_at(63, 15), word_at(127, 31));
+        assert_eq!(word_at(63, 15), word_at(255, 63));
+        assert_ne!(
+            word_at(ROOM_TPAGE_TEXEL_HEIGHT - 1, ROOM_TPAGE_HALFWORDS - 1),
+            0
+        );
     }
 }

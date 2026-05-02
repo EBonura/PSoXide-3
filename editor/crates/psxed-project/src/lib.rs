@@ -322,14 +322,18 @@ pub enum GridUvRotation {
 /// Non-destructive texture-coordinate transform for one grid face.
 ///
 /// `offset` is in PS1 texels and is applied after flip/rotation. It
-/// wraps in the 8-bit UV coordinate space, which matches packet-level
-/// PS1 UVs; seamless repeated scrolling still needs texture-window
-/// support or an intentionally repeated texture page.
+    /// wraps in the 8-bit UV coordinate space, which matches packet-level
+    /// PS1 UVs; runtime room materials use texture-window state so this
+    /// can repeat a compact material tile without rebaking the texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridUvTransform {
     /// Signed `[u, v]` texel offset.
     #[serde(default)]
     pub offset: [i16; 2],
+    /// Optional `[u, v]` UV span in texels. Zero means "use the
+    /// source quad's native span" for that axis.
+    #[serde(default, skip_serializing_if = "is_default_uv_span")]
+    pub span: [u16; 2],
     /// Quarter-turn rotation.
     #[serde(default)]
     pub rotation: GridUvRotation,
@@ -345,6 +349,7 @@ impl GridUvTransform {
     /// Identity transform.
     pub const IDENTITY: Self = Self {
         offset: [0, 0],
+        span: [0, 0],
         rotation: GridUvRotation::Deg0,
         flip_u: false,
         flip_v: false,
@@ -354,6 +359,8 @@ impl GridUvTransform {
     pub const fn is_identity(&self) -> bool {
         self.offset[0] == 0
             && self.offset[1] == 0
+            && self.span[0] == 0
+            && self.span[1] == 0
             && matches!(self.rotation, GridUvRotation::Deg0)
             && !self.flip_u
             && !self.flip_v
@@ -408,11 +415,24 @@ impl GridUvTransform {
                 height - scale_rounded(u, height, width),
             ),
         };
+        let span_u = self.effective_span_axis(0, width);
+        let span_v = self.effective_span_axis(1, height);
+        let u = scale_rounded(u, span_u, width);
+        let v = scale_rounded(v, span_v, height);
 
         (
             wrap_uv(bounds.min_u + u + self.offset[0] as i32),
             wrap_uv(bounds.min_v + v + self.offset[1] as i32),
         )
+    }
+
+    fn effective_span_axis(self, axis: usize, fallback: i32) -> i32 {
+        let span = self.span[axis];
+        if span == 0 {
+            fallback
+        } else {
+            i32::from(span.min(255))
+        }
     }
 }
 
@@ -461,6 +481,10 @@ fn scale_rounded(value: i32, numerator: i32, denominator: i32) -> i32 {
 
 fn wrap_uv(value: i32) -> u8 {
     value.rem_euclid(256) as u8
+}
+
+const fn is_default_uv_span(span: &[u16; 2]) -> bool {
+    span[0] == 0 && span[1] == 0
 }
 
 /// Floor / ceiling corner index. Maps directly to the
@@ -771,6 +795,120 @@ impl GridVerticalFace {
 
     pub const fn is_triangle(&self) -> bool {
         self.dropped_corner.is_some()
+    }
+
+    /// Set this wall's V span so texel density follows the world
+    /// grid: `TILE_UV` texels cover one sector-height.
+    ///
+    /// The wall geometry is not changed. Returns `true` when the
+    /// requested span had to be clamped to the PS1 packet UV range.
+    pub fn autotile_uv(&mut self, sector_size: i32) -> bool {
+        let (span_v, clamped) = uv_span_for_world_span(self.max_vertical_span(), sector_size);
+        self.uv.span[0] = 0;
+        self.uv.span[1] = stored_uv_span(span_v);
+        clamped
+    }
+
+    /// Split this wall into sector-height stack entries without
+    /// changing its material or UV settings.
+    pub fn split_into_height_segments(&self, sector_size: i32) -> Vec<Self> {
+        if self.is_triangle() {
+            return vec![self.clone()];
+        }
+        let sector_size = sector_size.max(1);
+        let max_span = self.max_vertical_span();
+        if max_span == 0 {
+            return vec![self.clone()];
+        }
+
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < max_span {
+            let end = start.saturating_add(sector_size).min(max_span);
+            let mut wall = self.clone();
+            wall.heights = [
+                lerp_i32_ratio(
+                    self.heights[WallCorner::BL.idx()],
+                    self.heights[WallCorner::TL.idx()],
+                    start,
+                    max_span,
+                ),
+                lerp_i32_ratio(
+                    self.heights[WallCorner::BR.idx()],
+                    self.heights[WallCorner::TR.idx()],
+                    start,
+                    max_span,
+                ),
+                lerp_i32_ratio(
+                    self.heights[WallCorner::BR.idx()],
+                    self.heights[WallCorner::TR.idx()],
+                    end,
+                    max_span,
+                ),
+                lerp_i32_ratio(
+                    self.heights[WallCorner::BL.idx()],
+                    self.heights[WallCorner::TL.idx()],
+                    end,
+                    max_span,
+                ),
+            ];
+            out.push(wall);
+            start = end;
+        }
+        out
+    }
+
+    fn max_vertical_span(&self) -> i32 {
+        let left_span =
+            self.heights[WallCorner::TL.idx()].saturating_sub(self.heights[WallCorner::BL.idx()]);
+        let right_span =
+            self.heights[WallCorner::TR.idx()].saturating_sub(self.heights[WallCorner::BR.idx()]);
+        left_span.unsigned_abs().max(right_span.unsigned_abs()) as i32
+    }
+}
+
+fn uv_span_for_world_span(world_span: i32, sector_size: i32) -> (u16, bool) {
+    if world_span <= 0 {
+        return (u16::from(psxed_format::world::TILE_UV), false);
+    }
+    let sector_size = sector_size.max(1);
+    let unclamped = div_round_i64(
+        i64::from(world_span) * i64::from(psxed_format::world::TILE_UV),
+        i64::from(sector_size),
+    );
+    let texels = unclamped.clamp(1, 255) as u16;
+    (texels, unclamped > 255)
+}
+
+fn stored_uv_span(span: u16) -> u16 {
+    if span == u16::from(psxed_format::world::TILE_UV) {
+        0
+    } else {
+        span
+    }
+}
+
+fn lerp_i32_ratio(a: i32, b: i32, numerator: i32, denominator: i32) -> i32 {
+    if denominator <= 0 {
+        return a;
+    }
+    let delta = i64::from(b).saturating_sub(i64::from(a));
+    i64::from(a)
+        .saturating_add(div_round_i64(
+            delta.saturating_mul(i64::from(numerator)),
+            i64::from(denominator),
+        ))
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+fn div_round_i64(numerator: i64, denominator: i64) -> i64 {
+    if denominator == 0 {
+        return 0;
+    }
+    if numerator >= 0 {
+        numerator.saturating_add(denominator / 2) / denominator
+    } else {
+        numerator.saturating_sub(denominator / 2) / denominator
     }
 }
 
@@ -1702,6 +1840,7 @@ impl WorldGrid {
         let old_sector_size = self.sector_size.max(1);
         if old_sector_size == new_sector_size {
             self.sector_size = new_sector_size;
+            self.snap_heights_to_quantum();
             return;
         }
         for sector in self.sectors.iter_mut().flatten() {
@@ -1727,6 +1866,32 @@ impl WorldGrid {
         self.fog_far = scale_i32_ratio(self.fog_far, old_sector_size, new_sector_size)
             .max(self.fog_near + HEIGHT_QUANTUM);
         self.sector_size = new_sector_size;
+    }
+
+    /// Snap all authored vertical geometry to the cooker-supported
+    /// height quantum. This is load/save normalization for stale or
+    /// hand-edited project data; live editor controls call
+    /// [`snap_height`] at the point of edit.
+    pub fn snap_heights_to_quantum(&mut self) {
+        for sector in self.sectors.iter_mut().flatten() {
+            if let Some(face) = &mut sector.floor {
+                for h in &mut face.heights {
+                    *h = snap_height(*h);
+                }
+            }
+            if let Some(face) = &mut sector.ceiling {
+                for h in &mut face.heights {
+                    *h = snap_height(*h);
+                }
+            }
+            for direction in GridDirection::ALL {
+                for wall in sector.walls.get_mut(direction) {
+                    for h in &mut wall.heights {
+                        *h = snap_height(*h);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3310,6 +3475,7 @@ fn apply_world_sector_size_to_descendants(
                     grid.rescale_sector_size(sector_size);
                 } else {
                     grid.sector_size = snap_world_sector_size(sector_size);
+                    grid.snap_heights_to_quantum();
                 }
             }
             NodeKind::Collider { shape, .. } if rescale => {
@@ -3737,6 +3903,42 @@ mod tests {
         assert_eq!(snap_height(48), 64);
         assert_eq!(snap_height(-47), -32);
         assert_eq!(snap_height(-48), -64);
+    }
+
+    #[test]
+    fn normalize_loaded_snaps_room_heights_to_quantum() {
+        let mut project = ProjectDocument::starter();
+        let room_id = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Room { .. }))
+            .map(|node| node.id)
+            .unwrap();
+        {
+            let room = project.active_scene_mut().node_mut(room_id).unwrap();
+            let NodeKind::Room { grid } = &mut room.kind else {
+                panic!("expected room");
+            };
+            let sector = grid.ensure_sector(0, 0).unwrap();
+            sector.floor = Some(GridHorizontalFace::flat(17, None));
+            let walls = sector.walls.get_mut(GridDirection::West);
+            walls.clear();
+            walls.push(GridVerticalFace::with_heights([0, 0, 965, 802], None));
+        }
+
+        project.normalize_loaded();
+
+        let room = project.active_scene().node(room_id).unwrap();
+        let NodeKind::Room { grid } = &room.kind else {
+            panic!("expected room");
+        };
+        let sector = grid.sector(0, 0).unwrap();
+        assert_eq!(sector.floor.as_ref().unwrap().heights, [32, 32, 32, 32]);
+        assert_eq!(
+            sector.walls.get(GridDirection::West)[0].heights,
+            [0, 0, 960, 800]
+        );
     }
 
     #[test]
@@ -5031,6 +5233,7 @@ mod tests {
     fn grid_uv_transform_rotates_quad_without_rebaking_texture() {
         let transform = GridUvTransform {
             offset: [0, 0],
+            span: [0, 0],
             rotation: GridUvRotation::Deg90,
             flip_u: false,
             flip_v: false,
@@ -5046,6 +5249,7 @@ mod tests {
     fn grid_uv_transform_flips_and_wraps_ps1_uv_offsets() {
         let transform = GridUvTransform {
             offset: [-8, 12],
+            span: [0, 0],
             rotation: GridUvRotation::Deg0,
             flip_u: true,
             flip_v: false,
@@ -5055,5 +5259,91 @@ mod tests {
             transform.apply_to_quad([(0, 0), (64, 0), (64, 64), (0, 64)]),
             [(56, 12), (248, 12), (248, 76), (56, 76)]
         );
+    }
+
+    #[test]
+    fn grid_uv_transform_scales_quad_span_without_rebaking_texture() {
+        let transform = GridUvTransform {
+            offset: [0, 0],
+            span: [0, 32],
+            rotation: GridUvRotation::Deg0,
+            flip_u: false,
+            flip_v: false,
+        };
+
+        assert_eq!(
+            transform.apply_to_quad([(0, 64), (64, 64), (64, 0), (0, 0)]),
+            [(0, 32), (64, 32), (64, 0), (0, 0)]
+        );
+    }
+
+    #[test]
+    fn wall_autotile_sets_double_height_v_span_without_changing_geometry() {
+        let mut wall = GridVerticalFace::flat(0, 1536, None);
+        let heights = wall.heights;
+
+        let clamped = wall.autotile_uv(768);
+
+        assert!(!clamped);
+        assert_eq!(wall.heights, heights);
+        assert_eq!(wall.uv.span, [0, 128]);
+    }
+
+    #[test]
+    fn wall_autotile_uses_partial_v_span_for_short_wall() {
+        let mut wall = GridVerticalFace::flat(0, 384, None);
+
+        let clamped = wall.autotile_uv(768);
+
+        assert!(!clamped);
+        assert_eq!(wall.heights, [0, 0, 384, 384]);
+        assert_eq!(wall.uv.span, [0, 32]);
+    }
+
+    #[test]
+    fn wall_autotile_clamps_one_quad_to_ps1_uv_range() {
+        let mut wall = GridVerticalFace::flat(0, 768 * 5, None);
+
+        let clamped = wall.autotile_uv(768);
+
+        assert!(clamped);
+        assert_eq!(wall.heights, [0, 0, 3840, 3840]);
+        assert_eq!(wall.uv.span, [0, 255]);
+    }
+
+    #[test]
+    fn wall_split_height_segments_keeps_uvs_and_sloped_edges_connected() {
+        let mut wall = GridVerticalFace::flat(0, 1536, None);
+        wall.heights = [0, 384, 1536, 1920];
+        wall.uv.span = [12, 96];
+
+        let segments = wall.split_into_height_segments(768);
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(
+            [
+                segments[0].heights[WallCorner::BL.idx()],
+                segments[0].heights[WallCorner::BR.idx()],
+            ],
+            [0, 384]
+        );
+        assert_eq!(
+            [
+                segments[2].heights[WallCorner::TL.idx()],
+                segments[2].heights[WallCorner::TR.idx()],
+            ],
+            [1920, 1536]
+        );
+        for pair in segments.windows(2) {
+            assert_eq!(
+                pair[0].heights[WallCorner::TL.idx()],
+                pair[1].heights[WallCorner::BL.idx()]
+            );
+            assert_eq!(
+                pair[0].heights[WallCorner::TR.idx()],
+                pair[1].heights[WallCorner::BR.idx()]
+            );
+        }
+        assert!(segments.iter().all(|segment| segment.uv.span == [12, 96]));
     }
 }

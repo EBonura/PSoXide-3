@@ -88,16 +88,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
             PlaytestAssetKind::ModelAnimation => "AssetKind::ModelAnimation",
         };
         let static_name = asset_static_name(asset, i);
-        let vram_bytes = match asset.kind {
-            PlaytestAssetKind::RoomWorld
-            | PlaytestAssetKind::ModelMesh
-            | PlaytestAssetKind::ModelAnimation => 0,
-            // Heuristic: the upload cost is the texture's byte
-            // length. Future loaders may compute a tighter
-            // figure -- for now this is the conservative bound
-            // the residency budget has to honour.
-            PlaytestAssetKind::Texture => asset.bytes.len(),
-        };
+        let vram_bytes = asset_vram_bytes(asset);
         let _ = writeln!(
             out,
             "    LevelAssetRecord {{ id: AssetId({i}), kind: {kind}, bytes: {static_name}, ram_bytes: {static_name}.len() as u32, vram_bytes: {vram_bytes}, flags: 0 }},"
@@ -475,6 +466,20 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     out
 }
 
+fn asset_vram_bytes(asset: &PlaytestAsset) -> usize {
+    match asset.kind {
+        PlaytestAssetKind::RoomWorld
+        | PlaytestAssetKind::ModelMesh
+        | PlaytestAssetKind::ModelAnimation => 0,
+        PlaytestAssetKind::Texture => texture_vram_bytes(asset).unwrap_or(asset.bytes.len()),
+    }
+}
+
+fn texture_vram_bytes(asset: &PlaytestAsset) -> Option<usize> {
+    let texture = psx_asset::Texture::from_bytes(&asset.bytes).ok()?;
+    Some(texture.pixel_bytes().len() + texture.clut_bytes().len())
+}
+
 fn render_weapon_hit_shape(shape: PlaytestWeaponHitShape) -> String {
     match shape {
         PlaytestWeaponHitShape::Box {
@@ -614,6 +619,42 @@ fn purge_models_dir(dir: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn room_texture_vram_bytes_match_runtime_compact_tile_upload() {
+        let bytes = std::fs::read(crate::default_project_dir().join("assets/textures/floor.psxt"))
+            .expect("starter floor texture exists");
+        let asset = PlaytestAsset {
+            kind: PlaytestAssetKind::Texture,
+            bytes,
+            filename: "texture_000.psxt".to_string(),
+            source_label: "Floor".to_string(),
+        };
+
+        assert_eq!(asset_vram_bytes(&asset), 16 * 64 * 2 + 16 * 2);
+    }
+
+    #[test]
+    fn model_atlas_vram_bytes_match_runtime_atlas_upload() {
+        let bytes = std::fs::read(
+            crate::default_project_dir()
+                .join("assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt"),
+        )
+        .expect("starter wraith atlas exists");
+        let asset = PlaytestAsset {
+            kind: PlaytestAssetKind::Texture,
+            bytes,
+            filename: "models/model_000_obsidian_wraith/atlas.psxt".to_string(),
+            source_label: "Obsidian Wraith atlas".to_string(),
+        };
+
+        assert_eq!(asset_vram_bytes(&asset), 64 * 128 * 2 + 256 * 2);
+    }
 }
 
 /// Header emitted at the top of every generated manifest. The

@@ -45,7 +45,12 @@ use psx_engine::{
 #[cfg(feature = "world-grid-visible")]
 use psx_engine::{draw_room_lit_grid_visible, GridVisibility};
 use psx_font::{fonts::BASIC, FontAtlas};
-use psx_gpu::{draw_quad_flat, material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
+use psx_gpu::{
+    draw_quad_flat,
+    material::{TextureMaterial, TextureWindow},
+    ot::OrderingTable,
+    prim::TriTextured,
+};
 use psx_level::{
     equipment_flags, find_asset_of_kind, room_flags, AssetId, AssetKind, EntityRecord,
     LevelCharacterRecord, LevelMaterialRecord, LevelMaterialSidedness, LevelModelRecord,
@@ -79,10 +84,10 @@ use generated::{
 // disjoint regions so a model atlas upload never overwrites a
 // room texture (and vice versa).
 //
-// Room materials: 4bpp pages starting at (640, 0), one tpage per
-// material. `draw_room` v1 UVs always start at (0,0), so packing
-// multiple 64x64 textures side-by-side inside one tpage would make
-// every material sample the first texture with a different CLUT.
+// Room materials: 4bpp pages starting at (640, 0), packed as 64x64
+// tiles inside each tpage. Each material carries GP0(E2)
+// texture-window state so authored UV repetition samples only its tile
+// instead of requiring physically repeated texels.
 //
 // Model atlases: 8bpp tpage at (384, 256); stripe atlases
 // left-to-right (each atlas occupies its own halfword stride);
@@ -92,6 +97,11 @@ const SHARED_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
 const TPAGE_WORD: u16 = SHARED_TPAGE.uv_tpage_word(0);
 const ROOM_TPAGE_STRIDE_HW: u16 = 64;
 const ROOM_TPAGE_LIMIT_X: u16 = 1024;
+const ROOM_TILE_TEXELS: u16 = 64;
+const ROOM_TILE_HALFWORDS: u16 = ROOM_TILE_TEXELS / 4;
+const ROOM_TILE_ROWS: u16 = 4;
+const ROOM_TILE_COLUMNS: u16 = 4;
+const ROOM_TILES_PER_PAGE: u16 = ROOM_TILE_ROWS * ROOM_TILE_COLUMNS;
 /// CLUT strip used by room material textures. Keep it outside the
 /// 320-pixel-wide double-buffered framebuffer (`x=0..319`,
 /// `y=0..479`) so frame clears cannot overwrite palettes.
@@ -234,14 +244,15 @@ static mut RESIDENCY: ResidencyManager<MAX_RESIDENT_RAM_ASSETS, MAX_RESIDENT_VRA
     ResidencyManager::new();
 
 /// Per-asset upload bookkeeping. When a texture asset becomes
-/// VRAM-resident we record its CLUT word and tpage half-x stride
-/// so the per-frame material build can reconstruct its
+/// VRAM-resident we record its CLUT word, tpage word, and texture
+/// window so the per-frame material build can reconstruct its
 /// `TextureMaterial` without re-walking the upload code.
 #[derive(Copy, Clone)]
 struct VramSlot {
     asset: AssetId,
     clut_word: u16,
     tpage_word: u16,
+    texture_window: TextureWindow,
 }
 
 const VRAM_SLOT_EMPTY: Option<VramSlot> = None;
@@ -582,9 +593,7 @@ impl Scene for Playtest {
         } else {
             self.room.as_ref().map(|room| room.collision())
         };
-        let motor_frame = self
-            .motor
-            .update_vblanks(collision, input, config, ctx.time.delta_vblanks());
+        let motor_frame = self.motor.update(collision, input, config);
         self.update_current_room_from_player();
 
         // Animation state comes from the reusable motor, but the
@@ -653,10 +662,12 @@ impl Scene for Playtest {
                 // local_slot. Slots that didn't resolve become a
                 // sentinel material -- visually obvious without
                 // crashing the renderer.
-                let mut bound: [WorldRenderMaterial; MAX_ROOM_MATERIALS] = [WorldRenderMaterial::both(
-                    TextureMaterial::opaque(0, TPAGE_WORD, (0x80, 0x80, 0x80)),
-                );
-                    MAX_ROOM_MATERIALS];
+                let mut bound: [WorldRenderMaterial; MAX_ROOM_MATERIALS] =
+                    [WorldRenderMaterial::both(TextureMaterial::opaque(
+                        0,
+                        TPAGE_WORD,
+                        (0x80, 0x80, 0x80),
+                    )); MAX_ROOM_MATERIALS];
                 for i in 0..active.material_count {
                     if let Some(m) = active.materials[i] {
                         bound[i] = m;
@@ -749,8 +760,9 @@ impl Scene for Playtest {
                     &mut world,
                 );
                 telemetry::stage_end(telemetry::stage::MODEL_INSTANCES);
-                total_instance_stats.draws =
-                    total_instance_stats.draws.saturating_add(instance_stats.draws);
+                total_instance_stats.draws = total_instance_stats
+                    .draws
+                    .saturating_add(instance_stats.draws);
                 accumulate_model_stats(&mut total_instance_stats.stats, instance_stats.stats);
             }
 
@@ -1734,7 +1746,8 @@ fn build_room_materials(
             slot_record.clut_word,
             slot_record.tpage_word,
             rgb_tuple(material.tint_rgb),
-        );
+        )
+        .with_texture_window(slot_record.texture_window);
         out[slot] = Some(match material.sidedness() {
             LevelMaterialSidedness::Front => WorldRenderMaterial::front(texture),
             LevelMaterialSidedness::Back => WorldRenderMaterial::back(texture),
@@ -1861,30 +1874,44 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
         return None;
     }
 
-    // Pick a full 4bpp tpage page per room material. v1 world UVs
-    // are page-relative and always start at u=0, so page isolation is
-    // the material selector; the CLUT only selects the palette.
+    if texture.width() > ROOM_TILE_TEXELS || texture.height() > ROOM_TILE_TEXELS {
+        return None;
+    }
+
+    // Pack room materials into 64x64 cells inside 4bpp tpages. The
+    // material's GP0(E2) texture window makes authored UV repetition
+    // wrap inside this cell.
     let room_index = u16::try_from(room_count).ok()?;
+    let page_index = room_index / ROOM_TILES_PER_PAGE;
+    let tile_index = room_index % ROOM_TILES_PER_PAGE;
+    let tile_x = tile_index % ROOM_TILE_COLUMNS;
+    let tile_y = tile_index / ROOM_TILE_COLUMNS;
     let tpage_x = SHARED_TPAGE
         .x()
-        .checked_add(room_index.checked_mul(ROOM_TPAGE_STRIDE_HW)?)?;
-    let end_x = tpage_x.checked_add(texture.halfwords_per_row())?;
+        .checked_add(page_index.checked_mul(ROOM_TPAGE_STRIDE_HW)?)?;
+    let end_x = tpage_x.checked_add(ROOM_TPAGE_STRIDE_HW)?;
     if end_x > ROOM_TPAGE_LIMIT_X {
         return None;
     }
+    let tile_x_hw = tile_x.checked_mul(ROOM_TILE_HALFWORDS)?;
+    let tile_y_px = tile_y.checked_mul(ROOM_TILE_TEXELS)?;
+    let tile_origin_u = u8::try_from(tile_x.checked_mul(ROOM_TILE_TEXELS)?).ok()?;
+    let tile_origin_v = u8::try_from(tile_y.checked_mul(ROOM_TILE_TEXELS)?).ok()?;
     let clut_x = ROOM_CLUT_BASE_X.checked_add(room_index.checked_mul(ROOM_CLUT_STRIDE)?)?;
     if clut_x.checked_add(texture.clut_entries())? > 1024 {
         return None;
     }
     let tpage = Tpage::new(tpage_x, SHARED_TPAGE.y(), TexDepth::Bit4);
 
-    let pix_rect = VramRect::new(
-        tpage_x,
-        SHARED_TPAGE.y(),
-        texture.halfwords_per_row(),
-        texture.height(),
-    );
-    upload_bytes(pix_rect, texture.pixel_bytes());
+    if !upload_4bpp_tile(
+        tpage_x.checked_add(tile_x_hw)?,
+        SHARED_TPAGE.y().checked_add(tile_y_px)?,
+        ROOM_TILE_HALFWORDS,
+        ROOM_TILE_TEXELS,
+        &texture,
+    ) {
+        return None;
+    }
 
     let clut_rect = VramRect::new(clut_x, ROOM_CLUT_Y, texture.clut_entries(), 1);
     upload_clut(clut_rect, texture.clut_bytes());
@@ -1894,6 +1921,12 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
         asset: asset_id,
         clut_word: clut.uv_clut_word(),
         tpage_word: tpage.uv_tpage_word(0),
+        texture_window: room_texture_window(
+            tile_origin_u,
+            tile_origin_v,
+            texture.width(),
+            texture.height(),
+        )?,
     };
 
     unsafe {
@@ -1907,6 +1940,22 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
     }
 
     Some(slot)
+}
+
+fn room_texture_window(origin_u: u8, origin_v: u8, width: u16, height: u16) -> Option<TextureWindow> {
+    Some(TextureWindow::power_of_two_tile(
+        origin_u,
+        origin_v,
+        room_texture_window_size(width)?,
+        room_texture_window_size(height)?,
+    ))
+}
+
+fn room_texture_window_size(size: u16) -> Option<u8> {
+    if size < 8 || size > ROOM_TILE_TEXELS || !size.is_power_of_two() || size % 8 != 0 {
+        return None;
+    }
+    u8::try_from(size).ok()
 }
 
 /// Upload an 8bpp model atlas to the dedicated model VRAM
@@ -1954,6 +2003,7 @@ fn ensure_model_atlas_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<
         asset: asset_id,
         clut_word: Clut::new(0, clut_y).uv_clut_word(),
         tpage_word: MODEL_TPAGE_WORD,
+        texture_window: TextureWindow::NONE,
     };
 
     unsafe {
@@ -2107,8 +2157,7 @@ fn draw_entity_markers(
     // Reuse the room's first material so we don't need a
     // dedicated marker texture. Tint override picks up the
     // existing CLUT + tpage but recolours.
-    let base = materials[0].texture;
-    let material = TextureMaterial::opaque(base.clut_word(), base.tpage_word(), MARKER_TINT);
+    let material = materials[0].texture.with_tint(MARKER_TINT);
     let opts = options.with_material_layer(material);
     const UVS: [(u8, u8); 4] = [(0, 0), (64, 0), (64, 64), (0, 64)];
 

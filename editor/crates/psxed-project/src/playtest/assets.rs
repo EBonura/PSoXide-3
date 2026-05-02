@@ -50,7 +50,49 @@ pub(super) fn expect_room_material_depth(resource: &Resource, bytes: &[u8]) -> R
             texture.clut_entries(),
         ));
     }
+    if !is_supported_room_material_dimension(texture.width())
+        || !is_supported_room_material_dimension(texture.height())
+    {
+        return Err(format!(
+            "texture '{}' must be a power-of-two room material no larger than 64x64 texels and aligned to 8-texel texture-window units; found {}x{}",
+            resource.name,
+            texture.width(),
+            texture.height(),
+        ));
+    }
     Ok(())
+}
+
+fn is_supported_room_material_dimension(size: u16) -> bool {
+    size >= 8 && size <= 64 && size.is_power_of_two() && size % 8 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ProjectDocument, ResourceData};
+
+    #[test]
+    fn room_material_rejects_non_texture_window_dimensions() {
+        let mut bytes =
+            std::fs::read(crate::default_project_dir().join("assets/textures/floor.psxt"))
+                .expect("starter floor texture exists");
+        // AssetHeader is 12 bytes; TextureHeader width/height live at
+        // payload offsets 2/4. Mutating only the dimensions is enough
+        // to exercise the room-material contract.
+        bytes[14..16].copy_from_slice(&48u16.to_le_bytes());
+        let mut project = ProjectDocument::new("room-materials");
+        let id = project.add_resource(
+            "Odd Tile",
+            ResourceData::Texture {
+                psxt_path: "assets/textures/odd.psxt".to_string(),
+            },
+        );
+        let resource = project.resource(id).expect("resource inserted");
+
+        let error = expect_room_material_depth(&resource, &bytes).expect_err("48-wide rejected");
+        assert!(error.contains("power-of-two room material"));
+    }
 }
 
 /// Read the texture's `.psxt` bytes from disk. Resolves

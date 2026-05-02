@@ -296,7 +296,7 @@ impl CharacterMotorState {
         }
 
         if let Some((move_x, move_z, move_mag)) = analog_move_vector(input) {
-            self.update_sprint_gate(input.sprint, true);
+            self.update_sprint_gate(input.sprint);
             self.yaw = yaw_from_vector(move_x, move_z);
             let wants_sprint = input.sprint;
             let sprinting = self.can_sprint(wants_sprint, config);
@@ -341,7 +341,7 @@ impl CharacterMotorState {
         }
 
         let moving_intent = input.walk != 0;
-        self.update_sprint_gate(input.sprint, moving_intent);
+        self.update_sprint_gate(input.sprint);
         let wants_forward_sprint = input.sprint && input.walk > 0;
         let sprinting = moving_intent && self.can_sprint(wants_forward_sprint, config);
         let speed = if sprinting {
@@ -543,15 +543,18 @@ impl CharacterMotorState {
             .min(config.stamina_max_q12);
     }
 
-    fn update_sprint_gate(&mut self, wants_sprint: bool, moving: bool) {
-        if !wants_sprint || !moving {
+    fn update_sprint_gate(&mut self, wants_sprint: bool) {
+        if !wants_sprint {
             self.sprint_latched = false;
             self.sprint_exhausted = false;
         }
     }
 
     fn can_sprint(&mut self, wants_sprint: bool, config: CharacterMotorConfig) -> bool {
-        if !wants_sprint || self.sprint_exhausted || self.stamina_q12 <= 0 {
+        if !wants_sprint {
+            return false;
+        }
+        if self.sprint_exhausted || self.stamina_q12 <= 0 {
             self.sprint_latched = false;
             return false;
         }
@@ -989,6 +992,38 @@ mod tests {
         let restarted = motor.update(None, held, cfg);
         assert_eq!(restarted.anim, CharacterMotorAnim::Run);
         assert!(restarted.sprinting);
+    }
+
+    #[test]
+    fn held_sprint_survives_brief_direction_change_idle_gap() {
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
+        let mut cfg = config();
+        cfg.stamina_max_q12 = 512;
+        cfg.sprint_min_q12 = 384;
+        cfg.sprint_drain_q12 = 256;
+        cfg.stamina_recover_q12 = 0;
+        motor.stamina_q12 = cfg.stamina_max_q12;
+
+        let held_run = CharacterMotorInput {
+            walk: 1,
+            sprint: true,
+            ..CharacterMotorInput::default()
+        };
+        let held_idle = CharacterMotorInput {
+            sprint: true,
+            ..CharacterMotorInput::default()
+        };
+
+        let first = motor.update(None, held_run, cfg);
+        assert_eq!(first.anim, CharacterMotorAnim::Run);
+        assert_eq!(first.stamina_q12, 256);
+
+        let idle_gap = motor.update(None, held_idle, cfg);
+        assert_eq!(idle_gap.anim, CharacterMotorAnim::Idle);
+
+        let resumed = motor.update(None, held_run, cfg);
+        assert_eq!(resumed.anim, CharacterMotorAnim::Run);
+        assert!(resumed.sprinting);
     }
 
     #[test]

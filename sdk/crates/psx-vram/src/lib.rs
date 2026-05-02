@@ -310,6 +310,11 @@ impl Tpage {
             false,
             true,
         ));
+        // Plain tpage application means "sample the page directly".
+        // Material-aware helpers re-apply their own texture window after
+        // setting draw mode.
+        wait_cmd_ready();
+        write_gp0(gp0::tex_window(0, 0, 0, 0));
     }
 }
 
