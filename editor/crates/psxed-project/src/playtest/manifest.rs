@@ -128,7 +128,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     for room in &package.rooms {
         let _ = writeln!(
             out,
-            "    LevelRoomRecord {{ name: {:?}, world_asset: AssetId({}), origin_x: {}, origin_z: {}, sector_size: {}, material_first: MaterialIndex({}), material_count: {}, flags: 0 }},",
+            "    LevelRoomRecord {{ name: {:?}, world_asset: AssetId({}), origin_x: {}, origin_z: {}, sector_size: {}, material_first: MaterialIndex({}), material_count: {}, fog_rgb: [{}, {}, {}], fog_near: {}, fog_far: {}, flags: {} }},",
             room.name,
             room.world_asset_index,
             room.origin_x,
@@ -136,6 +136,12 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
             room.sector_size,
             room.material_first,
             room.material_count,
+            room.fog_rgb[0],
+            room.fog_rgb[1],
+            room.fog_rgb[2],
+            room.fog_near,
+            room.fog_far,
+            room.flags,
         );
     }
     out.push_str("];\n\n");

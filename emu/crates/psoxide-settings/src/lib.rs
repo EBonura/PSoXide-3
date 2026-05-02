@@ -40,7 +40,7 @@ pub use settings::{EditorSettings, InputBinding, Settings, SettingsError};
 /// Current on-disk format version for `settings.ron`. Bumped when
 /// a breaking change lands; the loader migrates older versions in
 /// place rather than failing outright.
-pub const SETTINGS_VERSION: u32 = 2;
+pub const SETTINGS_VERSION: u32 = 3;
 
 /// Current version for `library.ron`. Cache files from older
 /// versions are discarded silently -- the scanner regenerates them.

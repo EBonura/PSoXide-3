@@ -37,6 +37,7 @@ const GOURAUD_COMMAND_NONE: u16 = u16::MAX;
 enum WorldCommandOrdering {
     LinkedSorted,
     DeferredSorted,
+    DeferredSlotSorted,
     Bucketed,
 }
 
@@ -666,6 +667,27 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         }
     }
 
+    /// Start a world render pass that appends commands into OT buckets and
+    /// sorts only within each occupied bucket at flush.
+    ///
+    /// This preserves the same exact same-slot depth/layer/order semantics as
+    /// the global deferred sorter, but avoids comparing triangles that already
+    /// landed in different ordering-table slots.
+    pub fn new_deferred_slot_sorted(
+        ot: &'a mut OtFrame<'ot, OT_DEPTH>,
+        commands: &'a mut [WorldTriCommand],
+    ) -> Self {
+        Self {
+            ot,
+            commands,
+            slot_heads: [WORLD_COMMAND_NONE; OT_DEPTH],
+            slot_tails: [WORLD_COMMAND_NONE; OT_DEPTH],
+            command_len: 0,
+            next_order: 0,
+            ordering: WorldCommandOrdering::DeferredSlotSorted,
+        }
+    }
+
     /// Start a world render pass that appends commands into coarse OT buckets.
     ///
     /// This is the fastest ordered mode: it preserves submission order within
@@ -685,6 +707,11 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             next_order: 0,
             ordering: WorldCommandOrdering::Bucketed,
         }
+    }
+
+    /// Number of world/model triangle commands queued in this pass.
+    pub const fn command_len(&self) -> usize {
+        self.command_len
     }
 
     /// Submit a projected textured triangle.
@@ -1455,6 +1482,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         match self.ordering {
             WorldCommandOrdering::LinkedSorted => self.insert_command_in_slot(command_index),
             WorldCommandOrdering::DeferredSorted => {}
+            WorldCommandOrdering::DeferredSlotSorted => self.append_command_in_slot(command_index),
             WorldCommandOrdering::Bucketed => self.append_command_in_slot(command_index),
         }
     }
@@ -1528,6 +1556,88 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         }
     }
 
+    fn sort_slot_links(&mut self) {
+        let mut slot = 0;
+        while slot < OT_DEPTH {
+            self.slot_heads[slot] = self.merge_sort_slot_links(self.slot_heads[slot]);
+            self.slot_tails[slot] = WORLD_COMMAND_NONE;
+            slot += 1;
+        }
+    }
+
+    fn merge_sort_slot_links(&mut self, head: u16) -> u16 {
+        if head == WORLD_COMMAND_NONE {
+            return head;
+        }
+        let next = self.commands[head as usize].next;
+        if next == WORLD_COMMAND_NONE {
+            return head;
+        }
+
+        let mid = self.split_slot_links(head);
+        let left = self.merge_sort_slot_links(head);
+        let right = self.merge_sort_slot_links(mid);
+        self.merge_sorted_slot_links(left, right)
+    }
+
+    fn split_slot_links(&mut self, head: u16) -> u16 {
+        let mut slow = head;
+        let mut fast = self.commands[head as usize].next;
+        while fast != WORLD_COMMAND_NONE {
+            fast = self.commands[fast as usize].next;
+            if fast != WORLD_COMMAND_NONE {
+                slow = self.commands[slow as usize].next;
+                fast = self.commands[fast as usize].next;
+            }
+        }
+
+        let mid = self.commands[slow as usize].next;
+        self.commands[slow as usize].next = WORLD_COMMAND_NONE;
+        mid
+    }
+
+    fn merge_sorted_slot_links(&mut self, mut left: u16, mut right: u16) -> u16 {
+        let mut head = WORLD_COMMAND_NONE;
+        let mut tail = WORLD_COMMAND_NONE;
+
+        while left != WORLD_COMMAND_NONE && right != WORLD_COMMAND_NONE {
+            let take_left = !should_insert_world_before(
+                self.commands[right as usize],
+                self.commands[left as usize],
+            );
+            let link = if take_left {
+                let next = self.commands[left as usize].next;
+                let out = left;
+                left = next;
+                out
+            } else {
+                let next = self.commands[right as usize].next;
+                let out = right;
+                right = next;
+                out
+            };
+            self.commands[link as usize].next = WORLD_COMMAND_NONE;
+            if head == WORLD_COMMAND_NONE {
+                head = link;
+            } else {
+                self.commands[tail as usize].next = link;
+            }
+            tail = link;
+        }
+
+        let rest = if left != WORLD_COMMAND_NONE {
+            left
+        } else {
+            right
+        };
+        if head == WORLD_COMMAND_NONE {
+            rest
+        } else {
+            self.commands[tail as usize].next = rest;
+            head
+        }
+    }
+
     /// Sort and insert all submitted triangles into the ordering table.
     pub fn flush(mut self) {
         if self.ordering == WorldCommandOrdering::DeferredSorted {
@@ -1549,7 +1659,9 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             return;
         }
 
-        if self.ordering == WorldCommandOrdering::Bucketed {
+        if self.ordering == WorldCommandOrdering::DeferredSlotSorted {
+            self.sort_slot_links();
+        } else if self.ordering == WorldCommandOrdering::Bucketed {
             // OrderingTable::insert prepends packets. Bucketed mode appends
             // submissions so reversing each bucket once here makes the final
             // GPU DMA walk preserve same-slot submission order without doing

@@ -14,13 +14,10 @@
 //! 5. Walk the OT via `iter_packets`, build a `GpuCmdLogEntry` log,
 //!    hand it to `psx-gpu-render::HwRenderer::render_frame`.
 //!
-//! That's the same path PS1 software follows (minus DMA) -- so the
-//! editor preview is bit-identical to the renderer the emulator runs
-//! against the actual cooked `.psxw`.
-//!
-//! Walls / ceilings / textures land in later phases. This phase is
-//! the smallest end-to-end loop that proves authored Room data
-//! drives the editor renderer.
+//! Scene geometry stays on the PSX-style path. Editor-only
+//! affordances such as bounds, selection, and paint previews are
+//! returned as host-drawn overlay lines so they can use fractional UI
+//! strokes without PSX integer-pixel limitations.
 
 use std::sync::Mutex;
 
@@ -60,6 +57,9 @@ const SCREEN_CY: i32 = SCREEN_H / 2;
 const PROJ_H: i32 = 320;
 const PREVIEW_PROJECTION: psx_engine::WorldProjection =
     psx_engine::WorldProjection::new(SCREEN_CX as i16, SCREEN_CY as i16, PROJ_H, 1);
+const EDITOR_PREVIEW_HOVER_STROKE_WIDTH: f32 = 1.5;
+const EDITOR_PREVIEW_SELECTED_STROKE_WIDTH: f32 = 3.0;
+const EDITOR_PREVIEW_PAINT_STROKE_WIDTH: f32 = 2.0;
 
 /// Per-frame scratch -- primitives **and** OT must live in the same
 /// memory region. `OrderingTable` stores 24-bit chain pointers (the
@@ -78,6 +78,10 @@ struct PreviewScratch {
     /// `tex_used` = next free slot in `tex_tris`.
     used: usize,
     tex_used: usize,
+    /// Host-drawn overlay lines for editor affordances. These stay
+    /// outside the GP0 command log so the UI can draw fractional,
+    /// overlaid strokes that are not limited by PSX integer pixels.
+    overlay_lines: Vec<psxed_ui::EditorViewportOverlayLine>,
     /// GP0(02h) fill-rectangle packet: 1 tag word + 3 data words
     /// (`opcode|color`, `pack_xy(x, y)`, `pack_xy(w, h)`). Must live
     /// in the same static as the OT for the same reason the prim
@@ -103,42 +107,56 @@ static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
     tex_tris: [EMPTY_TEX_TRI; TRI_CAP],
     used: 0,
     tex_used: 0,
+    overlay_lines: Vec::new(),
     clear_packet: [0; 4],
 });
 
-/// Build a fresh `cmd_log` rendering the project's first Room from
+/// Render data for one editable 3D preview frame.
+pub struct EditorPreviewFrame {
+    /// PSX-style command log for the scene itself.
+    pub cmd_log: Vec<GpuCmdLogEntry>,
+    /// Host UI overlay lines for editor-only affordances.
+    pub overlay_lines: Vec<psxed_ui::EditorViewportOverlayLine>,
+}
+
+/// Build a fresh preview frame rendering the project's first Room from
 /// `camera`'s orbit angles.
 ///
-/// Returns an empty log if the project has no Rooms -- the editor
+/// Returns an empty frame if the project has no Rooms -- the editor
 /// renderer will then paint a black panel, which is the correct "no
 /// scene to show" affordance.
 #[allow(clippy::too_many_arguments)]
-pub fn build_phase1_cmd_log(
+pub fn build_phase1_frame(
     project: &ProjectDocument,
     camera: ViewportCameraState,
     selected: psxed_project::NodeId,
     hovered_primitive: Option<psxed_ui::Selection>,
     selected_primitive: Option<psxed_ui::Selection>,
+    selected_sector_faces: &[psxed_ui::FaceRef],
     paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     entity_bounds: &[psxed_ui::EntityBounds],
     hovered_entity_node: Option<psxed_project::NodeId>,
     textures: &EditorTextures,
     assets: &crate::editor_assets::EditorAssets,
-) -> Vec<GpuCmdLogEntry> {
-    let Some((room_id, grid, target)) = first_room_grid(project) else {
-        return Vec::new();
+) -> EditorPreviewFrame {
+    let Some((room_id, grid)) = first_room_grid(project) else {
+        return EditorPreviewFrame {
+            cmd_log: Vec::new(),
+            overlay_lines: Vec::new(),
+        };
     };
 
     let mut scratch = SCRATCH.lock().expect("editor preview scratch mutex");
     scratch.used = 0;
     scratch.tex_used = 0;
+    scratch.overlay_lines.clear();
     scratch.ot.clear();
 
     push_clear(&mut scratch);
-    let world_camera = setup_gte_for_camera(camera, target);
+    let world_camera = setup_gte_for_camera(camera);
     walk_room(project, room_id, grid, textures, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
-    walk_light_gizmos(project, grid, selected, &mut scratch);
+    walk_light_gizmos(project, grid, selected, hovered_entity_node, &mut scratch);
 
     // Selection / hover / paint overlays drawn before models --
     // they project through the camera GTE matrix that
@@ -149,6 +167,9 @@ pub fn build_phase1_cmd_log(
     // model joint matrix.
     if let Some(selection) = selected_primitive {
         push_selection_outline(grid, selection, OutlineRole::Selected, &mut scratch);
+    }
+    for face in selected_sector_faces {
+        push_face_outline(grid, *face, FACE_OUTLINE_SELECTED, &mut scratch);
     }
     if let Some(selection) = hovered_primitive {
         if Some(selection) != selected_primitive {
@@ -172,21 +193,21 @@ pub fn build_phase1_cmd_log(
     // Re-prime the GTE with the camera matrix -- model
     // rendering left it set to the last joint's view, which
     // would project entity bound lines into junk.
-    let _ = setup_gte_for_camera(camera, target);
+    let _ = setup_gte_for_camera(camera);
     walk_entity_bounds(entity_bounds, selected, hovered_entity_node, &mut scratch);
 
     // SAFETY: `scratch.tris` lives until end of this function (the
     // mutex guard keeps it alive); the OT chain pointers reference
     // packets inside that vec and are stable while the lock is held.
-    unsafe { psx_gpu_render::build_cmd_log(&scratch.ot) }
+    let cmd_log = unsafe { psx_gpu_render::build_cmd_log(&scratch.ot) };
+    EditorPreviewFrame {
+        cmd_log,
+        overlay_lines: scratch.overlay_lines.clone(),
+    }
 }
 
-/// First Room node in the active scene plus the world-space point we
-/// want the orbit camera to look at (centre of the grid at floor
-/// height). `None` if no Room exists.
-fn first_room_grid(
-    project: &ProjectDocument,
-) -> Option<(psxed_project::NodeId, &WorldGrid, [i32; 3])> {
+/// First Room node in the active scene. `None` if no Room exists.
+fn first_room_grid(project: &ProjectDocument) -> Option<(psxed_project::NodeId, &WorldGrid)> {
     let scene = project.active_scene();
     let room = scene
         .nodes()
@@ -195,15 +216,14 @@ fn first_room_grid(
     let NodeKind::Room { grid } = &room.kind else {
         return None;
     };
-    // Geometric centre in world coords accounts for `origin` so the
-    // camera reframes naturally as the grid grows in any direction.
-    Some((room.id, grid, spatial::room_preview_center(grid)))
+    Some((room.id, grid))
 }
 
 /// Configure the host-side GTE so subsequent `project_vertex` /
 /// `project_triangle` calls produce screen-space coords for the
 /// requested orbit camera.
-fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) -> psx_engine::WorldCamera {
+fn setup_gte_for_camera(camera: ViewportCameraState) -> psx_engine::WorldCamera {
+    let target = camera.target;
     // Orbit camera world position: target offset by radius along the
     // unit vector implied by yaw + pitch. Pitch positive = camera
     // raised above the target, looking down.
@@ -539,7 +559,7 @@ fn preview_lights(scene: &Scene) -> Vec<PreviewLightMeta> {
                     radius: *radius,
                 });
             }
-            NodeKind::Entity | NodeKind::Actor => {
+            NodeKind::Entity => {
                 for child in component_children(scene, node) {
                     let NodeKind::PointLight {
                         color,
@@ -592,7 +612,7 @@ fn preview_model_reference(scene: &Scene, node: &SceneNode) -> Option<PreviewMod
             renderer_node: None,
             animator_node: None,
         }),
-        NodeKind::Entity | NodeKind::Actor => {
+        NodeKind::Entity => {
             let mut renderer = None;
             let mut animator = None;
             for child in component_children(scene, node) {
@@ -635,7 +655,7 @@ fn preview_player_reference(scene: &Scene, node: &SceneNode) -> Option<PreviewPl
             character: *character,
             controller_node: None,
         }),
-        NodeKind::Entity | NodeKind::Actor => component_children(scene, node).find_map(|child| {
+        NodeKind::Entity => component_children(scene, node).find_map(|child| {
             let NodeKind::CharacterController {
                 character,
                 player: true,
@@ -1074,7 +1094,7 @@ const PREVIEW_JOINT_CAP: usize = 32;
 
 /// Per-frame tick used to advance animation phase for the
 /// editor's looping model preview. Bumped once per
-/// `build_phase1_cmd_log` call. PSX angle / phase math needs
+/// `build_phase1_frame` call. PSX angle / phase math needs
 /// monotonic ticks rather than wall-clock, and the editor
 /// frame rate fluctuates on host -- so this is "preview
 /// frames", not real-time. Good enough for inspector preview.
@@ -1101,7 +1121,7 @@ struct PreviewModelInstance<'a> {
 }
 
 /// Render every Model-backed legacy `MeshInstance` or component
-/// `Entity`/`Actor` in the scene as a real textured animated model.
+/// `Entity` in the scene as a real textured animated model.
 /// Mirrors the runtime path in `editor-playtest`: parse `.psxmdl`
 /// + `.psxt` + `.psxanim`, upload atlas (lazily -- done by
 /// `EditorTextures::refresh_models`), compose joint transforms via
@@ -1405,11 +1425,11 @@ fn draw_model_selection_gizmo(meta: &InstanceMeta, scratch: &mut PreviewScratch)
 
     let cyan = FaceOutlineStyle {
         rgb: (0x40, 0xC8, 0xE8),
-        thickness_px: 3,
+        thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
     };
     let yellow = FaceOutlineStyle {
         rgb: (0xF0, 0xC8, 0x40),
-        thickness_px: 3,
+        thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
     };
     if origin_p.sz != 0 && top_p.sz != 0 {
         push_screen_line(scratch, origin_p, top_p, cyan);
@@ -1605,38 +1625,35 @@ fn projected_from_engine(projected: psx_engine::ProjectedVertex) -> psx_gte::sce
     }
 }
 
-/// Draw a horizontal radius ring at floor level for every legacy
-/// Light and component PointLight in the scene. Selected lights get
-/// a thicker, brighter ring; unselected lights get a thin one in
-/// the light's own colour. Marker squares + selection gizmos are
-/// still drawn by `walk_entities` (the ring is additive).
+/// Draw a horizontal radius ring plus a host-side bulb icon for every
+/// legacy Light and component PointLight in the scene. The bulb
+/// replaces the old coloured square marker so lights read as editor
+/// light gizmos rather than generic entities.
 fn walk_light_gizmos(
     project: &ProjectDocument,
     grid: &WorldGrid,
     selected: psxed_project::NodeId,
+    hovered: Option<psxed_project::NodeId>,
     scratch: &mut PreviewScratch,
 ) {
     let scene = project.active_scene();
     for light in preview_lights(scene) {
-        if light.radius <= 0.0 {
-            continue;
-        }
         let center = node_room_local_origin(grid, &light.transform);
         let center_world = [center.x, center.y, center.z];
-        // Light radius is authored in *sector units*; scale to
-        // engine units so the ring matches the light's actual
-        // attenuation footprint.
-        let radius_engine = spatial::light_radius_engine_units(grid, light.radius);
-        if radius_engine <= 0 {
-            continue;
-        }
-
         let is_selected =
             preview_reference_selected(selected, light.host_id, light.component_id, None);
+        let is_hovered = hovered.is_some_and(|id| {
+            preview_reference_selected(id, light.host_id, light.component_id, None)
+        });
         let style = if is_selected {
             FaceOutlineStyle {
                 rgb: (0xFF, 0xE0, 0x80),
-                thickness_px: 3,
+                thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
+            }
+        } else if is_hovered {
+            FaceOutlineStyle {
+                rgb: (0xFF, 0xF0, 0x90),
+                thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
             }
         } else {
             // Tint the unlit ring toward the authored colour
@@ -1647,21 +1664,36 @@ fn walk_light_gizmos(
                     light.color[1].max(0x40),
                     light.color[2].max(0x40),
                 ),
-                thickness_px: 1,
+                thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
             }
         };
-        push_horizontal_ring(scratch, center_world, radius_engine, 16, style);
+        // Light radius is authored in *sector units*; scale to
+        // engine units so the ring matches the light's actual
+        // attenuation footprint. The bulb remains visible even
+        // for radius-zero lights.
+        let radius_engine = spatial::light_radius_engine_units(grid, light.radius);
+        if radius_engine > 0 {
+            push_horizontal_ring(scratch, center_world, radius_engine, 16, style);
+        }
+        push_light_bulb_icon(
+            scratch,
+            center_world,
+            (
+                light.color[0].max(0x40),
+                light.color[1].max(0x40),
+                light.color[2].max(0x40),
+            ),
+            is_selected || is_hovered,
+        );
     }
 }
 
 /// Wireframe AABB + facing arrow per selectable scene entity.
 /// Bounds are gathered by `EditorWorkspace::collect_entity_bounds`
-/// -- every entity-kind node (model, spawn, light, trigger,
-/// portal, audio source, legacy mesh) carries an AABB the user
-/// can click to select and drag to move. This pass renders the
-/// box wireframe so the user can *see* what they're picking;
-/// the picker itself runs in psxed-ui and never reads from the
-/// editor preview.
+/// -- every entity-kind node carries an AABB the user can click to
+/// select and drag to move. This pass renders the box wireframe for
+/// non-light markers; lights use the bulb/radius gizmo above instead
+/// of a generic cube.
 ///
 /// Idle bounds draw thin and muted so they don't dominate the
 /// viewport over the room they sit in. Hover and selected reuse
@@ -1674,6 +1706,9 @@ fn walk_entity_bounds(
     scratch: &mut PreviewScratch,
 ) {
     for b in bounds {
+        if matches!(b.kind, psxed_ui::EntityBoundKind::Light) {
+            continue;
+        }
         let is_selected = b.node == selected;
         let is_hovered = hovered == Some(b.node);
         let style = entity_bound_style(b.kind, is_selected, is_hovered);
@@ -1704,10 +1739,10 @@ fn entity_bound_style(
     hovered: bool,
 ) -> FaceOutlineStyle {
     if selected {
-        return FACE_OUTLINE_SELECTED;
+        return ENTITY_BOUND_SELECTED;
     }
     if hovered {
-        return FACE_OUTLINE_HOVER;
+        return ENTITY_BOUND_HOVER;
     }
     let rgb = match kind {
         psxed_ui::EntityBoundKind::Model => (0xC0, 0xC8, 0xD0),
@@ -1720,7 +1755,7 @@ fn entity_bound_style(
     };
     FaceOutlineStyle {
         rgb,
-        thickness_px: 1,
+        thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
     }
 }
 
@@ -1844,6 +1879,107 @@ fn push_horizontal_ring(
     let _ = prev_world; // silence the unused-final-assignment lint
 }
 
+fn push_light_bulb_icon(
+    scratch: &mut PreviewScratch,
+    center_world: [i32; 3],
+    rgb: (u8, u8, u8),
+    emphasized: bool,
+) {
+    let projected = gte_scene::project_vertex(world_to_view(center_world));
+    if projected.sz == 0 {
+        return;
+    }
+    let cx = projected.sx as f32;
+    let cy = projected.sy as f32;
+    let radius = if emphasized { 8.5 } else { 7.0 };
+    let icon = FaceOutlineStyle {
+        rgb,
+        thickness_px: if emphasized { 1.0 } else { 0.75 },
+    };
+    let glass = egui::pos2(cx, cy - radius * 0.28);
+    let segments = 16;
+    for i in 0..segments {
+        let a0 = i as f32 * std::f32::consts::TAU / segments as f32;
+        let a1 = (i + 1) as f32 * std::f32::consts::TAU / segments as f32;
+        push_overlay_line(
+            scratch,
+            egui::pos2(glass.x + a0.cos() * radius, glass.y + a0.sin() * radius),
+            egui::pos2(glass.x + a1.cos() * radius, glass.y + a1.sin() * radius),
+            icon,
+        );
+    }
+
+    let neck_y = glass.y + radius * 0.72;
+    let base_y = neck_y + radius * 0.62;
+    let neck_half = radius * 0.46;
+    let base_half = radius * 0.34;
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx - neck_half, neck_y),
+        egui::pos2(cx - base_half, base_y),
+        icon,
+    );
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx + neck_half, neck_y),
+        egui::pos2(cx + base_half, base_y),
+        icon,
+    );
+    for step in [0.0, 0.28, 0.56] {
+        let y = neck_y + radius * step;
+        push_overlay_line(
+            scratch,
+            egui::pos2(cx - base_half, y),
+            egui::pos2(cx + base_half, y),
+            icon,
+        );
+    }
+
+    let filament_y = glass.y + radius * 0.18;
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx - radius * 0.36, filament_y),
+        egui::pos2(cx - radius * 0.12, filament_y + radius * 0.2),
+        icon,
+    );
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx - radius * 0.12, filament_y + radius * 0.2),
+        egui::pos2(cx + radius * 0.12, filament_y + radius * 0.2),
+        icon,
+    );
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx + radius * 0.12, filament_y + radius * 0.2),
+        egui::pos2(cx + radius * 0.36, filament_y),
+        icon,
+    );
+
+    if emphasized {
+        let halo = FaceOutlineStyle {
+            rgb: (0xFF, 0xFF, 0xFF),
+            thickness_px: 0.45,
+        };
+        let halo_radius = radius + 2.0;
+        for i in 0..segments {
+            let a0 = i as f32 * std::f32::consts::TAU / segments as f32;
+            let a1 = (i + 1) as f32 * std::f32::consts::TAU / segments as f32;
+            push_overlay_line(
+                scratch,
+                egui::pos2(
+                    glass.x + a0.cos() * halo_radius,
+                    glass.y + a0.sin() * halo_radius,
+                ),
+                egui::pos2(
+                    glass.x + a1.cos() * halo_radius,
+                    glass.y + a1.sin() * halo_radius,
+                ),
+                halo,
+            );
+        }
+    }
+}
+
 fn synth(sx: i16, sy: i16, sz: u16) -> psx_gte::scene::Projected {
     psx_gte::scene::Projected { sx, sy, sz }
 }
@@ -1857,8 +1993,10 @@ fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
         NodeKind::SpawnPoint { player: false, .. } => Some((0x60, 0xB8, 0xF0)),
         NodeKind::MeshInstance { .. } => Some((0xC0, 0xC8, 0xD0)),
         NodeKind::Entity => Some((0xA0, 0xB0, 0xC0)),
-        NodeKind::Actor => Some((0x60, 0xE0, 0x80)),
-        NodeKind::Light { color, .. } => Some((color[0], color[1], color[2])),
+        // Lights draw their own bulb icon + radius ring in
+        // `walk_light_gizmos`; using the generic billboard square
+        // makes them read like ordinary markers.
+        NodeKind::Light { .. } => None,
         NodeKind::Trigger { .. } => Some((0xC8, 0x80, 0xE0)),
         NodeKind::Portal { .. } => Some((0xFF, 0xB0, 0x60)),
         NodeKind::AudioSource { .. } => Some((0x70, 0xD8, 0xC0)),
@@ -1871,7 +2009,7 @@ fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
         | NodeKind::Combat { .. }
         | NodeKind::PointLight { .. }
         | NodeKind::Room { .. }
-        | NodeKind::World
+        | NodeKind::World { .. }
         | NodeKind::Node
         | NodeKind::Node3D => None,
     }
@@ -2079,31 +2217,36 @@ fn push_ghost_wall_outline(
 }
 
 /// Hover and Selected outline styling. RGB plus screen-space line
-/// thickness in pixels; selected reads bolder so the user can spot
-/// it across a busy room. Thicknesses are at least 2 px because
-/// `push_screen_line` carries the line as two screen-space tris
-/// whose half-width gets truncated to integer pixels -- anything
-/// less collapses to a degenerate zero-width strip.
+/// thickness in pixels. Keep these light: they are editor affordances,
+/// not scene geometry, and thick strokes obscure PS1-scale surfaces.
 const FACE_OUTLINE_HOVER: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0xFF, 0xE0, 0x60),
-    thickness_px: 2,
+    thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
 };
 const FACE_OUTLINE_SELECTED: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0x60, 0xC8, 0xFF),
-    thickness_px: 4,
+    thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
+};
+const ENTITY_BOUND_HOVER: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0xFF, 0xE0, 0x60),
+    thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
+};
+const ENTITY_BOUND_SELECTED: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0x60, 0xC8, 0xFF),
+    thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
 };
 /// PaintWall hover preview -- green for "this would be added /
-/// replaced". 3 px so it reads through the `FACE_OUTLINE_HOVER`
-/// yellow when both fire on the same face.
+/// replaced". Slightly stronger than hover, but still thin enough
+/// to leave the underlying face readable.
 const FACE_OUTLINE_WALL_PAINT: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0x60, 0xFF, 0x90),
-    thickness_px: 3,
+    thickness_px: EDITOR_PREVIEW_PAINT_STROKE_WIDTH,
 };
 
 #[derive(Copy, Clone)]
 struct FaceOutlineStyle {
     rgb: (u8, u8, u8),
-    thickness_px: i16,
+    thickness_px: f32,
 }
 
 /// Hover vs Selected -- outline style picker for the unified
@@ -2392,84 +2535,52 @@ fn push_face_outline(
     }
 }
 
-/// Round-away-from-zero, clamped so any non-zero perpendicular is
-/// at least ±1 pixel. Keeps thin diagonal lines from collapsing to
-/// degenerate zero-width strips after `as i16` truncation.
-fn round_perp(value: f32) -> i16 {
-    if value > 0.0 {
-        (value + 0.5).max(1.0) as i16
-    } else if value < 0.0 {
-        (value - 0.5).min(-1.0) as i16
-    } else {
-        0
-    }
-}
-
-/// Emit two triangles forming a `thickness_px`-pixel-wide line
-/// between two screen-projected vertices. The OT slot is pinned at
-/// 0 so the line draws on top of everything.
+/// Queue one host-drawn overlay segment between two screen-projected
+/// vertices. Unlike the scene command log, this is painted by egui on
+/// top of the preview texture, so fractional widths and normal UI
+/// compositing work as expected.
 fn push_screen_line(
     scratch: &mut PreviewScratch,
     a: psx_gte::scene::Projected,
     b: psx_gte::scene::Projected,
     style: FaceOutlineStyle,
 ) {
-    // Perpendicular to (b - a) in screen space, normalised to
-    // `thickness_px / 2`. Width 0 (parallel a/b) collapses the line
-    // to a single screen point, which we just skip.
-    let dx = (b.sx as f32) - (a.sx as f32);
-    let dy = (b.sy as f32) - (a.sy as f32);
+    push_overlay_line(
+        scratch,
+        egui::pos2(a.sx as f32, a.sy as f32),
+        egui::pos2(b.sx as f32, b.sy as f32),
+        style,
+    );
+}
+
+fn push_overlay_line(
+    scratch: &mut PreviewScratch,
+    a: egui::Pos2,
+    b: egui::Pos2,
+    style: FaceOutlineStyle,
+) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
     let len = (dx * dx + dy * dy).sqrt();
     if len < 0.5 {
         return;
     }
-    let half = (style.thickness_px as f32) * 0.5;
-    // Round-away-from-zero on both components so a diagonal screen
-    // edge with a sub-pixel perpendicular doesn't collapse the line
-    // to zero width -- `0.707 as i16` truncates to 0, so a 2 px
-    // hover line on any tilted edge would otherwise disappear. We
-    // also clamp the magnitude to ≥ 1 px on the dominant axis so
-    // very thin slopes still render visibly.
-    let nx_f = -dy / len * half;
-    let ny_f = dx / len * half;
-    let nx = round_perp(nx_f);
-    let ny = round_perp(ny_f);
-    let a_lo = synth(a.sx.saturating_add(-nx), a.sy.saturating_add(-ny), a.sz);
-    let a_hi = synth(a.sx.saturating_add(nx), a.sy.saturating_add(ny), a.sz);
-    let b_lo = synth(b.sx.saturating_add(-nx), b.sy.saturating_add(-ny), b.sz);
-    let b_hi = synth(b.sx.saturating_add(nx), b.sy.saturating_add(ny), b.sz);
-    push_tri_at_slot(scratch, [a_lo, a_hi, b_lo], style.rgb, 0);
-    push_tri_at_slot(scratch, [b_lo, a_hi, b_hi], style.rgb, 0);
+    scratch
+        .overlay_lines
+        .push(psxed_ui::EditorViewportOverlayLine::new(
+            a,
+            b,
+            bright_overlay_color(style.rgb),
+            style.thickness_px,
+        ));
 }
 
-/// Lower-level [`push_tri`] that pins the OT slot rather than
-/// computing it from screen-space depth. Used for fixed-layer
-/// overlays (hover highlight, gizmos, …).
-fn push_tri_at_slot(
-    scratch: &mut PreviewScratch,
-    p: [psx_gte::scene::Projected; 3],
-    rgb: (u8, u8, u8),
-    slot: usize,
-) {
-    if scratch.used >= TRI_CAP {
-        return;
-    }
-    let idx = scratch.used;
-    scratch.tris[idx] = TriFlat::new(
-        [(p[0].sx, p[0].sy), (p[1].sx, p[1].sy), (p[2].sx, p[2].sy)],
-        rgb.0,
-        rgb.1,
-        rgb.2,
-    );
-    scratch.used = idx + 1;
-    let packet_ptr: *mut TriFlat = &mut scratch.tris[idx];
-    unsafe {
-        scratch.ot.insert(
-            slot.min(OT_DEPTH - 1),
-            packet_ptr.cast::<u32>(),
-            TriFlat::WORDS,
-        );
-    }
+fn bright_overlay_color(rgb: (u8, u8, u8)) -> egui::Color32 {
+    let lift = |channel: u8| -> u8 {
+        let c = channel as u16;
+        (c + ((255 - c) * 3 / 5)).min(255) as u8
+    };
+    egui::Color32::from_rgb(lift(rgb.0), lift(rgb.1), lift(rgb.2))
 }
 
 /// Stamp a GP0(02h) fill-rectangle into `scratch.clear_packet` and
@@ -2641,7 +2752,7 @@ mod tests {
             },
         );
         let scene = project.active_scene_mut();
-        let actor = scene.add_node(scene.root, "Enemy", NodeKind::Actor);
+        let actor = scene.add_node(scene.root, "Enemy", NodeKind::Entity);
         let renderer = scene.add_node(
             actor,
             "Model Renderer",
@@ -2678,7 +2789,7 @@ mod tests {
             },
         );
         let scene = project.active_scene_mut();
-        let actor = scene.add_node(scene.root, "Player", NodeKind::Actor);
+        let actor = scene.add_node(scene.root, "Player", NodeKind::Entity);
         let controller = scene.add_node(
             actor,
             "Character Controller",

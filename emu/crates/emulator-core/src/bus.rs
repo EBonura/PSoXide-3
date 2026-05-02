@@ -14,6 +14,7 @@ use crate::irq::{Irq, IrqSource};
 use crate::mmio_trace::{MmioKind, MmioTrace};
 use crate::sio::Sio0;
 use crate::spu::Spu;
+use crate::telemetry::GuestTelemetry;
 use crate::timers::Timers;
 
 mod timing;
@@ -102,6 +103,9 @@ pub struct Bus {
     /// no-op at every call site unless the `trace-mmio` Cargo feature
     /// is enabled -- see `mmio_trace.rs` for the rationale.
     pub mmio_trace: MmioTrace,
+    /// Out-of-band profiler/debug telemetry emitted by instrumented
+    /// homebrew through the Expansion 2 debug port.
+    pub telemetry: GuestTelemetry,
     /// When true, the CPU replaces fetches at `0xA0` / `0xB0` / `0xC0`
     /// with a host-Rust implementation of the BIOS syscall they
     /// dispatch to. Off by default so parity tests stay bit-exact
@@ -193,6 +197,7 @@ impl Bus {
                 s
             },
             mmio_trace: MmioTrace::new(),
+            telemetry: GuestTelemetry::new(),
             hle_bios_enabled: false,
             hle_bios_calls: [[0; 256]; 3],
             hsync_cycles: HSYNC_CYCLES_NTSC,
@@ -1819,6 +1824,9 @@ impl Bus {
     }
 
     fn write32_impl(&mut self, virt: u32, phys: u32, value: u32) {
+        if self.telemetry.observe_write32(phys, value, self.cycles) {
+            return;
+        }
         if phys == IRQ_STAT_ADDR {
             self.irq.write_stat_at(value, self.cycles);
             return;

@@ -72,6 +72,8 @@ pub struct Graphics {
     /// models / clips and evict stale entries; the per-frame
     /// preview pass never touches the filesystem.
     editor_assets: crate::editor_assets::EditorAssets,
+    /// Host-drawn editor overlay lines from the last preview build.
+    editor_overlay_lines: Vec<psxed_ui::EditorViewportOverlayLine>,
 }
 
 impl Graphics {
@@ -165,6 +167,7 @@ impl Graphics {
             editor_gpu_stub: Gpu::new(),
             editor_textures: crate::editor_textures::EditorTextures::new(),
             editor_assets: crate::editor_assets::EditorAssets::new(),
+            editor_overlay_lines: Vec::new(),
         }
     }
 
@@ -190,6 +193,11 @@ impl Graphics {
         self.editor_hw_renderer.texture_id()
     }
 
+    /// Host-drawn overlay lines from the latest editor preview pass.
+    pub fn editor_overlay_lines(&self) -> &[psxed_ui::EditorViewportOverlayLine] {
+        &self.editor_overlay_lines
+    }
+
     /// Render one frame of the editor preview through the second
     /// `HwRenderer` instance.
     ///
@@ -197,7 +205,9 @@ impl Graphics {
     /// floor through the host GTE shim, and feeds the resulting
     /// `TriFlat` packets to the renderer. The path is intentionally
     /// the same one PS1 runtime code follows -- only the final DMA
-    /// step is replaced by `build_cmd_log` + `render_frame`.
+    /// step is replaced by `build_cmd_log` + `render_frame`. Editor
+    /// affordance lines are returned separately for egui to draw over
+    /// the preview texture.
     #[allow(clippy::too_many_arguments)]
     pub fn render_editor_preview(
         &mut self,
@@ -207,6 +217,7 @@ impl Graphics {
         selected: psxed_project::NodeId,
         hovered_primitive: Option<psxed_ui::Selection>,
         selected_primitive: Option<psxed_ui::Selection>,
+        selected_sector_faces: &[psxed_ui::FaceRef],
         paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
         entity_bounds: &[psxed_ui::EntityBounds],
         hovered_entity_node: Option<psxed_project::NodeId>,
@@ -214,21 +225,23 @@ impl Graphics {
         self.editor_textures.refresh(project, project_root);
         self.editor_textures.refresh_models(project, project_root);
         self.editor_assets.refresh(project, project_root);
-        let cmd_log = crate::editor_preview::build_phase1_cmd_log(
+        let frame = crate::editor_preview::build_phase1_frame(
             project,
             camera,
             selected,
             hovered_primitive,
             selected_primitive,
+            selected_sector_faces,
             paint_target_preview,
             entity_bounds,
             hovered_entity_node,
             &self.editor_textures,
             &self.editor_assets,
         );
+        self.editor_overlay_lines = frame.overlay_lines;
         self.editor_hw_renderer.render_frame(
             &self.editor_gpu_stub,
-            &cmd_log,
+            &frame.cmd_log,
             self.editor_textures.vram_words(),
         );
     }

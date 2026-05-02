@@ -3,9 +3,9 @@
 use super::*;
 
 pub(super) fn validate_grid_shape(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
-    if grid.sector_size != world::SECTOR_SIZE {
+    if snap_world_sector_size(grid.sector_size) != grid.sector_size {
         return Err(WorldGridCookError::UnsupportedSectorSize {
-            expected: world::SECTOR_SIZE,
+            expected: WORLD_SECTOR_SIZE_QUANTUM,
             actual: grid.sector_size,
         });
     }

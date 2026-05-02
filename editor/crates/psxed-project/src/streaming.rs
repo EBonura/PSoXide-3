@@ -502,6 +502,7 @@ mod tests {
                 default_clip: None,
                 preview_clip: None,
                 world_height: 1024,
+                scale_q8: [crate::MODEL_SCALE_ONE_Q8; 3],
             }),
         );
         let character = project.add_resource(
@@ -520,9 +521,9 @@ mod tests {
                 grid: WorldGrid::stone_room(2, 2, 1024, Some(material), None),
             },
         );
-        let actor = scene.add_node(room, "Actor", NodeKind::Actor);
+        let entity = scene.add_node(room, "Entity", NodeKind::Entity);
         scene.add_node(
-            actor,
+            entity,
             "Controller",
             NodeKind::CharacterController {
                 character: Some(character),
@@ -530,7 +531,7 @@ mod tests {
             },
         );
         scene.add_node(
-            actor,
+            entity,
             "Renderer",
             NodeKind::ModelRenderer {
                 model: Some(model),

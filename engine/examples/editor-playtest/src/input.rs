@@ -57,7 +57,7 @@ pub(crate) fn player_anim_from_motor(anim: CharacterMotorAnim) -> PlayerAnim {
 pub(crate) fn camera_input(ctx: &Ctx) -> ThirdPersonCameraInput {
     let (right_x, _) = ctx.pad.sticks.right_centered();
     ThirdPersonCameraInput {
-        yaw_delta_q12: stick_to_yaw_delta(InputAxis::new(right_x)),
+        yaw_delta_q12: stick_to_yaw_delta(InputAxis::new(right_x.saturating_neg())),
         recenter: ctx.is_held(button::L1),
     }
 }

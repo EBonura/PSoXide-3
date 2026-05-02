@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use psxed_format::world;
 
 use crate::{
-    GridDirection, GridHorizontalFace, GridSector, GridSplit, GridVerticalFace, GridWalls,
-    MaterialFaceSidedness, MaterialResource, ProjectDocument, PsxBlendMode, ResourceData,
-    ResourceId, WorldGrid, HEIGHT_QUANTUM, MAX_ROOM_BYTES, MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES,
-    MAX_ROOM_WIDTH, MAX_WALL_STACK,
+    snap_world_sector_size, GridDirection, GridHorizontalFace, GridSector, GridSplit,
+    GridVerticalFace, GridWalls, MaterialFaceSidedness, MaterialResource, ProjectDocument,
+    PsxBlendMode, ResourceData, ResourceId, WorldGrid, HEIGHT_QUANTUM, MAX_ROOM_BYTES,
+    MAX_ROOM_DEPTH, MAX_ROOM_TRIANGLES, MAX_ROOM_WIDTH, MAX_WALL_STACK, WORLD_SECTOR_SIZE_QUANTUM,
 };
 
 mod coords;
@@ -55,9 +55,9 @@ impl std::fmt::Display for WorldGridFaceKind {
 /// Errors raised while validating and cooking an authored grid world.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorldGridCookError {
-    /// Runtime currently supports only the canonical PS1 sector scale.
+    /// Sector size must be snapped to the editor/runtime sector quantum.
     UnsupportedSectorSize {
-        /// Required sector size.
+        /// Required sector-size quantum.
         expected: i32,
         /// Authored sector size.
         actual: i32,
@@ -232,7 +232,10 @@ impl std::fmt::Display for WorldGridCookError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedSectorSize { expected, actual } => {
-                write!(f, "unsupported sector size {actual}; expected {expected}")
+                write!(
+                    f,
+                    "unsupported sector size {actual}; expected {expected}-unit increments"
+                )
             }
             Self::InvalidDimensions { width, depth } => {
                 write!(f, "invalid grid dimensions {width} x {depth}")
@@ -449,6 +452,13 @@ pub struct CookedWorldGrid {
     pub ambient_color: [u8; 3],
     /// Whether PS1 depth cue/fog should be enabled.
     pub fog_enabled: bool,
+    /// Authored depth-cue far color. Kept in the cook model even
+    /// while the v1 `.psxw` payload only persists the enable flag.
+    pub fog_color: [u8; 3],
+    /// Authored fog start distance in engine units.
+    pub fog_near: i32,
+    /// Authored fog end distance in engine units.
+    pub fog_far: i32,
 }
 
 impl CookedWorldGrid {
@@ -514,6 +524,9 @@ pub fn cook_world_grid(
         materials,
         ambient_color: grid.ambient_color,
         fog_enabled: grid.fog_enabled,
+        fog_color: grid.fog_color,
+        fog_near: grid.fog_near,
+        fog_far: grid.fog_far,
     })
 }
 
@@ -797,16 +810,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_sector_size() {
+    fn cooks_quantized_non_default_sector_size() {
         let project = ProjectDocument::starter();
         let mut grid = starter_grid(&project);
-        grid.sector_size = 512;
+        grid.rescale_sector_size(1536);
+
+        let cooked = cook_world_grid(&project, &grid).unwrap();
+
+        assert_eq!(cooked.sector_size, 1536);
+    }
+
+    #[test]
+    fn rejects_non_quantized_sector_size() {
+        let project = ProjectDocument::starter();
+        let mut grid = starter_grid(&project);
+        grid.sector_size = 513;
 
         assert_eq!(
             cook_world_grid(&project, &grid).unwrap_err(),
             WorldGridCookError::UnsupportedSectorSize {
-                expected: world::SECTOR_SIZE,
-                actual: 512,
+                expected: WORLD_SECTOR_SIZE_QUANTUM,
+                actual: 513,
             }
         );
     }

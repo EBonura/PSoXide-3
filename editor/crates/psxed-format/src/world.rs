@@ -29,7 +29,7 @@ pub const MAGIC: [u8; 4] = *b"PSXW";
 /// Current (and only) world format revision.
 pub const VERSION: u16 = 1;
 
-/// Engine units per grid sector.
+/// Canonical/default engine units per grid sector.
 pub const SECTOR_SIZE: i32 = 1024;
 
 /// Material sentinel used by missing optional floor/ceiling records.

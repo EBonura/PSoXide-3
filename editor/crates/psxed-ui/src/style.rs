@@ -20,7 +20,6 @@ pub(crate) const STUDIO_TEXT: Color32 = Color32::from_rgb(220, 229, 238);
 pub(crate) const STUDIO_TEXT_WEAK: Color32 = Color32::from_rgb(142, 154, 168);
 pub(crate) const STUDIO_ACCENT: Color32 = Color32::from_rgb(45, 177, 207);
 pub(crate) const STUDIO_ACCENT_DIM: Color32 = Color32::from_rgb(17, 82, 101);
-pub(crate) const STUDIO_GOLD: Color32 = Color32::from_rgb(238, 197, 119);
 pub(crate) const STUDIO_ROOM_FLOOR: Color32 = Color32::from_rgb(119, 132, 143);
 pub(crate) const STUDIO_ROOM_WALL: Color32 = Color32::from_rgb(126, 73, 43);
 

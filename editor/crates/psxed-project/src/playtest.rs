@@ -224,6 +224,14 @@ pub fn build_package(
             sector_size: grid.sector_size,
             material_first,
             material_count,
+            fog_rgb: grid.fog_color,
+            fog_near: grid.fog_near,
+            fog_far: grid.fog_far,
+            flags: if grid.fog_enabled {
+                psx_level::room_flags::FOG_ENABLED
+            } else {
+                0
+            },
         });
     }
 
@@ -253,11 +261,7 @@ pub fn build_package(
         let Some((room_node, room_index)) = enclosing_room(scene, node, &node_to_room_index) else {
             if !matches!(
                 node.kind,
-                NodeKind::Node
-                    | NodeKind::Node3D
-                    | NodeKind::Entity
-                    | NodeKind::Actor
-                    | NodeKind::World
+                NodeKind::Node | NodeKind::Node3D | NodeKind::Entity | NodeKind::World { .. }
             ) {
                 report.warn(format!(
                     "{} '{}' has no enclosing Room — dropped",
@@ -274,7 +278,7 @@ pub fn build_package(
         let yaw = yaw_from_degrees(node.transform.rotation_degrees[1]);
 
         match &node.kind {
-            NodeKind::Entity | NodeKind::Actor => {
+            NodeKind::Entity => {
                 if let Some((model_resource_id, _material)) = component_model_renderer(scene, node)
                     .and_then(|(model, material)| {
                         model
@@ -331,8 +335,10 @@ pub fn build_package(
                             room_index,
                             character: controller.character,
                         });
-                    } else if warned_unsupported.insert("NonPlayerActor") {
-                        report.warn("Non-player Actor components are skipped in this pass");
+                    } else if warned_unsupported.insert("NonPlayerEntity") {
+                        report.warn(
+                            "Non-player Entity character components are skipped in this pass",
+                        );
                     }
                 }
             }
@@ -448,7 +454,7 @@ pub fn build_package(
             }
             NodeKind::Node
             | NodeKind::Node3D
-            | NodeKind::World
+            | NodeKind::World { .. }
             | NodeKind::Room { .. }
             | NodeKind::ModelRenderer { .. }
             | NodeKind::Animator { .. }
@@ -1224,7 +1230,7 @@ mod tests {
         assert!(has_room, "starter must contain a Room");
         assert!(
             has_player_spawn,
-            "starter must contain a player spawn actor"
+            "starter must contain a player spawn entity"
         );
         project
     }
@@ -1232,7 +1238,7 @@ mod tests {
     fn is_player_spawn_node(scene: &crate::Scene, node: &SceneNode) -> bool {
         match &node.kind {
             NodeKind::SpawnPoint { player: true, .. } => true,
-            NodeKind::Actor | NodeKind::Entity => node.children.iter().any(|id| {
+            NodeKind::Entity => node.children.iter().any(|id| {
                 scene.node(*id).is_some_and(|child| {
                     matches!(
                         child.kind,
@@ -1250,7 +1256,7 @@ mod tests {
             .nodes()
             .iter()
             .find(|node| is_player_spawn_node(scene, node))
-            .expect("starter has a player spawn actor")
+            .expect("starter has a player spawn entity")
             .id
     }
 
@@ -1345,7 +1351,7 @@ mod tests {
             .iter()
             .filter(|node| match &node.kind {
                 NodeKind::MeshInstance { mesh: Some(_), .. } => true,
-                NodeKind::Entity | NodeKind::Actor => node.children.iter().any(|id| {
+                NodeKind::Entity => node.children.iter().any(|id| {
                     scene.node(*id).is_some_and(|child| {
                         matches!(child.kind, NodeKind::ModelRenderer { model: Some(_), .. })
                     })
@@ -1721,7 +1727,7 @@ mod tests {
         let (package, _) = build_package(&project, &starter_project_root());
         let package = package.expect("starter cooks");
         assert_eq!(package.models.len(), 1);
-        assert_eq!(package.model_instances.len(), 1);
+        assert_eq!(package.model_instances.len(), 2);
         assert!(!package.model_clips.is_empty());
         assert_eq!(package.model_mesh_asset_count(), 1);
         assert_eq!(
@@ -2332,7 +2338,7 @@ mod tests {
         let (package, _) = build_package(&project, &starter_project_root());
         let package = package.expect("cooks");
         assert_eq!(package.models.len(), 1);
-        assert_eq!(package.model_instances.len(), 2);
+        assert_eq!(package.model_instances.len(), 3);
         // Both instances point at the same model index.
         assert_eq!(
             package.model_instances[0].model,

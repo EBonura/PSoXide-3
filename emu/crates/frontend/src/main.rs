@@ -236,6 +236,7 @@ fn key_to_pad_button(key: &Key, bindings: &PortBindings) -> Option<u16> {
         (button::R2, &bindings.r2),
         (button::START, &bindings.start),
         (button::SELECT, &bindings.select),
+        (button::R3, &bindings.r3),
     ]
     .into_iter()
     .find_map(|(mask, binding)| binding_matches_key(binding, key).then_some(mask))
@@ -592,7 +593,7 @@ impl ApplicationHandler for Shell {
                         // timing model.
                         let audio_start = Instant::now();
                         let effective_audio_volume = self.state.effective_audio_volume();
-                        if let Some(bus) = self.state.bus.as_mut() {
+                        let guest_events = if let Some(bus) = self.state.bus.as_mut() {
                             let cycles_after = bus.cycles();
                             self.audio_cycle_accum = self
                                 .audio_cycle_accum
@@ -615,7 +616,12 @@ impl ApplicationHandler for Shell {
                                 // SPU's internal queue doesn't grow unbounded.
                                 let _ = bus.spu.drain_audio();
                             }
-                        }
+                            bus.telemetry.drain_events()
+                        } else {
+                            Vec::new()
+                        };
+                        let guest_profile = self.state.profiler.consume_guest_events(&guest_events);
+                        profile.add_guest_profile(guest_profile);
                         profile.audio_ms += elapsed_ms(audio_start);
                     }
                     self.emu_frame_accum -= (frames_to_run as f32) * TARGET_FRAME_DT;
@@ -741,6 +747,7 @@ impl ApplicationHandler for Shell {
                     let editor_root = state.editor.project_root();
                     let editor_hover = state.editor.hovered_primitive();
                     let editor_selection = state.editor.selected_primitive();
+                    let editor_selected_sector_faces = state.editor.selected_sector_faces();
                     let editor_paint_preview = state.editor.paint_target_preview();
                     let editor_active_room = state.editor.active_room_id();
                     let editor_entity_bounds =
@@ -753,6 +760,7 @@ impl ApplicationHandler for Shell {
                         editor_selected,
                         editor_hover,
                         editor_selection,
+                        &editor_selected_sector_faces,
                         editor_paint_preview,
                         &editor_entity_bounds,
                         editor_hovered_entity,
@@ -782,7 +790,10 @@ impl ApplicationHandler for Shell {
                         editor_play_uv(state.bus.as_ref(), framebuffer_source),
                     )
                 } else {
-                    psxed_ui::EditorViewport3dPresentation::edit(gfx.editor_hw_texture_id())
+                    psxed_ui::EditorViewport3dPresentation::edit(
+                        gfx.editor_hw_texture_id(),
+                        gfx.editor_overlay_lines().to_vec(),
+                    )
                 };
                 profile.egui = gfx.render(|ctx| {
                     app::build_ui(
@@ -915,6 +926,10 @@ mod tests {
         assert_eq!(
             key_to_pad_button(&Key::Named(NamedKey::Backspace), &bindings),
             Some(button::SELECT)
+        );
+        assert_eq!(
+            key_to_pad_button(&Key::Character("r".into()), &bindings),
+            Some(button::R3)
         );
         assert!(key_is_analog_button(&Key::Named(NamedKey::F9), &bindings));
     }

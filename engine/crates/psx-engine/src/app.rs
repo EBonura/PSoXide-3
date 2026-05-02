@@ -37,6 +37,7 @@ use psx_gpu::{self as gpu, Resolution, VideoMode};
 use psx_pad::{poll_port1, PadState};
 
 use crate::scene::{Ctx, Scene};
+use crate::telemetry;
 use crate::time::{EngineClock, EngineTime};
 
 /// Configuration passed to [`App::run`]. Sensible defaults via
@@ -128,23 +129,32 @@ impl App {
         scene.init(&mut ctx);
 
         loop {
+            telemetry::frame_begin(ctx.frame);
             ctx.time = clock.begin_frame(ctx.frame);
             ctx.pad_prev = ctx.pad;
             ctx.pad = poll_port1();
 
+            telemetry::stage_begin(telemetry::stage::UPDATE);
             scene.update(&mut ctx);
+            telemetry::stage_end(telemetry::stage::UPDATE);
 
+            telemetry::stage_begin(telemetry::stage::FRAME_CLEAR);
             ctx.fb.clear(
                 config.clear_color.0,
                 config.clear_color.1,
                 config.clear_color.2,
             );
+            telemetry::stage_end(telemetry::stage::FRAME_CLEAR);
 
+            telemetry::stage_begin(telemetry::stage::RENDER);
             scene.render(&mut ctx);
+            telemetry::stage_end(telemetry::stage::RENDER);
 
+            telemetry::stage_begin(telemetry::stage::PRESENT);
             clock.wait_present();
             gpu::draw_sync();
             ctx.fb.swap();
+            telemetry::stage_end(telemetry::stage::PRESENT);
             ctx.frame = ctx.frame.wrapping_add(1);
         }
     }

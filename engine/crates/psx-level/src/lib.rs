@@ -87,6 +87,12 @@ typed_index! {
     pub struct ModelClipTableIndex;
 }
 
+/// Room record flags.
+pub mod room_flags {
+    /// Per-room fog/depth cue is enabled.
+    pub const FOG_ENABLED: u16 = 1 << 0;
+}
+
 typed_index! {
     /// Clip index local to one model's clip slice.
     pub struct ModelClipIndex;
@@ -230,6 +236,12 @@ pub struct LevelRoomRecord {
     /// Number of `LevelMaterialRecord`s in this room's slice.
     /// Matches the cooked `.psxw`'s material count.
     pub material_count: u16,
+    /// Fog/depth-cue far colour.
+    pub fog_rgb: [u8; 3],
+    /// Fog start distance in engine units.
+    pub fog_near: i32,
+    /// Fog end distance in engine units.
+    pub fog_far: i32,
     /// Reserved.
     pub flags: u16,
 }

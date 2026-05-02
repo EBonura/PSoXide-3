@@ -81,6 +81,14 @@ pub struct PlaytestRoom {
     /// Number of material records in the slice. Matches the
     /// cooked `.psxw`'s material count exactly.
     pub material_count: u16,
+    /// Fog/depth-cue far colour.
+    pub fog_rgb: [u8; 3],
+    /// Fog start distance in engine units.
+    pub fog_near: i32,
+    /// Fog end distance in engine units.
+    pub fog_far: i32,
+    /// Room flags mirrored into the runtime manifest.
+    pub flags: u16,
 }
 
 /// One material slot binding. Lifted from

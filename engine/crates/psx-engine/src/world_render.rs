@@ -101,6 +101,55 @@ pub struct WorldSurfaceSample {
     pub center: RoomPoint,
 }
 
+/// Coarse grid visibility settings for room rendering.
+///
+/// This is intentionally cell-based rather than triangle-based: the
+/// renderer can reject whole authored sectors before it walks their
+/// floor/wall records. `radius_cells` bounds traversal around an
+/// anchor such as the player, while the camera test rejects cells that
+/// are outside the current view cone.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GridVisibility {
+    /// Runtime room-space anchor, usually the player root.
+    pub anchor: RoomPoint,
+    /// Maximum Chebyshev distance from `anchor` in grid cells.
+    pub radius_cells: u16,
+    /// Extra projected-pixel margin around the viewport. A non-zero
+    /// margin avoids visible popping when a large cell straddles the
+    /// frustum edge.
+    pub screen_margin: i32,
+}
+
+impl GridVisibility {
+    /// Build a conservative grid visibility window around an anchor.
+    pub const fn around(anchor: RoomPoint, radius_cells: u16) -> Self {
+        Self {
+            anchor,
+            radius_cells,
+            screen_margin: 48,
+        }
+    }
+
+    /// Return a copy with a different projected screen margin.
+    pub const fn with_screen_margin(mut self, margin: i32) -> Self {
+        self.screen_margin = margin;
+        self
+    }
+}
+
+/// Runtime counters from a grid-visible room draw.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GridVisibilityStats {
+    /// Non-empty cells considered inside the traversal radius.
+    pub cells_considered: u16,
+    /// Cells rejected by the coarse camera-space bounds test.
+    pub cells_frustum_culled: u16,
+    /// Cells that reached surface emission.
+    pub cells_drawn: u16,
+    /// Floor/ceiling/wall surfaces handed to the projection path.
+    pub surfaces_considered: u16,
+}
+
 /// Hook used by [`draw_room_lit`] to vary material tint per room
 /// surface.
 pub trait WorldSurfaceLighting {
@@ -227,118 +276,304 @@ pub fn draw_room_lit<const OT: usize, L: WorldSurfaceLighting>(
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT>,
 ) {
-    let sector_size = room.sector_size();
     for sx in 0..room.width() {
         for sz in 0..room.depth() {
             let Some(sector) = room.sector(sx, sz) else {
                 continue;
             };
+            let _ = draw_sector_lit(
+                room, sx, sz, sector, materials, lighting, camera, options, triangles, world,
+            );
+        }
+    }
+}
 
-            if sector.has_floor() {
-                if let Some(slot) = sector.floor_material() {
-                    if let Some(&base_material) = materials.get(slot as usize) {
-                        let material = lighting.shade(
-                            WorldSurfaceSample {
-                                kind: WorldSurfaceKind::Floor,
-                                sx,
-                                sz,
-                                center: horizontal_face_center(
-                                    sx,
-                                    sz,
-                                    sector_size,
-                                    sector.floor_heights(),
-                                ),
-                            },
-                            base_material,
-                        );
-                        emit_floor(
+/// Draw a room through a coarse grid visibility pass.
+///
+/// Traversal is ring-ordered from farthest to nearest around
+/// `visibility.anchor`, which gives bucketed ordering a stable coarse
+/// back-to-front submission order before the PS1 ordering table handles
+/// per-triangle depth buckets.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_room_lit_grid_visible<const OT: usize, L: WorldSurfaceLighting>(
+    room: RoomRender<'_, '_>,
+    materials: &[WorldRenderMaterial],
+    lighting: &L,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    visibility: GridVisibility,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) -> GridVisibilityStats {
+    let mut stats = GridVisibilityStats::default();
+    let width = room.width();
+    let depth = room.depth();
+    if width == 0 || depth == 0 {
+        return stats;
+    }
+
+    let sector_size = room.sector_size().max(1);
+    let anchor_x = grid_cell_for_world(visibility.anchor.x, sector_size).clamp(0, width as i32 - 1);
+    let anchor_z = grid_cell_for_world(visibility.anchor.z, sector_size).clamp(0, depth as i32 - 1);
+    let radius = visibility.radius_cells as i32;
+    let min_x = (anchor_x - radius).max(0) as u16;
+    let max_x = (anchor_x + radius).min(width as i32 - 1) as u16;
+    let min_z = (anchor_z - radius).max(0) as u16;
+    let max_z = (anchor_z + radius).min(depth as i32 - 1) as u16;
+
+    let max_ring_x = (anchor_x - min_x as i32).max(max_x as i32 - anchor_x);
+    let max_ring_z = (anchor_z - min_z as i32).max(max_z as i32 - anchor_z);
+    let mut ring = max_ring_x.max(max_ring_z);
+    loop {
+        let mut sx = min_x;
+        while sx <= max_x {
+            let mut sz = min_z;
+            while sz <= max_z {
+                let dx = ((sx as i32) - anchor_x).abs();
+                let dz = ((sz as i32) - anchor_z).abs();
+                if dx.max(dz) == ring {
+                    if let Some(sector) = room.sector(sx, sz) {
+                        stats.cells_considered = stats.cells_considered.saturating_add(1);
+                        let (min_y, max_y) = sector_y_bounds(room, sector);
+                        if !cell_visible_to_camera(
+                            camera,
+                            options,
                             sx,
                             sz,
                             sector_size,
-                            sector.floor_heights(),
-                            sector.floor_split(),
-                            material,
-                            camera,
-                            options,
-                            triangles,
-                            world,
-                        );
+                            min_y,
+                            max_y,
+                            visibility.screen_margin,
+                        ) {
+                            stats.cells_frustum_culled =
+                                stats.cells_frustum_culled.saturating_add(1);
+                        } else {
+                            stats.cells_drawn = stats.cells_drawn.saturating_add(1);
+                            stats.surfaces_considered =
+                                stats.surfaces_considered.saturating_add(draw_sector_lit(
+                                    room, sx, sz, sector, materials, lighting, camera, options,
+                                    triangles, world,
+                                ));
+                        }
                     }
                 }
+                if sz == max_z {
+                    break;
+                }
+                sz += 1;
             }
+            if sx == max_x {
+                break;
+            }
+            sx += 1;
+        }
+        if ring == 0 {
+            break;
+        }
+        ring -= 1;
+    }
 
-            if sector.has_ceiling() {
-                if let Some(slot) = sector.ceiling_material() {
-                    if let Some(&base_material) = materials.get(slot as usize) {
-                        let material = lighting.shade(
-                            WorldSurfaceSample {
-                                kind: WorldSurfaceKind::Ceiling,
-                                sx,
-                                sz,
-                                center: horizontal_face_center(
-                                    sx,
-                                    sz,
-                                    sector_size,
-                                    sector.ceiling_heights(),
-                                ),
-                            },
-                            base_material,
-                        );
-                        emit_ceiling(
+    stats
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
+    room: RoomRender<'_, '_>,
+    sx: u16,
+    sz: u16,
+    sector: crate::SectorRender,
+    materials: &[WorldRenderMaterial],
+    lighting: &L,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) -> u16 {
+    let sector_size = room.sector_size();
+    let mut surfaces = 0u16;
+
+    if sector.has_floor() {
+        if let Some(slot) = sector.floor_material() {
+            if let Some(&base_material) = materials.get(slot as usize) {
+                let material = lighting.shade(
+                    WorldSurfaceSample {
+                        kind: WorldSurfaceKind::Floor,
+                        sx,
+                        sz,
+                        center: horizontal_face_center(sx, sz, sector_size, sector.floor_heights()),
+                    },
+                    base_material,
+                );
+                surfaces = surfaces.saturating_add(1);
+                emit_floor(
+                    sx,
+                    sz,
+                    sector_size,
+                    sector.floor_heights(),
+                    sector.floor_split(),
+                    material,
+                    camera,
+                    options,
+                    triangles,
+                    world,
+                );
+            }
+        }
+    }
+
+    if sector.has_ceiling() {
+        if let Some(slot) = sector.ceiling_material() {
+            if let Some(&base_material) = materials.get(slot as usize) {
+                let material = lighting.shade(
+                    WorldSurfaceSample {
+                        kind: WorldSurfaceKind::Ceiling,
+                        sx,
+                        sz,
+                        center: horizontal_face_center(
                             sx,
                             sz,
                             sector_size,
                             sector.ceiling_heights(),
-                            sector.ceiling_split(),
-                            material,
-                            camera,
-                            options,
-                            triangles,
-                            world,
-                        );
-                    }
-                }
-            }
-
-            let mut i = 0;
-            while i < sector.wall_count() {
-                if let Some(wall) = room.sector_wall(sector, i) {
-                    if let Some(&base_material) = materials.get(wall.material() as usize) {
-                        let Some(center) =
-                            wall_face_center(sx, sz, sector_size, wall.direction(), wall.heights())
-                        else {
-                            i += 1;
-                            continue;
-                        };
-                        let material = lighting.shade(
-                            WorldSurfaceSample {
-                                kind: WorldSurfaceKind::Wall {
-                                    direction: wall.direction(),
-                                },
-                                sx,
-                                sz,
-                                center,
-                            },
-                            base_material,
-                        );
-                        emit_wall(
-                            sx,
-                            sz,
-                            sector_size,
-                            wall.direction(),
-                            wall.heights(),
-                            material,
-                            camera,
-                            options,
-                            triangles,
-                            world,
-                        );
-                    }
-                }
-                i += 1;
+                        ),
+                    },
+                    base_material,
+                );
+                surfaces = surfaces.saturating_add(1);
+                emit_ceiling(
+                    sx,
+                    sz,
+                    sector_size,
+                    sector.ceiling_heights(),
+                    sector.ceiling_split(),
+                    material,
+                    camera,
+                    options,
+                    triangles,
+                    world,
+                );
             }
         }
     }
+
+    let mut i = 0;
+    while i < sector.wall_count() {
+        if let Some(wall) = room.sector_wall(sector, i) {
+            if let Some(&base_material) = materials.get(wall.material() as usize) {
+                let Some(center) =
+                    wall_face_center(sx, sz, sector_size, wall.direction(), wall.heights())
+                else {
+                    i += 1;
+                    continue;
+                };
+                let material = lighting.shade(
+                    WorldSurfaceSample {
+                        kind: WorldSurfaceKind::Wall {
+                            direction: wall.direction(),
+                        },
+                        sx,
+                        sz,
+                        center,
+                    },
+                    base_material,
+                );
+                surfaces = surfaces.saturating_add(1);
+                emit_wall(
+                    sx,
+                    sz,
+                    sector_size,
+                    wall.direction(),
+                    wall.heights(),
+                    material,
+                    camera,
+                    options,
+                    triangles,
+                    world,
+                );
+            }
+        }
+        i += 1;
+    }
+
+    surfaces
+}
+
+fn grid_cell_for_world(value: i32, sector_size: i32) -> i32 {
+    if value >= 0 {
+        value / sector_size
+    } else {
+        (value - sector_size + 1) / sector_size
+    }
+}
+
+fn sector_y_bounds(room: RoomRender<'_, '_>, sector: crate::SectorRender) -> (i32, i32) {
+    let mut min_y = i32::MAX;
+    let mut max_y = i32::MIN;
+    let mut any = false;
+
+    if sector.has_floor() {
+        include_heights(&mut min_y, &mut max_y, &mut any, sector.floor_heights());
+    }
+    if sector.has_ceiling() {
+        include_heights(&mut min_y, &mut max_y, &mut any, sector.ceiling_heights());
+    }
+
+    let mut i = 0;
+    while i < sector.wall_count() {
+        if let Some(wall) = room.sector_wall(sector, i) {
+            include_heights(&mut min_y, &mut max_y, &mut any, wall.heights());
+        }
+        i += 1;
+    }
+
+    if any {
+        (min_y, max_y)
+    } else {
+        (0, room.sector_size())
+    }
+}
+
+fn include_heights(min_y: &mut i32, max_y: &mut i32, any: &mut bool, heights: [i32; 4]) {
+    let mut i = 0;
+    while i < heights.len() {
+        *min_y = (*min_y).min(heights[i]);
+        *max_y = (*max_y).max(heights[i]);
+        *any = true;
+        i += 1;
+    }
+}
+
+fn cell_visible_to_camera(
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    sx: u16,
+    sz: u16,
+    sector_size: i32,
+    min_y: i32,
+    max_y: i32,
+    screen_margin: i32,
+) -> bool {
+    let (x0, x1, z0, z1) = cell_bounds(sx, sz, sector_size);
+    let center = WorldVertex::new((x0 + x1) / 2, (min_y + max_y) / 2, (z0 + z1) / 2);
+    let view = camera.view_vertex(center);
+    let half_height = ((max_y - min_y).abs() / 2).max(sector_size / 2);
+    let radius = sector_size.saturating_add(half_height);
+    let near = camera.projection.near_z.max(1);
+    let far = options.depth_range.far().max(near);
+    if view.z < near.saturating_sub(radius) || view.z > far.saturating_add(radius) {
+        return false;
+    }
+
+    let z = view.z.max(near);
+    let focal = camera.projection.focal_length.max(1);
+    let half_w = (camera.projection.screen_x as i32)
+        .saturating_add(screen_margin)
+        .max(1);
+    let half_h = (camera.projection.screen_y as i32)
+        .saturating_add(screen_margin)
+        .max(1);
+    let projected_x = view.x.abs().saturating_sub(radius).saturating_mul(focal);
+    let projected_y = view.y.abs().saturating_sub(radius).saturating_mul(focal);
+    projected_x <= half_w.saturating_mul(z) && projected_y <= half_h.saturating_mul(z)
 }
 
 /// Emit one floor quad. Cooked corners are `[NW, NE, SE, SW]`,
