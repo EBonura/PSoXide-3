@@ -132,6 +132,7 @@ pub fn build_phase1_frame(
     selected: psxed_project::NodeId,
     hovered_primitive: Option<psxed_ui::Selection>,
     selected_primitive: Option<psxed_ui::Selection>,
+    selected_primitives: &[psxed_ui::Selection],
     selected_sector_faces: &[psxed_ui::FaceRef],
     paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     entity_bounds: &[psxed_ui::EntityBounds],
@@ -165,14 +166,20 @@ pub fn build_phase1_frame(
     // camera state below before drawing entity bounds so they
     // pick up the same camera basis instead of the last
     // model joint matrix.
-    if let Some(selection) = selected_primitive {
-        push_selection_outline(grid, selection, OutlineRole::Selected, &mut scratch);
+    if selected_primitives.is_empty() {
+        if let Some(selection) = selected_primitive {
+            push_selection_outline(grid, selection, OutlineRole::Selected, &mut scratch);
+        }
+    } else {
+        for selection in selected_primitives {
+            push_selection_outline(grid, *selection, OutlineRole::Selected, &mut scratch);
+        }
     }
     for face in selected_sector_faces {
         push_face_outline(grid, *face, FACE_OUTLINE_SELECTED, &mut scratch);
     }
     if let Some(selection) = hovered_primitive {
-        if Some(selection) != selected_primitive {
+        if Some(selection) != selected_primitive && !selected_primitives.contains(&selection) {
             push_selection_outline(grid, selection, OutlineRole::Hover, &mut scratch);
         }
     }
@@ -2007,6 +2014,7 @@ fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
         | NodeKind::CharacterController { .. }
         | NodeKind::AiController { .. }
         | NodeKind::Combat { .. }
+        | NodeKind::Equipment { .. }
         | NodeKind::PointLight { .. }
         | NodeKind::Room { .. }
         | NodeKind::World { .. }

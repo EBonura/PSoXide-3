@@ -188,6 +188,84 @@ pub struct PlaytestModelInstance {
 /// [`psx_level::MODEL_CLIP_INHERIT`].
 pub const MODEL_CLIP_INHERIT: u16 = 0xFFFF;
 
+/// Weapon-local hit shape, ready for manifest emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaytestWeaponHitShape {
+    /// Box hit volume.
+    Box {
+        /// Local center.
+        center: [i32; 3],
+        /// Half extents.
+        half_extents: [u16; 3],
+    },
+    /// Capsule hit volume.
+    Capsule {
+        /// Local start.
+        start: [i32; 3],
+        /// Local end.
+        end: [i32; 3],
+        /// Radius.
+        radius: u16,
+    },
+}
+
+/// One weapon hitbox and active animation-frame window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaytestWeaponHitbox {
+    /// Display name.
+    pub name: String,
+    /// Local shape.
+    pub shape: PlaytestWeaponHitShape,
+    /// First active frame.
+    pub active_start_frame: u16,
+    /// Last active frame.
+    pub active_end_frame: u16,
+}
+
+/// Cooked weapon resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaytestWeapon {
+    /// Display name.
+    pub name: String,
+    /// Source resource id.
+    pub source_resource: ResourceId,
+    /// Optional visual model index.
+    pub model: Option<u16>,
+    /// Character socket this weapon expects by default.
+    pub default_character_socket: String,
+    /// Weapon-local grip/pivot name.
+    pub grip_name: String,
+    /// Weapon-local grip translation.
+    pub grip_translation: [i32; 3],
+    /// Weapon-local grip rotation, Q12 turns.
+    pub grip_rotation_q12: [i16; 3],
+    /// First index in [`PlaytestPackage::weapon_hitboxes`].
+    pub hitbox_first: u16,
+    /// Number of hitboxes.
+    pub hitbox_count: u16,
+}
+
+/// Cooked Equipment component on an Entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaytestEquipment {
+    /// Owning room.
+    pub room: u16,
+    /// Weapon index.
+    pub weapon: u16,
+    /// Parent entity room-local X.
+    pub x: i32,
+    /// Parent entity room-local Y.
+    pub y: i32,
+    /// Parent entity room-local Z.
+    pub z: i32,
+    /// Parent entity yaw.
+    pub yaw: i16,
+    /// Character socket to follow.
+    pub character_socket: String,
+    /// Weapon grip/pivot to align.
+    pub weapon_grip: String,
+}
+
 /// One placed point light, room-local engine units. Mirrors
 /// [`psx_level::PointLightRecord`] one-for-one -- intensity is
 /// already quantised to Q8.8 so the cook output is a direct
@@ -332,6 +410,12 @@ pub struct PlaytestPackage {
     pub model_clips: Vec<PlaytestModelClip>,
     /// Placed model instances, room-local coordinates.
     pub model_instances: Vec<PlaytestModelInstance>,
+    /// Weapon hitboxes, shared by [`Self::weapons`].
+    pub weapon_hitboxes: Vec<PlaytestWeaponHitbox>,
+    /// Cooked Weapon resources, deduplicated by source resource id.
+    pub weapons: Vec<PlaytestWeapon>,
+    /// Equipment components placed in rooms.
+    pub equipment: Vec<PlaytestEquipment>,
     /// Placed point lights, room-local coordinates.
     pub lights: Vec<PlaytestLight>,
     /// Single player spawn -- required.

@@ -1310,6 +1310,166 @@ pub struct ModelAnimationClip {
     pub psxanim_path: String,
 }
 
+/// Named model attachment point, usually bound to a skeleton
+/// joint. Runtime composition is:
+/// `entity transform × joint pose × socket local transform`.
+///
+/// Offsets are integer model/engine units and rotations are Q12
+/// turn units (`4096 = 360°`) so project data can be cooked
+/// directly for the PS1 without preserving floats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentSocket {
+    /// User-facing socket name (`right_hand_grip`, `back_slot`, …).
+    pub name: String,
+    /// Joint index in the cooked `.psxmdl` skeleton.
+    pub joint: u16,
+    /// Local translation relative to the joint pose.
+    #[serde(default)]
+    pub translation: [i32; 3],
+    /// Local Euler rotation in Q12 turns: X / Y / Z, 4096 per turn.
+    #[serde(default)]
+    pub rotation_q12: [i16; 3],
+}
+
+impl AttachmentSocket {
+    /// Common right-hand default for humanoid rigs.
+    pub fn right_hand_grip() -> Self {
+        Self {
+            name: default_character_socket(),
+            joint: 0,
+            translation: [0, 0, 0],
+            rotation_q12: [0, 0, 0],
+        }
+    }
+}
+
+/// Pivot on a weapon model that should land on a character socket.
+/// A sword normally uses `grip`; a shield might use `handle`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeaponGrip {
+    /// User-facing grip/pivot name.
+    pub name: String,
+    /// Local translation inside the weapon model.
+    #[serde(default)]
+    pub translation: [i32; 3],
+    /// Local Euler rotation in Q12 turns: X / Y / Z, 4096 per turn.
+    #[serde(default)]
+    pub rotation_q12: [i16; 3],
+}
+
+impl Default for WeaponGrip {
+    fn default() -> Self {
+        Self {
+            name: default_weapon_grip(),
+            translation: [0, 0, 0],
+            rotation_q12: [0, 0, 0],
+        }
+    }
+}
+
+/// Weapon hit volume, stored relative to the weapon grip/pivot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WeaponHitShape {
+    /// Oriented box hit volume. `half_extents` are local axes.
+    Box {
+        /// Local center relative to the weapon grip.
+        center: [i32; 3],
+        /// Half extents in engine/model units.
+        half_extents: [u16; 3],
+    },
+    /// Capsule hit volume, useful for blades, clubs, and spears.
+    Capsule {
+        /// Local capsule start relative to the weapon grip.
+        start: [i32; 3],
+        /// Local capsule end relative to the weapon grip.
+        end: [i32; 3],
+        /// Capsule radius in engine/model units.
+        radius: u16,
+    },
+}
+
+impl Default for WeaponHitShape {
+    fn default() -> Self {
+        Self::Capsule {
+            start: [0, 0, 0],
+            end: [0, 512, 0],
+            radius: 48,
+        }
+    }
+}
+
+/// One named active hitbox window for a weapon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeaponHitbox {
+    /// User-facing hitbox name.
+    pub name: String,
+    /// Local hit volume.
+    #[serde(default)]
+    pub shape: WeaponHitShape,
+    /// First animation frame where the hitbox is active.
+    #[serde(default)]
+    pub active_start_frame: u16,
+    /// Last animation frame where the hitbox is active.
+    #[serde(default)]
+    pub active_end_frame: u16,
+}
+
+impl Default for WeaponHitbox {
+    fn default() -> Self {
+        Self {
+            name: "Main Hit".to_string(),
+            shape: WeaponHitShape::default(),
+            active_start_frame: 0,
+            active_end_frame: 0,
+        }
+    }
+}
+
+/// Gameplay weapon resource: model reference, grip/pivot, and
+/// authored attack hit volumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeaponResource {
+    /// Visual model used for the weapon. `None` is allowed during
+    /// authoring so hitboxes can be blocked in before art lands.
+    #[serde(default)]
+    pub model: Option<ResourceId>,
+    /// Which character socket this weapon expects by default.
+    #[serde(default = "default_character_socket")]
+    pub default_character_socket: String,
+    /// Weapon-local grip/pivot that aligns to the character socket.
+    #[serde(default)]
+    pub grip: WeaponGrip,
+    /// Hit volumes authored relative to [`Self::grip`].
+    #[serde(default)]
+    pub hitboxes: Vec<WeaponHitbox>,
+}
+
+impl WeaponResource {
+    /// Minimal editable weapon.
+    pub fn defaults() -> Self {
+        Self {
+            model: None,
+            default_character_socket: default_character_socket(),
+            grip: WeaponGrip::default(),
+            hitboxes: vec![WeaponHitbox::default()],
+        }
+    }
+}
+
+impl Default for WeaponResource {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+fn default_character_socket() -> String {
+    "right_hand_grip".to_string()
+}
+
+fn default_weapon_grip() -> String {
+    "grip".to_string()
+}
+
 /// Cooked PSX model bundle: a `.psxmdl` plus optional atlas
 /// `.psxt` plus zero or more `.psxanim` clips.
 ///
@@ -1350,6 +1510,9 @@ pub struct ModelResource {
     /// cook/import, not as runtime floats.
     #[serde(default = "default_model_scale_q8")]
     pub scale_q8: [u16; 3],
+    /// Named sockets used by equipment, VFX, and hitbox authoring.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentSocket>,
 }
 
 const fn default_model_world_height() -> u16 {
@@ -1514,6 +1677,9 @@ pub enum ResourceData {
     /// resource; the player spawn references this to resolve
     /// what to render and how the controller behaves.
     Character(CharacterResource),
+    /// Equipment/weapon authoring resource. A Weapon references a
+    /// Model for visuals and owns grip + hitbox data for combat.
+    Weapon(WeaponResource),
 }
 
 impl ResourceData {
@@ -1528,6 +1694,7 @@ impl ResourceData {
             Self::Script { .. } => "Script",
             Self::Audio { .. } => "Audio",
             Self::Character(_) => "Character",
+            Self::Weapon(_) => "Weapon",
         }
     }
 }
@@ -1782,6 +1949,20 @@ pub enum NodeKind {
         #[serde(default = "default_combat_health")]
         health: u16,
     },
+    /// Equipment component. The parent Entity supplies the animated
+    /// character model; this component names the Weapon and which
+    /// socket/grip pair should be composed.
+    Equipment {
+        /// Weapon resource.
+        #[serde(default)]
+        weapon: Option<ResourceId>,
+        /// Character/model socket to follow.
+        #[serde(default = "default_character_socket")]
+        character_socket: String,
+        /// Weapon-local grip/pivot to align to the character socket.
+        #[serde(default = "default_weapon_grip")]
+        weapon_grip: String,
+    },
     /// Simple authoring light.
     Light {
         /// RGB light colour.
@@ -1861,6 +2042,7 @@ impl NodeKind {
             Self::CharacterController { .. } => "CharacterController",
             Self::AiController { .. } => "AiController",
             Self::Combat { .. } => "Combat",
+            Self::Equipment { .. } => "Equipment",
             Self::Light { .. } => "Light",
             Self::PointLight { .. } => "PointLight",
             Self::SpawnPoint { .. } => "SpawnPoint",
@@ -1883,6 +2065,7 @@ impl NodeKind {
                 | Self::CharacterController { .. }
                 | Self::AiController { .. }
                 | Self::Combat { .. }
+                | Self::Equipment { .. }
                 | Self::PointLight { .. }
         )
     }
@@ -2342,7 +2525,7 @@ impl ProjectDocument {
                     &mut plan,
                 );
             }
-            ResourceData::Material(_) | ResourceData::Character(_) => {}
+            ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => {}
         }
 
         execute_resource_rename_plan(&plan)?;
@@ -2515,6 +2698,7 @@ fn resource_data_reference_count(data: &ResourceData, id: ResourceId) -> usize {
     match data {
         ResourceData::Material(material) => option_resource_reference_count(material.texture, id),
         ResourceData::Character(character) => option_resource_reference_count(character.model, id),
+        ResourceData::Weapon(weapon) => option_resource_reference_count(weapon.model, id),
         ResourceData::Texture { .. }
         | ResourceData::Model(_)
         | ResourceData::Mesh { .. }
@@ -2537,6 +2721,7 @@ fn clear_resource_data_references(data: &mut ResourceData, id: ResourceId) -> us
             }
             cleared
         }
+        ResourceData::Weapon(weapon) => clear_option_resource(&mut weapon.model, id),
         ResourceData::Texture { .. }
         | ResourceData::Model(_)
         | ResourceData::Mesh { .. }
@@ -2560,6 +2745,7 @@ fn node_kind_reference_count(kind: &NodeKind, id: ResourceId) -> usize {
         NodeKind::CharacterController { character, .. } => {
             option_resource_reference_count(*character, id)
         }
+        NodeKind::Equipment { weapon, .. } => option_resource_reference_count(*weapon, id),
         NodeKind::SpawnPoint { character, .. } => option_resource_reference_count(*character, id),
         NodeKind::AudioSource { sound, .. } => option_resource_reference_count(*sound, id),
         NodeKind::Node
@@ -2588,6 +2774,7 @@ fn clear_node_kind_references(kind: &mut NodeKind, id: ResourceId) -> usize {
             clear_option_resource(model, id) + clear_option_resource(material, id)
         }
         NodeKind::CharacterController { character, .. } => clear_option_resource(character, id),
+        NodeKind::Equipment { weapon, .. } => clear_option_resource(weapon, id),
         NodeKind::SpawnPoint { character, .. } => clear_option_resource(character, id),
         NodeKind::AudioSource { sound, .. } => clear_option_resource(sound, id),
         NodeKind::Node
@@ -2759,7 +2946,7 @@ fn plan_resource_file_deletes(resource: &Resource, project_root: &Path) -> Resou
         | ResourceData::Audio { source_path } => {
             plan_path_delete(source_path, project_root, &mut plan);
         }
-        ResourceData::Material(_) | ResourceData::Character(_) => {}
+        ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => {}
     }
     plan
 }
@@ -3057,6 +3244,7 @@ const fn resource_default_stem(data: &ResourceData) -> &'static str {
         ResourceData::Texture { .. } => "texture",
         ResourceData::Material(_) => "material",
         ResourceData::Model(_) => "model",
+        ResourceData::Weapon(_) => "weapon",
         ResourceData::Mesh { .. } => "mesh",
         ResourceData::Scene { .. } => "scene",
         ResourceData::Script { .. } => "script",
@@ -3070,6 +3258,7 @@ const fn resource_default_extension(data: &ResourceData) -> &'static str {
         ResourceData::Texture { .. } => "psxt",
         ResourceData::Material(_) => "mat",
         ResourceData::Model(_) => "psxmdl",
+        ResourceData::Weapon(_) => "weapon",
         ResourceData::Mesh { .. } => "psxmesh",
         ResourceData::Scene { .. } => "room",
         ResourceData::Script { .. } => "script",
@@ -3753,6 +3942,12 @@ mod tests {
                     MODEL_SCALE_ONE_Q8 * 2,
                     MODEL_SCALE_ONE_Q8,
                 ],
+                attachments: vec![AttachmentSocket {
+                    name: "right_hand_grip".to_string(),
+                    joint: 3,
+                    translation: [16, 32, -8],
+                    rotation_q12: [0, 1024, 0],
+                }],
             }),
         );
         let ron = project.to_ron_string().unwrap();
@@ -3775,6 +3970,9 @@ mod tests {
                 );
                 assert_eq!(m.effective_preview_clip(), Some(1));
                 assert_eq!(m.effective_runtime_clip(), Some(0));
+                assert_eq!(m.attachments.len(), 1);
+                assert_eq!(m.attachments[0].joint, 3);
+                assert_eq!(m.attachments[0].translation, [16, 32, -8]);
             }
             _ => panic!("expected Model"),
         }
@@ -3973,6 +4171,7 @@ mod tests {
                 preview_clip: Some(0),
                 world_height: 1024,
                 scale_q8: [MODEL_SCALE_ONE_Q8; 3],
+                attachments: Vec::new(),
             }),
         );
 
@@ -4075,6 +4274,13 @@ mod tests {
                 ..CharacterResource::defaults()
             }),
         );
+        let weapon = project.add_resource(
+            "Weapon",
+            ResourceData::Weapon(WeaponResource {
+                model: Some(target),
+                ..WeaponResource::default()
+            }),
+        );
 
         let scene = project.active_scene_mut();
         let mut grid = WorldGrid::empty(1, 1, 1024);
@@ -4108,6 +4314,15 @@ mod tests {
             },
         );
         scene.add_node(
+            entity,
+            "Equipment",
+            NodeKind::Equipment {
+                weapon: Some(target),
+                character_socket: "right_hand_grip".to_string(),
+                weapon_grip: "grip".to_string(),
+            },
+        );
+        scene.add_node(
             room,
             "Spawn",
             NodeKind::SpawnPoint {
@@ -4124,12 +4339,12 @@ mod tests {
             },
         );
 
-        assert_eq!(project.resource_reference_count(target), 11);
+        assert_eq!(project.resource_reference_count(target), 13);
         let report = project
             .delete_resource_with_files(target, &root)
             .expect("resource exists");
         assert_eq!(report.removed.name, "Target");
-        assert_eq!(report.cleared_references, 11);
+        assert_eq!(report.cleared_references, 13);
         assert_eq!(
             report.deleted_files,
             vec![ResourceFileDelete {
@@ -4155,6 +4370,10 @@ mod tests {
         assert_eq!(character_data.walk_clip, None);
         assert_eq!(character_data.run_clip, None);
         assert_eq!(character_data.turn_clip, None);
+        let ResourceData::Weapon(weapon_data) = &project.resource(weapon).unwrap().data else {
+            panic!("expected weapon");
+        };
+        assert_eq!(weapon_data.model, None);
 
         for node in project.active_scene().nodes() {
             match &node.kind {
@@ -4180,6 +4399,9 @@ mod tests {
                 NodeKind::CharacterController { character, .. }
                 | NodeKind::SpawnPoint { character, .. } => {
                     assert_eq!(*character, None);
+                }
+                NodeKind::Equipment { weapon, .. } => {
+                    assert_eq!(*weapon, None);
                 }
                 NodeKind::AudioSource { sound, .. } => {
                     assert_eq!(*sound, None);

@@ -246,9 +246,13 @@ pub fn build_package(
     let mut models: Vec<PlaytestModel> = Vec::new();
     let mut model_clips: Vec<PlaytestModelClip> = Vec::new();
     let mut model_instances: Vec<PlaytestModelInstance> = Vec::new();
+    let mut weapon_hitboxes: Vec<PlaytestWeaponHitbox> = Vec::new();
+    let mut weapons: Vec<PlaytestWeapon> = Vec::new();
+    let mut equipment: Vec<PlaytestEquipment> = Vec::new();
     let mut lights: Vec<PlaytestLight> = Vec::new();
     // ResourceId → index into `models` for instance dedup.
     let mut model_for_resource: HashMap<ResourceId, u16> = HashMap::new();
+    let mut weapon_for_resource: HashMap<ResourceId, u16> = HashMap::new();
     let mut warned_unsupported: HashSet<&'static str> = HashSet::new();
 
     for node in scene.nodes() {
@@ -339,6 +343,38 @@ pub fn build_package(
                         report.warn(
                             "Non-player Entity character components are skipped in this pass",
                         );
+                    }
+                }
+
+                if let Some(equipped) = component_equipment(scene, node) {
+                    if let Some(weapon_id) = equipped.weapon {
+                        let Some(weapon_index) = register_weapon_for_equipment(
+                            project,
+                            project_root,
+                            weapon_id,
+                            &mut assets,
+                            &mut models,
+                            &mut model_clips,
+                            &mut model_for_resource,
+                            &mut weapon_hitboxes,
+                            &mut weapons,
+                            &mut weapon_for_resource,
+                            &mut report,
+                        ) else {
+                            return (None, report);
+                        };
+                        equipment.push(PlaytestEquipment {
+                            room: room_index,
+                            weapon: weapon_index,
+                            x: pos[0],
+                            y: pos[1],
+                            z: pos[2],
+                            yaw,
+                            character_socket: equipped.character_socket.to_string(),
+                            weapon_grip: equipped.weapon_grip.to_string(),
+                        });
+                    } else if warned_unsupported.insert("UnboundEquipment") {
+                        report.warn("Equipment components with no Weapon are skipped");
                     }
                 }
             }
@@ -463,6 +499,7 @@ pub fn build_package(
             | NodeKind::CharacterController { .. }
             | NodeKind::AiController { .. }
             | NodeKind::Combat { .. }
+            | NodeKind::Equipment { .. }
             | NodeKind::PointLight { .. } => {}
         }
     }
@@ -599,6 +636,9 @@ pub fn build_package(
             models,
             model_clips,
             model_instances,
+            weapon_hitboxes,
+            weapons,
+            equipment,
             lights,
             spawn,
             characters,
@@ -1056,6 +1096,96 @@ fn push_model_instance_for_resource(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+fn register_weapon_for_equipment(
+    project: &ProjectDocument,
+    project_root: &Path,
+    weapon_resource_id: ResourceId,
+    assets: &mut Vec<PlaytestAsset>,
+    models: &mut Vec<PlaytestModel>,
+    model_clips: &mut Vec<PlaytestModelClip>,
+    model_for_resource: &mut HashMap<ResourceId, u16>,
+    weapon_hitboxes: &mut Vec<PlaytestWeaponHitbox>,
+    weapons: &mut Vec<PlaytestWeapon>,
+    weapon_for_resource: &mut HashMap<ResourceId, u16>,
+    report: &mut PlaytestValidationReport,
+) -> Option<u16> {
+    if let Some(&existing) = weapon_for_resource.get(&weapon_resource_id) {
+        return Some(existing);
+    }
+    let Some(resource) = project.resource(weapon_resource_id) else {
+        report.error(format!(
+            "Equipment references missing Weapon resource #{}",
+            weapon_resource_id.raw()
+        ));
+        return None;
+    };
+    let ResourceData::Weapon(weapon) = &resource.data else {
+        report.error(format!(
+            "Equipment references resource '{}' which is not a Weapon",
+            resource.name
+        ));
+        return None;
+    };
+
+    let model = match weapon.model {
+        Some(model_resource_id) => Some(register_model_for_instance(
+            project,
+            project_root,
+            model_resource_id,
+            assets,
+            models,
+            model_clips,
+            model_for_resource,
+            report,
+        )?),
+        None => None,
+    };
+
+    let hitbox_first = u16::try_from(weapon_hitboxes.len()).unwrap_or(u16::MAX);
+    for hitbox in &weapon.hitboxes {
+        weapon_hitboxes.push(PlaytestWeaponHitbox {
+            name: hitbox.name.clone(),
+            shape: playtest_weapon_shape(&hitbox.shape),
+            active_start_frame: hitbox.active_start_frame,
+            active_end_frame: hitbox.active_end_frame.max(hitbox.active_start_frame),
+        });
+    }
+    let hitbox_count =
+        u16::try_from(weapon_hitboxes.len() - hitbox_first as usize).unwrap_or(u16::MAX);
+    let weapon_index = u16::try_from(weapons.len()).unwrap_or(u16::MAX);
+    weapons.push(PlaytestWeapon {
+        name: resource.name.clone(),
+        source_resource: weapon_resource_id,
+        model,
+        default_character_socket: weapon.default_character_socket.clone(),
+        grip_name: weapon.grip.name.clone(),
+        grip_translation: weapon.grip.translation,
+        grip_rotation_q12: weapon.grip.rotation_q12,
+        hitbox_first,
+        hitbox_count,
+    });
+    weapon_for_resource.insert(weapon_resource_id, weapon_index);
+    Some(weapon_index)
+}
+
+fn playtest_weapon_shape(shape: &crate::WeaponHitShape) -> PlaytestWeaponHitShape {
+    match shape {
+        crate::WeaponHitShape::Box {
+            center,
+            half_extents,
+        } => PlaytestWeaponHitShape::Box {
+            center: *center,
+            half_extents: *half_extents,
+        },
+        crate::WeaponHitShape::Capsule { start, end, radius } => PlaytestWeaponHitShape::Capsule {
+            start: *start,
+            end: *end,
+            radius: *radius,
+        },
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AnimatorComponent {
     clip: Option<u16>,
@@ -1065,6 +1195,12 @@ struct AnimatorComponent {
 struct CharacterControllerComponent {
     character: Option<ResourceId>,
     player: bool,
+}
+
+struct EquipmentComponent<'a> {
+    weapon: Option<ResourceId>,
+    character_socket: &'a str,
+    weapon_grip: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -1099,6 +1235,24 @@ fn component_character_controller(
         NodeKind::CharacterController { character, player } => Some(CharacterControllerComponent {
             character: *character,
             player: *player,
+        }),
+        _ => None,
+    })
+}
+
+fn component_equipment<'a>(
+    scene: &'a crate::Scene,
+    host: &'a SceneNode,
+) -> Option<EquipmentComponent<'a>> {
+    component_children(scene, host).find_map(|node| match &node.kind {
+        NodeKind::Equipment {
+            weapon,
+            character_socket,
+            weapon_grip,
+        } => Some(EquipmentComponent {
+            weapon: *weapon,
+            character_socket,
+            weapon_grip,
         }),
         _ => None,
     })
@@ -2214,6 +2368,120 @@ mod tests {
             "color: [{}, {}, {}]",
             color[0], color[1], color[2]
         )));
+    }
+
+    #[test]
+    fn equipment_component_emits_weapon_and_hitbox_records() {
+        let starter = ProjectDocument::starter();
+        let starter_model = starter
+            .resources
+            .iter()
+            .find_map(|resource| match &resource.data {
+                ResourceData::Model(model) => Some(model.clone()),
+                _ => None,
+            })
+            .expect("starter has a model");
+        let mut project = ProjectDocument::new("equipment-test");
+        let texture = project.add_resource(
+            "Floor Texture",
+            ResourceData::Texture {
+                psxt_path: "assets/textures/floor.psxt".to_string(),
+            },
+        );
+        let material = project.add_resource(
+            "Floor",
+            ResourceData::Material(crate::MaterialResource::opaque(Some(texture))),
+        );
+        let model = project.add_resource("Wraith Model", ResourceData::Model(starter_model));
+        let character = project.add_resource(
+            "Wraith Character",
+            ResourceData::Character(crate::CharacterResource {
+                model: Some(model),
+                idle_clip: Some(3),
+                walk_clip: Some(7),
+                run_clip: Some(4),
+                ..crate::CharacterResource::defaults()
+            }),
+        );
+        let weapon = project.add_resource(
+            "Practice Sword",
+            ResourceData::Weapon(crate::WeaponResource {
+                model: Some(model),
+                default_character_socket: "right_hand_grip".to_string(),
+                grip: crate::WeaponGrip {
+                    name: "grip".to_string(),
+                    translation: [8, 16, 0],
+                    rotation_q12: [0, 1024, 0],
+                },
+                hitboxes: vec![crate::WeaponHitbox {
+                    name: "Blade".to_string(),
+                    shape: crate::WeaponHitShape::Capsule {
+                        start: [0, 0, 0],
+                        end: [0, 640, 0],
+                        radius: 32,
+                    },
+                    active_start_frame: 4,
+                    active_end_frame: 9,
+                }],
+            }),
+        );
+
+        let scene = project.active_scene_mut();
+        let mut grid = crate::WorldGrid::empty(2, 2, 1024);
+        grid.set_floor(0, 0, 0, Some(material));
+        let room = scene.add_node(scene.root, "Room", NodeKind::Room { grid });
+        let entity = scene.add_node(room, "Player", NodeKind::Entity);
+        if let Some(node) = scene.node_mut(entity) {
+            node.transform.translation = [0.5, 0.0, 0.5];
+        }
+        scene.add_node(
+            entity,
+            "Model Renderer",
+            NodeKind::ModelRenderer {
+                model: Some(model),
+                material: None,
+            },
+        );
+        scene.add_node(
+            entity,
+            "Animator",
+            NodeKind::Animator {
+                clip: Some(3),
+                autoplay: true,
+            },
+        );
+        scene.add_node(
+            entity,
+            "Character Controller",
+            NodeKind::CharacterController {
+                character: Some(character),
+                player: true,
+            },
+        );
+        scene.add_node(
+            entity,
+            "Equipment",
+            NodeKind::Equipment {
+                weapon: Some(weapon),
+                character_socket: "right_hand_grip".to_string(),
+                weapon_grip: "grip".to_string(),
+            },
+        );
+
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.expect("cooks");
+        assert_eq!(package.weapons.len(), 1);
+        assert_eq!(package.equipment.len(), 1);
+        assert_eq!(package.weapon_hitboxes.len(), 1);
+        assert_eq!(package.weapons[0].model, Some(0));
+        assert_eq!(package.weapons[0].grip_translation, [8, 16, 0]);
+        assert_eq!(package.equipment[0].weapon, 0);
+
+        let src = render_manifest_source(&package);
+        assert!(src.contains("pub static WEAPONS"));
+        assert!(src.contains("pub static EQUIPMENT"));
+        assert!(src.contains("WeaponHitShapeRecord::Capsule"));
     }
 
     #[test]

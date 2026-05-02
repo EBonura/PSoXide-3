@@ -104,6 +104,16 @@ typed_index! {
 }
 
 typed_index! {
+    /// Index into the generated `WEAPONS` table.
+    pub struct WeaponIndex;
+}
+
+typed_index! {
+    /// Index into the generated `WEAPON_HITBOXES` table.
+    pub struct WeaponHitboxIndex;
+}
+
+typed_index! {
     /// Runtime resource slot for entity records.
     pub struct ResourceSlot;
 }
@@ -451,6 +461,90 @@ pub struct LevelModelInstanceRecord {
 /// Sentinel for [`LevelModelInstanceRecord::clip`] meaning
 /// "inherit model default".
 pub const MODEL_CLIP_INHERIT: OptionalModelClipIndex = OptionalModelClipIndex::INHERIT;
+
+/// Cooked weapon-local hit shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeaponHitShapeRecord {
+    /// Box hit volume local to the weapon grip.
+    Box {
+        /// Local center.
+        center: [i32; 3],
+        /// Half extents.
+        half_extents: [u16; 3],
+    },
+    /// Capsule hit volume local to the weapon grip.
+    Capsule {
+        /// Local start.
+        start: [i32; 3],
+        /// Local end.
+        end: [i32; 3],
+        /// Radius.
+        radius: u16,
+    },
+}
+
+/// One weapon hitbox and its active animation-frame window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeaponHitboxRecord {
+    /// Display name.
+    pub name: &'static str,
+    /// Local shape.
+    pub shape: WeaponHitShapeRecord,
+    /// First active frame.
+    pub active_start_frame: u16,
+    /// Last active frame.
+    pub active_end_frame: u16,
+    /// Reserved.
+    pub flags: u16,
+}
+
+/// Cooked weapon resource: optional visual model plus grip and
+/// hitbox slice. The visual model is optional so designers can
+/// author combat volumes before art exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelWeaponRecord {
+    /// Display name.
+    pub name: &'static str,
+    /// Optional visual model.
+    pub model: Option<ModelIndex>,
+    /// Character socket this weapon expects by default.
+    pub default_character_socket: &'static str,
+    /// Weapon-local grip/pivot name.
+    pub grip_name: &'static str,
+    /// Weapon-local grip translation.
+    pub grip_translation: [i32; 3],
+    /// Weapon-local grip rotation, Q12 turns.
+    pub grip_rotation_q12: [i16; 3],
+    /// First hitbox in `WEAPON_HITBOXES`.
+    pub hitbox_first: WeaponHitboxIndex,
+    /// Number of hitboxes.
+    pub hitbox_count: u16,
+    /// Reserved.
+    pub flags: u16,
+}
+
+/// One Equipment component cooked from an Entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EquipmentRecord {
+    /// Owning room.
+    pub room: RoomIndex,
+    /// Weapon resource.
+    pub weapon: WeaponIndex,
+    /// Parent entity room-local X.
+    pub x: i32,
+    /// Parent entity room-local Y.
+    pub y: i32,
+    /// Parent entity room-local Z.
+    pub z: i32,
+    /// Parent entity yaw.
+    pub yaw: i16,
+    /// Character socket to follow.
+    pub character_socket: &'static str,
+    /// Weapon grip/pivot to align.
+    pub weapon_grip: &'static str,
+    /// Reserved.
+    pub flags: u16,
+}
 
 /// One placed point light. Coordinates are room-local engine
 /// units (same convention as model instances and player

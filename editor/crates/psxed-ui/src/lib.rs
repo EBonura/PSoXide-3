@@ -116,6 +116,10 @@ pub struct EditorWorkspace {
     /// boldly than `hovered_primitive`; the inspector reads it to
     /// surface per-primitive properties.
     selected_primitive: Option<Selection>,
+    /// Multi primitive selection for Select mode. `selected_primitive`
+    /// remains the active/inspected item; this list is the editable
+    /// set used by overlay, delete, and drag.
+    selected_primitives: Vec<Selection>,
     /// Active drag-translate stroke. Set on drag-start over a
     /// primitive in Select mode, mutated by every drag frame, and
     /// cleared on release. Records pre-drag heights of every
@@ -902,20 +906,14 @@ impl SelectionMode {
 /// pointer moves until release.
 #[derive(Debug, Clone)]
 struct PrimitiveDrag {
-    /// What's being dragged -- used to refresh the visual outline
-    /// while the geometry under it shifts.
-    target: Selection,
-    /// Physical vertices to translate -- typically 1 (Vertex
-    /// mode), 2 (Edge mode), or 4 (Face mode). Each entry
-    /// carries every coincident face-corner so a single drag
-    /// applies through the universal-coincidence resolver
-    /// without re-walking the grid each frame.
-    vertices: Vec<PhysicalVertex>,
-    /// Pre-drag Y of each entry in `vertices`, in the same
-    /// order. Apply step is `snap(pre_y + total_delta_world)`
-    /// for every vertex -- single source of truth for the new
-    /// height, no accumulator drift.
-    pre_drag_ys: Vec<i32>,
+    /// Primitives being dragged. Usually one entry, or the current
+    /// multi-selection when the drag starts on an already-selected
+    /// primitive.
+    targets: Vec<Selection>,
+    /// Physical vertices to translate. Each entry carries the owning
+    /// room plus every coincident face-corner so one drag can span
+    /// multiple selected faces/edges/vertices.
+    vertices: Vec<DragVertex>,
     /// Total mouse-Y travel since drag-start, in screen pixels.
     /// Sign-flipped at apply time (screen +Y is down, world +Y
     /// is up). Stored as `f32` because egui hands per-frame
@@ -926,6 +924,15 @@ struct PrimitiveDrag {
     /// a non-zero quantum delta, so a press-without-drag (a
     /// pure click) leaves the undo stack alone.
     snapshot_pushed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DragVertex {
+    room: NodeId,
+    vertex: PhysicalVertex,
+    /// Pre-drag Y. Apply step is `snap(pre_y + total_delta_world)`
+    /// so every frame is derived from the original geometry.
+    pre_drag_y: i32,
 }
 
 /// Active node-drag stroke. Set on press over an entity
@@ -1131,6 +1138,7 @@ enum ResourceFilter {
     Material,
     Model,
     Character,
+    Weapon,
     Mesh,
     Room,
     Other,
@@ -1144,6 +1152,7 @@ impl ResourceFilter {
             Self::Material => "Material",
             Self::Model => "Model",
             Self::Character => "Character",
+            Self::Weapon => "Weapon",
             Self::Mesh => "Mesh",
             Self::Room => "Room",
             Self::Other => "Other",
@@ -1157,6 +1166,7 @@ impl ResourceFilter {
             Self::Material => icons::BLEND,
             Self::Model => icons::BOX,
             Self::Character => icons::MAP_PIN,
+            Self::Weapon => icons::WAYPOINT,
             Self::Mesh => icons::BOX,
             Self::Room => icons::GRID,
             Self::Other => icons::FILE,
@@ -1170,6 +1180,7 @@ impl ResourceFilter {
             Self::Material => matches!(data, ResourceData::Material(_)),
             Self::Model => matches!(data, ResourceData::Model(_)),
             Self::Character => matches!(data, ResourceData::Character(_)),
+            Self::Weapon => matches!(data, ResourceData::Weapon(_)),
             Self::Mesh => matches!(data, ResourceData::Mesh { .. }),
             Self::Room => matches!(data, ResourceData::Scene { .. }),
             Self::Other => matches!(
@@ -1220,6 +1231,7 @@ impl EditorWorkspace {
             selection_mode: SelectionMode::default(),
             hovered_primitive: None,
             selected_primitive: None,
+            selected_primitives: Vec::new(),
             primitive_drag: None,
             hovered_entity_node: None,
             node_drag: None,
@@ -2077,7 +2089,7 @@ impl EditorWorkspace {
             Ok(id) => {
                 self.replace_resource_selection(id);
                 self.clear_node_selection_state();
-                self.selected_primitive = None;
+                self.clear_primitive_selection_state();
                 self.clear_sector_selection();
                 self.close_texture_import_dialog();
                 self.status = format!("Imported texture {output_name}");
@@ -2495,7 +2507,7 @@ impl EditorWorkspace {
             Ok(id) => {
                 self.replace_resource_selection(id);
                 self.clear_node_selection_state();
-                self.selected_primitive = None;
+                self.clear_primitive_selection_state();
                 self.clear_sector_selection();
                 self.close_model_import_dialog();
                 self.status = format!("Imported model {output_name}");
@@ -2717,7 +2729,7 @@ impl EditorWorkspace {
                     if let Some(hit) = entity_hit {
                         self.begin_node_drag(hit, rect);
                     } else {
-                        self.begin_primitive_drag();
+                        self.begin_primitive_drag(ui.input(|input| input.modifiers));
                     }
                 }
                 if response.dragged_by(egui::PointerButton::Primary) {
@@ -2931,6 +2943,12 @@ impl EditorWorkspace {
         self.selected_primitive
     }
 
+    /// All selected grid primitives, excluding floor-tile sector
+    /// selections which are exposed separately as floor faces.
+    pub fn selected_primitives(&self) -> Vec<Selection> {
+        self.selected_primitive_targets()
+    }
+
     /// Selected floor tiles as face refs for the 3D preview overlay.
     /// 2D tile selection stores sector cells, while the 3D preview
     /// outline path already knows how to draw face outlines.
@@ -3069,50 +3087,41 @@ impl EditorWorkspace {
     /// happens in `update_primitive_drag` once the pointer
     /// actually moves. A pure click (no movement) flows through
     /// `commit_face_selection` and never touches `primitive_drag`.
-    fn begin_primitive_drag(&mut self) {
+    fn begin_primitive_drag(&mut self, modifiers: egui::Modifiers) {
         let Some(target) = self.hovered_primitive else {
             return;
         };
-        // Make the dragged primitive the selection. The user's
-        // mental model: "I clicked it, so it's mine to drag."
-        // This also drops `selected_resource` so the inspector
-        // doesn't fight for the panel.
-        self.selected_primitive = Some(target);
-        self.clear_node_selection_state();
-        if let Selection::Face(face) = target {
-            if let Some(id) = self.face_material(face) {
-                self.replace_resource_selection(id);
+        let already_selected = self.primitive_is_selected(target)
+            || self.floor_face_sector_is_selected(target).is_some();
+        if !already_selected {
+            if modifiers.shift || modifiers.command || modifiers.ctrl {
+                self.apply_primitive_selection_modifiers(target, modifiers);
             } else {
-                self.clear_resource_selection_state();
+                self.replace_primitive_selection(target);
+                self.clear_node_selection_state();
+                self.clear_sector_selection();
+                self.update_primitive_resource_selection();
             }
         } else {
-            self.clear_resource_selection_state();
+            self.selected_primitive = Some(target);
         }
 
-        // Resolve the physical vertices the drag will translate
-        // and snapshot their pre-drag Ys. For Face / Edge this
-        // is up to 4 / 2 entries -- the universal-coincidence
-        // resolver fans each out to all face-corners that share
-        // the world point, so the drag itself only walks this
-        // small list.
-        let Some(grid) = self.room_grid_view(target.room()) else {
+        let targets = self.primitive_drag_targets(target);
+        if targets.is_empty() {
             return;
-        };
-        let vertices = match drag_corner_seeds(target) {
-            Some(seeds) => seeds
-                .iter()
-                .filter_map(|seed| physical_vertex(grid, *seed))
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
+        }
+        // Resolve the physical vertices the drag will translate
+        // and snapshot their pre-drag Ys. The universal-coincidence
+        // resolver fans each seed out to all face-corners that share
+        // the world point, so the drag itself only walks this small
+        // list even for multi-selection.
+        let vertices = self.drag_vertices_for_targets(&targets);
         if vertices.is_empty() {
             return;
         }
-        let pre_drag_ys = vertices.iter().map(|v| v.world[1]).collect();
         self.primitive_drag = Some(PrimitiveDrag {
-            target,
+            targets,
             vertices,
-            pre_drag_ys,
             accumulated_pixel_dy: 0.0,
             snapshot_pushed: false,
         });
@@ -3154,24 +3163,22 @@ impl EditorWorkspace {
         // Compute every (vertex, new_y) BEFORE entering the
         // mutable scene borrow so the apply step is one tight
         // loop without re-borrowing.
-        let updates: Vec<(PhysicalVertex, i32)> = drag
+        let updates: Vec<(NodeId, PhysicalVertex, i32)> = drag
             .vertices
             .iter()
-            .zip(drag.pre_drag_ys.iter())
-            .map(|(vertex, pre_y)| {
-                let new_y = snap_height(pre_y + world_delta);
-                (vertex.clone(), new_y)
+            .map(|entry| {
+                let new_y = snap_height(entry.pre_drag_y + world_delta);
+                (entry.room, entry.vertex.clone(), new_y)
             })
             .collect();
-        let target = drag.target;
         let scene = self.project.active_scene_mut();
-        let Some(node) = scene.node_mut(target.room()) else {
-            return;
-        };
-        let NodeKind::Room { grid } = &mut node.kind else {
-            return;
-        };
-        for (vertex, new_y) in updates {
+        for (room, vertex, new_y) in updates {
+            let Some(node) = scene.node_mut(room) else {
+                continue;
+            };
+            let NodeKind::Room { grid } = &mut node.kind else {
+                continue;
+            };
             apply_vertex_height(grid, &vertex, new_y);
         }
         self.mark_dirty();
@@ -3182,13 +3189,65 @@ impl EditorWorkspace {
     fn end_primitive_drag(&mut self) {
         if let Some(drag) = self.primitive_drag.take() {
             if drag.snapshot_pushed {
+                let label = if drag.targets.len() == 1 {
+                    describe_selection(drag.targets[0])
+                } else {
+                    format!("{} primitives", drag.targets.len())
+                };
                 self.status = format!(
                     "Translated {} ({} face-corners followed)",
-                    describe_selection(drag.target),
-                    drag.vertices.iter().map(|v| v.members.len()).sum::<usize>(),
+                    label,
+                    drag.vertices
+                        .iter()
+                        .map(|v| v.vertex.members.len())
+                        .sum::<usize>(),
                 );
             }
         }
+    }
+
+    fn primitive_drag_targets(&self, target: Selection) -> Vec<Selection> {
+        if self.floor_face_sector_is_selected(target).is_some() {
+            return self
+                .selected_sector_faces()
+                .into_iter()
+                .map(Selection::Face)
+                .collect();
+        }
+        if self.primitive_is_selected(target) {
+            self.selected_primitive_targets()
+        } else {
+            vec![target]
+        }
+    }
+
+    fn drag_vertices_for_targets(&self, targets: &[Selection]) -> Vec<DragVertex> {
+        let mut vertices = Vec::new();
+        for target in targets {
+            let Some(grid) = self.room_grid_view(target.room()) else {
+                continue;
+            };
+            let Some(seeds) = drag_corner_seeds(*target) else {
+                continue;
+            };
+            for seed in seeds {
+                let Some(vertex) = physical_vertex(grid, seed) else {
+                    continue;
+                };
+                if vertices
+                    .iter()
+                    .any(|entry: &DragVertex| entry.room == target.room() && entry.vertex == vertex)
+                {
+                    continue;
+                }
+                vertices.push(DragVertex {
+                    room: target.room(),
+                    pre_drag_y: vertex.world[1],
+                    vertex,
+                });
+            }
+        }
+        vertices
     }
 
     /// Promote the hovered primitive to a selection. When the
@@ -3202,7 +3261,7 @@ impl EditorWorkspace {
     /// in sync with the viewport click.
     fn commit_node_selection(&mut self, node: NodeId) {
         self.replace_node_selection(node);
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         self.clear_resource_selection_state();
         self.clear_sector_selection();
         let scene = self.project.active_scene();
@@ -3317,27 +3376,10 @@ impl EditorWorkspace {
     fn commit_face_selection(&mut self, modifiers: egui::Modifiers) {
         match self.hovered_primitive {
             Some(selection) => {
-                let toggle = modifiers.command || modifiers.ctrl;
-                if (modifiers.shift || toggle) && self.select_floor_face_tile(selection, modifiers)
-                {
-                    return;
-                }
-                self.selected_primitive = Some(selection);
-                self.clear_node_selection_state();
-                self.clear_sector_selection();
-                if let Selection::Face(face) = selection {
-                    if let Some(id) = self.face_material(face) {
-                        self.replace_resource_selection(id);
-                    } else {
-                        self.clear_resource_selection_state();
-                    }
-                } else {
-                    self.clear_resource_selection_state();
-                }
-                self.status = format!("Selected {}", describe_selection(selection));
+                self.apply_primitive_selection_modifiers(selection, modifiers);
             }
             None => {
-                self.selected_primitive = None;
+                self.clear_primitive_selection_state();
                 self.clear_resource_selection_state();
                 self.clear_sector_selection();
                 self.status = "Cleared selection".to_string();
@@ -3363,9 +3405,77 @@ impl EditorWorkspace {
             }
         }
 
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         self.select_sector((face.room, face.sx, face.sz), modifiers);
         true
+    }
+
+    fn floor_face_sector_is_selected(&self, selection: Selection) -> Option<SectorSelection> {
+        let Selection::Face(face) = selection else {
+            return None;
+        };
+        if !matches!(face.kind, FaceKind::Floor) {
+            return None;
+        }
+        let sector = (face.room, face.sx, face.sz);
+        self.selected_sectors.contains(&sector).then_some(sector)
+    }
+
+    fn apply_primitive_selection_modifiers(
+        &mut self,
+        selection: Selection,
+        modifiers: egui::Modifiers,
+    ) {
+        let toggle = modifiers.command || modifiers.ctrl;
+        if (modifiers.shift || toggle) && self.select_floor_face_tile(selection, modifiers) {
+            return;
+        }
+
+        self.clear_sector_selection();
+        self.clear_node_selection_state();
+        if modifiers.shift {
+            if self.selected_primitives.is_empty() {
+                if let Some(current) = self.selected_primitive {
+                    self.selected_primitives.push(current);
+                }
+            }
+            self.push_selected_primitive_unique(selection);
+        } else if toggle {
+            if self.selected_primitives.is_empty() {
+                if let Some(current) = self.selected_primitive {
+                    self.selected_primitives.push(current);
+                }
+            }
+            if let Some(index) = self
+                .selected_primitives
+                .iter()
+                .position(|candidate| *candidate == selection)
+            {
+                self.selected_primitives.remove(index);
+                self.selected_primitive = self.selected_primitives.last().copied();
+            } else {
+                self.push_selected_primitive_unique(selection);
+            }
+        } else {
+            self.replace_primitive_selection(selection);
+        }
+
+        if self.selected_primitives.is_empty() {
+            self.clear_primitive_selection_state();
+            self.clear_resource_selection_state();
+            self.status = "Cleared primitive selection".to_string();
+            return;
+        }
+
+        self.update_primitive_resource_selection();
+        self.status = match self.selected_primitives.len() {
+            0 => "Cleared primitive selection".to_string(),
+            1 => format!(
+                "Selected {}",
+                describe_selection(self.selected_primitives[0])
+            ),
+            count => format!("Selected {count} primitives"),
+        };
     }
 
     /// 3D paint / move click handler. `face_hit` is the ray-test
@@ -3484,7 +3594,7 @@ impl EditorWorkspace {
                 );
                 self.replace_node_selection(node);
                 self.clear_resource_selection_state();
-                self.selected_primitive = None;
+                self.clear_primitive_selection_state();
                 self.status = format!("Created Entity from {}", resource.name);
                 self.mark_dirty();
             }
@@ -3502,8 +3612,25 @@ impl EditorWorkspace {
                 );
                 self.replace_node_selection(node);
                 self.clear_resource_selection_state();
-                self.selected_primitive = None;
+                self.clear_primitive_selection_state();
                 self.status = format!("Created Entity from {}", resource.name);
+                self.mark_dirty();
+            }
+            ResourceData::Weapon(weapon) => {
+                self.push_undo();
+                let node = self.create_weapon_entity_at_room_hit(
+                    room_id,
+                    resource_id,
+                    &resource.name,
+                    weapon.model,
+                    weapon.default_character_socket.as_str(),
+                    weapon.grip.name.as_str(),
+                    hit_world,
+                );
+                self.replace_node_selection(node);
+                self.clear_resource_selection_state();
+                self.selected_primitive = None;
+                self.status = format!("Created Weapon Entity from {}", resource.name);
                 self.mark_dirty();
             }
             ResourceData::Material(_) => {
@@ -3513,13 +3640,13 @@ impl EditorWorkspace {
                 };
                 if self.assign_face_material(face, Some(resource_id)) {
                     self.replace_resource_selection(resource_id);
-                    self.selected_primitive = Some(Selection::Face(face));
+                    self.replace_primitive_selection(Selection::Face(face));
                     self.status = format!("Assigned {} to {}", resource.name, describe_face(face));
                 }
             }
             _ => {
                 self.status = format!(
-                    "Drag Model or Character resources into the scene; {} is not placeable",
+                    "Drag Model, Character, or Weapon resources into the scene; {} is not placeable",
                     resource.data.label()
                 );
             }
@@ -3556,6 +3683,47 @@ impl EditorWorkspace {
             NodeKind::Animator {
                 clip: None,
                 autoplay: true,
+            },
+        );
+        entity
+    }
+
+    fn create_weapon_entity_at_room_hit(
+        &mut self,
+        room_id: NodeId,
+        weapon_id: ResourceId,
+        name: &str,
+        model_id: Option<ResourceId>,
+        character_socket: &str,
+        weapon_grip: &str,
+        hit_world: [f32; 3],
+    ) -> NodeId {
+        let editor = self
+            .room_grid_view(room_id)
+            .map(|grid| grid.room_local_to_editor(hit_world))
+            .unwrap_or([hit_world[0], hit_world[2]]);
+        let scene = self.project.active_scene_mut();
+        let entity = scene.add_node(room_id, name.to_string(), NodeKind::Entity);
+        if let Some(node) = scene.node_mut(entity) {
+            node.transform.translation = [editor[0], 0.0, editor[1]];
+        }
+        if let Some(model_id) = model_id {
+            scene.add_node(
+                entity,
+                "Model Renderer",
+                NodeKind::ModelRenderer {
+                    model: Some(model_id),
+                    material: None,
+                },
+            );
+        }
+        scene.add_node(
+            entity,
+            "Equipment",
+            NodeKind::Equipment {
+                weapon: Some(weapon_id),
+                character_socket: character_socket.to_string(),
+                weapon_grip: weapon_grip.to_string(),
             },
         );
         entity
@@ -3840,7 +4008,7 @@ impl EditorWorkspace {
                             );
                             self.replace_node_selection(id);
                             self.clear_resource_selection_state();
-                            self.selected_primitive = None;
+                            self.clear_primitive_selection_state();
                             self.status = format!("Placed Model at {sx},{sz}");
                             self.mark_dirty();
                             return;
@@ -3872,7 +4040,7 @@ impl EditorWorkspace {
             }
             self.replace_node_selection(id);
             self.clear_resource_selection_state();
-            self.selected_primitive = None;
+            self.clear_primitive_selection_state();
             self.status = format!("Placed {} at {sx},{sz}", kind.label());
             self.mark_dirty();
             return;
@@ -4348,8 +4516,8 @@ impl EditorWorkspace {
             if del && self.renaming.is_none() {
                 if !self.selected_sectors.is_empty() {
                     self.delete_selected_sectors();
-                } else if self.selected_primitive.is_some() {
-                    self.delete_selected_primitive();
+                } else if !self.selected_primitive_targets().is_empty() {
+                    self.delete_selected_primitives();
                 } else if self.selected_resource.is_some() {
                     self.begin_resource_delete_confirmation();
                 } else if self.selected_node != NodeId::ROOT {
@@ -4393,34 +4561,51 @@ impl EditorWorkspace {
             return;
         }
         self.selection_mode = mode;
-        self.selected_primitive = match (self.selected_primitive, mode) {
-            (Some(Selection::Face(face)), SelectionMode::Face) => Some(Selection::Face(face)),
-            (Some(Selection::Face(face)), SelectionMode::Edge) => {
-                Some(Selection::Edge(face_first_edge(face)))
+        let active = self
+            .selected_primitive
+            .and_then(|selection| Self::selection_as_mode(selection, mode));
+        let mut converted = Vec::new();
+        for selection in self.selected_primitive_targets() {
+            let Some(selection) = Self::selection_as_mode(selection, mode) else {
+                continue;
+            };
+            if !converted.contains(&selection) {
+                converted.push(selection);
             }
-            (Some(Selection::Face(face)), SelectionMode::Vertex) => {
-                Some(Selection::Vertex(face_first_vertex(face)))
-            }
-            (Some(Selection::Edge(edge)), SelectionMode::Face) => {
-                edge_owning_face_ref(edge).map(Selection::Face)
-            }
-            (Some(Selection::Edge(edge)), SelectionMode::Vertex) => {
-                Some(Selection::Vertex(edge_first_vertex(edge)))
-            }
-            (Some(Selection::Vertex(v)), SelectionMode::Face) => {
-                vertex_owning_face_ref(v).map(Selection::Face)
-            }
-            (Some(Selection::Vertex(v)), SelectionMode::Edge) => {
-                Some(Selection::Edge(vertex_first_edge(v)))
-            }
-            (Some(s), m) if Self::matches_mode(s, m) => Some(s),
-            _ => None,
-        };
+        }
+        self.selected_primitives = converted;
+        self.selected_primitive = active.or_else(|| self.selected_primitives.first().copied());
         // Clear the hover too -- its mode is the old one, and
         // the next mouse-move re-pick will repopulate under the
         // new mode anyway.
         self.hovered_primitive = None;
         self.status = format!("Selection mode: {}", mode.label());
+    }
+
+    fn selection_as_mode(selection: Selection, mode: SelectionMode) -> Option<Selection> {
+        match (selection, mode) {
+            (Selection::Face(face), SelectionMode::Face) => Some(Selection::Face(face)),
+            (Selection::Face(face), SelectionMode::Edge) => {
+                Some(Selection::Edge(face_first_edge(face)))
+            }
+            (Selection::Face(face), SelectionMode::Vertex) => {
+                Some(Selection::Vertex(face_first_vertex(face)))
+            }
+            (Selection::Edge(edge), SelectionMode::Face) => {
+                edge_owning_face_ref(edge).map(Selection::Face)
+            }
+            (Selection::Edge(edge), SelectionMode::Vertex) => {
+                Some(Selection::Vertex(edge_first_vertex(edge)))
+            }
+            (Selection::Vertex(vertex), SelectionMode::Face) => {
+                vertex_owning_face_ref(vertex).map(Selection::Face)
+            }
+            (Selection::Vertex(vertex), SelectionMode::Edge) => {
+                Some(Selection::Edge(vertex_first_edge(vertex)))
+            }
+            (selection, mode) if Self::matches_mode(selection, mode) => Some(selection),
+            _ => None,
+        }
     }
 
     fn matches_mode(selection: Selection, mode: SelectionMode) -> bool {
@@ -4551,7 +4736,7 @@ impl EditorWorkspace {
                 if scene.move_node(source, target_parent, position) {
                     self.replace_node_selection(source);
                     self.clear_resource_selection_state();
-                    self.selected_primitive = None;
+                    self.clear_primitive_selection_state();
                     self.clear_sector_selection();
                     self.status = "Moved node".to_string();
                     self.mark_dirty();
@@ -4912,6 +5097,7 @@ impl EditorWorkspace {
                         let room_options = collect_room_options(&self.project);
                         let model_options = collect_model_options(&self.project);
                         let character_options = collect_character_options(&self.project);
+                        let weapon_options = collect_weapon_options(&self.project);
                         let selected = self.selected_node;
                         let active_room = self.active_room_id();
                         let selected_sector = self.selected_sector;
@@ -4971,6 +5157,7 @@ impl EditorWorkspace {
                                     &room_options,
                                     &model_options,
                                     &character_options,
+                                    &weapon_options,
                                     inherited_sector_size,
                                     &mut nav_target,
                                 );
@@ -5096,7 +5283,7 @@ impl EditorWorkspace {
                         if let Some(target) = nav_target {
                             self.replace_resource_selection(target);
                             self.clear_node_selection_state();
-                            self.selected_primitive = None;
+                            self.clear_primitive_selection_state();
                             self.clear_sector_selection();
                         }
                     });
@@ -5482,7 +5669,7 @@ impl EditorWorkspace {
         // buttons. Safe here because the mutable scene borrow
         // ended at the end of the match block above.
         if let Some(target) = nav_target {
-            self.selected_primitive = None;
+            self.clear_primitive_selection_state();
             self.replace_resource_selection(target);
             self.clear_node_selection_state();
             self.clear_sector_selection();
@@ -5550,6 +5737,7 @@ impl EditorWorkspace {
         // without borrowing `self.project` while the mutable
         // borrow on `resource_mut` is live.
         let character_ctx = build_character_editor_context(&self.project);
+        let model_options = collect_model_options(&self.project);
 
         // Build the breadcrumb before the mutable borrow on
         // `resource_mut` -- we need other resources by id to
@@ -5697,6 +5885,9 @@ impl EditorWorkspace {
             ResourceData::Character(character) => {
                 changed |= draw_character_resource_editor(ui, character, &character_ctx);
             }
+            ResourceData::Weapon(weapon) => {
+                changed |= draw_weapon_resource_editor(ui, weapon, &model_options);
+            }
             ResourceData::Mesh { source_path }
             | ResourceData::Scene { source_path }
             | ResourceData::Script { source_path }
@@ -5719,7 +5910,7 @@ impl EditorWorkspace {
         if let Some(target) = nav_target {
             self.replace_resource_selection(target);
             self.clear_node_selection_state();
-            self.selected_primitive = None;
+            self.clear_primitive_selection_state();
             self.clear_sector_selection();
         }
     }
@@ -5756,7 +5947,7 @@ impl EditorWorkspace {
                         );
                         self.replace_resource_selection(id);
                         self.clear_node_selection_state();
-                        self.selected_primitive = None;
+                        self.clear_primitive_selection_state();
                         self.clear_sector_selection();
                         self.status = "Added material".to_string();
                         self.mark_dirty();
@@ -5774,7 +5965,7 @@ impl EditorWorkspace {
                         );
                         self.replace_resource_selection(id);
                         self.clear_node_selection_state();
-                        self.selected_primitive = None;
+                        self.clear_primitive_selection_state();
                         self.clear_sector_selection();
                         self.status = "Added texture".to_string();
                         self.mark_dirty();
@@ -5807,11 +5998,12 @@ impl EditorWorkspace {
                                 preview_clip: None,
                                 world_height: 1024,
                                 scale_q8: [MODEL_SCALE_ONE_Q8; 3],
+                                attachments: Vec::new(),
                             }),
                         );
                         self.replace_resource_selection(id);
                         self.clear_node_selection_state();
-                        self.selected_primitive = None;
+                        self.clear_primitive_selection_state();
                         self.clear_sector_selection();
                         self.status = "Added model".to_string();
                         self.mark_dirty();
@@ -5824,6 +6016,22 @@ impl EditorWorkspace {
                         .clicked()
                     {
                         self.open_model_import_dialog();
+                    }
+                    if ui
+                        .button(icons::label(icons::PLUS, "Weapon"))
+                        .on_hover_text("Add a Weapon resource with a grip and hitbox.")
+                        .clicked()
+                    {
+                        let id = self.project.add_resource(
+                            "New Weapon",
+                            ResourceData::Weapon(psxed_project::WeaponResource::default()),
+                        );
+                        self.replace_resource_selection(id);
+                        self.clear_node_selection_state();
+                        self.clear_primitive_selection_state();
+                        self.clear_sector_selection();
+                        self.status = "Added weapon".to_string();
+                        self.mark_dirty();
                     }
                 });
                 ui.separator();
@@ -6602,6 +6810,49 @@ impl EditorWorkspace {
         self.resource_delete_confirm = None;
     }
 
+    fn replace_primitive_selection(&mut self, selection: Selection) {
+        self.selected_primitive = Some(selection);
+        self.selected_primitives.clear();
+        self.selected_primitives.push(selection);
+    }
+
+    fn clear_primitive_selection_state(&mut self) {
+        self.selected_primitive = None;
+        self.selected_primitives.clear();
+    }
+
+    fn selected_primitive_targets(&self) -> Vec<Selection> {
+        if self.selected_primitives.is_empty() {
+            self.selected_primitive.into_iter().collect()
+        } else {
+            self.selected_primitives.clone()
+        }
+    }
+
+    fn primitive_is_selected(&self, selection: Selection) -> bool {
+        self.selected_primitives.contains(&selection)
+            || (self.selected_primitives.is_empty() && self.selected_primitive == Some(selection))
+    }
+
+    fn push_selected_primitive_unique(&mut self, selection: Selection) {
+        if !self.selected_primitives.contains(&selection) {
+            self.selected_primitives.push(selection);
+        }
+        self.selected_primitive = Some(selection);
+    }
+
+    fn update_primitive_resource_selection(&mut self) {
+        if self.selected_primitives.len() == 1 {
+            if let Selection::Face(face) = self.selected_primitives[0] {
+                if let Some(id) = self.face_material(face) {
+                    self.replace_resource_selection(id);
+                    return;
+                }
+            }
+        }
+        self.clear_resource_selection_state();
+    }
+
     fn node_is_selected(&self, id: NodeId) -> bool {
         self.selected_nodes.contains(&id)
             || (self.selected_nodes.is_empty() && self.selected_node == id)
@@ -6652,7 +6903,7 @@ impl EditorWorkspace {
         self.selected_resource = None;
         self.selected_resources.clear();
         self.resource_selection_anchor = None;
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         self.clear_sector_selection();
 
         let count = self.selected_nodes.len();
@@ -6707,7 +6958,7 @@ impl EditorWorkspace {
         self.selected_node = NodeId::ROOT;
         self.selected_nodes.clear();
         self.node_selection_anchor = None;
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         self.clear_sector_selection();
         self.resource_delete_confirm = None;
 
@@ -7088,7 +7339,7 @@ impl EditorWorkspace {
         self.sector_selection_anchor = Some(selection);
         self.replace_node_selection(selection.0);
         self.clear_resource_selection_state();
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         self.status = match self.selected_sectors.len() {
             0 => "Cleared tile selection".to_string(),
             1 => format!("Selected sector {},{}", selection.1, selection.2),
@@ -7120,7 +7371,7 @@ impl EditorWorkspace {
         self.sector_selection_anchor = Some(anchor);
         self.replace_node_selection(anchor.0);
         self.clear_resource_selection_state();
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         self.selected_sector = Some((current.1, current.2));
         self.status = format!("Selected {} sectors", self.selected_sectors.len());
     }
@@ -7143,7 +7394,7 @@ impl EditorWorkspace {
                     } else {
                         let visible_order = self.scene_node_order();
                         self.apply_node_selection_modifiers(hit.id, modifiers, &visible_order);
-                        self.selected_primitive = None;
+                        self.clear_primitive_selection_state();
                         self.clear_sector_selection();
                     }
                 } else {
@@ -7235,7 +7486,7 @@ impl EditorWorkspace {
             .add_node(parent, name.to_string(), kind);
         self.replace_node_selection(id);
         self.clear_resource_selection_state();
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         self.clear_sector_selection();
         self.status = format!("Added {name}");
         self.mark_dirty();
@@ -7270,7 +7521,7 @@ impl EditorWorkspace {
         self.selected_node = duplicated[0];
         self.node_selection_anchor = duplicated.last().copied();
         self.clear_resource_selection_state();
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         self.clear_sector_selection();
         self.status = if duplicated.len() == 1 {
             "Duplicated node".to_string()
@@ -7295,7 +7546,7 @@ impl EditorWorkspace {
         if removed > 0 {
             self.clear_node_selection_state();
             self.clear_resource_selection_state();
-            self.selected_primitive = None;
+            self.clear_primitive_selection_state();
             self.clear_sector_selection();
             self.status = if removed == 1 {
                 "Deleted node".to_string()
@@ -7331,7 +7582,7 @@ impl EditorWorkspace {
                             if ui.button(parent_name).clicked() {
                                 self.replace_node_selection(*parent_id);
                                 self.clear_resource_selection_state();
-                                self.selected_primitive = None;
+                                self.clear_primitive_selection_state();
                                 self.clear_sector_selection();
                             }
                         });
@@ -7396,7 +7647,7 @@ impl EditorWorkspace {
         if let Some(id) = select_component {
             self.replace_node_selection(id);
             self.clear_resource_selection_state();
-            self.selected_primitive = None;
+            self.clear_primitive_selection_state();
             self.clear_sector_selection();
         }
         if let Some((label, kind)) = add_component {
@@ -7435,7 +7686,7 @@ impl EditorWorkspace {
             .add_node(host, label.to_string(), kind);
         self.replace_node_selection(id);
         self.clear_resource_selection_state();
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         self.clear_sector_selection();
         self.status = format!("Added {label} component");
         self.mark_dirty();
@@ -7466,7 +7717,7 @@ impl EditorWorkspace {
         }
 
         self.clear_sector_selection();
-        self.selected_primitive = None;
+        self.clear_primitive_selection_state();
         if removed > 0 {
             self.status = if removed == 1 {
                 "Deleted tile".to_string()
@@ -7486,31 +7737,57 @@ impl EditorWorkspace {
     ///   into a triangle (split is auto-flipped to the surviving
     ///   diagonal). The other coincident face-corners are left
     ///   untouched.
-    fn delete_selected_primitive(&mut self) {
-        let Some(selection) = self.selected_primitive else {
+    fn delete_selected_primitives(&mut self) {
+        let targets = self.selected_primitive_targets();
+        if targets.is_empty() {
             return;
+        }
+        self.push_undo();
+
+        let mut removed = 0usize;
+        let mut triangulated = 0usize;
+        let mut first_label = None;
+        for selection in targets {
+            match self.delete_primitive_no_undo(selection) {
+                DeleteOutcome::Removed(label) => {
+                    removed += 1;
+                    first_label.get_or_insert(label);
+                }
+                DeleteOutcome::Triangulated(label) => {
+                    triangulated += 1;
+                    first_label.get_or_insert(label);
+                }
+                DeleteOutcome::Missing => {}
+            }
+        }
+
+        let changed = removed + triangulated;
+        if changed == 0 {
+            self.status = "Nothing to delete".to_string();
+            return;
+        }
+
+        self.clear_primitive_selection_state();
+        self.hovered_primitive = None;
+        self.status = if changed == 1 {
+            if removed == 1 {
+                format!("Deleted {}", first_label.unwrap_or("primitive"))
+            } else {
+                format!("Dropped {}", first_label.unwrap_or("primitive"))
+            }
+        } else {
+            format!("Deleted {changed} primitives")
         };
-        let outcome = match selection {
-            Selection::Face(face) => self.remove_face(face),
+        self.mark_dirty();
+    }
+
+    fn delete_primitive_no_undo(&mut self, selection: Selection) -> DeleteOutcome {
+        match selection {
+            Selection::Face(face) => self.remove_face_no_undo(face),
             Selection::Edge(edge) => edge_owning_face_ref(edge)
-                .map(|face| self.remove_face(face))
+                .map(|face| self.remove_face_no_undo(face))
                 .unwrap_or(DeleteOutcome::Missing),
-            Selection::Vertex(vertex) => self.drop_vertex(vertex),
-        };
-        match outcome {
-            DeleteOutcome::Removed(label) => {
-                self.selected_primitive = None;
-                self.hovered_primitive = None;
-                self.status = format!("Deleted {label}");
-                self.mark_dirty();
-            }
-            DeleteOutcome::Triangulated(label) => {
-                self.status = format!("Dropped {label}");
-                self.mark_dirty();
-            }
-            DeleteOutcome::Missing => {
-                self.status = "Nothing to delete".to_string();
-            }
+            Selection::Vertex(vertex) => self.drop_vertex_no_undo(vertex),
         }
     }
 
@@ -7518,8 +7795,7 @@ impl EditorWorkspace {
     /// `Option<>`; walls splice the entry out of the per-direction
     /// `Vec`. Returns `Removed` on success so the caller can update
     /// status / clear the selection.
-    fn remove_face(&mut self, face: FaceRef) -> DeleteOutcome {
-        self.push_undo();
+    fn remove_face_no_undo(&mut self, face: FaceRef) -> DeleteOutcome {
         let scene = self.project.active_scene_mut();
         let Some(node) = scene.node_mut(face.room) else {
             return DeleteOutcome::Missing;
@@ -7553,8 +7829,7 @@ impl EditorWorkspace {
     /// Drop a corner from the vertex's seed face. Floors / ceilings
     /// gain a `dropped_corner` and have their split forced to the
     /// surviving diagonal. Walls do the same with `WallCorner`.
-    fn drop_vertex(&mut self, vertex: VertexRef) -> DeleteOutcome {
-        self.push_undo();
+    fn drop_vertex_no_undo(&mut self, vertex: VertexRef) -> DeleteOutcome {
         let scene = self.project.active_scene_mut();
         let Some(node) = scene.node_mut(vertex.room) else {
             return DeleteOutcome::Missing;
@@ -7752,7 +8027,18 @@ impl EditorWorkspace {
             return Some(bounds_3d_to_center_half(bounds));
         }
 
-        if let Some(selection) = self.selected_primitive {
+        let primitive_targets = self.selected_primitive_targets();
+        if primitive_targets.len() > 1 {
+            let mut bounds = None;
+            for selection in primitive_targets {
+                if let Some((center, half)) = self.selection_bounds_3d(selection) {
+                    merge_bounds_3d(&mut bounds, center, half);
+                }
+            }
+            if let Some(bounds) = bounds {
+                return Some(bounds_3d_to_center_half(bounds));
+            }
+        } else if let Some(selection) = self.selected_primitive {
             return self.selection_bounds_3d(selection);
         }
 
@@ -7811,21 +8097,17 @@ impl EditorWorkspace {
             return Some(bounds_to_center_half(bounds));
         }
 
-        if let Some(selection) = self.selected_primitive {
-            let (room, sx, sz) = match selection {
-                Selection::Face(face) => (face.room, face.sx, face.sz),
-                Selection::Edge(edge) => match edge.anchor {
-                    EdgeAnchor::Floor { sx, sz, .. }
-                    | EdgeAnchor::Ceiling { sx, sz, .. }
-                    | EdgeAnchor::Wall { sx, sz, .. } => (edge.room, sx, sz),
-                },
-                Selection::Vertex(vertex) => match vertex.anchor {
-                    VertexAnchor::Floor { sx, sz, .. }
-                    | VertexAnchor::Ceiling { sx, sz, .. }
-                    | VertexAnchor::Wall { sx, sz, .. } => (vertex.room, sx, sz),
-                },
-            };
-            return self.sector_bounds_2d(room, sx, sz);
+        let primitive_targets = self.selected_primitive_targets();
+        if !primitive_targets.is_empty() {
+            for selection in primitive_targets {
+                let (room, sx, sz) = selection_sector(selection);
+                if let Some((center, half)) = self.sector_bounds_2d(room, sx, sz) {
+                    merge_bounds(&mut bounds, center, half);
+                }
+            }
+            if let Some(bounds) = bounds {
+                return Some(bounds_to_center_half(bounds));
+            }
         }
 
         if let Some((sx, sz)) = self.selected_sector {
@@ -8166,6 +8448,7 @@ fn draw_node_kind_editor(
     room_options: &[(NodeId, String)],
     model_options: &[(ResourceId, String, Vec<String>)],
     character_options: &[(ResourceId, String)],
+    weapon_options: &[(ResourceId, String)],
     inherited_sector_size: i32,
     nav_target: &mut Option<ResourceId>,
 ) -> bool {
@@ -8466,6 +8749,22 @@ fn draw_node_kind_editor(
             });
             changed |= drag_u16(ui, "Health", health, 0, u16::MAX);
         }
+        NodeKind::Equipment {
+            weapon,
+            character_socket,
+            weapon_grip,
+        } => {
+            ui.weak("Component: attaches a Weapon resource to a named model socket.");
+            changed |= draw_weapon_selector(ui, weapon_options, weapon);
+            ui.horizontal(|ui| {
+                ui.label("Character Socket");
+                changed |= ui.text_edit_singleline(character_socket).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Weapon Grip");
+                changed |= ui.text_edit_singleline(weapon_grip).changed();
+            });
+        }
         NodeKind::Light {
             color,
             intensity,
@@ -8718,6 +9017,7 @@ fn node_lucide_icon(kind: &str, root: bool) -> char {
         "CharacterController" => icons::MAP_PIN,
         "AiController" => icons::SCAN,
         "Combat" => icons::FOCUS,
+        "Equipment" => icons::WAYPOINT,
         "Light" => icons::SUN,
         "PointLight" => icons::SUN,
         "SpawnPoint" => icons::MAP_PIN,
@@ -8748,6 +9048,7 @@ fn node_lucide_color(kind: &str, root: bool, selected: bool) -> Color32 {
         "CharacterController" => Color32::from_rgb(104, 194, 142),
         "AiController" => Color32::from_rgb(144, 176, 112),
         "Combat" => Color32::from_rgb(220, 110, 110),
+        "Equipment" => Color32::from_rgb(210, 190, 104),
         "Light" => Color32::from_rgb(238, 203, 116),
         "PointLight" => Color32::from_rgb(238, 203, 116),
         "SpawnPoint" => Color32::from_rgb(236, 188, 104),
@@ -9319,6 +9620,13 @@ fn draw_model_resource_editor(
             changed |= model_scale_axis_editor(ui, "X", &mut model.scale_q8[0]);
             changed |= model_scale_axis_editor(ui, "Y", &mut model.scale_q8[1]);
             changed |= model_scale_axis_editor(ui, "Z", &mut model.scale_q8[2]);
+        });
+
+    egui::CollapsingHeader::new(icons::label(icons::WAYPOINT, "Attachment Sockets"))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.weak("Sockets bind equipment/VFX to a cooked joint plus an integer local offset.");
+            changed |= attachment_socket_list_editor(ui, &mut model.attachments);
         });
 
     // Live-parse the model + clips for stats. Cheap on every
@@ -9972,6 +10280,50 @@ fn draw_character_selector(
     changed
 }
 
+fn draw_weapon_selector(
+    ui: &mut egui::Ui,
+    options: &[(ResourceId, String)],
+    current: &mut Option<ResourceId>,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Weapon");
+        let preview = current
+            .and_then(|id| {
+                options
+                    .iter()
+                    .find(|(rid, _)| *rid == id)
+                    .map(|(_, n)| n.as_str())
+            })
+            .unwrap_or("(none)");
+        egui::ComboBox::from_id_salt("equipment-weapon-picker")
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "(none)").clicked() {
+                    *current = None;
+                    changed = true;
+                }
+                for (id, name) in options {
+                    if ui.selectable_label(*current == Some(*id), name).clicked() {
+                        *current = Some(*id);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    if let Some(id) = *current {
+        if !options.iter().any(|(rid, _)| *rid == id) {
+            ui.colored_label(
+                Color32::from_rgb(220, 120, 100),
+                "Weapon resource is missing.",
+            );
+        }
+    } else if options.is_empty() {
+        ui.colored_label(STUDIO_TEXT_WEAK, "No Weapon resources defined yet.");
+    }
+    changed
+}
+
 fn drag_u16(ui: &mut egui::Ui, label: &str, value: &mut u16, min: u16, max: u16) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -10074,6 +10426,312 @@ fn model_scale_axis_editor(ui: &mut egui::Ui, label: &str, value: &mut u16) -> b
                 .color(STUDIO_TEXT_WEAK)
                 .monospace(),
         );
+    });
+    changed
+}
+
+fn attachment_socket_list_editor(
+    ui: &mut egui::Ui,
+    sockets: &mut Vec<psxed_project::AttachmentSocket>,
+) -> bool {
+    let mut changed = false;
+    let mut remove: Option<usize> = None;
+    for (index, socket) in sockets.iter_mut().enumerate() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("#{index}")).color(STUDIO_TEXT_WEAK));
+                changed |= ui.text_edit_singleline(&mut socket.name).changed();
+                if ui
+                    .small_button(icons::label(icons::TRASH, ""))
+                    .on_hover_text("Remove socket")
+                    .clicked()
+                {
+                    remove = Some(index);
+                }
+            });
+            changed |= drag_u16(ui, "Joint", &mut socket.joint, 0, u16::MAX);
+            changed |= int_vec3_editor(ui, "Offset", &mut socket.translation, -32768, 32767, 8.0);
+            changed |= q12_rotation_editor(ui, "Rotation", &mut socket.rotation_q12);
+        });
+        ui.add_space(4.0);
+    }
+    if let Some(index) = remove {
+        sockets.remove(index);
+        changed = true;
+    }
+    ui.horizontal(|ui| {
+        if ui.button(icons::label(icons::PLUS, "Socket")).clicked() {
+            sockets.push(psxed_project::AttachmentSocket::right_hand_grip());
+            changed = true;
+        }
+    });
+    changed
+}
+
+fn draw_weapon_resource_editor(
+    ui: &mut egui::Ui,
+    weapon: &mut psxed_project::WeaponResource,
+    model_options: &[(ResourceId, String, Vec<String>)],
+) -> bool {
+    let mut changed = false;
+
+    egui::CollapsingHeader::new(icons::label(icons::BOX, "Visual Model"))
+        .default_open(true)
+        .show(ui, |ui| {
+            changed |= model_resource_picker(ui, "Model", &mut weapon.model, model_options);
+            ui.horizontal(|ui| {
+                ui.label("Character Socket");
+                changed |= ui
+                    .text_edit_singleline(&mut weapon.default_character_socket)
+                    .changed();
+            });
+        });
+
+    egui::CollapsingHeader::new(icons::label(icons::WAYPOINT, "Grip"))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                changed |= ui.text_edit_singleline(&mut weapon.grip.name).changed();
+            });
+            changed |= int_vec3_editor(
+                ui,
+                "Offset",
+                &mut weapon.grip.translation,
+                -32768,
+                32767,
+                8.0,
+            );
+            changed |= q12_rotation_editor(ui, "Rotation", &mut weapon.grip.rotation_q12);
+        });
+
+    egui::CollapsingHeader::new(icons::label(icons::SCAN, "Hitboxes"))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.weak("Hit volumes are local to the weapon grip and use integer engine units.");
+            changed |= weapon_hitbox_list_editor(ui, &mut weapon.hitboxes);
+        });
+
+    changed
+}
+
+fn model_resource_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    current: &mut Option<ResourceId>,
+    options: &[(ResourceId, String, Vec<String>)],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let preview = current
+            .and_then(|id| {
+                options
+                    .iter()
+                    .find(|(rid, _, _)| *rid == id)
+                    .map(|(_, name, _)| name.as_str())
+            })
+            .unwrap_or("(none)");
+        egui::ComboBox::from_id_salt(label)
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "(none)").clicked() {
+                    *current = None;
+                    changed = true;
+                }
+                for (id, name, _) in options {
+                    if ui.selectable_label(*current == Some(*id), name).clicked() {
+                        *current = Some(*id);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    if let Some(id) = *current {
+        if !options.iter().any(|(rid, _, _)| *rid == id) {
+            ui.colored_label(
+                Color32::from_rgb(220, 120, 100),
+                "Model resource is missing.",
+            );
+        }
+    }
+    changed
+}
+
+fn weapon_hitbox_list_editor(
+    ui: &mut egui::Ui,
+    hitboxes: &mut Vec<psxed_project::WeaponHitbox>,
+) -> bool {
+    let mut changed = false;
+    let mut remove: Option<usize> = None;
+    for (index, hitbox) in hitboxes.iter_mut().enumerate() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("#{index}")).color(STUDIO_TEXT_WEAK));
+                changed |= ui.text_edit_singleline(&mut hitbox.name).changed();
+                if ui
+                    .small_button(icons::label(icons::TRASH, ""))
+                    .on_hover_text("Remove hitbox")
+                    .clicked()
+                {
+                    remove = Some(index);
+                }
+            });
+            changed |= drag_u16(
+                ui,
+                "Start frame",
+                &mut hitbox.active_start_frame,
+                0,
+                u16::MAX,
+            );
+            changed |= drag_u16(ui, "End frame", &mut hitbox.active_end_frame, 0, u16::MAX);
+            if hitbox.active_end_frame < hitbox.active_start_frame {
+                hitbox.active_end_frame = hitbox.active_start_frame;
+                changed = true;
+            }
+            changed |= weapon_hit_shape_editor(ui, &mut hitbox.shape);
+        });
+        ui.add_space(4.0);
+    }
+    if let Some(index) = remove {
+        hitboxes.remove(index);
+        changed = true;
+    }
+    if ui.button(icons::label(icons::PLUS, "Hitbox")).clicked() {
+        hitboxes.push(psxed_project::WeaponHitbox::default());
+        changed = true;
+    }
+    changed
+}
+
+fn weapon_hit_shape_editor(ui: &mut egui::Ui, shape: &mut psxed_project::WeaponHitShape) -> bool {
+    let mut changed = false;
+    let mut shape_kind = match shape {
+        psxed_project::WeaponHitShape::Box { .. } => 0,
+        psxed_project::WeaponHitShape::Capsule { .. } => 1,
+    };
+    ui.horizontal(|ui| {
+        ui.label("Shape");
+        egui::ComboBox::from_id_salt(ui.id().with("weapon-hit-shape"))
+            .selected_text(if shape_kind == 0 { "Box" } else { "Capsule" })
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(shape_kind == 0, "Box").clicked() {
+                    shape_kind = 0;
+                }
+                if ui.selectable_label(shape_kind == 1, "Capsule").clicked() {
+                    shape_kind = 1;
+                }
+            });
+    });
+    match (shape_kind, &mut *shape) {
+        (0, psxed_project::WeaponHitShape::Capsule { .. }) => {
+            *shape = psxed_project::WeaponHitShape::Box {
+                center: [0, 256, 0],
+                half_extents: [64, 256, 64],
+            };
+            changed = true;
+        }
+        (1, psxed_project::WeaponHitShape::Box { .. }) => {
+            *shape = psxed_project::WeaponHitShape::Capsule {
+                start: [0, 0, 0],
+                end: [0, 512, 0],
+                radius: 48,
+            };
+            changed = true;
+        }
+        _ => {}
+    }
+
+    match shape {
+        psxed_project::WeaponHitShape::Box {
+            center,
+            half_extents,
+        } => {
+            changed |= int_vec3_editor(ui, "Center", center, -32768, 32767, 8.0);
+            changed |= u16_vec3_editor(ui, "Half Extents", half_extents, 1, 8192);
+        }
+        psxed_project::WeaponHitShape::Capsule { start, end, radius } => {
+            changed |= int_vec3_editor(ui, "Start", start, -32768, 32767, 8.0);
+            changed |= int_vec3_editor(ui, "End", end, -32768, 32767, 8.0);
+            changed |= drag_u16(ui, "Radius", radius, 1, 8192);
+        }
+    }
+    changed
+}
+
+fn int_vec3_editor(
+    ui: &mut egui::Ui,
+    label: &str,
+    values: &mut [i32; 3],
+    min: i32,
+    max: i32,
+    speed: f64,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        for axis in 0..3 {
+            let prefix = ["X ", "Y ", "Z "][axis];
+            let response = ui.add(
+                egui::DragValue::new(&mut values[axis])
+                    .prefix(prefix)
+                    .range(min..=max)
+                    .speed(speed),
+            );
+            if response.changed() {
+                values[axis] = values[axis].clamp(min, max);
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+fn u16_vec3_editor(
+    ui: &mut egui::Ui,
+    label: &str,
+    values: &mut [u16; 3],
+    min: u16,
+    max: u16,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        for axis in 0..3 {
+            let prefix = ["X ", "Y ", "Z "][axis];
+            let mut value = values[axis] as i32;
+            let response = ui.add(
+                egui::DragValue::new(&mut value)
+                    .prefix(prefix)
+                    .range(min as i32..=max as i32),
+            );
+            if response.changed() {
+                values[axis] = value.clamp(min as i32, max as i32) as u16;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+fn q12_rotation_editor(ui: &mut egui::Ui, label: &str, values: &mut [i16; 3]) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        for axis in 0..3 {
+            let prefix = ["X ", "Y ", "Z "][axis];
+            let mut value = values[axis] as i32;
+            let response = ui.add(
+                egui::DragValue::new(&mut value)
+                    .prefix(prefix)
+                    .range(-4096..=4096)
+                    .speed(16.0),
+            );
+            if response.changed() {
+                values[axis] = value.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                changed = true;
+            }
+        }
     });
     changed
 }
@@ -10456,7 +11114,7 @@ fn label_for_drag(row: &NodeRow) -> String {
 
 /// Default `(menu label, kind template)` pairs for "Add Child" menus.
 /// Each menu entry uses the label as the new node's display name.
-fn default_addable_kinds() -> [(&'static str, NodeKind); 17] {
+fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
     [
         (
             "World",
@@ -10518,6 +11176,14 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 17] {
             NodeKind::Combat {
                 faction: String::new(),
                 health: 1,
+            },
+        ),
+        (
+            "Equipment",
+            NodeKind::Equipment {
+                weapon: None,
+                character_socket: "right_hand_grip".to_string(),
+                weapon_grip: "grip".to_string(),
             },
         ),
         (
@@ -10646,6 +11312,14 @@ fn component_templates_for_host(host_kind: &NodeKind) -> Vec<(&'static str, Node
                 health: 1,
             },
         ),
+        (
+            "Equipment",
+            NodeKind::Equipment {
+                weapon: None,
+                character_socket: "right_hand_grip".to_string(),
+                weapon_grip: "grip".to_string(),
+            },
+        ),
     ]
 }
 
@@ -10705,6 +11379,7 @@ const fn component_slot(kind: &NodeKind) -> Option<&'static str> {
         NodeKind::CharacterController { .. } => Some("CharacterController"),
         NodeKind::AiController { .. } => Some("AiController"),
         NodeKind::Combat { .. } => Some("Combat"),
+        NodeKind::Equipment { .. } => Some("Equipment"),
         NodeKind::PointLight { .. } => Some("PointLight"),
         _ => None,
     }
@@ -10720,6 +11395,7 @@ fn node_draw_mode(kind: &NodeKind) -> &'static str {
         NodeKind::CharacterController { .. } => "Character Component",
         NodeKind::AiController { .. } => "AI Component",
         NodeKind::Combat { .. } => "Combat Component",
+        NodeKind::Equipment { .. } => "Equipment Component",
         NodeKind::World { .. } => "Streaming Region",
         NodeKind::Entity => "Entity Host",
         NodeKind::Room { .. } => "Sector Grid",
@@ -10786,6 +11462,7 @@ fn project_filesystem_rows(project: &ProjectDocument) -> Vec<ProjectFileRow> {
     push_resource_folder(project, &mut rows, "materials", ResourceFilter::Material);
     push_resource_folder(project, &mut rows, "textures", ResourceFilter::Texture);
     push_resource_folder(project, &mut rows, "models", ResourceFilter::Model);
+    push_resource_folder(project, &mut rows, "weapons", ResourceFilter::Weapon);
     push_resource_folder(project, &mut rows, "meshes", ResourceFilter::Mesh);
     push_resource_folder(project, &mut rows, "spawns", ResourceFilter::Other);
     rows
@@ -10869,6 +11546,7 @@ fn resource_file_name(resource: &Resource) -> String {
         ResourceData::Material(_) => cooked_name(&resource.name, "", "mat"),
         ResourceData::Model(model) => cooked_name(&resource.name, &model.model_path, "psxmdl"),
         ResourceData::Character(_) => cooked_name(&resource.name, "", "char"),
+        ResourceData::Weapon(_) => cooked_name(&resource.name, "", "weapon"),
         ResourceData::Mesh { source_path } => cooked_name(&resource.name, source_path, "psxmesh"),
         ResourceData::Scene { source_path } => cooked_name(&resource.name, source_path, "room"),
         ResourceData::Script { source_path } => cooked_name(&resource.name, source_path, "script"),
@@ -10900,11 +11578,12 @@ fn snake_name(name: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
-fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize); 7] {
+fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize); 8] {
     let mut texture = 0;
     let mut material = 0;
     let mut model = 0;
     let mut character = 0;
+    let mut weapon = 0;
     let mut mesh = 0;
     let mut room = 0;
     let mut other = 0;
@@ -10914,6 +11593,7 @@ fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize)
             ResourceData::Material(_) => material += 1,
             ResourceData::Model(_) => model += 1,
             ResourceData::Character(_) => character += 1,
+            ResourceData::Weapon(_) => weapon += 1,
             ResourceData::Mesh { .. } => mesh += 1,
             ResourceData::Scene { .. } => room += 1,
             ResourceData::Script { .. } | ResourceData::Audio { .. } => other += 1,
@@ -10924,6 +11604,7 @@ fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize)
         (ResourceFilter::Material, material),
         (ResourceFilter::Model, model),
         (ResourceFilter::Character, character),
+        (ResourceFilter::Weapon, weapon),
         (ResourceFilter::Mesh, mesh),
         (ResourceFilter::Room, room),
         (ResourceFilter::Other, other),
@@ -10951,7 +11632,7 @@ fn resource_source_path(resource: &Resource) -> Option<&str> {
         | ResourceData::Scene { source_path }
         | ResourceData::Script { source_path }
         | ResourceData::Audio { source_path } => Some(source_path.as_str()),
-        ResourceData::Material(_) | ResourceData::Character(_) => None,
+        ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => None,
     }
 }
 
@@ -10961,6 +11642,7 @@ fn resource_lucide_icon(data: &ResourceData) -> char {
         ResourceData::Material(_) => icons::BLEND,
         ResourceData::Model(_) => icons::BOX,
         ResourceData::Character(_) => icons::MAP_PIN,
+        ResourceData::Weapon(_) => icons::WAYPOINT,
         ResourceData::Mesh { .. } => icons::BOX,
         ResourceData::Scene { .. } => icons::GRID,
         ResourceData::Script { .. } => icons::FILE,
@@ -10978,6 +11660,7 @@ fn resource_lucide_color(data: &ResourceData, selected: bool) -> Color32 {
         ResourceData::Material(_) => Color32::from_rgb(208, 112, 162),
         ResourceData::Model(_) => Color32::from_rgb(186, 178, 124),
         ResourceData::Character(_) => Color32::from_rgb(120, 220, 148),
+        ResourceData::Weapon(_) => Color32::from_rgb(222, 196, 112),
         ResourceData::Mesh { .. } => Color32::from_rgb(156, 174, 190),
         ResourceData::Scene { .. } => Color32::from_rgb(209, 118, 71),
         ResourceData::Script { .. } => Color32::from_rgb(188, 176, 104),
@@ -11382,6 +12065,7 @@ fn resource_preview_color(resource: &Resource) -> Color32 {
             ResourceData::Material(_) => Color32::from_rgb(120, 92, 135),
             ResourceData::Model(_) => Color32::from_rgb(140, 124, 96),
             ResourceData::Character(_) => Color32::from_rgb(96, 144, 110),
+            ResourceData::Weapon(_) => Color32::from_rgb(150, 132, 76),
             ResourceData::Mesh { .. } => Color32::from_rgb(110, 120, 130),
             ResourceData::Scene { .. } => Color32::from_rgb(92, 130, 106),
             ResourceData::Script { .. } => Color32::from_rgb(128, 126, 80),
@@ -11396,6 +12080,7 @@ fn resource_detail(resource: &Resource) -> &'static str {
         ResourceData::Material(_) => "Material - 4bpp",
         ResourceData::Model(_) => "Model",
         ResourceData::Character(_) => "Character",
+        ResourceData::Weapon(_) => "Weapon",
         ResourceData::Mesh { .. } => "Mesh",
         ResourceData::Scene { .. } => "Room",
         ResourceData::Script { .. } => "Script",
@@ -12362,6 +13047,22 @@ pub fn describe_selection(selection: Selection) -> String {
     }
 }
 
+fn selection_sector(selection: Selection) -> (NodeId, u16, u16) {
+    match selection {
+        Selection::Face(face) => (face.room, face.sx, face.sz),
+        Selection::Edge(edge) => match edge.anchor {
+            EdgeAnchor::Floor { sx, sz, .. }
+            | EdgeAnchor::Ceiling { sx, sz, .. }
+            | EdgeAnchor::Wall { sx, sz, .. } => (edge.room, sx, sz),
+        },
+        Selection::Vertex(vertex) => match vertex.anchor {
+            VertexAnchor::Floor { sx, sz, .. }
+            | VertexAnchor::Ceiling { sx, sz, .. }
+            | VertexAnchor::Wall { sx, sz, .. } => (vertex.room, sx, sz),
+        },
+    }
+}
+
 fn describe_edge(edge: EdgeRef) -> String {
     match edge.anchor {
         EdgeAnchor::Floor { sx, sz, dir } => {
@@ -13261,6 +13962,7 @@ fn entity_bound_kind_and_size(
         | NodeKind::CharacterController { .. }
         | NodeKind::AiController { .. }
         | NodeKind::Combat { .. }
+        | NodeKind::Equipment { .. }
         | NodeKind::PointLight { .. } => None,
         NodeKind::Entity => {
             if let Some(model) = entity_model_resource(workspace, node) {
@@ -13376,6 +14078,18 @@ fn collect_character_options(project: &ProjectDocument) -> Vec<(ResourceId, Stri
         .iter()
         .filter_map(|r| match &r.data {
             ResourceData::Character(_) => Some((r.id, r.name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect every Weapon resource as `(id, name)`.
+fn collect_weapon_options(project: &ProjectDocument) -> Vec<(ResourceId, String)> {
+    project
+        .resources
+        .iter()
+        .filter_map(|r| match &r.data {
+            ResourceData::Weapon(_) => Some((r.id, r.name.clone())),
             _ => None,
         })
         .collect()
@@ -13560,7 +14274,7 @@ fn resource_file_budget(
             | ResourceData::Audio { source_path } => {
                 add_resource_file(project_root, source_path, &mut budget, &mut seen);
             }
-            ResourceData::Material(_) | ResourceData::Character(_) => {}
+            ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => {}
         }
     }
     budget
@@ -14311,7 +15025,10 @@ mod tests {
                 })
                 .collect()
         };
-        assert!(coords.len() >= 2, "starter has at least two populated sectors");
+        assert!(
+            coords.len() >= 2,
+            "starter has at least two populated sectors"
+        );
 
         let mut ctrl = egui::Modifiers::NONE;
         ctrl.ctrl = true;
@@ -14350,6 +15067,140 @@ mod tests {
             }
         }
         assert_eq!(workspace.selected_sector, Some((1, 1)));
+    }
+
+    #[test]
+    fn ctrl_selected_vertices_drag_together() {
+        let mut workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let room = workspace.active_room_id().expect("starter has room");
+        let (sx, sz) = first_floor_sector(&workspace, room);
+        let nw = Selection::Vertex(VertexRef {
+            room,
+            anchor: VertexAnchor::Floor {
+                sx,
+                sz,
+                corner: Corner::NW,
+            },
+        });
+        let ne = Selection::Vertex(VertexRef {
+            room,
+            anchor: VertexAnchor::Floor {
+                sx,
+                sz,
+                corner: Corner::NE,
+            },
+        });
+        let before = floor_heights(&workspace, room, sx, sz);
+
+        let mut ctrl = egui::Modifiers::NONE;
+        ctrl.ctrl = true;
+        workspace.apply_primitive_selection_modifiers(nw, egui::Modifiers::NONE);
+        workspace.apply_primitive_selection_modifiers(ne, ctrl);
+
+        assert_eq!(workspace.selected_primitives.len(), 2);
+
+        workspace.hovered_primitive = Some(nw);
+        workspace.begin_primitive_drag(egui::Modifiers::NONE);
+        workspace.update_primitive_drag(-8.0);
+        workspace.end_primitive_drag();
+
+        let after = floor_heights(&workspace, room, sx, sz);
+        assert_eq!(
+            after[Corner::NW.idx()],
+            snap_height(before[Corner::NW.idx()] + HEIGHT_QUANTUM)
+        );
+        assert_eq!(
+            after[Corner::NE.idx()],
+            snap_height(before[Corner::NE.idx()] + HEIGHT_QUANTUM)
+        );
+        assert_eq!(after[Corner::SE.idx()], before[Corner::SE.idx()]);
+        assert_eq!(after[Corner::SW.idx()], before[Corner::SW.idx()]);
+    }
+
+    #[test]
+    fn ctrl_selected_edges_drag_together() {
+        let mut workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let room = workspace.active_room_id().expect("starter has room");
+        let (sx, sz) = first_floor_sector(&workspace, room);
+        let north = Selection::Edge(EdgeRef {
+            room,
+            anchor: EdgeAnchor::Floor {
+                sx,
+                sz,
+                dir: GridDirection::North,
+            },
+        });
+        let east = Selection::Edge(EdgeRef {
+            room,
+            anchor: EdgeAnchor::Floor {
+                sx,
+                sz,
+                dir: GridDirection::East,
+            },
+        });
+        let before = floor_heights(&workspace, room, sx, sz);
+
+        let mut ctrl = egui::Modifiers::NONE;
+        ctrl.ctrl = true;
+        workspace.apply_primitive_selection_modifiers(north, egui::Modifiers::NONE);
+        workspace.apply_primitive_selection_modifiers(east, ctrl);
+
+        assert_eq!(workspace.selected_primitives.len(), 2);
+
+        workspace.hovered_primitive = Some(north);
+        workspace.begin_primitive_drag(egui::Modifiers::NONE);
+        workspace.update_primitive_drag(-8.0);
+        workspace.end_primitive_drag();
+
+        let after = floor_heights(&workspace, room, sx, sz);
+        assert_eq!(
+            after[Corner::NW.idx()],
+            snap_height(before[Corner::NW.idx()] + HEIGHT_QUANTUM)
+        );
+        assert_eq!(
+            after[Corner::NE.idx()],
+            snap_height(before[Corner::NE.idx()] + HEIGHT_QUANTUM)
+        );
+        assert_eq!(
+            after[Corner::SE.idx()],
+            snap_height(before[Corner::SE.idx()] + HEIGHT_QUANTUM)
+        );
+        assert_eq!(after[Corner::SW.idx()], before[Corner::SW.idx()]);
+    }
+
+    fn floor_heights(workspace: &EditorWorkspace, room: NodeId, sx: u16, sz: u16) -> [i32; 4] {
+        let scene = workspace.project.active_scene();
+        let node = scene.node(room).expect("room node exists");
+        let NodeKind::Room { grid } = &node.kind else {
+            panic!("active room is a room node");
+        };
+        grid.sector(sx, sz)
+            .and_then(|sector| sector.floor.as_ref())
+            .expect("starter floor exists")
+            .heights
+    }
+
+    fn first_floor_sector(workspace: &EditorWorkspace, room: NodeId) -> (u16, u16) {
+        let scene = workspace.project.active_scene();
+        let node = scene.node(room).expect("room node exists");
+        let NodeKind::Room { grid } = &node.kind else {
+            panic!("active room is a room node");
+        };
+        grid.sectors
+            .iter()
+            .enumerate()
+            .find_map(|(index, sector)| {
+                sector
+                    .as_ref()
+                    .and_then(|sector| sector.floor.as_ref())
+                    .map(|_| {
+                        let index = index as u16;
+                        (index / grid.depth, index % grid.depth)
+                    })
+            })
+            .expect("starter has a floor sector")
     }
 
     #[test]

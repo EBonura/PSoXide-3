@@ -503,6 +503,7 @@ mod tests {
                 preview_clip: None,
                 world_height: 1024,
                 scale_q8: [crate::MODEL_SCALE_ONE_Q8; 3],
+                attachments: Vec::new(),
             }),
         );
         let character = project.add_resource(

@@ -192,6 +192,25 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
                 }
             }
         }
+        for equipment in &package.equipment {
+            if equipment.room != i_u16 {
+                continue;
+            }
+            let Some(weapon) = package.weapons.get(equipment.weapon as usize) else {
+                continue;
+            };
+            if let Some(model) = weapon.model {
+                if !seen_models.contains(&model) {
+                    seen_models.push(model);
+                    include_model_in_residency(
+                        package,
+                        model,
+                        &mut required_ram,
+                        &mut required_vram,
+                    );
+                }
+            }
+        }
 
         let _ = writeln!(out, "/// Room {i} required RAM assets.");
         out.push_str(&format!(
@@ -296,6 +315,61 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n\n");
 
+    out.push_str("/// Weapon hitboxes, local to weapon grips.\n");
+    out.push_str("pub static WEAPON_HITBOXES: &[WeaponHitboxRecord] = &[\n");
+    for hitbox in &package.weapon_hitboxes {
+        let shape = render_weapon_hit_shape(hitbox.shape);
+        let _ = writeln!(
+            out,
+            "    WeaponHitboxRecord {{ name: {:?}, shape: {shape}, active_start_frame: {}, active_end_frame: {}, flags: 0 }},",
+            hitbox.name, hitbox.active_start_frame, hitbox.active_end_frame,
+        );
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// Cooked Weapon resources.\n");
+    out.push_str("pub static WEAPONS: &[LevelWeaponRecord] = &[\n");
+    for weapon in &package.weapons {
+        let model = weapon
+            .model
+            .map(|model| format!("Some(ModelIndex({model}))"))
+            .unwrap_or_else(|| "None".to_string());
+        let _ = writeln!(
+            out,
+            "    LevelWeaponRecord {{ name: {:?}, model: {model}, default_character_socket: {:?}, grip_name: {:?}, grip_translation: [{}, {}, {}], grip_rotation_q12: [{}, {}, {}], hitbox_first: WeaponHitboxIndex({}), hitbox_count: {}, flags: 0 }},",
+            weapon.name,
+            weapon.default_character_socket,
+            weapon.grip_name,
+            weapon.grip_translation[0],
+            weapon.grip_translation[1],
+            weapon.grip_translation[2],
+            weapon.grip_rotation_q12[0],
+            weapon.grip_rotation_q12[1],
+            weapon.grip_rotation_q12[2],
+            weapon.hitbox_first,
+            weapon.hitbox_count,
+        );
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// Equipment components, room-local parent transforms.\n");
+    out.push_str("pub static EQUIPMENT: &[EquipmentRecord] = &[\n");
+    for equipment in &package.equipment {
+        let _ = writeln!(
+            out,
+            "    EquipmentRecord {{ room: RoomIndex({}), weapon: WeaponIndex({}), x: {}, y: {}, z: {}, yaw: {}, character_socket: {:?}, weapon_grip: {:?}, flags: 0 }},",
+            equipment.room,
+            equipment.weapon,
+            equipment.x,
+            equipment.y,
+            equipment.z,
+            equipment.yaw,
+            equipment.character_socket,
+            equipment.weapon_grip,
+        );
+    }
+    out.push_str("];\n\n");
+
     out.push_str("/// Placed point lights, room-local coordinates.\n");
     out.push_str("pub static LIGHTS: &[PointLightRecord] = &[\n");
     for light in &package.lights {
@@ -377,6 +451,22 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n");
     out
+}
+
+fn render_weapon_hit_shape(shape: PlaytestWeaponHitShape) -> String {
+    match shape {
+        PlaytestWeaponHitShape::Box {
+            center,
+            half_extents,
+        } => format!(
+            "WeaponHitShapeRecord::Box {{ center: [{}, {}, {}], half_extents: [{}, {}, {}] }}",
+            center[0], center[1], center[2], half_extents[0], half_extents[1], half_extents[2],
+        ),
+        PlaytestWeaponHitShape::Capsule { start, end, radius } => format!(
+            "WeaponHitShapeRecord::Capsule {{ start: [{}, {}, {}], end: [{}, {}, {}], radius: {} }}",
+            start[0], start[1], start[2], end[0], end[1], end[2], radius,
+        ),
+    }
 }
 
 const fn material_flags_for_sidedness(sidedness: crate::MaterialFaceSidedness) -> u16 {
@@ -521,6 +611,7 @@ use psx_level::{
     CharacterIndex,
     EntityKind,
     EntityRecord,
+    EquipmentRecord,
     LevelAssetRecord,
     LevelCharacterRecord,
     LevelMaterialRecord,
@@ -528,6 +619,7 @@ use psx_level::{
     LevelModelInstanceRecord,
     LevelModelRecord,
     LevelRoomRecord,
+    LevelWeaponRecord,
     MaterialIndex,
     MaterialSlot,
     MODEL_CLIP_INHERIT,
@@ -541,6 +633,10 @@ use psx_level::{
     ResourceSlot,
     RoomIndex,
     RoomResidencyRecord,
+    WeaponHitboxIndex,
+    WeaponHitboxRecord,
+    WeaponHitShapeRecord,
+    WeaponIndex,
 };
 
 ";
