@@ -1230,8 +1230,8 @@ enum ViewTool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaceKind {
     /// `SpawnPoint { player: true }` -- the editor enforces
-    /// uniqueness by demoting existing player spawns to
-    /// generic spawns at place time.
+    /// player-source uniqueness by demoting existing player
+    /// SpawnPoints and CharacterControllers at place time.
     PlayerSpawn,
     /// `SpawnPoint { player: false }`. Multiple OK.
     SpawnMarker,
@@ -4095,6 +4095,7 @@ impl EditorWorkspace {
             }
             ResourceData::Character(character) => {
                 self.push_undo();
+                let player = !self.has_player_source();
                 let node = self.create_character_entity_at_room_hit(
                     room_id,
                     resource_id,
@@ -4103,12 +4104,20 @@ impl EditorWorkspace {
                     character.idle_clip,
                     character.radius,
                     character.height,
+                    player,
                     hit_world,
                 );
                 self.replace_node_selection(node);
                 self.clear_resource_selection_state();
                 self.clear_primitive_selection_state();
-                self.status = format!("Created Character Entity from profile {}", resource.name);
+                self.status = if player {
+                    format!(
+                        "Created Player Character Entity from profile {}",
+                        resource.name
+                    )
+                } else {
+                    format!("Created Character Entity from profile {}", resource.name)
+                };
                 self.mark_dirty();
             }
             ResourceData::Weapon(weapon) => {
@@ -4234,6 +4243,7 @@ impl EditorWorkspace {
         idle_clip: Option<u16>,
         radius: u16,
         height: u16,
+        player: bool,
         hit_world: [f32; 3],
     ) -> NodeId {
         let editor = self
@@ -4268,7 +4278,7 @@ impl EditorWorkspace {
             "Character Controller",
             NodeKind::CharacterController {
                 character: Some(character_id),
-                player: false,
+                player,
             },
         );
         scene.add_node(
@@ -4456,24 +4466,11 @@ impl EditorWorkspace {
                 .map(|grid| grid.room_local_to_editor(hit_world))
                 .unwrap_or([0.0, 0.0]);
             let kind = self.place_kind;
-            // Player Spawn is exclusive -- demote any existing
-            // player spawns so the cooker sees exactly one.
+            // Player source is exclusive -- demote any existing
+            // player SpawnPoint / CharacterController so the
+            // cooker sees exactly one.
             if matches!(kind, PlaceKind::PlayerSpawn) {
-                let scene = self.project.active_scene_mut();
-                let stale: Vec<NodeId> = scene
-                    .nodes()
-                    .iter()
-                    .filter(|n| matches!(n.kind, NodeKind::SpawnPoint { player: true, .. }))
-                    .map(|n| n.id)
-                    .collect();
-                for id in stale {
-                    if let Some(node) = scene.node_mut(id) {
-                        node.kind = NodeKind::SpawnPoint {
-                            player: false,
-                            character: None,
-                        };
-                    }
-                }
+                self.demote_player_sources_except(None);
             }
             let (default_name, node_kind): (String, NodeKind) = match kind {
                 PlaceKind::PlayerSpawn => (
@@ -5122,7 +5119,7 @@ impl EditorWorkspace {
             self.reload();
         }
         if consume_build {
-            self.pending_playtest_request = Some(EditorPlaytestRequest::BakeProjectBuild);
+            self.pending_playtest_request = Some(EditorPlaytestRequest::BuildProject);
         }
         if consume_play {
             self.request_play_or_rebuild(playtest_status);
@@ -5389,11 +5386,24 @@ impl EditorWorkspace {
 
     fn draw_action_bar(&mut self, ctx: &egui::Context, playtest_status: EditorPlaytestStatus) {
         egui::TopBottomPanel::top("psxed_action_bar")
-            .exact_height(42.0)
+            .exact_height(50.0)
             .frame(top_bar_frame())
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.menu_button(icons::label(icons::FILE, "File"), |ui| {
+                ui.horizontal_centered(|ui| {
+                    egui::Frame::new()
+                        .fill(STUDIO_PANEL_DARK)
+                        .stroke(Stroke::new(1.0, STUDIO_BORDER))
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(7, 5))
+                        .show(ui, |ui| {
+                            ui.label(icons::text(icons::BOX, 18.0).color(STUDIO_ACCENT));
+                        })
+                        .response
+                        .on_hover_text("PSoXide");
+
+                    ui.add_space(4.0);
+
+                    ui.menu_button("File", |ui| {
                         if ui
                             .button(menu_label("New Project...", &command_shortcut_text("N")))
                             .clicked()
@@ -5441,7 +5451,86 @@ impl EditorWorkspace {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
-                    ui.separator();
+                    ui.menu_button("Edit", |ui| {
+                        let can_node_delete = self.selected_node != NodeId::ROOT;
+                        if ui.button("Duplicate Selection").clicked() {
+                            self.duplicate_selected();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(can_node_delete, egui::Button::new("Delete Selection"))
+                            .clicked()
+                        {
+                            self.delete_selected();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("View", |ui| {
+                        if ui
+                            .checkbox(&mut self.left_dock_open, "Scene and files")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                        }
+                        if ui
+                            .checkbox(&mut self.resources_open, "Resources")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                        }
+                        if ui.checkbox(&mut self.inspector_open, "Inspector").clicked() {
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Frame Selection").clicked() {
+                            self.frame_viewport();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Project", |ui| {
+                        match psxed_project::list_projects() {
+                            Ok(projects) if projects.is_empty() => {
+                                ui.weak("No projects found");
+                            }
+                            Ok(projects) => {
+                                for path in projects {
+                                    let current = paths_equivalent(&self.project_dir, &path);
+                                    let label = short_path(&path);
+                                    if ui.selectable_label(current, label).clicked() {
+                                        self.open_project_from_menu(&path);
+                                        ui.close_menu();
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                ui.weak(format!("Could not list projects: {error}"));
+                            }
+                        }
+                    });
+                    ui.menu_button("Tools", |ui| {
+                        if ui.button("Build Project").clicked() {
+                            self.pending_playtest_request =
+                                Some(EditorPlaytestRequest::BuildProject);
+                            ui.close_menu();
+                        }
+                        let play_label = if playtest_status.is_active() {
+                            "Rebuild and Play"
+                        } else {
+                            "Play"
+                        };
+                        if ui.button(play_label).clicked() {
+                            self.request_play_or_rebuild(playtest_status);
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Help", |ui| {
+                        ui.label(RichText::new("PSoXide Editor").strong());
+                        ui.weak("Build cooks assets and compiles the PS1 runtime.");
+                        ui.weak("Play builds and runs inside the viewport.");
+                    });
+
+                    ui.add_space(10.0);
+
                     if ui
                         .selectable_label(self.left_dock_open, icons::text(icons::LAYERS, 14.0))
                         .on_hover_text("Toggle scene/files panel")
@@ -5463,7 +5552,9 @@ impl EditorWorkspace {
                     {
                         self.inspector_open = !self.inspector_open;
                     }
-                    ui.separator();
+
+                    ui.add_space(10.0);
+
                     if ui
                         .button(icons::label(icons::FILE_PLUS, "New"))
                         .on_hover_text(
@@ -5478,7 +5569,10 @@ impl EditorWorkspace {
                     }
                     if ui
                         .button(icons::label(icons::SAVE, "Save"))
-                        .on_hover_text(format!("Save the project. Shortcut: {}.", command_shortcut_text("S")))
+                        .on_hover_text(format!(
+                            "Save the project. Shortcut: {}.",
+                            command_shortcut_text("S")
+                        ))
                         .clicked()
                     {
                         self.save_project_from_ui();
@@ -5500,23 +5594,20 @@ impl EditorWorkspace {
                     {
                         self.frame_viewport();
                     }
-                    if ui.button(icons::label(icons::BLEND, "Cook")).clicked() {
-                        match self.cook_world_to_disk() {
-                            Ok(report) => self.status = report,
-                            Err(error) => self.status = format!("Cook failed: {error}"),
-                        }
-                    }
+
+                    ui.add_space(10.0);
+
                     if ui
                         .button(icons::label(icons::BOX, "Build"))
                         .on_hover_text(
                             format!(
-                                "Cook and build the current project into the launcher Projects list. Shortcut: {}.",
+                                "Cook assets, build the runtime EXE, and export it into the launcher Projects list. Shortcut: {}.",
                                 command_shortcut_text("B")
                             ),
                         )
                         .clicked()
                     {
-                        self.pending_playtest_request = Some(EditorPlaytestRequest::BakeProjectBuild);
+                        self.pending_playtest_request = Some(EditorPlaytestRequest::BuildProject);
                     }
                     let playtest_active = playtest_status.is_active();
                     let play_label = if playtest_active {
@@ -5528,7 +5619,7 @@ impl EditorWorkspace {
                         .button(icons::label(icons::PLAY, play_label))
                         .on_hover_text(
                             format!(
-                                "Cook the active scene, build editor-playtest, and run it inside the 3D viewport. Shortcut: {}.",
+                                "Cook assets, build the runtime, and run it inside the 3D viewport. Shortcut: {}.",
                                 command_shortcut_text("Enter")
                             ),
                         )
@@ -5544,16 +5635,28 @@ impl EditorWorkspace {
                     {
                         self.pending_playtest_request = Some(EditorPlaytestRequest::Stop);
                     }
-                    ui.separator();
+
+                    ui.add_space(12.0);
+
                     let project_label = if self.dirty {
                         format!("{} *", self.project.name)
                     } else {
                         self.project.name.clone()
                     };
-                    ui.label(RichText::new(project_label).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(&self.status).small().color(STUDIO_TEXT_WEAK));
-                    });
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width().max(160.0), 38.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(RichText::new(project_label).strong().color(STUDIO_TEXT));
+                            ui.add_sized(
+                                Vec2::new(ui.available_width(), 16.0),
+                                egui::Label::new(
+                                    RichText::new(&self.status).small().color(STUDIO_TEXT_WEAK),
+                                ),
+                            );
+                        },
+                    );
                 });
             });
     }
@@ -5569,26 +5672,32 @@ impl EditorWorkspace {
             .max_width(LEFT_DOCK_MAX_WIDTH)
             .frame(dock_frame())
             .show(ctx, |ui| {
-                section_frame().show(ui, |ui| self.draw_scene_tree_panel(ui));
+                ui.set_width(ui.available_width());
+                self.draw_scene_tree_panel(ui);
                 ui.add_space(6.0);
-                section_frame().show(ui, |ui| self.draw_filesystem_panel(ui));
+                self.draw_filesystem_panel(ui);
             });
     }
 
     fn draw_scene_tree_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(icons::text(icons::LAYERS, 15.0).color(STUDIO_ACCENT));
-            ui.label(RichText::new("Scene").strong().color(STUDIO_TEXT));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(egui::Button::new(icons::text(icons::PLUS, 14.0)))
-                    .on_hover_text("Add Node")
-                    .clicked()
-                {
-                    self.add_child(NodeKind::Node3D, "Node3D");
-                }
+        tool_panel_frame().show(ui, |ui| {
+            tool_panel_header(ui, icons::LAYERS, "Scene", |ui| {
+                ui.menu_button(icons::text(icons::PLUS, 14.0), |ui| {
+                    for (label, kind) in default_addable_kinds() {
+                        if ui.button(label).clicked() {
+                            self.add_child(kind, label);
+                            ui.close_menu();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Add node to the selected scene node");
             });
+            tool_panel_body(ui, |ui| self.draw_scene_tree_panel_body(ui));
         });
+    }
+
+    fn draw_scene_tree_panel_body(&mut self, ui: &mut egui::Ui) {
         ui.add(
             egui::TextEdit::singleline(&mut self.scene_filter)
                 .hint_text("Filter nodes")
@@ -5687,8 +5796,13 @@ impl EditorWorkspace {
     }
 
     fn draw_filesystem_panel(&mut self, ui: &mut egui::Ui) {
-        panel_heading(ui, icons::FOLDER, "FileSystem");
-        ui.separator();
+        tool_panel_frame().show(ui, |ui| {
+            tool_panel_header(ui, icons::FOLDER, "FileSystem", |_| {});
+            tool_panel_body(ui, |ui| self.draw_filesystem_panel_body(ui));
+        });
+    }
+
+    fn draw_filesystem_panel_body(&mut self, ui: &mut egui::Ui) {
         let rows = project_filesystem_rows(&self.project);
         let filter = self.file_filter.to_ascii_lowercase();
         let visible_resource_order: Vec<ResourceId> = rows
@@ -5742,232 +5856,255 @@ impl EditorWorkspace {
             .min_width(240.0)
             .frame(dock_frame())
             .show(ctx, |ui| {
-                let content_width = ui.available_width().max(1.0);
-                constrain_resizable_dock_content(ui, content_width);
-                ui.expand_to_include_rect(ui.max_rect());
-                panel_heading(ui, icons::SCAN, "Inspector");
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("psxed_inspector_scroll")
-                    .max_width(content_width)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                ui.set_width(ui.available_width().max(1.0));
+                tool_panel_frame().show(ui, |ui| {
+                    ui.expand_to_include_rect(ui.max_rect());
+                    let content_width = ui.available_width().max(1.0);
+                    constrain_resizable_dock_content(ui, content_width);
+                    tool_panel_header(ui, icons::SCAN, "Inspector", |_| {});
+                    tool_panel_body(ui, |ui| {
+                        let content_width = ui.available_width().max(1.0);
                         constrain_resizable_dock_content(ui, content_width);
-                        // Selection priority: primitive (Select tool's
-                        // product -- face, edge, or vertex) → resource
-                        // (clicked in the bottom panel) → node (scene
-                        // tree row). The primitive branch wins because
-                        // it's the active edit target during paint and
-                        // height-edit workflows.
-                        if let Some(selection) = self.selected_primitive {
-                            match selection {
-                                Selection::Face(face) => self.draw_face_inspector(ui, face),
-                                Selection::Edge(edge) => self.draw_edge_inspector(ui, edge),
-                                Selection::Vertex(vertex) => self.draw_vertex_inspector(ui, vertex),
-                            }
-                            return;
-                        }
-
-                        if let Some(resource_id) = self.selected_resource {
-                            self.draw_resource_inspector(ui, resource_id);
-                            return;
-                        }
-
-                        let material_options = self.project.material_options();
-                        let room_options = collect_room_options(&self.project);
-                        let model_options = collect_model_options(&self.project);
-                        let character_options = collect_character_options(&self.project);
-                        let weapon_options = collect_weapon_options(&self.project);
-                        let selected = self.selected_node;
-                        let active_room = self.active_room_id();
-                        let selected_sector = self.selected_sector;
-                        let selected_sector_count = self.selected_sectors.len();
-
-                        let mut changed = false;
-                        // Picker `→` jump-to requests bubble up here.
-                        // Applied after both phases release their borrows.
-                        let mut nav_target: Option<ResourceId> = None;
-                        let mut world_sector_size_change: Option<i32> = None;
-                        let inherited_sector_size =
-                            self.project.world_sector_size_for_node(selected);
-
-                        // Phase 1: mutate the selected node (transform + kind props).
-                        {
-                            let scene = self.project.active_scene_mut();
-                            let Some(node) = scene.node_mut(selected) else {
-                                ui.weak("No node selected");
-                                return;
-                            };
-
-                            ui.horizontal(|ui| {
-                                draw_inline_icon(
-                                    ui,
-                                    node_lucide_icon(node.kind.label(), node.id == NodeId::ROOT),
-                                    node_lucide_color(
-                                        node.kind.label(),
-                                        node.id == NodeId::ROOT,
-                                        true,
-                                    ),
-                                );
-                                ui.strong(format!("{} #{}", node.kind.label(), node.id.raw()));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Name");
-                                changed |= ui.text_edit_singleline(&mut node.name).changed();
-                            });
-                            ui.separator();
-
-                            changed |= draw_transform_policy_editor(
-                                ui,
-                                node,
-                                inherited_sector_size,
-                                &mut world_sector_size_change,
-                            );
-
-                            egui::CollapsingHeader::new(icons::label(
-                                icons::CIRCLE_DOT,
-                                "Node Properties",
-                            ))
-                            .default_open(true)
+                        egui::ScrollArea::vertical()
+                            .id_salt("psxed_inspector_scroll")
+                            .max_width(content_width)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                changed |= draw_node_kind_editor(
-                                    ui,
-                                    &mut node.kind,
-                                    &material_options,
-                                    &room_options,
-                                    &model_options,
-                                    &character_options,
-                                    &weapon_options,
-                                    inherited_sector_size,
-                                    &mut nav_target,
-                                );
-                            });
-                        }
+                                constrain_resizable_dock_content(ui, content_width);
+                                // Selection priority: primitive (Select tool's
+                                // product -- face, edge, or vertex) → resource
+                                // (clicked in the bottom panel) → node (scene
+                                // tree row). The primitive branch wins because
+                                // it's the active edit target during paint and
+                                // height-edit workflows.
+                                if let Some(selection) = self.selected_primitive {
+                                    match selection {
+                                        Selection::Face(face) => self.draw_face_inspector(ui, face),
+                                        Selection::Edge(edge) => self.draw_edge_inspector(ui, edge),
+                                        Selection::Vertex(vertex) => {
+                                            self.draw_vertex_inspector(ui, vertex)
+                                        }
+                                    }
+                                    return;
+                                }
 
-                        if let Some(new_sector_size) = world_sector_size_change {
-                            if let Some(applied) = self
-                                .project
-                                .set_world_sector_size(selected, new_sector_size)
-                            {
-                                self.status = format!("World grid size set to {applied}");
-                                changed = true;
-                            }
-                        }
+                                if let Some(resource_id) = self.selected_resource {
+                                    self.draw_resource_inspector(ui, resource_id);
+                                    return;
+                                }
 
-                        // Phase 2: component host/member authoring. This uses
-                        // its own borrow so adding/selecting component nodes does
-                        // not fight the selected node's property editor above.
-                        self.draw_component_authoring_panel(ui, selected);
+                                let material_options = self.project.material_options();
+                                let room_options = collect_room_options(&self.project);
+                                let model_options = collect_model_options(&self.project);
+                                let character_options = collect_character_options(&self.project);
+                                let weapon_options = collect_weapon_options(&self.project);
+                                let selected = self.selected_node;
+                                let active_room = self.active_room_id();
+                                let selected_sector = self.selected_sector;
+                                let selected_sector_count = self.selected_sectors.len();
 
-                        // Phase 3: per-sector inspector. Owns its own borrow of the
-                        // project so it can edit the active Room's grid.
-                        if let Some(room_id) = active_room {
-                            if let Some(grid) = self.room_grid_view(room_id) {
-                                draw_streaming_budget(
-                                    ui,
-                                    &self.project,
-                                    self.project_root(),
-                                    room_id,
-                                    grid,
-                                );
-                            }
-                            if let Some((sx, sz)) = selected_sector {
-                                if selected_sector_count > 1 {
+                                let mut changed = false;
+                                // Picker `→` jump-to requests bubble up here.
+                                // Applied after both phases release their borrows.
+                                let mut nav_target: Option<ResourceId> = None;
+                                let mut world_sector_size_change: Option<i32> = None;
+                                let inherited_sector_size =
+                                    self.project.world_sector_size_for_node(selected);
+
+                                // Phase 1: mutate the selected node (transform + kind props).
+                                {
+                                    let scene = self.project.active_scene_mut();
+                                    let Some(node) = scene.node_mut(selected) else {
+                                        ui.weak("No node selected");
+                                        return;
+                                    };
+
+                                    ui.horizontal(|ui| {
+                                        draw_inline_icon(
+                                            ui,
+                                            node_lucide_icon(
+                                                node.kind.label(),
+                                                node.id == NodeId::ROOT,
+                                            ),
+                                            node_lucide_color(
+                                                node.kind.label(),
+                                                node.id == NodeId::ROOT,
+                                                true,
+                                            ),
+                                        );
+                                        ui.strong(format!(
+                                            "{} #{}",
+                                            node.kind.label(),
+                                            node.id.raw()
+                                        ));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Name");
+                                        changed |= ui.text_edit_singleline(&mut node.name).changed();
+                                    });
+                                    ui.separator();
+
+                                    changed |= draw_transform_policy_editor(
+                                        ui,
+                                        node,
+                                        inherited_sector_size,
+                                        &mut world_sector_size_change,
+                                    );
+
                                     egui::CollapsingHeader::new(icons::label(
-                                        icons::GRID,
-                                        "Sector Selection",
+                                        icons::CIRCLE_DOT,
+                                        "Node Properties",
                                     ))
                                     .default_open(true)
                                     .show(ui, |ui| {
-                                        ui.label(format!(
-                                            "{selected_sector_count} sectors selected"
-                                        ));
-                                        ui.weak(
-                                            "The inspector edits the last selected sector for now.",
+                                        changed |= draw_node_kind_editor(
+                                            ui,
+                                            &mut node.kind,
+                                            &material_options,
+                                            &room_options,
+                                            &model_options,
+                                            &character_options,
+                                            &weapon_options,
+                                            inherited_sector_size,
+                                            &mut nav_target,
                                         );
                                     });
                                 }
-                                if draw_sector_inspector(
-                                    ui,
-                                    &mut self.project,
-                                    room_id,
-                                    sx,
-                                    sz,
-                                    &material_options,
-                                    &mut nav_target,
-                                ) {
-                                    changed = true;
+
+                                if let Some(new_sector_size) = world_sector_size_change {
+                                    if let Some(applied) =
+                                        self.project.set_world_sector_size(selected, new_sector_size)
+                                    {
+                                        self.status = format!("World grid size set to {applied}");
+                                        changed = true;
+                                    }
                                 }
-                            } else {
-                                egui::CollapsingHeader::new(icons::label(icons::GRID, "Sector"))
-                                    .default_open(true)
+                                if changed && self.selected_node_is_player_source() {
+                                    self.demote_player_sources_except(Some(selected));
+                                }
+
+                                // Phase 2: component host/member authoring. This uses
+                                // its own borrow so adding/selecting component nodes does
+                                // not fight the selected node's property editor above.
+                                self.draw_component_authoring_panel(ui, selected);
+
+                                // Phase 3: per-sector inspector. Owns its own borrow of the
+                                // project so it can edit the active Room's grid.
+                                if let Some(room_id) = active_room {
+                                    if let Some(grid) = self.room_grid_view(room_id) {
+                                        draw_streaming_budget(
+                                            ui,
+                                            &self.project,
+                                            self.project_root(),
+                                            room_id,
+                                            grid,
+                                        );
+                                    }
+                                    if let Some((sx, sz)) = selected_sector {
+                                        if selected_sector_count > 1 {
+                                            egui::CollapsingHeader::new(icons::label(
+                                                icons::GRID,
+                                                "Sector Selection",
+                                            ))
+                                            .default_open(true)
+                                            .show(ui, |ui| {
+                                                ui.label(format!(
+                                                    "{selected_sector_count} sectors selected"
+                                                ));
+                                                ui.weak(
+                                                    "The inspector edits the last selected sector for now.",
+                                                );
+                                            });
+                                        }
+                                        if draw_sector_inspector(
+                                            ui,
+                                            &mut self.project,
+                                            room_id,
+                                            sx,
+                                            sz,
+                                            &material_options,
+                                            &mut nav_target,
+                                        ) {
+                                            changed = true;
+                                        }
+                                    } else {
+                                        egui::CollapsingHeader::new(icons::label(
+                                            icons::GRID,
+                                            "Sector",
+                                        ))
+                                        .default_open(true)
+                                        .show(ui, |ui| {
+                                            ui.weak("Click a sector tile to inspect it.");
+                                        });
+                                    }
+                                }
+
+                                // Phase 4: read-only diagnostics that just need name / kind.
+                                let scene = self.project.active_scene();
+                                let Some(node) = scene.node(selected) else {
+                                    if changed {
+                                        self.mark_dirty();
+                                    }
+                                    return;
+                                };
+
+                                egui::CollapsingHeader::new(icons::label(icons::BOX, "Render"))
+                                    .default_open(false)
                                     .show(ui, |ui| {
-                                        ui.weak("Click a sector tile to inspect it.");
+                                        ui.horizontal(|ui| {
+                                            ui.label("Draw Mode");
+                                            ui.label(node_draw_mode(&node.kind));
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Ordering");
+                                            ui.label("World OT");
+                                        });
                                     });
-                            }
-                        }
 
-                        // Phase 4: read-only diagnostics that just need name / kind.
-                        let scene = self.project.active_scene();
-                        let Some(node) = scene.node(selected) else {
-                            if changed {
-                                self.mark_dirty();
-                            }
-                            return;
-                        };
+                                egui::CollapsingHeader::new(icons::label(
+                                    icons::SCAN,
+                                    "PS1 Details",
+                                ))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Texture Format");
+                                        ui.label("4bpp Indexed");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Transform");
+                                        ui.label("Fixed point");
+                                    });
+                                });
 
-                        egui::CollapsingHeader::new(icons::label(icons::BOX, "Render"))
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Draw Mode");
-                                    ui.label(node_draw_mode(&node.kind));
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Ordering");
-                                    ui.label("World OT");
-                                });
+                                egui::CollapsingHeader::new(icons::label(icons::WAYPOINT, "Node"))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Path");
+                                            ui.label(format!("/Root/{}", node.name));
+                                        });
+                                    });
+
+                                if changed {
+                                    self.mark_dirty();
+                                }
+
+                                // Apply any picker `→` jump-to. Phase 1 / 2 borrows
+                                // are released by the time the closure body reaches
+                                // here, and the next frame the inspector will see
+                                // `selected_resource = Some(target)` and route to
+                                // `draw_resource_inspector`.
+                                if let Some(target) = nav_target {
+                                    self.replace_resource_selection(target);
+                                    self.clear_node_selection_state();
+                                    self.clear_primitive_selection_state();
+                                    self.clear_sector_selection();
+                                }
                             });
-
-                        egui::CollapsingHeader::new(icons::label(icons::SCAN, "PS1 Details"))
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Texture Format");
-                                    ui.label("4bpp Indexed");
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Transform");
-                                    ui.label("Fixed point");
-                                });
-                            });
-
-                        egui::CollapsingHeader::new(icons::label(icons::WAYPOINT, "Node"))
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Path");
-                                    ui.label(format!("/Root/{}", node.name));
-                                });
-                            });
-
-                        if changed {
-                            self.mark_dirty();
-                        }
-
-                        // Apply any picker `→` jump-to. Phase 1 / 2 borrows
-                        // are released by the time the closure body reaches
-                        // here, and the next frame the inspector will see
-                        // `selected_resource = Some(target)` and route to
-                        // `draw_resource_inspector`.
-                        if let Some(target) = nav_target {
-                            self.replace_resource_selection(target);
-                            self.clear_node_selection_state();
-                            self.clear_primitive_selection_state();
-                            self.clear_sector_selection();
-                        }
+                        reserve_remaining_panel_space(ui);
                     });
-                reserve_remaining_panel_space(ui);
+                });
             });
     }
 
@@ -6686,90 +6823,95 @@ impl EditorWorkspace {
             .show(ctx, |ui| {
                 let content_width = ui.available_width().max(1.0);
                 ui.set_width(content_width);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(icons::label(icons::LAYERS, "Resources"));
-                    ui.separator();
-                    if ui
-                        .button(icons::label(icons::PLUS, "Material"))
-                        .on_hover_text("Add a new Material resource.")
-                        .clicked()
-                    {
-                        let id = self.project.add_resource(
-                            "New Material",
-                            ResourceData::Material(MaterialResource::opaque(None)),
-                        );
-                        self.replace_resource_selection(id);
-                        self.clear_node_selection_state();
-                        self.clear_primitive_selection_state();
-                        self.clear_sector_selection();
-                        self.status = "Added material".to_string();
-                        self.mark_dirty();
-                    }
-                    if ui
-                        .button(icons::label(icons::FILE_PLUS, "Import Texture"))
-                        .on_hover_text(
-                            "Open the PNG/JPG/BMP texture import preview with PSXT cook settings.",
-                        )
-                        .clicked()
-                    {
-                        self.open_texture_import_dialog();
-                    }
-                    if ui
-                        .button(icons::label(icons::FILE_PLUS, "Import Model"))
-                        .on_hover_text(
-                            "Open the GLB/glTF model import preview with atlas, clip, and root-centering controls.",
-                        )
-                        .clicked()
-                    {
-                        self.open_model_import_dialog();
-                    }
-                    if ui
-                        .button(icons::label(icons::PLUS, "Character Profile"))
-                        .on_hover_text(
-                            "Add reusable movement, animation-role, capsule, and camera defaults for character entities.",
-                        )
-                        .clicked()
-                    {
-                        let id = self.project.add_resource(
-                            "New Character Profile",
-                            ResourceData::Character(psxed_project::CharacterResource::default()),
-                        );
-                        self.replace_resource_selection(id);
-                        self.clear_node_selection_state();
-                        self.clear_primitive_selection_state();
-                        self.clear_sector_selection();
-                        self.status = "Added character profile".to_string();
-                        self.mark_dirty();
-                    }
-                    if ui
-                        .button(icons::label(icons::PLUS, "Weapon"))
-                        .on_hover_text("Add a Weapon resource with a grip and hitbox.")
-                        .clicked()
-                    {
-                        let id = self.project.add_resource(
-                            "New Weapon",
-                            ResourceData::Weapon(psxed_project::WeaponResource::default()),
-                        );
-                        self.replace_resource_selection(id);
-                        self.clear_node_selection_state();
-                        self.clear_primitive_selection_state();
-                        self.clear_sector_selection();
-                        self.status = "Added weapon".to_string();
-                        self.mark_dirty();
-                    }
-                });
-                ui.separator();
-                let body_height = ui.available_height().max(1.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("psxed_content_browser_body")
-                    .max_width(content_width)
-                    .max_height(body_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(content_width);
-                        self.draw_resources_tab(ui);
+                tool_panel_frame().show(ui, |ui| {
+                    ui.expand_to_include_rect(ui.max_rect());
+                    tool_panel_header(ui, icons::LAYERS, "Resources", |ui| {
+                        self.draw_resource_panel_actions(ui);
                     });
+                    tool_panel_body(ui, |ui| {
+                        let content_width = ui.available_width().max(1.0);
+                        let body_height = ui.available_height().max(1.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("psxed_content_browser_body")
+                            .max_width(content_width)
+                            .max_height(body_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(content_width);
+                                self.draw_resources_tab(ui);
+                            });
+                    });
+                });
             });
+    }
+
+    fn draw_resource_panel_actions(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button(icons::label(icons::PLUS, "Weapon"))
+            .on_hover_text("Add a Weapon resource with a grip and hitbox.")
+            .clicked()
+        {
+            let id = self.project.add_resource(
+                "New Weapon",
+                ResourceData::Weapon(psxed_project::WeaponResource::default()),
+            );
+            self.replace_resource_selection(id);
+            self.clear_node_selection_state();
+            self.clear_primitive_selection_state();
+            self.clear_sector_selection();
+            self.status = "Added weapon".to_string();
+            self.mark_dirty();
+        }
+        if ui
+            .button(icons::label(icons::PLUS, "Character Profile"))
+            .on_hover_text(
+                "Add reusable movement, animation-role, capsule, and camera defaults for character entities.",
+            )
+            .clicked()
+        {
+            let id = self.project.add_resource(
+                "New Character Profile",
+                ResourceData::Character(psxed_project::CharacterResource::default()),
+            );
+            self.replace_resource_selection(id);
+            self.clear_node_selection_state();
+            self.clear_primitive_selection_state();
+            self.clear_sector_selection();
+            self.status = "Added character profile".to_string();
+            self.mark_dirty();
+        }
+        if ui
+            .button(icons::label(icons::FILE_PLUS, "Import Model"))
+            .on_hover_text(
+                "Open the GLB/glTF model import preview with atlas, clip, and root-centering controls.",
+            )
+            .clicked()
+        {
+            self.open_model_import_dialog();
+        }
+        if ui
+            .button(icons::label(icons::FILE_PLUS, "Import Texture"))
+            .on_hover_text("Open the PNG/JPG/BMP texture import preview with PSXT cook settings.")
+            .clicked()
+        {
+            self.open_texture_import_dialog();
+        }
+        if ui
+            .button(icons::label(icons::PLUS, "Material"))
+            .on_hover_text("Add a new Material resource.")
+            .clicked()
+        {
+            let id = self.project.add_resource(
+                "New Material",
+                ResourceData::Material(MaterialResource::opaque(None)),
+            );
+            self.replace_resource_selection(id);
+            self.clear_node_selection_state();
+            self.clear_primitive_selection_state();
+            self.clear_sector_selection();
+            self.status = "Added material".to_string();
+            self.mark_dirty();
+        }
     }
 
     /// Walk every Texture resource and ensure its `.psxt` blob has
@@ -7024,160 +7166,174 @@ impl EditorWorkspace {
         egui::CentralPanel::default()
             .frame(viewport_frame())
             .show(ctx, |ui| {
-                self.draw_viewport_tabs(ui);
-                ui.separator();
-                self.draw_viewport_toolbar(ui);
-                ui.separator();
+                tool_panel_frame().show(ui, |ui| {
+                    ui.expand_to_include_rect(ui.max_rect());
+                    self.draw_viewport_tabs(ui);
+                    tool_panel_body(ui, |ui| {
+                        self.draw_viewport_toolbar(ui);
+                        ui.separator();
 
-                if viewport_3d.mode == EditorViewport3dMode::Play {
-                    self.draw_viewport_3d_play_body(ui, viewport_3d, playtest_status);
-                    return;
-                }
+                        if viewport_3d.mode == EditorViewport3dMode::Play {
+                            self.draw_viewport_3d_play_body(ui, viewport_3d, playtest_status);
+                            return;
+                        }
 
-                if !self.view_2d {
-                    self.draw_viewport_3d_body(ui, viewport_3d);
-                    return;
-                }
+                        if !self.view_2d {
+                            self.draw_viewport_3d_body(ui, viewport_3d);
+                            return;
+                        }
 
-                let size = ui.available_size();
-                let size = Vec2::new(size.x.max(320.0), size.y.max(240.0));
-                let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
-                self.last_viewport_size = rect.size();
-                let dnd_active = egui::DragAndDrop::has_any_payload(ui.ctx());
-                let resource_drop_hovered = response.dnd_hover_payload::<ResourceId>().is_some();
+                        let size = ui.available_size();
+                        let size = Vec2::new(size.x.max(320.0), size.y.max(240.0));
+                        let (rect, response) =
+                            ui.allocate_exact_size(size, Sense::click_and_drag());
+                        self.last_viewport_size = rect.size();
+                        let dnd_active = egui::DragAndDrop::has_any_payload(ui.ctx());
+                        let resource_drop_hovered =
+                            response.dnd_hover_payload::<ResourceId>().is_some();
 
-                if !dnd_active
-                    && (response.dragged_by(egui::PointerButton::Middle)
-                        || response.dragged_by(egui::PointerButton::Secondary))
-                {
-                    self.viewport_pan += ui.input(|input| input.pointer.delta());
-                }
+                        if !dnd_active
+                            && (response.dragged_by(egui::PointerButton::Middle)
+                                || response.dragged_by(egui::PointerButton::Secondary))
+                        {
+                            self.viewport_pan += ui.input(|input| input.pointer.delta());
+                        }
 
-                if !dnd_active && response.hovered() {
-                    let scroll = ui.input(|input| input.raw_scroll_delta.y);
-                    if scroll.abs() > f32::EPSILON {
-                        let pointer = ui
-                            .input(|input| input.pointer.hover_pos())
-                            .unwrap_or_else(|| rect.center());
-                        let before =
-                            ViewportTransform::new(rect, self.viewport_pan, self.viewport_zoom)
+                        if !dnd_active && response.hovered() {
+                            let scroll = ui.input(|input| input.raw_scroll_delta.y);
+                            if scroll.abs() > f32::EPSILON {
+                                let pointer = ui
+                                    .input(|input| input.pointer.hover_pos())
+                                    .unwrap_or_else(|| rect.center());
+                                let before = ViewportTransform::new(
+                                    rect,
+                                    self.viewport_pan,
+                                    self.viewport_zoom,
+                                )
                                 .screen_to_world(pointer);
-                        let zoom_factor = (1.0 + scroll * 0.0015).clamp(0.75, 1.25);
-                        self.viewport_zoom = (self.viewport_zoom * zoom_factor)
-                            .clamp(MIN_VIEWPORT_ZOOM, MAX_VIEWPORT_ZOOM);
-                        let after =
-                            ViewportTransform::new(rect, self.viewport_pan, self.viewport_zoom)
+                                let zoom_factor = (1.0 + scroll * 0.0015).clamp(0.75, 1.25);
+                                self.viewport_zoom = (self.viewport_zoom * zoom_factor)
+                                    .clamp(MIN_VIEWPORT_ZOOM, MAX_VIEWPORT_ZOOM);
+                                let after = ViewportTransform::new(
+                                    rect,
+                                    self.viewport_pan,
+                                    self.viewport_zoom,
+                                )
                                 .world_to_screen(before);
-                        self.viewport_pan += pointer - after;
-                    }
-                }
+                                self.viewport_pan += pointer - after;
+                            }
+                        }
 
-                let transform = ViewportTransform::new(rect, self.viewport_pan, self.viewport_zoom);
-                if let Some(resource_id) = response
-                    .dnd_release_payload::<ResourceId>()
-                    .map(|payload| *payload)
-                {
-                    if let Some(pointer) = response.interact_pointer_pos().or(response.hover_pos())
-                    {
-                        let world = transform.screen_to_world(pointer);
-                        self.drop_resource_2d(resource_id, world);
-                    }
-                }
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 0.0, STUDIO_VIEWPORT);
-                if self.show_grid {
-                    draw_world_grid(&painter, transform);
-                }
+                        let transform =
+                            ViewportTransform::new(rect, self.viewport_pan, self.viewport_zoom);
+                        if let Some(resource_id) = response
+                            .dnd_release_payload::<ResourceId>()
+                            .map(|payload| *payload)
+                        {
+                            if let Some(pointer) =
+                                response.interact_pointer_pos().or(response.hover_pos())
+                            {
+                                let world = transform.screen_to_world(pointer);
+                                self.drop_resource_2d(resource_id, world);
+                            }
+                        }
+                        let painter = ui.painter_at(rect);
+                        painter.rect_filled(rect, 0.0, STUDIO_VIEWPORT);
+                        if self.show_grid {
+                            draw_world_grid(&painter, transform);
+                        }
 
-                let hits = draw_scene_viewport(
-                    &painter,
-                    transform,
-                    &self.project,
-                    self.selected_node,
-                    &self.selected_nodes,
-                    &self.selected_sectors,
-                    &self.validation_issue_primitives,
-                    &self.validation_issue_rooms,
-                );
+                        let hits = draw_scene_viewport(
+                            &painter,
+                            transform,
+                            &self.project,
+                            self.selected_node,
+                            &self.selected_nodes,
+                            &self.selected_sectors,
+                            &self.validation_issue_primitives,
+                            &self.validation_issue_rooms,
+                        );
 
-                let pointer_world = response
-                    .interact_pointer_pos()
-                    .map(|pos| transform.screen_to_world(pos));
-                let top_hit = pointer_world
-                    .and_then(|world| hits.iter().rev().find(|hit| hit.contains(world)))
-                    .map(|hit| hit.id);
-                let top_hit_is_room = top_hit
-                    .and_then(|id| self.project.active_scene().node(id))
-                    .is_some_and(|node| matches!(node.kind, NodeKind::Room { .. }));
-                let primary_down =
-                    ui.input(|input| input.pointer.button_down(egui::PointerButton::Primary));
-                if !primary_down {
-                    self.tile_box_select_anchor = None;
-                }
-                if !dnd_active
-                    && matches!(self.active_tool, ViewTool::Select)
-                    && top_hit_is_room
-                    && response.drag_started_by(egui::PointerButton::Primary)
-                {
-                    if let Some(world) = pointer_world {
-                        self.tile_box_select_anchor = self.pick_sector_at_world(world);
-                    }
-                }
-                if !dnd_active
-                    && matches!(self.active_tool, ViewTool::Select)
-                    && response.dragged_by(egui::PointerButton::Primary)
-                {
-                    if let (Some(anchor), Some(world)) =
-                        (self.tile_box_select_anchor, pointer_world)
-                    {
-                        if let Some(current) = self.pick_sector_at_world(world) {
-                            let modifiers = ui.input(|input| input.modifiers);
-                            self.select_sector_rect(
-                                anchor,
-                                current,
-                                modifiers.shift || modifiers.command || modifiers.ctrl,
+                        let pointer_world = response
+                            .interact_pointer_pos()
+                            .map(|pos| transform.screen_to_world(pos));
+                        let top_hit = pointer_world
+                            .and_then(|world| hits.iter().rev().find(|hit| hit.contains(world)))
+                            .map(|hit| hit.id);
+                        let top_hit_is_room = top_hit
+                            .and_then(|id| self.project.active_scene().node(id))
+                            .is_some_and(|node| matches!(node.kind, NodeKind::Room { .. }));
+                        let primary_down = ui
+                            .input(|input| input.pointer.button_down(egui::PointerButton::Primary));
+                        if !primary_down {
+                            self.tile_box_select_anchor = None;
+                        }
+                        if !dnd_active
+                            && matches!(self.active_tool, ViewTool::Select)
+                            && top_hit_is_room
+                            && response.drag_started_by(egui::PointerButton::Primary)
+                        {
+                            if let Some(world) = pointer_world {
+                                self.tile_box_select_anchor = self.pick_sector_at_world(world);
+                            }
+                        }
+                        if !dnd_active
+                            && matches!(self.active_tool, ViewTool::Select)
+                            && response.dragged_by(egui::PointerButton::Primary)
+                        {
+                            if let (Some(anchor), Some(world)) =
+                                (self.tile_box_select_anchor, pointer_world)
+                            {
+                                if let Some(current) = self.pick_sector_at_world(world) {
+                                    let modifiers = ui.input(|input| input.modifiers);
+                                    self.select_sector_rect(
+                                        anchor,
+                                        current,
+                                        modifiers.shift || modifiers.command || modifiers.ctrl,
+                                    );
+                                }
+                            }
+                        }
+                        if !dnd_active
+                            && self.tile_box_select_anchor.is_none()
+                            && response.dragged_by(egui::PointerButton::Primary)
+                        {
+                            self.drag_selected_node(ui.input(|input| input.pointer.delta()));
+                        }
+
+                        if !dnd_active && response.clicked_by(egui::PointerButton::Primary) {
+                            if let Some(pos) = response.interact_pointer_pos() {
+                                let world = transform.screen_to_world(pos);
+                                let modifiers = ui.input(|input| input.modifiers);
+                                self.handle_viewport_click(world, &hits, modifiers);
+                            }
+                        }
+
+                        draw_viewport_overlay(
+                            &painter,
+                            rect,
+                            &self.project,
+                            self.viewport_zoom,
+                            self.snap_units,
+                        );
+                        draw_axes_gizmo(&painter, rect);
+                        if resource_drop_hovered {
+                            painter.rect_stroke(
+                                rect.shrink(2.0),
+                                2.0,
+                                Stroke::new(EDITOR_OUTLINE_STROKE_WIDTH, EDITOR_OUTLINE_ACCENT),
+                                StrokeKind::Inside,
+                            );
+                            painter.text(
+                                rect.center_top() + Vec2::new(0.0, 16.0),
+                                Align2::CENTER_TOP,
+                                "Drop resource into scene",
+                                FontId::proportional(13.0),
+                                STUDIO_ACCENT,
                             );
                         }
-                    }
-                }
-                if !dnd_active
-                    && self.tile_box_select_anchor.is_none()
-                    && response.dragged_by(egui::PointerButton::Primary)
-                {
-                    self.drag_selected_node(ui.input(|input| input.pointer.delta()));
-                }
-
-                if !dnd_active && response.clicked_by(egui::PointerButton::Primary) {
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        let world = transform.screen_to_world(pos);
-                        let modifiers = ui.input(|input| input.modifiers);
-                        self.handle_viewport_click(world, &hits, modifiers);
-                    }
-                }
-
-                draw_viewport_overlay(
-                    &painter,
-                    rect,
-                    &self.project,
-                    self.viewport_zoom,
-                    self.snap_units,
-                );
-                draw_axes_gizmo(&painter, rect);
-                if resource_drop_hovered {
-                    painter.rect_stroke(
-                        rect.shrink(2.0),
-                        2.0,
-                        Stroke::new(EDITOR_OUTLINE_STROKE_WIDTH, EDITOR_OUTLINE_ACCENT),
-                        StrokeKind::Inside,
-                    );
-                    painter.text(
-                        rect.center_top() + Vec2::new(0.0, 16.0),
-                        Align2::CENTER_TOP,
-                        "Drop resource into scene",
-                        FontId::proportional(13.0),
-                        STUDIO_ACCENT,
-                    );
-                }
+                    });
+                });
             });
     }
 
@@ -7191,17 +7347,11 @@ impl EditorWorkspace {
             .and_then(|id| self.project.active_scene().node(id))
             .map(|node| node.name.as_str())
             .unwrap_or("(no room)");
-        ui.horizontal(|ui| {
-            let _ = ui.selectable_label(
-                true,
-                RichText::new(icons::label(icons::GRID, &format!("{room_label}.room"))).strong(),
+        let title = format!("{room_label}.room");
+        tool_panel_header(ui, icons::GRID, &title, |ui| {
+            ui.label(
+                RichText::new(format!("Project: {}", self.project.name)).color(STUDIO_TEXT_WEAK),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!("Project: {}", self.project.name))
-                        .color(STUDIO_TEXT_WEAK),
-                );
-            });
         });
     }
 
@@ -7587,6 +7737,46 @@ impl EditorWorkspace {
 
     fn first_material(&self) -> Option<ResourceId> {
         self.project.material_options().first().map(|(id, _)| *id)
+    }
+
+    fn has_player_source(&self) -> bool {
+        self.project
+            .active_scene()
+            .nodes()
+            .iter()
+            .any(|node| node_kind_is_player_source(&node.kind))
+    }
+
+    fn selected_node_is_player_source(&self) -> bool {
+        self.project
+            .active_scene()
+            .node(self.selected_node)
+            .is_some_and(|node| node_kind_is_player_source(&node.kind))
+    }
+
+    fn demote_player_sources_except(&mut self, keep: Option<NodeId>) {
+        let scene = self.project.active_scene_mut();
+        let ids: Vec<NodeId> = scene
+            .nodes()
+            .iter()
+            .filter(|node| Some(node.id) != keep && node_kind_is_player_source(&node.kind))
+            .map(|node| node.id)
+            .collect();
+        for id in ids {
+            let Some(node) = scene.node_mut(id) else {
+                continue;
+            };
+            match &mut node.kind {
+                NodeKind::SpawnPoint { player, character } => {
+                    *player = false;
+                    *character = None;
+                }
+                NodeKind::CharacterController { player, .. } => {
+                    *player = false;
+                }
+                _ => {}
+            }
+        }
     }
 
     fn replace_node_selection(&mut self, id: NodeId) {
@@ -8576,12 +8766,23 @@ impl EditorWorkspace {
         }
 
         let host_kind = node.kind.clone();
-        let components: Vec<(NodeId, String, &'static str)> = node
+        let components: Vec<(NodeId, String, &'static str, Option<bool>)> = node
             .children
             .iter()
             .filter_map(|id| scene.node(*id))
             .filter(|child| child.kind.is_component())
-            .map(|child| (child.id, child.name.clone(), child.kind.label()))
+            .map(|child| {
+                let player_controlled = match &child.kind {
+                    NodeKind::CharacterController { player, .. } => Some(*player),
+                    _ => None,
+                };
+                (
+                    child.id,
+                    child.name.clone(),
+                    child.kind.label(),
+                    player_controlled,
+                )
+            })
             .collect();
         let existing: Vec<&NodeKind> = node
             .children
@@ -8594,17 +8795,30 @@ impl EditorWorkspace {
 
         let mut add_component = None;
         let mut select_component = None;
+        let mut set_player_controlled = None;
         egui::CollapsingHeader::new(icons::label(icons::LAYERS, "Components"))
             .default_open(true)
             .show(ui, |ui| {
                 if components.is_empty() {
                     ui.weak("No components attached.");
                 } else {
-                    for (id, name, kind) in &components {
+                    for (id, name, kind, player_controlled) in &components {
                         ui.horizontal(|ui| {
                             draw_inline_icon(ui, node_lucide_icon(kind, false), STUDIO_TEXT_WEAK);
                             ui.label(name);
                             ui.label(RichText::new(*kind).color(STUDIO_TEXT_WEAK).small());
+                            if let Some(player_controlled) = player_controlled {
+                                let mut player = *player_controlled;
+                                if ui
+                                    .checkbox(
+                                        &mut player,
+                                        icons::label(icons::MAP_PIN, "Player controlled"),
+                                    )
+                                    .changed()
+                                {
+                                    set_player_controlled = Some((*id, player));
+                                }
+                            }
                             if ui.small_button("Select").clicked() {
                                 select_component = Some(*id);
                             }
@@ -8635,6 +8849,50 @@ impl EditorWorkspace {
         if let Some((label, kind)) = add_component {
             self.add_component_to_host(selected, label, kind);
         }
+        if let Some((controller, player)) = set_player_controlled {
+            self.set_character_controller_player_controlled(controller, player);
+        }
+    }
+
+    fn set_character_controller_player_controlled(&mut self, controller: NodeId, player: bool) {
+        let Some(current) =
+            self.project
+                .active_scene()
+                .node(controller)
+                .and_then(|node| match &node.kind {
+                    NodeKind::CharacterController { player, .. } => Some(*player),
+                    _ => None,
+                })
+        else {
+            self.status = "Selected component is not a Character Controller".to_string();
+            return;
+        };
+        if current == player {
+            return;
+        }
+
+        self.push_undo();
+        if player {
+            self.demote_player_sources_except(Some(controller));
+        }
+        let Some(node) = self.project.active_scene_mut().node_mut(controller) else {
+            self.status = "Character Controller no longer exists".to_string();
+            return;
+        };
+        let NodeKind::CharacterController {
+            player: current, ..
+        } = &mut node.kind
+        else {
+            self.status = "Selected component is not a Character Controller".to_string();
+            return;
+        };
+        *current = player;
+        self.status = if player {
+            "Marked Character Controller as player controlled".to_string()
+        } else {
+            "Cleared player control from Character Controller".to_string()
+        };
+        self.mark_dirty();
     }
 
     fn add_component_to_host(
@@ -9986,6 +10244,14 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+fn node_kind_is_player_source(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::SpawnPoint { player: true, .. }
+            | NodeKind::CharacterController { player: true, .. }
+    )
 }
 
 fn node_lucide_icon(kind: &str, root: bool) -> char {
@@ -18059,6 +18325,172 @@ mod tests {
             assert_eq!(floor.material, Some(material));
             assert!(sector.ceiling.is_none());
         }
+        assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn dropping_first_character_profile_creates_player_controller() {
+        let mut project = ProjectDocument::new("drop-character");
+        let character = project.add_resource(
+            "Hero",
+            ResourceData::Character(psxed_project::CharacterResource::defaults()),
+        );
+        let room = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "Room",
+            NodeKind::Room {
+                grid: WorldGrid::empty(1, 1, 1024),
+            },
+        );
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+
+        workspace.drop_resource_at_room_hit(character, room, [0.0, 0.0, 0.0], None);
+
+        let entity = workspace.selected_node;
+        let scene = workspace.project.active_scene();
+        let node = scene.node(entity).expect("character entity exists");
+        assert_eq!(node.parent, Some(room));
+        let controller = node
+            .children
+            .iter()
+            .filter_map(|id| scene.node(*id))
+            .find_map(|child| match child.kind {
+                NodeKind::CharacterController { character, player } => Some((character, player)),
+                _ => None,
+            })
+            .expect("character entity has controller component");
+        assert_eq!(controller, (Some(character), true));
+        assert!(workspace.status.contains("Player Character Entity"));
+    }
+
+    #[test]
+    fn dropping_character_profile_stays_non_player_when_player_exists() {
+        let mut project = ProjectDocument::new("drop-npc");
+        let character = project.add_resource(
+            "NPC",
+            ResourceData::Character(psxed_project::CharacterResource::defaults()),
+        );
+        let room = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "Room",
+            NodeKind::Room {
+                grid: WorldGrid::empty(1, 1, 1024),
+            },
+        );
+        project.active_scene_mut().add_node(
+            room,
+            "Player Spawn",
+            NodeKind::SpawnPoint {
+                player: true,
+                character: None,
+            },
+        );
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+
+        workspace.drop_resource_at_room_hit(character, room, [0.0, 0.0, 0.0], None);
+
+        let entity = workspace.selected_node;
+        let scene = workspace.project.active_scene();
+        let controller = scene
+            .node(entity)
+            .expect("character entity exists")
+            .children
+            .iter()
+            .filter_map(|id| scene.node(*id))
+            .find_map(|child| match child.kind {
+                NodeKind::CharacterController { player, .. } => Some(player),
+                _ => None,
+            })
+            .expect("character entity has controller component");
+        assert!(!controller);
+    }
+
+    #[test]
+    fn player_source_demote_handles_spawn_points_and_character_controllers() {
+        let mut project = ProjectDocument::new("player-source-demote");
+        let room = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "Room",
+            NodeKind::Room {
+                grid: WorldGrid::empty(1, 1, 1024),
+            },
+        );
+        let spawn = project.active_scene_mut().add_node(
+            room,
+            "Legacy Player",
+            NodeKind::SpawnPoint {
+                player: true,
+                character: None,
+            },
+        );
+        let entity = project
+            .active_scene_mut()
+            .add_node(room, "Entity Player", NodeKind::Entity);
+        let controller = project.active_scene_mut().add_node(
+            entity,
+            "Character Controller",
+            NodeKind::CharacterController {
+                character: None,
+                player: true,
+            },
+        );
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+
+        workspace.demote_player_sources_except(Some(controller));
+
+        let scene = workspace.project.active_scene();
+        assert!(matches!(
+            scene.node(spawn).unwrap().kind,
+            NodeKind::SpawnPoint { player: false, .. }
+        ));
+        assert!(matches!(
+            scene.node(controller).unwrap().kind,
+            NodeKind::CharacterController { player: true, .. }
+        ));
+    }
+
+    #[test]
+    fn character_controller_player_toggle_demotes_existing_player_source() {
+        let mut project = ProjectDocument::new("player-source-toggle");
+        let room = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "Room",
+            NodeKind::Room {
+                grid: WorldGrid::empty(1, 1, 1024),
+            },
+        );
+        let spawn = project.active_scene_mut().add_node(
+            room,
+            "Legacy Player",
+            NodeKind::SpawnPoint {
+                player: true,
+                character: None,
+            },
+        );
+        let entity = project
+            .active_scene_mut()
+            .add_node(room, "Wraith", NodeKind::Entity);
+        let controller = project.active_scene_mut().add_node(
+            entity,
+            "Character Controller",
+            NodeKind::CharacterController {
+                character: None,
+                player: false,
+            },
+        );
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+
+        workspace.set_character_controller_player_controlled(controller, true);
+
+        let scene = workspace.project.active_scene();
+        assert!(matches!(
+            scene.node(spawn).unwrap().kind,
+            NodeKind::SpawnPoint { player: false, .. }
+        ));
+        assert!(matches!(
+            scene.node(controller).unwrap().kind,
+            NodeKind::CharacterController { player: true, .. }
+        ));
         assert!(workspace.is_dirty());
     }
 

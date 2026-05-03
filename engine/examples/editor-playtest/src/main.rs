@@ -139,10 +139,8 @@ const CAMERA_YAW_STEP: Angle = Angle::from_q12(12);
 const MOVE_STICK_DEADZONE: i16 = 18;
 const STICK_MAX: i16 = 127;
 const CAMERA_STICK_DEADZONE: i16 = 18;
-const CAMERA_STICK_YAW_STEP: i16 = 42;
-const CAMERA_HEIGHT_STICK_STEP: i32 = 18;
-const CAMERA_HEIGHT_OFFSET_MIN: i32 = -512;
-const CAMERA_HEIGHT_OFFSET_MAX: i32 = 768;
+const CAMERA_STICK_YAW_STEP: i16 = 64;
+const CAMERA_STICK_PITCH_STEP: i16 = 48;
 const CAMERA_SOFT_LOCK_BREAK_STICK: i16 = 72;
 const LOCK_RANGE: i32 = 4096;
 const LOCK_BREAK_RANGE: i32 = 5120;
@@ -461,9 +459,6 @@ struct Playtest {
     /// Runtime third-person camera rig. Updated from render so it
     /// can consume the same room collision view used for drawing.
     camera: ThirdPersonCameraState,
-    /// Manual right-stick vertical offset layered on top of the
-    /// authored camera height.
-    camera_height_offset: i32,
     /// Index into `ENTITIES` for the current lock-on target. In this
     /// vertical-slice pass generic entity markers stand in for
     /// enemies until enemy records exist.
@@ -498,7 +493,6 @@ impl Playtest {
             orbit_yaw: CAMERA_START_YAW,
             orbit_radius: CAMERA_START_RADIUS,
             camera: ThirdPersonCameraState::new(CAMERA_START_YAW),
-            camera_height_offset: 0,
             lock_target: None,
             soft_lock_target: None,
             soft_lock_suppressed: false,
@@ -588,8 +582,6 @@ impl Scene for Playtest {
             }
             return;
         }
-
-        self.update_camera_height_offset(ctx);
 
         let input = motor_input(ctx, self.camera.yaw());
         let config = self.motor_config();
@@ -970,10 +962,7 @@ impl Playtest {
                 FOLLOW_TARGET_HEIGHT_DEFAULT,
             ),
         };
-        config.height = config
-            .height
-            .saturating_add(self.camera_height_offset)
-            .max(256);
+        config.height = config.height.max(256);
         config
     }
 
@@ -1005,14 +994,6 @@ impl Playtest {
         self.camera
             .update(PROJECTION, collision, target, input, config)
             .camera
-    }
-
-    fn update_camera_height_offset(&mut self, ctx: &Ctx) {
-        let (_, right_y) = ctx.pad.sticks.right_centered();
-        self.camera_height_offset = self
-            .camera_height_offset
-            .saturating_add(stick_to_height_delta(psx_engine::InputAxis::new(right_y)))
-            .clamp(CAMERA_HEIGHT_OFFSET_MIN, CAMERA_HEIGHT_OFFSET_MAX);
     }
 
     fn chunked_level(&self) -> bool {
@@ -1948,7 +1929,12 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
     Some(slot)
 }
 
-fn room_texture_window(origin_u: u8, origin_v: u8, width: u16, height: u16) -> Option<TextureWindow> {
+fn room_texture_window(
+    origin_u: u8,
+    origin_v: u8,
+    width: u16,
+    height: u16,
+) -> Option<TextureWindow> {
     Some(TextureWindow::power_of_two_tile(
         origin_u,
         origin_v,

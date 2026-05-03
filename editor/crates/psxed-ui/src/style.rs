@@ -12,6 +12,7 @@ pub(crate) const STUDIO_BG: Color32 = Color32::from_rgb(12, 16, 21);
 pub(crate) const STUDIO_TOP_BAR: Color32 = Color32::from_rgb(18, 22, 28);
 pub(crate) const STUDIO_PANEL: Color32 = Color32::from_rgb(17, 22, 28);
 pub(crate) const STUDIO_PANEL_DARK: Color32 = Color32::from_rgb(13, 17, 22);
+pub(crate) const STUDIO_PANEL_HEADER: Color32 = Color32::from_rgb(18, 25, 32);
 pub(crate) const STUDIO_INPUT: Color32 = Color32::from_rgb(11, 15, 20);
 pub(crate) const STUDIO_VIEWPORT: Color32 = Color32::from_rgb(12, 24, 31);
 pub(crate) const STUDIO_BORDER: Color32 = Color32::from_rgb(41, 51, 63);
@@ -91,13 +92,12 @@ pub(crate) fn top_bar_frame() -> Frame {
     Frame::new()
         .fill(STUDIO_TOP_BAR)
         .stroke(Stroke::new(1.0, STUDIO_BORDER_DARK))
-        .inner_margin(Margin::symmetric(10, 4))
+        .inner_margin(Margin::symmetric(8, 5))
 }
 
 pub(crate) fn dock_frame() -> Frame {
     Frame::new()
-        .fill(STUDIO_PANEL_DARK)
-        .stroke(Stroke::new(1.0, STUDIO_BORDER))
+        .fill(STUDIO_BG)
         .inner_margin(Margin::symmetric(6, 6))
 }
 
@@ -109,11 +109,26 @@ pub(crate) fn section_frame() -> Frame {
         .inner_margin(Margin::symmetric(8, 7))
 }
 
-pub(crate) fn viewport_frame() -> Frame {
+pub(crate) fn tool_panel_frame() -> Frame {
     Frame::new()
-        .fill(STUDIO_BG)
+        .fill(STUDIO_PANEL)
         .stroke(Stroke::new(1.0, STUDIO_BORDER))
-        .inner_margin(Margin::same(4))
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin::same(0))
+}
+
+pub(crate) fn tool_panel_body<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    Frame::new()
+        .inner_margin(Margin::symmetric(8, 7))
+        .show(ui, add_contents)
+        .inner
+}
+
+pub(crate) fn viewport_frame() -> Frame {
+    Frame::new().fill(STUDIO_BG).inner_margin(Margin::same(6))
 }
 
 pub(crate) fn panel_heading(ui: &mut egui::Ui, icon: char, label: &str) {
@@ -121,4 +136,26 @@ pub(crate) fn panel_heading(ui: &mut egui::Ui, icon: char, label: &str) {
         ui.label(icons::text(icon, 15.0).color(STUDIO_ACCENT));
         ui.label(RichText::new(label).strong().color(STUDIO_TEXT));
     });
+}
+
+pub(crate) fn tool_panel_header(
+    ui: &mut egui::Ui,
+    icon: char,
+    label: &str,
+    add_actions: impl FnOnce(&mut egui::Ui),
+) {
+    Frame::new()
+        .fill(STUDIO_PANEL_HEADER)
+        .inner_margin(Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.set_min_height(24.0);
+            ui.horizontal(|ui| {
+                ui.label(icons::text(icon, 15.0).color(STUDIO_ACCENT));
+                ui.label(RichText::new(label).strong().color(STUDIO_TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    add_actions(ui);
+                });
+            });
+        });
+    ui.separator();
 }

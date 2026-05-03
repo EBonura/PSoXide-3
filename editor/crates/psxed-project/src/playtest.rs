@@ -579,7 +579,9 @@ pub fn build_package(
 
     let spawn = match player_spawns.len() {
         0 => {
-            report.error("playtest needs exactly one SpawnPoint with `player: true` — none found");
+            report.error(
+                "playtest needs exactly one player source — mark a SpawnPoint as player or enable Player controlled on a Character Controller",
+            );
             None
         }
         1 => {
@@ -598,7 +600,7 @@ pub fn build_package(
         }
         n => {
             report.error(format!(
-                "playtest needs exactly one player SpawnPoint, found {n}"
+                "playtest needs exactly one player source, found {n}"
             ));
             None
         }
@@ -623,7 +625,7 @@ pub fn build_package(
                 Ok(resolved) => {
                     if resolved.auto_picked {
                         report.warn(format!(
-                            "Player Spawn '{}' had no Character — auto-picked the only one defined",
+                            "Player source '{}' had no Character — auto-picked the only one defined",
                             spawn_node.name,
                         ));
                     }
@@ -631,7 +633,7 @@ pub fn build_package(
                 }
                 Err(crate::resolve::SpawnCharacterResolutionError::MissingExplicit(id)) => {
                     report.error(format!(
-                        "Player Spawn '{}' references Character #{} which doesn't exist",
+                        "Player source '{}' references Character #{} which doesn't exist",
                         spawn_node.name,
                         id.raw()
                     ));
@@ -643,14 +645,14 @@ pub fn build_package(
                         .map(|r| r.name.as_str())
                         .unwrap_or("<missing>");
                     report.error(format!(
-                        "Player Spawn '{}' references resource '{}' which is not a Character",
+                        "Player source '{}' references resource '{}' which is not a Character",
                         spawn_node.name, name
                     ));
                     None
                 }
                 Err(crate::resolve::SpawnCharacterResolutionError::NoCharacters) => {
                     report.error(format!(
-                        "Player Spawn '{}' has no Character assigned and no Character resources exist",
+                        "Player source '{}' has no Character assigned and no Character resources exist",
                         spawn_node.name
                     ));
                     None
@@ -659,7 +661,7 @@ pub fn build_package(
                     count,
                 }) => {
                     report.error(format!(
-                        "Player Spawn '{}' has no Character assigned and {count} Characters are defined — pick one explicitly",
+                        "Player source '{}' has no Character assigned and {count} Characters are defined — pick one explicitly",
                         spawn_node.name
                     ));
                     None

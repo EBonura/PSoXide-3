@@ -445,6 +445,7 @@ fn walk_room(
                         face.dropped_corner,
                         face.uv,
                         shade,
+                        [camera.position.x, camera.position.y, camera.position.z],
                     );
                 }
             }
@@ -476,6 +477,17 @@ impl FaceShade {
     fn sidedness(self) -> psxed_project::MaterialFaceSidedness {
         match self {
             Self::Flat { sidedness, .. } | Self::Textured { sidedness, .. } => sidedness,
+        }
+    }
+
+    fn with_sidedness(self, sidedness: psxed_project::MaterialFaceSidedness) -> Self {
+        match self {
+            Self::Flat { rgb, .. } => Self::Flat { rgb, sidedness },
+            Self::Textured { slot, tint, .. } => Self::Textured {
+                slot,
+                tint,
+                sidedness,
+            },
         }
     }
 }
@@ -1018,6 +1030,27 @@ enum WallEdge {
     West,
 }
 
+fn wall_side_visible(
+    sidedness: psxed_project::MaterialFaceSidedness,
+    bounds: [i32; 4],
+    edge: WallEdge,
+    camera_position: [i32; 3],
+) -> bool {
+    let [x0, x1, z0, z1] = bounds;
+    let [cam_x, _, cam_z] = camera_position;
+    let inside_distance = match edge {
+        WallEdge::North => z1.saturating_sub(cam_z),
+        WallEdge::East => x1.saturating_sub(cam_x),
+        WallEdge::South => cam_z.saturating_sub(z0),
+        WallEdge::West => cam_x.saturating_sub(x0),
+    };
+    match sidedness {
+        psxed_project::MaterialFaceSidedness::Both => true,
+        psxed_project::MaterialFaceSidedness::Back => inside_distance >= 0,
+        psxed_project::MaterialFaceSidedness::Front => inside_distance <= 0,
+    }
+}
+
 /// Build the four world-space corners of a wall face on `edge`
 /// and emit one or two triangles. `heights` is the
 /// `GridVerticalFace` `[bl, br, tr, tl]` quad. `dropped_corner`
@@ -1032,8 +1065,13 @@ fn push_wall_face(
     dropped_corner: Option<psxed_project::WallCorner>,
     uv_transform: GridUvTransform,
     shade: FaceShade,
+    camera_position: [i32; 3],
 ) {
     use psxed_project::WallCorner;
+    if !wall_side_visible(shade.sidedness(), bounds, edge, camera_position) {
+        return;
+    }
+    let render_shade = shade.with_sidedness(psxed_project::MaterialFaceSidedness::Both);
     let [x0, x1, z0, z1] = bounds;
     // For each cardinal edge, "left" and "right" are picked so an
     // observer standing inside the sector sees the wall the right
@@ -1099,7 +1137,10 @@ fn push_wall_face(
     // separate concern: the authored wall back side faces the
     // owning cell/interior, matching runtime `world_render` and
     // the default one-sided Brick material.
-    let flip_winding = matches!(edge, WallEdge::North);
+    let flip_winding = !matches!(
+        shade.sidedness(),
+        psxed_project::MaterialFaceSidedness::Back
+    );
     let emit_wall_triangle = |scratch: &mut PreviewScratch,
                               verts: [psx_gte::scene::Projected; 3],
                               uvs: [(u8, u8); 3]| {
@@ -1108,10 +1149,10 @@ fn push_wall_face(
                 scratch,
                 [verts[0], verts[2], verts[1]],
                 [uvs[0], uvs[2], uvs[1]],
-                shade,
+                render_shade,
             );
         } else {
-            emit_face_tri(scratch, verts, uvs, shade);
+            emit_face_tri(scratch, verts, uvs, render_shade);
         }
     };
     if !skip(tri_a.2) {
@@ -3074,42 +3115,96 @@ mod tests {
     #[test]
     fn editor_cardinal_wall_backs_face_their_owning_cell() {
         let cases = [
-            (WallEdge::North, 2048),
-            (WallEdge::East, 3072),
-            (WallEdge::South, 0),
-            (WallEdge::West, 1024),
+            (WallEdge::North, [512, 512, 512], 2048, [512, 512, 1536], 0),
+            (
+                WallEdge::East,
+                [512, 512, 512],
+                3072,
+                [1536, 512, 512],
+                1024,
+            ),
+            (WallEdge::South, [512, 512, 512], 0, [512, 512, -512], 2048),
+            (
+                WallEdge::West,
+                [512, 512, 512],
+                1024,
+                [-512, 512, 512],
+                3072,
+            ),
         ];
 
-        for (edge, yaw_q12) in cases {
-            let _camera = setup_gte_for_camera(ViewportCameraState {
-                mode: ViewportCameraMode::Free,
-                yaw_q12,
-                pitch_q12: 0,
-                radius: 1024,
-                target: [512, 512, 512],
-                position: [512, 512, 512],
-            });
-            let mut scratch = SCRATCH.lock().expect("editor preview scratch mutex");
-            scratch.used = 0;
-            scratch.tex_used = 0;
-            scratch.overlay_lines.clear();
-            scratch.ot.clear();
-
-            push_wall_face(
-                &mut scratch,
-                [0, 1024, 0, 1024],
-                edge,
-                [0, 0, 1024, 1024],
-                None,
-                GridUvTransform::default(),
-                flat_sided(128, 128, 128, MaterialFaceSidedness::Back),
-            );
-
+        for (edge, inside_pos, inside_yaw, outside_pos, outside_yaw) in cases {
             assert!(
-                scratch.used > 0 || scratch.tex_used > 0,
+                wall_face_emits_from_camera(
+                    edge,
+                    inside_pos,
+                    inside_yaw,
+                    MaterialFaceSidedness::Back
+                ),
                 "{edge:?} wall back side should render from inside the owning cell"
             );
+            assert!(
+                !wall_face_emits_from_camera(
+                    edge,
+                    inside_pos,
+                    inside_yaw,
+                    MaterialFaceSidedness::Front
+                ),
+                "{edge:?} wall front side should not render from inside the owning cell"
+            );
+            assert!(
+                !wall_face_emits_from_camera(
+                    edge,
+                    outside_pos,
+                    outside_yaw,
+                    MaterialFaceSidedness::Back
+                ),
+                "{edge:?} wall back side should not render from outside the owning cell"
+            );
+            assert!(
+                wall_face_emits_from_camera(
+                    edge,
+                    outside_pos,
+                    outside_yaw,
+                    MaterialFaceSidedness::Front
+                ),
+                "{edge:?} wall front side should render from outside the owning cell"
+            );
         }
+    }
+
+    fn wall_face_emits_from_camera(
+        edge: WallEdge,
+        position: [i32; 3],
+        yaw_q12: u16,
+        sidedness: MaterialFaceSidedness,
+    ) -> bool {
+        let _camera = setup_gte_for_camera(ViewportCameraState {
+            mode: ViewportCameraMode::Free,
+            yaw_q12,
+            pitch_q12: 0,
+            radius: 1024,
+            target: [512, 512, 512],
+            position,
+        });
+        let mut scratch = SCRATCH.lock().expect("editor preview scratch mutex");
+        scratch.used = 0;
+        scratch.tex_used = 0;
+        scratch.overlay_lines.clear();
+        scratch.ot.clear();
+
+        push_wall_face(
+            &mut scratch,
+            [0, 1024, 0, 1024],
+            edge,
+            [0, 0, 1024, 1024],
+            None,
+            GridUvTransform::default(),
+            flat_sided(128, 128, 128, sidedness),
+            position,
+        );
+
+        scratch.used > 0 || scratch.tex_used > 0
     }
 
     #[test]

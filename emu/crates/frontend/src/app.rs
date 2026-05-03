@@ -855,13 +855,14 @@ impl AppState {
         self.embedded_playtest.input_captured()
     }
 
-    /// Cook the active editor project, then spawn the existing MIPS
-    /// build target. The build is asynchronous; call
+    /// Build and run the active editor project: cook assets, spawn
+    /// the existing MIPS build target, then side-load the EXE. The
+    /// build is asynchronous; call
     /// [`Self::poll_embedded_playtest_build`] once per frame to load
     /// the resulting EXE when it exits successfully.
     pub fn start_embedded_playtest(&mut self) {
         self.stop_embedded_playtest();
-        self.editor.set_status("Cooking embedded playtest...");
+        self.editor.set_status("Play: cooking assets...");
         if let Err(error) = self.save_editor_project() {
             let message = format!("Embedded Play failed: {error}");
             self.editor.set_status(message.clone());
@@ -871,14 +872,14 @@ impl AppState {
         let cook_status = match self.editor.cook_playtest_to_disk() {
             Ok(status) => status,
             Err(error) => {
-                let message = format!("Embedded Play cook failed: {error}");
+                let message = format!("Embedded Play failed while cooking assets: {error}");
                 self.editor.set_status(message.clone());
                 self.embedded_playtest.fail();
                 return;
             }
         };
         self.editor
-            .set_status(format!("{cook_status}; building editor-playtest..."));
+            .set_status(format!("{cook_status}; compiling runtime..."));
 
         if let Err(error) = self.spawn_editor_playtest_build(
             EditorBuildCompletion::RunEmbedded,
@@ -890,12 +891,13 @@ impl AppState {
         }
     }
 
-    /// Cook/build the active project and copy the resulting PSX EXE into
-    /// the project folder so the launcher Projects category can run it
-    /// without opening the editor first.
+    /// Build the active project by cooking assets, compiling the runtime,
+    /// and copying the resulting PSX EXE into the project folder so the
+    /// launcher Projects category can run it without opening the editor.
     pub fn build_current_project_for_launcher(&mut self) {
         self.stop_embedded_playtest();
-        self.editor.set_status("Cooking project build...");
+        self.editor
+            .set_status("Building project: cooking assets...");
         if let Err(error) = self.save_editor_project() {
             let message = format!("Project build failed: {error}");
             self.editor.set_status(message.clone());
@@ -907,14 +909,14 @@ impl AppState {
         let cook_status = match self.editor.cook_playtest_to_disk() {
             Ok(status) => status,
             Err(error) => {
-                let message = format!("Project build cook failed: {error}");
+                let message = format!("Project build failed while cooking assets: {error}");
                 self.editor.set_status(message.clone());
                 self.embedded_playtest.fail();
                 return;
             }
         };
         self.editor.set_status(format!(
-            "{cook_status}; building project EXE for {}...",
+            "{cook_status}; compiling project EXE for {}...",
             dest_path.display()
         ));
 
@@ -1060,7 +1062,7 @@ impl AppState {
             psxed_ui::EditorPlaytestRequest::Play | psxed_ui::EditorPlaytestRequest::Rebuild => {
                 self.start_embedded_playtest();
             }
-            psxed_ui::EditorPlaytestRequest::BakeProjectBuild => {
+            psxed_ui::EditorPlaytestRequest::BuildProject => {
                 self.build_current_project_for_launcher();
             }
             psxed_ui::EditorPlaytestRequest::Stop => {

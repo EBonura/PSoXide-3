@@ -5,15 +5,17 @@ use egui::{Color32, Pos2, Rect, Vec2};
 /// Request emitted by the editor UI for embedded play mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorPlaytestRequest {
-    /// Cook/build/load and start play mode.
+    /// Build/load and start play mode. The frontend performs the
+    /// cook step before compiling the runtime.
     Play,
     /// Stop play mode and return to edit preview.
     Stop,
     /// Re-cook/rebuild/reload while play mode is already active.
     Rebuild,
-    /// Cook/build the current project and export the resulting EXE to
-    /// the launcher Projects list.
-    BakeProjectBuild,
+    /// Build the current project and export the resulting EXE to the
+    /// launcher Projects list. The frontend performs the cook step
+    /// first, then compiles the runtime.
+    BuildProject,
     /// The playable viewport was clicked; capture game input there.
     CaptureInput,
 }

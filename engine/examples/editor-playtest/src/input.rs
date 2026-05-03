@@ -55,9 +55,10 @@ pub(crate) fn player_anim_from_motor(anim: CharacterMotorAnim) -> PlayerAnim {
 }
 
 pub(crate) fn camera_input(ctx: &Ctx) -> ThirdPersonCameraInput {
-    let (right_x, _) = ctx.pad.sticks.right_centered();
+    let (right_x, right_y) = ctx.pad.sticks.right_centered();
     ThirdPersonCameraInput {
         yaw_delta_q12: stick_to_yaw_delta(InputAxis::new(right_x.saturating_neg())),
+        pitch_delta_q12: stick_to_pitch_delta(InputAxis::new(right_y)),
         recenter: ctx.is_held(button::L1),
     }
 }
@@ -66,12 +67,12 @@ pub(crate) fn stick_to_yaw_delta(axis: InputAxis) -> i16 {
     stick_axis_delta(axis, CAMERA_STICK_YAW_STEP)
 }
 
-pub(crate) fn stick_to_radius_delta(axis: InputAxis) -> i32 {
-    stick_axis_delta(axis, CAMERA_RADIUS_STEP as i16) as i32
+pub(crate) fn stick_to_pitch_delta(axis: InputAxis) -> i16 {
+    stick_axis_delta(axis, CAMERA_STICK_PITCH_STEP)
 }
 
-pub(crate) fn stick_to_height_delta(axis: InputAxis) -> i32 {
-    stick_axis_delta(axis, CAMERA_HEIGHT_STICK_STEP as i16) as i32
+pub(crate) fn stick_to_radius_delta(axis: InputAxis) -> i32 {
+    stick_axis_delta(axis, CAMERA_RADIUS_STEP as i16) as i32
 }
 
 pub(crate) fn stick_axis_delta(axis: InputAxis, max_step: i16) -> i16 {

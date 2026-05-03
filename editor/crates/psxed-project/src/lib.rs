@@ -1148,6 +1148,8 @@ pub const HEIGHT_QUANTUM: i32 = 32;
 pub const WORLD_SECTOR_SIZE_QUANTUM: i32 = 128;
 /// Default sector size used by starter/legacy projects.
 pub const DEFAULT_WORLD_SECTOR_SIZE: i32 = 1024;
+/// Default wall span when no ceiling is authored above the edge.
+pub const DEFAULT_WALL_HEIGHT_SECTORS: i32 = 2;
 /// Minimum authored sector size.
 pub const MIN_WORLD_SECTOR_SIZE: i32 = WORLD_SECTOR_SIZE_QUANTUM;
 /// Maximum authored sector size. This is an authoring sanity cap,
@@ -1181,6 +1183,10 @@ pub fn snap_world_sector_size(size: i32) -> i32 {
 
 fn default_world_sector_size() -> i32 {
     DEFAULT_WORLD_SECTOR_SIZE
+}
+
+fn default_wall_height_for_sector_size(sector_size: i32) -> i32 {
+    sector_size.saturating_mul(DEFAULT_WALL_HEIGHT_SECTORS)
 }
 
 fn default_model_scale_q8() -> [u16; 3] {
@@ -1331,20 +1337,21 @@ impl WorldGrid {
         wall_material: Option<ResourceId>,
     ) -> Self {
         let mut grid = Self::empty(width, depth, sector_size);
+        let wall_top = default_wall_height_for_sector_size(sector_size);
         for x in 0..width {
             for z in 0..depth {
                 grid.set_floor(x, z, 0, floor_material);
                 if z == depth.saturating_sub(1) {
-                    grid.add_wall(x, z, GridDirection::North, 0, sector_size, wall_material);
+                    grid.add_wall(x, z, GridDirection::North, 0, wall_top, wall_material);
                 }
                 if x == width.saturating_sub(1) {
-                    grid.add_wall(x, z, GridDirection::East, 0, sector_size, wall_material);
+                    grid.add_wall(x, z, GridDirection::East, 0, wall_top, wall_material);
                 }
                 if z == 0 {
-                    grid.add_wall(x, z, GridDirection::South, 0, sector_size, wall_material);
+                    grid.add_wall(x, z, GridDirection::South, 0, wall_top, wall_material);
                 }
                 if x == 0 {
-                    grid.add_wall(x, z, GridDirection::West, 0, sector_size, wall_material);
+                    grid.add_wall(x, z, GridDirection::West, 0, wall_top, wall_material);
                 }
             }
         }
@@ -1407,10 +1414,10 @@ impl WorldGrid {
         }
     }
 
-    /// Add a wall whose bottom edge follows the floor edge under
-    /// it and whose top edge follows the ceiling edge when present.
-    /// Missing ceilings fall back to the room's default sector
-    /// height, matching the old wall-paint default.
+    /// Add a wall whose bottom edge follows the floor edge under it
+    /// and whose top edge follows the ceiling edge when present.
+    /// Missing ceilings fall back to a two-sector wall span above
+    /// each bottom endpoint.
     pub fn add_wall_aligned_to_surfaces(
         &mut self,
         x: u16,
@@ -1441,9 +1448,10 @@ impl WorldGrid {
         let top = self
             .ceiling_edge_heights_for_wall(x, z, direction)
             .unwrap_or_else(|| {
+                let height = default_wall_height_for_sector_size(self.sector_size);
                 [
-                    self.sector_size.max(bottom[0].saturating_add(1)),
-                    self.sector_size.max(bottom[1].saturating_add(1)),
+                    bottom[0].saturating_add(height),
+                    bottom[1].saturating_add(height),
                 ]
             });
         [bottom[0], bottom[1], top[1], top[0]]
@@ -1464,9 +1472,10 @@ impl WorldGrid {
         let top = self
             .horizontal_edge_heights_for_world_wall(wcx, wcz, direction, HorizontalSurface::Ceiling)
             .unwrap_or_else(|| {
+                let height = default_wall_height_for_sector_size(self.sector_size);
                 [
-                    self.sector_size.max(bottom[0].saturating_add(1)),
-                    self.sector_size.max(bottom[1].saturating_add(1)),
+                    bottom[0].saturating_add(height),
+                    bottom[1].saturating_add(height),
                 ]
             });
         [bottom[0], bottom[1], top[1], top[0]]
@@ -4185,7 +4194,7 @@ mod tests {
             .get(GridDirection::North)
             .first()
             .unwrap();
-        assert_eq!(wall.heights, [128, 256, 1024, 1024]);
+        assert_eq!(wall.heights, [128, 256, 2304, 2176]);
     }
 
     #[test]
@@ -4221,12 +4230,13 @@ mod tests {
         let heights =
             grid.wall_heights_aligned_to_surfaces_for_world_cell(1, 0, GridDirection::West);
 
-        assert_eq!(heights, [384, 256, 1024, 1024]);
+        assert_eq!(heights, [384, 256, 2304, 2432]);
     }
 
     #[test]
     fn stone_room_perimeter_uses_editor_direction_convention() {
         let grid = WorldGrid::stone_room(2, 3, 1024, None, None);
+        let default_wall_height = default_wall_height_for_sector_size(1024);
 
         for x in 0..grid.width {
             assert!(!grid
@@ -4254,6 +4264,17 @@ mod tests {
                 .get(GridDirection::South)
                 .is_empty());
         }
+        let south_wall = grid
+            .sector(0, 0)
+            .unwrap()
+            .walls
+            .get(GridDirection::South)
+            .first()
+            .unwrap();
+        assert_eq!(
+            south_wall.heights,
+            [0, 0, default_wall_height, default_wall_height]
+        );
     }
 
     #[test]
