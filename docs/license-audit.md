@@ -133,8 +133,8 @@ items below are quality / completeness, not legal blockers.
   MeshLab, but the underlying Suzanne mesh provenance/license is not
   written down. Add it before release.
 - `engine/examples/editor-playtest/generated/level_manifest.rs` is a
-  tracked placeholder with no `include_bytes!`. Cooked generated rooms,
-  textures, and models are ignored and regenerated.
+  tracked placeholder with no `include_bytes!`. Cooked generated
+  manifests, rooms, textures, and models are ignored and regenerated.
 - `/build/` is ignored and should stay untracked.
 
 ## Generated Artifacts
@@ -143,8 +143,10 @@ Expected public-source contract:
 
 - Tracked: `engine/examples/editor-playtest/generated/level_manifest.rs`
   placeholder only.
-- Ignored/regenerated: cooked generated `rooms/`, `textures/`, and
-  `models/` directories under `engine/examples/editor-playtest/generated/`.
+- Ignored/regenerated:
+  `engine/examples/editor-playtest/generated/level_manifest.cooked.rs`,
+  plus cooked generated `rooms/`, `textures/`, and `models/`
+  directories under `engine/examples/editor-playtest/generated/`.
 - Ignored/regenerated: `/build/examples/.../*.exe`.
 - Tracked cooked demo assets: small `.psxt`, `.psxm`, `.psxmdl`, and
   `.psxanim` blobs that examples or the default project need from a

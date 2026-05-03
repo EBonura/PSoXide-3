@@ -10,17 +10,21 @@ into this crate's `generated/` directory:
 
 ```
 generated/
-  level_manifest.rs              Rust source -- psx_level records + include_bytes!
+  level_manifest.rs              tracked placeholder manifest
+  level_manifest.cooked.rs       ignored cooked manifest -- psx_level records + include_bytes!
   rooms/
     room_NNN.psxw                cooked room geometry (one per Room node)
   textures/
     texture_NNN.psxt             cooked texture blobs (one per unique texture)
 ```
 
-`src/main.rs` `include!`s the manifest and consumes the schema
-defined in [`engine/crates/psx-level`](../../crates/psx-level/),
-which is shared between the editor's playtest compiler and
-this runtime example. See
+`build.rs` selects `level_manifest.cooked.rs` when present, or
+falls back to the placeholder manifest on a fresh clone.
+`src/main.rs` `include!`s that selected manifest and consumes
+the schema defined in
+[`engine/crates/psx-level`](../../crates/psx-level/), which is
+shared between the editor's playtest compiler and this runtime
+example. See
 [`docs/level-residency.md`](../../../docs/level-residency.md)
 for the full contract.
 
@@ -53,10 +57,11 @@ For headless / CI workflows, these Make targets remain:
 
 ```sh
 # Cook the active editor project (or starter, with no args) into
-# generated/. Destructive -- overwrites whatever was there.
+# generated/. Destructive for ignored cooked outputs only.
 make cook-playtest [PROJECT=path/to/project.ron]
 
-# Build the EXE against whatever's in generated/ right now.
+# Build the EXE against generated/level_manifest.cooked.rs if it
+# exists, otherwise the tracked placeholder.
 # Doesn't recook.
 make build-editor-playtest
 ```
@@ -67,14 +72,16 @@ make build-editor-playtest
 state: imports the `psx_level` schema, declares empty asset /
 room / material / model / light / character slices, and contains
 no `include_bytes!` references. The EXE boots to a clear-coloured
-screen until a cook lands real data.
+screen until a cook lands real data in
+`generated/level_manifest.cooked.rs`.
 
-Cooked outputs live alongside the manifest and are gitignored
-so cooks don't churn diffs:
+Cooked outputs live alongside the placeholder and are gitignored
+so cooks don't churn diffs or dirty the tracked manifest:
 
 ```
 generated/
   level_manifest.rs              tracked placeholder
+  level_manifest.cooked.rs       gitignored cooked manifest
   rooms/
     room_NNN.psxw                gitignored
   textures/
@@ -86,8 +93,9 @@ generated/
 From a fresh clone:
 
 1. `make build-editor-playtest` -- works from the placeholder.
-2. Editor -> "Play" -- cooks your current scene, builds, and runs inside the editor
-   3D viewport until you press Stop.
+2. Editor -> "Play" -- cooks your current scene into the ignored
+   cooked manifest, builds, and runs inside the editor 3D viewport
+   until you press Stop.
 
 ## Scope
 
@@ -133,7 +141,8 @@ What it *does* render:
 - `src/main.rs` -- Scene impl, camera, input, draw call, residency wiring.
 - `Cargo.toml` -- standalone PSX-target crate (its own `[workspace]`).
 - `.cargo/config.toml` -- pins `target = "mipsel-sony-psx"`.
-- `generated/level_manifest.rs` -- generated; do not edit.
+- `generated/level_manifest.rs` -- tracked placeholder; keep free of `include_bytes!`.
+- `generated/level_manifest.cooked.rs` -- generated; do not edit; gitignored.
 - `generated/rooms/*.psxw` -- generated; do not edit; gitignored.
 - `generated/textures/*.psxt` -- generated; do not edit; gitignored.
 - `generated/models/model_NNN_*/` -- per-model folders carrying

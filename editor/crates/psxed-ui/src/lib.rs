@@ -1917,7 +1917,7 @@ impl EditorWorkspace {
     /// Cook the active project into the playtest example's
     /// `generated/` directory. Validates the scene tree, cooks
     /// every populated Room into `rooms/room_NNN.psxw`, and
-    /// writes a fresh `level_manifest.rs`. Returns a status
+    /// writes a fresh ignored cooked manifest. Returns a status
     /// string suitable for `self.status`. The "& Play" half is
     /// up to the caller -- the editor doesn't spawn child
     /// processes from this path; instead the status string

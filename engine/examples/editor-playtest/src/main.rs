@@ -1,8 +1,9 @@
 //! `editor-playtest` -- render a level cooked from the editor.
 //!
-//! Loads `generated/level_manifest.rs` (a Rust source file the
-//! editor's playtest compiler produces via
-//! [`psxed_project::playtest::write_package`]) containing:
+//! Loads a Rust manifest selected by `build.rs`: the ignored
+//! `generated/level_manifest.cooked.rs` when the editor has
+//! cooked a project, otherwise the tracked placeholder
+//! `generated/level_manifest.rs`. The cooked manifest contains:
 //!
 //! * a master [`LevelAssetRecord`] table -- every cooked
 //!   `.psxw` room blob and `.psxt` texture blob is a record;
@@ -72,7 +73,7 @@ use vram_upload::*;
 // manifests reference all of them. Quiet either side here.
 #[allow(dead_code, unused_imports)]
 mod generated {
-    include!("../generated/level_manifest.rs");
+    include!(env!("PSXED_PLAYTEST_MANIFEST"));
 }
 
 use generated::{

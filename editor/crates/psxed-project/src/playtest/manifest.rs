@@ -40,7 +40,7 @@ pub fn write_package(package: &PlaytestPackage, generated_dir: &Path) -> std::io
     }
 
     let manifest = render_manifest_source(package);
-    std::fs::write(generated_dir.join(MANIFEST_FILENAME), manifest)?;
+    std::fs::write(generated_dir.join(COOKED_MANIFEST_FILENAME), manifest)?;
     Ok(())
 }
 
@@ -557,6 +557,14 @@ pub fn cook_to_dir(
     project_root: &Path,
     generated_dir: &Path,
 ) -> std::io::Result<PlaytestValidationReport> {
+    // A failed cook must not leave a stale cooked manifest for
+    // subsequent runtime builds. If validation fails before a
+    // package exists, editor-playtest falls back to the tracked
+    // placeholder manifest.
+    let cooked_manifest = generated_dir.join(COOKED_MANIFEST_FILENAME);
+    if cooked_manifest.exists() {
+        std::fs::remove_file(&cooked_manifest)?;
+    }
     let (package, report) = build_package(project, project_root);
     if let Some(package) = package {
         write_package(&package, generated_dir)?;

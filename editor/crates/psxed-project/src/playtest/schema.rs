@@ -3,13 +3,17 @@
 use crate::{MaterialFaceSidedness, ResourceId};
 
 /// Generated subdirectory inside the playtest example that
-/// receives `level_manifest.rs` + `rooms/` + `textures/`. Stable
+/// receives manifest source + `rooms/` + `textures/`. Stable
 /// so the example's `include!` paths don't move.
 pub const GENERATED_DIRNAME: &str = "generated";
 
-/// Filename of the generated Rust-source manifest the example
-/// `include!`s.
+/// Tracked placeholder manifest. Kept buildable in source
+/// control so a fresh clone can compile before any project cook.
 pub const MANIFEST_FILENAME: &str = "level_manifest.rs";
+
+/// Ignored cooked Rust-source manifest written by editor Play /
+/// `make cook-playtest`.
+pub const COOKED_MANIFEST_FILENAME: &str = "level_manifest.cooked.rs";
 
 /// Subdirectory inside `generated/` that holds cooked `.psxw`
 /// blobs.

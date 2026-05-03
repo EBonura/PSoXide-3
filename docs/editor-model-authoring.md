@@ -163,7 +163,7 @@ walks the scene tree and:
 
 The writer (`write_package`) emits cooked bytes under
 `generated/models/model_NNN_<safe>/` (mesh + atlas + per-clip
-files) and renders a `level_manifest.rs` containing:
+files) and renders `level_manifest.cooked.rs` containing:
 
 ```rust
 pub static MODELS: &[LevelModelRecord] = &[ ... ];

@@ -2532,10 +2532,14 @@ mod tests {
         let report = cook_to_dir(&project, &starter_project_root(), &dir).expect("cook IO");
         assert!(report.is_ok(), "errors: {:?}", report.errors);
 
-        let manifest =
-            std::fs::read_to_string(dir.join(MANIFEST_FILENAME)).expect("manifest written");
+        let manifest = std::fs::read_to_string(dir.join(COOKED_MANIFEST_FILENAME))
+            .expect("cooked manifest written");
         assert!(manifest.contains("rooms/room_000.psxw"));
         assert!(manifest.contains("textures/texture_000.psxt"));
+        assert!(
+            !dir.join(MANIFEST_FILENAME).exists(),
+            "cook should not overwrite the tracked placeholder manifest"
+        );
 
         let blob = std::fs::read(dir.join(ROOMS_DIRNAME).join("room_000.psxw"))
             .expect("room blob written");
@@ -2578,6 +2582,33 @@ mod tests {
         let report = cook_to_dir(&project, &starter_project_root(), &dir).expect("cook IO");
         assert!(report.is_ok());
         assert!(!stale.exists(), "stale texture_999.psxt should be purged");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_cook_removes_stale_cooked_manifest() {
+        let mut project = ProjectDocument::starter();
+        demote_player_spawns(&mut project);
+
+        let dir = std::env::temp_dir().join(format!(
+            "psxed-playtest-stale-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cooked_manifest = dir.join(COOKED_MANIFEST_FILENAME);
+        std::fs::write(&cooked_manifest, "stale cooked manifest").unwrap();
+
+        let report = cook_to_dir(&project, &starter_project_root(), &dir).expect("cook IO");
+        assert!(!report.is_ok());
+        assert!(
+            !cooked_manifest.exists(),
+            "failed cook should not leave stale cooked manifest"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

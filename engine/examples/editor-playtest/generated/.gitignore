@@ -5,6 +5,7 @@
 # every time someone cooks. The tracked `level_manifest.rs`
 # stays as a buildable placeholder with no references to these
 # ignored files.
+level_manifest.cooked.rs
 rooms/*.psxw
 textures/*.psxt
 models/

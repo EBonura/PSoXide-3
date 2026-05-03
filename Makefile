@@ -224,14 +224,16 @@ showcase-room:
 # Cook a project into editor-playtest/generated/. With no
 # arguments cooks the embedded starter project; pass
 # `PROJECT=<path/to/project.ron>` to cook a specific one.
-# This target is **destructive**: it overwrites whatever was
-# in generated/ before. Don't run it after the editor's Play
-# action unless you want the editor's output replaced.
+# This target is **destructive** for ignored cooked outputs:
+# it overwrites the cooked manifest/assets in generated/.
+# Don't run it after the editor's Play action unless you want
+# the editor's output replaced.
 cook-playtest:
 	cd editor && cargo run --release -p psxed-project --bin cook-playtest -- $(PROJECT)
 
 # Build the editor-playtest example against whatever is in
-# `generated/` right now. Does NOT recook — that's the editor's
+# `generated/level_manifest.cooked.rs` if present, otherwise
+# the tracked placeholder. Does NOT recook — that's the editor's
 # job (or `make cook-playtest` if you want the starter).
 build-editor-playtest:
 	cd engine/examples/editor-playtest && cargo build --release
