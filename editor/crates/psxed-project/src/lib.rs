@@ -4952,7 +4952,7 @@ mod tests {
         let migrated = scene
             .nodes()
             .iter()
-            .find(|node| node.name == "Wraith Hero")
+            .find(|node| node.name == "Crimson Cross Knight Player")
             .expect("starter player entity exists");
         assert!(matches!(&migrated.kind, NodeKind::Entity));
     }

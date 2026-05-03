@@ -125,14 +125,18 @@ pub fn resolve_character_idle_preview_clip_for_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CharacterResource;
 
     #[test]
     fn spawn_character_auto_picks_single_character() {
         let mut project = ProjectDocument::starter();
+        let first_character = project
+            .resources
+            .iter()
+            .find_map(|r| matches!(r.data, ResourceData::Character(_)).then_some(r.id))
+            .expect("starter has a character");
         project
             .resources
-            .retain(|r| matches!(r.data, ResourceData::Character(_)));
+            .retain(|r| matches!(r.data, ResourceData::Character(_)) && r.id == first_character);
         assert_eq!(project.resources.len(), 1);
 
         let resolved = resolve_spawn_character(&project, None).expect("single character resolves");
@@ -142,15 +146,19 @@ mod tests {
 
     #[test]
     fn spawn_character_reports_ambiguity() {
-        let mut project = ProjectDocument::starter();
-        project.add_resource(
-            "Second Character",
-            ResourceData::Character(CharacterResource::defaults()),
-        );
+        let project = ProjectDocument::starter();
+        let character_count = project
+            .resources
+            .iter()
+            .filter(|resource| matches!(resource.data, ResourceData::Character(_)))
+            .count();
+        assert!(character_count > 1);
 
         assert_eq!(
             resolve_spawn_character(&project, None),
-            Err(SpawnCharacterResolutionError::AmbiguousCharacters { count: 2 })
+            Err(SpawnCharacterResolutionError::AmbiguousCharacters {
+                count: character_count
+            })
         );
     }
 }

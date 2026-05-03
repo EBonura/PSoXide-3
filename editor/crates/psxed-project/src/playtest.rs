@@ -1898,6 +1898,32 @@ mod tests {
             .id
     }
 
+    fn player_character_resource_id(project: &ProjectDocument) -> ResourceId {
+        let scene = project.active_scene();
+        scene
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::CharacterController {
+                    player: true,
+                    character: Some(character),
+                } => Some(*character),
+                _ => None,
+            })
+            .expect("starter has an assigned player Character")
+    }
+
+    fn player_model_resource_id(project: &ProjectDocument) -> ResourceId {
+        let character_id = player_character_resource_id(project);
+        project
+            .resource(character_id)
+            .and_then(|resource| match &resource.data {
+                ResourceData::Character(character) => character.model,
+                _ => None,
+            })
+            .expect("starter player Character has a Model")
+    }
+
     fn demote_player_spawns(project: &mut ProjectDocument) {
         let scene = project.active_scene_mut();
         let ids: Vec<NodeId> = scene
@@ -1979,14 +2005,7 @@ mod tests {
     }
 
     fn set_first_model_instance_clip(project: &mut ProjectDocument, clip_index: u16) {
-        let model_id = project
-            .resources
-            .iter()
-            .find_map(|r| match &r.data {
-                ResourceData::Model(_) => Some(r.id),
-                _ => None,
-            })
-            .expect("starter has Model");
+        let model_id = player_model_resource_id(project);
         let scene = project.active_scene_mut();
         let ids: Vec<NodeId> = scene
             .nodes()
@@ -2102,7 +2121,7 @@ mod tests {
         assert_eq!(
             package.characters.len(),
             1,
-            "starter ships exactly one Character (Wraith Hero)"
+            "starter ships exactly one player Character"
         );
         let pc = package
             .player_controller
@@ -2110,18 +2129,19 @@ mod tests {
         assert_eq!(pc.character, 0);
         assert_eq!(pc.spawn, package.spawn.unwrap());
         let character = &package.characters[0];
-        // Wraith model: idle at index 3, walking at index 7.
-        assert_eq!(character.idle_clip, 3);
-        assert_eq!(character.walk_clip, 7);
-        // Run is `running` clip (4); turn is unset.
-        assert_eq!(character.run_clip, 4);
+        // Crimson local clips are agree/run/walk; idle comes
+        // from the shared Wraith idle library clip appended to
+        // the compatible resolved clip list.
+        assert_eq!(character.idle_clip, 6);
+        assert_eq!(character.walk_clip, 2);
+        assert_eq!(character.run_clip, 1);
         assert_eq!(character.turn_clip, CHARACTER_CLIP_NONE);
     }
 
     #[test]
     fn player_character_model_is_deduplicated_with_renderer_component() {
-        // Starter includes both a Wraith ModelRenderer component
-        // and a Wraith-Hero Character resource on the player
+        // Starter includes both a ModelRenderer component and a
+        // Character resource on the player
         // entity. The cooker must register the model once, but
         // must not also emit a static model instance for the
         // player-controlled renderer.
@@ -2144,7 +2164,7 @@ mod tests {
     fn player_character_model_lands_in_room_residency_without_placed_meshinstance() {
         // Simulate a project where the player Character points
         // at a Model that *isn't* also placed as a MeshInstance.
-        // The starter has both, so we delete the placed Wraith
+        // The starter has both, so we delete the placed renderer
         // before cooking and assert residency still picks up the
         // Wraith mesh + atlas + clips via the player path.
         let mut project = project_with_one_room();
@@ -2152,21 +2172,21 @@ mod tests {
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
         let package = package.expect("package returned on ok report");
-        // Only the player path should have registered the Wraith
+        // Only the player path should have registered the model
         // -- there's no MeshInstance left to pull it in.
         assert!(package.model_instances.is_empty());
         assert_eq!(package.models.len(), 1);
         assert_eq!(package.characters.len(), 1);
 
         let manifest = render_manifest_source(&package);
-        // Asset indexes for the Wraith mesh, atlas, and clips
+        // Asset indexes for the player mesh, atlas, and clips
         // come straight from `package.assets` -- every one of
         // them must show up in ROOM_0_REQUIRED_RAM/VRAM.
         let wraith = &package.models[0];
         let mesh_token = format!("AssetId({})", wraith.mesh_asset_index);
         assert!(
             manifest_contains_required(&manifest, "RAM", 0, &mesh_token),
-            "RAM missing wraith mesh: {mesh_token}"
+            "RAM missing player mesh: {mesh_token}"
         );
         let atlas_token = format!(
             "AssetId({})",
@@ -2176,7 +2196,7 @@ mod tests {
         );
         assert!(
             manifest_contains_required(&manifest, "VRAM", 0, &atlas_token),
-            "VRAM missing wraith atlas: {atlas_token}"
+            "VRAM missing player atlas: {atlas_token}"
         );
         let cf = wraith.clip_first as usize;
         let cc = wraith.clip_count as usize;
@@ -2192,8 +2212,8 @@ mod tests {
 
     #[test]
     fn player_character_model_assets_dedupe_with_placed_meshinstance() {
-        // Starter's Wraith is referenced twice: by the placed
-        // MeshInstance *and* by the Character. Each asset still
+        // Starter's player model is referenced twice: by the
+        // placed renderer and by the Character. Each asset still
         // shows up exactly once in the manifest's residency
         // slice -- the player path mustn't double-add.
         let project = project_with_one_room();
@@ -2206,7 +2226,7 @@ mod tests {
         assert_eq!(
             count_required_occurrences(&manifest, "RAM", 0, &mesh_token),
             1,
-            "wraith mesh appears more than once in RAM residency"
+            "player mesh appears more than once in RAM residency"
         );
         let atlas = wraith.texture_asset_index.unwrap();
         let atlas_token = format!("AssetId({atlas})");
@@ -2267,6 +2287,7 @@ mod tests {
         // validation must reject.
         if let Some(resource) = project.resource_mut(character_id) {
             if let crate::ResourceData::Character(c) = &mut resource.data {
+                c.animation_set = None;
                 c.idle_clip = Some(99);
             }
         }
@@ -2277,9 +2298,13 @@ mod tests {
 
     #[test]
     fn player_spawn_without_character_assignment_auto_picks_when_one_exists() {
-        // Starter has exactly one Character. Clear the spawn's
-        // explicit reference; cooker should auto-pick + warn.
+        // Keep exactly one Character. Clear the spawn's explicit
+        // reference; cooker should auto-pick + warn.
         let mut project = project_with_one_room();
+        let player_character = player_character_resource_id(&project);
+        project.resources.retain(|resource| {
+            !matches!(resource.data, ResourceData::Character(_)) || resource.id == player_character
+        });
         let controller_id = player_controller_component_id(&project);
         if let Some(node) = project.active_scene_mut().node_mut(controller_id) {
             if let NodeKind::CharacterController { character, .. } = &mut node.kind {
@@ -2553,7 +2578,7 @@ mod tests {
             .is_file());
         assert!(dir
             .join(MODELS_DIRNAME)
-            .join("model_000_obsidian_wraith")
+            .join("model_000_crimson_cross_knight")
             .join("atlas.psxt")
             .is_file());
 
@@ -2747,12 +2772,16 @@ mod tests {
 
     #[test]
     fn missing_model_mesh_path_fails_with_clear_error() {
-        // Bend the starter's model resource at a bogus mesh
+        // Bend the starter player's model resource at a bogus mesh
         // path; cook should refuse rather than silently
         // emitting a Model record without bytes.
         let mut project = ProjectDocument::starter();
+        let player_model = player_model_resource_id(&project);
         for resource in project.resources.iter_mut() {
-            if let ResourceData::Model(model) = &mut resource.data {
+            if resource.id == player_model {
+                let ResourceData::Model(model) = &mut resource.data else {
+                    continue;
+                };
                 model.model_path = "no/such/model.psxmdl".to_string();
                 break;
             }
@@ -2790,12 +2819,16 @@ mod tests {
 
     #[test]
     fn model_with_no_atlas_fails_when_placed() {
-        // Strip the starter Wraith's texture_path; cook must
+        // Strip the starter player's texture_path; cook must
         // refuse the placed instance instead of silently
         // dropping it at runtime.
         let mut project = ProjectDocument::starter();
+        let player_model = player_model_resource_id(&project);
         for resource in project.resources.iter_mut() {
-            if let ResourceData::Model(model) = &mut resource.data {
+            if resource.id == player_model {
+                let ResourceData::Model(model) = &mut resource.data else {
+                    continue;
+                };
                 model.texture_path = None;
                 break;
             }
@@ -2812,8 +2845,13 @@ mod tests {
     #[test]
     fn model_with_no_clips_fails_when_placed() {
         let mut project = ProjectDocument::starter();
+        let player_model = player_model_resource_id(&project);
         for resource in project.resources.iter_mut() {
-            if let ResourceData::Model(model) = &mut resource.data {
+            if resource.id == player_model {
+                let ResourceData::Model(model) = &mut resource.data else {
+                    continue;
+                };
+                model.skeleton = None;
                 model.clips.clear();
                 model.default_clip = None;
                 model.preview_clip = None;
@@ -3089,12 +3127,16 @@ mod tests {
 
     #[test]
     fn out_of_range_model_default_clip_fails_at_cook() {
-        // Bend the starter Wraith's default_clip past its clip
+        // Bend the starter player's default_clip past its clip
         // count; cook must refuse rather than emit a runtime
         // record that resolves to no animation.
         let mut project = ProjectDocument::starter();
+        let player_model = player_model_resource_id(&project);
         for resource in project.resources.iter_mut() {
-            if let ResourceData::Model(model) = &mut resource.data {
+            if resource.id == player_model {
+                let ResourceData::Model(model) = &mut resource.data else {
+                    continue;
+                };
                 model.default_clip = Some(999);
                 break;
             }
@@ -3114,8 +3156,12 @@ mod tests {
         // clip list should cook fine -- runtime gets clip 0 as
         // the resolved default. No bind-pose sentinel.
         let mut project = ProjectDocument::starter();
+        let player_model = player_model_resource_id(&project);
         for resource in project.resources.iter_mut() {
-            if let ResourceData::Model(model) = &mut resource.data {
+            if resource.id == player_model {
+                let ResourceData::Model(model) = &mut resource.data else {
+                    continue;
+                };
                 model.default_clip = None;
                 break;
             }
@@ -3165,11 +3211,15 @@ mod tests {
 
     #[test]
     fn model_atlas_must_be_8bpp() {
-        // Swap the wraith atlas to a 4bpp room texture path so
+        // Swap the player atlas to a 4bpp room texture path so
         // the cook runs the depth check on a known-bad atlas.
         let mut project = ProjectDocument::starter();
+        let player_model = player_model_resource_id(&project);
         for resource in project.resources.iter_mut() {
-            if let ResourceData::Model(model) = &mut resource.data {
+            if resource.id == player_model {
+                let ResourceData::Model(model) = &mut resource.data else {
+                    continue;
+                };
                 model.texture_path = Some("assets/textures/floor.psxt".to_string());
                 break;
             }
@@ -3186,19 +3236,11 @@ mod tests {
     #[test]
     fn two_instances_of_one_model_dedup_to_one_record() {
         // Add two explicit MeshInstances that reference the same
-        // model resource as the starter's player Wraith. The cook
+        // model resource as the starter's player. The cook
         // emits two `model_instances` but only one `models[]`
         // entry.
         let mut project = ProjectDocument::starter();
-        // Resolve the starter's Wraith resource id.
-        let model_id = project
-            .resources
-            .iter()
-            .find_map(|r| match &r.data {
-                ResourceData::Model(_) => Some(r.id),
-                _ => None,
-            })
-            .expect("starter has Model");
+        let model_id = player_model_resource_id(&project);
         let scene = project.active_scene_mut();
         let room_id = scene
             .nodes()
@@ -3206,7 +3248,7 @@ mod tests {
             .find(|n| matches!(n.kind, NodeKind::Room { .. }))
             .map(|n| n.id)
             .unwrap();
-        for name in ["Wraith2", "Wraith3"] {
+        for name in ["PlayerClone2", "PlayerClone3"] {
             scene.add_node(
                 room_id,
                 name,

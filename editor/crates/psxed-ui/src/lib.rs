@@ -225,6 +225,10 @@ pub struct EditorWorkspace {
     /// re-decoding. Keyed on the *Texture* resource id; Materials
     /// follow `material.texture` to the same key.
     texture_thumbs: HashMap<ResourceId, ThumbnailEntry>,
+    /// Persistent texture used by the Model resource inspector's
+    /// animated preview. Keeping the handle alive across frames
+    /// avoids submitting a texture id that egui has already freed.
+    model_resource_preview_texture: Option<egui::TextureHandle>,
     texture_import_dialog: TextureImportDialog,
     model_import_dialog: ModelImportDialog,
     import_retired_textures: Vec<(u8, egui::TextureHandle)>,
@@ -1456,6 +1460,7 @@ impl EditorWorkspace {
             viewport_3d_free_position: orbit_camera_position_i32(256, 256, 6144, [0, 512, 0]),
             viewport_3d_free_initialized: false,
             texture_thumbs: HashMap::new(),
+            model_resource_preview_texture: None,
             texture_import_dialog: TextureImportDialog::default(),
             model_import_dialog: ModelImportDialog::default(),
             import_retired_textures: Vec::new(),
@@ -4264,12 +4269,29 @@ impl EditorWorkspace {
             ResourceData::Character(character) => {
                 self.push_undo();
                 let player = !self.has_player_source();
+                let idle_clip = character
+                    .model
+                    .and_then(|model_id| {
+                        self.project.resource(model_id).and_then(|resource| {
+                            let ResourceData::Model(model) = &resource.data else {
+                                return None;
+                            };
+                            Some(psxed_project::resolve::resolve_character_idle_preview_clip_for_model(
+                                &self.project,
+                                &character,
+                                model_id,
+                                model,
+                            ))
+                        })
+                    })
+                    .flatten()
+                    .or(character.idle_clip);
                 let node = self.create_character_entity_at_room_hit(
                     room_id,
                     resource_id,
                     &resource.name,
                     character.model,
-                    character.idle_clip,
+                    idle_clip,
                     character.radius,
                     character.height,
                     player,
@@ -6929,6 +6951,7 @@ impl EditorWorkspace {
                     &project_root,
                     preview_thumb,
                     &skeleton_options,
+                    &mut self.model_resource_preview_texture,
                 );
             }
             ResourceData::Skeleton(skeleton) => {
@@ -11012,6 +11035,7 @@ fn draw_model_resource_editor(
     project_root: &Path,
     preview_thumb: Option<(egui::TextureId, PsxtStats)>,
     skeleton_options: &[(ResourceId, String)],
+    preview_texture: &mut Option<egui::TextureHandle>,
 ) -> bool {
     let mut changed = false;
 
@@ -11027,9 +11051,18 @@ fn draw_model_resource_editor(
     // model sizes; a cache can land when authoring scales beyond that.
     let model_path =
         psxed_project::model_import::resolve_path(&model.model_path, Some(project_root));
-    let model_stats = std::fs::read(&model_path)
-        .ok()
-        .and_then(|b| psxed_project::model_import::model_stats_from_bytes(&b).ok());
+    let model_bytes = std::fs::read(&model_path).ok();
+    let model_stats = model_bytes
+        .as_deref()
+        .and_then(|b| psxed_project::model_import::model_stats_from_bytes(b).ok());
+
+    draw_model_resource_preview_panel(
+        ui,
+        model,
+        project_root,
+        model_bytes.as_deref(),
+        preview_texture,
+    );
 
     egui::CollapsingHeader::new(icons::label(icons::FOLDER, "Bundle helpers"))
         .default_open(false)
@@ -11348,6 +11381,173 @@ fn register_bundle_into_model(
     model.skeleton = None;
     *target = model;
     Ok(clip_count)
+}
+
+fn draw_model_resource_preview_panel(
+    ui: &mut egui::Ui,
+    model: &psxed_project::ModelResource,
+    project_root: &Path,
+    model_bytes: Option<&[u8]>,
+    preview_texture: &mut Option<egui::TextureHandle>,
+) {
+    egui::CollapsingHeader::new(icons::label(icons::EYE, "Animated Preview"))
+        .default_open(true)
+        .show(ui, |ui| {
+            let Some(model_bytes) = model_bytes else {
+                ui.colored_label(Color32::from_rgb(220, 120, 100), "Model file is missing.");
+                return;
+            };
+
+            let Some(clip_index) = model.effective_preview_clip() else {
+                draw_model_wireframe_preview(ui, model_bytes);
+                return;
+            };
+            let Some(clip) = model.clips.get(clip_index as usize) else {
+                ui.colored_label(
+                    Color32::from_rgb(220, 160, 80),
+                    format!("Preview clip {clip_index} is out of range."),
+                );
+                draw_model_wireframe_preview(ui, model_bytes);
+                return;
+            };
+            let clip_path =
+                psxed_project::model_import::resolve_path(&clip.psxanim_path, Some(project_root));
+            let Ok(clip_bytes) = std::fs::read(&clip_path) else {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    format!("Animation file is missing: {}", clip_path.display()),
+                );
+                draw_model_wireframe_preview(ui, model_bytes);
+                return;
+            };
+
+            let Some(atlas_path) = model.texture_path.as_ref() else {
+                draw_model_wireframe_preview(ui, model_bytes);
+                return;
+            };
+            let atlas_path =
+                psxed_project::model_import::resolve_path(atlas_path, Some(project_root));
+            let atlas_image = std::fs::read(&atlas_path)
+                .ok()
+                .and_then(|bytes| decode_psxt_thumbnail(&bytes).map(|(image, _)| image));
+            let Some(atlas_image) = atlas_image else {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    format!("Atlas preview failed: {}", atlas_path.display()),
+                );
+                draw_model_wireframe_preview(ui, model_bytes);
+                return;
+            };
+
+            let yaw_id = ui.id().with("model-resource-preview-yaw");
+            let pitch_id = ui.id().with("model-resource-preview-pitch");
+            let radius_id = ui.id().with("model-resource-preview-radius");
+            let mut yaw: i32 = ui
+                .memory_mut(|m| m.data.get_persisted::<i32>(yaw_id))
+                .unwrap_or(340);
+            let mut pitch: i32 = ui
+                .memory_mut(|m| m.data.get_persisted::<i32>(pitch_id))
+                .unwrap_or(350);
+            let mut radius: i32 = ui
+                .memory_mut(|m| m.data.get_persisted::<i32>(radius_id))
+                .unwrap_or((model.world_height as i32).saturating_mul(3) / 2);
+
+            let width = ui.available_width().clamp(300.0, 640.0);
+            let height = width
+                * (model_import_preview::PREVIEW_HEIGHT as f32
+                    / model_import_preview::PREVIEW_WIDTH as f32);
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::drag());
+            if response.dragged() {
+                let delta = ui.input(|i| i.pointer.delta());
+                yaw = (yaw + (delta.x * 6.0) as i32).rem_euclid(4096);
+                pitch = (pitch + (delta.y * 4.0) as i32).clamp(64, 960);
+            }
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+
+            let image = model_import_preview::render_import_model_preview_with_options(
+                model_bytes,
+                &clip_bytes,
+                &atlas_image,
+                model_import_preview::ImportPreviewOptions {
+                    world_height: model.world_height as i32,
+                    time_seconds: ui.input(|i| i.time),
+                    yaw_q12: yaw.rem_euclid(4096) as u16,
+                    pitch_q12: pitch.rem_euclid(4096) as u16,
+                    radius,
+                    show_animation_root: false,
+                },
+            );
+
+            ui.memory_mut(|m| {
+                m.data.insert_persisted(yaw_id, yaw);
+                m.data.insert_persisted(pitch_id, pitch);
+                m.data.insert_persisted(radius_id, radius);
+            });
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
+
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 4.0, STUDIO_PANEL);
+            match image {
+                Some(image) => {
+                    let texture_id = match preview_texture {
+                        Some(handle) => {
+                            handle.set(image, egui::TextureOptions::NEAREST);
+                            handle.id()
+                        }
+                        None => {
+                            let handle = ui.ctx().load_texture(
+                                "model-resource-animated-preview",
+                                image,
+                                egui::TextureOptions::NEAREST,
+                            );
+                            let id = handle.id();
+                            *preview_texture = Some(handle);
+                            id
+                        }
+                    };
+                    painter.image(
+                        texture_id,
+                        rect,
+                        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+                None => {
+                    painter.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "preview failed",
+                        FontId::proportional(12.0),
+                        Color32::from_rgb(220, 120, 100),
+                    );
+                }
+            }
+            painter.rect_stroke(
+                rect,
+                4.0,
+                Stroke::new(1.0, STUDIO_BORDER),
+                StrokeKind::Inside,
+            );
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Clip: {}", clip.name)).color(STUDIO_TEXT_WEAK));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Radius").color(STUDIO_TEXT_WEAK));
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut radius)
+                            .speed(16.0)
+                            .range(256..=8192),
+                    )
+                    .changed()
+                {
+                    ui.memory_mut(|m| m.data.insert_persisted(radius_id, radius));
+                }
+            });
+        });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11891,11 +12091,35 @@ fn animation_resource_picker(
             });
     });
     if let Some(id) = *current {
-        if !options.iter().any(|option| option.id == id) {
-            ui.colored_label(
-                Color32::from_rgb(220, 120, 100),
-                "Animation clip resource is missing.",
-            );
+        match options.iter().find(|option| option.id == id) {
+            None => {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Animation clip resource is missing.",
+                );
+            }
+            Some(option) if !animation_option_matches_skeleton(option, skeleton) => {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Animation clip targets a different skeleton.",
+                );
+            }
+            Some(option)
+                if role_hint.is_some_and(|role| {
+                    option.role != role
+                        && !matches!(option.role, psxed_project::AnimationRole::Generic)
+                }) =>
+            {
+                ui.colored_label(
+                    Color32::from_rgb(220, 160, 80),
+                    format!(
+                        "Clip role is {}; expected {}.",
+                        option.role.label(),
+                        role_hint.unwrap().label()
+                    ),
+                );
+            }
+            Some(_) => {}
         }
     }
     changed
@@ -12009,15 +12233,66 @@ fn material_texture_picker(
 struct CharacterEditorContext {
     /// `(model id, model display name, clip names in order)`.
     models: Vec<(ResourceId, String, Vec<String>)>,
-    /// `(animation set id, display name, skeleton id)`.
-    animation_sets: Vec<(ResourceId, String, Option<ResourceId>)>,
+    /// `(model id, skeleton id)`.
+    model_skeletons: Vec<(ResourceId, Option<ResourceId>)>,
+    animation_sets: Vec<AnimationSetOption>,
+    animation_clips: Vec<(ResourceId, String)>,
 }
 
 fn build_character_editor_context(project: &ProjectDocument) -> CharacterEditorContext {
     CharacterEditorContext {
         models: collect_model_options(project),
+        model_skeletons: project
+            .resources
+            .iter()
+            .filter_map(|resource| match &resource.data {
+                ResourceData::Model(model) => Some((resource.id, model.skeleton)),
+                _ => None,
+            })
+            .collect(),
         animation_sets: collect_animation_set_options(project),
+        animation_clips: project
+            .resources
+            .iter()
+            .filter_map(|resource| match &resource.data {
+                ResourceData::AnimationClip(_) => Some((resource.id, resource.name.clone())),
+                _ => None,
+            })
+            .collect(),
     }
+}
+
+impl CharacterEditorContext {
+    fn model_skeleton(&self, model: Option<ResourceId>) -> Option<ResourceId> {
+        let model = model?;
+        self.model_skeletons
+            .iter()
+            .find_map(|(id, skeleton)| (*id == model).then_some(*skeleton))
+            .flatten()
+    }
+
+    fn animation_set(&self, set: Option<ResourceId>) -> Option<&AnimationSetOption> {
+        let set = set?;
+        self.animation_sets.iter().find(|option| option.id == set)
+    }
+
+    fn animation_clip_name(&self, clip: ResourceId) -> &str {
+        self.animation_clips
+            .iter()
+            .find_map(|(id, name)| (*id == clip).then_some(name.as_str()))
+            .unwrap_or("(missing)")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AnimationSetOption {
+    id: ResourceId,
+    name: String,
+    skeleton: Option<ResourceId>,
+    idle_clip: Option<ResourceId>,
+    walk_clip: Option<ResourceId>,
+    run_clip: Option<ResourceId>,
+    turn_clip: Option<ResourceId>,
 }
 
 /// Inspector body for `ResourceData::Character` profiles. Combines a
@@ -12039,6 +12314,8 @@ fn draw_character_resource_editor(
     let bound = character
         .model
         .and_then(|id| ctx.models.iter().find(|(mid, _, _)| *mid == id));
+    let bound_skeleton = ctx.model_skeleton(character.model);
+    let selected_set = ctx.animation_set(character.animation_set);
 
     egui::CollapsingHeader::new(icons::label(icons::BOX, "Model"))
         .default_open(true)
@@ -12080,9 +12357,31 @@ fn draw_character_resource_editor(
                 &mut character.animation_set,
                 &ctx.animation_sets
                     .iter()
-                    .map(|(id, name, _)| (*id, name.clone()))
+                    .filter(|set| {
+                        bound_skeleton.is_none()
+                            || set.skeleton.is_none()
+                            || set.skeleton == bound_skeleton
+                    })
+                    .map(|set| (set.id, set.name.clone()))
                     .collect::<Vec<_>>(),
             );
+            if character.animation_set.is_some() && selected_set.is_none() {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    "Animation Set resource is missing.",
+                );
+            }
+            if let Some(set) = selected_set {
+                if bound_skeleton.is_some()
+                    && set.skeleton.is_some()
+                    && set.skeleton != bound_skeleton
+                {
+                    ui.colored_label(
+                        Color32::from_rgb(220, 120, 100),
+                        "Animation Set targets a different skeleton than the selected Model.",
+                    );
+                }
+            }
         });
 
     egui::CollapsingHeader::new(icons::label(icons::PALETTE, "Animation roles"))
@@ -12108,6 +12407,8 @@ fn draw_character_resource_editor(
             changed |= clip_role_picker(ui, "Walk", "character-clip-walk", &mut character.walk_clip, clips);
             changed |= clip_role_picker(ui, "Run", "character-clip-run", &mut character.run_clip, clips);
             changed |= clip_role_picker(ui, "Turn", "character-clip-turn", &mut character.turn_clip, clips);
+
+            draw_character_effective_roles(ui, character, selected_set, clips, ctx);
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -12165,13 +12466,15 @@ fn draw_character_resource_editor(
             {
                 ui.colored_label(Color32::from_rgb(220, 160, 80), warning);
             }
-            if character.model.is_some() && character.idle_clip.is_none() {
+            let has_set_idle = selected_set.and_then(|set| set.idle_clip).is_some();
+            let has_set_walk = selected_set.and_then(|set| set.walk_clip).is_some();
+            if character.model.is_some() && character.idle_clip.is_none() && !has_set_idle {
                 ui.colored_label(
                     Color32::from_rgb(220, 120, 100),
                     "Idle clip is required for the player character.",
                 );
             }
-            if character.model.is_some() && character.walk_clip.is_none() {
+            if character.model.is_some() && character.walk_clip.is_none() && !has_set_walk {
                 ui.colored_label(
                     Color32::from_rgb(220, 120, 100),
                     "Walk clip is required for the player character.",
@@ -12215,6 +12518,72 @@ fn draw_character_resource_editor(
         });
 
     changed
+}
+
+fn draw_character_effective_roles(
+    ui: &mut egui::Ui,
+    character: &psxed_project::CharacterResource,
+    set: Option<&AnimationSetOption>,
+    model_clips: &[String],
+    ctx: &CharacterEditorContext,
+) {
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Effective roles")
+            .color(STUDIO_TEXT_WEAK)
+            .small(),
+    );
+    egui::Grid::new("character-effective-roles")
+        .num_columns(3)
+        .spacing([8.0, 3.0])
+        .show(ui, |ui| {
+            for (label, set_clip, legacy_clip, required) in [
+                (
+                    "Idle",
+                    set.and_then(|set| set.idle_clip),
+                    character.idle_clip,
+                    true,
+                ),
+                (
+                    "Walk",
+                    set.and_then(|set| set.walk_clip),
+                    character.walk_clip,
+                    true,
+                ),
+                (
+                    "Run",
+                    set.and_then(|set| set.run_clip),
+                    character.run_clip,
+                    false,
+                ),
+                (
+                    "Turn",
+                    set.and_then(|set| set.turn_clip),
+                    character.turn_clip,
+                    false,
+                ),
+            ] {
+                ui.label(label);
+                if let Some(clip) = set_clip {
+                    ui.label(ctx.animation_clip_name(clip));
+                    ui.label(RichText::new("set").color(STUDIO_TEXT_WEAK).small());
+                } else if let Some(index) = legacy_clip {
+                    let name = model_clips
+                        .get(index as usize)
+                        .map(String::as_str)
+                        .unwrap_or("(missing)");
+                    ui.label(format!("{index}: {name}"));
+                    ui.label(RichText::new("fallback").color(STUDIO_TEXT_WEAK).small());
+                } else if required {
+                    ui.colored_label(Color32::from_rgb(220, 120, 100), "missing");
+                    ui.label("");
+                } else {
+                    ui.label(RichText::new("(none)").color(STUDIO_TEXT_WEAK));
+                    ui.label("");
+                }
+                ui.end_row();
+            }
+        });
 }
 
 /// Helper: clip dropdown for one animation role. Renders the
@@ -16760,16 +17129,20 @@ fn collect_animation_clip_options(project: &ProjectDocument) -> Vec<AnimationCli
         .collect()
 }
 
-fn collect_animation_set_options(
-    project: &ProjectDocument,
-) -> Vec<(ResourceId, String, Option<ResourceId>)> {
+fn collect_animation_set_options(project: &ProjectDocument) -> Vec<AnimationSetOption> {
     project
         .resources
         .iter()
         .filter_map(|resource| match &resource.data {
-            ResourceData::AnimationSet(set) => {
-                Some((resource.id, resource.name.clone(), set.skeleton))
-            }
+            ResourceData::AnimationSet(set) => Some(AnimationSetOption {
+                id: resource.id,
+                name: resource.name.clone(),
+                skeleton: set.skeleton,
+                idle_clip: set.idle_clip,
+                walk_clip: set.walk_clip,
+                run_clip: set.run_clip,
+                turn_clip: set.turn_clip,
+            }),
             _ => None,
         })
         .collect()
