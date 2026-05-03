@@ -18,22 +18,13 @@
 //! `0x1000` (= 1.0 in 1.3.12) for most frames' rotation matrix
 //! top-left element.
 
-use emulator_core::{Bus, Cpu};
-use psx_iso::Exe;
+use emulator_core::Cpu;
+
+#[path = "support/frame_probe.rs"]
+mod frame_probe;
 
 fn main() {
-    let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("bios");
-    let exe_bytes = std::fs::read(
-        "/Users/ebonura/Desktop/repos/psoxide/build/examples/mipsel-sony-psx/release/hello-gte.exe",
-    )
-    .expect("hello-gte");
-    let exe = Exe::parse(&exe_bytes).expect("parse");
-    let mut bus = Bus::new(bios).expect("bus");
-    bus.load_exe_payload(exe.load_addr, &exe.payload);
-    bus.enable_hle_bios();
-    bus.attach_digital_pad_port1();
-    let mut cpu = Cpu::new();
-    cpu.seed_from_exe(exe.initial_pc, exe.initial_gp, exe.initial_sp());
+    let mut probe = frame_probe::SideLoadedExe::example("hello-gte", true);
 
     // Step manually; before each instruction, peek the instruction
     // word. If it's COP2 (primary opcode 0x12 = top 6 bits = 0b010010),
@@ -44,28 +35,27 @@ fn main() {
     let mut cycles_at_last_pump = 0u64;
 
     for _ in 0..max_steps {
-        let pc = cpu.pc();
-        let instr = bus.peek_instruction(pc).unwrap_or(0);
+        let pc = probe.cpu.pc();
+        let instr = probe.bus.peek_instruction(pc).unwrap_or(0);
         let primary = (instr >> 26) & 0x3F;
         if primary == 0x12 {
             cop2_count += 1;
             if cop2_count <= stop_at_nth {
-                log_cop2(pc, instr, &cpu);
+                log_cop2(pc, instr, &probe.cpu);
             }
             if cop2_count == stop_at_nth {
                 eprintln!("--- reached {stop_at_nth} COP2 ops, stopping trace ---");
                 stop_at_nth = u64::MAX; // silence further logs
             }
         }
-        if cpu.step(&mut bus).is_err() {
+        if !frame_probe::step_cpu_and_pump_spu(
+            &mut probe.cpu,
+            &mut probe.bus,
+            &mut cycles_at_last_pump,
+        ) {
             break;
         }
-        if bus.cycles() - cycles_at_last_pump > 560_000 {
-            cycles_at_last_pump = bus.cycles();
-            bus.run_spu_samples(735);
-            let _ = bus.spu.drain_audio();
-        }
-        if bus.irq().raise_counts()[0] >= 2 {
+        if probe.bus.irq().raise_counts()[0] >= 2 {
             break;
         }
     }

@@ -10,9 +10,10 @@
 use emulator_core::{gpu::GpuCmdLogEntry, Bus, ButtonState, Cpu};
 use psx_iso::Exe;
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::Path;
 use std::time::Instant;
+
+#[path = "support/frame_probe.rs"]
+mod frame_probe;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -41,13 +42,8 @@ fn main() {
         .is_some_and(|text| text != "0");
     let mut pc_hist: HashMap<u32, u64> = HashMap::new();
     let mut pc_hist_samples = 0u64;
-    let bios = std::fs::read("/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN").expect("bios");
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .expect("repo root");
-    let exe_path = repo_root
+    let bios = frame_probe::read_bios();
+    let exe_path = frame_probe::repo_root()
         .join("build/examples/mipsel-sony-psx/release")
         .join(format!("{name}.exe"));
     let exe_bytes = std::fs::read(&exe_path).expect("exe");
@@ -84,13 +80,8 @@ fn main() {
                 *pc_hist.entry(cpu.pc()).or_insert(0) += 1;
                 pc_hist_samples = pc_hist_samples.saturating_add(1);
             }
-            if cpu.step(&mut bus).is_err() {
+            if !frame_probe::step_cpu_and_pump_spu(&mut cpu, &mut bus, &mut cycles_at_last_pump) {
                 break;
-            }
-            if bus.cycles() - cycles_at_last_pump > 560_000 {
-                cycles_at_last_pump = bus.cycles();
-                bus.run_spu_samples(735);
-                let _ = bus.spu.drain_audio();
             }
         }
         let host_ms = host_start.elapsed().as_secs_f64() * 1000.0;
@@ -119,7 +110,9 @@ fn main() {
                 .saturating_sub(gte_before.estimated_cycles),
             cpu.pc(),
         );
-        dump_ppm(&bus, &name, target);
+        frame_probe::dump_display_ppm(&bus, &name, target)
+            .expect("dump frame")
+            .log(target);
     }
 
     if pc_hist_enabled {
@@ -207,27 +200,6 @@ fn gpu_log_counters(log: &[GpuCmdLogEntry]) -> (usize, usize, usize, usize) {
         }
     }
     (log.len(), words, draw_cmds, image_cmds)
-}
-
-fn dump_ppm(bus: &Bus, name: &str, target: u64) {
-    let da = bus.gpu.display_area();
-    let path = format!("/tmp/{name}-f{:03}.ppm", target);
-    let mut f = std::fs::File::create(&path).unwrap();
-    writeln!(f, "P6\n{} {}\n255", da.width, da.height).unwrap();
-    let mut buf = Vec::with_capacity((da.width as usize) * (da.height as usize) * 3);
-    for dy in 0..da.height {
-        for dx in 0..da.width {
-            let pix = bus.gpu.vram.get_pixel(da.x + dx, da.y + dy);
-            let r5 = (pix & 0x1F) as u8;
-            let g5 = ((pix >> 5) & 0x1F) as u8;
-            let b5 = ((pix >> 10) & 0x1F) as u8;
-            buf.push((r5 << 3) | (r5 >> 2));
-            buf.push((g5 << 3) | (g5 >> 2));
-            buf.push((b5 << 3) | (b5 >> 2));
-        }
-    }
-    f.write_all(&buf).unwrap();
-    eprintln!("wrote {path}");
 }
 
 fn parse_targets(text: &str) -> Vec<u64> {
