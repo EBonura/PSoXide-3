@@ -103,6 +103,33 @@ flat-line raster tie-breaks, so the next parity investigation should
 split its remaining gap between COP2 projection state and GP0 line edge
 cases.
 
+## Commercial disc smoke
+
+The bounded commercial-disc smoke test is ignored and requires a local
+disc path. PSoXide does not vendor or name copyrighted disc assets.
+
+```bash
+export PSOXIDE_DISC=/absolute/path/to/game.cue
+export PSOXIDE_BIOS=/absolute/path/to/SCPH1001.BIN
+make oracle-disc-smoke
+```
+
+`PSOXIDE_DISC` may point at a `.cue` or raw `.bin`; the local emulator
+uses the same CUE/BIN loader path as the interactive
+`disc_vram_parity` example. Redux uses the configured
+`PSOXIDE_REDUX_BIN` discovery rules documented above.
+
+The default checkpoint is intentionally conservative:
+
+```bash
+export PSOXIDE_ORACLE_DISC_STEPS=1000000
+```
+
+The test skips cleanly when `PSOXIDE_DISC`, the disc file, the BIOS, or
+the patched Redux binary is missing. When all inputs are present, it
+boots BIOS plus disc in both emulators, advances to the checkpoint, and
+requires the visible display dimensions and hash to match Redux.
+
 ## Managing Redux changes
 
 Keep Redux changes in the Redux fork/branch. Keep PSoXide changes in
