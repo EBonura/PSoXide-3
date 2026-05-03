@@ -10,7 +10,7 @@ mod play_mode;
 mod style;
 
 pub use play_mode::{
-    EditorPlaytestRequest, EditorPlaytestStatus, EditorViewport3dMode,
+    EditorPlaytestMetrics, EditorPlaytestRequest, EditorPlaytestStatus, EditorViewport3dMode,
     EditorViewport3dPresentation, EditorViewportOverlayLine,
 };
 
@@ -46,6 +46,31 @@ const EDITOR_OUTLINE_ACCENT: Color32 = Color32::from_rgb(165, 238, 255);
 const EDITOR_OUTLINE_GOLD: Color32 = Color32::from_rgb(255, 238, 150);
 const EGUI_TEXTURE_RETIRE_FRAMES: u8 = 2;
 const VIEWPORT_PREVIEW_ASPECT: f32 = 320.0 / 240.0;
+const STARTER_CHARACTER_ASSET_DIRS: &[&str] = &[
+    "assets/models/obsidian_wraith",
+    "assets/models/crimson_cross_knight",
+    "assets/models/hooded_wretch",
+    "assets/models/obsidian_warden",
+];
+const STARTER_CHARACTER_MODEL_NAMES: &[&str] = &[
+    "Obsidian Wraith",
+    "Crimson Cross Knight",
+    "Hooded Wretch",
+    "Obsidian Warden",
+];
+const STARTER_ANIMATION_SET_NAMES: &[&str] = &[
+    "Obsidian Wraith Enemy Set",
+    "Crimson Cross Knight Player Set",
+    "Hooded Wretch Enemy Set",
+    "Obsidian Warden Enemy Set",
+];
+const STARTER_CHARACTER_PROFILE_NAMES: &[&str] = &[
+    "Crimson Cross Knight Player",
+    "Obsidian Wraith Enemy",
+    "Hooded Wretch Enemy",
+    "Obsidian Warden Enemy",
+];
+const LEGACY_WRAITH_HERO_PROFILE_NAME: &str = "Wraith Hero";
 
 /// Discrete action a scene-tree row can produce in one frame.
 ///
@@ -1247,6 +1272,10 @@ enum PlaceKind {
     /// resource if set, auto-picks the only Model resource if exactly
     /// one exists, or refuses with an actionable error otherwise.
     ModelInstance,
+    /// Character entity: `Entity + ModelRenderer + Animator +
+    /// CharacterController + Collider` referencing a
+    /// [`ResourceData::Character`] profile.
+    Character,
     /// `PointLight` with default color / intensity / radius.
     PointLightMarker,
 }
@@ -1257,6 +1286,7 @@ impl PlaceKind {
             Self::PlayerSpawn => "Player Spawn",
             Self::SpawnMarker => "Spawn",
             Self::ModelInstance => "Prop",
+            Self::Character => "Character",
             Self::PointLightMarker => "Point Light",
         }
     }
@@ -1377,11 +1407,11 @@ impl EditorWorkspace {
     /// starter (which masked the path-resolution bug previously).
     pub fn open_directory(dir: impl Into<PathBuf>) -> Result<Self, String> {
         let dir = dir.into();
-        let project_file = dir.join("project.ron");
-        let project = ProjectDocument::load_from_path(&project_file)
-            .map_err(|error| format!("load {}: {error}", project_file.display()))?;
+        let (project, sync_status, dirty) = load_project_with_starter_catalogue(&dir)?;
         let mut workspace = Self::with_project(dir, project);
-        workspace.status = format!("Loaded {}", short_path(&workspace.project_dir));
+        workspace.dirty = dirty;
+        workspace.status =
+            sync_status.unwrap_or_else(|| format!("Loaded {}", short_path(&workspace.project_dir)));
         workspace.select_first_room();
         Ok(workspace)
     }
@@ -1560,9 +1590,8 @@ impl EditorWorkspace {
     /// rather than failing -- the user can still keep editing the
     /// in-memory state.
     pub fn reload(&mut self) {
-        let path = self.project_dir.join("project.ron");
-        match ProjectDocument::load_from_path(&path) {
-            Ok(project) => {
+        match load_project_with_starter_catalogue(&self.project_dir) {
+            Ok((project, sync_status, dirty)) => {
                 self.saved_project_name = project.name.clone();
                 self.project = project;
                 self.selected_node = NodeId::ROOT;
@@ -1574,8 +1603,9 @@ impl EditorWorkspace {
                 self.clear_sector_selection();
                 self.resource_renaming = None;
                 self.resource_delete_confirm = None;
-                self.dirty = false;
-                self.status = format!("Reloaded {}", short_path(&self.project_dir));
+                self.dirty = dirty;
+                self.status = sync_status
+                    .unwrap_or_else(|| format!("Reloaded {}", short_path(&self.project_dir)));
                 self.select_first_room();
             }
             Err(error) => {
@@ -3429,27 +3459,74 @@ impl EditorWorkspace {
                 STUDIO_TEXT,
             );
         }
-        let stable_dt = ui.ctx().input(|input| input.stable_dt).max(1.0 / 240.0);
-        let fps = (1.0 / stable_dt).round() as u32;
         let debug_rect = Rect::from_min_size(
             rect.left_top() + Vec2::new(8.0, 8.0),
-            Vec2::new(118.0, 44.0),
+            Vec2::new(168.0, 106.0),
         );
         painter.rect_filled(debug_rect, 4.0, Color32::from_black_alpha(164));
-        painter.text(
-            debug_rect.left_top() + Vec2::new(8.0, 7.0),
-            Align2::LEFT_TOP,
-            format!("FPS {fps}"),
-            FontId::monospace(13.0),
+        let mut y = debug_rect.top() + 7.0;
+        draw_play_metric_line(
+            &painter,
+            debug_rect.left() + 8.0,
+            &mut y,
+            "Play profiler",
             STUDIO_TEXT,
         );
-        painter.text(
-            debug_rect.left_top() + Vec2::new(8.0, 24.0),
-            Align2::LEFT_TOP,
-            "Play debug",
-            FontId::monospace(11.0),
-            STUDIO_TEXT_WEAK,
-        );
+        if let Some(metrics) = viewport_3d.play_metrics {
+            draw_play_metric_line(
+                &painter,
+                debug_rect.left() + 8.0,
+                &mut y,
+                &format!("EMU  {:>5.1} Hz", metrics.emu_hz),
+                STUDIO_TEXT,
+            );
+            draw_play_metric_line(
+                &painter,
+                debug_rect.left() + 8.0,
+                &mut y,
+                &format!("DRAW {:>5.1} Hz", metrics.draw_hz),
+                STUDIO_TEXT,
+            );
+            draw_play_metric_line(
+                &painter,
+                debug_rect.left() + 8.0,
+                &mut y,
+                &format!("HOST {:>5.1} fps", metrics.host_fps),
+                STUDIO_TEXT_WEAK,
+            );
+            draw_play_metric_line(
+                &painter,
+                debug_rect.left() + 8.0,
+                &mut y,
+                &format!("FRAME {:>5.2} ms", metrics.total_ms),
+                STUDIO_TEXT_WEAK,
+            );
+            draw_play_metric_line(
+                &painter,
+                debug_rect.left() + 8.0,
+                &mut y,
+                &format!(
+                    "EMU/HW/UI {:>4.1}/{:>4.1}/{:>4.1}",
+                    metrics.emu_ms, metrics.hw_ms, metrics.ui_ms
+                ),
+                STUDIO_TEXT_WEAK,
+            );
+            draw_play_metric_line(
+                &painter,
+                debug_rect.left() + 8.0,
+                &mut y,
+                &format!("STEP {:>5.1}%", metrics.step_budget_percent),
+                STUDIO_TEXT_WEAK,
+            );
+        } else {
+            draw_play_metric_line(
+                &painter,
+                debug_rect.left() + 8.0,
+                &mut y,
+                "collecting...",
+                STUDIO_TEXT_WEAK,
+            );
+        }
     }
 
     /// Snapshot of the 3D camera the frontend needs to drive the
@@ -4270,23 +4347,7 @@ impl EditorWorkspace {
             ResourceData::Character(character) => {
                 self.push_undo();
                 let player = !self.has_player_source();
-                let idle_clip = character
-                    .model
-                    .and_then(|model_id| {
-                        self.project.resource(model_id).and_then(|resource| {
-                            let ResourceData::Model(model) = &resource.data else {
-                                return None;
-                            };
-                            Some(psxed_project::resolve::resolve_character_idle_preview_clip_for_model(
-                                &self.project,
-                                &character,
-                                model_id,
-                                model,
-                            ))
-                        })
-                    })
-                    .flatten()
-                    .or(character.idle_clip);
+                let idle_clip = self.resolve_character_idle_preview_clip(&character);
                 let node = self.create_character_entity_at_room_hit(
                     room_id,
                     resource_id,
@@ -4481,6 +4542,28 @@ impl EditorWorkspace {
             },
         );
         entity
+    }
+
+    fn resolve_character_idle_preview_clip(
+        &self,
+        character: &psxed_project::CharacterResource,
+    ) -> Option<u16> {
+        character
+            .model
+            .and_then(|model_id| {
+                self.project.resource(model_id).and_then(|resource| {
+                    let ResourceData::Model(model) = &resource.data else {
+                        return None;
+                    };
+                    psxed_project::resolve::resolve_character_idle_preview_clip_for_model(
+                        &self.project,
+                        character,
+                        model_id,
+                        model,
+                    )
+                })
+            })
+            .or(character.idle_clip)
     }
 
     /// Build the dedupe key for the next paint dispatch. PaintWall
@@ -4702,6 +4785,37 @@ impl EditorWorkspace {
                         }
                     }
                 }
+                PlaceKind::Character => match self.resolve_place_character_resource() {
+                    Ok((character_id, name, character)) => {
+                        let player = !self.has_player_source();
+                        let idle_clip = self.resolve_character_idle_preview_clip(&character);
+                        let id = self.create_character_entity_at_room_hit(
+                            room_id,
+                            character_id,
+                            &name,
+                            character.model,
+                            idle_clip,
+                            character.radius,
+                            character.height,
+                            player,
+                            hit_world,
+                        );
+                        self.replace_node_selection(id);
+                        self.clear_resource_selection_state();
+                        self.clear_primitive_selection_state();
+                        self.status = if player {
+                            format!("Placed Player Character at {sx},{sz}")
+                        } else {
+                            format!("Placed Character at {sx},{sz}")
+                        };
+                        self.mark_dirty();
+                        return;
+                    }
+                    Err(message) => {
+                        self.status = message;
+                        return;
+                    }
+                },
                 PlaceKind::PointLightMarker => (
                     "Point Light".to_string(),
                     NodeKind::PointLight {
@@ -7125,6 +7239,29 @@ impl EditorWorkspace {
             }
         }
         if ui
+            .button(icons::label(icons::MAP_PIN, "Starter Characters"))
+            .on_hover_text(
+                "Sync the built-in player/enemy models, animation sets, and character profiles into this project.",
+            )
+            .clicked()
+        {
+            self.push_undo();
+            match sync_starter_character_catalogue(&mut self.project, &self.project_dir) {
+                Ok(report) => {
+                    self.status = format!(
+                        "Synced starter characters: {} added, {} updated, {} file(s) copied",
+                        report.resources_added, report.resources_updated, report.files_copied
+                    );
+                    if report.changed() {
+                        self.mark_dirty();
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("Starter character sync failed: {error}");
+                }
+            }
+        }
+        if ui
             .button(icons::label(icons::FILE_PLUS, "Import Model"))
             .on_hover_text(
                 "Open the GLB/glTF model import preview with atlas, clip, and root-centering controls.",
@@ -7766,10 +7903,64 @@ impl EditorWorkspace {
             PlaceKind::PlayerSpawn,
             PlaceKind::SpawnMarker,
             PlaceKind::ModelInstance,
+            PlaceKind::Character,
             PlaceKind::PointLightMarker,
         ] {
             ui.selectable_value(&mut self.place_kind, kind, kind.label());
         }
+        match self.place_kind {
+            PlaceKind::ModelInstance => {
+                self.draw_place_resource_picker(ui, ResourceFilter::Model, "Model")
+            }
+            PlaceKind::Character => {
+                self.draw_place_resource_picker(ui, ResourceFilter::Character, "Profile")
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_place_resource_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        filter: ResourceFilter,
+        label: &str,
+    ) {
+        let options: Vec<(ResourceId, String)> = self
+            .project
+            .resources
+            .iter()
+            .filter(|resource| filter.matches(&resource.data))
+            .map(|resource| (resource.id, resource.name.clone()))
+            .collect();
+        let selected = self
+            .selected_resource
+            .and_then(|id| {
+                options
+                    .iter()
+                    .find(|(candidate, _)| *candidate == id)
+                    .map(|(_, name)| name.clone())
+            })
+            .unwrap_or_else(|| {
+                if options.len() == 1 {
+                    options[0].1.clone()
+                } else {
+                    format!("Select {label}")
+                }
+            });
+
+        ui.label(icons::label(filter.icon(), label));
+        egui::ComboBox::from_id_salt(("place-resource-picker", filter.label()))
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                for (id, name) in options {
+                    if ui
+                        .selectable_label(self.selected_resource == Some(id), name)
+                        .clicked()
+                    {
+                        self.replace_resource_selection(id);
+                    }
+                }
+            });
     }
 
     /// Pick the Model resource a `PlaceKind::ModelInstance` prop click
@@ -7799,6 +7990,37 @@ impl EditorWorkspace {
             1 => Ok((models[0].id, models[0].name.clone())),
             n => Err(format!(
                 "Select a Model resource before placing a prop ({n} available)"
+            )),
+        }
+    }
+
+    fn resolve_place_character_resource(
+        &self,
+    ) -> Result<(ResourceId, String, psxed_project::CharacterResource), String> {
+        if let Some(id) = self.selected_resource {
+            if let Some(resource) = self.project.resource(id) {
+                if let ResourceData::Character(character) = &resource.data {
+                    return Ok((id, resource.name.clone(), character.clone()));
+                }
+            }
+        }
+
+        let characters: Vec<&Resource> = self
+            .project
+            .resources
+            .iter()
+            .filter(|r| matches!(r.data, ResourceData::Character(_)))
+            .collect();
+        match characters.len() {
+            0 => Err("No Character Profile resources exist. Sync starter characters or add a profile first.".to_string()),
+            1 => {
+                let ResourceData::Character(character) = &characters[0].data else {
+                    unreachable!("filtered to character resources");
+                };
+                Ok((characters[0].id, characters[0].name.clone(), character.clone()))
+            }
+            n => Err(format!(
+                "Select a Character Profile resource before placing a character ({n} available)"
             )),
         }
     }
@@ -9694,6 +9916,297 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct StarterCharacterSyncReport {
+    resources_added: usize,
+    resources_updated: usize,
+    files_copied: usize,
+}
+
+impl StarterCharacterSyncReport {
+    const fn changed(&self) -> bool {
+        self.resources_added > 0 || self.resources_updated > 0 || self.files_copied > 0
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StarterCataloguePhase {
+    Skeleton,
+    Model,
+    AnimationClip,
+    AnimationSet,
+    Character,
+}
+
+fn load_project_with_starter_catalogue(
+    dir: &Path,
+) -> Result<(ProjectDocument, Option<String>, bool), String> {
+    let project_file = dir.join("project.ron");
+    let mut project = ProjectDocument::load_from_path(&project_file)
+        .map_err(|error| format!("{}: {error}", project_file.display()))?;
+    if !should_auto_sync_starter_character_catalogue(&project) {
+        return Ok((project, None, false));
+    }
+
+    let report = match sync_starter_character_catalogue(&mut project, dir) {
+        Ok(report) => report,
+        Err(error) => {
+            let status = format!(
+                "Loaded {}; starter character sync failed: {error}",
+                short_path(dir)
+            );
+            return Ok((project, Some(status), false));
+        }
+    };
+    if !report.changed() {
+        return Ok((project, None, false));
+    }
+
+    project.normalize_loaded();
+    match project.save_to_path(&project_file) {
+        Ok(()) => {
+            let status = format!(
+                "Synced starter characters: {} added, {} updated, {} file(s) copied",
+                report.resources_added, report.resources_updated, report.files_copied
+            );
+            Ok((project, Some(status), false))
+        }
+        Err(error) => {
+            let status =
+                format!("Synced starter characters but save failed: {error}; save manually");
+            Ok((project, Some(status), true))
+        }
+    }
+}
+
+fn should_auto_sync_starter_character_catalogue(project: &ProjectDocument) -> bool {
+    let has_legacy_starter_character = project.resources.iter().any(|resource| {
+        matches!(resource.data, ResourceData::Character(_))
+            && resource.name == LEGACY_WRAITH_HERO_PROFILE_NAME
+    });
+    let has_starter_character_asset =
+        project
+            .resources
+            .iter()
+            .any(|resource| match &resource.data {
+                ResourceData::Model(_) => {
+                    STARTER_CHARACTER_MODEL_NAMES.contains(&resource.name.as_str())
+                }
+                ResourceData::Character(_) => {
+                    STARTER_CHARACTER_PROFILE_NAMES.contains(&resource.name.as_str())
+                }
+                _ => false,
+            });
+    let missing_canonical_profile = STARTER_CHARACTER_PROFILE_NAMES.iter().any(|name| {
+        !project_has_resource_name(project, name, |data| {
+            matches!(data, ResourceData::Character(_))
+        })
+    });
+
+    missing_canonical_profile && (has_legacy_starter_character || has_starter_character_asset)
+}
+
+fn sync_starter_character_catalogue(
+    project: &mut ProjectDocument,
+    project_root: &Path,
+) -> Result<StarterCharacterSyncReport, String> {
+    let starter = ProjectDocument::starter();
+    let mut report = StarterCharacterSyncReport::default();
+    let mut id_map: HashMap<ResourceId, ResourceId> = HashMap::new();
+
+    for phase in [
+        StarterCataloguePhase::Skeleton,
+        StarterCataloguePhase::Model,
+        StarterCataloguePhase::AnimationClip,
+        StarterCataloguePhase::AnimationSet,
+        StarterCataloguePhase::Character,
+    ] {
+        for starter_resource in starter
+            .resources
+            .iter()
+            .filter(|resource| starter_catalogue_resource_matches_phase(resource, phase))
+        {
+            let mut data = starter_resource.data.clone();
+            remap_resource_data(&mut data, &id_map);
+            if let Some(existing_id) = find_starter_catalogue_target(project, starter_resource) {
+                if let Some(existing) = project.resource_mut(existing_id) {
+                    if existing.name != starter_resource.name || existing.data != data {
+                        existing.name = starter_resource.name.clone();
+                        existing.data = data;
+                        report.resources_updated += 1;
+                    }
+                    id_map.insert(starter_resource.id, existing_id);
+                }
+            } else {
+                let id = project.add_resource(starter_resource.name.clone(), data);
+                id_map.insert(starter_resource.id, id);
+                report.resources_added += 1;
+            }
+        }
+    }
+
+    report.files_copied = copy_starter_character_asset_dirs(project_root)
+        .map_err(|error| format!("copy starter character assets: {error}"))?;
+    Ok(report)
+}
+
+fn starter_catalogue_resource_matches_phase(
+    resource: &Resource,
+    phase: StarterCataloguePhase,
+) -> bool {
+    match (&resource.data, phase) {
+        (ResourceData::Skeleton(_), StarterCataloguePhase::Skeleton) => {
+            resource.name == "Meshy Biped Skeleton"
+        }
+        (ResourceData::Model(_), StarterCataloguePhase::Model) => {
+            STARTER_CHARACTER_MODEL_NAMES.contains(&resource.name.as_str())
+        }
+        (ResourceData::AnimationClip(clip), StarterCataloguePhase::AnimationClip) => {
+            starter_character_asset_path(&clip.psxanim_path)
+        }
+        (ResourceData::AnimationSet(_), StarterCataloguePhase::AnimationSet) => {
+            STARTER_ANIMATION_SET_NAMES.contains(&resource.name.as_str())
+        }
+        (ResourceData::Character(_), StarterCataloguePhase::Character) => {
+            STARTER_CHARACTER_PROFILE_NAMES.contains(&resource.name.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn find_starter_catalogue_target(
+    project: &ProjectDocument,
+    starter_resource: &Resource,
+) -> Option<ResourceId> {
+    if let ResourceData::Skeleton(starter_skeleton) = &starter_resource.data {
+        if let Some(id) = project
+            .resources
+            .iter()
+            .find_map(|resource| match &resource.data {
+                ResourceData::Skeleton(existing)
+                    if existing.signature == starter_skeleton.signature =>
+                {
+                    Some(resource.id)
+                }
+                _ => None,
+            })
+        {
+            return Some(id);
+        }
+    }
+
+    if let Some(id) = project.resources.iter().find_map(|resource| {
+        (resource.name == starter_resource.name
+            && same_resource_variant(&resource.data, &starter_resource.data))
+        .then_some(resource.id)
+    }) {
+        return Some(id);
+    }
+
+    if starter_resource.name == "Obsidian Wraith Enemy"
+        && matches!(starter_resource.data, ResourceData::Character(_))
+    {
+        return project.resources.iter().find_map(|resource| {
+            (resource.name == LEGACY_WRAITH_HERO_PROFILE_NAME
+                && matches!(resource.data, ResourceData::Character(_)))
+            .then_some(resource.id)
+        });
+    }
+
+    None
+}
+
+fn same_resource_variant(a: &ResourceData, b: &ResourceData) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+fn remap_resource_data(data: &mut ResourceData, id_map: &HashMap<ResourceId, ResourceId>) {
+    match data {
+        ResourceData::Material(material) => remap_resource_id_option(&mut material.texture, id_map),
+        ResourceData::Model(model) => remap_resource_id_option(&mut model.skeleton, id_map),
+        ResourceData::AnimationClip(clip) => remap_resource_id_option(&mut clip.skeleton, id_map),
+        ResourceData::AnimationSet(set) => {
+            remap_resource_id_option(&mut set.skeleton, id_map);
+            remap_resource_id_option(&mut set.idle_clip, id_map);
+            remap_resource_id_option(&mut set.walk_clip, id_map);
+            remap_resource_id_option(&mut set.run_clip, id_map);
+            remap_resource_id_option(&mut set.turn_clip, id_map);
+            for clip in &mut set.clips {
+                if let Some(mapped) = id_map.get(clip).copied() {
+                    *clip = mapped;
+                }
+            }
+        }
+        ResourceData::Character(character) => {
+            remap_resource_id_option(&mut character.model, id_map);
+            remap_resource_id_option(&mut character.animation_set, id_map);
+        }
+        ResourceData::Weapon(weapon) => remap_resource_id_option(&mut weapon.model, id_map),
+        ResourceData::Texture { .. }
+        | ResourceData::Mesh { .. }
+        | ResourceData::Scene { .. }
+        | ResourceData::Script { .. }
+        | ResourceData::Audio { .. }
+        | ResourceData::Skeleton(_) => {}
+    }
+}
+
+fn remap_resource_id_option(id: &mut Option<ResourceId>, id_map: &HashMap<ResourceId, ResourceId>) {
+    if let Some(mapped) = id.and_then(|id| id_map.get(&id).copied()) {
+        *id = Some(mapped);
+    }
+}
+
+fn project_has_resource_name(
+    project: &ProjectDocument,
+    name: &str,
+    predicate: impl Fn(&ResourceData) -> bool,
+) -> bool {
+    project
+        .resources
+        .iter()
+        .any(|resource| resource.name == name && predicate(&resource.data))
+}
+
+fn starter_character_asset_path(path: &str) -> bool {
+    STARTER_CHARACTER_ASSET_DIRS.iter().any(|dir| {
+        path.strip_prefix(dir)
+            .is_some_and(|remaining| remaining.starts_with('/'))
+    })
+}
+
+fn copy_starter_character_asset_dirs(project_root: &Path) -> std::io::Result<usize> {
+    let default_root = psxed_project::default_project_dir();
+    if paths_equivalent(project_root, &default_root) {
+        return Ok(0);
+    }
+
+    let mut copied = 0;
+    for rel in STARTER_CHARACTER_ASSET_DIRS {
+        let src = default_root.join(rel);
+        let dst = project_root.join(rel);
+        copied += copy_dir_recursive_missing(&src, &dst)?;
+    }
+    Ok(copied)
+}
+
+fn copy_dir_recursive_missing(src: &Path, dst: &Path) -> std::io::Result<usize> {
+    std::fs::create_dir_all(dst)?;
+    let mut copied = 0;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copied += copy_dir_recursive_missing(&from, &to)?;
+        } else if !to.exists() {
+            std::fs::copy(&from, &to)?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
 }
 
 fn draw_transform_policy_editor(
@@ -13394,6 +13907,17 @@ fn human_bytes_u64(n: u64) -> String {
     } else {
         format!("{:.1} MB", (n as f64) / (1024.0 * 1024.0))
     }
+}
+
+fn draw_play_metric_line(painter: &egui::Painter, x: f32, y: &mut f32, text: &str, color: Color32) {
+    painter.text(
+        Pos2::new(x, *y),
+        Align2::LEFT_TOP,
+        text,
+        FontId::monospace(11.0),
+        color,
+    );
+    *y += 13.0;
 }
 
 fn dock_label_limit(depth: usize) -> usize {
@@ -18544,6 +19068,69 @@ mod tests {
             loaded.project().resources.len(),
             workspace.project().resources.len()
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_directory_syncs_legacy_starter_character_catalogue() {
+        let dir = std::env::temp_dir().join(format!(
+            "psxed-ui-test-character-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let starter = ProjectDocument::starter();
+        let mut legacy = ProjectDocument::new("legacy-starter");
+        let mut wraith_model = starter
+            .resources
+            .iter()
+            .find_map(|resource| match &resource.data {
+                ResourceData::Model(model) if resource.name == "Obsidian Wraith" => {
+                    Some(model.clone())
+                }
+                _ => None,
+            })
+            .expect("starter has wraith model");
+        wraith_model.skeleton = None;
+        let model = legacy.add_resource("Obsidian Wraith", ResourceData::Model(wraith_model));
+        let mut character = psxed_project::CharacterResource::defaults();
+        character.model = Some(model);
+        legacy.add_resource(
+            LEGACY_WRAITH_HERO_PROFILE_NAME,
+            ResourceData::Character(character),
+        );
+        legacy.save_to_path(dir.join("project.ron")).unwrap();
+
+        let workspace = EditorWorkspace::open_directory(&dir).unwrap();
+
+        assert!(!workspace.is_dirty());
+        for name in STARTER_CHARACTER_PROFILE_NAMES {
+            assert!(
+                project_has_resource_name(workspace.project(), name, |data| {
+                    matches!(data, ResourceData::Character(_))
+                }),
+                "missing {name}"
+            );
+        }
+        assert!(!project_has_resource_name(
+            workspace.project(),
+            LEGACY_WRAITH_HERO_PROFILE_NAME,
+            |data| matches!(data, ResourceData::Character(_))
+        ));
+        assert!(project_has_resource_name(
+            workspace.project(),
+            "Crimson Cross Knight",
+            |data| { matches!(data, ResourceData::Model(_)) }
+        ));
+        assert!(dir
+            .join("assets/models/crimson_cross_knight/crimson_cross_knight.psxmdl")
+            .is_file());
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -2332,6 +2332,93 @@ mod tests {
     }
 
     #[test]
+    fn native_model_prunes_small_detached_cooked_position_islands() {
+        let mut source = SkinnedSourceMesh {
+            vertices: vec![
+                test_source_vertex([0.0, 0.0, 0.0]),
+                test_source_vertex([1.0, 0.0, 0.0]),
+                test_source_vertex([1.0, 1.0, 0.0]),
+                test_source_vertex([0.0, 1.0, 0.0]),
+                test_source_vertex([4.0, 0.0, 0.0]),
+                test_source_vertex([4.5, 0.0, 0.0]),
+                test_source_vertex([4.0, 0.5, 0.0]),
+            ],
+            faces: vec![
+                SourceFace {
+                    indices: [0, 1, 2],
+                    joint: 0,
+                },
+                SourceFace {
+                    indices: [0, 2, 3],
+                    joint: 0,
+                },
+                SourceFace {
+                    indices: [4, 5, 6],
+                    joint: 0,
+                },
+            ],
+        };
+        let bounds = ModelBounds::from_min_max([0.0, 0.0, 0.0], [4.5, 1.0, 0.0], 30_000.0).unwrap();
+
+        let removed = prune_detached_face_islands(&mut source, &bounds, 1);
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            source
+                .faces
+                .iter()
+                .map(|face| face.indices)
+                .collect::<Vec<_>>(),
+            vec![[0, 1, 2], [0, 2, 3]]
+        );
+    }
+
+    #[test]
+    fn native_model_reassigns_vertex_only_joints_to_face_part() {
+        let mut foreign_joint_vertex = test_source_vertex([0.0, 0.0, 0.0]);
+        foreign_joint_vertex.joints = [1, 0, 0, 0];
+        foreign_joint_vertex.dominant_joint = 1;
+        let source = SkinnedSourceMesh {
+            vertices: vec![
+                foreign_joint_vertex,
+                SourceVertex {
+                    position: [1.0, 0.0, 0.0],
+                    ..foreign_joint_vertex
+                },
+                SourceVertex {
+                    position: [0.0, 1.0, 0.0],
+                    ..foreign_joint_vertex
+                },
+            ],
+            faces: vec![SourceFace {
+                indices: [0, 1, 2],
+                joint: 0,
+            }],
+        };
+        let bounds = ModelBounds::from_min_max([0.0, 0.0, 0.0], [1.0, 1.0, 0.0], 30_000.0).unwrap();
+
+        let (bytes, vertices, parts) = cook_model_blob(
+            &source,
+            &bounds,
+            &[None, None],
+            &[0, 1],
+            [255, 255, 255, 255],
+            128,
+            128,
+            psxed_format::model::DEFAULT_LOCAL_TO_WORLD_Q12,
+        )
+        .unwrap();
+
+        let model = psx_asset::Model::from_bytes(&bytes).unwrap();
+        assert_eq!(vertices, 3);
+        assert_eq!(parts, 1);
+        assert_eq!(model.part_count(), 1);
+        assert_eq!(model.part(0).unwrap().joint_index(), 0);
+        assert_eq!(model.part(0).unwrap().vertex_count(), 3);
+        assert_eq!(model.part(0).unwrap().face_count(), 1);
+    }
+
+    #[test]
     fn root_translation_normalization_restores_bind_pose_translation() {
         let base = vec![
             Trs {

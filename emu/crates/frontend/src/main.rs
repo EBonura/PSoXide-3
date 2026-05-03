@@ -796,6 +796,7 @@ impl ApplicationHandler for Shell {
                     psxed_ui::EditorViewport3dPresentation::play(
                         display_tex,
                         editor_play_uv(state.bus.as_ref(), framebuffer_source),
+                        editor_play_metrics(state),
                     )
                 } else {
                     psxed_ui::EditorViewport3dPresentation::edit(
@@ -909,6 +910,24 @@ fn editor_play_uv(
             ),
         ),
     }
+}
+
+fn editor_play_metrics(state: &app::AppState) -> Option<psxed_ui::EditorPlaytestMetrics> {
+    let sample = state
+        .profiler
+        .average()
+        .or_else(|| state.profiler.latest())?;
+    Some(psxed_ui::EditorPlaytestMetrics {
+        host_fps: sample.host_fps(),
+        host_ms: sample.host_dt_ms,
+        emu_hz: sample.emulated_vblank_hz(),
+        draw_hz: sample.psx_draw_hz(),
+        total_ms: sample.total_ms,
+        emu_ms: sample.emu_ms,
+        hw_ms: sample.hw_render_ms,
+        ui_ms: sample.egui.total_ms,
+        step_budget_percent: sample.psx_budget_percent(),
+    })
 }
 
 #[cfg(test)]
