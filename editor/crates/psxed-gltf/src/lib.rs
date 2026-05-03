@@ -461,6 +461,14 @@ pub struct RigidModelConfig {
     /// the whole model visibly grow or shrink when switching clips, so
     /// imported animations strip basis scale by default.
     pub strip_animation_scale: bool,
+    /// Drop detached mesh islands with at most this many faces after
+    /// cooked-position welding. Zero disables pruning.
+    ///
+    /// Meshy-style character exports can contain one- or two-triangle
+    /// loose scraps that survive normal vertex welding. This pass runs
+    /// after the model precision bounds are known so it uses the same
+    /// quantised positions as the final `.psxmdl`.
+    pub prune_detached_face_islands: u16,
 }
 
 impl Default for RigidModelConfig {
@@ -473,6 +481,7 @@ impl Default for RigidModelConfig {
             world_height: DEFAULT_MODEL_WORLD_HEIGHT,
             normalize_root_translation: false,
             strip_animation_scale: true,
+            prune_detached_face_islands: 4,
         }
     }
 }
@@ -606,6 +615,80 @@ fn convert_rigid_model_document(
         precision_bounds.max,
         MODEL_LOCAL_COORD_LIMIT,
     )?;
+    if prune_detached_face_islands(
+        &mut source,
+        &bounds,
+        cfg.prune_detached_face_islands as usize,
+    ) > 0
+    {
+        if source.faces.is_empty() {
+            return Err(Error::Empty);
+        }
+        let precision_bounds = collect_precision_bounds(
+            document,
+            buffers,
+            &source,
+            &parents,
+            &base_trs,
+            &root_joint_nodes,
+            &joints,
+            &inverse_bind_matrices,
+            cfg.animation_fps,
+            cfg.normalize_root_translation,
+            cfg.strip_animation_scale,
+        )?;
+        let bounds = ModelBounds::from_min_max(
+            precision_bounds.min,
+            precision_bounds.max,
+            MODEL_LOCAL_COORD_LIMIT,
+        )?;
+        return finish_rigid_model_document(
+            document,
+            buffers,
+            cfg,
+            source,
+            bounds,
+            precision_bounds,
+            &parents,
+            &base_trs,
+            &root_joint_nodes,
+            &joints,
+            &inverse_bind_matrices,
+            mesh,
+        );
+    }
+
+    finish_rigid_model_document(
+        document,
+        buffers,
+        cfg,
+        source,
+        bounds,
+        precision_bounds,
+        &parents,
+        &base_trs,
+        &root_joint_nodes,
+        &joints,
+        &inverse_bind_matrices,
+        mesh,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_rigid_model_document(
+    document: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+    cfg: &RigidModelConfig,
+    source: SkinnedSourceMesh,
+    bounds: ModelBounds,
+    precision_bounds: PrecisionBounds,
+    parents: &[Option<usize>],
+    base_trs: &[Trs],
+    root_joint_nodes: &[usize],
+    joints: &[usize],
+    inverse_bind_matrices: &[[[f32; 4]; 4]],
+    mesh: gltf::Mesh<'_>,
+) -> Result<RigidModelPackage, Error> {
     let local_height = bounds.encoded_axis_size(precision_bounds.min[1], precision_bounds.max[1]);
     let local_to_world_q12 = choose_local_to_world_q12(local_height, cfg.world_height);
 
@@ -703,6 +786,7 @@ struct SkinnedSourceMesh {
 
 #[derive(Clone, Copy)]
 struct CookedModelVertex {
+    source: SourceVertex,
     primary_joint: u16,
     record: [u8; psxed_format::model::VERTEX_RECORD_SIZE],
 }
@@ -1068,6 +1152,96 @@ fn rebuild_source_normals(source: &mut SkinnedSourceMesh, normal_faces: &[[usize
     }
 }
 
+fn prune_detached_face_islands(
+    source: &mut SkinnedSourceMesh,
+    bounds: &ModelBounds,
+    max_faces: usize,
+) -> usize {
+    if max_faces == 0 || source.faces.len() <= 1 {
+        return 0;
+    }
+
+    let mut faces_by_position: BTreeMap<[i16; 3], Vec<usize>> = BTreeMap::new();
+    for (face_index, face) in source.faces.iter().enumerate() {
+        for vertex_index in face.indices {
+            let key = model_vertex_position_key_for_source(source.vertices[vertex_index], bounds);
+            let faces = faces_by_position.entry(key).or_default();
+            if faces.last().copied() != Some(face_index) {
+                faces.push(face_index);
+            }
+        }
+    }
+
+    let mut adjacency = vec![Vec::new(); source.faces.len()];
+    for faces in faces_by_position.values() {
+        for (offset, face_a) in faces.iter().copied().enumerate() {
+            for face_b in faces.iter().copied().skip(offset + 1) {
+                adjacency[face_a].push(face_b);
+                adjacency[face_b].push(face_a);
+            }
+        }
+    }
+
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    let mut seen = vec![false; source.faces.len()];
+    for start in 0..source.faces.len() {
+        if seen[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut component = Vec::new();
+        seen[start] = true;
+        while let Some(face_index) = stack.pop() {
+            component.push(face_index);
+            for next in adjacency[face_index].iter().copied() {
+                if !seen[next] {
+                    seen[next] = true;
+                    stack.push(next);
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    if components.len() <= 1 {
+        return 0;
+    }
+    let Some((largest_index, largest)) = components
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, component)| component.len())
+    else {
+        return 0;
+    };
+    if largest.len() <= max_faces {
+        return 0;
+    }
+
+    let mut keep = vec![true; source.faces.len()];
+    let mut removed = 0usize;
+    for (component_index, component) in components.iter().enumerate() {
+        if component_index == largest_index || component.len() > max_faces {
+            continue;
+        }
+        for face_index in component {
+            keep[*face_index] = false;
+            removed += 1;
+        }
+    }
+    if removed == 0 {
+        return 0;
+    }
+
+    source.faces = source
+        .faces
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, face)| keep[index].then_some(face))
+        .collect();
+    removed
+}
+
 fn joint_indices_or_zero(joints: [u16; 4], weights: [f32; 4]) -> [u16; 4] {
     let mut out = joints;
     for i in 0..4 {
@@ -1260,6 +1434,7 @@ fn cook_model_blob(
 
     let mut canonical_by_position: BTreeMap<[i16; 3], u16> = BTreeMap::new();
     let mut canonical_vertices: Vec<CookedModelVertex> = Vec::new();
+    let mut vertex_face_joints: BTreeMap<u16, BTreeSet<u16>> = BTreeMap::new();
     let mut grouped_faces: BTreeMap<u16, Vec<[CookedFaceCorner; 3]>> = BTreeMap::new();
 
     for face in &source.faces {
@@ -1278,11 +1453,16 @@ fn cook_model_blob(
                 let index = ensure_u16("vertices", canonical_vertices.len())?;
                 canonical_by_position.insert(key, index);
                 canonical_vertices.push(CookedModelVertex {
+                    source: vertex,
                     primary_joint,
                     record,
                 });
                 index
             };
+            vertex_face_joints
+                .entry(temp_index)
+                .or_default()
+                .insert(face.joint);
             *out_corner = CookedFaceCorner {
                 vertex_index: temp_index,
                 uv: (
@@ -1294,6 +1474,20 @@ fn cook_model_blob(
         grouped_faces.entry(face.joint).or_default().push(out_face);
     }
 
+    let face_joints: BTreeSet<u16> = grouped_faces.keys().copied().collect();
+    for (index, vertex) in canonical_vertices.iter_mut().enumerate() {
+        if face_joints.contains(&vertex.primary_joint) {
+            continue;
+        }
+        let fallback = vertex_face_joints
+            .get(&(index as u16))
+            .and_then(|joints| joints.iter().next().copied());
+        if let Some(primary_joint) = fallback {
+            vertex.primary_joint = primary_joint;
+            vertex.record = encode_model_vertex(vertex.source, primary_joint, bounds);
+        }
+    }
+
     let mut vertices_by_joint: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
     for (index, vertex) in canonical_vertices.iter().enumerate() {
         vertices_by_joint
@@ -1302,15 +1496,9 @@ fn cook_model_blob(
             .push(ensure_u16("vertices", index)?);
     }
 
-    let mut part_joints = BTreeSet::new();
-    for joint in vertices_by_joint.keys().copied() {
-        part_joints.insert(joint);
-    }
-    for joint in grouped_faces.keys().copied() {
-        part_joints.insert(joint);
-    }
+    let part_joints = face_joints;
 
-    let mut temp_to_final = vec![0u16; canonical_vertices.len()];
+    let mut temp_to_final = vec![u16::MAX; canonical_vertices.len()];
     let mut vertex_ranges: BTreeMap<u16, (u16, u16)> = BTreeMap::new();
     let mut cooked_vertices: Vec<[u8; psxed_format::model::VERTEX_RECORD_SIZE]> = Vec::new();
     let mut blend_skin = false;
@@ -1345,7 +1533,11 @@ fn cook_model_blob(
             for face in faces {
                 let mut out_face = *face;
                 for corner in &mut out_face {
-                    corner.vertex_index = temp_to_final[corner.vertex_index as usize];
+                    let final_index = temp_to_final[corner.vertex_index as usize];
+                    if final_index == u16::MAX {
+                        return Err(Error::BadSkin("model face references an un-emitted vertex"));
+                    }
+                    corner.vertex_index = final_index;
                 }
                 cooked_faces.push(out_face);
             }
@@ -1433,17 +1625,26 @@ fn model_vertex_position_key(record: &[u8; psxed_format::model::VERTEX_RECORD_SI
     ]
 }
 
+fn model_vertex_position_key_for_source(vertex: SourceVertex, bounds: &ModelBounds) -> [i16; 3] {
+    let position = bounds.normalize_point(vertex.position);
+    [
+        q12_i16(position[0]),
+        q12_i16(position[1]),
+        q12_i16(position[2]),
+    ]
+}
+
 fn encode_model_vertex(
     vertex: SourceVertex,
     primary_joint: u16,
     bounds: &ModelBounds,
 ) -> [u8; psxed_format::model::VERTEX_RECORD_SIZE] {
-    let position = bounds.normalize_point(vertex.position);
+    let position = model_vertex_position_key_for_source(vertex, bounds);
     let (joint1_byte, blend_byte) = blend_slot_for_vertex(vertex, primary_joint);
     let mut out = [0u8; psxed_format::model::VERTEX_RECORD_SIZE];
-    write_i16(&mut out, 0, q12_i16(position[0]));
-    write_i16(&mut out, 2, q12_i16(position[1]));
-    write_i16(&mut out, 4, q12_i16(position[2]));
+    write_i16(&mut out, 0, position[0]);
+    write_i16(&mut out, 2, position[1]);
+    write_i16(&mut out, 4, position[2]);
     out[6] = joint1_byte;
     out[7] = blend_byte;
     out

@@ -2971,6 +2971,7 @@ impl EditorWorkspace {
             world_height: self.model_import_dialog.world_height.clamp(128, 8192) as u16,
             normalize_root_translation: self.model_import_dialog.normalize_root_translation,
             strip_animation_scale: true,
+            prune_detached_face_islands: 4,
         }
     }
 
@@ -17465,6 +17466,7 @@ fn draw_streaming_budget(
     let resource_use = collect_scene_resource_use(project);
     let file_budget = resource_file_budget(project, project_root, &resource_use);
     let vram_budget = runtime_vram_budget(project, project_root, &resource_use);
+    let model_budget = runtime_model_budget(project, project_root, &resource_use);
     let over = plan.over_budget_count() > 0;
     let header = if over {
         icons::label(icons::TRASH, "Streaming Budget — over limit")
@@ -17497,18 +17499,30 @@ fn draw_streaming_budget(
                 false,
             );
             ui.weak("Embedded Play cooks this Room as generated chunks.");
-            if let Some(chunk) = plan.largest_psxw_chunk() {
+            if let Some(chunk) = plan.largest_room_asset_chunk() {
                 draw_budget_row(
                     ui,
-                    "Largest chunk",
+                    "Largest chunk asset",
                     format!(
-                        "#{} {}×{}, {}",
+                        "#{} {}×{}, {} total",
                         chunk.index,
                         chunk.size[0],
                         chunk.size[1],
-                        human_bytes(chunk.budget.psxw_bytes as u32)
+                        human_bytes_u64(chunk.budget.psxw_static_lit_bytes as u64)
                     ),
                     chunk.over_budget,
+                );
+            }
+            if let Some(chunk) = plan.largest_psxw_chunk() {
+                draw_budget_row(
+                    ui,
+                    "Largest geometry",
+                    format!(
+                        "#{} {}",
+                        chunk.index,
+                        human_bytes_u64(chunk.budget.psxw_bytes as u64)
+                    ),
+                    chunk.budget.psxw_bytes > MAX_ROOM_BYTES,
                 );
             }
             if let Some(chunk) = plan.largest_triangle_chunk() {
@@ -17552,11 +17566,42 @@ fn draw_streaming_budget(
             );
             draw_budget_row(
                 ui,
-                "Runtime texture VRAM",
+                "Texture VRAM",
                 format!(
                     "{} across {} textures",
                     human_bytes_u64(vram_budget.bytes),
                     vram_budget.textures
+                ),
+                false,
+            );
+            draw_budget_row(
+                ui,
+                "Room texture VRAM",
+                format!(
+                    "{} across {} textures",
+                    human_bytes_u64(vram_budget.room_bytes),
+                    vram_budget.room_textures
+                ),
+                false,
+            );
+            draw_budget_row(
+                ui,
+                "Model texture VRAM",
+                format!(
+                    "{} across {} atlases",
+                    human_bytes_u64(vram_budget.model_bytes),
+                    vram_budget.model_textures
+                ),
+                false,
+            );
+            draw_budget_row(
+                ui,
+                "Model RAM",
+                format!(
+                    "{} across {} models, {} clips",
+                    human_bytes_u64(model_budget.ram_bytes),
+                    model_budget.models,
+                    model_budget.clips
                 ),
                 false,
             );
@@ -17576,17 +17621,27 @@ fn draw_streaming_budget(
                     true,
                 );
             }
+            if model_budget.missing > 0 {
+                draw_budget_row(
+                    ui,
+                    "Unresolved model assets",
+                    format!("{}", model_budget.missing),
+                    true,
+                );
+            }
 
             ui.add_space(4.0);
             egui::Grid::new(format!("streaming_chunks_{}", room_id.raw()))
-                .num_columns(5)
+                .num_columns(7)
                 .striped(true)
                 .show(ui, |ui| {
                     ui.label(RichText::new("#").color(STUDIO_TEXT_WEAK));
                     ui.label(RichText::new("Origin").color(STUDIO_TEXT_WEAK));
                     ui.label(RichText::new("Size").color(STUDIO_TEXT_WEAK));
                     ui.label(RichText::new("Tris").color(STUDIO_TEXT_WEAK));
-                    ui.label(RichText::new(".psxw").color(STUDIO_TEXT_WEAK));
+                    ui.label(RichText::new("Geom").color(STUDIO_TEXT_WEAK));
+                    ui.label(RichText::new("Light").color(STUDIO_TEXT_WEAK));
+                    ui.label(RichText::new("Total").color(STUDIO_TEXT_WEAK));
                     ui.end_row();
 
                     for chunk in plan.chunks.iter().take(8) {
@@ -17608,7 +17663,13 @@ fn draw_streaming_budget(
                         )));
                         ui.label(text(format!("{}×{}", chunk.size[0], chunk.size[1])));
                         ui.label(text(format!("{}", chunk.budget.triangles)));
-                        ui.label(text(human_bytes(chunk.budget.psxw_bytes as u32)));
+                        ui.label(text(human_bytes_u64(chunk.budget.psxw_bytes as u64)));
+                        ui.label(text(human_bytes_u64(
+                            chunk.budget.static_light_table_bytes as u64,
+                        )));
+                        ui.label(text(human_bytes_u64(
+                            chunk.budget.psxw_static_lit_bytes as u64,
+                        )));
                         ui.end_row();
                     }
                 });
@@ -17629,6 +17690,18 @@ struct ResourceFileBudget {
 struct RuntimeVramBudget {
     textures: usize,
     bytes: u64,
+    room_textures: usize,
+    room_bytes: u64,
+    model_textures: usize,
+    model_bytes: u64,
+    missing: usize,
+}
+
+#[derive(Default)]
+struct RuntimeModelBudget {
+    models: usize,
+    clips: usize,
+    ram_bytes: u64,
     missing: usize,
 }
 
@@ -17687,14 +17760,13 @@ fn runtime_vram_budget(
     resource_use: &SceneResourceUse,
 ) -> RuntimeVramBudget {
     let mut budget = RuntimeVramBudget::default();
-    let mut seen = HashSet::new();
 
     for id in &resource_use.textures {
         let Some(resource) = project.resource(*id) else {
             continue;
         };
         if let ResourceData::Texture { psxt_path } = &resource.data {
-            add_runtime_texture_vram(project_root, psxt_path, true, &mut budget, &mut seen);
+            add_runtime_texture_vram(project_root, psxt_path, true, &mut budget);
         }
     }
 
@@ -17706,7 +17778,32 @@ fn runtime_vram_budget(
             continue;
         };
         if let Some(texture_path) = &model.texture_path {
-            add_runtime_texture_vram(project_root, texture_path, false, &mut budget, &mut seen);
+            add_runtime_texture_vram(project_root, texture_path, false, &mut budget);
+        }
+    }
+
+    budget
+}
+
+fn runtime_model_budget(
+    project: &ProjectDocument,
+    project_root: &Path,
+    resource_use: &SceneResourceUse,
+) -> RuntimeModelBudget {
+    let mut budget = RuntimeModelBudget::default();
+
+    for id in &resource_use.models {
+        let Some(resource) = project.resource(*id) else {
+            continue;
+        };
+        let ResourceData::Model(model) = &resource.data else {
+            continue;
+        };
+        budget.models += 1;
+        add_runtime_model_asset_bytes(project_root, &model.model_path, &mut budget);
+        for clip in project.resolved_model_animation_clips(*id) {
+            budget.clips += 1;
+            add_runtime_model_asset_bytes(project_root, &clip.psxanim_path, &mut budget);
         }
     }
 
@@ -17716,17 +17813,13 @@ fn runtime_vram_budget(
 fn add_runtime_texture_vram(
     project_root: &Path,
     stored: &str,
-    _room_material: bool,
+    room_material: bool,
     budget: &mut RuntimeVramBudget,
-    seen: &mut HashSet<PathBuf>,
 ) {
     if stored.trim().is_empty() {
         return;
     }
     let abs = psxed_project::model_import::resolve_path(stored, Some(project_root));
-    if !seen.insert(abs.clone()) {
-        return;
-    }
     let Ok(bytes) = std::fs::read(&abs) else {
         budget.missing += 1;
         return;
@@ -17739,6 +17832,31 @@ fn add_runtime_texture_vram(
     budget.textures += 1;
     let bytes = texture.pixel_bytes().len() as u64 + texture.clut_bytes().len() as u64;
     budget.bytes = budget.bytes.saturating_add(bytes);
+    if room_material {
+        budget.room_textures += 1;
+        budget.room_bytes = budget.room_bytes.saturating_add(bytes);
+    } else {
+        budget.model_textures += 1;
+        budget.model_bytes = budget.model_bytes.saturating_add(bytes);
+    }
+}
+
+fn add_runtime_model_asset_bytes(
+    project_root: &Path,
+    stored: &str,
+    budget: &mut RuntimeModelBudget,
+) {
+    if stored.trim().is_empty() {
+        budget.missing += 1;
+        return;
+    }
+    let abs = psxed_project::model_import::resolve_path(stored, Some(project_root));
+    match std::fs::metadata(&abs) {
+        Ok(metadata) if metadata.is_file() => {
+            budget.ram_bytes = budget.ram_bytes.saturating_add(metadata.len());
+        }
+        _ => budget.missing += 1,
+    }
 }
 
 fn add_resource_file(
@@ -17818,18 +17936,34 @@ fn draw_room_budget_rows(ui: &mut egui::Ui, budget: WorldGridBudget) {
     );
     draw_budget_row(
         ui,
-        ".psxw",
+        ".psxw geometry",
         format!(
             "{} / {}",
-            human_bytes(budget.psxw_bytes as u32),
-            human_bytes(MAX_ROOM_BYTES as u32)
+            human_bytes_u64(budget.psxw_bytes as u64),
+            human_bytes_u64(MAX_ROOM_BYTES as u64)
         ),
         budget.psxw_bytes > MAX_ROOM_BYTES,
     );
     draw_budget_row(
         ui,
+        "Static-light table",
+        human_bytes_u64(budget.static_light_table_bytes as u64),
+        false,
+    );
+    draw_budget_row(
+        ui,
+        "Room asset total",
+        format!(
+            "{} / {}",
+            human_bytes_u64(budget.psxw_static_lit_bytes as u64),
+            human_bytes_u64(MAX_ROOM_BYTES as u64)
+        ),
+        budget.static_lit_over_budget(),
+    );
+    draw_budget_row(
+        ui,
         ".psxw compact est.",
-        human_bytes(budget.future_compact_estimated_bytes as u32).to_string(),
+        human_bytes_u64(budget.future_compact_estimated_bytes as u64).to_string(),
         budget.future_compact_estimated_bytes > MAX_ROOM_BYTES,
     );
 }
@@ -19274,7 +19408,11 @@ mod tests {
         );
 
         assert_eq!(budget.textures, 2);
+        assert_eq!(budget.room_textures, 1);
+        assert_eq!(budget.model_textures, 1);
         assert_eq!(budget.missing, 0);
+        assert_eq!(budget.room_bytes, 16 * 64 * 2 + 16 * 2);
+        assert_eq!(budget.model_bytes, 64 * 128 * 2 + 256 * 2);
         assert_eq!(budget.bytes, 16 * 64 * 2 + 16 * 2 + 64 * 128 * 2 + 256 * 2);
     }
 
@@ -20003,9 +20141,11 @@ mod tests {
         assert!(rows.iter().any(|row| row.name == "floor.psxt"));
         assert!(rows.iter().any(|row| row.name == "brick_wall.psxt"));
         assert!(rows.iter().any(|row| row.name == "characters"));
-        assert!(rows
-            .iter()
-            .any(|row| row.name == "wraith_hero.profile" && row.resource.is_some()));
+        assert!(
+            rows.iter()
+                .any(|row| row.name == "crimson_cross_knight_player.profile"
+                    && row.resource.is_some())
+        );
         assert!(rows
             .iter()
             .any(|row| row.name == "brick.mat" && row.resource.is_some()));

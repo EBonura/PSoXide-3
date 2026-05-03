@@ -43,6 +43,8 @@
 //!   --world-height N      Suggested engine/world height (default 1024).
 //!   --center-animation-root
 //!                         Freeze root-joint translation while sampling clips.
+//!   --prune-detached-islands N
+//!                         Drop cooked-position detached islands up to N faces (default 4).
 //! ```
 //!
 //! ## `tex` -- PNG/JPG → `.psxt`
@@ -129,6 +131,7 @@ GLB-MODEL SUBCOMMAND:
                           [--anim-fps N]           (default 15)
                           [--world-height N]       (default 1024)
                           [--center-animation-root]
+                          [--prune-detached-islands N] (default 4)
 
 TEX SUBCOMMAND:
     psxed tex <input.png|.jpg|.bmp> -o <output.psxt>
@@ -302,6 +305,8 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
     let mut animation_fps: u16 = 15;
     let mut world_height: u16 = 1024;
     let mut normalize_root_translation = false;
+    let mut prune_detached_face_islands =
+        psxed_gltf::RigidModelConfig::default().prune_detached_face_islands;
 
     let mut i = 0;
     while i < args.len() {
@@ -359,6 +364,18 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
             "--center-animation-root" | "--normalize-root-translation" => {
                 normalize_root_translation = true;
             }
+            "--prune-detached-islands" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "expected N after --prune-detached-islands".to_string())?;
+                prune_detached_face_islands = val
+                    .parse()
+                    .map_err(|_| format!("invalid --prune-detached-islands value: {val}"))?;
+            }
+            "--no-prune-detached-islands" => {
+                prune_detached_face_islands = 0;
+            }
             a if a.starts_with('-') => {
                 return Err(format!("unknown flag: {a}\n\n{USAGE}"));
             }
@@ -384,6 +401,7 @@ fn run_glb_model(args: &[String]) -> Result<(), String> {
         world_height,
         normalize_root_translation,
         strip_animation_scale: true,
+        prune_detached_face_islands,
     };
     let package =
         psxed_gltf::convert_rigid_model_path(&input, &cfg).map_err(|e| format!("convert: {e}"))?;

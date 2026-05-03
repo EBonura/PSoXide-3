@@ -27,7 +27,8 @@ pub struct StreamingChunkConfig {
     pub max_depth: u16,
     /// Absolute maximum triangle estimate accepted by the current cooker.
     pub max_triangles: usize,
-    /// Absolute maximum `.psxw` byte estimate accepted by the cooker.
+    /// Absolute maximum static-lit `.psxw` room asset size accepted
+    /// by Embedded Play.
     pub max_bytes: usize,
 }
 
@@ -60,7 +61,7 @@ impl StreamingChunkConfig {
         budget.width > self.max_width
             || budget.depth > self.max_depth
             || budget.triangles > self.max_triangles
-            || budget.psxw_bytes > self.max_bytes
+            || budget.psxw_static_lit_bytes > self.max_bytes
     }
 }
 
@@ -105,11 +106,18 @@ impl GeneratedChunkPlan {
         self.chunks.iter().filter(|chunk| chunk.over_budget).count()
     }
 
-    /// Chunk with the largest `.psxw` byte estimate.
+    /// Chunk with the largest base geometry `.psxw` byte estimate.
     pub fn largest_psxw_chunk(&self) -> Option<&GeneratedChunk> {
         self.chunks
             .iter()
             .max_by_key(|chunk| chunk.budget.psxw_bytes)
+    }
+
+    /// Chunk with the largest Embedded Play room asset estimate.
+    pub fn largest_room_asset_chunk(&self) -> Option<&GeneratedChunk> {
+        self.chunks
+            .iter()
+            .max_by_key(|chunk| chunk.budget.psxw_static_lit_bytes)
     }
 
     /// Chunk with the largest triangle estimate.

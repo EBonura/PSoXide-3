@@ -2981,8 +2981,8 @@ mod tests {
         let src = render_manifest_source(&package);
         assert!(src.contains("PointLightRecord"));
         assert!(src.contains("pub static LIGHTS"));
-        assert!(src.contains("SurfaceLightRecord"));
-        assert!(src.contains("pub static SURFACE_LIGHTS: &[SurfaceLightRecord] = &[];"));
+        assert!(!src.contains("SurfaceLightRecord"));
+        assert!(!src.contains("SURFACE_LIGHTS"));
         assert!(src.contains("intensity_q8"));
         assert!(src.contains(&format!(
             "color: [{}, {}, {}]",

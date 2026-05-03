@@ -1249,9 +1249,16 @@ pub struct WorldGridBudget {
     pub ceilings: usize,
     pub walls: usize,
     pub triangles: usize,
-    /// Current `.psxw` wire size. The format stores a record for **every** cell, so this
-    /// uses `total_cells`, not `populated_cells`.
+    /// Current `.psxw` geometry wire size. The format stores a
+    /// sector record for **every** cell, so this uses `total_cells`,
+    /// not `populated_cells`.
     pub psxw_bytes: usize,
+    /// Additional bytes appended when static per-vertex lighting is
+    /// baked into `.psxw` v3 for Embedded Play.
+    pub static_light_table_bytes: usize,
+    /// Full Embedded Play room asset size: geometry `.psxw` plus the
+    /// baked static-light table.
+    pub psxw_static_lit_bytes: usize,
     /// Estimated size if we shipped the future compact format
     /// described in `docs/world-format-roadmap.md` (28-byte
     /// sectors, 12-byte walls). Surfaced as a planning aid, not
@@ -1260,14 +1267,23 @@ pub struct WorldGridBudget {
 }
 
 impl WorldGridBudget {
-    /// `true` if any cap is exceeded. Mirrors the validation the
-    /// cooker now enforces -- UI and cooker can't disagree about
-    /// what counts as "too big."
+    /// `true` if any base geometry cap is exceeded. Mirrors the
+    /// generic world-cooker validation before Embedded Play appends
+    /// static lighting.
     pub fn over_budget(&self) -> bool {
         self.width > MAX_ROOM_WIDTH
             || self.depth > MAX_ROOM_DEPTH
             || self.triangles > MAX_ROOM_TRIANGLES
             || self.psxw_bytes > MAX_ROOM_BYTES
+    }
+
+    /// `true` if Embedded Play's static-lit room asset would exceed
+    /// the current runtime chunk limits.
+    pub fn static_lit_over_budget(&self) -> bool {
+        self.width > MAX_ROOM_WIDTH
+            || self.depth > MAX_ROOM_DEPTH
+            || self.triangles > MAX_ROOM_TRIANGLES
+            || self.psxw_static_lit_bytes > MAX_ROOM_BYTES
     }
 }
 
@@ -1275,6 +1291,7 @@ const ASSET_HEADER_BYTES: usize = 12;
 const WORLD_HEADER_BYTES: usize = 20;
 const PSXW_SECTOR_BYTES: usize = psxed_format::world::SectorRecord::SIZE;
 const PSXW_WALL_BYTES: usize = psxed_format::world::WallRecord::SIZE;
+const PSXW_SURFACE_LIGHT_BYTES: usize = psxed_format::world::SurfaceLightRecord::SIZE;
 const FUTURE_COMPACT_SECTOR_BYTES: usize = 28;
 const FUTURE_COMPACT_WALL_BYTES: usize = 12;
 
@@ -1718,6 +1735,10 @@ impl WorldGrid {
             + WORLD_HEADER_BYTES
             + b.total_cells * PSXW_SECTOR_BYTES
             + b.walls * PSXW_WALL_BYTES;
+        if b.populated_cells > 0 {
+            b.static_light_table_bytes = (b.total_cells * 2 + b.walls) * PSXW_SURFACE_LIGHT_BYTES;
+        }
+        b.psxw_static_lit_bytes = b.psxw_bytes + b.static_light_table_bytes;
         b.future_compact_estimated_bytes = ASSET_HEADER_BYTES
             + WORLD_HEADER_BYTES
             + b.total_cells * FUTURE_COMPACT_SECTOR_BYTES
@@ -4803,8 +4824,11 @@ mod tests {
             b.psxw_bytes,
             12 + 20 + 9 * psxed_format::world::SectorRecord::SIZE
         );
+        assert_eq!(b.static_light_table_bytes, 0);
+        assert_eq!(b.psxw_static_lit_bytes, b.psxw_bytes);
         assert_eq!(b.future_compact_estimated_bytes, 12 + 20 + 9 * 28);
         assert!(!b.over_budget());
+        assert!(!b.static_lit_over_budget());
     }
 
     #[test]
@@ -4821,7 +4845,16 @@ mod tests {
         // The future compact estimate should be strictly smaller
         // than the active format once any geometry exists.
         assert!(b.future_compact_estimated_bytes < b.psxw_bytes);
+        assert_eq!(
+            b.static_light_table_bytes,
+            (9 * 2 + 12) * psxed_format::world::SurfaceLightRecord::SIZE
+        );
+        assert_eq!(
+            b.psxw_static_lit_bytes,
+            b.psxw_bytes + b.static_light_table_bytes
+        );
         assert!(!b.over_budget());
+        assert!(!b.static_lit_over_budget());
     }
 
     #[test]
@@ -4842,8 +4875,10 @@ mod tests {
         // Active format remains under the byte cap for floors-only;
         // the wall-stack-heavy worst case is what pushes rooms over.
         assert!(b.psxw_bytes <= MAX_ROOM_BYTES);
+        assert!(b.psxw_static_lit_bytes > MAX_ROOM_BYTES);
         assert!(b.future_compact_estimated_bytes <= MAX_ROOM_BYTES);
         assert!(!b.over_budget());
+        assert!(b.static_lit_over_budget());
     }
 
     #[test]

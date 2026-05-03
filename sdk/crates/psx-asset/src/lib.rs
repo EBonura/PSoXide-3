@@ -1971,16 +1971,17 @@ mod tests {
     fn world_round_trip_1x1_with_wall() {
         use psxed_format::world;
 
-        const SURFACE_LIGHTS: usize = 3;
+        const SURFACE_LIGHT_RECORD_COUNT: usize = 3;
         const WORLD_ROUND_TRIP_LEN: usize = psxed_format::AssetHeader::SIZE
             + psxed_format::world::WorldHeader::SIZE
             + psxed_format::world::SectorRecord::SIZE
             + psxed_format::world::WallRecord::SIZE
-            + SURFACE_LIGHTS * psxed_format::world::SurfaceLightRecord::SIZE;
+            + SURFACE_LIGHT_RECORD_COUNT * psxed_format::world::SurfaceLightRecord::SIZE;
         let payload_len = (world::WorldHeader::SIZE
             + world::SectorRecord::SIZE
             + world::WallRecord::SIZE
-            + SURFACE_LIGHTS * world::SurfaceLightRecord::SIZE) as u32;
+            + SURFACE_LIGHT_RECORD_COUNT * world::SurfaceLightRecord::SIZE)
+            as u32;
         let mut buf = [0u8; WORLD_ROUND_TRIP_LEN];
         buf[0..4].copy_from_slice(&world::MAGIC);
         buf[4..6].copy_from_slice(&world::VERSION.to_le_bytes());
@@ -1995,7 +1996,7 @@ mod tests {
         buf[24..26].copy_from_slice(&1u16.to_le_bytes()); // walls
         buf[26..29].copy_from_slice(&[32, 32, 40]);
         buf[29] = world::world_flags::FOG_ENABLED | world::world_flags::STATIC_VERTEX_LIGHTING;
-        buf[30..32].copy_from_slice(&(SURFACE_LIGHTS as u16).to_le_bytes());
+        buf[30..32].copy_from_slice(&(SURFACE_LIGHT_RECORD_COUNT as u16).to_le_bytes());
 
         let sector = 12 + world::WorldHeader::SIZE;
         buf[sector] = world::sector_flags::HAS_FLOOR | world::sector_flags::FLOOR_WALKABLE;
@@ -2038,7 +2039,10 @@ mod tests {
         assert_eq!(world.sector_size(), psxed_format::world::SECTOR_SIZE);
         assert_eq!(world.material_count(), 2);
         assert_eq!(world.wall_count(), 1);
-        assert_eq!(world.surface_light_count(), SURFACE_LIGHTS as u16);
+        assert_eq!(
+            world.surface_light_count(),
+            SURFACE_LIGHT_RECORD_COUNT as u16
+        );
         assert_eq!(world.ambient_color(), [32, 32, 40]);
         assert!(world.fog_enabled());
         assert!(world.static_vertex_lighting());

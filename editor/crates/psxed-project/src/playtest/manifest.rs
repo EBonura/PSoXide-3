@@ -402,9 +402,6 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n\n");
 
-    out.push_str("/// Legacy side-table hook. Static room lighting is embedded in `.psxw` v3.\n");
-    out.push_str("pub static SURFACE_LIGHTS: &[SurfaceLightRecord] = &[];\n\n");
-
     out.push_str("/// Cooked Character resources — gameplay metadata layered on top of MODELS.\n");
     out.push_str("pub static CHARACTERS: &[LevelCharacterRecord] = &[\n");
     for character in &package.characters {
@@ -709,7 +706,6 @@ use psx_level::{
     ResourceSlot,
     RoomIndex,
     RoomResidencyRecord,
-    SurfaceLightRecord,
     WeaponHitboxIndex,
     WeaponHitboxRecord,
     WeaponHitShapeRecord,

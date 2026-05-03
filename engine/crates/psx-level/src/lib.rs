@@ -106,16 +106,6 @@ pub mod equipment_flags {
     pub const PLAYER: u16 = 1 << 0;
 }
 
-/// Static surface-light record kinds.
-pub mod surface_light_kind {
-    /// Sector floor.
-    pub const FLOOR: u8 = 0;
-    /// Sector ceiling.
-    pub const CEILING: u8 = 1;
-    /// Sector wall.
-    pub const WALL: u8 = 2;
-}
-
 typed_index! {
     /// Clip index local to one model's clip slice.
     pub struct ModelClipIndex;
@@ -620,31 +610,6 @@ pub struct PointLightRecord {
     /// 8-bit RGB tint applied before the per-surface
     /// attenuation weight.
     pub color: [u8; 3],
-    /// Reserved.
-    pub flags: u16,
-}
-
-/// Legacy manifest-side per-surface static lighting.
-///
-/// Current room geometry stores static vertex lighting inside
-/// `.psxw` v3. This record stays in the manifest schema as an
-/// empty compatibility hook for older generated code paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SurfaceLightRecord {
-    /// Owning room index.
-    pub room: RoomIndex,
-    /// Sector X coordinate.
-    pub sx: u16,
-    /// Sector Z coordinate.
-    pub sz: u16,
-    /// One of [`surface_light_kind`].
-    pub kind: u8,
-    /// Runtime wall direction id for walls, `0` otherwise.
-    pub direction: u8,
-    /// Surface ordinal within `(sx, sz, kind, direction)`.
-    pub ordinal: u16,
-    /// Baked RGB tint for the emitted quad's four vertices.
-    pub vertex_rgb: [[u8; 3]; 4],
     /// Reserved.
     pub flags: u16,
 }
