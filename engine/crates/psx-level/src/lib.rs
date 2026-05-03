@@ -6,15 +6,16 @@
 //! contract (master asset table, per-room residency lists) -- the
 //! current backing store is `include_bytes!`, but the same schema
 //! is what future stream-pack / CD-streaming code will resolve
-//! against.
+//! against. Runtime-consumed visibility/PVS records live here too
+//! because the playtest cooker now emits them and the PSX renderer
+//! consumes them directly.
 //!
 //! # Scope
 //!
 //! Only the records that are *both written by the editor compiler
 //! and consumed by the runtime in this same pass* live here. No
-//! speculative future systems (portals, PVS, farfield, lighting,
-//! actors, audio banks) -- they land alongside the writer + reader
-//! that need them.
+//! speculative future systems (farfield, actors, audio banks) --
+//! they land alongside the writer + reader that need them.
 //!
 //! # `no_std`
 //!
@@ -70,6 +71,16 @@ typed_index! {
 typed_index! {
     /// Index into the generated `MATERIALS` table.
     pub struct MaterialIndex;
+}
+
+typed_index! {
+    /// Index into the generated `VISIBILITY_CELLS` table.
+    pub struct VisibilityCellIndex;
+}
+
+typed_index! {
+    /// Index into the generated `VISIBLE_CELLS` table.
+    pub struct VisibleCellIndex;
 }
 
 typed_index! {
@@ -267,6 +278,79 @@ pub struct LevelRoomRecord {
     pub fog_far: i32,
     /// Reserved.
     pub flags: u16,
+}
+
+/// Visibility metadata for one cooked room/chunk. Points into the
+/// generated cell table; individual cells then point into the
+/// flattened per-anchor visible-cell reference table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelRoomVisibilityRecord {
+    /// Owning room index.
+    pub room: RoomIndex,
+    /// First cell record for this room.
+    pub cell_first: VisibilityCellIndex,
+    /// Number of cell records in this room's visibility slice.
+    pub cell_count: u16,
+    /// Reserved.
+    pub flags: u16,
+}
+
+/// Edge bitmasks used by [`LevelVisibilityCellRecord::portal_mask`]
+/// and [`LevelVisibilityCellRecord::blocker_mask`].
+pub mod visibility_edge_flags {
+    /// North edge, negative Z.
+    pub const NORTH: u8 = 1 << 0;
+    /// East edge, positive X.
+    pub const EAST: u8 = 1 << 1;
+    /// South edge, positive Z.
+    pub const SOUTH: u8 = 1 << 2;
+    /// West edge, negative X.
+    pub const WEST: u8 = 1 << 3;
+}
+
+/// Per-cell visibility flags.
+pub mod visibility_cell_flags {
+    /// Cell contains renderable room geometry.
+    pub const HAS_GEOMETRY: u16 = 1 << 0;
+}
+
+/// One generated grid cell with precomputed bounds and portal/blocker
+/// metadata. Bounds are room-local engine units and are used by the
+/// runtime to avoid walking wall/floor records just to frustum-test a
+/// cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelVisibilityCellRecord {
+    /// Owning room index.
+    pub room: RoomIndex,
+    /// Grid X coordinate inside the cooked `.psxw`.
+    pub x: u16,
+    /// Grid Z coordinate inside the cooked `.psxw`.
+    pub z: u16,
+    /// Minimum authored surface height in this cell.
+    pub min_y: i32,
+    /// Maximum authored surface height in this cell.
+    pub max_y: i32,
+    /// Cardinal edges that are considered open for conservative
+    /// portal-style visibility traversal.
+    pub portal_mask: u8,
+    /// Cardinal edges that contain a conservative full-height solid
+    /// blocker.
+    pub blocker_mask: u8,
+    /// First visible-cell reference for this anchor cell.
+    pub visible_first: VisibleCellIndex,
+    /// Number of visible-cell references for this anchor cell.
+    pub visible_count: u16,
+    /// Reserved.
+    pub flags: u16,
+}
+
+/// One reference from an anchor cell to a potentially visible cell.
+/// The table is flattened so every anchor cell can have a compact
+/// far-to-near traversal list without heap allocation at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelVisibleCellRecord {
+    /// Referenced cell in the generated `VISIBILITY_CELLS` table.
+    pub cell: VisibilityCellIndex,
 }
 
 /// One material slot for one room. The compiler emits records

@@ -31,20 +31,21 @@
 extern crate psx_rt;
 
 use psx_asset::{Animation, Model, Texture};
-#[cfg(not(feature = "world-grid-visible"))]
 use psx_engine::draw_room_vertex_lit;
 use psx_engine::{
     button, compute_joint_world_transform, telemetry, Angle, App, CharacterMotorAnim,
     CharacterMotorConfig, CharacterMotorInput, CharacterMotorState, Config, Ctx, CullMode,
     DepthBand, DepthPolicy, DepthRange, JointViewTransform, JointWorldTransform, LocalToWorldScale,
     Mat3I16, MaterialTint, OtFrame, PointLightSample, PrimitiveArena, ProjectedVertex, Rgb8,
-    RoomPoint, RuntimeRoom, Scene, TexturedModelRenderStats, ThirdPersonCameraConfig,
+    RoomPoint, RoomRender, RuntimeRoom, Scene, TexturedModelRenderStats, ThirdPersonCameraConfig,
     ThirdPersonCameraInput, ThirdPersonCameraState, ThirdPersonCameraTarget, WorldCamera,
     WorldProjection, WorldRenderMaterial, WorldRenderPass, WorldSurfaceLighting,
     WorldSurfaceOptions, WorldSurfaceSample, WorldTriCommand, WorldVertex, Q8,
 };
 #[cfg(feature = "world-grid-visible")]
-use psx_engine::{draw_room_vertex_lit_grid_visible, GridVisibility};
+use psx_engine::{
+    draw_room_vertex_lit_visible_cells, GridVisibility, GridVisibilityStats, GridVisibleCell,
+};
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{
     draw_quad_flat,
@@ -78,7 +79,7 @@ mod generated {
 use generated::{
     ASSETS, CHARACTERS, ENTITIES, EQUIPMENT, LIGHTS, MATERIALS, MODELS, MODEL_CLIPS,
     MODEL_INSTANCES, MODEL_SOCKETS, PLAYER_CONTROLLER, PLAYER_SPAWN, ROOMS, ROOM_RESIDENCY,
-    WEAPONS, WEAPON_HITBOXES,
+    ROOM_VISIBILITY, VISIBILITY_CELLS, VISIBLE_CELLS, WEAPONS, WEAPON_HITBOXES,
 };
 
 // VRAM layout. Room materials and model atlases live in
@@ -177,6 +178,8 @@ const ACTOR_BAND: DepthBand = DepthBand::new(0, ACTOR_BAND_BACK);
 const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, FAR_Z);
 #[cfg(feature = "world-grid-visible")]
 const ROOM_GRID_VISIBILITY_RADIUS: u16 = 4;
+#[cfg(feature = "world-grid-visible")]
+const MAX_PRECOMPUTED_VISIBLE_CELLS: usize = 128;
 
 const MAX_TEXTURED_TRIS: usize = 4096;
 
@@ -711,16 +714,39 @@ impl Scene for Playtest {
                         player.y,
                         player.z.saturating_sub(active.offset_z),
                     );
-                    let stats = draw_room_vertex_lit_grid_visible(
+                    let visibility =
+                        GridVisibility::around(visibility_anchor, ROOM_GRID_VISIBILITY_RADIUS);
+                    let mut cells =
+                        [GridVisibleCell::EMPTY; MAX_PRECOMPUTED_VISIBLE_CELLS];
+                    let stats = if let Some(count) = fill_precomputed_visible_cells(
+                        active.index,
                         active.room.render(),
-                        materials,
-                        &lighting,
-                        &room_camera,
-                        room_options,
-                        GridVisibility::around(visibility_anchor, ROOM_GRID_VISIBILITY_RADIUS),
-                        &mut gouraud_triangles,
-                        &mut world,
-                    );
+                        visibility_anchor,
+                        &mut cells,
+                    ) {
+                        draw_room_vertex_lit_visible_cells(
+                            active.room.render(),
+                            materials,
+                            &lighting,
+                            &room_camera,
+                            room_options,
+                            &cells[..count],
+                            visibility.screen_margin,
+                            &mut gouraud_triangles,
+                            &mut world,
+                        )
+                    } else {
+                        draw_room_vertex_lit(
+                            active.room.render(),
+                            materials,
+                            &lighting,
+                            &room_camera,
+                            room_options,
+                            &mut gouraud_triangles,
+                            &mut world,
+                        );
+                        GridVisibilityStats::default()
+                    };
                     telemetry::counter(
                         telemetry::counter::ROOM_CELLS_CONSIDERED,
                         stats.cells_considered as u32,
@@ -1647,6 +1673,52 @@ fn emit_model_counters(
 fn parse_runtime_room(record: &LevelRoomRecord) -> Option<RuntimeRoom<'static>> {
     let asset = find_asset_of_kind(ASSETS, record.world_asset, AssetKind::RoomWorld)?;
     RuntimeRoom::from_bytes(asset.bytes).ok()
+}
+
+#[cfg(feature = "world-grid-visible")]
+fn fill_precomputed_visible_cells(
+    room_index: RoomIndex,
+    room: RoomRender<'_, '_>,
+    anchor: RoomPoint,
+    out: &mut [GridVisibleCell],
+) -> Option<usize> {
+    let room_visibility = ROOM_VISIBILITY
+        .iter()
+        .find(|visibility| visibility.room == room_index)?;
+    let first = room_visibility.cell_first.to_usize();
+    let count = room_visibility.cell_count as usize;
+    let room_cells = VISIBILITY_CELLS.get(first..first.checked_add(count)?)?;
+    let sector_size = room.sector_size().max(1);
+    let anchor_x = grid_cell_for_room(anchor.x, sector_size).clamp(0, room.width() as i32 - 1);
+    let anchor_z = grid_cell_for_room(anchor.z, sector_size).clamp(0, room.depth() as i32 - 1);
+    let anchor_cell = room_cells
+        .iter()
+        .find(|cell| cell.x as i32 == anchor_x && cell.z as i32 == anchor_z)?;
+    let visible_first = anchor_cell.visible_first.to_usize();
+    let visible_count = anchor_cell.visible_count as usize;
+    if visible_count > out.len() {
+        return None;
+    }
+    let visible = VISIBLE_CELLS.get(visible_first..visible_first.checked_add(visible_count)?)?;
+    let mut written = 0usize;
+    for reference in visible {
+        let cell = *VISIBILITY_CELLS.get(reference.cell.to_usize())?;
+        if cell.room != room_index {
+            return None;
+        }
+        out[written] = GridVisibleCell::new(cell.x, cell.z, cell.min_y, cell.max_y);
+        written += 1;
+    }
+    Some(written)
+}
+
+#[cfg(feature = "world-grid-visible")]
+fn grid_cell_for_room(value: i32, sector_size: i32) -> i32 {
+    if value >= 0 {
+        value / sector_size
+    } else {
+        (value - sector_size + 1) / sector_size
+    }
 }
 
 fn build_active_room(

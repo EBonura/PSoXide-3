@@ -95,6 +95,49 @@ pub struct PlaytestRoom {
     pub flags: u16,
 }
 
+/// Per-room slice into generated visibility cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaytestRoomVisibility {
+    /// Owning room index.
+    pub room: u16,
+    /// First index into [`PlaytestPackage::visibility_cells`].
+    pub cell_first: u16,
+    /// Number of visibility cells for this room.
+    pub cell_count: u16,
+}
+
+/// One cooked room grid cell with precomputed visibility metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaytestVisibilityCell {
+    /// Owning room index.
+    pub room: u16,
+    /// Cell X coordinate inside the cooked `.psxw`.
+    pub x: u16,
+    /// Cell Z coordinate inside the cooked `.psxw`.
+    pub z: u16,
+    /// Minimum surface height in room-local engine units.
+    pub min_y: i32,
+    /// Maximum surface height in room-local engine units.
+    pub max_y: i32,
+    /// Cardinal portal/open-edge mask.
+    pub portal_mask: u8,
+    /// Cardinal full-height solid-blocker mask.
+    pub blocker_mask: u8,
+    /// First index into [`PlaytestPackage::visible_cells`].
+    pub visible_first: u16,
+    /// Number of visible-cell references for this anchor.
+    pub visible_count: u16,
+    /// Runtime flags.
+    pub flags: u16,
+}
+
+/// One flattened PVS reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaytestVisibleCell {
+    /// Index into [`PlaytestPackage::visibility_cells`].
+    pub cell: u16,
+}
+
 /// One material slot binding. Lifted from
 /// [`CookedWorldMaterial`] and pinned to its owning room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +472,12 @@ pub struct PlaytestPackage {
     pub rooms: Vec<PlaytestRoom>,
     /// Material records ordered as `(room, local_slot)`.
     pub materials: Vec<PlaytestMaterial>,
+    /// Per-room visibility slices.
+    pub room_visibility: Vec<PlaytestRoomVisibility>,
+    /// Per-cell visibility metadata.
+    pub visibility_cells: Vec<PlaytestVisibilityCell>,
+    /// Flattened per-anchor visible-cell references.
+    pub visible_cells: Vec<PlaytestVisibleCell>,
     /// Cooked model bundles, deduplicated across instances.
     pub models: Vec<PlaytestModel>,
     /// Per-model clip records ordered as `(model, clip_index)`.

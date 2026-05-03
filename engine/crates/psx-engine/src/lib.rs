@@ -116,9 +116,9 @@ pub use world::{
 };
 pub use world_render::{
     draw_room, draw_room_lit, draw_room_lit_grid_visible, draw_room_vertex_lit,
-    draw_room_vertex_lit_grid_visible, GridVisibility, GridVisibilityStats, NoWorldSurfaceLighting,
-    SurfaceSidedness, WorldRenderMaterial, WorldSurfaceKind, WorldSurfaceLighting,
-    WorldSurfaceSample,
+    draw_room_vertex_lit_grid_visible, draw_room_vertex_lit_visible_cells, GridVisibility,
+    GridVisibilityStats, GridVisibleCell, NoWorldSurfaceLighting, SurfaceSidedness,
+    WorldRenderMaterial, WorldSurfaceKind, WorldSurfaceLighting, WorldSurfaceSample,
 };
 
 /// Button-mask constants (UP, DOWN, CROSS, START, …) re-exported

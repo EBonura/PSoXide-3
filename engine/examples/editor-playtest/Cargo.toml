@@ -16,7 +16,7 @@ codegen-units = 1
 lto           = true
 
 [features]
-default = ["world-order-global"]
+default = ["world-order-bucketed", "world-grid-visible"]
 world-order-global = []
 world-order-slot = []
 world-order-linked = []

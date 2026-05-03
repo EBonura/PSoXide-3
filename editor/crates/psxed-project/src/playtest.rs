@@ -31,6 +31,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use psx_level::{visibility_cell_flags, visibility_edge_flags};
 use psxed_format::world as psxw;
 
 use crate::streaming::{plan_generated_chunks, StreamingChunkConfig};
@@ -128,6 +129,9 @@ pub fn build_package(
         std::collections::HashMap::new();
     let mut room_chunks_by_node: HashMap<NodeId, Vec<AuthoredRoomChunk>> = HashMap::new();
     let mut room_bake_inputs: Vec<CookedRoomBakeInput> = Vec::new();
+    let mut room_visibility: Vec<PlaytestRoomVisibility> = Vec::new();
+    let mut visibility_cells: Vec<PlaytestVisibilityCell> = Vec::new();
+    let mut visible_cells: Vec<PlaytestVisibleCell> = Vec::new();
 
     for room_node in &room_nodes {
         let NodeKind::Room { grid } = &room_node.kind else {
@@ -258,6 +262,14 @@ pub fn build_package(
             }
             let material_count =
                 u16::try_from(materials.len() - material_first as usize).unwrap_or(u16::MAX);
+
+            append_room_visibility(
+                room_index,
+                &cooked,
+                &mut room_visibility,
+                &mut visibility_cells,
+                &mut visible_cells,
+            );
 
             rooms.push(PlaytestRoom {
                 name: chunk_room_name(&room_node.name, chunk_count, chunk.index),
@@ -725,6 +737,9 @@ pub fn build_package(
             assets,
             rooms,
             materials,
+            room_visibility,
+            visibility_cells,
+            visible_cells,
             models,
             model_clips,
             model_sockets,
@@ -1725,6 +1740,302 @@ fn isqrt_u32(value: u32) -> u32 {
     r
 }
 
+const FULL_HEIGHT_BLOCKER_TOLERANCE: i32 = 32;
+
+fn append_room_visibility(
+    room_index: u16,
+    cooked: &CookedWorldGrid,
+    room_visibility: &mut Vec<PlaytestRoomVisibility>,
+    visibility_cells: &mut Vec<PlaytestVisibilityCell>,
+    visible_cells: &mut Vec<PlaytestVisibleCell>,
+) {
+    let cell_first = u16::try_from(visibility_cells.len()).unwrap_or(u16::MAX);
+    let mut local_cells = build_visibility_cells(room_index, cooked);
+    let cell_count = u16::try_from(local_cells.len()).unwrap_or(u16::MAX);
+    let index_by_coord = visibility_index_by_coord(cooked.width, cooked.depth, &local_cells);
+    assign_visibility_portals(
+        cooked.width,
+        cooked.depth,
+        &index_by_coord,
+        &mut local_cells,
+    );
+
+    for local_index in 0..local_cells.len() {
+        let visible_first = u16::try_from(visible_cells.len()).unwrap_or(u16::MAX);
+        let visible = visible_cells_for_anchor(
+            local_index,
+            cooked.width,
+            cooked.depth,
+            &local_cells,
+            &index_by_coord,
+        );
+        local_cells[local_index].visible_first = visible_first;
+        local_cells[local_index].visible_count = u16::try_from(visible.len()).unwrap_or(u16::MAX);
+        for visible_local in visible {
+            let global_index = (cell_first as usize).saturating_add(visible_local);
+            visible_cells.push(PlaytestVisibleCell {
+                cell: u16::try_from(global_index).unwrap_or(u16::MAX),
+            });
+        }
+    }
+
+    visibility_cells.extend(local_cells);
+    room_visibility.push(PlaytestRoomVisibility {
+        room: room_index,
+        cell_first,
+        cell_count,
+    });
+}
+
+fn build_visibility_cells(
+    room_index: u16,
+    cooked: &CookedWorldGrid,
+) -> Vec<PlaytestVisibilityCell> {
+    let mut out = Vec::new();
+    for x in 0..cooked.width {
+        for z in 0..cooked.depth {
+            let Some(sector) = cooked_sector(cooked, x, z) else {
+                continue;
+            };
+            let (min_y, max_y) = cooked_sector_y_bounds(sector, cooked.sector_size);
+            out.push(PlaytestVisibilityCell {
+                room: room_index,
+                x,
+                z,
+                min_y,
+                max_y,
+                portal_mask: 0,
+                blocker_mask: blocker_mask_for_sector(sector, cooked.sector_size),
+                visible_first: 0,
+                visible_count: 0,
+                flags: visibility_cell_flags::HAS_GEOMETRY,
+            });
+        }
+    }
+    out
+}
+
+fn visibility_index_by_coord(
+    width: u16,
+    depth: u16,
+    cells: &[PlaytestVisibilityCell],
+) -> Vec<Option<usize>> {
+    let mut out = vec![None; (width as usize).saturating_mul(depth as usize)];
+    for (index, cell) in cells.iter().enumerate() {
+        if let Some(flat) = visibility_flat_index(depth, cell.x, cell.z) {
+            if let Some(slot) = out.get_mut(flat) {
+                *slot = Some(index);
+            }
+        }
+    }
+    out
+}
+
+fn assign_visibility_portals(
+    width: u16,
+    depth: u16,
+    index_by_coord: &[Option<usize>],
+    cells: &mut [PlaytestVisibilityCell],
+) {
+    for index in 0..cells.len() {
+        let x = cells[index].x;
+        let z = cells[index].z;
+        let mut mask = 0u8;
+        for edge in VISIBILITY_EDGES {
+            let Some((nx, nz)) = neighbour_cell(width, depth, x, z, edge.dx, edge.dz) else {
+                continue;
+            };
+            let Some(neighbour_index) = visibility_cell_index(index_by_coord, depth, nx, nz) else {
+                continue;
+            };
+            let this_blocked = cells[index].blocker_mask & edge.bit != 0;
+            let neighbour_blocked = cells[neighbour_index].blocker_mask & edge.opposite_bit != 0;
+            if !this_blocked && !neighbour_blocked {
+                mask |= edge.bit;
+            }
+        }
+        cells[index].portal_mask = mask;
+    }
+}
+
+fn visible_cells_for_anchor(
+    anchor_index: usize,
+    _width: u16,
+    _depth: u16,
+    cells: &[PlaytestVisibilityCell],
+    index_by_coord: &[Option<usize>],
+) -> Vec<usize> {
+    if anchor_index >= cells.len() {
+        return Vec::new();
+    }
+    let _ = index_by_coord;
+    let anchor = cells[anchor_index];
+    let mut visible: Vec<usize> = (0..cells.len()).collect();
+
+    visible.sort_by(|&a, &b| {
+        let ca = cells[a];
+        let cb = cells[b];
+        let da = chebyshev_distance(anchor, ca);
+        let db = chebyshev_distance(anchor, cb);
+        db.cmp(&da).then(ca.x.cmp(&cb.x)).then(ca.z.cmp(&cb.z))
+    });
+    visible
+}
+
+#[derive(Clone, Copy)]
+struct VisibilityEdge {
+    bit: u8,
+    opposite_bit: u8,
+    dx: i32,
+    dz: i32,
+}
+
+const VISIBILITY_EDGES: [VisibilityEdge; 4] = [
+    VisibilityEdge {
+        bit: visibility_edge_flags::NORTH,
+        opposite_bit: visibility_edge_flags::SOUTH,
+        dx: 0,
+        dz: -1,
+    },
+    VisibilityEdge {
+        bit: visibility_edge_flags::EAST,
+        opposite_bit: visibility_edge_flags::WEST,
+        dx: 1,
+        dz: 0,
+    },
+    VisibilityEdge {
+        bit: visibility_edge_flags::SOUTH,
+        opposite_bit: visibility_edge_flags::NORTH,
+        dx: 0,
+        dz: 1,
+    },
+    VisibilityEdge {
+        bit: visibility_edge_flags::WEST,
+        opposite_bit: visibility_edge_flags::EAST,
+        dx: -1,
+        dz: 0,
+    },
+];
+
+fn chebyshev_distance(anchor: PlaytestVisibilityCell, cell: PlaytestVisibilityCell) -> i32 {
+    (cell.x as i32 - anchor.x as i32)
+        .abs()
+        .max((cell.z as i32 - anchor.z as i32).abs())
+}
+
+fn visibility_cell_index(
+    index_by_coord: &[Option<usize>],
+    depth: u16,
+    x: u16,
+    z: u16,
+) -> Option<usize> {
+    let flat = visibility_flat_index(depth, x, z)?;
+    index_by_coord.get(flat).copied().flatten()
+}
+
+fn visibility_flat_index(depth: u16, x: u16, z: u16) -> Option<usize> {
+    (x as usize)
+        .checked_mul(depth as usize)?
+        .checked_add(z as usize)
+}
+
+fn neighbour_cell(width: u16, depth: u16, x: u16, z: u16, dx: i32, dz: i32) -> Option<(u16, u16)> {
+    let nx = x as i32 + dx;
+    let nz = z as i32 + dz;
+    if nx < 0 || nz < 0 || nx > u16::MAX as i32 || nz > u16::MAX as i32 {
+        return None;
+    }
+    let nx = nx as u16;
+    let nz = nz as u16;
+    if nx >= width || nz >= depth {
+        return None;
+    }
+    Some((nx, nz))
+}
+
+fn cooked_sector(
+    cooked: &CookedWorldGrid,
+    x: u16,
+    z: u16,
+) -> Option<&crate::world_cook::CookedGridSector> {
+    let index = (x as usize)
+        .checked_mul(cooked.depth as usize)?
+        .checked_add(z as usize)?;
+    cooked.sectors.get(index)?.as_ref()
+}
+
+fn cooked_sector_y_bounds(
+    sector: &crate::world_cook::CookedGridSector,
+    sector_size: i32,
+) -> (i32, i32) {
+    let mut min_y = i32::MAX;
+    let mut max_y = i32::MIN;
+    let mut any = false;
+    if let Some(face) = sector.floor {
+        include_cooked_heights(&mut min_y, &mut max_y, &mut any, face.heights);
+    }
+    if let Some(face) = sector.ceiling {
+        include_cooked_heights(&mut min_y, &mut max_y, &mut any, face.heights);
+    }
+    for wall in sector
+        .walls
+        .north
+        .iter()
+        .chain(sector.walls.east.iter())
+        .chain(sector.walls.south.iter())
+        .chain(sector.walls.west.iter())
+    {
+        include_cooked_heights(&mut min_y, &mut max_y, &mut any, wall.heights);
+    }
+    if any {
+        (min_y, max_y)
+    } else {
+        (0, sector_size)
+    }
+}
+
+fn include_cooked_heights(min_y: &mut i32, max_y: &mut i32, any: &mut bool, heights: [i32; 4]) {
+    for height in heights {
+        *min_y = (*min_y).min(height);
+        *max_y = (*max_y).max(height);
+        *any = true;
+    }
+}
+
+fn blocker_mask_for_sector(sector: &crate::world_cook::CookedGridSector, sector_size: i32) -> u8 {
+    let mut mask = 0u8;
+    if has_full_height_solid_wall(&sector.walls.north, sector_size) {
+        mask |= visibility_edge_flags::NORTH;
+    }
+    if has_full_height_solid_wall(&sector.walls.east, sector_size) {
+        mask |= visibility_edge_flags::EAST;
+    }
+    if has_full_height_solid_wall(&sector.walls.south, sector_size) {
+        mask |= visibility_edge_flags::SOUTH;
+    }
+    if has_full_height_solid_wall(&sector.walls.west, sector_size) {
+        mask |= visibility_edge_flags::WEST;
+    }
+    mask
+}
+
+fn has_full_height_solid_wall(
+    walls: &[crate::world_cook::CookedGridVerticalFace],
+    sector_size: i32,
+) -> bool {
+    walls.iter().any(|wall| {
+        if !wall.solid {
+            return false;
+        }
+        let bottom = wall.heights[0].min(wall.heights[1]);
+        let top = wall.heights[2].max(wall.heights[3]);
+        top.saturating_sub(bottom)
+            >= sector_size
+                .saturating_sub(FULL_HEIGHT_BLOCKER_TOLERANCE)
+                .max(sector_size / 2)
+    })
+}
+
 fn grid_rect(grid: &WorldGrid, origin: [u16; 2], size: [u16; 2]) -> Option<WorldGrid> {
     if size[0] == 0 || size[1] == 0 {
         return None;
@@ -2056,6 +2367,14 @@ mod tests {
         let package = package.expect("package returned on ok report");
         assert_eq!(package.rooms.len(), 1);
         assert_eq!(package.room_asset_count(), 1);
+        assert_eq!(package.room_visibility.len(), 1);
+        assert!(!package.visibility_cells.is_empty());
+        assert!(!package.visible_cells.is_empty());
+        assert_eq!(
+            package.visibility_cells[0].visible_count as usize,
+            package.visibility_cells.len(),
+            "starter visibility is conservative and includes every generated cell"
+        );
         assert!(package.spawn.is_some());
     }
 
@@ -2529,6 +2848,9 @@ mod tests {
         assert!(src.contains("pub static ASSETS"));
         assert!(src.contains("pub static MATERIALS"));
         assert!(src.contains("pub static ROOMS"));
+        assert!(src.contains("pub static ROOM_VISIBILITY"));
+        assert!(src.contains("pub static VISIBILITY_CELLS"));
+        assert!(src.contains("pub static VISIBLE_CELLS"));
         assert!(src.contains("pub static ROOM_RESIDENCY"));
         assert!(src.contains("pub static PLAYER_SPAWN"));
         assert!(src.contains("pub static ENTITIES"));

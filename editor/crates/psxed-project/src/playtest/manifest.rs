@@ -137,6 +137,48 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n\n");
 
+    out.push_str("/// Per-room visibility slices.\n");
+    out.push_str("pub static ROOM_VISIBILITY: &[LevelRoomVisibilityRecord] = &[\n");
+    for visibility in &package.room_visibility {
+        let _ = writeln!(
+            out,
+            "    LevelRoomVisibilityRecord {{ room: RoomIndex({}), cell_first: VisibilityCellIndex({}), cell_count: {}, flags: 0 }},",
+            visibility.room, visibility.cell_first, visibility.cell_count,
+        );
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// Cooked grid-cell visibility metadata.\n");
+    out.push_str("pub static VISIBILITY_CELLS: &[LevelVisibilityCellRecord] = &[\n");
+    for cell in &package.visibility_cells {
+        let _ = writeln!(
+            out,
+            "    LevelVisibilityCellRecord {{ room: RoomIndex({}), x: {}, z: {}, min_y: {}, max_y: {}, portal_mask: {}, blocker_mask: {}, visible_first: VisibleCellIndex({}), visible_count: {}, flags: {} }},",
+            cell.room,
+            cell.x,
+            cell.z,
+            cell.min_y,
+            cell.max_y,
+            cell.portal_mask,
+            cell.blocker_mask,
+            cell.visible_first,
+            cell.visible_count,
+            cell.flags,
+        );
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// Flattened per-anchor potentially visible cell references.\n");
+    out.push_str("pub static VISIBLE_CELLS: &[LevelVisibleCellRecord] = &[\n");
+    for cell in &package.visible_cells {
+        let _ = writeln!(
+            out,
+            "    LevelVisibleCellRecord {{ cell: VisibilityCellIndex({}) }},",
+            cell.cell,
+        );
+    }
+    out.push_str("];\n\n");
+
     // Per-room residency: required RAM = the room's world
     // asset + every model mesh + every animation clip
     // referenced by an instance OR by the player character in
@@ -691,6 +733,9 @@ use psx_level::{
     LevelModelRecord,
     LevelModelSocketRecord,
     LevelRoomRecord,
+    LevelRoomVisibilityRecord,
+    LevelVisibilityCellRecord,
+    LevelVisibleCellRecord,
     LevelWeaponRecord,
     MaterialIndex,
     MaterialSlot,
@@ -706,6 +751,8 @@ use psx_level::{
     ResourceSlot,
     RoomIndex,
     RoomResidencyRecord,
+    VisibilityCellIndex,
+    VisibleCellIndex,
     WeaponHitboxIndex,
     WeaponHitboxRecord,
     WeaponHitShapeRecord,
