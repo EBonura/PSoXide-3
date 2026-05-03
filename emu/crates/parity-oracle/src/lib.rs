@@ -27,4 +27,4 @@ mod launch;
 
 pub use config::OracleConfig;
 pub use error::OracleError;
-pub use launch::{ReduxProcess, StateCheckpoint};
+pub use launch::{ExeLoadInfo, ReduxProcess, StateCheckpoint, VblankRun};

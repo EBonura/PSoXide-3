@@ -53,22 +53,22 @@ VSync timing without trusting the GPU's VBlank IRQ.
 Writing the mode register is surprisingly effectful: it **resets
 the counter to 0** as a side effect, and re-arms the IRQ latch.
 
-## Ticking (not yet implemented)
+## Ticking
 
-The emulator's `Timers` module is register-backing only as of
-phase 2e -- counters don't advance on their own. To make them
-useful we need:
+The emulator advances root counters from the bus cycle clock. To keep
+the hot CPU path cheap, `Bus` synchronizes the timer bank lazily at
+scheduler drains and timer MMIO accesses instead of ticking all three
+counters every instruction.
 
-1. A system cycle counter on `Bus` that advances each time the
-   CPU retires an instruction.
-2. A per-timer "cycles until next tick" calculation derived from
-   the clock source.
-3. A `Bus::tick(cycles)` that advances all three timers, raises
-   `IrqSource::Timer0`..=`Timer2` on target matches, and wraps
-   / resets per mode bit 3.
+Timer 0 converts cycles through the current GPU dot-clock divisor when
+bits 9:8 select dot clock. Timer 1 converts cycles to HBlank ticks when
+bits 9:8 select HBlank. Timer 2 supports the system-clock and system/8
+sources, with Redux-compatible stop behavior for sync modes 1/2.
 
-This is the natural first consumer of the cycle model; VBlank
-generation from GPU scan-out depends on the same counter.
+Redux does not implement Timer 0/1 sync gate/reset semantics beyond the
+clock-source and IRQ effects. PSoXide mirrors that: Timer 1 mode
+`0x0103`, used by the SDK `vsync()` helper, continues counting across
+VBlank instead of resetting on the VBlank IRQ edge.
 
 ## Rust shape
 
@@ -77,6 +77,7 @@ pub struct Timer {
     pub counter: u32,   // 16-bit meaningful
     pub mode:    u32,
     pub target:  u32,
+    // plus accumulator and diagnostic cycle fields
 }
 
 pub struct Timers {
@@ -88,8 +89,9 @@ impl Timers {
     pub const SIZE:   u32 = 0x30;
     pub const STRIDE: u32 = 0x10;
     pub fn contains(phys: u32) -> bool;
-    pub fn read32(&self, phys: u32) -> u32;
-    pub fn write32(&mut self, phys: u32, value: u32);
+    pub fn advance_to(&mut self, now: u64, hsync_period: u64, dot_clock_divisor: u64) -> u8;
+    pub fn read32(&mut self, phys: u32) -> u32;
+    pub fn write32(&mut self, phys: u32, value: u32, now: u64);
 }
 ```
 
@@ -97,4 +99,4 @@ impl Timers {
 
 - Nocash PSX-SPX -- "Timers"
 - PCSX-Redux `src/core/psxcounters.cc` -- the real ticking implementation
-- `emulator_core::timers` -- our register-backing impl
+- `emulator_core::timers` -- PSoXide's timed counter implementation

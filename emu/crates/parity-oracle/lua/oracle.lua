@@ -1,10 +1,17 @@
 -- oracle.lua — synchronous command/response protocol.
 --
--- Requires a Redux built with these patched-in Lua bindings:
---   PCSX.stepIn()             -- Debug::stepIn
---   PCSX.runExecute()         -- CPU::Execute (synchronous)
---   PCSX.setQuietPauseResume  -- suppress ExecutionFlow::Run/Pause events
---                                during stepping; essential for performance.
+-- Requires a Redux built with the PSoXide oracle Lua bindings:
+--   PCSX.stepIn()              -- Debug::stepIn
+--   PCSX.runExecute()          -- CPU::Execute (synchronous)
+--   PCSX.setQuietPauseResume() -- suppress ExecutionFlow::Run/Pause events
+--                                 during stepping; essential for performance.
+--   PCSX.getMemPtr() / getRomPtr() / getScratchPtr()
+--   PCSX.getRegisters()        -- includes GPR, COP0, COP2, PC, cycles.
+--   PCSX.getCPUCycles()
+--   PCSX.invalidateCache()
+--   PCSX.GPU.takeScreenShot()
+--   PCSX.drainAudioFrames()
+--   PCSX.SIO0 slot/pad override tables.
 --
 -- Execution model:
 --
@@ -148,6 +155,86 @@ local function read_instruction(pc)
         return tonumber(ffi.cast("uint32_t*", rom_ptr + (phys - 0x1FC00000))[0])
     end
     return 0
+end
+
+local function read_u32_le(bytes, offset)
+    local b0, b1, b2, b3 = string.byte(bytes, offset + 1, offset + 4)
+    if not b3 then
+        error("truncated u32 at offset " .. tostring(offset))
+    end
+    return b0 + b1 * 0x100 + b2 * 0x10000 + b3 * 0x1000000
+end
+
+local function ram_offset(addr, len, label)
+    local phys = bit.band(addr, 0x1FFFFFFF)
+    if phys >= 0x00800000 then
+        error(string.format("%s address outside RAM: 0x%08x", label, addr))
+    end
+    local off = phys % 0x00200000
+    if off + len > 0x00200000 then
+        error(string.format("%s overflows RAM: addr=0x%08x len=%d", label, addr, len))
+    end
+    return off
+end
+
+local function load_exe_into_ram(path)
+    local file = io.open(path, "rb")
+    if not file then
+        error("cannot open " .. path)
+    end
+    local bytes = file:read("*a")
+    file:close()
+
+    if not bytes or #bytes < 2048 then
+        error("file shorter than PSX-EXE header")
+    end
+    if string.sub(bytes, 1, 8) ~= "PS-X EXE" then
+        error("bad PSX-EXE magic")
+    end
+
+    local initial_pc = read_u32_le(bytes, 0x10)
+    local initial_gp = read_u32_le(bytes, 0x14)
+    local load_addr = read_u32_le(bytes, 0x18)
+    local payload_len = read_u32_le(bytes, 0x1c)
+    local bss_addr = read_u32_le(bytes, 0x28)
+    local bss_size = read_u32_le(bytes, 0x2c)
+    local sp_base = read_u32_le(bytes, 0x30)
+    local sp_offset = read_u32_le(bytes, 0x34)
+
+    if #bytes - 2048 < payload_len then
+        error(string.format(
+            "truncated payload: expected %d bytes, got %d",
+            payload_len,
+            #bytes - 2048))
+    end
+
+    local payload = string.sub(bytes, 2049, 2048 + payload_len)
+    ffi.copy(ram_ptr + ram_offset(load_addr, payload_len, "EXE payload"), payload, payload_len)
+    if bss_size > 0 then
+        ffi.fill(ram_ptr + ram_offset(bss_addr, bss_size, "EXE BSS"), bss_size, 0)
+    end
+
+    local stack_pointer = nil
+    if sp_base ~= 0 or sp_offset ~= 0 then
+        stack_pointer = (sp_base + sp_offset) % 0x100000000
+        regs.GPR.r[29] = stack_pointer
+        regs.GPR.r[30] = stack_pointer
+    end
+    regs.GPR.r[0] = 0
+    regs.GPR.r[28] = initial_gp
+    regs.pc = initial_pc
+    regs_ext[0].code = 0
+    PCSX.invalidateCache()
+
+    return {
+        initial_pc = initial_pc,
+        initial_gp = initial_gp,
+        load_addr = load_addr,
+        payload_len = payload_len,
+        bss_addr = bss_addr,
+        bss_size = bss_size,
+        stack_pointer = stack_pointer,
+    }
 end
 
 -- Format `[v0,v1,...,v31]` from a 32-entry u32 cdata array. Used for
@@ -432,6 +519,82 @@ local function run()
             end
             local tick = tonumber(PCSX.getCPUCycles())
             send(string.format("run ok tick=%d", tick))
+
+        elseif cmd == "load_exe" then
+            -- `load_exe PATH` -- side-load a PSX-EXE into the current
+            -- warmed machine state. Rust is responsible for running
+            -- the BIOS warmup first when it wants real-BIOS parity;
+            -- this command only mirrors the BIOS loader's EXE copy,
+            -- BSS clear, PC/GP/SP seed, and I-cache invalidation.
+            local path = line:match("^load_exe%s+(.+)$")
+            if not path then
+                send("err load_exe: missing path")
+            else
+                local ok, info = pcall(function()
+                    return load_exe_into_ram(path)
+                end)
+                if ok then
+                    send(string.format(
+                        "load_exe ok pc=%d gp=%d load=%d payload=%d bss_addr=%d bss_size=%d sp=%s",
+                        info.initial_pc,
+                        info.initial_gp,
+                        info.load_addr,
+                        info.payload_len,
+                        info.bss_addr,
+                        info.bss_size,
+                        info.stack_pointer and tostring(info.stack_pointer) or "none"))
+                else
+                    send("err load_exe: " .. tostring(info))
+                end
+            end
+
+        elseif cmd == "run_vblanks" then
+            -- `run_vblanks FRAMES MAX_STEPS` -- run until VBlank has
+            -- risen FRAMES more times, capped by MAX_STEPS so a hung
+            -- program fails loudly instead of blocking the oracle.
+            -- The VBlank latch may already be high after BIOS warmup;
+            -- acknowledge it first so this waits for future edges.
+            local frames_str, max_steps_str = line:match("^run_vblanks%s+(%d+)%s+(%d+)$")
+            local frames = tonumber(frames_str) or 0
+            local max_steps = tonumber(max_steps_str) or 0
+            if frames == 0 or max_steps == 0 then
+                send("err run_vblanks: bad args")
+            else
+                local hw_ptr = get_hw_ptr()
+                local istat_ptr = ffi.cast("uint32_t*", hw_ptr + 0x1070)
+                istat_ptr[0] = math.floor((tonumber(istat_ptr[0]) or 0) / 2) * 2
+                local prev = bit.band(tonumber(istat_ptr[0]) or 0, 0x1)
+                local seen = 0
+                local steps = 0
+                for i = 1, max_steps do
+                    PCSX.stepIn()
+                    PCSX.runExecute()
+                    steps = i
+                    local cur = bit.band(tonumber(istat_ptr[0]) or 0, 0x1)
+                    if cur ~= 0 and prev == 0 then
+                        seen = seen + 1
+                        if seen >= frames then
+                            break
+                        end
+                    end
+                    prev = cur
+                end
+                if seen >= frames then
+                    send(string.format(
+                        "run_vblanks ok frames=%d steps=%d tick=%d pc=%d",
+                        seen,
+                        steps,
+                        tonumber(PCSX.getCPUCycles()),
+                        tonumber(regs.pc)))
+                else
+                    send(string.format(
+                        "err run_vblanks: cap hit frames=%d steps=%d tick=%d pc=%d",
+                        seen,
+                        steps,
+                        tonumber(PCSX.getCPUCycles()),
+                        tonumber(regs.pc)))
+                end
+            end
 
         elseif cmd == "run_audio_capture" then
             -- `run_audio_capture N CHUNK_STEPS PATH` — run N user-side

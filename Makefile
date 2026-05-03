@@ -13,7 +13,7 @@
 # with cargo build in their own directory so they can use their own
 # .cargo/config.toml for the mipsel-sony-psx target.
 
-.PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke parity run \
+.PHONY: help check test canaries fmt lint clean fetch-opcode oracle-smoke oracle-side-load parity run \
         test-sdk \
         psxed assets \
         examples hello-tri hello-input hello-ot hello-tex hello-gte hello-audio \
@@ -45,6 +45,7 @@ help:
 	@echo "    make run          - launch the desktop frontend (no EXE)"
 	@echo "    make parity       - step both emulators and assert bit-identical traces"
 	@echo "    make oracle-smoke - smoke: launch headless Redux and verify Lua runs"
+	@echo "    make oracle-side-load - compare a side-loaded SDK EXE against Redux"
 	@echo "    make test-sdk     - build every SDK example + run Milestone-C regression suite"
 	@echo ""
 	@echo "  SDK examples (build mipsel-sony-psx binaries):"
@@ -147,6 +148,9 @@ fetch-opcode:
 
 oracle-smoke:
 	cd emu && cargo test -p parity-oracle --test smoke -- --ignored --nocapture
+
+oracle-side-load: examples
+	cd emu && cargo test -p parity-oracle --test side_loaded_exe --release -- --ignored --nocapture
 
 parity:
 	cd emu && cargo test -p emulator-core --release --features trace-cop2 --test parity -- --ignored --nocapture

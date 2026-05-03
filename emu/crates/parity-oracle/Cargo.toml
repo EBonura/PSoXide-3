@@ -28,3 +28,7 @@ path = "tests/smoke.rs"
 [[test]]
 name = "display_parity"
 path = "tests/display_parity.rs"
+
+[[test]]
+name = "side_loaded_exe"
+path = "tests/side_loaded_exe.rs"

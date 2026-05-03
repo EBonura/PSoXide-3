@@ -6,12 +6,10 @@
 //! - mode / control (offset 4)
 //! - target value (offset 8)
 //!
-//! **Phase 2e scope:** typed register backing + MMIO dispatch. No
-//! ticking, no interrupts. Software that writes a counter and reads
-//! it back sees its own value (same as the MMIO echo buffer used to
-//! provide), and peripherals that read timer state get zeros. Once
-//! the emulator gains a cycle model, the counters start advancing
-//! and firing IRQs via [`crate::irq::IrqSource::Timer0`]…`Timer2`.
+//! The bus advances counters lazily from the shared CPU cycle clock:
+//! scheduler drains and MMIO reads/writes synchronize the bank to the
+//! current cycle, then raise timer IRQs through
+//! [`crate::irq::IrqSource::Timer0`]…`Timer2`.
 
 /// One of the three root counters. Fields are 16 bits on hardware but
 /// held as `u32` for uniform bus access -- upper bits read as 0.
@@ -213,16 +211,12 @@ impl Timers {
         }
     }
 
-    /// Pulse a VBlank event to the timer bank. Called by the bus
-    /// when `EventSlot::VBlank` fires. Timer 1 sync-mode-1 ("reset at
-    /// VBlank") resets its counter to 0.
+    /// Pulse a VBlank event to the timer bank. Redux ignores Timer 1
+    /// VBlank sync reset semantics; mode bits only affect rate/IRQ
+    /// handling in its counter model. Keep this as a no-op so bus-level
+    /// VBlank dispatch can stay explicit without perturbing counter
+    /// phase.
     pub fn notify_vblank(&mut self) {
-        // Sync-mode-1 for Timer 1: reset on VBlank.
-        let t1 = &mut self.timers[1];
-        if t1.mode & MODE_SYNC_ENABLE != 0 && ((t1.mode >> 1) & 3) == 1 {
-            t1.counter = 0;
-            t1.accum = 0;
-        }
     }
 
     fn advance_timer(
@@ -430,14 +424,16 @@ mod tests {
     }
 
     #[test]
-    fn timer1_sync_mode_1_resets_on_vblank() {
+    fn timer1_sync_mode_1_ignores_vblank_reset_like_redux() {
         let mut t = Timers::new();
-        // Sync enable + sync mode 1 (reset at VBlank).
+        // Redux does not implement Timer 1's VBlank reset gate; it
+        // keeps counting with the selected clock source.
         t.write32(0x1F80_1114, MODE_SYNC_ENABLE | (1 << 1), 0);
         t.tick(200, 2146, 8);
         assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 200);
         t.notify_vblank();
-        assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 0);
+        t.tick(200, 2146, 8);
+        assert_eq!(t.read32(0x1F80_1110) & 0xFFFF, 400);
     }
 
     #[test]

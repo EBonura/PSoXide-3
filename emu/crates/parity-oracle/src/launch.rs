@@ -91,6 +91,28 @@ pub struct DisplayHash {
     pub byte_len: usize,
 }
 
+/// Summary returned after Redux side-loads a PSX-EXE into RAM.
+///
+/// The values mirror the executable header plus the effective stack
+/// pointer Redux applied to `$sp`/`$fp`, if the EXE provided one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExeLoadInfo {
+    /// Entry point seeded into Redux's PC.
+    pub initial_pc: u32,
+    /// Global pointer seeded into `$gp`.
+    pub initial_gp: u32,
+    /// RAM destination where the payload was copied.
+    pub load_addr: u32,
+    /// Number of payload bytes copied from the EXE.
+    pub payload_len: usize,
+    /// BSS start address from the EXE header.
+    pub bss_addr: u32,
+    /// Number of BSS bytes cleared.
+    pub bss_size: usize,
+    /// Effective stack pointer applied to `$sp`/`$fp`, if any.
+    pub stack_pointer: Option<u32>,
+}
+
 /// Coarse CPU state checkpoint emitted by Redux during a silent run.
 ///
 /// `state_hash` is an FNV-1a-64 digest of the software-visible GPR and
@@ -107,6 +129,19 @@ pub struct StateCheckpoint {
     pub pc: u32,
     /// FNV-1a-64 over GPR + software-visible COP2 state.
     pub state_hash: u64,
+}
+
+/// Result of advancing Redux to one or more VBlank rising edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VblankRun {
+    /// Number of VBlank edges observed by the Lua command.
+    pub frames: u64,
+    /// Redux-style user steps retired while waiting for those edges.
+    pub steps: u64,
+    /// Redux CPU cycle counter after the final edge.
+    pub tick: u64,
+    /// Program counter after the final edge.
+    pub pc: u32,
 }
 
 impl ReduxProcess {
@@ -531,6 +566,59 @@ impl ReduxProcess {
         }
     }
 
+    /// Side-load a PSX-EXE into Redux's current machine state.
+    ///
+    /// Callers that want parity with PSoXide's real-BIOS path should
+    /// first run both emulators through the same BIOS warmup window,
+    /// then call this method and mirror the same EXE copy/seed on the
+    /// PSoXide side. This intentionally does not model PSoXide's HLE
+    /// BIOS side-load path.
+    pub fn load_exe(
+        &mut self,
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<ExeLoadInfo, OracleError> {
+        ensure_file(path)?;
+        self.send_command(&format!("load_exe {}", path.display()))?;
+        let line = self.wait_for_response(timeout)?;
+        let rest = line
+            .strip_prefix("load_exe ok ")
+            .ok_or_else(|| OracleError::Protocol {
+                expected: "load_exe ok ...".to_string(),
+                got: line.clone(),
+            })?;
+        parse_exe_load_info(rest, &line)
+    }
+
+    /// Advance Redux until `frames` more VBlank rising edges have
+    /// occurred, failing if `max_steps` retires first.
+    ///
+    /// Frame canaries use VBlank edges instead of fixed instruction
+    /// budgets because side-loaded SDK examples are normally reasoned
+    /// about in frame checkpoints.
+    pub fn run_vblanks(
+        &mut self,
+        frames: u64,
+        max_steps: u64,
+        timeout: Duration,
+    ) -> Result<VblankRun, OracleError> {
+        if frames == 0 || max_steps == 0 {
+            return Err(OracleError::Protocol {
+                expected: "frames > 0, max_steps > 0".to_string(),
+                got: format!("frames={frames} max_steps={max_steps}"),
+            });
+        }
+        self.send_command(&format!("run_vblanks {frames} {max_steps}"))?;
+        let line = self.wait_for_response(timeout)?;
+        let rest = line
+            .strip_prefix("run_vblanks ok ")
+            .ok_or_else(|| OracleError::Protocol {
+                expected: "run_vblanks ok ...".to_string(),
+                got: line.clone(),
+            })?;
+        parse_vblank_run(rest, &line)
+    }
+
     /// Run `n` user-side steps silently while draining Redux's mixed
     /// audio output to `path` as raw little-endian stereo s16 PCM.
     ///
@@ -795,6 +883,110 @@ fn parse_state_kv(rest: &str, full_line: &str) -> Result<StateCheckpoint, Oracle
     }
 }
 
+fn parse_exe_load_info(rest: &str, full_line: &str) -> Result<ExeLoadInfo, OracleError> {
+    let mut initial_pc = None;
+    let mut initial_gp = None;
+    let mut load_addr = None;
+    let mut payload_len = None;
+    let mut bss_addr = None;
+    let mut bss_size = None;
+    let mut stack_pointer = None;
+    let mut saw_stack = false;
+
+    for part in rest.split_whitespace() {
+        if let Some(v) = part.strip_prefix("pc=") {
+            initial_pc = parse_u32_field(v);
+        } else if let Some(v) = part.strip_prefix("gp=") {
+            initial_gp = parse_u32_field(v);
+        } else if let Some(v) = part.strip_prefix("load=") {
+            load_addr = parse_u32_field(v);
+        } else if let Some(v) = part.strip_prefix("payload=") {
+            payload_len = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("bss_addr=") {
+            bss_addr = parse_u32_field(v);
+        } else if let Some(v) = part.strip_prefix("bss_size=") {
+            bss_size = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("sp=") {
+            saw_stack = true;
+            if v != "none" {
+                stack_pointer = Some(parse_u32_field(v).ok_or_else(|| OracleError::Protocol {
+                    expected: "sp=<u32>|none".to_string(),
+                    got: full_line.to_string(),
+                })?);
+            }
+        }
+    }
+
+    match (
+        initial_pc,
+        initial_gp,
+        load_addr,
+        payload_len,
+        bss_addr,
+        bss_size,
+        saw_stack,
+    ) {
+        (
+            Some(initial_pc),
+            Some(initial_gp),
+            Some(load_addr),
+            Some(payload_len),
+            Some(bss_addr),
+            Some(bss_size),
+            true,
+        ) => Ok(ExeLoadInfo {
+            initial_pc,
+            initial_gp,
+            load_addr,
+            payload_len,
+            bss_addr,
+            bss_size,
+            stack_pointer,
+        }),
+        _ => Err(OracleError::Protocol {
+            expected: "pc=... gp=... load=... payload=... bss_addr=... bss_size=... sp=..."
+                .to_string(),
+            got: full_line.to_string(),
+        }),
+    }
+}
+
+fn parse_vblank_run(rest: &str, full_line: &str) -> Result<VblankRun, OracleError> {
+    let mut frames = None;
+    let mut steps = None;
+    let mut tick = None;
+    let mut pc = None;
+
+    for part in rest.split_whitespace() {
+        if let Some(v) = part.strip_prefix("frames=") {
+            frames = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("steps=") {
+            steps = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("tick=") {
+            tick = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("pc=") {
+            pc = parse_u32_field(v);
+        }
+    }
+
+    match (frames, steps, tick, pc) {
+        (Some(frames), Some(steps), Some(tick), Some(pc)) => Ok(VblankRun {
+            frames,
+            steps,
+            tick,
+            pc,
+        }),
+        _ => Err(OracleError::Protocol {
+            expected: "frames=... steps=... tick=... pc=...".to_string(),
+            got: full_line.to_string(),
+        }),
+    }
+}
+
+fn parse_u32_field(value: &str) -> Option<u32> {
+    value.parse::<u64>().ok().map(|v| v as u32)
+}
+
 /// Parse `step=X tick=Y pc=Z` fragments (shared between `chk ...`
 /// and the final `run_checkpoint ok ...` line).
 fn parse_kv_triple(rest: &str, full_line: &str) -> Result<(u64, u64, u32), OracleError> {
@@ -926,7 +1118,7 @@ impl RollingBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::RollingBuffer;
+    use super::{parse_exe_load_info, parse_vblank_run, ExeLoadInfo, RollingBuffer, VblankRun};
 
     #[test]
     fn rolling_buffer_drops_oldest_lines_when_full() {
@@ -944,5 +1136,46 @@ mod tests {
         buf.push_line("ghijkl");
         assert!(buf.snapshot().ends_with("ghijkl\n"));
         assert!(!buf.snapshot().contains("abc"));
+    }
+
+    #[test]
+    fn parse_exe_load_info_accepts_unsigned_addresses() {
+        let line = "load_exe ok pc=2147549184 gp=2147553280 load=2147549184 payload=4096 bss_addr=2147557376 bss_size=128 sp=2149588992";
+        let rest = line.strip_prefix("load_exe ok ").unwrap();
+        let parsed = parse_exe_load_info(rest, line).unwrap();
+        assert_eq!(
+            parsed,
+            ExeLoadInfo {
+                initial_pc: 0x8001_0000,
+                initial_gp: 0x8001_1000,
+                load_addr: 0x8001_0000,
+                payload_len: 4096,
+                bss_addr: 0x8001_2000,
+                bss_size: 128,
+                stack_pointer: Some(0x8020_2000),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_exe_load_info_accepts_missing_stack() {
+        let line = "load_exe ok pc=2147549184 gp=0 load=2147549184 payload=4 bss_addr=0 bss_size=0 sp=none";
+        let rest = line.strip_prefix("load_exe ok ").unwrap();
+        assert_eq!(parse_exe_load_info(rest, line).unwrap().stack_pointer, None);
+    }
+
+    #[test]
+    fn parse_vblank_run_accepts_checkpoint_summary() {
+        let line = "run_vblanks ok frames=2 steps=571232 tick=1234567 pc=2147549200";
+        let rest = line.strip_prefix("run_vblanks ok ").unwrap();
+        assert_eq!(
+            parse_vblank_run(rest, line).unwrap(),
+            VblankRun {
+                frames: 2,
+                steps: 571232,
+                tick: 1234567,
+                pc: 0x8001_0010,
+            }
+        );
     }
 }

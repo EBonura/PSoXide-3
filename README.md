@@ -111,6 +111,8 @@ make test
 
 The fast defaults do not require commercial games or PCSX-Redux.
 Canaries and parity tests are ignored by default.
+Patched PCSX-Redux setup for oracle tests is documented in
+[`docs/redux-oracle.md`](docs/redux-oracle.md).
 
 ### 3. Configure a BIOS
 
@@ -302,7 +304,8 @@ Not included:
 Ignored tests and parity tools may require:
 
 - `PSOXIDE_BIOS=/path/to/bios.bin`
-- a local PCSX-Redux build,
+- `PSOXIDE_REDUX_BIN=/path/to/patched/pcsx-redux`,
+- a local PCSX-Redux build from the PSoXide oracle branch,
 - local game images you legally own.
 
 ## License
