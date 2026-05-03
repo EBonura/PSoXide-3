@@ -45,7 +45,7 @@ help:
 	@echo "    make run          - launch the desktop frontend (no EXE)"
 	@echo "    make parity       - step both emulators and assert bit-identical traces"
 	@echo "    make oracle-smoke - smoke: launch headless Redux and verify Lua runs"
-	@echo "    make oracle-side-load - compare a side-loaded SDK EXE against Redux"
+	@echo "    make oracle-side-load - compare side-loaded SDK EXEs against Redux"
 	@echo "    make test-sdk     - build every SDK example + run Milestone-C regression suite"
 	@echo ""
 	@echo "  SDK examples (build mipsel-sony-psx binaries):"

@@ -65,22 +65,29 @@ Run the side-load parity probe with:
 make oracle-side-load
 ```
 
-By default it uses `build/examples/mipsel-sony-psx/release/hello-tri.exe`.
+By default the ignored test matrix covers:
+
+- `hello-tri` -- direct GP0 Gouraud triangle
+- `hello-tex` -- texture upload / CLUT / textured drawing
+- `hello-ot` -- GPU DMA linked-list ordering table
+- `hello-input` -- pad polling path with no buttons pressed
+
 Override inputs with:
 
 ```bash
 export PSOXIDE_ORACLE_EXE=/absolute/path/to/example.exe
+export PSOXIDE_ORACLE_EXE_HELLO_TEX=/absolute/path/to/hello-tex.exe
 export PSOXIDE_ORACLE_EXE_WARMUP=10000000
 export PSOXIDE_ORACLE_EXE_MAX_STEPS_PER_FRAME=2000000
 export PSOXIDE_ORACLE_EXE_FRAMES=3
+export PSOXIDE_ORACLE_EXE_HELLO_TEX_FRAMES=3
 export PSOXIDE_ORACLE_EXE_SETTLE_STEPS=0
 ```
 
-The default side-load target checks three VBlank checkpoints, enough to
-prove the `hello-tri` double-buffer display-start sequence
-`Y=0 -> Y=240 -> Y=0` against Redux. Raise
-`PSOXIDE_ORACLE_EXE_FRAMES` while investigating deeper frame drift; any
-mismatch fails the test and prints both hashes.
+The default side-load target checks three VBlank checkpoints per
+example, enough to prove double-buffer display-start transitions
+against Redux. Raise `PSOXIDE_ORACLE_EXE_FRAMES` while investigating
+deeper frame drift; any mismatch fails the test and prints both hashes.
 `PSOXIDE_ORACLE_EXE_SETTLE_STEPS` is normally `0`; set it only when
 probing whether a mismatch is
 edge-sampling phase or actual display/GPU state.
@@ -89,6 +96,12 @@ The SDK `vsync()` helper polls Timer 1 with HBlank clock source. For
 Redux parity, PSoXide intentionally mirrors Redux's counter model:
 Timer 1's VBlank sync/reset mode bits do not reset the counter at the
 VBlank IRQ edge. Side-loaded double-buffer samples depend on this phase.
+
+`hello-gte` is intentionally not in the green side-load matrix yet. It
+currently diverges on frame 1 against Redux even after matching Redux's
+flat-line raster tie-breaks, so the next parity investigation should
+split its remaining gap between COP2 projection state and GP0 line edge
+cases.
 
 ## Managing Redux changes
 

@@ -2361,11 +2361,10 @@ impl Gpu {
         }
     }
 
-    /// Rasterize a line from `v0` to `v1` using Bresenham's
-    /// algorithm. Clips to the draw area and respects mask-bit
-    /// flags. `c0` and `c1` are the same for monochrome lines;
-    /// Gouraud lines use [`Gpu::rasterize_line_shaded`] which
-    /// interpolates per pixel.
+    /// Rasterize a monochrome line using Redux's four-slope Bresenham
+    /// walkers. The tie-breaks matter: `hello-gte`'s wireframe cube
+    /// lands on many half-step diagonals, and the generic symmetric
+    /// Bresenham variant lights a different pixel set.
     ///
     /// `_interpolate` is reserved for future shaded mode but kept
     /// here so the signature is stable.
@@ -2378,31 +2377,108 @@ impl Gpu {
         mode: BlendMode,
         _interpolate: bool,
     ) {
-        let (mut x, mut y) = v0;
-        let (x1, y1) = v1;
-        let dx = (x1 - x).abs();
-        let dy = -(y1 - y).abs();
-        let sx: i32 = if x < x1 { 1 } else { -1 };
-        let sy: i32 = if y < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
+        let (mut x0, mut y0) = v0;
+        let (mut x1, mut y1) = v1;
+        let mut dx = x1 - x0;
+        let mut dy = y1 - y0;
+
+        if dx == 0 {
+            if dy == 0 {
+                return;
+            }
+            if dy < 0 {
+                std::mem::swap(&mut y0, &mut y1);
+            }
+            for y in y0..=y1 {
+                self.plot_line_pixel(x0, y, c0, mode);
+            }
+            return;
+        }
+
+        if dy == 0 {
+            if dx < 0 {
+                std::mem::swap(&mut x0, &mut x1);
+            }
+            for x in x0..=x1 {
+                self.plot_line_pixel(x, y0, c0, mode);
+            }
+            return;
+        }
+
+        if dx < 0 {
+            std::mem::swap(&mut x0, &mut x1);
+            std::mem::swap(&mut y0, &mut y1);
+            dx = x1 - x0;
+            dy = y1 - y0;
+        }
+
+        let (mut x, mut y) = (x0, y0);
+        self.plot_line_pixel(x, y, c0, mode);
+        if dy > 0 {
+            if dy > dx {
+                let mut d = 2 * dx - dy;
+                while y < y1 {
+                    if d <= 0 {
+                        d += 2 * dx;
+                        y += 1;
+                    } else {
+                        d += 2 * (dx - dy);
+                        x += 1;
+                        y += 1;
+                    }
+                    self.plot_line_pixel(x, y, c0, mode);
+                }
+            } else {
+                let mut d = 2 * dy - dx;
+                while x < x1 {
+                    if d <= 0 {
+                        d += 2 * dy;
+                        x += 1;
+                    } else {
+                        d += 2 * (dy - dx);
+                        x += 1;
+                        y += 1;
+                    }
+                    self.plot_line_pixel(x, y, c0, mode);
+                }
+            }
+        } else {
+            let ndy = -dy;
+            if ndy > dx {
+                let mut d = 2 * dx - ndy;
+                while y > y1 {
+                    if d <= 0 {
+                        d += 2 * dx;
+                        y -= 1;
+                    } else {
+                        d += 2 * (dx - ndy);
+                        x += 1;
+                        y -= 1;
+                    }
+                    self.plot_line_pixel(x, y, c0, mode);
+                }
+            } else {
+                let mut d = 2 * ndy - dx;
+                while x < x1 {
+                    if d <= 0 {
+                        d += 2 * ndy;
+                        x += 1;
+                    } else {
+                        d += 2 * (ndy - dx);
+                        x += 1;
+                        y -= 1;
+                    }
+                    self.plot_line_pixel(x, y, c0, mode);
+                }
+            }
+        }
+    }
+
+    fn plot_line_pixel(&mut self, x: i32, y: i32, colour: u16, mode: BlendMode) {
         let (min_x, max_x) = (self.draw_area_left as i32, self.draw_area_right as i32);
         let (min_y, max_y) = (self.draw_area_top as i32, self.draw_area_bottom as i32);
-        loop {
-            if (min_x..=max_x).contains(&x) && (min_y..=max_y).contains(&y) {
-                self.plot_pixel(x as u16, y as u16, c0, mode);
-            }
-            if x == x1 && y == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y += sy;
-            }
+        if (min_x..=max_x).contains(&x) && (min_y..=max_y).contains(&y) {
+            self.plot_pixel(x as u16, y as u16, colour, mode);
         }
     }
 
@@ -3940,6 +4016,21 @@ mod tests {
             assert_ne!(px, 0, "pixel ({x}, 0) should be set");
         }
         assert_eq!(gpu.vram.get_pixel(10, 0), 0);
+    }
+
+    #[test]
+    fn mono_line_shallow_diagonal_matches_redux_tie_break() {
+        let mut gpu = Gpu::new();
+        gpu.write32(GP0_ADDR, 0xE3_00_00_00);
+        gpu.write32(GP0_ADDR, 0xE4_00_0A_0A);
+        gpu.write32(GP0_ADDR, 0x40_FF_FF_FF);
+        gpu.write32(GP0_ADDR, 0x0000_0000);
+        gpu.write32(GP0_ADDR, 0x0002_0004);
+
+        for (x, y) in [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2)] {
+            assert_ne!(gpu.vram.get_pixel(x, y), 0, "pixel ({x}, {y})");
+        }
+        assert_eq!(gpu.vram.get_pixel(1, 1), 0, "Redux chooses E on d == 0");
     }
 
     #[test]

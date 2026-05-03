@@ -19,7 +19,6 @@ use parity_oracle::{OracleConfig, ReduxProcess};
 use psx_iso::Exe;
 
 const DEFAULT_BIOS: &str = "/Users/ebonura/Downloads/ps1 bios/SCPH1001.BIN";
-const DEFAULT_EXE_NAME: &str = "hello-tri";
 const EXAMPLE_OUT: &str = "build/examples/mipsel-sony-psx/release";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
@@ -31,6 +30,12 @@ const SPU_SAMPLES_PER_PUMP: usize = 735;
 const DEFAULT_CHECKPOINT_FRAMES: u64 = 3;
 const DEFAULT_POST_VBLANK_SETTLE_STEPS: u64 = 0;
 
+#[derive(Clone, Copy)]
+struct ExampleCase {
+    name: &'static str,
+    default_frames: u64,
+}
+
 struct LocalExeRun {
     bus: Bus,
     cpu: Cpu,
@@ -40,19 +45,55 @@ struct LocalExeRun {
 #[test]
 #[ignore = "requires patched PCSX-Redux, BIOS, and a built SDK EXE; run via `make oracle-side-load`"]
 fn side_loaded_hello_tri_vblank_display_parity() {
+    run_example_case(ExampleCase {
+        name: "hello-tri",
+        default_frames: DEFAULT_CHECKPOINT_FRAMES,
+    });
+}
+
+#[test]
+#[ignore = "requires patched PCSX-Redux, BIOS, and a built SDK EXE; run via `make oracle-side-load`"]
+fn side_loaded_hello_tex_vblank_display_parity() {
+    run_example_case(ExampleCase {
+        name: "hello-tex",
+        default_frames: DEFAULT_CHECKPOINT_FRAMES,
+    });
+}
+
+#[test]
+#[ignore = "requires patched PCSX-Redux, BIOS, and a built SDK EXE; run via `make oracle-side-load`"]
+fn side_loaded_hello_ot_vblank_display_parity() {
+    run_example_case(ExampleCase {
+        name: "hello-ot",
+        default_frames: DEFAULT_CHECKPOINT_FRAMES,
+    });
+}
+
+#[test]
+#[ignore = "requires patched PCSX-Redux, BIOS, and a built SDK EXE; run via `make oracle-side-load`"]
+fn side_loaded_hello_input_vblank_display_parity() {
+    run_example_case(ExampleCase {
+        name: "hello-input",
+        default_frames: DEFAULT_CHECKPOINT_FRAMES,
+    });
+}
+
+fn run_example_case(case: ExampleCase) {
     let bios = bios_path();
     if !bios.exists() {
         eprintln!(
-            "[side-load-parity] skip: BIOS not found at {}",
+            "[side-load-parity:{}] skip: BIOS not found at {}",
+            case.name,
             bios.display()
         );
         return;
     }
 
-    let exe = exe_path();
+    let exe = exe_path(case);
     if !exe.exists() {
         eprintln!(
-            "[side-load-parity] skip: EXE not found at {}",
+            "[side-load-parity:{}] skip: EXE not found at {}",
+            case.name,
             exe.display()
         );
         return;
@@ -60,10 +101,13 @@ fn side_loaded_hello_tri_vblank_display_parity() {
 
     let warmup_steps = warmup_steps();
     let settle_steps = post_vblank_settle_steps();
-    eprintln!("[side-load-parity] BIOS : {}", bios.display());
-    eprintln!("[side-load-parity] EXE  : {}", exe.display());
-    eprintln!("[side-load-parity] warm : {warmup_steps} steps");
-    eprintln!("[side-load-parity] settle: {settle_steps} post-vblank steps");
+    eprintln!("[side-load-parity:{}] BIOS : {}", case.name, bios.display());
+    eprintln!("[side-load-parity:{}] EXE  : {}", case.name, exe.display());
+    eprintln!("[side-load-parity:{}] warm : {warmup_steps} steps", case.name);
+    eprintln!(
+        "[side-load-parity:{}] settle: {settle_steps} post-vblank steps",
+        case.name
+    );
 
     let lua = OracleConfig::default_lua_dir().join("oracle.lua");
     let config = OracleConfig::new(bios.clone(), lua).expect("Redux binary resolves");
@@ -73,11 +117,11 @@ fn side_loaded_hello_tri_vblank_display_parity() {
     let run_timeout = Duration::from_secs((warmup_steps / 200_000).max(60));
     redux.run(warmup_steps, run_timeout).expect("Redux warmup");
     let redux_info = redux.load_exe(&exe, LOAD_TIMEOUT).expect("Redux load_exe");
-    eprintln!("[side-load-parity] Redux load: {redux_info:?}");
+    eprintln!("[side-load-parity:{}] Redux load: {redux_info:?}", case.name);
 
     let mut ours = load_local_exe_after_bios_warmup(&bios, &exe, warmup_steps);
 
-    for frame in 1_u64..=checkpoint_frames() {
+    for frame in 1_u64..=checkpoint_frames(case) {
         let max_steps = max_vblank_steps();
         let redux_run = redux
             .run_vblanks(1, max_steps, VBLANK_TIMEOUT)
@@ -94,7 +138,8 @@ fn side_loaded_hello_tri_vblank_display_parity() {
         let (our_hash, our_w, our_h, our_len) = ours.bus.gpu.display_hash();
         let our_area = ours.bus.gpu.display_area();
         eprintln!(
-            "[side-load-parity] frame={frame} redux_steps={} ours_steps={} settle={} ours=0x{our_hash:016x} ({our_w}x{our_h} @{},{} len={our_len}) redux=0x{:016x} ({}x{} len={})",
+            "[side-load-parity:{}] frame={frame} redux_steps={} ours_steps={} settle={} ours=0x{our_hash:016x} ({our_w}x{our_h} @{},{} len={our_len}) redux=0x{:016x} ({}x{} len={})",
+            case.name,
             redux_run.steps,
             our_steps,
             settle_steps,
@@ -109,16 +154,19 @@ fn side_loaded_hello_tri_vblank_display_parity() {
         assert_eq!(
             (our_w, our_h),
             (their.width, their.height),
-            "display dimensions diverged at frame {frame}"
+            "{} display dimensions diverged at frame {frame}",
+            case.name
         );
         assert_eq!(
             our_hash, their.hash,
-            "display hash diverged at frame {frame}"
+            "{} display hash diverged at frame {frame}",
+            case.name
         );
     }
 
     eprintln!(
-        "[side-load-parity] local display starts: {:?}",
+        "[side-load-parity:{}] local display starts: {:?}",
+        case.name,
         ours.bus.gpu.display_start_history().collect::<Vec<_>>()
     );
 
@@ -192,13 +240,31 @@ fn bios_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_BIOS))
 }
 
-fn exe_path() -> PathBuf {
-    if let Ok(path) = env::var("PSOXIDE_ORACLE_EXE") {
+fn exe_path(case: ExampleCase) -> PathBuf {
+    let case_key = format!("PSOXIDE_ORACLE_EXE_{}", env_suffix(case.name));
+    if let Ok(path) = env::var(case_key) {
         return PathBuf::from(path);
+    }
+    if case.name == "hello-tri" {
+        if let Ok(path) = env::var("PSOXIDE_ORACLE_EXE") {
+            return PathBuf::from(path);
+        }
     }
     repo_root()
         .join(EXAMPLE_OUT)
-        .join(format!("{DEFAULT_EXE_NAME}.exe"))
+        .join(format!("{}.exe", case.name))
+}
+
+fn env_suffix(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn warmup_steps() -> u64 {
@@ -215,11 +281,21 @@ fn max_vblank_steps() -> u64 {
         .unwrap_or(2_000_000)
 }
 
-fn checkpoint_frames() -> u64 {
+fn example_frame_env(case: ExampleCase) -> Option<u64> {
+    let case_key = format!("PSOXIDE_ORACLE_EXE_{}_FRAMES", env_suffix(case.name));
+    env::var(case_key).ok().and_then(|v| v.parse().ok())
+}
+
+fn global_frame_env() -> Option<u64> {
     env::var("PSOXIDE_ORACLE_EXE_FRAMES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_CHECKPOINT_FRAMES)
+}
+
+fn checkpoint_frames(case: ExampleCase) -> u64 {
+    example_frame_env(case)
+        .or_else(global_frame_env)
+        .unwrap_or(case.default_frames)
 }
 
 fn post_vblank_settle_steps() -> u64 {
