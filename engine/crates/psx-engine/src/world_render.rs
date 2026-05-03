@@ -10,8 +10,9 @@
 use psx_gpu::{material::TextureMaterial, prim::TriTextured};
 
 use crate::{
-    render3d::CullMode, PrimitiveArena, RoomPoint, RoomRender, WorldCamera, WorldRenderPass,
-    WorldSurfaceOptions, WorldVertex,
+    render3d::{CullMode, DepthPolicy},
+    PrimitiveArena, RoomPoint, RoomRender, WorldCamera, WorldRenderPass, WorldSurfaceOptions,
+    WorldVertex,
 };
 
 /// Which side(s) of a room face should render.
@@ -235,9 +236,9 @@ const WALL_UVS: [(u8, u8); 4] = [(0, TILE_UV), (TILE_UV, TILE_UV), (TILE_UV, 0),
 ///   Floors keep that top-facing winding; ceilings flip to the
 ///   inward underside winding. UVs are transformed with the vertices.
 /// * **Walls** -- runtime records store `[bottom-left, bottom-right,
-///   top-right, top-left]` for an owning cell edge. The renderer flips
-///   that to inward-facing winding before culling while keeping the same
-///   physical UV mapping.
+///   top-right, top-left]` for an owning cell edge. That physical corner
+///   order makes the wall back side face the owning cell/interior; use a
+///   back-sided material for the common one-sided interior wall case.
 ///
 /// [`SectorRender::floor_material`]: crate::SectorRender::floor_material
 /// [`SectorRender::ceiling_material`]: crate::SectorRender::ceiling_material
@@ -601,7 +602,7 @@ fn emit_floor<const OT: usize>(
     ];
     submit_split_quad(
         camera,
-        options,
+        options.with_depth_policy(DepthPolicy::Farthest),
         CullMode::Back,
         material,
         verts,
@@ -638,7 +639,7 @@ fn emit_ceiling<const OT: usize>(
     ]);
     submit_split_quad(
         camera,
-        options,
+        options.with_depth_policy(DepthPolicy::Farthest),
         CullMode::Back,
         material,
         verts,
@@ -667,7 +668,7 @@ fn emit_wall<const OT: usize>(
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT>,
 ) {
-    let Some(verts) = inward_wall_vertices(sx, sz, sector_size, direction, heights) else {
+    let Some(verts) = wall_vertices(sx, sz, sector_size, direction, heights) else {
         return;
     };
     submit_quad(
@@ -676,7 +677,7 @@ fn emit_wall<const OT: usize>(
         CullMode::Back,
         material,
         verts,
-        reverse_quad_winding(uvs),
+        uvs,
         triangles,
         world,
     );
@@ -840,7 +841,7 @@ fn wall_face_center(
     direction: u8,
     heights: [i32; 4],
 ) -> Option<RoomPoint> {
-    let verts = inward_wall_vertices(sx, sz, sector_size, direction, heights)?;
+    let verts = wall_vertices(sx, sz, sector_size, direction, heights)?;
     Some(RoomPoint::new(
         average4_i32(verts[0].x, verts[1].x, verts[2].x, verts[3].x),
         average4_i32(verts[0].y, verts[1].y, verts[2].y, verts[3].y),
@@ -852,7 +853,7 @@ fn average4_i32(a: i32, b: i32, c: i32, d: i32) -> i32 {
     a.saturating_add(b).saturating_add(c).saturating_add(d) / 4
 }
 
-fn inward_wall_vertices(
+fn wall_vertices(
     sx: u16,
     sz: u16,
     sector_size: i32,
@@ -887,12 +888,12 @@ fn inward_wall_vertices(
         ],
         _ => return None,
     };
-    Some(reverse_quad_winding(bl_br_tr_tl))
+    Some(bl_br_tr_tl)
 }
 
 #[cfg(test)]
-fn inward_wall_uvs() -> [(u8, u8); 4] {
-    reverse_quad_winding(WALL_UVS)
+fn wall_uvs() -> [(u8, u8); 4] {
+    WALL_UVS
 }
 
 fn reverse_quad_winding<T: Copy>(corners: [T; 4]) -> [T; 4] {
@@ -975,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn cardinal_walls_face_their_owning_cell() {
+    fn cardinal_wall_backs_face_their_owning_cell() {
         let projection = WorldProjection::new(160, 120, 200, 16);
         let y = 512;
         let center = WorldVertex::new(512, y, 512);
@@ -1027,15 +1028,15 @@ mod tests {
         ];
 
         for (direction, camera) in cases {
-            let verts = inward_wall_vertices(0, 0, 1024, direction, [0, 0, 1024, 1024])
-                .expect("cardinal wall");
+            let verts =
+                wall_vertices(0, 0, 1024, direction, [0, 0, 1024, 1024]).expect("cardinal wall");
             let projected = camera
                 .project_world_quad(verts)
                 .expect("wall projects from owning cell");
             for (a, b, c) in SPLIT_NW_SE_TRIANGLES {
                 assert!(
-                    projected_triangle_area(projected[a], projected[b], projected[c]) > 0,
-                    "direction {direction} should not be culled"
+                    projected_triangle_area(projected[a], projected[b], projected[c]) < 0,
+                    "direction {direction} wall back side should face owning cell"
                 );
             }
         }
@@ -1071,10 +1072,72 @@ mod tests {
     }
 
     #[test]
-    fn wall_uvs_follow_the_reversed_winding() {
+    fn wall_uvs_follow_physical_wall_corner_order() {
         assert_eq!(
-            inward_wall_uvs(),
-            [(0, TILE_UV), (0, 0), (TILE_UV, 0), (TILE_UV, TILE_UV)]
+            wall_uvs(),
+            [(0, TILE_UV), (TILE_UV, TILE_UV), (TILE_UV, 0), (0, 0)]
+        );
+    }
+
+    #[test]
+    fn floor_depth_uses_farthest_projected_corner() {
+        const ZERO: TriTextured = TriTextured::new(
+            [(0, 0), (0, 0), (0, 0)],
+            [(0, 0), (0, 0), (0, 0)],
+            0,
+            0,
+            (0, 0, 0),
+        );
+        let mut ot_storage = psx_gpu::ot::OrderingTable::<8>::new();
+        let mut ot = crate::OtFrame::begin(&mut ot_storage);
+        let mut triangle_storage = [const { ZERO }; 4];
+        let mut triangles = PrimitiveArena::new(&mut triangle_storage);
+        let mut commands = [crate::WorldTriCommand::EMPTY; 4];
+        let mut pass = WorldRenderPass::new(&mut ot, &mut commands);
+
+        let projection = WorldProjection::new(160, 120, 200, 16);
+        let camera = WorldCamera::orbit_yaw(
+            projection,
+            WorldVertex::new(512, 0, 512),
+            1100,
+            2048,
+            Angle::ZERO,
+        );
+        let options =
+            WorldSurfaceOptions::new(crate::DepthBand::whole(), crate::DepthRange::new(0, 4096))
+                .with_textured_triangle_splitting(false);
+        emit_floor(
+            0,
+            0,
+            1024,
+            [0, 0, 0, 0],
+            SPLIT_NW_SE,
+            [(0, 0), (TILE_UV, 0), (TILE_UV, TILE_UV), (0, TILE_UV)],
+            WorldRenderMaterial::front(TextureMaterial::opaque(0, 0, (128, 128, 128))),
+            &camera,
+            options,
+            &mut triangles,
+            &mut pass,
+        );
+        assert_eq!(pass.command_len(), 2);
+        drop(pass);
+
+        let projected = camera
+            .project_world_quad([
+                WorldVertex::new(0, 0, 0),
+                WorldVertex::new(1024, 0, 0),
+                WorldVertex::new(1024, 0, 1024),
+                WorldVertex::new(0, 0, 1024),
+            ])
+            .expect("floor projects from playable camera");
+        let [(a, b, c), (d, e, f)] = SPLIT_NW_SE_TRIANGLES;
+        assert_eq!(
+            commands[0].depth_raw(),
+            max3(projected[a].sz, projected[b].sz, projected[c].sz)
+        );
+        assert_eq!(
+            commands[1].depth_raw(),
+            max3(projected[d].sz, projected[e].sz, projected[f].sz)
         );
     }
 
@@ -1104,5 +1167,14 @@ mod tests {
         let bx = (c.sx as i32) - (a.sx as i32);
         let by = (c.sy as i32) - (a.sy as i32);
         ax * by - ay * bx
+    }
+
+    const fn max3(a: i32, b: i32, c: i32) -> i32 {
+        let ab = if a > b { a } else { b };
+        if ab > c {
+            ab
+        } else {
+            c
+        }
     }
 }

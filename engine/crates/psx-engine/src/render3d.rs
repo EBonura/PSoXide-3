@@ -588,6 +588,11 @@ impl WorldTriCommand {
         order: 0,
         next: WORLD_COMMAND_NONE,
     };
+
+    #[cfg(test)]
+    pub(crate) const fn depth_raw(self) -> i32 {
+        self.depth
+    }
 }
 
 /// Per-submit counters and overflow flags for world surfaces.

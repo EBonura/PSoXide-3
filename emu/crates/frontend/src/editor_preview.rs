@@ -136,6 +136,7 @@ pub fn build_phase1_frame(
     hovered_primitive: Option<psxed_ui::Selection>,
     selected_primitive: Option<psxed_ui::Selection>,
     selected_primitives: &[psxed_ui::Selection],
+    validation_issue_primitives: &[psxed_ui::Selection],
     selected_bounds: Option<([f32; 3], [f32; 3])>,
     selected_sector_faces: &[psxed_ui::FaceRef],
     paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
@@ -218,6 +219,11 @@ pub fn build_phase1_frame(
     walk_entity_bounds(entity_bounds, selected, hovered_entity_node, &mut scratch);
     if let Some((center, half_extents)) = selected_bounds {
         push_aabb_wireframe(&mut scratch, center, half_extents, ENTITY_BOUND_SELECTED);
+    }
+    for selection in validation_issue_primitives {
+        if selection.room() == room_id {
+            push_selection_outline(grid, *selection, OutlineRole::Error, &mut scratch);
+        }
     }
 
     // SAFETY: `scratch.tris` lives until end of this function (the
@@ -727,6 +733,19 @@ fn preview_model_reference(scene: &Scene, node: &SceneNode) -> Option<PreviewMod
     }
 }
 
+fn preview_static_model_reference(
+    scene: &Scene,
+    node: &SceneNode,
+) -> Option<PreviewModelReference> {
+    // Match the playtest cooker: a player-controlled Entity's
+    // ModelRenderer is consumed by the CharacterController path,
+    // not emitted as a second static model at the same transform.
+    if matches!(node.kind, NodeKind::Entity) && preview_player_reference(scene, node).is_some() {
+        return None;
+    }
+    preview_model_reference(scene, node)
+}
+
 #[derive(Clone, Copy)]
 struct PreviewPlayerReference {
     character: Option<ResourceId>,
@@ -773,7 +792,7 @@ fn host_renders_as_preview_model(
     scene: &Scene,
     node: &SceneNode,
 ) -> bool {
-    if let Some(reference) = preview_model_reference(scene, node) {
+    if let Some(reference) = preview_static_model_reference(scene, node) {
         return project
             .resource(reference.model_id)
             .is_some_and(|resource| matches!(&resource.data, ResourceData::Model(_)));
@@ -991,7 +1010,7 @@ fn push_horizontal_face(
 /// Which edge of the sector this wall sits on. The renderer needs
 /// the four corner positions in a consistent order so heights[bl,
 /// br, tr, tl] line up with the right world-space corners.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum WallEdge {
     North,
     East,
@@ -1076,11 +1095,30 @@ fn push_wall_face(
 
     let skip =
         |members: [WallCorner; 3]| -> bool { dropped_corner.is_some_and(|c| members.contains(&c)) };
+    // Endpoint order keeps wall UVs upright. Winding is the
+    // separate concern: the authored wall back side faces the
+    // owning cell/interior, matching runtime `world_render` and
+    // the default one-sided Brick material.
+    let flip_winding = matches!(edge, WallEdge::North);
+    let emit_wall_triangle = |scratch: &mut PreviewScratch,
+                              verts: [psx_gte::scene::Projected; 3],
+                              uvs: [(u8, u8); 3]| {
+        if flip_winding {
+            emit_face_tri(
+                scratch,
+                [verts[0], verts[2], verts[1]],
+                [uvs[0], uvs[2], uvs[1]],
+                shade,
+            );
+        } else {
+            emit_face_tri(scratch, verts, uvs, shade);
+        }
+    };
     if !skip(tri_a.2) {
-        emit_face_tri(scratch, tri_a.0, tri_a.1, shade);
+        emit_wall_triangle(scratch, tri_a.0, tri_a.1);
     }
     if !skip(tri_b.2) {
-        emit_face_tri(scratch, tri_b.0, tri_b.1, shade);
+        emit_wall_triangle(scratch, tri_b.0, tri_b.1);
     }
 }
 
@@ -1235,7 +1273,7 @@ fn walk_model_instances(
         if instances_meta.len() >= MAX_PREVIEW_MODEL_INSTANCES {
             break;
         }
-        let Some(reference) = preview_model_reference(scene, node) else {
+        let Some(reference) = preview_static_model_reference(scene, node) else {
             continue;
         };
         let Some(model_resource) = project.resource(reference.model_id) else {
@@ -2310,6 +2348,10 @@ const FACE_OUTLINE_SELECTED: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0x60, 0xC8, 0xFF),
     thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
 };
+const FACE_OUTLINE_ERROR: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0xFF, 0x40, 0x40),
+    thickness_px: 4.0,
+};
 const ENTITY_BOUND_HOVER: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0xFF, 0xE0, 0x60),
     thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
@@ -2344,6 +2386,7 @@ struct FaceOutlineStyle {
 enum OutlineRole {
     Hover,
     Selected,
+    Error,
 }
 
 impl OutlineRole {
@@ -2351,6 +2394,7 @@ impl OutlineRole {
         match self {
             Self::Hover => FACE_OUTLINE_HOVER,
             Self::Selected => FACE_OUTLINE_SELECTED,
+            Self::Error => FACE_OUTLINE_ERROR,
         }
     }
 }
@@ -2831,19 +2875,28 @@ fn push_tri(scratch: &mut PreviewScratch, p: [psx_gte::scene::Projected; 3], rgb
 mod tests {
     use super::{
         face_side_visible, floor_anchored_model_origin, light_face, node_room_local_origin,
-        preview_lights, preview_model_reference, preview_player_reference, FaceShade, MaterialSlot,
-        PreviewFog,
+        preview_lights, preview_model_reference, preview_player_reference,
+        preview_static_model_reference, push_wall_face, setup_gte_for_camera, FaceShade,
+        MaterialSlot, PreviewFog, WallEdge, SCRATCH,
     };
     use psx_engine::{PointLightSample, WorldVertex};
     use psx_gte::scene::Projected;
     use psxed_project::{
-        MaterialFaceSidedness, NodeKind, ProjectDocument, ResourceData, WorldGrid,
+        GridUvTransform, MaterialFaceSidedness, NodeKind, ProjectDocument, ResourceData, WorldGrid,
     };
+    use psxed_ui::{ViewportCameraMode, ViewportCameraState};
 
     fn flat(r: u8, g: u8, b: u8) -> FaceShade {
         FaceShade::Flat {
             rgb: (r, g, b),
             sidedness: psxed_project::MaterialFaceSidedness::Front,
+        }
+    }
+
+    fn flat_sided(r: u8, g: u8, b: u8, sidedness: MaterialFaceSidedness) -> FaceShade {
+        FaceShade::Flat {
+            rgb: (r, g, b),
+            sidedness,
         }
     }
 
@@ -2932,6 +2985,52 @@ mod tests {
     }
 
     #[test]
+    fn player_controlled_entity_does_not_static_preview_model_renderer() {
+        let mut project = ProjectDocument::new("test");
+        let model_id = project.add_resource(
+            "Dummy Model",
+            ResourceData::Texture {
+                psxt_path: "dummy.psxt".to_string(),
+            },
+        );
+        let character_id = project.add_resource(
+            "Dummy Character",
+            ResourceData::Texture {
+                psxt_path: "dummy-character.psxt".to_string(),
+            },
+        );
+        let scene = project.active_scene_mut();
+        let actor = scene.add_node(scene.root, "Player", NodeKind::Entity);
+        scene.add_node(
+            actor,
+            "Model Renderer",
+            NodeKind::ModelRenderer {
+                model: Some(model_id),
+                material: None,
+            },
+        );
+        scene.add_node(
+            actor,
+            "Character Controller",
+            NodeKind::CharacterController {
+                character: Some(character_id),
+                player: true,
+            },
+        );
+
+        let scene = project.active_scene();
+        let actor_node = scene.node(actor).unwrap();
+        assert!(
+            preview_model_reference(scene, actor_node).is_some(),
+            "the raw renderer reference is still present"
+        );
+        assert!(
+            preview_static_model_reference(scene, actor_node).is_none(),
+            "player-controlled renderers are drawn by the player preview path"
+        );
+    }
+
+    #[test]
     fn component_point_light_uses_host_transform() {
         let mut project = ProjectDocument::new("test");
         let scene = project.active_scene_mut();
@@ -2970,6 +3069,47 @@ mod tests {
         assert!(face_side_visible(MaterialFaceSidedness::Back, back));
         assert!(face_side_visible(MaterialFaceSidedness::Both, front));
         assert!(face_side_visible(MaterialFaceSidedness::Both, back));
+    }
+
+    #[test]
+    fn editor_cardinal_wall_backs_face_their_owning_cell() {
+        let cases = [
+            (WallEdge::North, 2048),
+            (WallEdge::East, 3072),
+            (WallEdge::South, 0),
+            (WallEdge::West, 1024),
+        ];
+
+        for (edge, yaw_q12) in cases {
+            let _camera = setup_gte_for_camera(ViewportCameraState {
+                mode: ViewportCameraMode::Free,
+                yaw_q12,
+                pitch_q12: 0,
+                radius: 1024,
+                target: [512, 512, 512],
+                position: [512, 512, 512],
+            });
+            let mut scratch = SCRATCH.lock().expect("editor preview scratch mutex");
+            scratch.used = 0;
+            scratch.tex_used = 0;
+            scratch.overlay_lines.clear();
+            scratch.ot.clear();
+
+            push_wall_face(
+                &mut scratch,
+                [0, 1024, 0, 1024],
+                edge,
+                [0, 0, 1024, 1024],
+                None,
+                GridUvTransform::default(),
+                flat_sided(128, 128, 128, MaterialFaceSidedness::Back),
+            );
+
+            assert!(
+                scratch.used > 0 || scratch.tex_used > 0,
+                "{edge:?} wall back side should render from inside the owning cell"
+            );
+        }
     }
 
     #[test]

@@ -238,12 +238,10 @@ impl EditorTextures {
                     break;
                 }
                 let raw = u16::from_le_bytes([clut_bytes[off], clut_bytes[off + 1]]);
-                // STP-bit hack the showcase applies: opaque texels
-                // get bit15 set so PSX semi-transparent draws can
-                // still discriminate against fully transparent
-                // black. Mirroring keeps editor + runtime visuals
-                // identical.
-                let marked = if raw == 0 { 0 } else { raw | 0x8000 };
+                // Room materials are opaque until materials carry
+                // explicit alpha, so index 0 must not become a
+                // preview-only hole in imported textures.
+                let marked = opaque_room_clut_entry(raw);
                 let vram_idx = (clut_y as usize) * VRAM_WIDTH as usize + clut_x as usize + i;
                 self.vram[vram_idx] = marked;
             }
@@ -786,6 +784,10 @@ fn psx_555(rgb: (u8, u8, u8)) -> u16 {
     (b5 << 10) | (g5 << 5) | r5
 }
 
+fn opaque_room_clut_entry(raw: u16) -> u16 {
+    raw | 0x8000
+}
+
 /// Pack a (tpage_index, tpage_y_block) pair into the GP0
 /// uv1-high-half tpage word format. 4bpp depth, blend bits 0,
 /// matching `psx_vram::Tpage::uv_tpage_word(0)`.
@@ -830,7 +832,10 @@ fn align_up_to(value: u16, boundary: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{align_up_to, EditorTextures, ROOM_TPAGE_HALFWORDS, ROOM_TPAGE_TEXEL_HEIGHT};
+    use super::{
+        align_up_to, opaque_room_clut_entry, EditorTextures, ROOM_TPAGE_HALFWORDS,
+        ROOM_TPAGE_TEXEL_HEIGHT,
+    };
     use psx_gpu_render::VRAM_WIDTH;
 
     #[test]
@@ -876,5 +881,11 @@ mod tests {
             word_at(ROOM_TPAGE_TEXEL_HEIGHT - 1, ROOM_TPAGE_HALFWORDS - 1),
             0
         );
+    }
+
+    #[test]
+    fn imported_room_clut_keeps_palette_zero_opaque() {
+        assert_eq!(opaque_room_clut_entry(0), 0x8000);
+        assert_eq!(opaque_room_clut_entry(0x1234), 0x9234);
     }
 }

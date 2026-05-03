@@ -36,8 +36,8 @@ use psx_engine::{
     button, compute_joint_world_transform, telemetry, Angle, App, CharacterMotorAnim,
     CharacterMotorConfig, CharacterMotorInput, CharacterMotorState, Config, Ctx, CullMode,
     DepthBand, DepthPolicy, DepthRange, JointViewTransform, JointWorldTransform, LocalToWorldScale,
-    Mat3I16, MaterialTint, OtDepth, OtFrame, PointLightSample, PrimitiveArena, ProjectedVertex,
-    Rgb8, RoomPoint, RuntimeRoom, Scene, TexturedModelRenderStats, ThirdPersonCameraConfig,
+    Mat3I16, MaterialTint, OtFrame, PointLightSample, PrimitiveArena, ProjectedVertex, Rgb8,
+    RoomPoint, RuntimeRoom, Scene, TexturedModelRenderStats, ThirdPersonCameraConfig,
     ThirdPersonCameraInput, ThirdPersonCameraState, ThirdPersonCameraTarget, WorldCamera,
     WorldProjection, WorldRenderMaterial, WorldRenderPass, WorldSurfaceLighting,
     WorldSurfaceOptions, WorldSurfaceSample, WorldTriCommand, WorldVertex, Q8,
@@ -169,7 +169,12 @@ const OT_DEPTH: usize = 2048;
 const OT_DEPTH: usize = 1024;
 #[cfg(all(not(feature = "ot-2048"), not(feature = "ot-1024")))]
 const OT_DEPTH: usize = 512;
-const WORLD_BAND: DepthBand = OtDepth::<OT_DEPTH>::whole_band();
+/// Keep dynamic actors in the nearest ordering-table band so large
+/// split room quads cannot overpaint characters in the no-Z-buffer
+/// runtime. Room geometry starts after this reserved band.
+const ACTOR_BAND_BACK: usize = 63;
+const ROOM_BAND: DepthBand = DepthBand::new(ACTOR_BAND_BACK + 1, OT_DEPTH - 1);
+const ACTOR_BAND: DepthBand = DepthBand::new(0, ACTOR_BAND_BACK);
 const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, FAR_Z);
 #[cfg(feature = "world-grid-visible")]
 const ROOM_GRID_VISIBILITY_RADIUS: u16 = 4;
@@ -653,7 +658,8 @@ impl Scene for Playtest {
         let mut world = unsafe { begin_world_render_pass(&mut ot, &mut WORLD_COMMANDS) };
 
         if self.room.is_some() {
-            let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE);
+            let room_options = WorldSurfaceOptions::new(ROOM_BAND, WORLD_DEPTH_RANGE);
+            let actor_options = WorldSurfaceOptions::new(ACTOR_BAND, WORLD_DEPTH_RANGE);
             let mut total_instance_stats = ModelInstanceDrawStats::default();
 
             for active in self.active_rooms.iter().flatten().copied() {
@@ -701,7 +707,7 @@ impl Scene for Playtest {
                         materials,
                         &lighting,
                         &room_camera,
-                        options,
+                        room_options,
                         GridVisibility::around(visibility_anchor, ROOM_GRID_VISIBILITY_RADIUS),
                         &mut triangles,
                         &mut world,
@@ -730,7 +736,7 @@ impl Scene for Playtest {
                         materials,
                         &lighting,
                         &room_camera,
-                        options,
+                        room_options,
                         &mut triangles,
                         &mut world,
                     );
@@ -742,7 +748,7 @@ impl Scene for Playtest {
                     active.index,
                     materials,
                     &room_camera,
-                    options,
+                    room_options,
                     &mut triangles,
                     &mut world,
                 );
@@ -753,7 +759,7 @@ impl Scene for Playtest {
                     ctx.time.elapsed_vblanks(),
                     ctx.time.video_hz(),
                     &room_camera,
-                    options,
+                    room_options,
                     &self.models,
                     &self.clips,
                     &mut triangles,
@@ -795,7 +801,7 @@ impl Scene for Playtest {
                     ctx.time.elapsed_vblanks(),
                     ctx.time.video_hz(),
                     &camera,
-                    options,
+                    actor_options,
                     &mut triangles,
                     &mut world,
                 );
@@ -822,7 +828,7 @@ impl Scene for Playtest {
                     ctx.time.elapsed_vblanks(),
                     ctx.time.video_hz(),
                     &camera,
-                    options,
+                    actor_options,
                     &mut triangles,
                     &mut world,
                 );
@@ -1914,7 +1920,7 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
     }
 
     let clut_rect = VramRect::new(clut_x, ROOM_CLUT_Y, texture.clut_entries(), 1);
-    upload_clut(clut_rect, texture.clut_bytes());
+    upload_opaque_clut(clut_rect, texture.clut_bytes());
 
     let clut = Clut::new(clut_x, ROOM_CLUT_Y);
     let slot = VramSlot {

@@ -512,7 +512,15 @@ pub fn cook_world_grid(
             let sector = grid
                 .sector(x, z)
                 .map(|sector| {
-                    cook_sector(project, sector, x, z, &mut materials, &mut material_slots)
+                    cook_sector(
+                        project,
+                        sector,
+                        x,
+                        z,
+                        grid.sector_size,
+                        &mut materials,
+                        &mut material_slots,
+                    )
                 })
                 .transpose()?
                 .flatten();
@@ -547,6 +555,7 @@ fn cook_sector(
     sector: &GridSector,
     x: u16,
     z: u16,
+    sector_size: i32,
     materials: &mut Vec<CookedWorldMaterial>,
     material_slots: &mut HashMap<ResourceId, u16>,
 ) -> Result<Option<CookedGridSector>, WorldGridCookError> {
@@ -601,7 +610,15 @@ fn cook_sector(
             )
         })
         .transpose()?;
-    let walls = cook_walls(project, &sector.walls, x, z, materials, material_slots)?;
+    let walls = cook_walls(
+        project,
+        &sector.walls,
+        x,
+        z,
+        sector_size,
+        materials,
+        material_slots,
+    )?;
 
     // -------- collision-relevant cook --------
     // `walkable` / `solid` are forwarded through the cooked
@@ -651,6 +668,7 @@ fn cook_walls(
     walls: &GridWalls,
     x: u16,
     z: u16,
+    sector_size: i32,
     materials: &mut Vec<CookedWorldMaterial>,
     material_slots: &mut HashMap<ResourceId, u16>,
 ) -> Result<CookedGridWalls, WorldGridCookError> {
@@ -689,14 +707,22 @@ fn cook_walls(
                 material_slots,
             )?;
             let runtime_direction = runtime_wall_direction(direction);
-            cooked
-                .get_mut(runtime_direction)
-                .push(CookedGridVerticalFace {
-                    heights: runtime_wall_heights(wall.heights),
-                    material,
-                    uvs: runtime_wall_uvs(wall.uv.apply_to_quad(world::WALL_UVS)),
-                    solid: wall.solid,
-                });
+            for mut segment in wall.split_into_autotile_segments(sector_size) {
+                validate_wall_heights(&segment, x, z, direction)?;
+                if segment.uv.span[1] == 0 {
+                    segment.autotile_uv(sector_size);
+                    segment.uv.offset[1] =
+                        crate::wrap_tiled_uv_offset_i16(i64::from(segment.uv.offset[1]));
+                }
+                cooked
+                    .get_mut(runtime_direction)
+                    .push(CookedGridVerticalFace {
+                        heights: runtime_wall_heights(segment.heights),
+                        material,
+                        uvs: runtime_wall_uvs(segment.uv.apply_to_quad(world::WALL_UVS)),
+                        solid: segment.solid,
+                    });
+            }
         }
     }
     Ok(cooked)
@@ -775,6 +801,12 @@ mod tests {
             + sector.walls.west.len()
             + sector.walls.north_west_south_east.len()
             + sector.walls.north_east_south_west.len()
+    }
+
+    fn max_uv_v_span(uvs: [(u8, u8); 4]) -> u8 {
+        let min_v = uvs.iter().map(|(_, v)| *v).min().unwrap();
+        let max_v = uvs.iter().map(|(_, v)| *v).max().unwrap();
+        max_v - min_v
     }
 
     #[test]
@@ -923,6 +955,70 @@ mod tests {
             runtime_wall_uvs(wall_uv.apply_to_quad(world::WALL_UVS))
         );
         assert_eq!(parsed_wall.uvs().corners(), cooked_wall.uvs);
+    }
+
+    #[test]
+    fn cook_autotiles_implicit_tall_wall_without_splitting_when_uv_fits_packet() {
+        let project = ProjectDocument::starter();
+        let material = first_floor_material(&starter_grid(&project));
+        let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
+        grid.add_wall(
+            0,
+            0,
+            GridDirection::North,
+            0,
+            world::SECTOR_SIZE * 2,
+            Some(material),
+        );
+
+        let cooked = cook_world_grid(&project, &grid).unwrap();
+        let cooked_sector = cooked.sectors[0].as_ref().unwrap();
+        let bytes = encode_world_grid_psxw(&project, &grid).unwrap();
+        let parsed_world = psx_asset::World::from_bytes(&bytes).expect("psxw parses");
+        let parsed_sector = parsed_world.sector(0, 0).unwrap();
+        let parsed_wall = parsed_world.sector_wall(parsed_sector, 0).unwrap();
+
+        assert_eq!(cooked_wall_count(cooked_sector), 1);
+        assert_eq!(parsed_sector.wall_count(), 1);
+        assert_eq!(
+            max_uv_v_span(cooked_sector.walls.south[0].uvs),
+            world::TILE_UV * 2
+        );
+        assert_eq!(
+            max_uv_v_span(parsed_wall.uvs().corners()),
+            world::TILE_UV * 2
+        );
+    }
+
+    #[test]
+    fn cook_splits_autotiled_wall_only_when_uv_exceeds_packet_range() {
+        let project = ProjectDocument::starter();
+        let material = first_floor_material(&starter_grid(&project));
+        let mut grid = WorldGrid::empty(1, 1, world::SECTOR_SIZE);
+        grid.add_wall(
+            0,
+            0,
+            GridDirection::North,
+            0,
+            world::SECTOR_SIZE * 5,
+            Some(material),
+        );
+
+        let cooked = cook_world_grid(&project, &grid).unwrap();
+        let cooked_sector = cooked.sectors[0].as_ref().unwrap();
+        let bytes = encode_world_grid_psxw(&project, &grid).unwrap();
+        let parsed_world = psx_asset::World::from_bytes(&bytes).expect("psxw parses");
+        let parsed_sector = parsed_world.sector(0, 0).unwrap();
+
+        assert_eq!(cooked_wall_count(cooked_sector), 5);
+        assert_eq!(parsed_sector.wall_count(), 5);
+        for wall in &cooked_sector.walls.south {
+            assert!(max_uv_v_span(wall.uvs) <= world::TILE_UV);
+        }
+        for index in 0..5 {
+            let parsed_wall = parsed_world.sector_wall(parsed_sector, index).unwrap();
+            assert!(max_uv_v_span(parsed_wall.uvs().corners()) <= world::TILE_UV);
+        }
     }
 
     #[test]

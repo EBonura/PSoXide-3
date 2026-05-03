@@ -64,12 +64,7 @@ impl TextureWindow {
     /// `origin_*` and `size_*` are in texels. The origin and size must
     /// be 8-texel aligned because GP0(E2) stores mask/offset in 8-texel
     /// units.
-    pub const fn power_of_two_tile(
-        origin_x: u8,
-        origin_y: u8,
-        size_x: u8,
-        size_y: u8,
-    ) -> Self {
+    pub const fn power_of_two_tile(origin_x: u8, origin_y: u8, size_x: u8, size_y: u8) -> Self {
         assert!(
             size_x >= 8 && size_x.is_power_of_two(),
             "texture-window width must be a power of two >= 8"
@@ -78,8 +73,14 @@ impl TextureWindow {
             size_y >= 8 && size_y.is_power_of_two(),
             "texture-window height must be a power of two >= 8"
         );
-        assert!(origin_x % 8 == 0, "texture-window origin_x must align to 8 texels");
-        assert!(origin_y % 8 == 0, "texture-window origin_y must align to 8 texels");
+        assert!(
+            origin_x % 8 == 0,
+            "texture-window origin_x must align to 8 texels"
+        );
+        assert!(
+            origin_y % 8 == 0,
+            "texture-window origin_y must align to 8 texels"
+        );
         assert!(size_x <= 128, "texture-window width must fit GP0(E2)");
         assert!(size_y <= 128, "texture-window height must fit GP0(E2)");
         let mask_x = ((!((size_x as u16) - 1)) & 0x00FF) as u8;

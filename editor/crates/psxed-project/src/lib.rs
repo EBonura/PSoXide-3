@@ -322,9 +322,9 @@ pub enum GridUvRotation {
 /// Non-destructive texture-coordinate transform for one grid face.
 ///
 /// `offset` is in PS1 texels and is applied after flip/rotation. It
-    /// wraps in the 8-bit UV coordinate space, which matches packet-level
-    /// PS1 UVs; runtime room materials use texture-window state so this
-    /// can repeat a compact material tile without rebaking the texture.
+/// wraps in the 8-bit UV coordinate space, which matches packet-level
+/// PS1 UVs; runtime room materials use texture-window state so this
+/// can repeat a compact material tile without rebaking the texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridUvTransform {
     /// Signed `[u, v]` texel offset.
@@ -481,6 +481,10 @@ fn scale_rounded(value: i32, numerator: i32, denominator: i32) -> i32 {
 
 fn wrap_uv(value: i32) -> u8 {
     value.rem_euclid(256) as u8
+}
+
+pub(crate) fn wrap_tiled_uv_offset_i16(value: i64) -> i16 {
+    value.rem_euclid(i64::from(psxed_format::world::TILE_UV)) as i16
 }
 
 const fn is_default_uv_span(span: &[u16; 2]) -> bool {
@@ -809,6 +813,51 @@ impl GridVerticalFace {
         clamped
     }
 
+    /// Number of runtime wall records needed to draw this wall
+    /// without asking one PS1 primitive to encode a V span beyond
+    /// the packet's 8-bit UV coordinate range.
+    pub fn autotile_segment_count(&self, sector_size: i32) -> usize {
+        if !self.should_split_autotile_segments(sector_size) {
+            return 1;
+        }
+        let sector_size = sector_size.max(1) as usize;
+        let max_span = self.max_vertical_span().max(0) as usize;
+        ((max_span + sector_size - 1) / sector_size).max(1)
+    }
+
+    /// Split this wall into sector-height stack entries and retile
+    /// each segment so every cooked primitive stays within the
+    /// packet's 8-bit V coordinate range.
+    pub fn split_into_autotile_segments(&self, sector_size: i32) -> Vec<Self> {
+        if !self.should_split_autotile_segments(sector_size) {
+            return vec![self.clone()];
+        }
+        let sector_size = sector_size.max(1);
+        let max_span = self.max_vertical_span();
+        if max_span == 0 {
+            return vec![self.clone()];
+        }
+
+        let mut out = Vec::with_capacity(self.autotile_segment_count(sector_size));
+        let mut start = 0;
+        while start < max_span {
+            let end = start.saturating_add(sector_size).min(max_span);
+            let mut wall = self.clone();
+            wall.heights = self.segment_heights(start, end, max_span);
+            let (span_v, _) = uv_span_for_world_span(end.saturating_sub(start), sector_size);
+            wall.uv.span[1] = stored_uv_span(span_v);
+            let start_v = div_round_i64(
+                i64::from(start) * i64::from(psxed_format::world::TILE_UV),
+                i64::from(sector_size),
+            );
+            wall.uv.offset[1] =
+                wrap_tiled_uv_offset_i16(i64::from(self.uv.offset[1]).saturating_add(start_v));
+            out.push(wall);
+            start = end;
+        }
+        out
+    }
+
     /// Split this wall into sector-height stack entries without
     /// changing its material or UV settings.
     pub fn split_into_height_segments(&self, sector_size: i32) -> Vec<Self> {
@@ -826,36 +875,49 @@ impl GridVerticalFace {
         while start < max_span {
             let end = start.saturating_add(sector_size).min(max_span);
             let mut wall = self.clone();
-            wall.heights = [
-                lerp_i32_ratio(
-                    self.heights[WallCorner::BL.idx()],
-                    self.heights[WallCorner::TL.idx()],
-                    start,
-                    max_span,
-                ),
-                lerp_i32_ratio(
-                    self.heights[WallCorner::BR.idx()],
-                    self.heights[WallCorner::TR.idx()],
-                    start,
-                    max_span,
-                ),
-                lerp_i32_ratio(
-                    self.heights[WallCorner::BR.idx()],
-                    self.heights[WallCorner::TR.idx()],
-                    end,
-                    max_span,
-                ),
-                lerp_i32_ratio(
-                    self.heights[WallCorner::BL.idx()],
-                    self.heights[WallCorner::TL.idx()],
-                    end,
-                    max_span,
-                ),
-            ];
+            wall.heights = self.segment_heights(start, end, max_span);
             out.push(wall);
             start = end;
         }
         out
+    }
+
+    fn should_split_autotile_segments(&self, sector_size: i32) -> bool {
+        if self.is_triangle() {
+            return false;
+        }
+        let max_span = self.max_vertical_span();
+        let (expected_span, clamped) = uv_span_for_world_span(max_span, sector_size);
+        clamped && (self.uv.span[1] == 0 || self.uv.span[1] == stored_uv_span(expected_span))
+    }
+
+    fn segment_heights(&self, start: i32, end: i32, max_span: i32) -> [i32; 4] {
+        [
+            lerp_i32_ratio(
+                self.heights[WallCorner::BL.idx()],
+                self.heights[WallCorner::TL.idx()],
+                start,
+                max_span,
+            ),
+            lerp_i32_ratio(
+                self.heights[WallCorner::BR.idx()],
+                self.heights[WallCorner::TR.idx()],
+                start,
+                max_span,
+            ),
+            lerp_i32_ratio(
+                self.heights[WallCorner::BR.idx()],
+                self.heights[WallCorner::TR.idx()],
+                end,
+                max_span,
+            ),
+            lerp_i32_ratio(
+                self.heights[WallCorner::BL.idx()],
+                self.heights[WallCorner::TL.idx()],
+                end,
+                max_span,
+            ),
+        ]
     }
 
     fn max_vertical_span(&self) -> i32 {
@@ -1600,7 +1662,12 @@ impl WorldGrid {
                     b.triangles += 2;
                 }
                 for direction in GridDirection::ALL {
-                    let count = sector.walls.get(direction).len();
+                    let count = sector
+                        .walls
+                        .get(direction)
+                        .iter()
+                        .map(|wall| wall.autotile_segment_count(self.sector_size))
+                        .sum::<usize>();
                     b.walls += count;
                     b.triangles += count * 2;
                 }
@@ -2249,8 +2316,9 @@ pub enum ResourceData {
     /// Editor material.
     Material(MaterialResource),
     /// Cooked animated PSX model -- `.psxmdl` + optional `.psxt`
-    /// atlas + animation clips. Instantiated in scenes via
-    /// [`NodeKind::MeshInstance`] referencing this resource id.
+    /// atlas + animation clips. Instantiated in scenes by placing an
+    /// [`NodeKind::Entity`] with a [`NodeKind::ModelRenderer`]
+    /// component referencing this resource id.
     Model(ModelResource),
     /// Legacy / generic source mesh path. Kept for backward
     /// compatibility; new authoring should use [`ResourceData::Model`].
@@ -2273,10 +2341,10 @@ pub enum ResourceData {
         /// Project-relative audio path.
         source_path: String,
     },
-    /// Gameplay character -- Model + role clip mapping +
+    /// Gameplay character profile -- Model + role clip mapping +
     /// capsule/camera defaults. Layered on top of a Model
-    /// resource; the player spawn references this to resolve
-    /// what to render and how the controller behaves.
+    /// resource; character-controller components reference this to
+    /// resolve what to render and how movement/camera behaviour works.
     Character(CharacterResource),
     /// Equipment/weapon authoring resource. A Weapon references a
     /// Model for visuals and owns grip + hitbox data for combat.
@@ -2294,7 +2362,7 @@ impl ResourceData {
             Self::Scene { .. } => "Scene",
             Self::Script { .. } => "Script",
             Self::Audio { .. } => "Audio",
-            Self::Character(_) => "Character",
+            Self::Character(_) => "Character Profile",
             Self::Weapon(_) => "Weapon",
         }
     }
@@ -2476,9 +2544,8 @@ pub enum NodeKind {
         animation_clip: Option<u16>,
     },
     /// Render a cooked [`ResourceData::Model`] from the transform
-    /// on the nearest entity/actor ancestor. This is the component
-    /// form of the legacy [`MeshInstance`](Self::MeshInstance)
-    /// node.
+    /// on the nearest entity ancestor. This is the component form of
+    /// the legacy [`MeshInstance`](Self::MeshInstance) node.
     ModelRenderer {
         /// Model resource.
         model: Option<ResourceId>,
@@ -2502,7 +2569,7 @@ pub enum NodeKind {
     },
     /// Collision component. The first runtime pass only cooks room
     /// grid collision, but keeping authored collider data as a node
-    /// makes prop/interactable/NPC architecture explicit now.
+    /// makes entity/interactable/NPC architecture explicit now.
     Collider {
         /// Collision shape in engine/editor units.
         #[serde(default)]
@@ -2523,15 +2590,16 @@ pub enum NodeKind {
         #[serde(default)]
         action: String,
     },
-    /// Character/controller component. When `player` is true this is
+    /// Character/controller component. It binds an entity to a reusable
+    /// [`ResourceData::Character`] profile. When `player` is true this is
     /// the component-tree replacement for a legacy player
-    /// [`SpawnPoint`](Self::SpawnPoint); non-player actor cooking lands
+    /// [`SpawnPoint`](Self::SpawnPoint); non-player character cooking lands
     /// after NPC runtime records exist.
     CharacterController {
-        /// Character resource profile.
+        /// Character profile resource.
         #[serde(default)]
         character: Option<ResourceId>,
-        /// Whether this actor is the player controller.
+        /// Whether this controller drives the player.
         #[serde(default)]
         player: bool,
     },
@@ -2541,7 +2609,7 @@ pub enum NodeKind {
         #[serde(default)]
         behavior: String,
     },
-    /// Combat stat component for actor nodes.
+    /// Combat stat component for entity nodes.
     Combat {
         /// Team/faction label.
         #[serde(default)]
@@ -2588,7 +2656,7 @@ pub enum NodeKind {
     SpawnPoint {
         /// Whether this is the player spawn.
         player: bool,
-        /// Character resource that drives this spawn. For the
+        /// Character profile resource that drives this spawn. For the
         /// player spawn this picks the player's model + role
         /// clips + controller params. `None` lets the cook step
         /// auto-pick a Character when exactly one exists, or
@@ -2635,20 +2703,20 @@ impl NodeKind {
             Self::Entity => "Entity",
             Self::World { .. } => "World",
             Self::Room { .. } => "Room",
-            Self::MeshInstance { .. } => "MeshInstance",
-            Self::ModelRenderer { .. } => "ModelRenderer",
+            Self::MeshInstance { .. } => "Mesh Instance",
+            Self::ModelRenderer { .. } => "Model Renderer",
             Self::Animator { .. } => "Animator",
             Self::Collider { .. } => "Collider",
             Self::Interactable { .. } => "Interactable",
-            Self::CharacterController { .. } => "CharacterController",
-            Self::AiController { .. } => "AiController",
+            Self::CharacterController { .. } => "Character Controller",
+            Self::AiController { .. } => "AI Controller",
             Self::Combat { .. } => "Combat",
             Self::Equipment { .. } => "Equipment",
             Self::Light { .. } => "Light",
-            Self::PointLight { .. } => "PointLight",
-            Self::SpawnPoint { .. } => "SpawnPoint",
+            Self::PointLight { .. } => "Point Light",
+            Self::SpawnPoint { .. } => "Spawn Point",
             Self::Trigger { .. } => "Trigger",
-            Self::AudioSource { .. } => "AudioSource",
+            Self::AudioSource { .. } => "Audio Source",
             Self::Portal { .. } => "Portal",
         }
     }
@@ -5309,6 +5377,32 @@ mod tests {
         assert!(clamped);
         assert_eq!(wall.heights, [0, 0, 3840, 3840]);
         assert_eq!(wall.uv.span, [0, 255]);
+    }
+
+    #[test]
+    fn wall_autotile_keeps_one_primitive_when_repeated_uvs_fit_packet() {
+        let mut wall = GridVerticalFace::flat(0, 1536, None);
+        wall.uv.offset[1] = -5;
+        wall.autotile_uv(768);
+
+        let segments = wall.split_into_autotile_segments(768);
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].heights, [0, 0, 1536, 1536]);
+        assert_eq!(segments[0].uv.span, [0, 128]);
+        assert_eq!(segments[0].uv.offset[1], -5);
+    }
+
+    #[test]
+    fn wall_autotile_segments_restore_clamped_tall_wall_density() {
+        let mut wall = GridVerticalFace::flat(0, 768 * 5, None);
+        wall.autotile_uv(768);
+
+        let segments = wall.split_into_autotile_segments(768);
+
+        assert_eq!(segments.len(), 5);
+        assert!(segments.iter().all(|segment| segment.uv.span == [0, 0]));
+        assert_eq!(segments[4].heights, [3072, 3072, 3840, 3840]);
     }
 
     #[test]

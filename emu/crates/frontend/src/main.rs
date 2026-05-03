@@ -749,6 +749,7 @@ impl ApplicationHandler for Shell {
                     let editor_hover = state.editor.hovered_primitive();
                     let editor_selection = state.editor.selected_primitive();
                     let editor_selected_primitives = state.editor.selected_primitives();
+                    let editor_validation_issues = state.editor.validation_issue_primitives();
                     let editor_selected_bounds = state.editor.selected_bounds_3d();
                     let editor_selected_sector_faces = state.editor.selected_sector_faces();
                     let editor_paint_preview = state.editor.paint_target_preview();
@@ -765,6 +766,7 @@ impl ApplicationHandler for Shell {
                         editor_hover,
                         editor_selection,
                         &editor_selected_primitives,
+                        &editor_validation_issues,
                         editor_selected_bounds,
                         &editor_selected_sector_faces,
                         editor_paint_preview,

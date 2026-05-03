@@ -45,6 +45,7 @@ const EDITOR_SELECTED_OUTLINE_STROKE_WIDTH: f32 = 3.0;
 const EDITOR_OUTLINE_ACCENT: Color32 = Color32::from_rgb(165, 238, 255);
 const EDITOR_OUTLINE_GOLD: Color32 = Color32::from_rgb(255, 238, 150);
 const EGUI_TEXTURE_RETIRE_FRAMES: u8 = 2;
+const VIEWPORT_PREVIEW_ASPECT: f32 = 320.0 / 240.0;
 
 /// Discrete action a scene-tree row can produce in one frame.
 ///
@@ -679,7 +680,12 @@ fn world_cook_error_primitives(
     array_origin: [u16; 2],
 ) -> Vec<Selection> {
     let face = |x: u16, z: u16, kind: WorldGridFaceKind| {
-        world_cook_face_selection(room, x + array_origin[0], z + array_origin[1], kind)
+        world_cook_face_selection(
+            room,
+            x.saturating_add(array_origin[0]),
+            z.saturating_add(array_origin[1]),
+            kind,
+        )
     };
 
     match *error {
@@ -712,12 +718,7 @@ fn world_cook_error_primitives(
     }
 }
 
-fn world_cook_face_selection(
-    room: NodeId,
-    sx: u16,
-    sz: u16,
-    kind: WorldGridFaceKind,
-) -> Selection {
+fn world_cook_face_selection(room: NodeId, sx: u16, sz: u16, kind: WorldGridFaceKind) -> Selection {
     let kind = match kind {
         WorldGridFaceKind::Floor => FaceKind::Floor,
         WorldGridFaceKind::Ceiling => FaceKind::Ceiling,
@@ -1234,7 +1235,7 @@ enum PlaceKind {
     PlayerSpawn,
     /// `SpawnPoint { player: false }`. Multiple OK.
     SpawnMarker,
-    /// `Entity + ModelRenderer + Animator` referencing a
+    /// Prop entity: `Entity + ModelRenderer + Animator` referencing a
     /// [`ResourceData::Model`]. Place flow picks the selected Model
     /// resource if set, auto-picks the only Model resource if exactly
     /// one exists, or refuses with an actionable error otherwise.
@@ -1248,7 +1249,7 @@ impl PlaceKind {
         match self {
             Self::PlayerSpawn => "Player Spawn",
             Self::SpawnMarker => "Spawn",
-            Self::ModelInstance => "Model",
+            Self::ModelInstance => "Prop",
             Self::LightMarker => "Light",
         }
     }
@@ -1286,7 +1287,7 @@ impl ResourceFilter {
             Self::Texture => "Texture",
             Self::Material => "Material",
             Self::Model => "Model",
-            Self::Character => "Character",
+            Self::Character => "Character Profiles",
             Self::Weapon => "Weapon",
             Self::Mesh => "Mesh",
             Self::Room => "Room",
@@ -1324,6 +1325,32 @@ impl ResourceFilter {
             ),
         }
     }
+}
+
+fn allocate_centered_preview_rect(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    sense: Sense,
+) -> (Rect, egui::Response) {
+    let avail = ui.available_size();
+    let container_size = Vec2::new(avail.x.max(1.0), avail.y.max(1.0));
+    let (container, _) = ui.allocate_exact_size(container_size, Sense::hover());
+    let rect = centered_aspect_rect(container, VIEWPORT_PREVIEW_ASPECT);
+    let response = ui.interact(rect, ui.id().with(id_salt), sense);
+    (rect, response)
+}
+
+fn centered_aspect_rect(container: Rect, target_aspect: f32) -> Rect {
+    let size = container.size();
+    if size.x <= 0.0 || size.y <= 0.0 || target_aspect <= 0.0 {
+        return container;
+    }
+    let (w, h) = if size.x / size.y > target_aspect {
+        (size.y * target_aspect, size.y)
+    } else {
+        (size.x, size.x / target_aspect)
+    };
+    Rect::from_center_size(container.center(), Vec2::new(w, h))
 }
 
 impl EditorWorkspace {
@@ -1526,10 +1553,31 @@ impl EditorWorkspace {
         }
         copy_dir_recursive(&psxed_project::default_project_dir(), &target)
             .map_err(|error| format!("copy default project: {error}"))?;
-        let opened = Self::open_directory(&target)?;
+        let mut opened = Self::open_directory(&target)?;
+        opened.retire_egui_textures(self.drain_live_egui_textures());
         *self = opened;
         self.status = format!("Created {}", short_path(&self.project_dir));
         Ok(())
+    }
+
+    /// Switch to another project directory, preserving live egui
+    /// texture handles long enough for the current frame to finish.
+    fn switch_project(&mut self, dir: impl Into<PathBuf>) -> Result<(), String> {
+        let target = dir.into();
+        let mut opened = Self::open_directory(&target)?;
+        opened.retire_egui_textures(self.drain_live_egui_textures());
+        *self = opened;
+        Ok(())
+    }
+
+    fn open_project_from_menu(&mut self, path: &Path) {
+        if paths_equivalent(&self.project_dir, path) {
+            self.status = format!("Already loaded {}", short_path(path));
+            return;
+        }
+        if let Err(error) = self.switch_project(path.to_path_buf()) {
+            self.status = format!("Open project failed: {error}");
+        }
     }
 
     /// Select the first Room in the active scene if one exists.
@@ -1721,18 +1769,23 @@ impl EditorWorkspace {
         let mut total_bytes = 0usize;
         let mut written = 0usize;
         for (room_id, room_name) in &rooms {
-            let scene = self.project.active_scene();
-            let Some(node) = scene.node(*room_id) else {
-                continue;
+            let cook_result = {
+                let scene = self.project.active_scene();
+                let Some(node) = scene.node(*room_id) else {
+                    continue;
+                };
+                let NodeKind::Room { grid } = &node.kind else {
+                    continue;
+                };
+                psxed_project::world_cook::encode_world_grid_psxw(&self.project, grid)
             };
-            let NodeKind::Room { grid } = &node.kind else {
-                continue;
-            };
-            let bytes = psxed_project::world_cook::encode_world_grid_psxw(&self.project, grid)
-                .map_err(|error| {
+            let bytes = match cook_result {
+                Ok(bytes) => bytes,
+                Err(error) => {
                     self.record_world_cook_error(*room_id, &error, [0, 0]);
-                    format!("cook \"{room_name}\": {error}")
-                })?;
+                    return Err(format!("cook \"{room_name}\": {error}"));
+                }
+            };
             let filename = sanitise_room_filename(room_name);
             let path = cooked_dir.join(format!("{filename}.psxw"));
             std::fs::write(&path, &bytes)
@@ -2177,6 +2230,36 @@ impl EditorWorkspace {
     fn retire_egui_texture(&mut self, handle: egui::TextureHandle) {
         self.import_retired_textures
             .push((EGUI_TEXTURE_RETIRE_FRAMES, handle));
+    }
+
+    fn retire_egui_textures(&mut self, handles: impl IntoIterator<Item = egui::TextureHandle>) {
+        self.import_retired_textures.extend(
+            handles
+                .into_iter()
+                .map(|handle| (EGUI_TEXTURE_RETIRE_FRAMES, handle)),
+        );
+    }
+
+    fn drain_live_egui_textures(&mut self) -> Vec<egui::TextureHandle> {
+        let mut handles = Vec::new();
+        handles.extend(self.texture_thumbs.drain().map(|(_, entry)| entry.handle));
+        if let Some(preview) = self.texture_import_dialog.preview.take() {
+            handles.push(preview.handle);
+        }
+        if let Some(preview) = self.model_import_dialog.preview.take() {
+            if let Some((handle, _)) = preview.atlas {
+                handles.push(handle);
+            }
+            if let Some(handle) = preview.animated_texture {
+                handles.push(handle);
+            }
+        }
+        handles.extend(
+            self.import_retired_textures
+                .drain(..)
+                .map(|(_, handle)| handle),
+        );
+        handles
     }
 
     fn set_texture_import_preview(&mut self, preview: TextureImportPreview) {
@@ -2793,15 +2876,8 @@ impl EditorWorkspace {
             }
         });
         ui.separator();
-        let avail = ui.available_size();
-        let target_aspect = 320.0_f32 / 240.0;
-        let (w, h) = if avail.x / avail.y > target_aspect {
-            (avail.y * target_aspect, avail.y)
-        } else {
-            (avail.x, avail.x / target_aspect)
-        };
         let (rect, response) =
-            ui.allocate_exact_size(egui::Vec2::new(w, h), egui::Sense::click_and_drag());
+            allocate_centered_preview_rect(ui, "viewport_3d_canvas", egui::Sense::click_and_drag());
         let dnd_active = egui::DragAndDrop::has_any_payload(ui.ctx());
         let resource_drop_hovered = response.dnd_hover_payload::<ResourceId>().is_some();
 
@@ -3158,14 +3234,8 @@ impl EditorWorkspace {
         });
         ui.separator();
 
-        let avail = ui.available_size();
-        let target_aspect = 320.0_f32 / 240.0;
-        let (w, h) = if avail.x / avail.y > target_aspect {
-            (avail.y * target_aspect, avail.y)
-        } else {
-            (avail.x, avail.x / target_aspect)
-        };
-        let (rect, response) = ui.allocate_exact_size(egui::Vec2::new(w, h), egui::Sense::click());
+        let (rect, response) =
+            allocate_centered_preview_rect(ui, "viewport_3d_play_canvas", egui::Sense::click());
         if response.clicked() {
             self.pending_playtest_request = Some(EditorPlaytestRequest::CaptureInput);
         }
@@ -4020,7 +4090,7 @@ impl EditorWorkspace {
                 self.replace_node_selection(node);
                 self.clear_resource_selection_state();
                 self.clear_primitive_selection_state();
-                self.status = format!("Created Entity from {}", resource.name);
+                self.status = format!("Created Prop Entity from model {}", resource.name);
                 self.mark_dirty();
             }
             ResourceData::Character(character) => {
@@ -4038,7 +4108,7 @@ impl EditorWorkspace {
                 self.replace_node_selection(node);
                 self.clear_resource_selection_state();
                 self.clear_primitive_selection_state();
-                self.status = format!("Created Entity from {}", resource.name);
+                self.status = format!("Created Character Entity from profile {}", resource.name);
                 self.mark_dirty();
             }
             ResourceData::Weapon(weapon) => {
@@ -4055,7 +4125,7 @@ impl EditorWorkspace {
                 self.replace_node_selection(node);
                 self.clear_resource_selection_state();
                 self.selected_primitive = None;
-                self.status = format!("Created Weapon Entity from {}", resource.name);
+                self.status = format!("Created Weapon Entity from resource {}", resource.name);
                 self.mark_dirty();
             }
             ResourceData::Material(_) => {
@@ -4071,7 +4141,7 @@ impl EditorWorkspace {
             }
             _ => {
                 self.status = format!(
-                    "Drag Model, Character, or Weapon resources into the scene; {} is not placeable",
+                    "Drag Model, Character Profile, or Weapon resources into the scene; {} is not placeable",
                     resource.data.label()
                 );
             }
@@ -4434,7 +4504,7 @@ impl EditorWorkspace {
                             self.replace_node_selection(id);
                             self.clear_resource_selection_state();
                             self.clear_primitive_selection_state();
-                            self.status = format!("Placed Model at {sx},{sz}");
+                            self.status = format!("Placed Prop at {sx},{sz}");
                             self.mark_dirty();
                             return;
                         }
@@ -4732,11 +4802,7 @@ impl EditorWorkspace {
                 match world_cook::cook_world_grid(project, &chunk_grid) {
                     Ok(cooked) => {
                         if let Err(error) = cooked.to_psxw_bytes() {
-                            self.record_world_cook_error(
-                                room_node.id,
-                                &error,
-                                chunk.array_origin,
-                            );
+                            self.record_world_cook_error(room_node.id, &error, chunk.array_origin);
                             return;
                         }
                     }
@@ -5045,6 +5111,7 @@ impl EditorWorkspace {
         let consume_play = consume_command_shortcut(ctx, egui::Key::Enter);
         let consume_redo = consume_command_shift_shortcut(ctx, egui::Key::Z);
         let consume_undo = consume_command_shortcut(ctx, egui::Key::Z);
+        let focus_taken = ctx.memory(|m| m.focused().is_some());
         if consume_save {
             self.save_project_from_ui();
         }
@@ -5065,10 +5132,12 @@ impl EditorWorkspace {
         } else if consume_undo {
             self.do_undo();
         }
+        if !focus_taken && consume_command_shortcut(ctx, egui::Key::A) {
+            self.select_all_current_scope();
+        }
 
         // F2 / Delete only fire when no widget owns focus -- so they
         // don't fight TextEdit content while the user is typing.
-        let focus_taken = ctx.memory(|m| m.focused().is_some());
         let modifiers = ctx.input(|i| i.modifiers);
         if bare_shortcuts_available(focus_taken, modifiers) {
             let f2 = ctx.input_mut(|i| i.key_pressed(egui::Key::F2));
@@ -5332,6 +5401,26 @@ impl EditorWorkspace {
                             self.open_new_project_dialog();
                             ui.close_menu();
                         }
+                        ui.menu_button(icons::label(icons::FOLDER, "Project"), |ui| {
+                            match psxed_project::list_projects() {
+                                Ok(projects) if projects.is_empty() => {
+                                    ui.weak("No projects found");
+                                }
+                                Ok(projects) => {
+                                    for path in projects {
+                                        let current = paths_equivalent(&self.project_dir, &path);
+                                        let label = short_path(&path);
+                                        if ui.selectable_label(current, label).clicked() {
+                                            self.open_project_from_menu(&path);
+                                            ui.close_menu();
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    ui.weak(format!("Could not list projects: {error}"));
+                                }
+                            }
+                        });
                         ui.separator();
                         if ui
                             .button(menu_label("Save", &command_shortcut_text("S")))
@@ -6391,7 +6480,7 @@ impl EditorWorkspace {
             })
             .collect();
         // Snapshot Model resources + their clip names so the
-        // Character inspector can populate model + clip pickers
+        // Character Profile inspector can populate model + clip pickers
         // without borrowing `self.project` while the mutable
         // borrow on `resource_mut` is live.
         let character_ctx = build_character_editor_context(&self.project);
@@ -6633,6 +6722,24 @@ impl EditorWorkspace {
                         .clicked()
                     {
                         self.open_model_import_dialog();
+                    }
+                    if ui
+                        .button(icons::label(icons::PLUS, "Character Profile"))
+                        .on_hover_text(
+                            "Add reusable movement, animation-role, capsule, and camera defaults for character entities.",
+                        )
+                        .clicked()
+                    {
+                        let id = self.project.add_resource(
+                            "New Character Profile",
+                            ResourceData::Character(psxed_project::CharacterResource::default()),
+                        );
+                        self.replace_resource_selection(id);
+                        self.clear_node_selection_state();
+                        self.clear_primitive_selection_state();
+                        self.clear_sector_selection();
+                        self.status = "Added character profile".to_string();
+                        self.mark_dirty();
                     }
                     if ui
                         .button(icons::label(icons::PLUS, "Weapon"))
@@ -7145,7 +7252,7 @@ impl EditorWorkspace {
                         (
                             ViewTool::Place,
                             icons::label(icons::PLUS, "Place"),
-                            "Drop a SpawnPoint at the clicked cell.",
+                            "Drop a Spawn Point at the clicked cell.",
                         ),
                     ] {
                         ui.selectable_value(&mut self.active_tool, tool, label)
@@ -7271,7 +7378,7 @@ impl EditorWorkspace {
         }
     }
 
-    /// Pick the Model resource a `PlaceKind::ModelInstance` click
+    /// Pick the Model resource a `PlaceKind::ModelInstance` prop click
     /// should bind to. Returns `(id, default_node_name)` on
     /// success or an actionable status message on failure. The
     /// caller renders the failure into `self.status` and skips
@@ -7297,7 +7404,7 @@ impl EditorWorkspace {
             0 => Err("No Model resources exist. Register or import a model first.".to_string()),
             1 => Ok((models[0].id, models[0].name.clone())),
             n => Err(format!(
-                "Select a Model resource before placing a model ({n} available)"
+                "Select a Model resource before placing a prop ({n} available)"
             )),
         }
     }
@@ -7478,6 +7585,10 @@ impl EditorWorkspace {
             .map(|(id, _)| *id)
     }
 
+    fn first_material(&self) -> Option<ResourceId> {
+        self.project.material_options().first().map(|(id, _)| *id)
+    }
+
     fn replace_node_selection(&mut self, id: NodeId) {
         self.selected_node = id;
         self.selected_nodes.clear();
@@ -7515,6 +7626,173 @@ impl EditorWorkspace {
     fn clear_primitive_selection_state(&mut self) {
         self.selected_primitive = None;
         self.selected_primitives.clear();
+    }
+
+    fn select_all_current_scope(&mut self) {
+        if self.selected_resource.is_some() || !self.selected_resources.is_empty() {
+            self.select_all_resources();
+            return;
+        }
+
+        if matches!(self.active_tool, ViewTool::Select)
+            || self.selected_primitive.is_some()
+            || !self.selected_primitives.is_empty()
+        {
+            if self.select_all_primitives_in_active_room() {
+                return;
+            }
+        }
+
+        self.select_all_scene_nodes();
+    }
+
+    fn select_all_scene_nodes(&mut self) {
+        let ids: Vec<NodeId> = self
+            .scene_node_order()
+            .into_iter()
+            .filter(|id| *id != NodeId::ROOT)
+            .collect();
+        if ids.is_empty() {
+            self.status = "No scene nodes to select".to_string();
+            return;
+        }
+
+        self.selected_nodes = ids.iter().copied().collect();
+        self.selected_node = ids[0];
+        self.node_selection_anchor = Some(ids[0]);
+        self.clear_resource_selection_state();
+        self.clear_primitive_selection_state();
+        self.clear_sector_selection();
+        self.status = if ids.len() == 1 {
+            "Selected 1 node".to_string()
+        } else {
+            format!("Selected {} nodes", ids.len())
+        };
+    }
+
+    fn select_all_resources(&mut self) {
+        let ids: Vec<ResourceId> = self
+            .project
+            .resources
+            .iter()
+            .map(|resource| resource.id)
+            .collect();
+        if ids.is_empty() {
+            self.status = "No resources to select".to_string();
+            return;
+        }
+
+        self.selected_resources = ids.iter().copied().collect();
+        self.selected_resource = Some(ids[0]);
+        self.resource_selection_anchor = Some(ids[0]);
+        self.resource_delete_confirm = None;
+        self.clear_node_selection_state();
+        self.clear_primitive_selection_state();
+        self.clear_sector_selection();
+        self.status = if ids.len() == 1 {
+            "Selected 1 resource".to_string()
+        } else {
+            format!("Selected {} resources", ids.len())
+        };
+    }
+
+    fn select_all_primitives_in_active_room(&mut self) -> bool {
+        let Some(room) = self.active_room_id() else {
+            self.status = "No active room to select".to_string();
+            return false;
+        };
+        let selections = self.all_primitive_selections_in_room(room, self.selection_mode);
+        if selections.is_empty() {
+            self.status = format!("No {} primitives to select", self.selection_mode.label());
+            return false;
+        }
+
+        self.selected_primitives = selections;
+        self.selected_primitive = self.selected_primitives.first().copied();
+        self.clear_sector_selection();
+        self.clear_node_selection_state();
+        self.update_primitive_resource_selection();
+        self.status = format!(
+            "Selected {} {} primitives",
+            self.selected_primitives.len(),
+            self.selection_mode.label()
+        );
+        true
+    }
+
+    fn all_primitive_selections_in_room(
+        &self,
+        room: NodeId,
+        mode: SelectionMode,
+    ) -> Vec<Selection> {
+        let mut selections = Vec::new();
+        for face in self.all_faces_in_room(room) {
+            match mode {
+                SelectionMode::Face => {
+                    push_unique_selection(&mut selections, Selection::Face(face))
+                }
+                SelectionMode::Edge => {
+                    for edge in face_edges(face) {
+                        push_unique_selection(&mut selections, Selection::Edge(edge));
+                    }
+                }
+                SelectionMode::Vertex => {
+                    for vertex in face_vertices(face) {
+                        push_unique_selection(&mut selections, Selection::Vertex(vertex));
+                    }
+                }
+            }
+        }
+        selections
+    }
+
+    fn all_faces_in_room(&self, room: NodeId) -> Vec<FaceRef> {
+        let scene = self.project.active_scene();
+        let Some(node) = scene.node(room) else {
+            return Vec::new();
+        };
+        let NodeKind::Room { grid } = &node.kind else {
+            return Vec::new();
+        };
+
+        let mut faces = Vec::new();
+        for sx in 0..grid.width {
+            for sz in 0..grid.depth {
+                let Some(sector) = grid.sector(sx, sz) else {
+                    continue;
+                };
+                if sector.floor.is_some() {
+                    faces.push(FaceRef {
+                        room,
+                        sx,
+                        sz,
+                        kind: FaceKind::Floor,
+                    });
+                }
+                if sector.ceiling.is_some() {
+                    faces.push(FaceRef {
+                        room,
+                        sx,
+                        sz,
+                        kind: FaceKind::Ceiling,
+                    });
+                }
+                for dir in GridDirection::CARDINAL {
+                    for (stack, _) in sector.walls.get(dir).iter().enumerate() {
+                        let Ok(stack) = u8::try_from(stack) else {
+                            continue;
+                        };
+                        faces.push(FaceRef {
+                            room,
+                            sx,
+                            sz,
+                            kind: FaceKind::Wall { dir, stack },
+                        });
+                    }
+                }
+            }
+        }
+        faces
     }
 
     fn selected_primitive_targets(&self) -> Vec<Selection> {
@@ -8177,8 +8455,12 @@ impl EditorWorkspace {
     fn add_child(&mut self, mut kind: NodeKind, name: &str) {
         self.push_undo();
         let parent = self.selected_node;
+        let first_material = self.first_material();
         if let NodeKind::Room { grid } = &mut kind {
-            grid.sector_size = self.project.world_sector_size_for_node(parent);
+            *grid = starter_room_grid(
+                self.project.world_sector_size_for_node(parent),
+                first_material,
+            );
         }
         let id = self
             .project
@@ -9163,7 +9445,7 @@ fn draw_node_kind_editor(
             ui.weak("Organisational transform node");
         }
         NodeKind::Entity => {
-            ui.weak("Entity host. Add component-node children for rendering, collision, interaction, lighting, or logic.");
+            ui.weak("Entity host. Add component children for rendering, collision, interaction, lighting, or logic.");
         }
         NodeKind::World { .. } => {
             ui.weak("Streamed-region group; holds Room children.");
@@ -9412,12 +9694,12 @@ fn draw_node_kind_editor(
             });
         }
         NodeKind::Collider { shape, solid } => {
-            ui.weak("Component: collision authored on an Entity. Runtime prop collision is not cooked yet.");
+            ui.weak("Component: collision authored on an Entity. Runtime entity collision is not cooked yet.");
             changed |= ui.checkbox(solid, "Solid").changed();
             changed |= collider_shape_editor(ui, shape);
         }
         NodeKind::Interactable { prompt, action } => {
-            ui.weak("Component: marks a prop/entity as interactable. Runtime interaction cooking lands later.");
+            ui.weak("Component: marks an Entity as interactable. Runtime interaction cooking lands later.");
             ui.horizontal(|ui| {
                 ui.label("Prompt");
                 changed |= ui.text_edit_singleline(prompt).changed();
@@ -9428,7 +9710,7 @@ fn draw_node_kind_editor(
             });
         }
         NodeKind::CharacterController { character, player } => {
-            ui.weak("Component: binds an Entity to a Character profile. Player controllers cook into the current playtest controller.");
+            ui.weak("Component: binds an Entity to a Character Profile. Player controllers cook into the current playtest controller.");
             changed |= ui
                 .checkbox(player, icons::label(icons::MAP_PIN, "Player controlled"))
                 .changed();
@@ -9699,6 +9981,13 @@ fn short_path(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 fn node_lucide_icon(kind: &str, root: bool) -> char {
     if root {
         return icons::HOUSE;
@@ -9709,20 +9998,20 @@ fn node_lucide_icon(kind: &str, root: bool) -> char {
         "Entity" => icons::BOX,
         "World" => icons::HOUSE,
         "Room" => icons::GRID,
-        "MeshInstance" => icons::BOX,
-        "ModelRenderer" => icons::BOX,
+        "Mesh Instance" | "MeshInstance" => icons::BOX,
+        "Model Renderer" | "ModelRenderer" => icons::BOX,
         "Animator" => icons::PLAY,
         "Collider" => icons::SCALE_3D,
         "Interactable" => icons::POINTER,
-        "CharacterController" => icons::MAP_PIN,
-        "AiController" => icons::SCAN,
+        "Character Controller" | "CharacterController" => icons::MAP_PIN,
+        "AI Controller" | "AiController" => icons::SCAN,
         "Combat" => icons::FOCUS,
         "Equipment" => icons::WAYPOINT,
         "Light" => icons::SUN,
-        "PointLight" => icons::SUN,
-        "SpawnPoint" => icons::MAP_PIN,
+        "Point Light" | "PointLight" => icons::SUN,
+        "Spawn Point" | "SpawnPoint" => icons::MAP_PIN,
         "Trigger" => icons::SCAN,
-        "AudioSource" => icons::AUDIO_LINES,
+        "Audio Source" | "AudioSource" => icons::AUDIO_LINES,
         "Portal" => icons::WAYPOINT,
         _ => icons::CIRCLE_DOT,
     }
@@ -9740,20 +10029,20 @@ fn node_lucide_color(kind: &str, root: bool, selected: bool) -> Color32 {
         "Entity" => Color32::from_rgb(156, 174, 190),
         "World" => Color32::from_rgb(232, 152, 96),
         "Room" => Color32::from_rgb(209, 118, 71),
-        "MeshInstance" => Color32::from_rgb(156, 174, 190),
-        "ModelRenderer" => Color32::from_rgb(134, 168, 196),
+        "Mesh Instance" | "MeshInstance" => Color32::from_rgb(156, 174, 190),
+        "Model Renderer" | "ModelRenderer" => Color32::from_rgb(134, 168, 196),
         "Animator" => Color32::from_rgb(126, 164, 220),
         "Collider" => Color32::from_rgb(180, 170, 112),
         "Interactable" => Color32::from_rgb(216, 160, 108),
-        "CharacterController" => Color32::from_rgb(104, 194, 142),
-        "AiController" => Color32::from_rgb(144, 176, 112),
+        "Character Controller" | "CharacterController" => Color32::from_rgb(104, 194, 142),
+        "AI Controller" | "AiController" => Color32::from_rgb(144, 176, 112),
         "Combat" => Color32::from_rgb(220, 110, 110),
         "Equipment" => Color32::from_rgb(210, 190, 104),
         "Light" => Color32::from_rgb(238, 203, 116),
-        "PointLight" => Color32::from_rgb(238, 203, 116),
-        "SpawnPoint" => Color32::from_rgb(236, 188, 104),
+        "Point Light" | "PointLight" => Color32::from_rgb(238, 203, 116),
+        "Spawn Point" | "SpawnPoint" => Color32::from_rgb(236, 188, 104),
         "Trigger" => Color32::from_rgb(190, 128, 232),
-        "AudioSource" => Color32::from_rgb(104, 202, 188),
+        "Audio Source" | "AudioSource" => Color32::from_rgb(104, 202, 188),
         "Portal" => Color32::from_rgb(255, 188, 100),
         _ => Color32::from_rgb(141, 160, 180),
     }
@@ -10389,6 +10678,15 @@ fn draw_model_resource_editor(
     egui::CollapsingHeader::new(icons::label(icons::PLAY, "Animation Clips"))
         .default_open(true)
         .show(ui, |ui| {
+            let available_clips = available_animation_clips(project_root);
+            if available_clips.is_empty() {
+                ui.label(
+                    RichText::new("No .psxanim files found in this project.")
+                        .color(STUDIO_TEXT_WEAK)
+                        .small(),
+                );
+            }
+
             // Walk a copy of the indices so we can offer add /
             // remove buttons without confusing the borrow checker.
             let mut to_remove: Option<usize> = None;
@@ -10402,10 +10700,12 @@ fn draw_model_resource_editor(
                         to_remove = Some(i);
                     }
                 });
-                ui.label(RichText::new("Path").color(STUDIO_TEXT_WEAK).small());
-                if ui.text_edit_singleline(&mut clip.psxanim_path).changed() {
-                    changed = true;
-                }
+                changed |= animation_clip_source_picker(
+                    ui,
+                    ui.id().with("model-animation-clip-source").with(i),
+                    clip,
+                    &available_clips,
+                );
                 // Inline per-clip stats: parse on the fly. Joint
                 // mismatch is the most actionable thing to surface
                 // -- the cooker rejects the bundle if it persists.
@@ -10469,10 +10769,21 @@ fn draw_model_resource_editor(
                 changed = true;
             }
             if ui.button(icons::label(icons::PLUS, "Add clip")).clicked() {
-                model.clips.push(psxed_project::ModelAnimationClip {
-                    name: format!("clip_{}", model.clips.len()),
-                    psxanim_path: String::new(),
-                });
+                let used_paths: HashSet<&str> = model
+                    .clips
+                    .iter()
+                    .map(|c| c.psxanim_path.as_str())
+                    .collect();
+                let source = available_clips
+                    .iter()
+                    .find(|clip| !used_paths.contains(clip.stored_path.as_str()))
+                    .or_else(|| available_clips.first());
+                let (name, psxanim_path) = source
+                    .map(|clip| (clip.default_name.clone(), clip.stored_path.clone()))
+                    .unwrap_or_else(|| (format!("clip_{}", model.clips.len()), String::new()));
+                model
+                    .clips
+                    .push(psxed_project::ModelAnimationClip { name, psxanim_path });
                 changed = true;
             }
 
@@ -10513,6 +10824,192 @@ fn register_bundle_into_model(
     let clip_count = model.clips.len();
     *target = model.clone();
     Ok(clip_count)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AvailableAnimationClip {
+    label: String,
+    default_name: String,
+    stored_path: String,
+}
+
+impl AvailableAnimationClip {
+    fn from_stored_path(stored_path: String) -> Self {
+        Self {
+            label: animation_clip_label_for_path(&stored_path),
+            default_name: animation_clip_default_name(&stored_path),
+            stored_path,
+        }
+    }
+}
+
+fn available_animation_clips(project_root: &Path) -> Vec<AvailableAnimationClip> {
+    let mut clips = Vec::new();
+    let mut seen = HashSet::new();
+    collect_available_animation_clips(project_root, project_root, &mut seen, &mut clips);
+    clips.sort_by(|a, b| {
+        a.label
+            .to_ascii_lowercase()
+            .cmp(&b.label.to_ascii_lowercase())
+            .then_with(|| a.stored_path.cmp(&b.stored_path))
+    });
+    clips
+}
+
+fn collect_available_animation_clips(
+    dir: &Path,
+    project_root: &Path,
+    seen: &mut HashSet<String>,
+    clips: &mut Vec<AvailableAnimationClip>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if should_skip_animation_scan_dir(&path) {
+                continue;
+            }
+            collect_available_animation_clips(&path, project_root, seen, clips);
+        } else if is_psxanim_path(&path) {
+            let stored_path = project_relative_path_string(&path, project_root);
+            if seen.insert(stored_path.clone()) {
+                clips.push(AvailableAnimationClip::from_stored_path(stored_path));
+            }
+        }
+    }
+}
+
+fn should_skip_animation_scan_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with('.') || name == "target"
+}
+
+fn is_psxanim_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("psxanim"))
+}
+
+fn project_relative_path_string(path: &Path, project_root: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn animation_clip_source_picker(
+    ui: &mut egui::Ui,
+    id_salt: egui::Id,
+    clip: &mut psxed_project::ModelAnimationClip,
+    options: &[AvailableAnimationClip],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Animation").color(STUDIO_TEXT_WEAK).small());
+        let preview = if clip.psxanim_path.trim().is_empty() {
+            "(none)".to_string()
+        } else {
+            options
+                .iter()
+                .find(|option| option.stored_path == clip.psxanim_path)
+                .map(|option| option.label.clone())
+                .unwrap_or_else(|| animation_clip_label_for_path(&clip.psxanim_path))
+        };
+        let current_custom = (!clip.psxanim_path.trim().is_empty()
+            && !options
+                .iter()
+                .any(|option| option.stored_path == clip.psxanim_path))
+        .then(|| AvailableAnimationClip::from_stored_path(clip.psxanim_path.clone()));
+
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(clip.psxanim_path.trim().is_empty(), "(none)")
+                    .clicked()
+                {
+                    changed |= set_model_animation_clip_source(clip, "");
+                }
+                if let Some(current_custom) = &current_custom {
+                    let response = ui
+                        .selectable_label(true, format!("{} (missing)", current_custom.label))
+                        .on_hover_text(&current_custom.stored_path);
+                    if response.clicked() {
+                        changed |=
+                            set_model_animation_clip_source(clip, &current_custom.stored_path);
+                    }
+                    if !options.is_empty() {
+                        ui.separator();
+                    }
+                }
+                for option in options {
+                    let response = ui
+                        .selectable_label(clip.psxanim_path == option.stored_path, &option.label)
+                        .on_hover_text(&option.stored_path);
+                    if response.clicked() {
+                        changed |= set_model_animation_clip_source(clip, &option.stored_path);
+                    }
+                }
+            });
+    });
+    if !clip.psxanim_path.trim().is_empty() {
+        ui.label(
+            RichText::new(&clip.psxanim_path)
+                .color(STUDIO_TEXT_WEAK)
+                .monospace()
+                .small(),
+        );
+    }
+    changed
+}
+
+fn set_model_animation_clip_source(
+    clip: &mut psxed_project::ModelAnimationClip,
+    new_path: &str,
+) -> bool {
+    if clip.psxanim_path == new_path {
+        return false;
+    }
+    let old_path = clip.psxanim_path.clone();
+    let should_rename = should_auto_rename_animation_clip(&clip.name, &old_path);
+    clip.psxanim_path = new_path.to_string();
+    if should_rename && !new_path.trim().is_empty() {
+        clip.name = animation_clip_default_name(new_path);
+    }
+    true
+}
+
+fn should_auto_rename_animation_clip(name: &str, old_path: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.is_empty()
+        || trimmed.starts_with("clip_")
+        || (!old_path.trim().is_empty() && trimmed == animation_clip_default_name(old_path))
+}
+
+fn animation_clip_default_name(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("clip")
+        .to_string()
+}
+
+fn animation_clip_label_for_path(path: &str) -> String {
+    let default_name = animation_clip_default_name(path);
+    let parent = Path::new(path)
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty());
+    match parent {
+        Some(parent) => format!("{default_name} ({parent})"),
+        None => default_name,
+    }
 }
 
 /// Combo-box picker for a clip index. `None` means "unset" and
@@ -10651,7 +11148,7 @@ fn material_texture_picker(
 }
 
 /// Snapshot of every Model resource and its clip names. Built
-/// before the mutable borrow on a Resource so the Character
+/// before the mutable borrow on a Resource so the Character Profile
 /// inspector can populate model + clip dropdowns without
 /// fighting the live `&mut CharacterResource`.
 struct CharacterEditorContext {
@@ -10665,7 +11162,7 @@ fn build_character_editor_context(project: &ProjectDocument) -> CharacterEditorC
     }
 }
 
-/// Inspector body for `ResourceData::Character`. Combines a
+/// Inspector body for `ResourceData::Character` profiles. Combines a
 /// model picker, four role-clip pickers (idle / walk / run /
 /// turn), capsule sizes, controller speed, and camera params.
 /// `Auto Assign Clips By Name` walks the bound model's clip
@@ -10922,9 +11419,9 @@ fn auto_assign_character_clips(character: &mut psxed_project::CharacterResource,
     }
 }
 
-/// Player-spawn inspector helper: pick which Character drives
-/// this spawn. `(none)` lets the cook step auto-pick when
-/// exactly one Character exists.
+/// Character-controller / player-spawn inspector helper: pick which
+/// Character Profile drives this entity. `(none)` lets the cook step
+/// auto-pick when exactly one profile exists.
 fn draw_character_selector(
     ui: &mut egui::Ui,
     options: &[(ResourceId, String)],
@@ -10932,7 +11429,7 @@ fn draw_character_selector(
 ) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.label("Character");
+        ui.label("Profile");
         let preview = current
             .and_then(|id| {
                 options
@@ -10960,24 +11457,24 @@ fn draw_character_selector(
         if !options.iter().any(|(rid, _)| *rid == id) {
             ui.colored_label(
                 Color32::from_rgb(220, 120, 100),
-                "Selected Character resource is missing.",
+                "Selected Character Profile resource is missing.",
             );
         }
     } else if options.is_empty() {
         ui.colored_label(
             STUDIO_TEXT_WEAK,
-            "No Character resources defined. Cook will fail unless one is added.",
+            "No Character Profile resources defined. Cook will fail unless one is added.",
         );
     } else if options.len() > 1 {
         ui.colored_label(
             STUDIO_TEXT_WEAK,
-            "Multiple Characters available — pick one explicitly to avoid Cook failures.",
+            "Multiple Character Profiles available — pick one explicitly to avoid Cook failures.",
         );
     } else {
         ui.colored_label(
             STUDIO_TEXT_WEAK,
             format!(
-                "Cook will auto-select \"{}\" — only one Character defined.",
+                "Cook will auto-select \"{}\" — only one Character Profile defined.",
                 options[0].1
             ),
         );
@@ -12027,13 +12524,13 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
         (
             "Room",
             NodeKind::Room {
-                grid: WorldGrid::empty(4, 4, 1024),
+                grid: WorldGrid::empty(3, 3, 1024),
             },
         ),
         ("Entity", NodeKind::Entity),
         ("Node3D", NodeKind::Node3D),
         (
-            "ModelRenderer",
+            "Model Renderer",
             NodeKind::ModelRenderer {
                 model: None,
                 material: None,
@@ -12061,14 +12558,14 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
             },
         ),
         (
-            "CharacterController",
+            "Character Controller",
             NodeKind::CharacterController {
                 character: None,
                 player: false,
             },
         ),
         (
-            "AiController",
+            "AI Controller",
             NodeKind::AiController {
                 behavior: String::new(),
             },
@@ -12089,7 +12586,7 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
             },
         ),
         (
-            "PointLight",
+            "Point Light",
             NodeKind::PointLight {
                 color: [255, 240, 200],
                 intensity: 1.0,
@@ -12097,7 +12594,7 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
             },
         ),
         (
-            "MeshInstance",
+            "Mesh Instance",
             NodeKind::MeshInstance {
                 mesh: None,
                 material: None,
@@ -12117,7 +12614,7 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
             },
         ),
         (
-            "SpawnPoint",
+            "Spawn Point",
             NodeKind::SpawnPoint {
                 player: false,
                 character: None,
@@ -12140,6 +12637,16 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
     ]
 }
 
+fn starter_room_grid(sector_size: i32, material: Option<ResourceId>) -> WorldGrid {
+    let mut grid = WorldGrid::empty(3, 3, sector_size);
+    for x in 0..3 {
+        for z in 0..3 {
+            grid.set_floor(x, z, 0, material);
+        }
+    }
+    grid
+}
+
 fn addable_component_templates(
     host_kind: &NodeKind,
     existing: &[&NodeKind],
@@ -12159,7 +12666,7 @@ fn component_templates_for_host(host_kind: &NodeKind) -> Vec<(&'static str, Node
     }
     vec![
         (
-            "ModelRenderer",
+            "Model Renderer",
             NodeKind::ModelRenderer {
                 model: None,
                 material: None,
@@ -12187,7 +12694,7 @@ fn component_templates_for_host(host_kind: &NodeKind) -> Vec<(&'static str, Node
             },
         ),
         (
-            "PointLight",
+            "Point Light",
             NodeKind::PointLight {
                 color: [255, 240, 200],
                 intensity: 1.0,
@@ -12195,14 +12702,14 @@ fn component_templates_for_host(host_kind: &NodeKind) -> Vec<(&'static str, Node
             },
         ),
         (
-            "CharacterController",
+            "Character Controller",
             NodeKind::CharacterController {
                 character: None,
                 player: false,
             },
         ),
         (
-            "AiController",
+            "AI Controller",
             NodeKind::AiController {
                 behavior: String::new(),
             },
@@ -12294,7 +12801,7 @@ fn node_draw_mode(kind: &NodeKind) -> &'static str {
         NodeKind::Animator { .. } => "Animation Component",
         NodeKind::Collider { .. } => "Collision Component",
         NodeKind::Interactable { .. } => "Interaction Component",
-        NodeKind::CharacterController { .. } => "Character Component",
+        NodeKind::CharacterController { .. } => "Controller Component",
         NodeKind::AiController { .. } => "AI Component",
         NodeKind::Combat { .. } => "Combat Component",
         NodeKind::Equipment { .. } => "Equipment Component",
@@ -12364,6 +12871,7 @@ fn project_filesystem_rows(project: &ProjectDocument) -> Vec<ProjectFileRow> {
     push_resource_folder(project, &mut rows, "materials", ResourceFilter::Material);
     push_resource_folder(project, &mut rows, "textures", ResourceFilter::Texture);
     push_resource_folder(project, &mut rows, "models", ResourceFilter::Model);
+    push_resource_folder(project, &mut rows, "characters", ResourceFilter::Character);
     push_resource_folder(project, &mut rows, "weapons", ResourceFilter::Weapon);
     push_resource_folder(project, &mut rows, "meshes", ResourceFilter::Mesh);
     push_resource_folder(project, &mut rows, "spawns", ResourceFilter::Other);
@@ -12447,7 +12955,7 @@ fn resource_file_name(resource: &Resource) -> String {
         ResourceData::Texture { psxt_path } => cooked_name(&resource.name, psxt_path, "psxt"),
         ResourceData::Material(_) => cooked_name(&resource.name, "", "mat"),
         ResourceData::Model(model) => cooked_name(&resource.name, &model.model_path, "psxmdl"),
-        ResourceData::Character(_) => cooked_name(&resource.name, "", "char"),
+        ResourceData::Character(_) => cooked_name(&resource.name, "", "profile"),
         ResourceData::Weapon(_) => cooked_name(&resource.name, "", "weapon"),
         ResourceData::Mesh { source_path } => cooked_name(&resource.name, source_path, "psxmesh"),
         ResourceData::Scene { source_path } => cooked_name(&resource.name, source_path, "room"),
@@ -12979,7 +13487,7 @@ fn resource_detail(resource: &Resource) -> &'static str {
         ResourceData::Texture { .. } => "Texture - 4bpp",
         ResourceData::Material(_) => "Material - 4bpp",
         ResourceData::Model(_) => "Model",
-        ResourceData::Character(_) => "Character",
+        ResourceData::Character(_) => "Character Profile",
         ResourceData::Weapon(_) => "Weapon",
         ResourceData::Mesh { .. } => "Mesh",
         ResourceData::Scene { .. } => "Room",
@@ -13186,6 +13694,8 @@ fn draw_scene_viewport(
     selected: NodeId,
     selected_nodes: &HashSet<NodeId>,
     selected_sectors: &HashSet<SectorSelection>,
+    validation_issue_primitives: &[Selection],
+    validation_issue_rooms: &HashSet<NodeId>,
 ) -> Vec<ViewportHit> {
     let scene = project.active_scene();
     let mut hits = Vec::new();
@@ -13200,6 +13710,8 @@ fn draw_scene_viewport(
                 selected_nodes.contains(&node.id)
                     || (selected_nodes.is_empty() && selected == node.id),
                 selected_sectors,
+                validation_issue_primitives,
+                validation_issue_rooms,
                 &mut hits,
             );
         }
@@ -13307,6 +13819,8 @@ fn draw_room(
     node: &psxed_project::SceneNode,
     selected: bool,
     selected_sectors: &HashSet<SectorSelection>,
+    validation_issue_primitives: &[Selection],
+    validation_issue_rooms: &HashSet<NodeId>,
     hits: &mut Vec<ViewportHit>,
 ) {
     let NodeKind::Room { grid } = &node.kind else {
@@ -13370,7 +13884,23 @@ fn draw_room(
     }
 
     draw_streaming_chunk_boundaries_2d(painter, transform, grid, node_center);
+    draw_validation_issue_primitives_2d(
+        painter,
+        transform,
+        grid,
+        node.id,
+        node_center,
+        validation_issue_primitives,
+    );
     painter.rect_stroke(outline, 0.0, selected_stroke(selected), StrokeKind::Outside);
+    if validation_issue_rooms.contains(&node.id) {
+        painter.rect_stroke(
+            outline.expand(2.0),
+            0.0,
+            Stroke::new(4.0, Color32::from_rgb(255, 64, 64)),
+            StrokeKind::Outside,
+        );
+    }
     painter.text(
         transform.world_to_screen([center[0] - half[0], center[1] + half[1]])
             + Vec2::new(8.0, -8.0),
@@ -13406,6 +13936,78 @@ fn draw_streaming_chunk_boundaries_2d(
     }
 }
 
+fn draw_validation_issue_primitives_2d(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    grid: &WorldGrid,
+    room: NodeId,
+    node_center: [f32; 2],
+    validation_issue_primitives: &[Selection],
+) {
+    for selection in validation_issue_primitives {
+        let Selection::Face(face) = *selection else {
+            continue;
+        };
+        if face.room != room || face.sx >= grid.width || face.sz >= grid.depth {
+            continue;
+        }
+
+        let local_tile_center = grid_cell_editor_center(grid, face.sx, face.sz);
+        let tile_center = [
+            node_center[0] + local_tile_center[0],
+            node_center[1] + local_tile_center[1],
+        ];
+        match face.kind {
+            FaceKind::Floor | FaceKind::Ceiling => {
+                let rect = transform.world_rect_to_screen(tile_center, [0.5, 0.5]);
+                if rect.intersects(transform.rect) {
+                    draw_validation_issue_rect(painter, rect);
+                }
+            }
+            FaceKind::Wall { dir, .. } if dir.is_cardinal() => {
+                if let Some((wall_center, wall_half)) = wall_band_center_half(tile_center, dir) {
+                    let rect = transform.world_rect_to_screen(wall_center, wall_half);
+                    if rect.intersects(transform.rect) {
+                        draw_validation_issue_rect(painter, rect);
+                    }
+                }
+            }
+            FaceKind::Wall { dir, .. } => {
+                draw_validation_issue_diagonal(painter, transform, tile_center, dir);
+            }
+        }
+    }
+}
+
+fn draw_validation_issue_rect(painter: &egui::Painter, rect: Rect) {
+    let fill = Color32::from_rgba_unmultiplied(255, 32, 32, 70);
+    let stroke = Stroke::new(4.0, Color32::from_rgb(255, 64, 64));
+    painter.rect_filled(rect, 0.0, fill);
+    painter.rect_stroke(rect, 0.0, stroke, StrokeKind::Outside);
+}
+
+fn draw_validation_issue_diagonal(
+    painter: &egui::Painter,
+    transform: ViewportTransform,
+    tile_center: [f32; 2],
+    dir: GridDirection,
+) {
+    let min_x = tile_center[0] - 0.5;
+    let min_z = tile_center[1] - 0.5;
+    let (a, b) = match dir {
+        GridDirection::NorthWestSouthEast => ([min_x, min_z + 1.0], [min_x + 1.0, min_z]),
+        GridDirection::NorthEastSouthWest => ([min_x + 1.0, min_z + 1.0], [min_x, min_z]),
+        _ => return,
+    };
+    let a = transform.world_to_screen(a);
+    let b = transform.world_to_screen(b);
+    painter.line_segment(
+        [a, b],
+        Stroke::new(7.0, Color32::from_rgba_unmultiplied(255, 32, 32, 92)),
+    );
+    painter.line_segment([a, b], Stroke::new(4.0, Color32::from_rgb(255, 64, 64)));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_grid_sector_walls(
     painter: &egui::Painter,
@@ -13414,7 +14016,6 @@ fn draw_grid_sector_walls(
     tile_center: [f32; 2],
     sector: &psxed_project::GridSector,
 ) {
-    let wall_thickness = 0.18;
     let min_x = tile_center[0] - 0.5;
     let min_z = tile_center[1] - 0.5;
     for direction in GridDirection::CARDINAL {
@@ -13424,24 +14025,8 @@ fn draw_grid_sector_walls(
         }
         let material = walls.first().and_then(|wall| wall.material);
         let wall_color = material_color(project, material, SurfaceRole::Wall);
-        let (wall_center, wall_half) = match direction {
-            GridDirection::North => (
-                [min_x + 0.5, min_z + 1.0 + wall_thickness * 0.5],
-                [0.5, wall_thickness * 0.5],
-            ),
-            GridDirection::East => (
-                [min_x + 1.0 + wall_thickness * 0.5, min_z + 0.5],
-                [wall_thickness * 0.5, 0.5],
-            ),
-            GridDirection::South => (
-                [min_x + 0.5, min_z - wall_thickness * 0.5],
-                [0.5, wall_thickness * 0.5],
-            ),
-            GridDirection::West => (
-                [min_x - wall_thickness * 0.5, min_z + 0.5],
-                [wall_thickness * 0.5, 0.5],
-            ),
-            _ => unreachable!(),
+        let Some((wall_center, wall_half)) = wall_band_center_half(tile_center, direction) else {
+            continue;
         };
         let screen_rect = transform.world_rect_to_screen(wall_center, wall_half);
         if screen_rect.intersects(transform.rect) {
@@ -13474,6 +14059,34 @@ fn draw_grid_sector_walls(
         };
         painter.line_segment([a, b], Stroke::new(4.0, STUDIO_ROOM_WALL));
         painter.line_segment([a, b], Stroke::new(1.0, Color32::from_rgb(84, 58, 44)));
+    }
+}
+
+fn wall_band_center_half(
+    tile_center: [f32; 2],
+    direction: GridDirection,
+) -> Option<([f32; 2], [f32; 2])> {
+    let wall_thickness = 0.18;
+    let min_x = tile_center[0] - 0.5;
+    let min_z = tile_center[1] - 0.5;
+    match direction {
+        GridDirection::North => Some((
+            [min_x + 0.5, min_z + 1.0 + wall_thickness * 0.5],
+            [0.5, wall_thickness * 0.5],
+        )),
+        GridDirection::East => Some((
+            [min_x + 1.0 + wall_thickness * 0.5, min_z + 0.5],
+            [wall_thickness * 0.5, 0.5],
+        )),
+        GridDirection::South => Some((
+            [min_x + 0.5, min_z - wall_thickness * 0.5],
+            [0.5, wall_thickness * 0.5],
+        )),
+        GridDirection::West => Some((
+            [min_x - wall_thickness * 0.5, min_z + 0.5],
+            [wall_thickness * 0.5, 0.5],
+        )),
+        _ => None,
     }
 }
 
@@ -14183,6 +14796,95 @@ fn describe_vertex(vertex: VertexRef) -> String {
             wall_corner_label(corner),
         ),
     }
+}
+
+fn push_unique_selection(selections: &mut Vec<Selection>, selection: Selection) {
+    if !selections.contains(&selection) {
+        selections.push(selection);
+    }
+}
+
+fn face_edges(face: FaceRef) -> Vec<EdgeRef> {
+    match face.kind {
+        FaceKind::Floor => floor_edges(face.room, face.sx, face.sz, false),
+        FaceKind::Ceiling => floor_edges(face.room, face.sx, face.sz, true),
+        FaceKind::Wall { dir, stack } => [
+            WallEdge::Bottom,
+            WallEdge::Right,
+            WallEdge::Top,
+            WallEdge::Left,
+        ]
+        .into_iter()
+        .map(|edge| EdgeRef {
+            room: face.room,
+            anchor: EdgeAnchor::Wall {
+                sx: face.sx,
+                sz: face.sz,
+                dir,
+                stack,
+                edge,
+            },
+        })
+        .collect(),
+    }
+}
+
+fn floor_edges(room: NodeId, sx: u16, sz: u16, ceiling: bool) -> Vec<EdgeRef> {
+    [
+        GridDirection::North,
+        GridDirection::East,
+        GridDirection::South,
+        GridDirection::West,
+    ]
+    .into_iter()
+    .map(|dir| EdgeRef {
+        room,
+        anchor: if ceiling {
+            EdgeAnchor::Ceiling { sx, sz, dir }
+        } else {
+            EdgeAnchor::Floor { sx, sz, dir }
+        },
+    })
+    .collect()
+}
+
+fn face_vertices(face: FaceRef) -> Vec<VertexRef> {
+    match face.kind {
+        FaceKind::Floor => floor_vertices(face.room, face.sx, face.sz, false),
+        FaceKind::Ceiling => floor_vertices(face.room, face.sx, face.sz, true),
+        FaceKind::Wall { dir, stack } => [
+            WallCorner::BL,
+            WallCorner::BR,
+            WallCorner::TR,
+            WallCorner::TL,
+        ]
+        .into_iter()
+        .map(|corner| VertexRef {
+            room: face.room,
+            anchor: VertexAnchor::Wall {
+                sx: face.sx,
+                sz: face.sz,
+                dir,
+                stack,
+                corner,
+            },
+        })
+        .collect(),
+    }
+}
+
+fn floor_vertices(room: NodeId, sx: u16, sz: u16, ceiling: bool) -> Vec<VertexRef> {
+    [Corner::NW, Corner::NE, Corner::SE, Corner::SW]
+        .into_iter()
+        .map(|corner| VertexRef {
+            room,
+            anchor: if ceiling {
+                VertexAnchor::Ceiling { sx, sz, corner }
+            } else {
+                VertexAnchor::Floor { sx, sz, corner }
+            },
+        })
+        .collect()
 }
 
 /// Adapter: face → its first edge (north for floor / ceiling,
@@ -15165,8 +15867,8 @@ fn collect_attachment_socket_names(project: &ProjectDocument) -> Vec<String> {
     names
 }
 
-/// Collect every Character resource as `(id, name)`. The
-/// player-spawn inspector uses this to populate its picker.
+/// Collect every Character Profile resource as `(id, name)`. The
+/// controller/spawn inspectors use this to populate their pickers.
 fn collect_character_options(project: &ProjectDocument) -> Vec<(ResourceId, String)> {
     project
         .resources
@@ -15495,7 +16197,7 @@ fn add_resource_file(
 
 fn resource_count_summary(resource_use: &SceneResourceUse) -> String {
     format!(
-        "{} model, {} character, {} material, {} texture, {} audio",
+        "{} model, {} character profile, {} material, {} texture, {} audio",
         resource_use.models.len(),
         resource_use.characters.len(),
         resource_use.materials.len(),
@@ -15944,6 +16646,17 @@ fn material_picker(
 mod tests {
     use super::*;
 
+    fn test_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "psxed-ui-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     fn assert_vec3_approx(actual: [f32; 3], expected: [f32; 3]) {
         for axis in 0..3 {
             assert!(
@@ -15953,6 +16666,36 @@ mod tests {
                 actual[axis]
             );
         }
+    }
+
+    fn assert_pos_approx(actual: Pos2, expected: Pos2) {
+        assert!((actual.x - expected.x).abs() < 0.001);
+        assert!((actual.y - expected.y).abs() < 0.001);
+    }
+
+    fn assert_size_approx(actual: Vec2, expected: Vec2) {
+        assert!((actual.x - expected.x).abs() < 0.001);
+        assert!((actual.y - expected.y).abs() < 0.001);
+    }
+
+    #[test]
+    fn centered_aspect_rect_centers_wide_preview_box() {
+        let container = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(800.0, 240.0));
+
+        let rect = centered_aspect_rect(container, VIEWPORT_PREVIEW_ASPECT);
+
+        assert_size_approx(rect.size(), Vec2::new(320.0, 240.0));
+        assert_pos_approx(rect.center(), container.center());
+    }
+
+    #[test]
+    fn centered_aspect_rect_centers_tall_preview_box() {
+        let container = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(320.0, 800.0));
+
+        let rect = centered_aspect_rect(container, VIEWPORT_PREVIEW_ASPECT);
+
+        assert_size_approx(rect.size(), Vec2::new(320.0, 240.0));
+        assert_pos_approx(rect.center(), container.center());
     }
 
     #[test]
@@ -16004,6 +16747,69 @@ mod tests {
     #[test]
     fn menu_labels_include_discoverable_shortcut_text() {
         assert_eq!(menu_label("Save", "Cmd+S"), "Save    Cmd+S");
+    }
+
+    #[test]
+    fn available_animation_clips_scan_project_relative_psxanim_files() {
+        let dir = test_temp_dir("animation-clips-scan");
+        let model_dir = dir.join("assets/models/wraith");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("idle.psxanim"), []).unwrap();
+        std::fs::write(model_dir.join("walk.PSXANIM"), []).unwrap();
+        std::fs::write(model_dir.join("notes.txt"), []).unwrap();
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+        std::fs::write(dir.join(".hidden/ghost.psxanim"), []).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("target/debug/generated.psxanim"), []).unwrap();
+
+        let clips = available_animation_clips(&dir);
+        let paths: Vec<&str> = clips.iter().map(|clip| clip.stored_path.as_str()).collect();
+
+        assert_eq!(
+            paths,
+            vec![
+                "assets/models/wraith/idle.psxanim",
+                "assets/models/wraith/walk.PSXANIM"
+            ]
+        );
+        assert_eq!(clips[0].default_name, "idle");
+        assert_eq!(clips[0].label, "idle (wraith)");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn selecting_animation_clip_source_updates_placeholder_names_only() {
+        let mut placeholder = psxed_project::ModelAnimationClip {
+            name: "clip_0".to_string(),
+            psxanim_path: String::new(),
+        };
+        assert!(set_model_animation_clip_source(
+            &mut placeholder,
+            "assets/models/wraith/run.psxanim"
+        ));
+        assert_eq!(placeholder.psxanim_path, "assets/models/wraith/run.psxanim");
+        assert_eq!(placeholder.name, "run");
+
+        let mut default_named = psxed_project::ModelAnimationClip {
+            name: "idle".to_string(),
+            psxanim_path: "assets/models/wraith/idle.psxanim".to_string(),
+        };
+        assert!(set_model_animation_clip_source(
+            &mut default_named,
+            "assets/models/wraith/walk.psxanim"
+        ));
+        assert_eq!(default_named.name, "walk");
+
+        let mut custom_named = psxed_project::ModelAnimationClip {
+            name: "Combat Idle".to_string(),
+            psxanim_path: "assets/models/wraith/idle.psxanim".to_string(),
+        };
+        assert!(set_model_animation_clip_source(
+            &mut custom_named,
+            "assets/models/wraith/walk.psxanim"
+        ));
+        assert_eq!(custom_named.name, "Combat Idle");
     }
 
     #[test]
@@ -16068,6 +16874,116 @@ mod tests {
         assert!(ws.create_and_open_project(".hidden").is_err());
         // "default" is a real existing dir, so this hits the "already exists" branch.
         assert!(ws.create_and_open_project("default").is_err());
+    }
+
+    #[test]
+    fn create_and_open_project_keeps_old_texture_handles_alive_temporarily() {
+        let mut ws = EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let ctx = egui::Context::default();
+        let texture_id = ws.project().resources[0].id;
+        let handle = ctx.load_texture(
+            "project-switch-thumb",
+            ColorImage {
+                size: [1, 1],
+                pixels: vec![Color32::WHITE],
+            },
+            egui::TextureOptions::NEAREST,
+        );
+        ws.texture_thumbs.insert(
+            texture_id,
+            ThumbnailEntry {
+                signature: "test.psxt".to_string(),
+                handle,
+                stats: PsxtStats {
+                    width: 1,
+                    height: 1,
+                    depth_bits: 4,
+                    clut_entries: 16,
+                    pixel_bytes: 1,
+                    clut_bytes: 32,
+                    file_bytes: 45,
+                },
+            },
+        );
+
+        let name = format!(
+            "texture-retire-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let target = psxed_project::projects_dir().join(&name);
+        let _ = std::fs::remove_dir_all(&target);
+
+        ws.create_and_open_project(&name).unwrap();
+
+        assert!(ws.texture_thumbs.is_empty());
+        assert_eq!(ws.import_retired_textures.len(), 1);
+        assert_eq!(ws.import_retired_textures[0].0, EGUI_TEXTURE_RETIRE_FRAMES);
+        let _ = std::fs::remove_dir_all(target);
+    }
+
+    #[test]
+    fn switch_project_opens_target_and_retains_old_texture_handles() {
+        let source_dir = test_temp_dir("switch-source");
+        let target_dir = test_temp_dir("switch-target");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let mut source_project = ProjectDocument::starter();
+        source_project.name = "Source".to_string();
+        let mut target_project = ProjectDocument::starter();
+        target_project.name = "Target".to_string();
+        std::fs::write(
+            source_dir.join("project.ron"),
+            source_project.to_ron_string().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            target_dir.join("project.ron"),
+            target_project.to_ron_string().unwrap(),
+        )
+        .unwrap();
+
+        let mut ws = EditorWorkspace::open_directory(&source_dir).unwrap();
+        let ctx = egui::Context::default();
+        let texture_id = ws.project().resources[0].id;
+        let handle = ctx.load_texture(
+            "switch-project-thumb",
+            ColorImage {
+                size: [1, 1],
+                pixels: vec![Color32::WHITE],
+            },
+            egui::TextureOptions::NEAREST,
+        );
+        ws.texture_thumbs.insert(
+            texture_id,
+            ThumbnailEntry {
+                signature: "test.psxt".to_string(),
+                handle,
+                stats: PsxtStats {
+                    width: 1,
+                    height: 1,
+                    depth_bits: 4,
+                    clut_entries: 16,
+                    pixel_bytes: 1,
+                    clut_bytes: 32,
+                    file_bytes: 45,
+                },
+            },
+        );
+
+        ws.switch_project(&target_dir).unwrap();
+
+        assert_eq!(ws.project().name, "Target");
+        assert_eq!(ws.project_root(), target_dir);
+        assert!(ws.texture_thumbs.is_empty());
+        assert_eq!(ws.import_retired_textures.len(), 1);
+        assert_eq!(ws.import_retired_textures[0].0, EGUI_TEXTURE_RETIRE_FRAMES);
+
+        let _ = std::fs::remove_dir_all(source_dir);
+        let _ = std::fs::remove_dir_all(target_dir);
     }
 
     #[test]
@@ -16309,6 +17225,132 @@ mod tests {
     }
 
     #[test]
+    fn select_all_current_scope_selects_all_resources_from_resource_context() {
+        let mut project = ProjectDocument::new("select-all-resources");
+        let first =
+            project.add_resource("A", ResourceData::Material(MaterialResource::opaque(None)));
+        project.add_resource("B", ResourceData::Material(MaterialResource::opaque(None)));
+        project.add_resource("C", ResourceData::Material(MaterialResource::opaque(None)));
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+        workspace.replace_resource_selection(first);
+
+        workspace.select_all_current_scope();
+
+        assert_eq!(workspace.selected_resources.len(), 3);
+        assert_eq!(workspace.selected_resource, Some(first));
+        assert_eq!(workspace.selected_node, NodeId::ROOT);
+    }
+
+    #[test]
+    fn select_all_current_scope_selects_scene_nodes_outside_select_tool() {
+        let mut project = ProjectDocument::new("select-all-nodes");
+        let room = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "Room",
+            NodeKind::Room {
+                grid: WorldGrid::empty(1, 1, 1024),
+            },
+        );
+        let entity = project
+            .active_scene_mut()
+            .add_node(room, "Entity", NodeKind::Entity);
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+        workspace.active_tool = ViewTool::PaintFloor;
+
+        workspace.select_all_current_scope();
+
+        assert!(workspace.selected_nodes.contains(&room));
+        assert!(workspace.selected_nodes.contains(&entity));
+        assert!(!workspace.selected_nodes.contains(&NodeId::ROOT));
+        assert_eq!(workspace.selected_nodes.len(), 2);
+        assert!(workspace.selected_primitives.is_empty());
+    }
+
+    #[test]
+    fn select_all_current_scope_selects_all_faces_in_active_room() {
+        let mut project = ProjectDocument::new("select-all-faces");
+        let mut grid = WorldGrid::empty(2, 1, 1024);
+        grid.set_floor(0, 0, 0, None);
+        grid.set_floor(1, 0, 0, None);
+        grid.ensure_sector(0, 0).unwrap().ceiling = Some(GridHorizontalFace::flat(1024, None));
+        grid.add_wall(0, 0, GridDirection::North, 0, 1024, None);
+        let room =
+            project
+                .active_scene_mut()
+                .add_node(NodeId::ROOT, "Room", NodeKind::Room { grid });
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+        workspace.active_tool = ViewTool::Select;
+        workspace.selection_mode = SelectionMode::Face;
+        workspace.replace_node_selection(room);
+
+        workspace.select_all_current_scope();
+
+        let floor0 = Selection::Face(FaceRef {
+            room,
+            sx: 0,
+            sz: 0,
+            kind: FaceKind::Floor,
+        });
+        let floor1 = Selection::Face(FaceRef {
+            room,
+            sx: 1,
+            sz: 0,
+            kind: FaceKind::Floor,
+        });
+        let ceiling = Selection::Face(FaceRef {
+            room,
+            sx: 0,
+            sz: 0,
+            kind: FaceKind::Ceiling,
+        });
+        let wall = Selection::Face(FaceRef {
+            room,
+            sx: 0,
+            sz: 0,
+            kind: FaceKind::Wall {
+                dir: GridDirection::North,
+                stack: 0,
+            },
+        });
+        for selection in [floor0, floor1, ceiling, wall] {
+            assert!(workspace.selected_primitives.contains(&selection));
+        }
+        assert_eq!(workspace.selected_primitives.len(), 4);
+        assert_eq!(workspace.selected_node, NodeId::ROOT);
+    }
+
+    #[test]
+    fn select_all_current_scope_respects_edge_and_vertex_modes() {
+        let mut project = ProjectDocument::new("select-all-modes");
+        let mut grid = WorldGrid::empty(1, 1, 1024);
+        grid.set_floor(0, 0, 0, None);
+        let room =
+            project
+                .active_scene_mut()
+                .add_node(NodeId::ROOT, "Room", NodeKind::Room { grid });
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+        workspace.active_tool = ViewTool::Select;
+        workspace.replace_node_selection(room);
+
+        workspace.selection_mode = SelectionMode::Edge;
+        workspace.select_all_current_scope();
+        assert_eq!(workspace.selected_primitives.len(), 4);
+        assert!(workspace
+            .selected_primitives
+            .iter()
+            .all(|selection| matches!(selection, Selection::Edge(_))));
+
+        workspace.replace_node_selection(room);
+        workspace.selection_mode = SelectionMode::Vertex;
+        workspace.select_all_current_scope();
+        assert_eq!(workspace.selected_primitives.len(), 4);
+        assert!(workspace
+            .selected_primitives
+            .iter()
+            .all(|selection| matches!(selection, Selection::Vertex(_))));
+    }
+
+    #[test]
     fn ctrl_selected_sector_delete_removes_all_selected_tiles() {
         let mut workspace =
             EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
@@ -16408,6 +17450,54 @@ mod tests {
             assert!(workspace.selected_primitives.contains(&wall_at(sx)));
         }
         assert_eq!(workspace.selected_primitive, Some(wall_at(3)));
+    }
+
+    #[test]
+    fn duplicate_wall_cook_error_marks_both_authored_faces() {
+        let mut project = ProjectDocument::new("duplicate-wall");
+        let room = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "Room",
+            NodeKind::Room {
+                grid: WorldGrid::empty(4, 2, 1024),
+            },
+        );
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+
+        workspace.record_world_cook_error(
+            room,
+            &WorldGridCookError::DuplicatePhysicalWall {
+                x: 3,
+                z: 1,
+                direction: GridDirection::South,
+                other_x: 3,
+                other_z: 0,
+                other_direction: GridDirection::North,
+            },
+            [0, 0],
+        );
+
+        let south = Selection::Face(FaceRef {
+            room,
+            sx: 3,
+            sz: 1,
+            kind: FaceKind::Wall {
+                dir: GridDirection::South,
+                stack: 0,
+            },
+        });
+        let north = Selection::Face(FaceRef {
+            room,
+            sx: 3,
+            sz: 0,
+            kind: FaceKind::Wall {
+                dir: GridDirection::North,
+                stack: 0,
+            },
+        });
+        assert!(workspace.validation_issue_primitives.contains(&south));
+        assert!(workspace.validation_issue_primitives.contains(&north));
+        assert!(workspace.validation_issue_rooms.is_empty());
     }
 
     #[test]
@@ -16666,7 +17756,7 @@ mod tests {
         let spawn_bound = bounds
             .iter()
             .find(|b| b.node == spawn.id)
-            .expect("player actor bound was emitted");
+            .expect("player entity bound was emitted");
         assert!(matches!(
             spawn_bound.kind,
             EntityBoundKind::Model | EntityBoundKind::MeshFallback
@@ -16910,7 +18000,7 @@ mod tests {
         let controller = workspace
             .add_component_to_host(
                 entity,
-                "CharacterController",
+                "Character Controller",
                 NodeKind::CharacterController {
                     character: None,
                     player: false,
@@ -16925,6 +18015,50 @@ mod tests {
             scene.node(controller).unwrap().kind,
             NodeKind::CharacterController { .. }
         ));
+        assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn add_room_child_creates_three_by_three_floor_with_first_material() {
+        let mut project = ProjectDocument::new("new-room");
+        let material = project.add_resource(
+            "First Material",
+            ResourceData::Material(MaterialResource::opaque(None)),
+        );
+        project.add_resource(
+            "Second Material",
+            ResourceData::Material(MaterialResource::opaque(None)),
+        );
+        let world = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "World",
+            NodeKind::World { sector_size: 1536 },
+        );
+        let mut workspace = EditorWorkspace::with_project(std::env::temp_dir(), project);
+        workspace.replace_node_selection(world);
+
+        workspace.add_child(
+            NodeKind::Room {
+                grid: WorldGrid::empty(9, 9, 1024),
+            },
+            "Room",
+        );
+
+        let room = workspace.selected_node;
+        let scene = workspace.project.active_scene();
+        let node = scene.node(room).expect("new room exists");
+        let NodeKind::Room { grid } = &node.kind else {
+            panic!("added node should be a room");
+        };
+        assert_eq!(node.parent, Some(world));
+        assert_eq!((grid.width, grid.depth), (3, 3));
+        assert_eq!(grid.sector_size, 1536);
+        assert_eq!(grid.sectors.iter().flatten().count(), 9);
+        for sector in grid.sectors.iter().flatten() {
+            let floor = sector.floor.as_ref().expect("starter sector has floor");
+            assert_eq!(floor.material, Some(material));
+            assert!(sector.ceiling.is_none());
+        }
         assert!(workspace.is_dirty());
     }
 
@@ -16965,6 +18099,10 @@ mod tests {
         assert!(rows.iter().any(|row| row.name == "main.room"));
         assert!(rows.iter().any(|row| row.name == "floor.psxt"));
         assert!(rows.iter().any(|row| row.name == "brick_wall.psxt"));
+        assert!(rows.iter().any(|row| row.name == "characters"));
+        assert!(rows
+            .iter()
+            .any(|row| row.name == "wraith_hero.profile" && row.resource.is_some()));
         assert!(rows
             .iter()
             .any(|row| row.name == "brick.mat" && row.resource.is_some()));
