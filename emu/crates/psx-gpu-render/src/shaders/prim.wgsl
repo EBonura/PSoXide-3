@@ -18,6 +18,12 @@
 //   bit      24   SEMI_TRANS
 //   bit      25   TEX_OPAQUE_PASS (discard STP texels)
 //   bit      26   TEX_SEMI_PASS   (keep only STP texels)
+//
+// `HwVertex::tex_window` packs GP0(E2) as four bytes:
+//   bits  0..=7   mask_x in pixels
+//   bits  8..=15  mask_y in pixels
+//   bits 16..=23  offset_x in pixels
+//   bits 24..=31  offset_y in pixels
 
 const VRAM_W: u32 = 1024u;
 const VRAM_H: u32 =  512u;
@@ -31,6 +37,7 @@ struct VertexIn {
     @location(1) color: vec4<f32>,
     @location(2) uv:    vec2<u32>,
     @location(3) flags: u32,
+    @location(4) tex_window: u32,
 }
 
 struct VertexOut {
@@ -42,6 +49,7 @@ struct VertexOut {
     // fragment got the provoking vertex's UV for every pixel.
     @location(1)       uv:       vec2<f32>,
     @location(2) @interpolate(flat) flags: u32,
+    @location(3) @interpolate(flat) tex_window: u32,
 }
 
 const FLAG_TEXTURED:    u32 = 1u << 22u;
@@ -59,17 +67,28 @@ fn vs_main(in: VertexIn) -> VertexOut {
     out.color    = in.color;
     out.uv       = vec2<f32>(f32(in.uv.x), f32(in.uv.y));
     out.flags    = in.flags;
+    out.tex_window = in.tex_window;
     return out;
 }
 
-// PSX U/V are 8-bit per axis (so wrap on >255). The active
-// tex-window is added in a later phase; for now just mask to the
-// page. Floor before the wrap matches the PSX nearest-neighbour
-// rasterizer the compute backend already replicates pixel-for-pixel.
+// PSX U/V are 8-bit per axis (so wrap on >255). Floor before the
+// wrap matches the PSX nearest-neighbour rasterizer the compute
+// backend already replicates pixel-for-pixel.
 fn page_uv(uv: vec2<f32>) -> vec2<u32> {
     let ix = u32(max(uv.x, 0.0));
     let iy = u32(max(uv.y, 0.0));
     return vec2<u32>(ix & 0xFFu, iy & 0xFFu);
+}
+
+fn apply_tex_window(uv8: vec2<u32>, tex_window: u32) -> vec2<u32> {
+    let mask_x = tex_window & 0xFFu;
+    let mask_y = (tex_window >> 8u) & 0xFFu;
+    let off_x = (tex_window >> 16u) & 0xFFu;
+    let off_y = (tex_window >> 24u) & 0xFFu;
+    return vec2<u32>(
+        (uv8.x & (~mask_x & 0xFFu)) | (off_x & mask_x),
+        (uv8.y & (~mask_y & 0xFFu)) | (off_y & mask_y),
+    );
 }
 
 fn tpage_origin(flags: u32) -> vec2<u32> {
@@ -161,7 +180,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if !textured {
         return vec4<f32>(srgb_to_linear(in.color.rgb), in.color.a);
     }
-    let uv8 = page_uv(in.uv);
+    let uv8 = apply_tex_window(page_uv(in.uv), in.tex_window);
     let texel = sample_texel(in.flags, uv8);
     if texel == 0u {
         discard;

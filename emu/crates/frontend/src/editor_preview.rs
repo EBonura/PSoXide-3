@@ -59,6 +59,19 @@ const SCREEN_CY: i32 = SCREEN_H / 2;
 const PROJ_H: i32 = 320;
 const PREVIEW_PROJECTION: psx_engine::WorldProjection =
     psx_engine::WorldProjection::new(SCREEN_CX as i16, SCREEN_CY as i16, PROJ_H, 1);
+const GRID_TILE_UV: u8 = 64;
+const PREVIEW_FLOOR_UVS: [(u8, u8); 4] = [
+    (0, 0),
+    (GRID_TILE_UV, 0),
+    (GRID_TILE_UV, GRID_TILE_UV),
+    (0, GRID_TILE_UV),
+];
+const PREVIEW_WALL_UVS: [(u8, u8); 4] = [
+    (0, GRID_TILE_UV),
+    (GRID_TILE_UV, GRID_TILE_UV),
+    (GRID_TILE_UV, 0),
+    (0, 0),
+];
 const EDITOR_PREVIEW_HOVER_STROKE_WIDTH: f32 = 1.5;
 const EDITOR_PREVIEW_SELECTED_STROKE_WIDTH: f32 = 3.0;
 const EDITOR_PREVIEW_PAINT_STROKE_WIDTH: f32 = 2.0;
@@ -504,7 +517,7 @@ fn face_shade(
         if let Some(slot) = textures.slot(id) {
             return FaceShade::Textured {
                 slot,
-                tint,
+                tint: material_texture_tint(project, id),
                 sidedness,
             };
         }
@@ -513,6 +526,17 @@ fn face_shade(
         rgb: tint,
         sidedness,
     }
+}
+
+fn material_texture_tint(project: &ProjectDocument, material: ResourceId) -> (u8, u8, u8) {
+    project
+        .resource(material)
+        .and_then(|resource| match &resource.data {
+            ResourceData::Material(material) => Some(material.tint),
+            _ => None,
+        })
+        .map(|[r, g, b]| (r, g, b))
+        .unwrap_or((0x80, 0x80, 0x80))
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -942,10 +966,13 @@ fn push_horizontal_face(
     let p_ne = gte_scene::project_vertex(world_to_view([x1, heights[1], z1]));
     let p_se = gte_scene::project_vertex(world_to_view([x1, heights[2], z0]));
     let p_sw = gte_scene::project_vertex(world_to_view([x0, heights[3], z0]));
-    let (uv_nw, uv_ne, uv_se, uv_sw) = if let FaceShade::Textured { slot, .. } = shade {
-        let max_u = slot.width.saturating_sub(1);
-        let max_v = slot.height.saturating_sub(1);
-        ((0u8, 0u8), (max_u, 0), (max_u, max_v), (0, max_v))
+    let (uv_nw, uv_ne, uv_se, uv_sw) = if let FaceShade::Textured { .. } = shade {
+        (
+            PREVIEW_FLOOR_UVS[0],
+            PREVIEW_FLOOR_UVS[1],
+            PREVIEW_FLOOR_UVS[2],
+            PREVIEW_FLOOR_UVS[3],
+        )
     } else {
         ((0, 0), (0, 0), (0, 0), (0, 0))
     };
@@ -1086,10 +1113,13 @@ fn push_wall_face(
     let p_br = gte_scene::project_vertex(world_to_view([br_xy.0, heights[1], br_xy.1]));
     let p_tr = gte_scene::project_vertex(world_to_view([tr_xy.0, heights[2], tr_xy.1]));
     let p_tl = gte_scene::project_vertex(world_to_view([tl_xy.0, heights[3], tl_xy.1]));
-    let (uv_bl, uv_br, uv_tr, uv_tl) = if let FaceShade::Textured { slot, .. } = shade {
-        let u_max = slot.width.saturating_sub(1);
-        let v_max = slot.height.saturating_sub(1);
-        ((0, v_max), (u_max, v_max), (u_max, 0), (0, 0))
+    let (uv_bl, uv_br, uv_tr, uv_tl) = if let FaceShade::Textured { .. } = shade {
+        (
+            PREVIEW_WALL_UVS[0],
+            PREVIEW_WALL_UVS[1],
+            PREVIEW_WALL_UVS[2],
+            PREVIEW_WALL_UVS[3],
+        )
     } else {
         ((0, 0), (0, 0), (0, 0), (0, 0))
     };
@@ -2849,9 +2879,9 @@ fn projected_area(p: [psx_gte::scene::Projected; 3]) -> i32 {
 /// `tint` modulates the texel: PSX hardware computes
 /// `output = texel * tint / 0x80`, so `(0x80, 0x80, 0x80)` is a
 /// pass-through and `(0xFF, 0x60, 0x40)` saturates a grey texel
-/// toward terracotta. The editor uses the material-name keyword
-/// colour as the tint so a procedural-grey brick texture still
-/// reads as red until real cooked textures land.
+/// toward terracotta. Textured preview uses the authored material
+/// tint so it matches the cooked runtime path; flat fallback still
+/// uses material-name colours to keep untextured faces readable.
 fn push_tex_tri(
     scratch: &mut PreviewScratch,
     p: [psx_gte::scene::Projected; 3],
@@ -2915,15 +2945,16 @@ fn push_tri(scratch: &mut PreviewScratch, p: [psx_gte::scene::Projected; 3], rgb
 #[cfg(test)]
 mod tests {
     use super::{
-        face_side_visible, floor_anchored_model_origin, light_face, node_room_local_origin,
-        preview_lights, preview_model_reference, preview_player_reference,
+        face_side_visible, floor_anchored_model_origin, light_face, material_texture_tint,
+        node_room_local_origin, preview_lights, preview_model_reference, preview_player_reference,
         preview_static_model_reference, push_wall_face, setup_gte_for_camera, FaceShade,
-        MaterialSlot, PreviewFog, WallEdge, SCRATCH,
+        MaterialSlot, PreviewFog, WallEdge, PREVIEW_WALL_UVS, SCRATCH,
     };
     use psx_engine::{PointLightSample, WorldVertex};
     use psx_gte::scene::Projected;
     use psxed_project::{
-        GridUvTransform, MaterialFaceSidedness, NodeKind, ProjectDocument, ResourceData, WorldGrid,
+        GridUvTransform, MaterialFaceSidedness, MaterialResource, NodeKind, ProjectDocument,
+        ResourceData, WorldGrid,
     };
     use psxed_ui::{ViewportCameraMode, ViewportCameraState};
 
@@ -2959,6 +2990,38 @@ mod tests {
 
     fn projected(sx: i16, sy: i16) -> Projected {
         Projected { sx, sy, sz: 100 }
+    }
+
+    #[test]
+    fn textured_preview_uses_authored_material_tint() {
+        let mut project = ProjectDocument::new("test");
+        let texture = project.add_resource(
+            "Brick Texture",
+            ResourceData::Texture {
+                psxt_path: "brick.psxt".to_string(),
+            },
+        );
+        let mut material = MaterialResource::opaque(Some(texture));
+        material.tint = [0x60, 0x70, 0x90];
+        let material = project.add_resource("Brick Wall", ResourceData::Material(material));
+
+        assert_eq!(
+            material_texture_tint(&project, material),
+            (0x60, 0x70, 0x90)
+        );
+    }
+
+    #[test]
+    fn wall_preview_uvs_use_runtime_grid_tile_span() {
+        let transform = GridUvTransform {
+            span: [0, 128],
+            ..GridUvTransform::IDENTITY
+        };
+
+        assert_eq!(
+            transform.apply_to_quad(PREVIEW_WALL_UVS),
+            [(0, 128), (64, 128), (64, 0), (0, 0)]
+        );
     }
 
     #[test]
@@ -3264,8 +3327,6 @@ mod tests {
                 slot: MaterialSlot {
                     tpage_word: 0,
                     clut_word: 0,
-                    width: 16,
-                    height: 16,
                 },
                 tint: (128, 64, 32),
                 sidedness: psxed_project::MaterialFaceSidedness::Front,

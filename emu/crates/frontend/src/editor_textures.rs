@@ -41,9 +41,6 @@ pub struct MaterialSlot {
     /// Packed `uv_clut_word` value the prim format wants in vertex
     /// 0's UV high half.
     pub clut_word: u16,
-    /// Texture dimensions in texels -- handy for UV computation.
-    pub width: u8,
-    pub height: u8,
 }
 
 /// Cache row keeping the slot together with the source signature so
@@ -206,8 +203,8 @@ impl EditorTextures {
         // PSX UVs are 8-bit so anything >256 wouldn't be addressable
         // from a single primitive anyway; reject taller-than-256
         // textures rather than silently producing wrong UVs.
-        let width = u8::try_from(texture.width()).ok()?;
-        let height = u8::try_from(texture.height()).ok()?;
+        u8::try_from(texture.width()).ok()?;
+        u8::try_from(texture.height()).ok()?;
         let tpage_index = self.next_tpage as u16;
         let tpage_x = tpage_index * 64;
         let tpage_y = 0;
@@ -250,8 +247,6 @@ impl EditorTextures {
         let slot = MaterialSlot {
             tpage_word: pack_tpage_word(tpage_index, 0),
             clut_word: pack_clut_word(clut_x, clut_y),
-            width,
-            height,
         };
         self.next_tpage += 1;
         self.next_clut_x += 16;
@@ -303,8 +298,6 @@ impl EditorTextures {
         let slot = MaterialSlot {
             tpage_word: pack_tpage_word(tpage_index, 0),
             clut_word: pack_clut_word(clut_x, clut_y),
-            width: pattern.width,
-            height: pattern.height,
         };
         self.next_tpage += 1;
         self.next_clut_x += 16;
@@ -393,8 +386,8 @@ impl EditorTextures {
             // path which we leave alone here.
             return None;
         }
-        let width = u8::try_from(texture.width()).ok()?;
-        let height = u8::try_from(texture.height()).ok()?;
+        u8::try_from(texture.width()).ok()?;
+        u8::try_from(texture.height()).ok()?;
 
         let halfwords_per_row = texture.halfwords_per_row();
         let height_px = texture.height();
@@ -463,8 +456,6 @@ impl EditorTextures {
         let slot = MaterialSlot {
             tpage_word: pack_8bpp_tpage_word(tpage_index, 1),
             clut_word: pack_clut_word(0, clut_y),
-            width,
-            height,
         };
 
         // Advance to the next aligned slot. Each atlas consumes
@@ -496,8 +487,6 @@ fn texture_path(project: &ProjectDocument, material: &MaterialResource) -> Optio
 struct ProceduralTexture {
     pixels: Vec<u8>,
     palette: [u16; 16],
-    width: u8,
-    height: u8,
 }
 
 fn pattern_for_name(name: &str) -> ProceduralTexture {
@@ -557,12 +546,7 @@ fn brick_pattern() -> ProceduralTexture {
             pixels[y * 64 + x] = nibble;
         }
     }
-    ProceduralTexture {
-        pixels,
-        palette,
-        width: 64,
-        height: 64,
-    }
+    ProceduralTexture { pixels, palette }
 }
 
 /// 64×64 stone-tile floor: sand-toned squares with slightly darker
@@ -613,12 +597,7 @@ fn stone_pattern() -> ProceduralTexture {
             pixels[y * 64 + x] = nibble;
         }
     }
-    ProceduralTexture {
-        pixels,
-        palette,
-        width: 64,
-        height: 64,
-    }
+    ProceduralTexture { pixels, palette }
 }
 
 fn glass_pattern() -> ProceduralTexture {
@@ -651,12 +630,7 @@ fn glass_pattern() -> ProceduralTexture {
             pixels[y * 64 + x] = nibble;
         }
     }
-    ProceduralTexture {
-        pixels,
-        palette,
-        width: 64,
-        height: 64,
-    }
+    ProceduralTexture { pixels, palette }
 }
 
 fn wood_pattern() -> ProceduralTexture {
@@ -695,12 +669,7 @@ fn wood_pattern() -> ProceduralTexture {
             pixels[y * 64 + x] = nibble;
         }
     }
-    ProceduralTexture {
-        pixels,
-        palette,
-        width: 64,
-        height: 64,
-    }
+    ProceduralTexture { pixels, palette }
 }
 
 fn metal_pattern() -> ProceduralTexture {
@@ -732,12 +701,7 @@ fn metal_pattern() -> ProceduralTexture {
             pixels[y * 64 + x] = (base + h) as u8;
         }
     }
-    ProceduralTexture {
-        pixels,
-        palette,
-        width: 64,
-        height: 64,
-    }
+    ProceduralTexture { pixels, palette }
 }
 
 fn default_pattern() -> ProceduralTexture {
@@ -766,12 +730,7 @@ fn default_pattern() -> ProceduralTexture {
             pixels[y * 64 + x] = nibble;
         }
     }
-    ProceduralTexture {
-        pixels,
-        palette,
-        width: 64,
-        height: 64,
-    }
+    ProceduralTexture { pixels, palette }
 }
 
 /// Convert a 24-bit RGB triple to PSX 15bpp BGR555. Bit 15 (the STP

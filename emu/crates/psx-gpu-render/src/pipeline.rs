@@ -4,10 +4,10 @@ use wgpu::util::DeviceExt;
 
 use crate::target::{TARGET_FORMAT, VRAM_HEIGHT, VRAM_WIDTH};
 
-/// Per-vertex data. 16 bytes, `bytemuck::Pod` so we can blit a
+/// Per-vertex data. 20 bytes, `bytemuck::Pod` so we can blit a
 /// `Vec<HwVertex>` into the GPU vertex buffer with `cast_slice`.
 ///
-/// `flags` packs every per-primitive piece of state the fragment
+/// `flags` and `tex_window` pack the per-primitive state the fragment
 /// shader needs -- the format is identical across primitives, so a
 /// single draw call handles mixed textured / mono / different
 /// tpages / different CLUTs in one batch. See [`flags`] module for
@@ -27,6 +27,10 @@ pub struct HwVertex {
     pub uv: [u16; 2],
     /// Bit-packed per-primitive state. See [`flags`].
     pub flags: u32,
+    /// Packed texture-window state: mask_x, mask_y, offset_x,
+    /// offset_y in the same pre-shifted pixel units used by the
+    /// CPU GPU path.
+    pub tex_window: u32,
 }
 
 /// `HwVertex::flags` bit layout. Host + shader must agree --
@@ -46,6 +50,10 @@ pub struct HwVertex {
 /// bit      25   TEX_OPAQUE_PASS               discard STP texels
 /// bit      26   TEX_SEMI_PASS                 keep only STP texels
 /// ```
+///
+/// Texture-window state deliberately lives in
+/// [`HwVertex::tex_window`] instead of these bits: GP0(E2) needs four
+/// 8-bit fields, and the low flag word is already dense.
 pub mod flags {
     pub const TEXTURED: u32 = 1 << 22;
     pub const RAW_TEXTURE: u32 = 1 << 23;
@@ -239,6 +247,12 @@ impl HwPipeline {
                     offset: 12,
                     shader_location: 3,
                 },
+                // tex_window: u32 → Uint32 (4 bytes), offset 16
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Uint32,
+                    offset: 16,
+                    shader_location: 4,
+                },
             ],
         };
 
@@ -390,8 +404,8 @@ impl HwPipeline {
 
     /// Vertex-buffer capacity in bytes (sticky high-water mark).
     /// Translator can use this to cap its emission so we never
-    /// truncate. Phase 1 caps on the Translator side at 16 K
-    /// vertices = 256 KiB, matches `INITIAL_VERTEX_CAPACITY`.
+    /// truncate. The initial allocation covers 16 K vertices and
+    /// then grows to a byte-aligned power-of-two high-water mark.
     pub fn vertex_capacity_bytes(&self) -> u64 {
         self.vertex_capacity_bytes
     }
@@ -472,7 +486,7 @@ mod tests {
         let grown = grown_vertex_capacity_bytes(initial, required);
 
         assert!(grown >= required);
-        assert_eq!(grown, initial * 2);
+        assert_eq!(grown, (initial * 2).next_power_of_two());
     }
 
     #[test]
