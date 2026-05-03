@@ -1489,20 +1489,7 @@ fn project_baked_exe_path(project_dir: &Path, project_name: &str) -> PathBuf {
 }
 
 fn safe_project_exe_stem(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    let trimmed = out.trim_matches('_').to_string();
-    if trimmed.is_empty() {
-        "project".to_string()
-    } else {
-        trimmed
-    }
+    psxed_project::project_file_stem(name)
 }
 
 /// Read `PSOXIDE_DISC` → disc image → `Disc`. Accepts raw BIN/ISO and

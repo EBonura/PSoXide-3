@@ -40,6 +40,29 @@ pub fn projects_dir() -> PathBuf {
         .join("projects")
 }
 
+/// Filesystem-safe stem derived from a project display name.
+///
+/// The editor keeps `ProjectDocument::name` as the user-facing source
+/// of truth, then uses this helper for generated directories and EXE
+/// filenames. It intentionally stays ASCII-only because the PSX build
+/// output and launcher paths benefit from boring, portable names.
+pub fn project_file_stem(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "project".to_string()
+    } else {
+        trimmed
+    }
+}
+
 /// Default project directory (`editor/projects/default/`). Always
 /// present in the source tree; user "New Project" copies its
 /// contents into a sibling directory.
@@ -4586,6 +4609,16 @@ mod tests {
         assert!(default_project_dir()
             .join("assets/textures/dirt.psxt")
             .is_file());
+    }
+
+    #[test]
+    fn project_file_stem_is_filesystem_safe() {
+        assert_eq!(
+            project_file_stem("Stone Room: Vertical Slice!"),
+            "stone_room_vertical_slice"
+        );
+        assert_eq!(project_file_stem("PSoXide 2"), "psoxide_2");
+        assert_eq!(project_file_stem("..."), "project");
     }
 
     #[test]

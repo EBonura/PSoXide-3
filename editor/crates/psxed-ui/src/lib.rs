@@ -83,9 +83,12 @@ enum TreeAction {
 pub struct EditorWorkspace {
     project: ProjectDocument,
     project_dir: PathBuf,
+    saved_project_name: String,
     new_project_dialog_open: bool,
     new_project_name: String,
     new_project_error: Option<String>,
+    delete_project_dialog_open: bool,
+    delete_project_error: Option<String>,
     selected_node: NodeId,
     selected_nodes: HashSet<NodeId>,
     node_selection_anchor: Option<NodeId>,
@@ -1374,12 +1377,16 @@ impl EditorWorkspace {
     /// by `open_directory` and `create_and_open_project`; not part
     /// of the public API.
     fn with_project(project_dir: PathBuf, project: ProjectDocument) -> Self {
+        let saved_project_name = project.name.clone();
         Self {
             project,
             project_dir,
+            saved_project_name,
             new_project_dialog_open: false,
             new_project_name: String::new(),
             new_project_error: None,
+            delete_project_dialog_open: false,
+            delete_project_error: None,
             selected_node: NodeId::ROOT,
             selected_nodes: HashSet::new(),
             node_selection_anchor: None,
@@ -1471,15 +1478,51 @@ impl EditorWorkspace {
         self.dirty
     }
 
-    /// Save to `<project_dir>/project.ron`.
+    /// Save to `<project_dir>/project.ron`, retargeting the project
+    /// directory when the user-facing project name changes.
     pub fn save(&mut self) -> Result<(), String> {
+        let trimmed_name = self.project.name.trim().to_string();
+        if trimmed_name.is_empty() {
+            return Err("Project name cannot be empty".to_string());
+        }
+        if trimmed_name != self.project.name {
+            self.project.name = trimmed_name;
+        }
+        self.retarget_project_dir_for_name()?;
         let path = self.project_dir.join("project.ron");
         self.project.normalize_loaded();
         self.project
             .save_to_path(&path)
             .map_err(|error| error.to_string())?;
+        self.saved_project_name = self.project.name.clone();
         self.dirty = false;
         self.status = format!("Saved {}", short_path(&self.project_dir));
+        Ok(())
+    }
+
+    fn retarget_project_dir_for_name(&mut self) -> Result<(), String> {
+        if self.project.name == self.saved_project_name {
+            return Ok(());
+        }
+        let parent = self
+            .project_dir
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", self.project_dir.display()))?;
+        let target = parent.join(psxed_project::project_file_stem(&self.project.name));
+        if paths_equivalent(&self.project_dir, &target) {
+            return Ok(());
+        }
+        if target.exists() {
+            return Err(format!("{} already exists", short_path(&target)));
+        }
+        if paths_equivalent(&self.project_dir, &psxed_project::default_project_dir()) {
+            copy_dir_recursive(&self.project_dir, &target)
+                .map_err(|error| format!("copy project directory: {error}"))?;
+        } else {
+            std::fs::rename(&self.project_dir, &target)
+                .map_err(|error| format!("rename project directory: {error}"))?;
+        }
+        self.project_dir = target;
         Ok(())
     }
 
@@ -1506,6 +1549,7 @@ impl EditorWorkspace {
         let path = self.project_dir.join("project.ron");
         match ProjectDocument::load_from_path(&path) {
             Ok(project) => {
+                self.saved_project_name = project.name.clone();
                 self.project = project;
                 self.selected_node = NodeId::ROOT;
                 self.selected_nodes.clear();
@@ -1526,34 +1570,27 @@ impl EditorWorkspace {
         }
     }
 
-    /// Create `editor/projects/<name>/` by recursive-copy of the
-    /// default project, then switch this workspace to it.
+    /// Create `editor/projects/<derived-name>/` by recursive-copy of
+    /// the default project, then switch this workspace to it.
     ///
-    /// Validates `name`: non-empty, no path separators, no `..`,
-    /// no leading `.`, target directory must not already exist.
-    /// On success the workspace points at the new project; on
+    /// Validates `name`: non-empty and target directory must not
+    /// already exist. On success the workspace points at the new project; on
     /// failure the workspace is unchanged.
     pub fn create_and_open_project(&mut self, name: &str) -> Result<(), String> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Err("Project name cannot be empty".to_string());
         }
-        if trimmed.contains('/')
-            || trimmed.contains('\\')
-            || trimmed.starts_with('.')
-            || trimmed.contains("..")
-        {
-            return Err(
-                "Project name cannot contain path separators, `..`, or leading `.`".to_string(),
-            );
-        }
-        let target = psxed_project::projects_dir().join(trimmed);
+        let target = psxed_project::projects_dir().join(psxed_project::project_file_stem(trimmed));
         if target.exists() {
             return Err(format!("{} already exists", short_path(&target)));
         }
         copy_dir_recursive(&psxed_project::default_project_dir(), &target)
             .map_err(|error| format!("copy default project: {error}"))?;
         let mut opened = Self::open_directory(&target)?;
+        opened.project.name = trimmed.to_string();
+        opened.mark_dirty();
+        opened.save()?;
         opened.retire_egui_textures(self.drain_live_egui_textures());
         *self = opened;
         self.status = format!("Created {}", short_path(&self.project_dir));
@@ -1577,6 +1614,71 @@ impl EditorWorkspace {
         }
         if let Err(error) = self.switch_project(path.to_path_buf()) {
             self.status = format!("Open project failed: {error}");
+        }
+    }
+
+    fn current_project_is_default(&self) -> bool {
+        paths_equivalent(&self.project_dir, &psxed_project::default_project_dir())
+    }
+
+    fn delete_project_fallback_dir(delete_dir: &Path) -> Result<PathBuf, String> {
+        let default_dir = psxed_project::default_project_dir();
+        if !paths_equivalent(delete_dir, &default_dir) && default_dir.join("project.ron").is_file()
+        {
+            return Ok(default_dir);
+        }
+        let projects =
+            psxed_project::list_projects().map_err(|error| format!("list projects: {error}"))?;
+        projects
+            .into_iter()
+            .find(|path| !paths_equivalent(path, delete_dir))
+            .ok_or_else(|| "Cannot delete the last available project".to_string())
+    }
+
+    fn delete_current_project(&mut self) -> Result<(), String> {
+        let delete_dir = self.project_dir.clone();
+        if self.current_project_is_default() {
+            return Err("The default project cannot be deleted".to_string());
+        }
+        let projects_root = psxed_project::projects_dir();
+        let parent = delete_dir
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", delete_dir.display()))?;
+        if !paths_equivalent(parent, &projects_root) {
+            return Err("Only projects in editor/projects can be deleted".to_string());
+        }
+        let fallback_dir = Self::delete_project_fallback_dir(&delete_dir)?;
+        let mut opened = Self::open_directory(&fallback_dir)?;
+        let deleted_name = self.project.name.clone();
+        std::fs::remove_dir_all(&delete_dir)
+            .map_err(|error| format!("delete {}: {error}", delete_dir.display()))?;
+        opened.retire_egui_textures(self.drain_live_egui_textures());
+        *self = opened;
+        self.status = format!(
+            "Deleted {deleted_name}; loaded {}",
+            short_path(&self.project_dir)
+        );
+        Ok(())
+    }
+
+    fn draw_project_switch_menu(&mut self, ui: &mut egui::Ui) {
+        match psxed_project::list_projects() {
+            Ok(projects) if projects.is_empty() => {
+                ui.weak("No projects found");
+            }
+            Ok(projects) => {
+                for path in projects {
+                    let current = paths_equivalent(&self.project_dir, &path);
+                    let label = project_menu_label(&path);
+                    if ui.selectable_label(current, label).clicked() {
+                        self.open_project_from_menu(&path);
+                        ui.close_menu();
+                    }
+                }
+            }
+            Err(error) => {
+                ui.weak(format!("Could not list projects: {error}"));
+            }
         }
     }
 
@@ -1941,6 +2043,7 @@ impl EditorWorkspace {
         self.draw_content_browser(ctx);
         self.draw_viewport(ctx, viewport_3d, playtest_status);
         self.draw_new_project_dialog(ctx);
+        self.draw_delete_project_dialog(ctx);
         self.draw_texture_import_dialog(ctx);
         self.draw_model_import_dialog(ctx);
     }
@@ -1964,19 +2067,17 @@ impl EditorWorkspace {
                 ui.label("Project name");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.new_project_name)
-                        .hint_text("e.g. test-room"),
+                        .hint_text("e.g. Test Room"),
                 );
+                let preview_stem = if self.new_project_name.trim().is_empty() {
+                    "<name>".to_string()
+                } else {
+                    psxed_project::project_file_stem(self.new_project_name.trim())
+                };
                 ui.label(
-                    RichText::new(format!(
-                        "→ editor/projects/{}/",
-                        if self.new_project_name.trim().is_empty() {
-                            "<name>"
-                        } else {
-                            self.new_project_name.trim()
-                        }
-                    ))
-                    .color(STUDIO_TEXT_WEAK)
-                    .small(),
+                    RichText::new(format!("→ editor/projects/{}/", preview_stem))
+                        .color(STUDIO_TEXT_WEAK)
+                        .small(),
                 );
                 if let Some(error) = &self.new_project_error {
                     ui.label(RichText::new(error).color(Color32::from_rgb(0xE0, 0x60, 0x60)));
@@ -2013,6 +2114,64 @@ impl EditorWorkspace {
         if close {
             self.new_project_dialog_open = false;
             self.new_project_error = None;
+        }
+    }
+
+    fn draw_delete_project_dialog(&mut self, ctx: &egui::Context) {
+        if !self.delete_project_dialog_open {
+            return;
+        }
+        let mut close = false;
+        let mut confirm = false;
+        let project_name = self.project.name.clone();
+        let project_dir = self.project_dir.display().to_string();
+        egui::Window::new("Delete Project")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label(RichText::new(format!("Delete \"{project_name}\"?")).strong());
+                ui.label(
+                    RichText::new(format!("This removes {project_dir}"))
+                        .color(STUDIO_TEXT_WEAK)
+                        .small(),
+                );
+                ui.label(RichText::new("This cannot be undone.").color(STUDIO_TEXT_WEAK));
+                if let Some(error) = &self.delete_project_error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(error).color(Color32::from_rgb(0xE0, 0x60, 0x60)));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("Delete").fill(Color32::from_rgb(0x65, 0x1F, 0x1F)))
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        if confirm {
+            match self.delete_current_project() {
+                Ok(()) => {
+                    self.delete_project_dialog_open = false;
+                    self.delete_project_error = None;
+                }
+                Err(error) => {
+                    self.delete_project_error = Some(error);
+                }
+            }
+        }
+        if close {
+            self.delete_project_dialog_open = false;
+            self.delete_project_error = None;
         }
     }
 
@@ -4517,8 +4676,7 @@ impl EditorWorkspace {
                         color: [255, 240, 200],
                         intensity: 1.0,
                         // Sectors. Matches the Add Child default
-                        // and the Room-fill preset -- covers a
-                        // typical 4×4 sector room.
+                        // and covers a typical 4×4 sector room.
                         radius: 4.0,
                     },
                 ),
@@ -5251,8 +5409,8 @@ impl EditorWorkspace {
     /// Snap the selected node's Y-rotation up by 90°. No-op on
     /// macro / structural nodes (Root, World, Room, plain
     /// transform-only nodes) since they have no in-world heading.
-    /// The `MeshInstance` card and entity markers (spawn / light /
-    /// trigger / audio / portal) are all rotatable.
+    /// The `MeshInstance` card and directional entity markers
+    /// (spawn / trigger / audio / portal) are all rotatable.
     fn rotate_selected_yaw_90(&mut self) {
         let id = self.selected_node;
         if id == NodeId::ROOT {
@@ -5264,7 +5422,6 @@ impl EditorWorkspace {
             node.kind,
             NodeKind::MeshInstance { .. }
                 | NodeKind::SpawnPoint { .. }
-                | NodeKind::Light { .. }
                 | NodeKind::Trigger { .. }
                 | NodeKind::AudioSource { .. }
                 | NodeKind::Portal { .. }
@@ -5412,25 +5569,22 @@ impl EditorWorkspace {
                             ui.close_menu();
                         }
                         ui.menu_button(icons::label(icons::FOLDER, "Project"), |ui| {
-                            match psxed_project::list_projects() {
-                                Ok(projects) if projects.is_empty() => {
-                                    ui.weak("No projects found");
-                                }
-                                Ok(projects) => {
-                                    for path in projects {
-                                        let current = paths_equivalent(&self.project_dir, &path);
-                                        let label = short_path(&path);
-                                        if ui.selectable_label(current, label).clicked() {
-                                            self.open_project_from_menu(&path);
-                                            ui.close_menu();
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    ui.weak(format!("Could not list projects: {error}"));
-                                }
-                            }
+                            self.draw_project_switch_menu(ui);
                         });
+                        let can_delete_project = !self.current_project_is_default();
+                        let delete_response = ui.add_enabled(
+                            can_delete_project,
+                            egui::Button::new("Delete Project..."),
+                        );
+                        let delete_clicked = delete_response.clicked();
+                        if !can_delete_project {
+                            delete_response.on_hover_text("The default project cannot be deleted");
+                        }
+                        if delete_clicked {
+                            self.delete_project_dialog_open = true;
+                            self.delete_project_error = None;
+                            ui.close_menu();
+                        }
                         ui.separator();
                         if ui
                             .button(menu_label("Save", &command_shortcut_text("S")))
@@ -5487,26 +5641,6 @@ impl EditorWorkspace {
                             ui.close_menu();
                         }
                     });
-                    ui.menu_button("Project", |ui| {
-                        match psxed_project::list_projects() {
-                            Ok(projects) if projects.is_empty() => {
-                                ui.weak("No projects found");
-                            }
-                            Ok(projects) => {
-                                for path in projects {
-                                    let current = paths_equivalent(&self.project_dir, &path);
-                                    let label = short_path(&path);
-                                    if ui.selectable_label(current, label).clicked() {
-                                        self.open_project_from_menu(&path);
-                                        ui.close_menu();
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                ui.weak(format!("Could not list projects: {error}"));
-                            }
-                        }
-                    });
                     ui.menu_button("Tools", |ui| {
                         if ui.button("Build Project").clicked() {
                             self.pending_playtest_request =
@@ -5559,7 +5693,7 @@ impl EditorWorkspace {
                         .button(icons::label(icons::FILE_PLUS, "New"))
                         .on_hover_text(
                             format!(
-                                "Create a new project in editor/projects/<name>/ from the default template. Shortcut: {}.",
+                                "Create a new project from the default template. Shortcut: {}.",
                                 command_shortcut_text("N")
                             ),
                         )
@@ -5638,27 +5772,40 @@ impl EditorWorkspace {
 
                     ui.add_space(12.0);
 
-                    let project_label = if self.dirty {
-                        format!("{} *", self.project.name)
-                    } else {
-                        self.project.name.clone()
-                    };
                     ui.allocate_ui_with_layout(
                         Vec2::new(ui.available_width().max(160.0), 38.0),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.label(RichText::new(project_label).strong().color(STUDIO_TEXT));
-                            ui.add_sized(
-                                Vec2::new(ui.available_width(), 16.0),
-                                egui::Label::new(
-                                    RichText::new(&self.status).small().color(STUDIO_TEXT_WEAK),
-                                ),
-                            );
+                            self.draw_project_title_status(ui);
                         },
                     );
                 });
             });
+    }
+
+    fn draw_project_title_status(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let dirty_width = if self.dirty { 12.0 } else { 0.0 };
+            let title_width = (ui.available_width() - dirty_width).max(96.0);
+            let response = ui.add_sized(
+                Vec2::new(title_width, 21.0),
+                egui::TextEdit::singleline(&mut self.project.name)
+                    .hint_text("Project name")
+                    .font(egui::TextStyle::Button),
+            );
+            if response.changed() {
+                self.mark_dirty();
+            }
+            if self.dirty {
+                ui.label(RichText::new("*").strong().color(STUDIO_ACCENT));
+            }
+        });
+        ui.add_sized(
+            Vec2::new(ui.available_width(), 16.0),
+            egui::Label::new(RichText::new(&self.status).small().color(STUDIO_TEXT_WEAK)),
+        );
     }
 
     fn draw_left_dock(&mut self, ctx: &egui::Context) {
@@ -9472,6 +9619,15 @@ fn draw_transform_policy_editor(
                 });
             changed
         }
+        NodeKind::Light { .. } => {
+            let mut changed = false;
+            egui::CollapsingHeader::new(icons::label(icons::MOVE, "Transform"))
+                .default_open(true)
+                .show(ui, |ui| {
+                    changed |= light_transform_editor(ui, &mut node.transform);
+                });
+            changed
+        }
         kind if kind.is_component() => false,
         NodeKind::Entity => {
             let mut changed = false;
@@ -9624,6 +9780,51 @@ fn entity_transform_editor(ui: &mut egui::Ui, transform: &mut psxed_project::Tra
     if transform.rotation_degrees[0] != 0.0 || transform.rotation_degrees[2] != 0.0 {
         transform.rotation_degrees[0] = 0.0;
         transform.rotation_degrees[2] = 0.0;
+        changed = true;
+    }
+    if transform.scale != [1.0, 1.0, 1.0] {
+        transform.scale = [1.0, 1.0, 1.0];
+        changed = true;
+    }
+    changed
+}
+
+fn light_transform_editor(ui: &mut egui::Ui, transform: &mut psxed_project::Transform3) -> bool {
+    let mut changed = normalise_light_transform(transform);
+    ui.horizontal(|ui| {
+        ui.label(icons::text(icons::MOVE, 12.0).color(STUDIO_TEXT_WEAK));
+        ui.label("Position");
+        let mut x = transform.translation[0].round() as i32;
+        let mut y = transform.translation[1].round() as i32;
+        let mut z = transform.translation[2].round() as i32;
+        let pos_changed = ui
+            .add(egui::DragValue::new(&mut x).prefix("X ").speed(1.0))
+            .changed()
+            | ui.add(
+                egui::DragValue::new(&mut y)
+                    .prefix("Y ")
+                    .speed(HEIGHT_QUANTUM as f64),
+            )
+            .changed()
+            | ui.add(egui::DragValue::new(&mut z).prefix("Z ").speed(1.0))
+                .changed();
+        if pos_changed {
+            transform.translation = [x as f32, snap_height(y) as f32, z as f32];
+            changed = true;
+        }
+    });
+    changed
+}
+
+fn normalise_light_transform(transform: &mut psxed_project::Transform3) -> bool {
+    let mut changed = false;
+    let snapped_y = snap_height(transform.translation[1].round() as i32) as f32;
+    if transform.translation[1] != snapped_y {
+        transform.translation[1] = snapped_y;
+        changed = true;
+    }
+    if transform.rotation_degrees != [0.0, 0.0, 0.0] {
+        transform.rotation_degrees = [0.0, 0.0, 0.0];
         changed = true;
     }
     if transform.scale != [1.0, 1.0, 1.0] {
@@ -10023,29 +10224,6 @@ fn draw_node_kind_editor(
                         .text(icons::label(icons::WAYPOINT, "Radius (sectors)")),
                 )
                 .changed();
-            // Quick presets -- author-friendly starting points;
-            // the user can still drag the sliders below.
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Preset").color(STUDIO_TEXT_WEAK));
-                if ui.small_button("Torch").clicked() {
-                    *color = [0xFF, 0xCC, 0x80];
-                    *intensity = 1.0;
-                    *radius = 2.0;
-                    changed = true;
-                }
-                if ui.small_button("Room fill").clicked() {
-                    *color = [0xFF, 0xF0, 0xD8];
-                    *intensity = 0.6;
-                    *radius = 4.0;
-                    changed = true;
-                }
-                if ui.small_button("Bright sun").clicked() {
-                    *color = [0xFF, 0xFF, 0xF0];
-                    *intensity = 2.0;
-                    *radius = 8.0;
-                    changed = true;
-                }
-            });
             // Validation warnings -- match what the playtest cooker
             // refuses, so authors see the issue before they cook.
             if *radius <= 0.0 {
@@ -10237,6 +10415,22 @@ fn short_path(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| path.display().to_string())
+}
+
+fn project_menu_label(path: &Path) -> String {
+    let folder = short_path(path);
+    let project_file = path.join("project.ron");
+    let Ok(project) = ProjectDocument::load_from_path(&project_file) else {
+        return folder;
+    };
+    let name = project.name.trim();
+    if name.is_empty() {
+        folder
+    } else if psxed_project::project_file_stem(name) == folder {
+        name.to_string()
+    } else {
+        format!("{name} ({folder})")
+    }
 }
 
 fn paths_equivalent(a: &Path, b: &Path) -> bool {
@@ -12872,10 +13066,9 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
             NodeKind::Light {
                 color: [255, 240, 200],
                 intensity: 1.0,
-                // Sectors. Matches the Place tool default and
-                // the Torch/Room fill presets -- historically
-                // this was 4096.0 (4096 sectors!) which lit
-                // every room from across the world.
+                // Sectors. Matches the Place tool default; historically
+                // this was 4096.0 (4096 sectors!) which lit every room
+                // from across the world.
                 radius: 4.0,
             },
         ),
@@ -17132,14 +17325,144 @@ mod tests {
     }
 
     #[test]
-    fn create_and_open_project_validates_name() {
+    fn create_and_open_project_validates_non_empty_name() {
         let mut ws = EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
         assert!(ws.create_and_open_project("").is_err());
-        assert!(ws.create_and_open_project("with/slash").is_err());
-        assert!(ws.create_and_open_project("..").is_err());
-        assert!(ws.create_and_open_project(".hidden").is_err());
         // "default" is a real existing dir, so this hits the "already exists" branch.
         assert!(ws.create_and_open_project("default").is_err());
+    }
+
+    #[test]
+    fn create_and_open_project_sets_document_name_and_derived_directory() {
+        let mut ws = EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let name = format!(
+            "Project Rename {} {}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let target = psxed_project::projects_dir().join(psxed_project::project_file_stem(&name));
+        let _ = std::fs::remove_dir_all(&target);
+
+        ws.create_and_open_project(&name).unwrap();
+
+        assert_eq!(ws.project().name, name);
+        assert_eq!(ws.project_root(), target);
+        assert!(!ws.is_dirty());
+        let saved = ProjectDocument::load_from_path(target.join("project.ron")).unwrap();
+        assert_eq!(saved.name, ws.project().name);
+        let _ = std::fs::remove_dir_all(target);
+    }
+
+    #[test]
+    fn save_renames_project_directory_when_project_name_changes() {
+        let parent = test_temp_dir("rename-project-parent");
+        let source = parent.join("old_project");
+        std::fs::create_dir_all(&source).unwrap();
+        let project_file = source.join("project.ron");
+        std::fs::write(
+            &project_file,
+            ProjectDocument::new("Old Project").to_ron_string().unwrap(),
+        )
+        .unwrap();
+        let mut workspace = EditorWorkspace::open_directory(&source).unwrap();
+
+        workspace.project.name = "New Project".to_string();
+        workspace.mark_dirty();
+        workspace.save().unwrap();
+
+        let target = parent.join(psxed_project::project_file_stem("New Project"));
+        assert_eq!(workspace.project_root(), target);
+        assert!(!source.exists());
+        let saved = ProjectDocument::load_from_path(target.join("project.ron")).unwrap();
+        assert_eq!(saved.name, "New Project");
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn save_rejects_project_rename_collision() {
+        let parent = test_temp_dir("rename-project-collision");
+        let source = parent.join("old_project");
+        let target = parent.join(psxed_project::project_file_stem("New Project"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            source.join("project.ron"),
+            ProjectDocument::new("Old Project").to_ron_string().unwrap(),
+        )
+        .unwrap();
+        let mut workspace = EditorWorkspace::open_directory(&source).unwrap();
+
+        workspace.project.name = "New Project".to_string();
+        workspace.mark_dirty();
+        let error = workspace.save().unwrap_err();
+
+        assert!(error.contains("already exists"));
+        assert_eq!(workspace.project_root(), source);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn delete_current_project_refuses_default_project() {
+        let mut workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+
+        let error = workspace.delete_current_project().unwrap_err();
+
+        assert!(error.contains("default project"));
+        assert!(psxed_project::default_project_dir()
+            .join("project.ron")
+            .is_file());
+    }
+
+    #[test]
+    fn delete_current_project_removes_directory_and_loads_default() {
+        let mut workspace =
+            EditorWorkspace::open_directory(psxed_project::default_project_dir()).unwrap();
+        let name = format!(
+            "Delete Project {} {}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let target = psxed_project::projects_dir().join(psxed_project::project_file_stem(&name));
+        let _ = std::fs::remove_dir_all(&target);
+
+        workspace.create_and_open_project(&name).unwrap();
+        assert!(target.join("project.ron").is_file());
+
+        workspace.delete_current_project().unwrap();
+
+        assert!(!target.exists());
+        assert!(paths_equivalent(
+            workspace.project_root(),
+            &psxed_project::default_project_dir()
+        ));
+        assert!(!workspace.is_dirty());
+    }
+
+    #[test]
+    fn delete_current_project_refuses_directory_outside_projects_root() {
+        let dir = test_temp_dir("delete-outside-project-root");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.ron"),
+            ProjectDocument::new("External Project")
+                .to_ron_string()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut workspace = EditorWorkspace::open_directory(&dir).unwrap();
+
+        let error = workspace.delete_current_project().unwrap_err();
+
+        assert!(error.contains("editor/projects"));
+        assert!(dir.join("project.ron").is_file());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -17180,7 +17503,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let target = psxed_project::projects_dir().join(&name);
+        let target = psxed_project::projects_dir().join(psxed_project::project_file_stem(&name));
         let _ = std::fs::remove_dir_all(&target);
 
         ws.create_and_open_project(&name).unwrap();
@@ -17331,6 +17654,44 @@ mod tests {
                 < 0.001
         );
         assert!(workspace.is_dirty());
+    }
+
+    #[test]
+    fn light_transform_normalises_hidden_rotation_scale_and_y_quantum() {
+        let mut transform = psxed_project::Transform3 {
+            translation: [10.0, 47.0, 20.0],
+            rotation_degrees: [10.0, 90.0, 5.0],
+            scale: [2.0, 3.0, 4.0],
+        };
+
+        assert!(normalise_light_transform(&mut transform));
+
+        assert_eq!(transform.translation, [10.0, 32.0, 20.0]);
+        assert_eq!(transform.rotation_degrees, [0.0, 0.0, 0.0]);
+        assert_eq!(transform.scale, [1.0, 1.0, 1.0]);
+        assert!(!normalise_light_transform(&mut transform));
+    }
+
+    #[test]
+    fn rotate_selected_yaw_ignores_light_nodes() {
+        let mut project = ProjectDocument::new("light-rotate");
+        let light = project.active_scene_mut().add_node(
+            NodeId::ROOT,
+            "Light",
+            NodeKind::Light {
+                color: [255, 240, 200],
+                intensity: 1.0,
+                radius: 4.0,
+            },
+        );
+        let mut workspace = EditorWorkspace::with_project(test_temp_dir("light-rotate"), project);
+        workspace.selected_node = light;
+
+        workspace.rotate_selected_yaw_90();
+
+        let node = workspace.project.active_scene().node(light).unwrap();
+        assert_eq!(node.transform.rotation_degrees, [0.0, 0.0, 0.0]);
+        assert!(!workspace.is_dirty());
     }
 
     #[test]
