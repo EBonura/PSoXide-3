@@ -15,6 +15,16 @@ panic         = "abort"
 codegen-units = 1
 lto           = true
 
+[features]
+default = ["world-order-global"]
+world-order-global = []
+world-order-slot = []
+world-order-linked = []
+world-order-bucketed = []
+world-grid-visible = []
+ot-1024 = []
+ot-2048 = []
+
 [dependencies]
 psx-asset  = { path = "../../../sdk/crates/psx-asset" }
 psx-engine = { path = "../../crates/psx-engine" }

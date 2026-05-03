@@ -88,16 +88,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
             PlaytestAssetKind::ModelAnimation => "AssetKind::ModelAnimation",
         };
         let static_name = asset_static_name(asset, i);
-        let vram_bytes = match asset.kind {
-            PlaytestAssetKind::RoomWorld
-            | PlaytestAssetKind::ModelMesh
-            | PlaytestAssetKind::ModelAnimation => 0,
-            // Heuristic: the upload cost is the texture's byte
-            // length. Future loaders may compute a tighter
-            // figure -- for now this is the conservative bound
-            // the residency budget has to honour.
-            PlaytestAssetKind::Texture => asset.bytes.len(),
-        };
+        let vram_bytes = asset_vram_bytes(asset);
         let _ = writeln!(
             out,
             "    LevelAssetRecord {{ id: AssetId({i}), kind: {kind}, bytes: {static_name}, ram_bytes: {static_name}.len() as u32, vram_bytes: {vram_bytes}, flags: 0 }},"
@@ -128,7 +119,7 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     for room in &package.rooms {
         let _ = writeln!(
             out,
-            "    LevelRoomRecord {{ name: {:?}, world_asset: AssetId({}), origin_x: {}, origin_z: {}, sector_size: {}, material_first: MaterialIndex({}), material_count: {}, flags: 0 }},",
+            "    LevelRoomRecord {{ name: {:?}, world_asset: AssetId({}), origin_x: {}, origin_z: {}, sector_size: {}, material_first: MaterialIndex({}), material_count: {}, fog_rgb: [{}, {}, {}], fog_near: {}, fog_far: {}, flags: {} }},",
             room.name,
             room.world_asset_index,
             room.origin_x,
@@ -136,6 +127,12 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
             room.sector_size,
             room.material_first,
             room.material_count,
+            room.fog_rgb[0],
+            room.fog_rgb[1],
+            room.fog_rgb[2],
+            room.fog_near,
+            room.fog_far,
+            room.flags,
         );
     }
     out.push_str("];\n\n");
@@ -175,6 +172,25 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         if let Some(pc) = package.player_controller {
             if pc.spawn.room == i_u16 {
                 let model = package.characters[pc.character as usize].model;
+                if !seen_models.contains(&model) {
+                    seen_models.push(model);
+                    include_model_in_residency(
+                        package,
+                        model,
+                        &mut required_ram,
+                        &mut required_vram,
+                    );
+                }
+            }
+        }
+        for equipment in &package.equipment {
+            if equipment.room != i_u16 {
+                continue;
+            }
+            let Some(weapon) = package.weapons.get(equipment.weapon as usize) else {
+                continue;
+            };
+            if let Some(model) = weapon.model {
                 if !seen_models.contains(&model) {
                     seen_models.push(model);
                     include_model_in_residency(
@@ -251,6 +267,25 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n\n");
 
+    out.push_str("/// Model attachment sockets, ordered by model.\n");
+    out.push_str("pub static MODEL_SOCKETS: &[LevelModelSocketRecord] = &[\n");
+    for socket in &package.model_sockets {
+        let _ = writeln!(
+            out,
+            "    LevelModelSocketRecord {{ model: ModelIndex({}), name: {:?}, joint: {}, translation: [{}, {}, {}], rotation_q12: [{}, {}, {}], flags: 0 }},",
+            socket.model,
+            socket.name,
+            socket.joint,
+            socket.translation[0],
+            socket.translation[1],
+            socket.translation[2],
+            socket.rotation_q12[0],
+            socket.rotation_q12[1],
+            socket.rotation_q12[2],
+        );
+    }
+    out.push_str("];\n\n");
+
     out.push_str("/// Cooked models — instances reference these by index.\n");
     out.push_str("pub static MODELS: &[LevelModelRecord] = &[\n");
     for model in &package.models {
@@ -260,12 +295,14 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
         };
         let _ = writeln!(
             out,
-            "    LevelModelRecord {{ name: {:?}, mesh_asset: AssetId({}), texture_asset: {texture}, clip_first: ModelClipTableIndex({}), clip_count: {}, default_clip: ModelClipIndex({}), world_height: {}, flags: 0 }},",
+            "    LevelModelRecord {{ name: {:?}, mesh_asset: AssetId({}), texture_asset: {texture}, clip_first: ModelClipTableIndex({}), clip_count: {}, default_clip: ModelClipIndex({}), socket_first: ModelSocketIndex({}), socket_count: {}, world_height: {}, flags: 0 }},",
             model.name,
             model.mesh_asset_index,
             model.clip_first,
             model.clip_count,
             model.default_clip,
+            model.socket_first,
+            model.socket_count,
             model.world_height,
         );
     }
@@ -286,6 +323,62 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
             out,
             "    LevelModelInstanceRecord {{ room: RoomIndex({}), model: ModelIndex({}), clip: {clip}, x: {}, y: {}, z: {}, yaw: {}, flags: {} }},",
             inst.room, inst.model, inst.x, inst.y, inst.z, inst.yaw, inst.flags,
+        );
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// Weapon hitboxes, local to weapon grips.\n");
+    out.push_str("pub static WEAPON_HITBOXES: &[WeaponHitboxRecord] = &[\n");
+    for hitbox in &package.weapon_hitboxes {
+        let shape = render_weapon_hit_shape(hitbox.shape);
+        let _ = writeln!(
+            out,
+            "    WeaponHitboxRecord {{ name: {:?}, shape: {shape}, active_start_frame: {}, active_end_frame: {}, flags: 0 }},",
+            hitbox.name, hitbox.active_start_frame, hitbox.active_end_frame,
+        );
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// Cooked Weapon resources.\n");
+    out.push_str("pub static WEAPONS: &[LevelWeaponRecord] = &[\n");
+    for weapon in &package.weapons {
+        let model = weapon
+            .model
+            .map(|model| format!("Some(ModelIndex({model}))"))
+            .unwrap_or_else(|| "None".to_string());
+        let _ = writeln!(
+            out,
+            "    LevelWeaponRecord {{ name: {:?}, model: {model}, default_character_socket: {:?}, grip_name: {:?}, grip_translation: [{}, {}, {}], grip_rotation_q12: [{}, {}, {}], hitbox_first: WeaponHitboxIndex({}), hitbox_count: {}, flags: 0 }},",
+            weapon.name,
+            weapon.default_character_socket,
+            weapon.grip_name,
+            weapon.grip_translation[0],
+            weapon.grip_translation[1],
+            weapon.grip_translation[2],
+            weapon.grip_rotation_q12[0],
+            weapon.grip_rotation_q12[1],
+            weapon.grip_rotation_q12[2],
+            weapon.hitbox_first,
+            weapon.hitbox_count,
+        );
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// Equipment components, room-local parent transforms.\n");
+    out.push_str("pub static EQUIPMENT: &[EquipmentRecord] = &[\n");
+    for equipment in &package.equipment {
+        let _ = writeln!(
+            out,
+            "    EquipmentRecord {{ room: RoomIndex({}), weapon: WeaponIndex({}), x: {}, y: {}, z: {}, yaw: {}, character_socket: {:?}, weapon_grip: {:?}, flags: {} }},",
+            equipment.room,
+            equipment.weapon,
+            equipment.x,
+            equipment.y,
+            equipment.z,
+            equipment.yaw,
+            equipment.character_socket,
+            equipment.weapon_grip,
+            equipment.flags,
         );
     }
     out.push_str("];\n\n");
@@ -371,6 +464,36 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n");
     out
+}
+
+fn asset_vram_bytes(asset: &PlaytestAsset) -> usize {
+    match asset.kind {
+        PlaytestAssetKind::RoomWorld
+        | PlaytestAssetKind::ModelMesh
+        | PlaytestAssetKind::ModelAnimation => 0,
+        PlaytestAssetKind::Texture => texture_vram_bytes(asset).unwrap_or(asset.bytes.len()),
+    }
+}
+
+fn texture_vram_bytes(asset: &PlaytestAsset) -> Option<usize> {
+    let texture = psx_asset::Texture::from_bytes(&asset.bytes).ok()?;
+    Some(texture.pixel_bytes().len() + texture.clut_bytes().len())
+}
+
+fn render_weapon_hit_shape(shape: PlaytestWeaponHitShape) -> String {
+    match shape {
+        PlaytestWeaponHitShape::Box {
+            center,
+            half_extents,
+        } => format!(
+            "WeaponHitShapeRecord::Box {{ center: [{}, {}, {}], half_extents: [{}, {}, {}] }}",
+            center[0], center[1], center[2], half_extents[0], half_extents[1], half_extents[2],
+        ),
+        PlaytestWeaponHitShape::Capsule { start, end, radius } => format!(
+            "WeaponHitShapeRecord::Capsule {{ start: [{}, {}, {}], end: [{}, {}, {}], radius: {} }}",
+            start[0], start[1], start[2], end[0], end[1], end[2], radius,
+        ),
+    }
 }
 
 const fn material_flags_for_sidedness(sidedness: crate::MaterialFaceSidedness) -> u16 {
@@ -498,6 +621,42 @@ fn purge_models_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn room_texture_vram_bytes_match_runtime_compact_tile_upload() {
+        let bytes = std::fs::read(crate::default_project_dir().join("assets/textures/floor.psxt"))
+            .expect("starter floor texture exists");
+        let asset = PlaytestAsset {
+            kind: PlaytestAssetKind::Texture,
+            bytes,
+            filename: "texture_000.psxt".to_string(),
+            source_label: "Floor".to_string(),
+        };
+
+        assert_eq!(asset_vram_bytes(&asset), 16 * 64 * 2 + 16 * 2);
+    }
+
+    #[test]
+    fn model_atlas_vram_bytes_match_runtime_atlas_upload() {
+        let bytes = std::fs::read(
+            crate::default_project_dir()
+                .join("assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt"),
+        )
+        .expect("starter wraith atlas exists");
+        let asset = PlaytestAsset {
+            kind: PlaytestAssetKind::Texture,
+            bytes,
+            filename: "models/model_000_obsidian_wraith/atlas.psxt".to_string(),
+            source_label: "Obsidian Wraith atlas".to_string(),
+        };
+
+        assert_eq!(asset_vram_bytes(&asset), 64 * 128 * 2 + 256 * 2);
+    }
+}
+
 /// Header emitted at the top of every generated manifest. The
 /// runtime example wraps the `include!` in a `mod generated`
 /// with `#[allow(dead_code)]` on the wrapper, so we don't
@@ -515,19 +674,23 @@ use psx_level::{
     CharacterIndex,
     EntityKind,
     EntityRecord,
+    EquipmentRecord,
     LevelAssetRecord,
     LevelCharacterRecord,
     LevelMaterialRecord,
     LevelModelClipRecord,
     LevelModelInstanceRecord,
     LevelModelRecord,
+    LevelModelSocketRecord,
     LevelRoomRecord,
+    LevelWeaponRecord,
     MaterialIndex,
     MaterialSlot,
     MODEL_CLIP_INHERIT,
     ModelClipIndex,
     ModelClipTableIndex,
     ModelIndex,
+    ModelSocketIndex,
     PlayerControllerRecord,
     PlayerSpawnRecord,
     PointLightRecord,
@@ -535,6 +698,10 @@ use psx_level::{
     ResourceSlot,
     RoomIndex,
     RoomResidencyRecord,
+    WeaponHitboxIndex,
+    WeaponHitboxRecord,
+    WeaponHitShapeRecord,
+    WeaponIndex,
 };
 
 ";

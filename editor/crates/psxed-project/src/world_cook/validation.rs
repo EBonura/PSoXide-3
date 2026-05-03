@@ -3,9 +3,9 @@
 use super::*;
 
 pub(super) fn validate_grid_shape(grid: &WorldGrid) -> Result<(), WorldGridCookError> {
-    if grid.sector_size != world::SECTOR_SIZE {
+    if snap_world_sector_size(grid.sector_size) != grid.sector_size {
         return Err(WorldGridCookError::UnsupportedSectorSize {
-            expected: world::SECTOR_SIZE,
+            expected: WORLD_SECTOR_SIZE_QUANTUM,
             actual: grid.sector_size,
         });
     }
@@ -72,9 +72,9 @@ pub(super) fn validate_grid_budget(grid: &WorldGrid) -> Result<(), WorldGridCook
             limit: MAX_ROOM_TRIANGLES,
         });
     }
-    if budget.psxw_v1_bytes > MAX_ROOM_BYTES {
+    if budget.psxw_bytes > MAX_ROOM_BYTES {
         return Err(WorldGridCookError::RoomByteBudgetExceeded {
-            bytes: budget.psxw_v1_bytes,
+            bytes: budget.psxw_bytes,
             limit: MAX_ROOM_BYTES,
         });
     }

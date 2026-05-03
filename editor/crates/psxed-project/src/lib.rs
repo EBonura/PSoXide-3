@@ -5,6 +5,7 @@
 //! then later cooker stages flatten it into PS1-friendly world surfaces,
 //! texture pages, entity spawns, and engine data.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ron::ser::PrettyConfig;
@@ -14,6 +15,8 @@ pub mod model_import;
 pub mod playtest;
 pub mod resolve;
 pub mod spatial;
+pub mod streaming;
+pub mod texture_import;
 pub mod world_cook;
 
 /// Embedded copy of the default project's RON, baked at compile
@@ -35,6 +38,29 @@ pub fn projects_dir() -> PathBuf {
         .join("..")
         .join("..")
         .join("projects")
+}
+
+/// Filesystem-safe stem derived from a project display name.
+///
+/// The editor keeps `ProjectDocument::name` as the user-facing source
+/// of truth, then uses this helper for generated directories and EXE
+/// filenames. It intentionally stays ASCII-only because the PSX build
+/// output and launcher paths benefit from boring, portable names.
+pub fn project_file_stem(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "project".to_string()
+    } else {
+        trimmed
+    }
 }
 
 /// Default project directory (`editor/projects/default/`). Always
@@ -298,6 +324,196 @@ pub enum GridSplit {
     NorthEastSouthWest,
 }
 
+/// Quarter-turn texture rotation for authored grid faces.
+///
+/// PS1 textured polygons carry per-corner 8-bit UVs, not a texture
+/// matrix, so these rotations are represented by rewriting the UVs
+/// sent with each face.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GridUvRotation {
+    /// No texture rotation.
+    #[default]
+    Deg0,
+    /// Rotate texture coordinates 90 degrees clockwise on the face.
+    Deg90,
+    /// Rotate texture coordinates 180 degrees.
+    Deg180,
+    /// Rotate texture coordinates 270 degrees clockwise on the face.
+    Deg270,
+}
+
+/// Non-destructive texture-coordinate transform for one grid face.
+///
+/// `offset` is in PS1 texels and is applied after flip/rotation. It
+/// wraps in the 8-bit UV coordinate space, which matches packet-level
+/// PS1 UVs; runtime room materials use texture-window state so this
+/// can repeat a compact material tile without rebaking the texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GridUvTransform {
+    /// Signed `[u, v]` texel offset.
+    #[serde(default)]
+    pub offset: [i16; 2],
+    /// Optional `[u, v]` UV span in texels. Zero means "use the
+    /// source quad's native span" for that axis.
+    #[serde(default, skip_serializing_if = "is_default_uv_span")]
+    pub span: [u16; 2],
+    /// Quarter-turn rotation.
+    #[serde(default)]
+    pub rotation: GridUvRotation,
+    /// Mirror horizontally before rotation.
+    #[serde(default)]
+    pub flip_u: bool,
+    /// Mirror vertically before rotation.
+    #[serde(default)]
+    pub flip_v: bool,
+}
+
+impl GridUvTransform {
+    /// Identity transform.
+    pub const IDENTITY: Self = Self {
+        offset: [0, 0],
+        span: [0, 0],
+        rotation: GridUvRotation::Deg0,
+        flip_u: false,
+        flip_v: false,
+    };
+
+    /// `true` when this transform leaves UVs unchanged.
+    pub const fn is_identity(&self) -> bool {
+        self.offset[0] == 0
+            && self.offset[1] == 0
+            && self.span[0] == 0
+            && self.span[1] == 0
+            && matches!(self.rotation, GridUvRotation::Deg0)
+            && !self.flip_u
+            && !self.flip_v
+    }
+
+    /// Apply the transform to a quad's corner UVs.
+    ///
+    /// The input order can be any perimeter order (`[NW, NE, SE, SW]`
+    /// for floors or `[BL, BR, TR, TL]` for walls); the transform is
+    /// computed inside the UV rectangle spanned by those four points.
+    pub fn apply_to_quad(self, uvs: [(u8, u8); 4]) -> [(u8, u8); 4] {
+        if self.is_identity() {
+            return uvs;
+        }
+        let bounds = uv_bounds(uvs);
+        [
+            self.apply_one(uvs[0], bounds),
+            self.apply_one(uvs[1], bounds),
+            self.apply_one(uvs[2], bounds),
+            self.apply_one(uvs[3], bounds),
+        ]
+    }
+
+    fn apply_one(self, uv: (u8, u8), bounds: UvBounds) -> (u8, u8) {
+        let width = bounds.max_u - bounds.min_u;
+        let height = bounds.max_v - bounds.min_v;
+        if width == 0 || height == 0 {
+            return (
+                wrap_uv(uv.0 as i32 + self.offset[0] as i32),
+                wrap_uv(uv.1 as i32 + self.offset[1] as i32),
+            );
+        }
+
+        let mut u = uv.0 as i32 - bounds.min_u;
+        let mut v = uv.1 as i32 - bounds.min_v;
+        if self.flip_u {
+            u = width - u;
+        }
+        if self.flip_v {
+            v = height - v;
+        }
+
+        let (u, v) = match self.rotation {
+            GridUvRotation::Deg0 => (u, v),
+            GridUvRotation::Deg90 => (
+                width - scale_rounded(v, width, height),
+                scale_rounded(u, height, width),
+            ),
+            GridUvRotation::Deg180 => (width - u, height - v),
+            GridUvRotation::Deg270 => (
+                scale_rounded(v, width, height),
+                height - scale_rounded(u, height, width),
+            ),
+        };
+        let span_u = self.effective_span_axis(0, width);
+        let span_v = self.effective_span_axis(1, height);
+        let u = scale_rounded(u, span_u, width);
+        let v = scale_rounded(v, span_v, height);
+
+        (
+            wrap_uv(bounds.min_u + u + self.offset[0] as i32),
+            wrap_uv(bounds.min_v + v + self.offset[1] as i32),
+        )
+    }
+
+    fn effective_span_axis(self, axis: usize, fallback: i32) -> i32 {
+        let span = self.span[axis];
+        if span == 0 {
+            fallback
+        } else {
+            i32::from(span.min(255))
+        }
+    }
+}
+
+impl Default for GridUvTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UvBounds {
+    min_u: i32,
+    max_u: i32,
+    min_v: i32,
+    max_v: i32,
+}
+
+fn uv_bounds(uvs: [(u8, u8); 4]) -> UvBounds {
+    let mut min_u = uvs[0].0 as i32;
+    let mut max_u = min_u;
+    let mut min_v = uvs[0].1 as i32;
+    let mut max_v = min_v;
+    for (u, v) in uvs {
+        let u = u as i32;
+        let v = v as i32;
+        min_u = min_u.min(u);
+        max_u = max_u.max(u);
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    UvBounds {
+        min_u,
+        max_u,
+        min_v,
+        max_v,
+    }
+}
+
+fn scale_rounded(value: i32, numerator: i32, denominator: i32) -> i32 {
+    if denominator == 0 {
+        0
+    } else {
+        (value.saturating_mul(numerator) + denominator / 2) / denominator
+    }
+}
+
+fn wrap_uv(value: i32) -> u8 {
+    value.rem_euclid(256) as u8
+}
+
+pub(crate) fn wrap_tiled_uv_offset_i16(value: i64) -> i16 {
+    value.rem_euclid(i64::from(psxed_format::world::TILE_UV)) as i16
+}
+
+const fn is_default_uv_span(span: &[u16; 2]) -> bool {
+    span[0] == 0 && span[1] == 0
+}
+
 /// Floor / ceiling corner index. Maps directly to the
 /// `[NW, NE, SE, SW]` order every height array uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +626,18 @@ impl GridDirection {
         matches!(self, Self::North | Self::East | Self::South | Self::West)
     }
 
+    /// Opposite cardinal edge. Diagonals do not have a single
+    /// opposite perimeter edge.
+    pub const fn opposite_cardinal(self) -> Option<Self> {
+        match self {
+            Self::North => Some(Self::South),
+            Self::East => Some(Self::West),
+            Self::South => Some(Self::North),
+            Self::West => Some(Self::East),
+            Self::NorthWestSouthEast | Self::NorthEastSouthWest => None,
+        }
+    }
+
     /// Canonical physical edge claimed by this authored cardinal
     /// direction. Editor authoring uses North=+Z and South=-Z;
     /// this key lets opposing-cell wall claims collide without
@@ -500,6 +728,9 @@ pub struct GridHorizontalFace {
     pub split: GridSplit,
     /// Material used by the face.
     pub material: Option<ResourceId>,
+    /// Non-destructive texture-coordinate transform.
+    #[serde(default, skip_serializing_if = "GridUvTransform::is_identity")]
+    pub uv: GridUvTransform,
     /// Whether character collision treats this face as walkable.
     pub walkable: bool,
     /// `Some(corner)` when one corner has been deleted, turning
@@ -518,6 +749,7 @@ impl GridHorizontalFace {
             heights: [height, height, height, height],
             split: GridSplit::NorthWestSouthEast,
             material,
+            uv: GridUvTransform::IDENTITY,
             walkable: true,
             dropped_corner: None,
         }
@@ -551,6 +783,9 @@ pub struct GridVerticalFace {
     pub heights: [i32; 4],
     /// Material used by the wall.
     pub material: Option<ResourceId>,
+    /// Non-destructive texture-coordinate transform.
+    #[serde(default, skip_serializing_if = "GridUvTransform::is_identity")]
+    pub uv: GridUvTransform,
     /// Whether collision treats this wall as blocking.
     pub solid: bool,
     /// `Some(corner)` when one wall corner has been deleted,
@@ -560,14 +795,21 @@ pub struct GridVerticalFace {
 }
 
 impl GridVerticalFace {
-    /// Flat wall from `bottom` to `top`.
-    pub const fn flat(bottom: i32, top: i32, material: Option<ResourceId>) -> Self {
+    /// Wall from explicit per-corner heights in `[BL, BR, TR, TL]`
+    /// order.
+    pub const fn with_heights(heights: [i32; 4], material: Option<ResourceId>) -> Self {
         Self {
-            heights: [bottom, bottom, top, top],
+            heights,
             material,
+            uv: GridUvTransform::IDENTITY,
             solid: true,
             dropped_corner: None,
         }
+    }
+
+    /// Flat wall from `bottom` to `top`.
+    pub const fn flat(bottom: i32, top: i32, material: Option<ResourceId>) -> Self {
+        Self::with_heights([bottom, bottom, top, top], material)
     }
 
     pub fn drop_corner(&mut self, corner: WallCorner) {
@@ -580,6 +822,197 @@ impl GridVerticalFace {
 
     pub const fn is_triangle(&self) -> bool {
         self.dropped_corner.is_some()
+    }
+
+    /// Set this wall's V span so texel density follows the world
+    /// grid: `TILE_UV` texels cover one sector-height.
+    ///
+    /// The wall geometry is not changed. Returns `true` when the
+    /// requested span had to be clamped to the PS1 packet UV range.
+    pub fn autotile_uv(&mut self, sector_size: i32) -> bool {
+        let (span_v, clamped) = uv_span_for_world_span(self.max_vertical_span(), sector_size);
+        self.uv.span[0] = 0;
+        self.uv.span[1] = stored_uv_span(span_v);
+        clamped
+    }
+
+    /// Number of runtime wall records needed to draw this wall
+    /// without asking one PS1 primitive to encode a V span beyond
+    /// the packet's 8-bit UV coordinate range.
+    pub fn autotile_segment_count(&self, sector_size: i32) -> usize {
+        if !self.should_split_autotile_segments(sector_size) {
+            return 1;
+        }
+        let sector_size = sector_size.max(1) as usize;
+        let max_span = self.max_vertical_span().max(0) as usize;
+        ((max_span + sector_size - 1) / sector_size).max(1)
+    }
+
+    /// Split this wall into sector-height stack entries and retile
+    /// each segment so every cooked primitive stays within the
+    /// packet's 8-bit V coordinate range.
+    pub fn split_into_autotile_segments(&self, sector_size: i32) -> Vec<Self> {
+        if !self.should_split_autotile_segments(sector_size) {
+            return vec![self.clone()];
+        }
+        let sector_size = sector_size.max(1);
+        let max_span = self.max_vertical_span();
+        if max_span == 0 {
+            return vec![self.clone()];
+        }
+
+        let mut out = Vec::with_capacity(self.autotile_segment_count(sector_size));
+        let mut start = 0;
+        while start < max_span {
+            let end = start.saturating_add(sector_size).min(max_span);
+            let mut wall = self.clone();
+            wall.heights = self.segment_heights(start, end, max_span);
+            let (span_v, _) = uv_span_for_world_span(end.saturating_sub(start), sector_size);
+            wall.uv.span[1] = stored_uv_span(span_v);
+            let start_v = div_round_i64(
+                i64::from(start) * i64::from(psxed_format::world::TILE_UV),
+                i64::from(sector_size),
+            );
+            wall.uv.offset[1] =
+                wrap_tiled_uv_offset_i16(i64::from(self.uv.offset[1]).saturating_add(start_v));
+            out.push(wall);
+            start = end;
+        }
+        out
+    }
+
+    /// Split this wall into sector-height stack entries without
+    /// changing its material or UV settings.
+    pub fn split_into_height_segments(&self, sector_size: i32) -> Vec<Self> {
+        if self.is_triangle() {
+            return vec![self.clone()];
+        }
+        let sector_size = sector_size.max(1);
+        let max_span = self.max_vertical_span();
+        if max_span == 0 {
+            return vec![self.clone()];
+        }
+
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < max_span {
+            let end = start.saturating_add(sector_size).min(max_span);
+            let mut wall = self.clone();
+            wall.heights = self.segment_heights(start, end, max_span);
+            out.push(wall);
+            start = end;
+        }
+        out
+    }
+
+    fn should_split_autotile_segments(&self, sector_size: i32) -> bool {
+        if self.is_triangle() {
+            return false;
+        }
+        let max_span = self.max_vertical_span();
+        let (expected_span, clamped) = uv_span_for_world_span(max_span, sector_size);
+        clamped && (self.uv.span[1] == 0 || self.uv.span[1] == stored_uv_span(expected_span))
+    }
+
+    fn segment_heights(&self, start: i32, end: i32, max_span: i32) -> [i32; 4] {
+        [
+            lerp_i32_ratio(
+                self.heights[WallCorner::BL.idx()],
+                self.heights[WallCorner::TL.idx()],
+                start,
+                max_span,
+            ),
+            lerp_i32_ratio(
+                self.heights[WallCorner::BR.idx()],
+                self.heights[WallCorner::TR.idx()],
+                start,
+                max_span,
+            ),
+            lerp_i32_ratio(
+                self.heights[WallCorner::BR.idx()],
+                self.heights[WallCorner::TR.idx()],
+                end,
+                max_span,
+            ),
+            lerp_i32_ratio(
+                self.heights[WallCorner::BL.idx()],
+                self.heights[WallCorner::TL.idx()],
+                end,
+                max_span,
+            ),
+        ]
+    }
+
+    fn max_vertical_span(&self) -> i32 {
+        let left_span =
+            self.heights[WallCorner::TL.idx()].saturating_sub(self.heights[WallCorner::BL.idx()]);
+        let right_span =
+            self.heights[WallCorner::TR.idx()].saturating_sub(self.heights[WallCorner::BR.idx()]);
+        left_span.unsigned_abs().max(right_span.unsigned_abs()) as i32
+    }
+}
+
+fn uv_span_for_world_span(world_span: i32, sector_size: i32) -> (u16, bool) {
+    if world_span <= 0 {
+        return (u16::from(psxed_format::world::TILE_UV), false);
+    }
+    let sector_size = sector_size.max(1);
+    let unclamped = div_round_i64(
+        i64::from(world_span) * i64::from(psxed_format::world::TILE_UV),
+        i64::from(sector_size),
+    );
+    let texels = unclamped.clamp(1, 255) as u16;
+    (texels, unclamped > 255)
+}
+
+fn stored_uv_span(span: u16) -> u16 {
+    if span == u16::from(psxed_format::world::TILE_UV) {
+        0
+    } else {
+        span
+    }
+}
+
+fn lerp_i32_ratio(a: i32, b: i32, numerator: i32, denominator: i32) -> i32 {
+    if denominator <= 0 {
+        return a;
+    }
+    let delta = i64::from(b).saturating_sub(i64::from(a));
+    i64::from(a)
+        .saturating_add(div_round_i64(
+            delta.saturating_mul(i64::from(numerator)),
+            i64::from(denominator),
+        ))
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+fn div_round_i64(numerator: i64, denominator: i64) -> i64 {
+    if denominator == 0 {
+        return 0;
+    }
+    if numerator >= 0 {
+        numerator.saturating_add(denominator / 2) / denominator
+    } else {
+        numerator.saturating_sub(denominator / 2) / denominator
+    }
+}
+
+/// Array-sector rectangle enclosing authored grid geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldGridFootprint {
+    pub x: u16,
+    pub z: u16,
+    pub width: u16,
+    pub depth: u16,
+}
+
+impl WorldGridFootprint {
+    pub fn end_x(self) -> u16 {
+        self.x + self.width
+    }
+
+    pub fn end_z(self) -> u16 {
+        self.z + self.depth
     }
 }
 
@@ -678,6 +1111,35 @@ impl GridSector {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HorizontalSurface {
+    Floor,
+    Ceiling,
+}
+
+impl HorizontalSurface {
+    fn edge_heights(self, sector: &GridSector, direction: GridDirection) -> Option<[i32; 2]> {
+        let heights = match self {
+            Self::Floor => sector.floor.as_ref()?.heights,
+            Self::Ceiling => sector.ceiling.as_ref()?.heights,
+        };
+        horizontal_edge_heights_for_wall(heights, direction)
+    }
+}
+
+fn horizontal_edge_heights_for_wall(
+    heights: [i32; 4],
+    direction: GridDirection,
+) -> Option<[i32; 2]> {
+    match direction {
+        GridDirection::North => Some([heights[Corner::NW.idx()], heights[Corner::NE.idx()]]),
+        GridDirection::East => Some([heights[Corner::NE.idx()], heights[Corner::SE.idx()]]),
+        GridDirection::South => Some([heights[Corner::SE.idx()], heights[Corner::SW.idx()]]),
+        GridDirection::West => Some([heights[Corner::SW.idx()], heights[Corner::NW.idx()]]),
+        GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => None,
+    }
+}
+
 /// Hard caps on a single room's authoring shape. The cooker
 /// rejects past these, and the editor inspector warns as the
 /// budget approaches them -- both to keep the cooked `.psxw`
@@ -703,6 +1165,21 @@ pub const MAX_ROOM_BYTES: usize = 64 * 1024;
 /// authored slopes look smooth, coarse enough that PS1 i16 vertex
 /// jitter never fights the snap.
 pub const HEIGHT_QUANTUM: i32 = 32;
+/// World grid size quantum. The editor stores one sector size per
+/// World node and snaps it to this step so room/cook math stays
+/// integer and PSX-friendly.
+pub const WORLD_SECTOR_SIZE_QUANTUM: i32 = 128;
+/// Default sector size used by starter/legacy projects.
+pub const DEFAULT_WORLD_SECTOR_SIZE: i32 = 1024;
+/// Default wall span when no ceiling is authored above the edge.
+pub const DEFAULT_WALL_HEIGHT_SECTORS: i32 = 2;
+/// Minimum authored sector size.
+pub const MIN_WORLD_SECTOR_SIZE: i32 = WORLD_SECTOR_SIZE_QUANTUM;
+/// Maximum authored sector size. This is an authoring sanity cap,
+/// not a PSX wire-format limit.
+pub const MAX_WORLD_SECTOR_SIZE: i32 = 8192;
+/// Fixed-point one for authored model resource scale.
+pub const MODEL_SCALE_ONE_Q8: u16 = 256;
 
 /// Snap a vertex height to the nearest [`HEIGHT_QUANTUM`] multiple.
 ///
@@ -720,6 +1197,36 @@ pub fn snap_height(y: i32) -> i32 {
     }
 }
 
+/// Snap a requested World sector size to a positive 128-unit grid.
+pub fn snap_world_sector_size(size: i32) -> i32 {
+    let clamped = size.clamp(MIN_WORLD_SECTOR_SIZE, MAX_WORLD_SECTOR_SIZE);
+    ((clamped + WORLD_SECTOR_SIZE_QUANTUM / 2) / WORLD_SECTOR_SIZE_QUANTUM)
+        * WORLD_SECTOR_SIZE_QUANTUM
+}
+
+fn default_world_sector_size() -> i32 {
+    DEFAULT_WORLD_SECTOR_SIZE
+}
+
+fn default_wall_height_for_sector_size(sector_size: i32) -> i32 {
+    sector_size.saturating_mul(DEFAULT_WALL_HEIGHT_SECTORS)
+}
+
+fn default_model_scale_q8() -> [u16; 3] {
+    [MODEL_SCALE_ONE_Q8; 3]
+}
+
+fn scale_i32_ratio(value: i32, from: i32, to: i32) -> i32 {
+    if from <= 0 || from == to {
+        return value;
+    }
+    (((value as i64) * (to as i64) + (from as i64 / 2)) / (from as i64)) as i32
+}
+
+fn scale_u16_ratio(value: u16, from: i32, to: i32) -> u16 {
+    scale_i32_ratio(value as i32, from, to).clamp(0, u16::MAX as i32) as u16
+}
+
 /// Snapshot of a [`WorldGrid`]'s authoring footprint + cooked-
 /// byte estimate. Cheap to compute (single sector pass); the
 /// editor recomputes it whenever the inspector for a Room
@@ -730,7 +1237,7 @@ pub struct WorldGridBudget {
     pub width: u16,
     /// Grid depth in sectors.
     pub depth: u16,
-    /// `width * depth`. v1 `.psxw` stores a sector record for
+    /// `width * depth`. `.psxw` stores a sector record for
     /// every cell whether it's populated or not, so this is
     /// what the wire-size formula multiplies against.
     pub total_cells: usize,
@@ -742,10 +1249,9 @@ pub struct WorldGridBudget {
     pub ceilings: usize,
     pub walls: usize,
     pub triangles: usize,
-    /// `.psxw` v1 wire size with 44-byte sectors / 24-byte
-    /// walls. v1 stores a record for **every** cell, so this
+    /// Current `.psxw` wire size. The format stores a record for **every** cell, so this
     /// uses `total_cells`, not `populated_cells`.
-    pub psxw_v1_bytes: usize,
+    pub psxw_bytes: usize,
     /// Estimated size if we shipped the future compact format
     /// described in `docs/world-format-roadmap.md` (28-byte
     /// sectors, 12-byte walls). Surfaced as a planning aid, not
@@ -761,12 +1267,31 @@ impl WorldGridBudget {
         self.width > MAX_ROOM_WIDTH
             || self.depth > MAX_ROOM_DEPTH
             || self.triangles > MAX_ROOM_TRIANGLES
-            || self.psxw_v1_bytes > MAX_ROOM_BYTES
+            || self.psxw_bytes > MAX_ROOM_BYTES
     }
 }
 
+const ASSET_HEADER_BYTES: usize = 12;
+const WORLD_HEADER_BYTES: usize = 20;
+const PSXW_SECTOR_BYTES: usize = psxed_format::world::SectorRecord::SIZE;
+const PSXW_WALL_BYTES: usize = psxed_format::world::WallRecord::SIZE;
+const FUTURE_COMPACT_SECTOR_BYTES: usize = 28;
+const FUTURE_COMPACT_WALL_BYTES: usize = 12;
+
 const fn default_ambient_color() -> [u8; 3] {
     [32, 32, 32]
+}
+
+const fn default_fog_color() -> [u8; 3] {
+    [24, 28, 34]
+}
+
+const fn default_fog_near() -> i32 {
+    4096
+}
+
+const fn default_fog_far() -> i32 {
+    16384
 }
 
 const fn default_light_color() -> [u8; 3] {
@@ -797,6 +1322,15 @@ pub struct WorldGrid {
     pub ambient_color: [u8; 3],
     /// Whether PS1 depth cue/fog should be cooked for this grid.
     pub fog_enabled: bool,
+    /// Depth-cue far color for this room.
+    #[serde(default = "default_fog_color")]
+    pub fog_color: [u8; 3],
+    /// Start distance for authored fog/depth cue in engine units.
+    #[serde(default = "default_fog_near")]
+    pub fog_near: i32,
+    /// Fully-fogged distance for authored fog/depth cue in engine units.
+    #[serde(default = "default_fog_far")]
+    pub fog_far: i32,
 }
 
 impl WorldGrid {
@@ -811,6 +1345,9 @@ impl WorldGrid {
             origin: [0, 0],
             ambient_color: default_ambient_color(),
             fog_enabled: true,
+            fog_color: default_fog_color(),
+            fog_near: default_fog_near(),
+            fog_far: default_fog_far(),
         }
     }
 
@@ -823,20 +1360,21 @@ impl WorldGrid {
         wall_material: Option<ResourceId>,
     ) -> Self {
         let mut grid = Self::empty(width, depth, sector_size);
+        let wall_top = default_wall_height_for_sector_size(sector_size);
         for x in 0..width {
             for z in 0..depth {
                 grid.set_floor(x, z, 0, floor_material);
                 if z == depth.saturating_sub(1) {
-                    grid.add_wall(x, z, GridDirection::North, 0, sector_size, wall_material);
+                    grid.add_wall(x, z, GridDirection::North, 0, wall_top, wall_material);
                 }
                 if x == width.saturating_sub(1) {
-                    grid.add_wall(x, z, GridDirection::East, 0, sector_size, wall_material);
+                    grid.add_wall(x, z, GridDirection::East, 0, wall_top, wall_material);
                 }
                 if z == 0 {
-                    grid.add_wall(x, z, GridDirection::South, 0, sector_size, wall_material);
+                    grid.add_wall(x, z, GridDirection::South, 0, wall_top, wall_material);
                 }
                 if x == 0 {
-                    grid.add_wall(x, z, GridDirection::West, 0, sector_size, wall_material);
+                    grid.add_wall(x, z, GridDirection::West, 0, wall_top, wall_material);
                 }
             }
         }
@@ -899,63 +1437,292 @@ impl WorldGrid {
         }
     }
 
-    /// Number of populated sectors.
-    pub fn populated_sector_count(&self) -> usize {
-        self.sectors.iter().flatten().count()
+    /// Add a wall whose bottom edge follows the floor edge under it
+    /// and whose top edge follows the ceiling edge when present.
+    /// Missing ceilings fall back to a two-sector wall span above
+    /// each bottom endpoint.
+    pub fn add_wall_aligned_to_surfaces(
+        &mut self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+        material: Option<ResourceId>,
+    ) {
+        let heights = self.wall_heights_aligned_to_surfaces(x, z, direction);
+        if let Some(sector) = self.ensure_sector(x, z) {
+            sector
+                .walls
+                .get_mut(direction)
+                .push(GridVerticalFace::with_heights(heights, material));
+        }
     }
 
-    /// Snapshot of this grid's authoring footprint + cooked-byte
-    /// estimate. Used by the editor inspector to surface room
-    /// budgets so authors notice when they're approaching PSX
-    /// limits before cook time.
-    pub fn budget(&self) -> WorldGridBudget {
-        let mut b = WorldGridBudget {
-            width: self.width,
-            depth: self.depth,
-            total_cells: (self.width as usize) * (self.depth as usize),
-            ..Default::default()
+    /// Candidate wall heights for editor placement on a cardinal
+    /// edge. The returned order is `[BL, BR, TR, TL]`.
+    pub fn wall_heights_aligned_to_surfaces(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+    ) -> [i32; 4] {
+        let bottom = self
+            .floor_edge_heights_for_wall(x, z, direction)
+            .unwrap_or([0, 0]);
+        let top = self
+            .ceiling_edge_heights_for_wall(x, z, direction)
+            .unwrap_or_else(|| {
+                let height = default_wall_height_for_sector_size(self.sector_size);
+                [
+                    bottom[0].saturating_add(height),
+                    bottom[1].saturating_add(height),
+                ]
+            });
+        [bottom[0], bottom[1], top[1], top[0]]
+    }
+
+    /// Same as [`Self::wall_heights_aligned_to_surfaces`], but
+    /// addressed by world-cell coordinates so hover previews can
+    /// match clicks that will auto-grow the grid on commit.
+    pub fn wall_heights_aligned_to_surfaces_for_world_cell(
+        &self,
+        wcx: i32,
+        wcz: i32,
+        direction: GridDirection,
+    ) -> [i32; 4] {
+        let bottom = self
+            .horizontal_edge_heights_for_world_wall(wcx, wcz, direction, HorizontalSurface::Floor)
+            .unwrap_or([0, 0]);
+        let top = self
+            .horizontal_edge_heights_for_world_wall(wcx, wcz, direction, HorizontalSurface::Ceiling)
+            .unwrap_or_else(|| {
+                let height = default_wall_height_for_sector_size(self.sector_size);
+                [
+                    bottom[0].saturating_add(height),
+                    bottom[1].saturating_add(height),
+                ]
+            });
+        [bottom[0], bottom[1], top[1], top[0]]
+    }
+
+    fn floor_edge_heights_for_wall(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+    ) -> Option<[i32; 2]> {
+        self.horizontal_edge_heights_for_wall(x, z, direction, HorizontalSurface::Floor)
+    }
+
+    fn ceiling_edge_heights_for_wall(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+    ) -> Option<[i32; 2]> {
+        self.horizontal_edge_heights_for_wall(x, z, direction, HorizontalSurface::Ceiling)
+    }
+
+    fn horizontal_edge_heights_for_wall(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+        surface: HorizontalSurface,
+    ) -> Option<[i32; 2]> {
+        if let Some(heights) = self
+            .sector(x, z)
+            .and_then(|sector| surface.edge_heights(sector, direction))
+        {
+            return Some(heights);
+        }
+
+        let (nx, nz, opposite) = self.neighbor_across_cardinal_edge(x, z, direction)?;
+        let mut heights = self
+            .sector(nx, nz)
+            .and_then(|sector| surface.edge_heights(sector, opposite))?;
+        heights.swap(0, 1);
+        Some(heights)
+    }
+
+    fn neighbor_across_cardinal_edge(
+        &self,
+        x: u16,
+        z: u16,
+        direction: GridDirection,
+    ) -> Option<(u16, u16, GridDirection)> {
+        let opposite = direction.opposite_cardinal()?;
+        let (nx, nz) = match direction {
+            GridDirection::North => (x, z.checked_add(1)?),
+            GridDirection::East => (x.checked_add(1)?, z),
+            GridDirection::South => (x, z.checked_sub(1)?),
+            GridDirection::West => (x.checked_sub(1)?, z),
+            GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => return None,
         };
-        for sector in self.sectors.iter().flatten() {
-            b.populated_cells += 1;
-            if sector.floor.is_some() {
-                b.floors += 1;
-                b.triangles += 2;
-            }
-            if sector.ceiling.is_some() {
-                b.ceilings += 1;
-                b.triangles += 2;
-            }
-            for direction in GridDirection::ALL {
-                let count = sector.walls.get(direction).len();
-                b.walls += count;
-                b.triangles += count * 2;
+        (nx < self.width && nz < self.depth).then_some((nx, nz, opposite))
+    }
+
+    fn horizontal_edge_heights_for_world_wall(
+        &self,
+        wcx: i32,
+        wcz: i32,
+        direction: GridDirection,
+        surface: HorizontalSurface,
+    ) -> Option<[i32; 2]> {
+        if let Some((sx, sz)) = self.world_cell_to_array(wcx, wcz) {
+            if let Some(heights) = self
+                .sector(sx, sz)
+                .and_then(|sector| surface.edge_heights(sector, direction))
+            {
+                return Some(heights);
             }
         }
-        // v1 wire layout (matches `psxed_format::world` records):
-        //   AssetHeader = 12, WorldHeader = 20, Sector = 44, Wall = 24.
-        // v1 stores a sector record for every cell -- empty or not --
-        // so the byte count uses `total_cells`. Using
+
+        let opposite = direction.opposite_cardinal()?;
+        let (nwcx, nwcz) = match direction {
+            GridDirection::North => (wcx, wcz.saturating_add(1)),
+            GridDirection::East => (wcx.saturating_add(1), wcz),
+            GridDirection::South => (wcx, wcz.saturating_sub(1)),
+            GridDirection::West => (wcx.saturating_sub(1), wcz),
+            GridDirection::NorthWestSouthEast | GridDirection::NorthEastSouthWest => return None,
+        };
+        let (sx, sz) = self.world_cell_to_array(nwcx, nwcz)?;
+        let mut heights = self
+            .sector(sx, sz)
+            .and_then(|sector| surface.edge_heights(sector, opposite))?;
+        heights.swap(0, 1);
+        Some(heights)
+    }
+
+    /// Number of populated sectors.
+    pub fn populated_sector_count(&self) -> usize {
+        self.sectors
+            .iter()
+            .flatten()
+            .filter(|sector| sector.has_geometry())
+            .count()
+    }
+
+    /// Rectangle enclosing every sector that emits authored
+    /// geometry. Empty allocated cells are capacity, not room
+    /// footprint, so they do not influence bounds or streaming
+    /// subdivision.
+    pub fn authored_footprint(&self) -> Option<WorldGridFootprint> {
+        let mut min_x = self.width;
+        let mut min_z = self.depth;
+        let mut max_x = 0u16;
+        let mut max_z = 0u16;
+        let mut found = false;
+        for x in 0..self.width {
+            for z in 0..self.depth {
+                let Some(sector) = self.sector(x, z) else {
+                    continue;
+                };
+                if !sector.has_geometry() {
+                    continue;
+                }
+                found = true;
+                min_x = min_x.min(x);
+                min_z = min_z.min(z);
+                max_x = max_x.max(x);
+                max_z = max_z.max(z);
+            }
+        }
+        found.then_some(WorldGridFootprint {
+            x: min_x,
+            z: min_z,
+            width: max_x - min_x + 1,
+            depth: max_z - min_z + 1,
+        })
+    }
+
+    /// Budget for the authored footprint only. This is the number
+    /// authors care about when sparse grid allocation has grown past
+    /// the currently placed tiles.
+    pub fn authored_budget(&self) -> WorldGridBudget {
+        self.authored_footprint()
+            .and_then(|f| self.budget_for_rect(f.x, f.z, f.width, f.depth))
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of the allocated grid rectangle + cooked-byte
+    /// estimate. Use [`Self::authored_budget`] when empty capacity
+    /// should not count as room footprint.
+    pub fn budget(&self) -> WorldGridBudget {
+        self.budget_for_rect(0, 0, self.width, self.depth)
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of one rectangular grid area. The rectangle is in
+    /// array-sector coordinates, not world-origin-adjusted cells.
+    /// Returns `None` for empty or out-of-bounds rectangles.
+    pub fn budget_for_rect(
+        &self,
+        x: u16,
+        z: u16,
+        width: u16,
+        depth: u16,
+    ) -> Option<WorldGridBudget> {
+        if width == 0 || depth == 0 {
+            return None;
+        }
+        let x1 = x.checked_add(width)?;
+        let z1 = z.checked_add(depth)?;
+        if x1 > self.width || z1 > self.depth {
+            return None;
+        }
+        let mut b = WorldGridBudget {
+            width,
+            depth,
+            total_cells: (width as usize) * (depth as usize),
+            ..Default::default()
+        };
+        for sx in x..x1 {
+            for sz in z..z1 {
+                let Some(sector) = self.sector(sx, sz) else {
+                    continue;
+                };
+                if !sector.has_geometry() {
+                    continue;
+                }
+                b.populated_cells += 1;
+                if sector.floor.is_some() {
+                    b.floors += 1;
+                    b.triangles += 2;
+                }
+                if sector.ceiling.is_some() {
+                    b.ceilings += 1;
+                    b.triangles += 2;
+                }
+                for direction in GridDirection::ALL {
+                    let count = sector
+                        .walls
+                        .get(direction)
+                        .iter()
+                        .map(|wall| wall.autotile_segment_count(self.sector_size))
+                        .sum::<usize>();
+                    b.walls += count;
+                    b.triangles += count * 2;
+                }
+            }
+        }
+        // Active wire layout (matches `psxed_format::world` records).
+        // `.psxw` stores a sector record for every cell -- empty or
+        // not -- so the byte count uses `total_cells`. Using
         // `populated_cells` here was the original bug: it under-
-        // reported the wire size by ~44 B per empty cell.
-        const ASSET_HEADER_BYTES: usize = 12;
-        const WORLD_HEADER_BYTES: usize = 20;
-        const V1_SECTOR_BYTES: usize = 44;
-        const V1_WALL_BYTES: usize = 24;
+        // reported the wire size by one sector record per empty cell.
         // Target compact-format sizes for the planning estimate.
         // See `docs/world-format-roadmap.md`. Plain numeric
         // constants rather than struct sizes so this block doesn't
         // pretend a v2 format exists in code.
-        const FUTURE_COMPACT_SECTOR_BYTES: usize = 28;
-        const FUTURE_COMPACT_WALL_BYTES: usize = 12;
-        b.psxw_v1_bytes = ASSET_HEADER_BYTES
+        b.psxw_bytes = ASSET_HEADER_BYTES
             + WORLD_HEADER_BYTES
-            + b.total_cells * V1_SECTOR_BYTES
-            + b.walls * V1_WALL_BYTES;
+            + b.total_cells * PSXW_SECTOR_BYTES
+            + b.walls * PSXW_WALL_BYTES;
         b.future_compact_estimated_bytes = ASSET_HEADER_BYTES
             + WORLD_HEADER_BYTES
             + b.total_cells * FUTURE_COMPACT_SECTOR_BYTES
             + b.walls * FUTURE_COMPACT_WALL_BYTES;
-        b
+        Some(b)
     }
 
     /// World-space X coordinate of the left edge of column `sx`
@@ -1162,6 +1929,69 @@ impl WorldGrid {
         self.depth = new_depth;
         self.sectors = new_sectors;
     }
+
+    /// Change this grid's sector size and scale engine-unit
+    /// vertical geometry by the same ratio. X/Z authored positions
+    /// are stored in sector units, so they inherit the new physical
+    /// size through `sector_size`.
+    pub fn rescale_sector_size(&mut self, new_sector_size: i32) {
+        let new_sector_size = snap_world_sector_size(new_sector_size);
+        let old_sector_size = self.sector_size.max(1);
+        if old_sector_size == new_sector_size {
+            self.sector_size = new_sector_size;
+            self.snap_heights_to_quantum();
+            return;
+        }
+        for sector in self.sectors.iter_mut().flatten() {
+            if let Some(face) = &mut sector.floor {
+                for h in &mut face.heights {
+                    *h = snap_height(scale_i32_ratio(*h, old_sector_size, new_sector_size));
+                }
+            }
+            if let Some(face) = &mut sector.ceiling {
+                for h in &mut face.heights {
+                    *h = snap_height(scale_i32_ratio(*h, old_sector_size, new_sector_size));
+                }
+            }
+            for direction in GridDirection::ALL {
+                for wall in sector.walls.get_mut(direction) {
+                    for h in &mut wall.heights {
+                        *h = snap_height(scale_i32_ratio(*h, old_sector_size, new_sector_size));
+                    }
+                }
+            }
+        }
+        self.fog_near = scale_i32_ratio(self.fog_near, old_sector_size, new_sector_size).max(0);
+        self.fog_far = scale_i32_ratio(self.fog_far, old_sector_size, new_sector_size)
+            .max(self.fog_near + HEIGHT_QUANTUM);
+        self.sector_size = new_sector_size;
+    }
+
+    /// Snap all authored vertical geometry to the cooker-supported
+    /// height quantum. This is load/save normalization for stale or
+    /// hand-edited project data; live editor controls call
+    /// [`snap_height`] at the point of edit.
+    pub fn snap_heights_to_quantum(&mut self) {
+        for sector in self.sectors.iter_mut().flatten() {
+            if let Some(face) = &mut sector.floor {
+                for h in &mut face.heights {
+                    *h = snap_height(*h);
+                }
+            }
+            if let Some(face) = &mut sector.ceiling {
+                for h in &mut face.heights {
+                    *h = snap_height(*h);
+                }
+            }
+            for direction in GridDirection::ALL {
+                for wall in sector.walls.get_mut(direction) {
+                    for h in &mut wall.heights {
+                        *h = snap_height(*h);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// One cooked animation clip referenced by a [`ModelResource`].
@@ -1178,6 +2008,166 @@ pub struct ModelAnimationClip {
     pub name: String,
     /// Path to the cooked `.psxanim` artifact.
     pub psxanim_path: String,
+}
+
+/// Named model attachment point, usually bound to a skeleton
+/// joint. Runtime composition is:
+/// `entity transform × joint pose × socket local transform`.
+///
+/// Offsets are integer model/engine units and rotations are Q12
+/// turn units (`4096 = 360°`) so project data can be cooked
+/// directly for the PS1 without preserving floats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentSocket {
+    /// User-facing socket name (`right_hand_grip`, `back_slot`, …).
+    pub name: String,
+    /// Joint index in the cooked `.psxmdl` skeleton.
+    pub joint: u16,
+    /// Local translation relative to the joint pose.
+    #[serde(default)]
+    pub translation: [i32; 3],
+    /// Local Euler rotation in Q12 turns: X / Y / Z, 4096 per turn.
+    #[serde(default)]
+    pub rotation_q12: [i16; 3],
+}
+
+impl AttachmentSocket {
+    /// Common right-hand default for humanoid rigs.
+    pub fn right_hand_grip() -> Self {
+        Self {
+            name: default_character_socket(),
+            joint: 0,
+            translation: [0, 0, 0],
+            rotation_q12: [0, 0, 0],
+        }
+    }
+}
+
+/// Pivot on a weapon model that should land on a character socket.
+/// A sword normally uses `grip`; a shield might use `handle`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeaponGrip {
+    /// User-facing grip/pivot name.
+    pub name: String,
+    /// Local translation inside the weapon model.
+    #[serde(default)]
+    pub translation: [i32; 3],
+    /// Local Euler rotation in Q12 turns: X / Y / Z, 4096 per turn.
+    #[serde(default)]
+    pub rotation_q12: [i16; 3],
+}
+
+impl Default for WeaponGrip {
+    fn default() -> Self {
+        Self {
+            name: default_weapon_grip(),
+            translation: [0, 0, 0],
+            rotation_q12: [0, 0, 0],
+        }
+    }
+}
+
+/// Weapon hit volume, stored relative to the weapon grip/pivot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WeaponHitShape {
+    /// Oriented box hit volume. `half_extents` are local axes.
+    Box {
+        /// Local center relative to the weapon grip.
+        center: [i32; 3],
+        /// Half extents in engine/model units.
+        half_extents: [u16; 3],
+    },
+    /// Capsule hit volume, useful for blades, clubs, and spears.
+    Capsule {
+        /// Local capsule start relative to the weapon grip.
+        start: [i32; 3],
+        /// Local capsule end relative to the weapon grip.
+        end: [i32; 3],
+        /// Capsule radius in engine/model units.
+        radius: u16,
+    },
+}
+
+impl Default for WeaponHitShape {
+    fn default() -> Self {
+        Self::Capsule {
+            start: [0, 0, 0],
+            end: [0, 512, 0],
+            radius: 48,
+        }
+    }
+}
+
+/// One named active hitbox window for a weapon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeaponHitbox {
+    /// User-facing hitbox name.
+    pub name: String,
+    /// Local hit volume.
+    #[serde(default)]
+    pub shape: WeaponHitShape,
+    /// First animation frame where the hitbox is active.
+    #[serde(default)]
+    pub active_start_frame: u16,
+    /// Last animation frame where the hitbox is active.
+    #[serde(default)]
+    pub active_end_frame: u16,
+}
+
+impl Default for WeaponHitbox {
+    fn default() -> Self {
+        Self {
+            name: "Main Hit".to_string(),
+            shape: WeaponHitShape::default(),
+            active_start_frame: 0,
+            active_end_frame: 0,
+        }
+    }
+}
+
+/// Gameplay weapon resource: model reference, grip/pivot, and
+/// authored attack hit volumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeaponResource {
+    /// Visual model used for the weapon. `None` is allowed during
+    /// authoring so hitboxes can be blocked in before art lands.
+    #[serde(default)]
+    pub model: Option<ResourceId>,
+    /// Which character socket this weapon expects by default.
+    #[serde(default = "default_character_socket")]
+    pub default_character_socket: String,
+    /// Weapon-local grip/pivot that aligns to the character socket.
+    #[serde(default)]
+    pub grip: WeaponGrip,
+    /// Hit volumes authored relative to [`Self::grip`].
+    #[serde(default)]
+    pub hitboxes: Vec<WeaponHitbox>,
+}
+
+impl WeaponResource {
+    /// Minimal editable weapon.
+    pub fn defaults() -> Self {
+        Self {
+            model: None,
+            default_character_socket: default_character_socket(),
+            grip: WeaponGrip::default(),
+            hitboxes: vec![WeaponHitbox::default()],
+        }
+    }
+}
+
+impl Default for WeaponResource {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+fn default_character_socket() -> String {
+    "right_hand_grip".to_string()
+}
+
+fn default_weapon_grip() -> String {
+    "grip".to_string()
 }
 
 /// Cooked PSX model bundle: a `.psxmdl` plus optional atlas
@@ -1214,6 +2204,15 @@ pub struct ModelResource {
     /// preview to size selection gizmos.
     #[serde(default = "default_model_world_height")]
     pub world_height: u16,
+    /// Authored bake-time scale in Q8 fixed point (`256 = 1.0`).
+    /// Stored as integers so project data mirrors the PS1/runtime
+    /// constraint; any application to mesh data must happen during
+    /// cook/import, not as runtime floats.
+    #[serde(default = "default_model_scale_q8")]
+    pub scale_q8: [u16; 3],
+    /// Named sockets used by equipment, VFX, and hitbox authoring.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentSocket>,
 }
 
 const fn default_model_world_height() -> u16 {
@@ -1221,6 +2220,15 @@ const fn default_model_world_height() -> u16 {
 }
 
 impl ModelResource {
+    /// Human-readable scale factor for one axis.
+    pub fn scale_axis(&self, axis: usize) -> f32 {
+        self.scale_q8
+            .get(axis)
+            .copied()
+            .unwrap_or(MODEL_SCALE_ONE_Q8) as f32
+            / MODEL_SCALE_ONE_Q8 as f32
+    }
+
     /// Index of the clip the editor inspector should preview --
     /// `preview_clip` if set, else `default_clip`, else `None`.
     pub fn effective_preview_clip(&self) -> Option<u16> {
@@ -1325,8 +2333,9 @@ pub enum ResourceData {
     /// The editor and the runtime both consume the same `.psxt` blob
     /// -- the runtime via `include_bytes!` at compile time, the editor
     /// via `std::fs::read` at refresh time and `psx_asset::Texture::from_bytes`
-    /// to extract pixel + CLUT bytes. PNG → PSXT cooking lives in the
-    /// `psxed-tex` CLI; the editor's runtime path doesn't touch PNGs.
+    /// to extract pixel + CLUT bytes. PNG/JPG/BMP → PSXT cooking lives
+    /// in `texture_import` and the `psxed tex` CLI; runtime paths still
+    /// consume only cooked blobs.
     Texture {
         /// Path to the cooked `.psxt` artifact. Resolved at refresh
         /// time first as-is (absolute paths), then relative to the
@@ -1339,8 +2348,9 @@ pub enum ResourceData {
     /// Editor material.
     Material(MaterialResource),
     /// Cooked animated PSX model -- `.psxmdl` + optional `.psxt`
-    /// atlas + animation clips. Instantiated in scenes via
-    /// [`NodeKind::MeshInstance`] referencing this resource id.
+    /// atlas + animation clips. Instantiated in scenes by placing an
+    /// [`NodeKind::Entity`] with a [`NodeKind::ModelRenderer`]
+    /// component referencing this resource id.
     Model(ModelResource),
     /// Legacy / generic source mesh path. Kept for backward
     /// compatibility; new authoring should use [`ResourceData::Model`].
@@ -1363,11 +2373,14 @@ pub enum ResourceData {
         /// Project-relative audio path.
         source_path: String,
     },
-    /// Gameplay character -- Model + role clip mapping +
+    /// Gameplay character profile -- Model + role clip mapping +
     /// capsule/camera defaults. Layered on top of a Model
-    /// resource; the player spawn references this to resolve
-    /// what to render and how the controller behaves.
+    /// resource; character-controller components reference this to
+    /// resolve what to render and how movement/camera behaviour works.
     Character(CharacterResource),
+    /// Equipment/weapon authoring resource. A Weapon references a
+    /// Model for visuals and owns grip + hitbox data for combat.
+    Weapon(WeaponResource),
 }
 
 impl ResourceData {
@@ -1381,7 +2394,8 @@ impl ResourceData {
             Self::Scene { .. } => "Scene",
             Self::Script { .. } => "Script",
             Self::Audio { .. } => "Audio",
-            Self::Character(_) => "Character",
+            Self::Character(_) => "Character Profile",
+            Self::Weapon(_) => "Weapon",
         }
     }
 }
@@ -1397,6 +2411,120 @@ pub struct Resource {
     pub data: ResourceData,
 }
 
+/// One backing-file move performed by a resource rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceFileRename {
+    /// Previous stored project path.
+    pub from: String,
+    /// New stored project path.
+    pub to: String,
+}
+
+/// One backing file deleted with a resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceFileDelete {
+    /// Stored project-relative path that was deleted.
+    pub path: String,
+}
+
+/// Summary returned after renaming a resource and any backing files
+/// that are safe for the project to own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceRenameReport {
+    /// Files that were physically moved and whose project paths were
+    /// updated.
+    pub renamed_files: Vec<ResourceFileRename>,
+    /// Path fields that were left alone because they were empty,
+    /// missing on disk, outside the project root, or otherwise not
+    /// safe to move automatically.
+    pub skipped_files: Vec<String>,
+}
+
+/// Summary returned after removing a resource from the project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceDeleteReport {
+    /// Resource removed from the project's resource table.
+    pub removed: Resource,
+    /// Number of project references cleared because they pointed at
+    /// the removed resource.
+    pub cleared_references: usize,
+    /// Project-owned backing files physically removed from disk.
+    pub deleted_files: Vec<ResourceFileDelete>,
+    /// Path fields left alone because they were empty, missing,
+    /// outside the project root, or otherwise not safe to delete.
+    pub skipped_files: Vec<String>,
+}
+
+/// Failure modes for [`ProjectDocument::rename_resource_with_files`].
+#[derive(Debug)]
+pub enum ResourceRenameError {
+    /// No resource with the requested id exists.
+    MissingResource(ResourceId),
+    /// Empty or whitespace-only names are refused.
+    EmptyName,
+    /// Two planned file moves would write the same destination.
+    DuplicateTarget(PathBuf),
+    /// A planned destination already exists.
+    TargetExists(PathBuf),
+    /// Filesystem operation failed.
+    Io {
+        /// Source path.
+        from: PathBuf,
+        /// Destination path.
+        to: PathBuf,
+        /// Error detail.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for ResourceRenameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingResource(id) => write!(f, "resource #{} does not exist", id.raw()),
+            Self::EmptyName => write!(f, "resource name cannot be empty"),
+            Self::DuplicateTarget(path) => {
+                write!(f, "multiple files would rename to {}", path.display())
+            }
+            Self::TargetExists(path) => write!(f, "target already exists: {}", path.display()),
+            Self::Io { from, to, detail } => write!(
+                f,
+                "failed to rename {} to {}: {detail}",
+                from.display(),
+                to.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResourceRenameError {}
+
+/// Failure modes for [`ProjectDocument::delete_resource_with_files`].
+#[derive(Debug)]
+pub enum ResourceDeleteError {
+    /// No resource with the requested id exists.
+    MissingResource(ResourceId),
+    /// Filesystem operation failed.
+    Io {
+        /// File path that could not be removed.
+        path: PathBuf,
+        /// Error detail.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for ResourceDeleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingResource(id) => write!(f, "resource #{} does not exist", id.raw()),
+            Self::Io { path, detail } => {
+                write!(f, "failed to delete {}: {detail}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResourceDeleteError {}
+
 /// Node type used by the editor scene tree.
 ///
 /// Hierarchy convention for level authoring:
@@ -1407,10 +2535,21 @@ pub enum NodeKind {
     Node,
     /// Spatial transform node.
     Node3D,
+    /// Composed world object. The node owns transform/identity;
+    /// behaviour is expressed by component-node children such as
+    /// [`ModelRenderer`](Self::ModelRenderer),
+    /// [`Animator`](Self::Animator), and
+    /// [`Collider`](Self::Collider).
+    Entity,
     /// Macro-node grouping every Room that belongs to one streamed
-    /// region. Holds shared metadata (default fog/ambient) the
-    /// editor will surface as it grows; for now it's a pure folder.
-    World,
+    /// region. Owns the global sector size inherited by descendant
+    /// Room grids.
+    World {
+        /// Shared sector size in engine units, snapped to
+        /// [`WORLD_SECTOR_SIZE_QUANTUM`].
+        #[serde(default = "default_world_sector_size")]
+        sector_size: i32,
+    },
     /// One streamed level chunk: a sector grid plus its child
     /// entities. Cooks to a single `.psxw` blob the runtime loads
     /// in isolation.
@@ -1436,6 +2575,95 @@ pub enum NodeKind {
         #[serde(default)]
         animation_clip: Option<u16>,
     },
+    /// Render a cooked [`ResourceData::Model`] from the transform
+    /// on the nearest entity ancestor. This is the component form of
+    /// the legacy [`MeshInstance`](Self::MeshInstance) node.
+    ModelRenderer {
+        /// Model resource.
+        model: Option<ResourceId>,
+        /// Optional material override for legacy/static paths.
+        /// Cooked PSX models currently carry their own atlas and
+        /// ignore this field.
+        #[serde(default)]
+        material: Option<ResourceId>,
+    },
+    /// Animation component for a model-rendering entity. `clip`
+    /// overrides the model default when set; `None` inherits the
+    /// model's runtime default.
+    Animator {
+        /// Per-instance clip override.
+        #[serde(default)]
+        clip: Option<u16>,
+        /// Whether this animation should run automatically in the
+        /// editor/playtest runtime.
+        #[serde(default = "default_true")]
+        autoplay: bool,
+    },
+    /// Collision component. The first runtime pass only cooks room
+    /// grid collision, but keeping authored collider data as a node
+    /// makes entity/interactable/NPC architecture explicit now.
+    Collider {
+        /// Collision shape in engine/editor units.
+        #[serde(default)]
+        shape: ColliderShape,
+        /// Solid colliders block movement; non-solid colliders are
+        /// trigger volumes.
+        #[serde(default = "default_true")]
+        solid: bool,
+    },
+    /// Interactable component for props such as chests, doors, and
+    /// levers. Runtime behaviour is not cooked yet; this is authoring
+    /// structure for the upcoming object pass.
+    Interactable {
+        /// UI prompt or editor-facing affordance.
+        #[serde(default)]
+        prompt: String,
+        /// Logical action id.
+        #[serde(default)]
+        action: String,
+    },
+    /// Character/controller component. It binds an entity to a reusable
+    /// [`ResourceData::Character`] profile. When `player` is true this is
+    /// the component-tree replacement for a legacy player
+    /// [`SpawnPoint`](Self::SpawnPoint); non-player character cooking lands
+    /// after NPC runtime records exist.
+    CharacterController {
+        /// Character profile resource.
+        #[serde(default)]
+        character: Option<ResourceId>,
+        /// Whether this controller drives the player.
+        #[serde(default)]
+        player: bool,
+    },
+    /// AI marker component for future NPC/enemy runtime records.
+    AiController {
+        /// Logical AI profile id.
+        #[serde(default)]
+        behavior: String,
+    },
+    /// Combat stat component for entity nodes.
+    Combat {
+        /// Team/faction label.
+        #[serde(default)]
+        faction: String,
+        /// Hit points.
+        #[serde(default = "default_combat_health")]
+        health: u16,
+    },
+    /// Equipment component. The parent Entity supplies the animated
+    /// character model; this component names the Weapon and which
+    /// socket/grip pair should be composed.
+    Equipment {
+        /// Weapon resource.
+        #[serde(default)]
+        weapon: Option<ResourceId>,
+        /// Character/model socket to follow.
+        #[serde(default = "default_character_socket")]
+        character_socket: String,
+        /// Weapon-local grip/pivot to align to the character socket.
+        #[serde(default = "default_weapon_grip")]
+        weapon_grip: String,
+    },
     /// Simple authoring light.
     Light {
         /// RGB light colour.
@@ -1446,11 +2674,21 @@ pub enum NodeKind {
         /// Approximate editor/runtime radius.
         radius: f32,
     },
+    /// Point-light component form of [`Light`](Self::Light).
+    PointLight {
+        /// RGB light colour.
+        #[serde(default = "default_light_color")]
+        color: [u8; 3],
+        /// Light intensity multiplier.
+        intensity: f32,
+        /// Approximate editor/runtime radius in sectors.
+        radius: f32,
+    },
     /// Spawn marker.
     SpawnPoint {
         /// Whether this is the player spawn.
         player: bool,
-        /// Character resource that drives this spawn. For the
+        /// Character profile resource that drives this spawn. For the
         /// player spawn this picks the player's model + role
         /// clips + controller params. `None` lets the cook step
         /// auto-pick a Character when exactly one exists, or
@@ -1494,16 +2732,82 @@ impl NodeKind {
         match self {
             Self::Node => "Node",
             Self::Node3D => "Node3D",
-            Self::World => "World",
+            Self::Entity => "Entity",
+            Self::World { .. } => "World",
             Self::Room { .. } => "Room",
-            Self::MeshInstance { .. } => "MeshInstance",
+            Self::MeshInstance { .. } => "Mesh Instance",
+            Self::ModelRenderer { .. } => "Model Renderer",
+            Self::Animator { .. } => "Animator",
+            Self::Collider { .. } => "Collider",
+            Self::Interactable { .. } => "Interactable",
+            Self::CharacterController { .. } => "Character Controller",
+            Self::AiController { .. } => "AI Controller",
+            Self::Combat { .. } => "Combat",
+            Self::Equipment { .. } => "Equipment",
             Self::Light { .. } => "Light",
-            Self::SpawnPoint { .. } => "SpawnPoint",
+            Self::PointLight { .. } => "Point Light",
+            Self::SpawnPoint { .. } => "Spawn Point",
             Self::Trigger { .. } => "Trigger",
-            Self::AudioSource { .. } => "AudioSource",
+            Self::AudioSource { .. } => "Audio Source",
             Self::Portal { .. } => "Portal",
         }
     }
+
+    /// True for behaviour/component nodes that are intended to be
+    /// children of an [`Entity`](Self::Entity) host rather than
+    /// independent placed objects.
+    pub const fn is_component(self: &Self) -> bool {
+        matches!(
+            self,
+            Self::ModelRenderer { .. }
+                | Self::Animator { .. }
+                | Self::Collider { .. }
+                | Self::Interactable { .. }
+                | Self::CharacterController { .. }
+                | Self::AiController { .. }
+                | Self::Combat { .. }
+                | Self::Equipment { .. }
+                | Self::PointLight { .. }
+        )
+    }
+}
+
+/// Authored collision shape for component-node entities.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ColliderShape {
+    /// Axis-aligned box, stored as half-extents.
+    Box {
+        /// Half extents in engine/editor units.
+        half_extents: [u16; 3],
+    },
+    /// Sphere collider.
+    Sphere {
+        /// Radius in engine/editor units.
+        radius: u16,
+    },
+    /// Upright capsule.
+    Capsule {
+        /// Radius in engine/editor units.
+        radius: u16,
+        /// Height in engine/editor units.
+        height: u16,
+    },
+}
+
+impl Default for ColliderShape {
+    fn default() -> Self {
+        Self::Box {
+            half_extents: [256, 256, 256],
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_combat_health() -> u16 {
+    1
 }
 
 /// A scene-tree node.
@@ -1694,6 +2998,19 @@ impl Scene {
         }
     }
 
+    /// Sector size inherited by `id` from the nearest World ancestor.
+    pub fn world_sector_size_for_node(&self, id: NodeId) -> Option<i32> {
+        let mut current = Some(id);
+        while let Some(node_id) = current {
+            let node = self.node(node_id)?;
+            if let NodeKind::World { sector_size } = &node.kind {
+                return Some(snap_world_sector_size(*sector_size));
+            }
+            current = node.parent;
+        }
+        None
+    }
+
     /// Rows in root-first depth-first order.
     pub fn hierarchy_rows(&self) -> Vec<NodeRow> {
         let mut rows = Vec::new();
@@ -1798,6 +3115,151 @@ impl ProjectDocument {
         self.resource(id).map(|resource| resource.name.as_str())
     }
 
+    /// Count project references to `id` from scenes and from other
+    /// resources. Backing-file paths are counted separately by the
+    /// delete plan because they are owned by the resource itself.
+    pub fn resource_reference_count(&self, id: ResourceId) -> usize {
+        let mut count = 0;
+        for resource in &self.resources {
+            count += resource_data_reference_count(&resource.data, id);
+        }
+        for scene in &self.scenes {
+            for node in scene.nodes() {
+                count += node_kind_reference_count(&node.kind, id);
+            }
+        }
+        count
+    }
+
+    /// Remove a resource from the project and clear references to it.
+    pub fn delete_resource(&mut self, id: ResourceId) -> Option<ResourceDeleteReport> {
+        let index = self
+            .resources
+            .iter()
+            .position(|resource| resource.id == id)?;
+        let removed = self.resources.remove(index);
+        let cleared_references = self.clear_resource_references(id);
+        Some(ResourceDeleteReport {
+            removed,
+            cleared_references,
+            deleted_files: Vec::new(),
+            skipped_files: Vec::new(),
+        })
+    }
+
+    /// Remove a resource, delete its project-owned backing files, and
+    /// clear references to it.
+    ///
+    /// Files are removed before project data is mutated. Only files
+    /// that currently exist under `project_root` are deleted; missing
+    /// or external paths are skipped and reported.
+    pub fn delete_resource_with_files(
+        &mut self,
+        id: ResourceId,
+        project_root: &Path,
+    ) -> Result<ResourceDeleteReport, ResourceDeleteError> {
+        let Some(index) = self.resources.iter().position(|resource| resource.id == id) else {
+            return Err(ResourceDeleteError::MissingResource(id));
+        };
+        let plan = plan_resource_file_deletes(&self.resources[index], project_root);
+        execute_resource_delete_plan(&plan, project_root)?;
+
+        let mut report = self
+            .delete_resource(id)
+            .ok_or(ResourceDeleteError::MissingResource(id))?;
+        report.deleted_files = plan
+            .files
+            .iter()
+            .map(|op| ResourceFileDelete {
+                path: op.stored.clone(),
+            })
+            .collect();
+        report.skipped_files = plan.skipped;
+        Ok(report)
+    }
+
+    /// Rename a resource and any project-owned backing files whose
+    /// names are derived from the resource name.
+    ///
+    /// File moves are preflighted before project data is mutated:
+    /// destinations must not already exist and duplicate destinations
+    /// are refused. Only files that already exist under `project_root`
+    /// are moved; missing paths and external absolute paths are
+    /// preserved and reported as skipped.
+    pub fn rename_resource_with_files(
+        &mut self,
+        id: ResourceId,
+        new_name: &str,
+        project_root: &Path,
+    ) -> Result<ResourceRenameReport, ResourceRenameError> {
+        let final_name = new_name.trim();
+        if final_name.is_empty() {
+            return Err(ResourceRenameError::EmptyName);
+        }
+
+        let Some(index) = self.resources.iter().position(|resource| resource.id == id) else {
+            return Err(ResourceRenameError::MissingResource(id));
+        };
+
+        let resource = self.resources[index].clone();
+        let safe_stem = resource_file_stem(final_name, resource_default_stem(&resource.data));
+        let mut plan = ResourceRenamePlan::default();
+        let mut data = resource.data.clone();
+
+        match &mut data {
+            ResourceData::Texture { psxt_path } => {
+                plan_path_rename(psxt_path, &safe_stem, "psxt", project_root, &mut plan);
+            }
+            ResourceData::Model(model) => {
+                plan_model_resource_rename(model, &safe_stem, project_root, &mut plan);
+            }
+            ResourceData::Mesh { source_path }
+            | ResourceData::Scene { source_path }
+            | ResourceData::Script { source_path }
+            | ResourceData::Audio { source_path } => {
+                let fallback_ext = resource_default_extension(&resource.data);
+                plan_path_rename(
+                    source_path,
+                    &safe_stem,
+                    fallback_ext,
+                    project_root,
+                    &mut plan,
+                );
+            }
+            ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => {}
+        }
+
+        execute_resource_rename_plan(&plan)?;
+
+        self.resources[index].name = final_name.to_string();
+        self.resources[index].data = data;
+
+        Ok(ResourceRenameReport {
+            renamed_files: plan
+                .ops
+                .iter()
+                .map(|op| ResourceFileRename {
+                    from: op.from_stored.clone(),
+                    to: op.to_stored.clone(),
+                })
+                .collect(),
+            skipped_files: plan.skipped,
+        })
+    }
+
+    fn clear_resource_references(&mut self, id: ResourceId) -> usize {
+        let mut count = 0;
+        for resource in &mut self.resources {
+            count += clear_resource_data_references(&mut resource.data, id);
+        }
+        for scene in &mut self.scenes {
+            for node in &mut scene.nodes {
+                count += clear_node_kind_references(&mut node.kind, id);
+            }
+        }
+        count
+    }
+
     /// Material resources as `(id, name)` pairs for inspector combo boxes.
     pub fn material_options(&self) -> Vec<(ResourceId, String)> {
         self.resources
@@ -1820,7 +3282,18 @@ impl ProjectDocument {
 
     /// Deserialize a project from RON.
     pub fn from_ron_str(source: &str) -> Result<Self, ProjectIoError> {
-        ron::from_str(source).map_err(ProjectIoError::Parse)
+        let mut project: Self = match ron::from_str(source) {
+            Ok(project) => project,
+            Err(first_error) => {
+                let migrated = migrate_legacy_project_ron(source);
+                if migrated == source {
+                    return Err(ProjectIoError::Parse(first_error));
+                }
+                ron::from_str(&migrated).map_err(ProjectIoError::Parse)?
+            }
+        };
+        project.normalize_loaded();
+        Ok(project)
     }
 
     /// Save this project to a RON file, creating parent directories.
@@ -1832,7 +3305,9 @@ impl ProjectDocument {
         {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, self.to_ron_string()?)?;
+        let mut normalized = self.clone();
+        normalized.normalize_loaded();
+        std::fs::write(path, normalized.to_ron_string()?)?;
         Ok(())
     }
 
@@ -1840,6 +3315,657 @@ impl ProjectDocument {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ProjectIoError> {
         let source = std::fs::read_to_string(path)?;
         Self::from_ron_str(&source)
+    }
+
+    /// Normalize legacy or hand-authored project data after load.
+    pub fn normalize_loaded(&mut self) {
+        for scene in &mut self.scenes {
+            for node in &mut scene.nodes {
+                match &mut node.kind {
+                    NodeKind::World { sector_size } => {
+                        *sector_size = snap_world_sector_size(*sector_size);
+                    }
+                    _ => {}
+                }
+            }
+            let worlds: Vec<(NodeId, i32)> = scene
+                .nodes()
+                .iter()
+                .filter_map(|node| match &node.kind {
+                    NodeKind::World { sector_size } => Some((node.id, *sector_size)),
+                    _ => None,
+                })
+                .collect();
+            for (world_id, sector_size) in worlds {
+                apply_world_sector_size_to_descendants(
+                    scene,
+                    world_id,
+                    sector_size,
+                    sector_size,
+                    false,
+                );
+            }
+            let orphan_rooms: Vec<NodeId> = scene
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.kind, NodeKind::Room { .. }))
+                .filter(|node| scene.world_sector_size_for_node(node.id).is_none())
+                .map(|node| node.id)
+                .collect();
+            for room_id in orphan_rooms {
+                if let Some(node) = scene.node_mut(room_id) {
+                    if let NodeKind::Room { grid } = &mut node.kind {
+                        grid.rescale_sector_size(grid.sector_size);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sector size inherited by `node_id` from its nearest World
+    /// ancestor, or the default when no World exists.
+    pub fn world_sector_size_for_node(&self, node_id: NodeId) -> i32 {
+        self.active_scene()
+            .world_sector_size_for_node(node_id)
+            .unwrap_or(DEFAULT_WORLD_SECTOR_SIZE)
+    }
+
+    /// Update a World node's sector size, snapping to 128-unit
+    /// increments and rescaling descendant rooms/components.
+    pub fn set_world_sector_size(&mut self, world_id: NodeId, requested: i32) -> Option<i32> {
+        let scene = self.active_scene_mut();
+        let new_size = snap_world_sector_size(requested);
+        let old_size = {
+            let world = scene.node_mut(world_id)?;
+            let NodeKind::World { sector_size } = &mut world.kind else {
+                return None;
+            };
+            let old_size = snap_world_sector_size(*sector_size);
+            *sector_size = new_size;
+            old_size
+        };
+        apply_world_sector_size_to_descendants(
+            scene,
+            world_id,
+            new_size,
+            old_size,
+            old_size != new_size,
+        );
+        Some(new_size)
+    }
+}
+
+fn resource_data_reference_count(data: &ResourceData, id: ResourceId) -> usize {
+    match data {
+        ResourceData::Material(material) => option_resource_reference_count(material.texture, id),
+        ResourceData::Character(character) => option_resource_reference_count(character.model, id),
+        ResourceData::Weapon(weapon) => option_resource_reference_count(weapon.model, id),
+        ResourceData::Texture { .. }
+        | ResourceData::Model(_)
+        | ResourceData::Mesh { .. }
+        | ResourceData::Scene { .. }
+        | ResourceData::Script { .. }
+        | ResourceData::Audio { .. } => 0,
+    }
+}
+
+fn clear_resource_data_references(data: &mut ResourceData, id: ResourceId) -> usize {
+    match data {
+        ResourceData::Material(material) => clear_option_resource(&mut material.texture, id),
+        ResourceData::Character(character) => {
+            let cleared = clear_option_resource(&mut character.model, id);
+            if cleared > 0 {
+                character.idle_clip = None;
+                character.walk_clip = None;
+                character.run_clip = None;
+                character.turn_clip = None;
+            }
+            cleared
+        }
+        ResourceData::Weapon(weapon) => clear_option_resource(&mut weapon.model, id),
+        ResourceData::Texture { .. }
+        | ResourceData::Model(_)
+        | ResourceData::Mesh { .. }
+        | ResourceData::Scene { .. }
+        | ResourceData::Script { .. }
+        | ResourceData::Audio { .. } => 0,
+    }
+}
+
+fn node_kind_reference_count(kind: &NodeKind, id: ResourceId) -> usize {
+    match kind {
+        NodeKind::Room { grid } => grid_resource_reference_count(grid, id),
+        NodeKind::MeshInstance { mesh, material, .. } => {
+            option_resource_reference_count(*mesh, id)
+                + option_resource_reference_count(*material, id)
+        }
+        NodeKind::ModelRenderer { model, material } => {
+            option_resource_reference_count(*model, id)
+                + option_resource_reference_count(*material, id)
+        }
+        NodeKind::CharacterController { character, .. } => {
+            option_resource_reference_count(*character, id)
+        }
+        NodeKind::Equipment { weapon, .. } => option_resource_reference_count(*weapon, id),
+        NodeKind::SpawnPoint { character, .. } => option_resource_reference_count(*character, id),
+        NodeKind::AudioSource { sound, .. } => option_resource_reference_count(*sound, id),
+        NodeKind::Node
+        | NodeKind::Node3D
+        | NodeKind::Entity
+        | NodeKind::World { .. }
+        | NodeKind::Animator { .. }
+        | NodeKind::Collider { .. }
+        | NodeKind::Interactable { .. }
+        | NodeKind::AiController { .. }
+        | NodeKind::Combat { .. }
+        | NodeKind::Light { .. }
+        | NodeKind::PointLight { .. }
+        | NodeKind::Trigger { .. }
+        | NodeKind::Portal { .. } => 0,
+    }
+}
+
+fn clear_node_kind_references(kind: &mut NodeKind, id: ResourceId) -> usize {
+    match kind {
+        NodeKind::Room { grid } => clear_grid_resource_references(grid, id),
+        NodeKind::MeshInstance { mesh, material, .. } => {
+            clear_option_resource(mesh, id) + clear_option_resource(material, id)
+        }
+        NodeKind::ModelRenderer { model, material } => {
+            clear_option_resource(model, id) + clear_option_resource(material, id)
+        }
+        NodeKind::CharacterController { character, .. } => clear_option_resource(character, id),
+        NodeKind::Equipment { weapon, .. } => clear_option_resource(weapon, id),
+        NodeKind::SpawnPoint { character, .. } => clear_option_resource(character, id),
+        NodeKind::AudioSource { sound, .. } => clear_option_resource(sound, id),
+        NodeKind::Node
+        | NodeKind::Node3D
+        | NodeKind::Entity
+        | NodeKind::World { .. }
+        | NodeKind::Animator { .. }
+        | NodeKind::Collider { .. }
+        | NodeKind::Interactable { .. }
+        | NodeKind::AiController { .. }
+        | NodeKind::Combat { .. }
+        | NodeKind::Light { .. }
+        | NodeKind::PointLight { .. }
+        | NodeKind::Trigger { .. }
+        | NodeKind::Portal { .. } => 0,
+    }
+}
+
+fn grid_resource_reference_count(grid: &WorldGrid, id: ResourceId) -> usize {
+    let mut count = 0;
+    for sector in grid.sectors.iter().flatten() {
+        if let Some(face) = &sector.floor {
+            count += option_resource_reference_count(face.material, id);
+        }
+        if let Some(face) = &sector.ceiling {
+            count += option_resource_reference_count(face.material, id);
+        }
+        for direction in GridDirection::ALL {
+            for wall in sector.walls.get(direction) {
+                count += option_resource_reference_count(wall.material, id);
+            }
+        }
+    }
+    count
+}
+
+fn clear_grid_resource_references(grid: &mut WorldGrid, id: ResourceId) -> usize {
+    let mut count = 0;
+    for sector in grid.sectors.iter_mut().flatten() {
+        if let Some(face) = &mut sector.floor {
+            count += clear_option_resource(&mut face.material, id);
+        }
+        if let Some(face) = &mut sector.ceiling {
+            count += clear_option_resource(&mut face.material, id);
+        }
+        for direction in GridDirection::ALL {
+            for wall in sector.walls.get_mut(direction) {
+                count += clear_option_resource(&mut wall.material, id);
+            }
+        }
+    }
+    count
+}
+
+fn option_resource_reference_count(value: Option<ResourceId>, id: ResourceId) -> usize {
+    usize::from(value == Some(id))
+}
+
+fn clear_option_resource(value: &mut Option<ResourceId>, id: ResourceId) -> usize {
+    if *value == Some(id) {
+        *value = None;
+        1
+    } else {
+        0
+    }
+}
+
+fn migrate_legacy_project_ron(source: &str) -> String {
+    source
+        .replace(
+            "kind: World,",
+            &format!("kind: World(sector_size: {}),", DEFAULT_WORLD_SECTOR_SIZE),
+        )
+        .replace("kind: Actor,", "kind: Entity,")
+}
+
+fn apply_world_sector_size_to_descendants(
+    scene: &mut Scene,
+    world_id: NodeId,
+    sector_size: i32,
+    old_sector_size: i32,
+    rescale: bool,
+) {
+    let ids: Vec<NodeId> = scene
+        .nodes()
+        .iter()
+        .filter(|node| scene.is_descendant_of(node.id, world_id))
+        .map(|node| node.id)
+        .collect();
+    for id in ids {
+        let Some(node) = scene.node_mut(id) else {
+            continue;
+        };
+        match &mut node.kind {
+            NodeKind::Room { grid } => {
+                if rescale {
+                    grid.rescale_sector_size(sector_size);
+                } else {
+                    grid.sector_size = snap_world_sector_size(sector_size);
+                    grid.snap_heights_to_quantum();
+                }
+            }
+            NodeKind::Collider { shape, .. } if rescale => {
+                rescale_collider_shape(shape, old_sector_size, sector_size);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn rescale_collider_shape(shape: &mut ColliderShape, from: i32, to: i32) {
+    match shape {
+        ColliderShape::Box { half_extents } => {
+            for axis in half_extents {
+                *axis = scale_u16_ratio(*axis, from, to);
+            }
+        }
+        ColliderShape::Sphere { radius } => {
+            *radius = scale_u16_ratio(*radius, from, to);
+        }
+        ColliderShape::Capsule { radius, height } => {
+            *radius = scale_u16_ratio(*radius, from, to);
+            *height = scale_u16_ratio(*height, from, to);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResourceRenamePlan {
+    ops: Vec<ResourcePathRename>,
+    skipped: Vec<String>,
+}
+
+#[derive(Default)]
+struct ResourceDeletePlan {
+    files: Vec<ResourcePathDelete>,
+    skipped: Vec<String>,
+}
+
+struct ResourcePathRename {
+    from_abs: PathBuf,
+    to_abs: PathBuf,
+    from_stored: String,
+    to_stored: String,
+}
+
+struct ResourcePathDelete {
+    abs: PathBuf,
+    stored: String,
+}
+
+fn plan_resource_file_deletes(resource: &Resource, project_root: &Path) -> ResourceDeletePlan {
+    let mut plan = ResourceDeletePlan::default();
+    match &resource.data {
+        ResourceData::Texture { psxt_path } => {
+            plan_path_delete(psxt_path, project_root, &mut plan);
+        }
+        ResourceData::Model(model) => {
+            plan_path_delete(&model.model_path, project_root, &mut plan);
+            if let Some(texture_path) = &model.texture_path {
+                plan_path_delete(texture_path, project_root, &mut plan);
+            }
+            for clip in &model.clips {
+                plan_path_delete(&clip.psxanim_path, project_root, &mut plan);
+            }
+        }
+        ResourceData::Mesh { source_path }
+        | ResourceData::Scene { source_path }
+        | ResourceData::Script { source_path }
+        | ResourceData::Audio { source_path } => {
+            plan_path_delete(source_path, project_root, &mut plan);
+        }
+        ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => {}
+    }
+    plan
+}
+
+fn plan_path_delete(stored: &str, project_root: &Path, plan: &mut ResourceDeletePlan) {
+    let trimmed = stored.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let abs = model_import::resolve_path(trimmed, Some(project_root));
+    if !abs.is_file() {
+        plan.skipped.push(trimmed.to_string());
+        return;
+    }
+    if !path_is_project_owned(&abs, project_root) {
+        plan.skipped.push(trimmed.to_string());
+        return;
+    }
+    if plan.files.iter().any(|op| op.abs == abs) {
+        return;
+    }
+    plan.files.push(ResourcePathDelete {
+        stored: relativise_resource_path(&abs, project_root),
+        abs,
+    });
+}
+
+fn execute_resource_delete_plan(
+    plan: &ResourceDeletePlan,
+    project_root: &Path,
+) -> Result<(), ResourceDeleteError> {
+    for op in &plan.files {
+        std::fs::remove_file(&op.abs).map_err(|error| ResourceDeleteError::Io {
+            path: op.abs.clone(),
+            detail: error.to_string(),
+        })?;
+    }
+    for op in &plan.files {
+        remove_empty_project_parents(op.abs.parent(), project_root);
+    }
+    Ok(())
+}
+
+fn remove_empty_project_parents(mut dir: Option<&Path>, project_root: &Path) {
+    while let Some(current) = dir {
+        if current == project_root {
+            break;
+        }
+        if std::fs::remove_dir(current).is_err() {
+            break;
+        }
+        dir = current.parent();
+    }
+}
+
+fn plan_path_rename(
+    stored: &mut String,
+    safe_stem: &str,
+    fallback_ext: &str,
+    project_root: &Path,
+    plan: &mut ResourceRenamePlan,
+) {
+    let original = stored.clone();
+    let Some(op) = build_path_rename(&original, safe_stem, fallback_ext, project_root, plan) else {
+        return;
+    };
+    *stored = op.to_stored.clone();
+    plan.ops.push(op);
+}
+
+fn plan_model_resource_rename(
+    model: &mut ModelResource,
+    safe_stem: &str,
+    project_root: &Path,
+    plan: &mut ResourceRenamePlan,
+) {
+    let model_path = model.model_path.clone();
+    let model_abs = model_import::resolve_path(&model_path, Some(project_root));
+    let model_dir = model_abs.parent().map(Path::to_path_buf);
+    let target_dir = model_dir
+        .as_deref()
+        .map(|dir| model_bundle_target_dir(dir, safe_stem, project_root));
+
+    if let Some(op) = build_path_rename_in_dir(
+        &model_path,
+        safe_stem,
+        "psxmdl",
+        target_dir.as_deref(),
+        project_root,
+        plan,
+    ) {
+        model.model_path = op.to_stored.clone();
+        plan.ops.push(op);
+    }
+
+    if let Some(texture_path) = &mut model.texture_path {
+        let original = texture_path.clone();
+        if let Some(op) = build_path_rename_in_dir(
+            &original,
+            safe_stem,
+            "psxt",
+            target_dir.as_deref(),
+            project_root,
+            plan,
+        ) {
+            *texture_path = op.to_stored.clone();
+            plan.ops.push(op);
+        }
+    }
+
+    let mut seen_clip_stems = HashSet::new();
+    for (index, clip) in model.clips.iter_mut().enumerate() {
+        let clip_suffix = resource_file_stem(&clip.name, "clip");
+        let mut clip_stem = format!("{safe_stem}_{clip_suffix}");
+        if !seen_clip_stems.insert(clip_stem.clone()) {
+            clip_stem = format!("{safe_stem}_{index}_{clip_suffix}");
+            seen_clip_stems.insert(clip_stem.clone());
+        }
+        let original = clip.psxanim_path.clone();
+        if let Some(op) = build_path_rename_in_dir(
+            &original,
+            &clip_stem,
+            "psxanim",
+            target_dir.as_deref(),
+            project_root,
+            plan,
+        ) {
+            clip.psxanim_path = op.to_stored.clone();
+            plan.ops.push(op);
+        }
+    }
+}
+
+fn build_path_rename(
+    stored: &str,
+    safe_stem: &str,
+    fallback_ext: &str,
+    project_root: &Path,
+    plan: &mut ResourceRenamePlan,
+) -> Option<ResourcePathRename> {
+    build_path_rename_in_dir(stored, safe_stem, fallback_ext, None, project_root, plan)
+}
+
+fn build_path_rename_in_dir(
+    stored: &str,
+    safe_stem: &str,
+    fallback_ext: &str,
+    target_dir: Option<&Path>,
+    project_root: &Path,
+    plan: &mut ResourceRenamePlan,
+) -> Option<ResourcePathRename> {
+    let trimmed = stored.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let from_abs = model_import::resolve_path(trimmed, Some(project_root));
+    if !from_abs.is_file() {
+        plan.skipped.push(trimmed.to_string());
+        return None;
+    }
+    if !path_is_project_owned(&from_abs, project_root) {
+        plan.skipped.push(trimmed.to_string());
+        return None;
+    }
+
+    let ext = from_abs
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or(fallback_ext);
+    let target_name = format!("{safe_stem}.{ext}");
+    let to_abs = target_dir
+        .map(|dir| dir.join(&target_name))
+        .unwrap_or_else(|| from_abs.with_file_name(target_name));
+
+    if from_abs == to_abs {
+        return None;
+    }
+
+    Some(ResourcePathRename {
+        from_abs,
+        to_stored: relativise_resource_path(&to_abs, project_root),
+        to_abs,
+        from_stored: trimmed.to_string(),
+    })
+}
+
+fn execute_resource_rename_plan(plan: &ResourceRenamePlan) -> Result<(), ResourceRenameError> {
+    let mut targets = HashSet::new();
+    for op in &plan.ops {
+        if !targets.insert(op.to_abs.clone()) {
+            return Err(ResourceRenameError::DuplicateTarget(op.to_abs.clone()));
+        }
+        if op.to_abs.exists() {
+            return Err(ResourceRenameError::TargetExists(op.to_abs.clone()));
+        }
+    }
+
+    let mut moved: Vec<&ResourcePathRename> = Vec::new();
+    let mut created_dirs = Vec::new();
+    for op in &plan.ops {
+        if let Some(parent) = op.to_abs.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|error| ResourceRenameError::Io {
+                    from: op.from_abs.clone(),
+                    to: op.to_abs.clone(),
+                    detail: error.to_string(),
+                })?;
+                created_dirs.push(parent.to_path_buf());
+            }
+        }
+        if let Err(error) = std::fs::rename(&op.from_abs, &op.to_abs) {
+            for done in moved.iter().rev() {
+                let _ = std::fs::rename(&done.to_abs, &done.from_abs);
+            }
+            for dir in created_dirs.iter().rev() {
+                let _ = std::fs::remove_dir(dir);
+            }
+            return Err(ResourceRenameError::Io {
+                from: op.from_abs.clone(),
+                to: op.to_abs.clone(),
+                detail: error.to_string(),
+            });
+        }
+        moved.push(op);
+    }
+
+    for op in &plan.ops {
+        if let (Some(from_parent), Some(to_parent)) = (op.from_abs.parent(), op.to_abs.parent()) {
+            if from_parent != to_parent {
+                let _ = std::fs::remove_dir(from_parent);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn model_bundle_target_dir(model_dir: &Path, safe_stem: &str, project_root: &Path) -> PathBuf {
+    let Ok(relative) = model_dir.strip_prefix(project_root) else {
+        return model_dir.to_path_buf();
+    };
+    let mut components = relative.components();
+    let is_imported_bundle = matches!(
+        (
+            components.next().and_then(|c| c.as_os_str().to_str()),
+            components.next().and_then(|c| c.as_os_str().to_str()),
+            components.next(),
+            components.next()
+        ),
+        (Some("assets"), Some("models"), Some(_), None)
+    );
+    if is_imported_bundle {
+        project_root.join("assets").join("models").join(safe_stem)
+    } else {
+        model_dir.to_path_buf()
+    }
+}
+
+fn path_is_project_owned(path: &Path, project_root: &Path) -> bool {
+    path.strip_prefix(project_root).is_ok()
+}
+
+fn relativise_resource_path(path: &Path, project_root: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn resource_file_stem(name: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_was_sep = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed
+    }
+}
+
+const fn resource_default_stem(data: &ResourceData) -> &'static str {
+    match data {
+        ResourceData::Texture { .. } => "texture",
+        ResourceData::Material(_) => "material",
+        ResourceData::Model(_) => "model",
+        ResourceData::Weapon(_) => "weapon",
+        ResourceData::Mesh { .. } => "mesh",
+        ResourceData::Scene { .. } => "scene",
+        ResourceData::Script { .. } => "script",
+        ResourceData::Audio { .. } => "audio",
+        ResourceData::Character(_) => "character",
+    }
+}
+
+const fn resource_default_extension(data: &ResourceData) -> &'static str {
+    match data {
+        ResourceData::Texture { .. } => "psxt",
+        ResourceData::Material(_) => "mat",
+        ResourceData::Model(_) => "psxmdl",
+        ResourceData::Weapon(_) => "weapon",
+        ResourceData::Mesh { .. } => "psxmesh",
+        ResourceData::Scene { .. } => "room",
+        ResourceData::Script { .. } => "script",
+        ResourceData::Audio { .. } => "vag",
+        ResourceData::Character(_) => "char",
     }
 }
 
@@ -1877,6 +4003,145 @@ mod tests {
         assert_eq!(snap_height(48), 64);
         assert_eq!(snap_height(-47), -32);
         assert_eq!(snap_height(-48), -64);
+    }
+
+    #[test]
+    fn normalize_loaded_snaps_room_heights_to_quantum() {
+        let mut project = ProjectDocument::starter();
+        let room_id = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Room { .. }))
+            .map(|node| node.id)
+            .unwrap();
+        {
+            let room = project.active_scene_mut().node_mut(room_id).unwrap();
+            let NodeKind::Room { grid } = &mut room.kind else {
+                panic!("expected room");
+            };
+            let sector = grid.ensure_sector(0, 0).unwrap();
+            sector.floor = Some(GridHorizontalFace::flat(17, None));
+            let walls = sector.walls.get_mut(GridDirection::West);
+            walls.clear();
+            walls.push(GridVerticalFace::with_heights([0, 0, 965, 802], None));
+        }
+
+        project.normalize_loaded();
+
+        let room = project.active_scene().node(room_id).unwrap();
+        let NodeKind::Room { grid } = &room.kind else {
+            panic!("expected room");
+        };
+        let sector = grid.sector(0, 0).unwrap();
+        assert_eq!(sector.floor.as_ref().unwrap().heights, [32, 32, 32, 32]);
+        assert_eq!(
+            sector.walls.get(GridDirection::West)[0].heights,
+            [0, 0, 960, 800]
+        );
+    }
+
+    #[test]
+    fn snap_world_sector_size_quantizes_to_128_units() {
+        assert_eq!(WORLD_SECTOR_SIZE_QUANTUM, 128);
+        assert_eq!(snap_world_sector_size(1), 128);
+        assert_eq!(snap_world_sector_size(127), 128);
+        assert_eq!(snap_world_sector_size(191), 128);
+        assert_eq!(snap_world_sector_size(192), 256);
+        assert_eq!(snap_world_sector_size(1500), 1536);
+        assert_eq!(
+            snap_world_sector_size(MAX_WORLD_SECTOR_SIZE + 1),
+            MAX_WORLD_SECTOR_SIZE
+        );
+    }
+
+    #[test]
+    fn changing_world_sector_size_rescales_descendant_room_and_colliders() {
+        let mut project = ProjectDocument::new("test");
+        let scene = project.active_scene_mut();
+        let world = scene.add_node(scene.root, "World", NodeKind::World { sector_size: 1024 });
+        let mut grid = WorldGrid::empty(1, 1, 1024);
+        grid.set_floor(0, 0, 160, None);
+        grid.add_wall(0, 0, GridDirection::North, 0, 1024, None);
+        let room = scene.add_node(world, "Room", NodeKind::Room { grid });
+        let entity = scene.add_node(room, "Entity", NodeKind::Entity);
+        let collider = scene.add_node(
+            entity,
+            "Collider",
+            NodeKind::Collider {
+                shape: ColliderShape::Capsule {
+                    radius: 128,
+                    height: 1024,
+                },
+                solid: true,
+            },
+        );
+
+        assert_eq!(project.set_world_sector_size(world, 1500), Some(1536));
+        assert_eq!(project.world_sector_size_for_node(entity), 1536);
+
+        let scene = project.active_scene();
+        let NodeKind::Room { grid } = &scene.node(room).unwrap().kind else {
+            panic!("expected Room");
+        };
+        assert_eq!(grid.sector_size, 1536);
+        let sector = grid.sector(0, 0).unwrap();
+        assert_eq!(sector.floor.as_ref().unwrap().heights, [256; 4]);
+        assert_eq!(
+            sector
+                .walls
+                .get(GridDirection::North)
+                .first()
+                .unwrap()
+                .heights,
+            [0, 0, 1536, 1536]
+        );
+
+        let NodeKind::Collider {
+            shape: ColliderShape::Capsule { radius, height },
+            ..
+        } = &scene.node(collider).unwrap().kind
+        else {
+            panic!("expected capsule collider");
+        };
+        assert_eq!((*radius, *height), (192, 1536));
+    }
+
+    #[test]
+    fn saving_normalizes_room_sector_size_to_world() {
+        let mut project = ProjectDocument::starter();
+        let scene = project.active_scene_mut();
+        let room_id = scene
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Room { .. }))
+            .map(|node| node.id)
+            .unwrap();
+        let NodeKind::Room { grid } = &mut scene.node_mut(room_id).unwrap().kind else {
+            panic!("expected Room");
+        };
+        grid.sector_size = 2030;
+
+        let dir = unique_temp_dir("normalize-room-sector-size");
+        let path = dir.join("project.ron");
+        project.save_to_path(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let expected_sector_size = project.world_sector_size_for_node(room_id);
+        assert!(saved.contains(&format!(
+            "kind: World(sector_size: {expected_sector_size}),"
+        )));
+        assert!(saved.contains(&format!("sector_size: {expected_sector_size}")));
+        assert!(!saved.contains("sector_size: 2030"));
+
+        let loaded = ProjectDocument::load_from_path(&path).unwrap();
+        let scene = loaded.active_scene();
+        let NodeKind::Room { grid } = &scene.node(room_id).unwrap().kind else {
+            panic!("expected Room");
+        };
+        assert_eq!(grid.sector_size, expected_sector_size);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1937,8 +4202,64 @@ mod tests {
     }
 
     #[test]
+    fn wall_placement_aligns_bottom_edge_to_floor_vertices() {
+        let mut grid = WorldGrid::empty(1, 1, 1024);
+        let mut floor = GridHorizontalFace::flat(0, None);
+        floor.heights = [128, 256, 384, 512];
+        grid.ensure_sector(0, 0).unwrap().floor = Some(floor);
+
+        grid.add_wall_aligned_to_surfaces(0, 0, GridDirection::North, None);
+
+        let wall = grid
+            .sector(0, 0)
+            .unwrap()
+            .walls
+            .get(GridDirection::North)
+            .first()
+            .unwrap();
+        assert_eq!(wall.heights, [128, 256, 2304, 2176]);
+    }
+
+    #[test]
+    fn wall_placement_aligns_top_edge_to_ceiling_vertices() {
+        let mut grid = WorldGrid::empty(1, 1, 1024);
+        let mut floor = GridHorizontalFace::flat(0, None);
+        floor.heights = [128, 256, 384, 512];
+        let mut ceiling = GridHorizontalFace::flat(1024, None);
+        ceiling.heights = [900, 1000, 1100, 1200];
+        let sector = grid.ensure_sector(0, 0).unwrap();
+        sector.floor = Some(floor);
+        sector.ceiling = Some(ceiling);
+
+        grid.add_wall_aligned_to_surfaces(0, 0, GridDirection::East, None);
+
+        let wall = grid
+            .sector(0, 0)
+            .unwrap()
+            .walls
+            .get(GridDirection::East)
+            .first()
+            .unwrap();
+        assert_eq!(wall.heights, [256, 384, 1100, 1000]);
+    }
+
+    #[test]
+    fn off_grid_wall_preview_samples_adjacent_floor_edge() {
+        let mut grid = WorldGrid::empty(1, 1, 1024);
+        let mut floor = GridHorizontalFace::flat(0, None);
+        floor.heights = [128, 256, 384, 512];
+        grid.ensure_sector(0, 0).unwrap().floor = Some(floor);
+
+        let heights =
+            grid.wall_heights_aligned_to_surfaces_for_world_cell(1, 0, GridDirection::West);
+
+        assert_eq!(heights, [384, 256, 2304, 2432]);
+    }
+
+    #[test]
     fn stone_room_perimeter_uses_editor_direction_convention() {
         let grid = WorldGrid::stone_room(2, 3, 1024, None, None);
+        let default_wall_height = default_wall_height_for_sector_size(1024);
 
         for x in 0..grid.width {
             assert!(!grid
@@ -1966,6 +4287,17 @@ mod tests {
                 .get(GridDirection::South)
                 .is_empty());
         }
+        let south_wall = grid
+            .sector(0, 0)
+            .unwrap()
+            .walls
+            .get(GridDirection::South)
+            .first()
+            .unwrap();
+        assert_eq!(
+            south_wall.heights,
+            [0, 0, default_wall_height, default_wall_height]
+        );
     }
 
     #[test]
@@ -2053,6 +4385,32 @@ mod tests {
     }
 
     #[test]
+    fn authored_footprint_ignores_empty_allocation() {
+        let mut grid = WorldGrid::empty(8, 6, 1024);
+        let _ = grid.ensure_sector(0, 0);
+        grid.set_floor(2, 1, 0, None);
+        grid.add_wall(5, 4, GridDirection::North, 0, 1024, None);
+
+        let footprint = grid.authored_footprint().expect("authored geometry");
+        assert_eq!(
+            footprint,
+            WorldGridFootprint {
+                x: 2,
+                z: 1,
+                width: 4,
+                depth: 4,
+            }
+        );
+        assert_eq!(grid.populated_sector_count(), 2);
+
+        let budget = grid.authored_budget();
+        assert_eq!(budget.width, 4);
+        assert_eq!(budget.depth, 4);
+        assert_eq!(budget.total_cells, 16);
+        assert_eq!(budget.populated_cells, 2);
+    }
+
+    #[test]
     fn budget_empty_grid_reports_no_geometry() {
         let grid = WorldGrid::empty(3, 3, 1024);
         let b = grid.budget();
@@ -2065,10 +4423,11 @@ mod tests {
         assert_eq!(b.walls, 0);
         assert_eq!(b.triangles, 0);
         // AssetHeader (12) + WorldHeader (20) + 9 sector records.
-        // v1 stores a record per cell whether populated or not, so
-        // an "empty" 3×3 still costs 9 * 44 = 396 B in sector
-        // records on top of the headers.
-        assert_eq!(b.psxw_v1_bytes, 12 + 20 + 9 * 44);
+        // `.psxw` stores a record per cell whether populated or not.
+        assert_eq!(
+            b.psxw_bytes,
+            12 + 20 + 9 * psxed_format::world::SectorRecord::SIZE
+        );
         assert_eq!(b.future_compact_estimated_bytes, 12 + 20 + 9 * 28);
         assert!(!b.over_budget());
     }
@@ -2084,10 +4443,9 @@ mod tests {
         assert_eq!(b.walls, 12);
         // 2 tris per face: 9 floors + 12 walls = 21 faces.
         assert_eq!(b.triangles, 42);
-        // v2 should be strictly smaller than v1 once any geometry
-        // exists -- the size delta is the whole point of the v2
-        // record reshape.
-        assert!(b.future_compact_estimated_bytes < b.psxw_v1_bytes);
+        // The future compact estimate should be strictly smaller
+        // than the active format once any geometry exists.
+        assert!(b.future_compact_estimated_bytes < b.psxw_bytes);
         assert!(!b.over_budget());
     }
 
@@ -2106,9 +4464,9 @@ mod tests {
         assert_eq!(b.floors, 1024);
         assert_eq!(b.triangles, 2048);
         assert!(b.triangles <= MAX_ROOM_TRIANGLES);
-        // v1: 32 + 1024 * 44 = 45088 -- over the 64KiB cap on the
-        // wall-stack-heavy worst case but fine on floors-only.
-        // v2: 32 + 1024 * 28 = 28704 -- well under cap.
+        // Active format remains under the byte cap for floors-only;
+        // the wall-stack-heavy worst case is what pushes rooms over.
+        assert!(b.psxw_bytes <= MAX_ROOM_BYTES);
         assert!(b.future_compact_estimated_bytes <= MAX_ROOM_BYTES);
         assert!(!b.over_budget());
     }
@@ -2164,6 +4522,10 @@ mod tests {
             &r.data,
             ResourceData::Texture { psxt_path } if psxt_path.ends_with("brick-wall.psxt")
         )));
+        assert!(project.resources.iter().any(|r| matches!(
+            &r.data,
+            ResourceData::Texture { psxt_path } if psxt_path.ends_with("dirt.psxt")
+        )));
         // Starter ships the obsidian wraith model so users can
         // place + playtest a real animated character without
         // running the import flow first.
@@ -2179,6 +4541,45 @@ mod tests {
         assert!(wraith.texture_path.is_some());
         assert!(!wraith.clips.is_empty());
         assert!(wraith.default_clip.is_some());
+        assert_eq!(wraith.scale_q8, [MODEL_SCALE_ONE_Q8; 3]);
+    }
+
+    #[test]
+    fn legacy_world_and_actor_project_ron_migrates_to_world_sector_and_entity() {
+        let starter = ProjectDocument::from_ron_str(DEFAULT_PROJECT_RON).unwrap();
+        let starter_world_sector_size = starter
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::World { sector_size } => Some(*sector_size),
+                _ => None,
+            })
+            .expect("starter world exists");
+        let legacy = DEFAULT_PROJECT_RON
+            .replace(
+                &format!("kind: World(sector_size: {starter_world_sector_size}),"),
+                "kind: World,",
+            )
+            .replacen("kind: Entity,", "kind: Actor,", 1);
+
+        let project = ProjectDocument::from_ron_str(&legacy).unwrap();
+        let scene = project.active_scene();
+        let world = scene
+            .nodes()
+            .iter()
+            .find(|node| node.name == "Demo World")
+            .expect("starter world exists");
+        assert!(matches!(
+            &world.kind,
+            NodeKind::World { sector_size } if *sector_size == DEFAULT_WORLD_SECTOR_SIZE
+        ));
+        let migrated = scene
+            .nodes()
+            .iter()
+            .find(|node| node.name == "Wraith Hero")
+            .expect("starter player entity exists");
+        assert!(matches!(&migrated.kind, NodeKind::Entity));
     }
 
     #[test]
@@ -2205,6 +4606,19 @@ mod tests {
         assert!(default_project_dir()
             .join("assets/textures/floor.psxt")
             .is_file());
+        assert!(default_project_dir()
+            .join("assets/textures/dirt.psxt")
+            .is_file());
+    }
+
+    #[test]
+    fn project_file_stem_is_filesystem_safe() {
+        assert_eq!(
+            project_file_stem("Stone Room: Vertical Slice!"),
+            "stone_room_vertical_slice"
+        );
+        assert_eq!(project_file_stem("PSoXide 2"), "psoxide_2");
+        assert_eq!(project_file_stem("..."), "project");
     }
 
     #[test]
@@ -2212,13 +4626,14 @@ mod tests {
         let project = ProjectDocument::starter();
 
         assert_eq!(project.scenes.len(), 1);
-        // 2 textures + 2 materials = 4.
-        assert!(project.resources.len() >= 4);
+        // Starter includes room textures/materials plus gameplay
+        // resources for the animated character and weapon path.
+        assert!(project.resources.len() >= 10);
         assert!(project
             .active_scene()
             .hierarchy_rows()
             .iter()
-            .any(|row| row.name == "Stone Room"));
+            .any(|row| row.name == "Room"));
         let grid = project
             .active_scene()
             .nodes()
@@ -2239,12 +4654,53 @@ mod tests {
 
     #[test]
     fn legacy_project_missing_light_color_and_room_ambient_uses_defaults() {
+        let starter = ProjectDocument::from_ron_str(DEFAULT_PROJECT_RON).unwrap();
+        let light = starter
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Light {
+                    color,
+                    intensity,
+                    radius,
+                }
+                | NodeKind::PointLight {
+                    color,
+                    intensity,
+                    radius,
+                } => Some((*color, *intensity, *radius)),
+                _ => None,
+            })
+            .expect("starter has a light");
+        let room = starter
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Room { grid } => Some(grid),
+                _ => None,
+            })
+            .expect("starter has a room");
         let source = DEFAULT_PROJECT_RON
             .replace(
-                "kind: Light(color: (255, 236, 198), intensity: 1.0, radius: 4.0)",
-                "kind: Light(intensity: 1.0, radius: 4.0)",
+                &format!(
+                    "kind: Light(color: ({}, {}, {}), intensity: {}, radius: {})",
+                    light.0[0], light.0[1], light.0[2], light.1, light.2
+                ),
+                &format!("kind: Light(intensity: {}, radius: {})", light.1, light.2),
             )
-            .replace(", ambient_color: (32, 32, 32)", "");
+            .replace(
+                &format!(
+                    ", ambient_color: ({}, {}, {})",
+                    room.ambient_color[0], room.ambient_color[1], room.ambient_color[2]
+                ),
+                "",
+            )
+            .replace(
+                &format!(", fog_near: {}, fog_far: {}", room.fog_near, room.fog_far),
+                "",
+            );
 
         let project = ProjectDocument::from_ron_str(&source).unwrap();
         let light_color = project
@@ -2253,6 +4709,7 @@ mod tests {
             .iter()
             .find_map(|node| match &node.kind {
                 NodeKind::Light { color, .. } => Some(*color),
+                NodeKind::PointLight { color, .. } => Some(*color),
                 _ => None,
             })
             .expect("starter has a light");
@@ -2268,6 +4725,20 @@ mod tests {
             })
             .expect("starter has a room");
         assert_eq!(ambient, default_ambient_color());
+
+        let fog = project
+            .active_scene()
+            .nodes()
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Room { grid } => Some((grid.fog_color, grid.fog_near, grid.fog_far)),
+                _ => None,
+            })
+            .expect("starter has a room");
+        assert_eq!(
+            fog,
+            (default_fog_color(), default_fog_near(), default_fog_far())
+        );
     }
 
     #[test]
@@ -2347,7 +4818,7 @@ mod tests {
         let project = ProjectDocument::starter();
         let ron = project.to_ron_string().unwrap();
 
-        assert!(ron.contains("Stone Room"));
+        assert!(ron.contains("Room"));
         assert_eq!(ProjectDocument::from_ron_str(&ron).unwrap(), project);
     }
 
@@ -2372,6 +4843,17 @@ mod tests {
                 default_clip: Some(0),
                 preview_clip: Some(1),
                 world_height: 1280,
+                scale_q8: [
+                    MODEL_SCALE_ONE_Q8,
+                    MODEL_SCALE_ONE_Q8 * 2,
+                    MODEL_SCALE_ONE_Q8,
+                ],
+                attachments: vec![AttachmentSocket {
+                    name: "right_hand_grip".to_string(),
+                    joint: 3,
+                    translation: [16, 32, -8],
+                    rotation_q12: [0, 1024, 0],
+                }],
             }),
         );
         let ron = project.to_ron_string().unwrap();
@@ -2384,8 +4866,19 @@ mod tests {
                 assert_eq!(m.default_clip, Some(0));
                 assert_eq!(m.preview_clip, Some(1));
                 assert_eq!(m.world_height, 1280);
+                assert_eq!(
+                    m.scale_q8,
+                    [
+                        MODEL_SCALE_ONE_Q8,
+                        MODEL_SCALE_ONE_Q8 * 2,
+                        MODEL_SCALE_ONE_Q8
+                    ]
+                );
                 assert_eq!(m.effective_preview_clip(), Some(1));
                 assert_eq!(m.effective_runtime_clip(), Some(0));
+                assert_eq!(m.attachments.len(), 1);
+                assert_eq!(m.attachments[0].joint, 3);
+                assert_eq!(m.attachments[0].translation, [16, 32, -8]);
             }
             _ => panic!("expected Model"),
         }
@@ -2505,6 +4998,327 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "psxed-project-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn resource_rename_moves_project_owned_texture_file() {
+        let root = unique_temp_dir("resource-rename-texture");
+        let texture_dir = root.join("assets").join("textures");
+        std::fs::create_dir_all(&texture_dir).unwrap();
+        std::fs::write(texture_dir.join("floor.psxt"), b"texture").unwrap();
+
+        let mut project = ProjectDocument::new("test");
+        let id = project.add_resource(
+            "Floor",
+            ResourceData::Texture {
+                psxt_path: "assets/textures/floor.psxt".to_string(),
+            },
+        );
+
+        let report = project
+            .rename_resource_with_files(id, "Stone Floor", &root)
+            .unwrap();
+
+        assert_eq!(project.resource_name(id), Some("Stone Floor"));
+        let ResourceData::Texture { psxt_path } = &project.resource(id).unwrap().data else {
+            panic!("expected texture");
+        };
+        assert_eq!(psxt_path, "assets/textures/stone_floor.psxt");
+        assert!(!texture_dir.join("floor.psxt").exists());
+        assert_eq!(
+            std::fs::read(texture_dir.join("stone_floor.psxt")).unwrap(),
+            b"texture"
+        );
+        assert_eq!(report.renamed_files.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resource_rename_moves_imported_model_bundle_files() {
+        let root = unique_temp_dir("resource-rename-model");
+        let bundle_dir = root.join("assets").join("models").join("obsidian_wraith");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("obsidian_wraith.psxmdl"), b"model").unwrap();
+        std::fs::write(bundle_dir.join("obsidian_wraith.psxt"), b"atlas").unwrap();
+        std::fs::write(bundle_dir.join("obsidian_wraith_idle.psxanim"), b"idle").unwrap();
+        std::fs::write(bundle_dir.join("obsidian_wraith_walk.psxanim"), b"walk").unwrap();
+
+        let mut project = ProjectDocument::new("test");
+        let id = project.add_resource(
+            "Obsidian Wraith",
+            ResourceData::Model(ModelResource {
+                model_path: "assets/models/obsidian_wraith/obsidian_wraith.psxmdl".to_string(),
+                texture_path: Some(
+                    "assets/models/obsidian_wraith/obsidian_wraith.psxt".to_string(),
+                ),
+                clips: vec![
+                    ModelAnimationClip {
+                        name: "idle".to_string(),
+                        psxanim_path: "assets/models/obsidian_wraith/obsidian_wraith_idle.psxanim"
+                            .to_string(),
+                    },
+                    ModelAnimationClip {
+                        name: "walk".to_string(),
+                        psxanim_path: "assets/models/obsidian_wraith/obsidian_wraith_walk.psxanim"
+                            .to_string(),
+                    },
+                ],
+                default_clip: Some(0),
+                preview_clip: Some(0),
+                world_height: 1024,
+                scale_q8: [MODEL_SCALE_ONE_Q8; 3],
+                attachments: Vec::new(),
+            }),
+        );
+
+        let report = project
+            .rename_resource_with_files(id, "Hooded Wretch", &root)
+            .unwrap();
+
+        let ResourceData::Model(model) = &project.resource(id).unwrap().data else {
+            panic!("expected model");
+        };
+        assert_eq!(
+            model.model_path,
+            "assets/models/hooded_wretch/hooded_wretch.psxmdl"
+        );
+        assert_eq!(
+            model.texture_path.as_deref(),
+            Some("assets/models/hooded_wretch/hooded_wretch.psxt")
+        );
+        assert_eq!(
+            model.clips[0].psxanim_path,
+            "assets/models/hooded_wretch/hooded_wretch_idle.psxanim"
+        );
+        assert_eq!(
+            model.clips[1].psxanim_path,
+            "assets/models/hooded_wretch/hooded_wretch_walk.psxanim"
+        );
+        assert_eq!(report.renamed_files.len(), 4);
+        assert!(!bundle_dir.exists());
+        assert!(root
+            .join("assets/models/hooded_wretch/hooded_wretch.psxmdl")
+            .exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resource_rename_refuses_existing_target_without_mutating_project() {
+        let root = unique_temp_dir("resource-rename-target-exists");
+        let texture_dir = root.join("assets").join("textures");
+        std::fs::create_dir_all(&texture_dir).unwrap();
+        std::fs::write(texture_dir.join("floor.psxt"), b"old").unwrap();
+        std::fs::write(texture_dir.join("stone_floor.psxt"), b"target").unwrap();
+
+        let mut project = ProjectDocument::new("test");
+        let id = project.add_resource(
+            "Floor",
+            ResourceData::Texture {
+                psxt_path: "assets/textures/floor.psxt".to_string(),
+            },
+        );
+
+        let error = project
+            .rename_resource_with_files(id, "Stone Floor", &root)
+            .unwrap_err();
+
+        assert!(matches!(error, ResourceRenameError::TargetExists(_)));
+        assert_eq!(project.resource_name(id), Some("Floor"));
+        let ResourceData::Texture { psxt_path } = &project.resource(id).unwrap().data else {
+            panic!("expected texture");
+        };
+        assert_eq!(psxt_path, "assets/textures/floor.psxt");
+        assert_eq!(
+            std::fs::read(texture_dir.join("floor.psxt")).unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            std::fs::read(texture_dir.join("stone_floor.psxt")).unwrap(),
+            b"target"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_resource_removes_entry_and_clears_references() {
+        let root = unique_temp_dir("resource-delete");
+        let texture_dir = root.join("assets").join("textures");
+        std::fs::create_dir_all(&texture_dir).unwrap();
+        std::fs::write(texture_dir.join("target.psxt"), b"texture").unwrap();
+
+        let mut project = ProjectDocument::new("delete-resource");
+        let target = project.add_resource(
+            "Target",
+            ResourceData::Texture {
+                psxt_path: "assets/textures/target.psxt".to_string(),
+            },
+        );
+        let material = project.add_resource(
+            "Material",
+            ResourceData::Material(MaterialResource::opaque(Some(target))),
+        );
+        let character = project.add_resource(
+            "Character",
+            ResourceData::Character(CharacterResource {
+                model: Some(target),
+                idle_clip: Some(0),
+                walk_clip: Some(1),
+                run_clip: Some(2),
+                turn_clip: Some(3),
+                ..CharacterResource::defaults()
+            }),
+        );
+        let weapon = project.add_resource(
+            "Weapon",
+            ResourceData::Weapon(WeaponResource {
+                model: Some(target),
+                ..WeaponResource::default()
+            }),
+        );
+
+        let scene = project.active_scene_mut();
+        let mut grid = WorldGrid::empty(1, 1, 1024);
+        grid.set_floor(0, 0, 0, Some(target));
+        grid.add_wall(0, 0, GridDirection::North, 0, 1024, Some(target));
+        let room = scene.add_node(scene.root, "Room", NodeKind::Room { grid });
+        scene.add_node(
+            room,
+            "Mesh",
+            NodeKind::MeshInstance {
+                mesh: Some(target),
+                material: Some(target),
+                animation_clip: None,
+            },
+        );
+        let entity = scene.add_node(room, "Entity", NodeKind::Entity);
+        scene.add_node(
+            entity,
+            "Renderer",
+            NodeKind::ModelRenderer {
+                model: Some(target),
+                material: Some(target),
+            },
+        );
+        scene.add_node(
+            entity,
+            "Controller",
+            NodeKind::CharacterController {
+                character: Some(target),
+                player: true,
+            },
+        );
+        scene.add_node(
+            entity,
+            "Equipment",
+            NodeKind::Equipment {
+                weapon: Some(target),
+                character_socket: "right_hand_grip".to_string(),
+                weapon_grip: "grip".to_string(),
+            },
+        );
+        scene.add_node(
+            room,
+            "Spawn",
+            NodeKind::SpawnPoint {
+                player: false,
+                character: Some(target),
+            },
+        );
+        scene.add_node(
+            room,
+            "Audio",
+            NodeKind::AudioSource {
+                sound: Some(target),
+                radius: 1.0,
+            },
+        );
+
+        assert_eq!(project.resource_reference_count(target), 13);
+        let report = project
+            .delete_resource_with_files(target, &root)
+            .expect("resource exists");
+        assert_eq!(report.removed.name, "Target");
+        assert_eq!(report.cleared_references, 13);
+        assert_eq!(
+            report.deleted_files,
+            vec![ResourceFileDelete {
+                path: "assets/textures/target.psxt".to_string(),
+            }]
+        );
+        assert!(report.skipped_files.is_empty());
+        assert!(!texture_dir.join("target.psxt").exists());
+        assert!(project.resource(target).is_none());
+        assert_eq!(project.resource_name(material), Some("Material"));
+
+        let ResourceData::Material(material_data) = &project.resource(material).unwrap().data
+        else {
+            panic!("expected material");
+        };
+        assert_eq!(material_data.texture, None);
+        let ResourceData::Character(character_data) = &project.resource(character).unwrap().data
+        else {
+            panic!("expected character");
+        };
+        assert_eq!(character_data.model, None);
+        assert_eq!(character_data.idle_clip, None);
+        assert_eq!(character_data.walk_clip, None);
+        assert_eq!(character_data.run_clip, None);
+        assert_eq!(character_data.turn_clip, None);
+        let ResourceData::Weapon(weapon_data) = &project.resource(weapon).unwrap().data else {
+            panic!("expected weapon");
+        };
+        assert_eq!(weapon_data.model, None);
+
+        for node in project.active_scene().nodes() {
+            match &node.kind {
+                NodeKind::Room { grid } => {
+                    let sector = grid.sector(0, 0).unwrap();
+                    assert_eq!(sector.floor.as_ref().unwrap().material, None);
+                    assert_eq!(
+                        sector
+                            .walls
+                            .get(GridDirection::North)
+                            .first()
+                            .unwrap()
+                            .material,
+                        None
+                    );
+                }
+                NodeKind::MeshInstance { mesh, material, .. } => {
+                    assert_eq!((*mesh, *material), (None, None));
+                }
+                NodeKind::ModelRenderer { model, material } => {
+                    assert_eq!((*model, *material), (None, None));
+                }
+                NodeKind::CharacterController { character, .. }
+                | NodeKind::SpawnPoint { character, .. } => {
+                    assert_eq!(*character, None);
+                }
+                NodeKind::Equipment { weapon, .. } => {
+                    assert_eq!(*weapon, None);
+                }
+                NodeKind::AudioSource { sound, .. } => {
+                    assert_eq!(*sound, None);
+                }
+                _ => {}
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn corner_surviving_split_picks_diagonal_that_keeps_a_triangle() {
         // Drop NE → only the NW-SE diagonal keeps a triangle.
@@ -2535,5 +5349,149 @@ mod tests {
         wall.drop_corner(WallCorner::TL);
         assert!(wall.is_triangle());
         assert_eq!(wall.dropped_corner, Some(WallCorner::TL));
+    }
+
+    #[test]
+    fn grid_uv_transform_rotates_quad_without_rebaking_texture() {
+        let transform = GridUvTransform {
+            offset: [0, 0],
+            span: [0, 0],
+            rotation: GridUvRotation::Deg90,
+            flip_u: false,
+            flip_v: false,
+        };
+
+        assert_eq!(
+            transform.apply_to_quad([(0, 0), (64, 0), (64, 64), (0, 64)]),
+            [(64, 0), (64, 64), (0, 64), (0, 0)]
+        );
+    }
+
+    #[test]
+    fn grid_uv_transform_flips_and_wraps_ps1_uv_offsets() {
+        let transform = GridUvTransform {
+            offset: [-8, 12],
+            span: [0, 0],
+            rotation: GridUvRotation::Deg0,
+            flip_u: true,
+            flip_v: false,
+        };
+
+        assert_eq!(
+            transform.apply_to_quad([(0, 0), (64, 0), (64, 64), (0, 64)]),
+            [(56, 12), (248, 12), (248, 76), (56, 76)]
+        );
+    }
+
+    #[test]
+    fn grid_uv_transform_scales_quad_span_without_rebaking_texture() {
+        let transform = GridUvTransform {
+            offset: [0, 0],
+            span: [0, 32],
+            rotation: GridUvRotation::Deg0,
+            flip_u: false,
+            flip_v: false,
+        };
+
+        assert_eq!(
+            transform.apply_to_quad([(0, 64), (64, 64), (64, 0), (0, 0)]),
+            [(0, 32), (64, 32), (64, 0), (0, 0)]
+        );
+    }
+
+    #[test]
+    fn wall_autotile_sets_double_height_v_span_without_changing_geometry() {
+        let mut wall = GridVerticalFace::flat(0, 1536, None);
+        let heights = wall.heights;
+
+        let clamped = wall.autotile_uv(768);
+
+        assert!(!clamped);
+        assert_eq!(wall.heights, heights);
+        assert_eq!(wall.uv.span, [0, 128]);
+    }
+
+    #[test]
+    fn wall_autotile_uses_partial_v_span_for_short_wall() {
+        let mut wall = GridVerticalFace::flat(0, 384, None);
+
+        let clamped = wall.autotile_uv(768);
+
+        assert!(!clamped);
+        assert_eq!(wall.heights, [0, 0, 384, 384]);
+        assert_eq!(wall.uv.span, [0, 32]);
+    }
+
+    #[test]
+    fn wall_autotile_clamps_one_quad_to_ps1_uv_range() {
+        let mut wall = GridVerticalFace::flat(0, 768 * 5, None);
+
+        let clamped = wall.autotile_uv(768);
+
+        assert!(clamped);
+        assert_eq!(wall.heights, [0, 0, 3840, 3840]);
+        assert_eq!(wall.uv.span, [0, 255]);
+    }
+
+    #[test]
+    fn wall_autotile_keeps_one_primitive_when_repeated_uvs_fit_packet() {
+        let mut wall = GridVerticalFace::flat(0, 1536, None);
+        wall.uv.offset[1] = -5;
+        wall.autotile_uv(768);
+
+        let segments = wall.split_into_autotile_segments(768);
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].heights, [0, 0, 1536, 1536]);
+        assert_eq!(segments[0].uv.span, [0, 128]);
+        assert_eq!(segments[0].uv.offset[1], -5);
+    }
+
+    #[test]
+    fn wall_autotile_segments_restore_clamped_tall_wall_density() {
+        let mut wall = GridVerticalFace::flat(0, 768 * 5, None);
+        wall.autotile_uv(768);
+
+        let segments = wall.split_into_autotile_segments(768);
+
+        assert_eq!(segments.len(), 5);
+        assert!(segments.iter().all(|segment| segment.uv.span == [0, 0]));
+        assert_eq!(segments[4].heights, [3072, 3072, 3840, 3840]);
+    }
+
+    #[test]
+    fn wall_split_height_segments_keeps_uvs_and_sloped_edges_connected() {
+        let mut wall = GridVerticalFace::flat(0, 1536, None);
+        wall.heights = [0, 384, 1536, 1920];
+        wall.uv.span = [12, 96];
+
+        let segments = wall.split_into_height_segments(768);
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(
+            [
+                segments[0].heights[WallCorner::BL.idx()],
+                segments[0].heights[WallCorner::BR.idx()],
+            ],
+            [0, 384]
+        );
+        assert_eq!(
+            [
+                segments[2].heights[WallCorner::TL.idx()],
+                segments[2].heights[WallCorner::TR.idx()],
+            ],
+            [1920, 1536]
+        );
+        for pair in segments.windows(2) {
+            assert_eq!(
+                pair[0].heights[WallCorner::TL.idx()],
+                pair[1].heights[WallCorner::BL.idx()]
+            );
+            assert_eq!(
+                pair[0].heights[WallCorner::TR.idx()],
+                pair[1].heights[WallCorner::BR.idx()]
+            );
+        }
+        assert!(segments.iter().all(|segment| segment.uv.span == [12, 96]));
     }
 }

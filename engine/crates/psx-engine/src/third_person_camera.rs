@@ -5,12 +5,11 @@
 //! read the cooked grid room through [`RoomCollision`]. It supplies the
 //! common action-camera pieces a game wants on top of [`WorldCamera`]:
 //! manual orbit cooldown, automatic re-alignment, camera lag, lock-on
-//! framing, and a small fan of "whisker" probes that tries to rotate
-//! around walls before falling back to pulling the camera closer.
+//! framing, and a spring-arm collision solve that shortens the boom
+//! without taking yaw control away from the player.
 
 use crate::{Angle, RoomCollision, RoomPoint, WorldCamera, WorldProjection, Q12};
 
-const WHISKER_COUNT: usize = 3;
 const RAY_STEPS_MAX: i32 = 8;
 const RAY_STEPS_MIN: i32 = 3;
 
@@ -36,20 +35,22 @@ pub struct ThirdPersonCameraConfig {
     pub target_height: i32,
     /// Extra clearance kept between the camera ray and blocking geometry.
     pub collision_margin: i32,
-    /// Angular stride between whisker rays.
-    pub whisker_stride: Angle,
+    /// Lowest manual pitch, in signed Q0.12 turn units.
+    pub pitch_min_q12: i16,
+    /// Highest manual pitch, in signed Q0.12 turn units.
+    pub pitch_max_q12: i16,
     /// Frames before auto-alignment resumes after manual camera input.
     pub manual_cooldown_frames: u8,
     /// Maximum auto-align yaw movement per frame.
     pub auto_align_step: Angle,
-    /// Maximum collision-driven yaw movement per frame.
-    pub collision_yaw_step: Angle,
     /// Position lag strength as a power-of-two divisor.
     pub position_lag_shift: u8,
     /// Focus lag strength as a power-of-two divisor.
     pub focus_lag_shift: u8,
     /// Ease-out strength when collision lets the camera extend again.
     pub distance_lag_shift: u8,
+    /// Frames to hold the shortened boom before easing out.
+    pub collision_release_delay_frames: u8,
 }
 
 impl ThirdPersonCameraConfig {
@@ -62,13 +63,14 @@ impl ThirdPersonCameraConfig {
             height,
             target_height,
             collision_margin: 160,
-            whisker_stride: Angle::from_q12(112),
+            pitch_min_q12: -192,
+            pitch_max_q12: 704,
             manual_cooldown_frames: 42,
             auto_align_step: Angle::from_q12(18),
-            collision_yaw_step: Angle::from_q12(42),
             position_lag_shift: 2,
             focus_lag_shift: 2,
             distance_lag_shift: 3,
+            collision_release_delay_frames: 4,
         }
     }
 }
@@ -78,6 +80,9 @@ impl ThirdPersonCameraConfig {
 pub struct ThirdPersonCameraInput {
     /// Signed manual yaw delta in Q0.12 angle units.
     pub yaw_delta_q12: i16,
+    /// Signed manual pitch delta in Q0.12 angle units.
+    /// Positive raises the camera above the focus point.
+    pub pitch_delta_q12: i16,
     /// When true, force the camera to begin easing back behind the player.
     pub recenter: bool,
 }
@@ -104,11 +109,14 @@ pub struct ThirdPersonCameraFrame {
     pub focus: RoomPoint,
     /// Camera orbit yaw.
     pub yaw: Angle,
+    /// Camera pitch, signed Q0.12 turn units.
+    pub pitch_q12: i16,
     /// Current camera distance after collision.
     pub distance: i32,
     /// True when the camera was shortened by collision this frame.
     pub collision_pull_in: bool,
-    /// True when a whisker ray steered the camera around a blocker.
+    /// Reserved for older debug overlays; spring-arm collision no
+    /// longer steers yaw, so this is currently always false.
     pub collision_rotated: bool,
 }
 
@@ -116,10 +124,12 @@ pub struct ThirdPersonCameraFrame {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ThirdPersonCameraState {
     yaw: Angle,
+    pitch_q12: i16,
     distance: i32,
     position: RoomPoint,
     focus: RoomPoint,
     manual_cooldown: u8,
+    collision_release_delay: u8,
     initialized: bool,
     last_pull_in: bool,
     last_rotated: bool,
@@ -130,10 +140,12 @@ impl ThirdPersonCameraState {
     pub const fn new(yaw: Angle) -> Self {
         Self {
             yaw,
+            pitch_q12: 0,
             distance: 0,
             position: RoomPoint::ZERO,
             focus: RoomPoint::ZERO,
             manual_cooldown: 0,
+            collision_release_delay: 0,
             initialized: false,
             last_pull_in: false,
             last_rotated: false,
@@ -151,14 +163,11 @@ impl ThirdPersonCameraState {
         self.distance = config
             .distance
             .clamp(config.min_distance, config.max_distance);
+        self.pitch_q12 = default_pitch_q12(config);
         self.focus = player_focus(target.player, config.target_height);
-        self.position = camera_position(
-            self.focus,
-            target.player.y.saturating_add(config.height),
-            self.distance,
-            self.yaw,
-        );
+        self.position = camera_position(self.focus, self.distance, self.yaw, self.pitch_q12);
         self.manual_cooldown = 0;
+        self.collision_release_delay = 0;
         self.initialized = true;
         self.last_pull_in = false;
         self.last_rotated = false;
@@ -179,10 +188,13 @@ impl ThirdPersonCameraState {
         }
 
         let focus_goal = camera_focus_goal(target, config);
-        let camera_y = camera_height_goal(focus_goal, target, config);
 
-        if input.yaw_delta_q12 != 0 {
+        if input.yaw_delta_q12 != 0 || input.pitch_delta_q12 != 0 {
             self.yaw = self.yaw.add_signed_q12(input.yaw_delta_q12);
+            self.pitch_q12 = self
+                .pitch_q12
+                .saturating_add(input.pitch_delta_q12)
+                .clamp(config.pitch_min_q12, config.pitch_max_q12);
             self.manual_cooldown = config.manual_cooldown_frames;
         } else if self.manual_cooldown != 0 {
             self.manual_cooldown -= 1;
@@ -199,28 +211,11 @@ impl ThirdPersonCameraState {
         self.yaw = self
             .yaw
             .approach_q12(desired_yaw, config.auto_align_step.as_q12());
-
-        let collision_solve =
-            solve_camera_collision(collision, focus_goal, camera_y, self.yaw, config);
-        let rotated_to_clear_path = collision_solve.rotated
-            && collision_solve
-                .distance
-                .saturating_add(config.collision_margin)
-                >= config.distance;
-        self.yaw = if rotated_to_clear_path {
-            collision_solve.yaw
-        } else {
-            self.yaw
-                .approach_q12(collision_solve.yaw, config.collision_yaw_step.as_q12())
-        };
-
-        if collision_solve.distance < self.distance {
-            self.distance = collision_solve.distance;
-        } else {
-            self.distance = approach_i32_shift(
-                self.distance,
-                collision_solve.distance,
-                config.distance_lag_shift,
+        if input.recenter {
+            self.pitch_q12 = approach_i16(
+                self.pitch_q12,
+                default_pitch_q12(config),
+                config.auto_align_step.as_q12() as i16,
             );
         }
 
@@ -234,8 +229,24 @@ impl ThirdPersonCameraState {
             approach_vertex_shift(self.focus, focus_goal, config.focus_lag_shift)
         };
 
-        let desired_position = camera_position(self.focus, camera_y, self.distance, self.yaw);
-        if collision_solve.pull_in || collision_solve.rotated {
+        let collision_solve =
+            solve_camera_collision(collision, self.focus, self.yaw, self.pitch_q12, config);
+
+        if collision_solve.distance < self.distance {
+            self.distance = collision_solve.distance;
+            self.collision_release_delay = config.collision_release_delay_frames;
+        } else if self.collision_release_delay != 0 {
+            self.collision_release_delay -= 1;
+        } else {
+            self.distance = approach_i32_shift(
+                self.distance,
+                collision_solve.distance,
+                config.distance_lag_shift,
+            );
+        }
+
+        let desired_position = camera_position(self.focus, self.distance, self.yaw, self.pitch_q12);
+        if collision_solve.pull_in {
             self.position = desired_position;
         } else {
             self.position =
@@ -243,11 +254,12 @@ impl ThirdPersonCameraState {
         }
 
         self.last_pull_in = collision_solve.pull_in;
-        self.last_rotated = collision_solve.rotated;
+        self.last_rotated = false;
         ThirdPersonCameraFrame {
             camera: camera_from_position_focus(projection, self.position, self.focus),
             focus: self.focus,
             yaw: self.yaw,
+            pitch_q12: self.pitch_q12,
             distance: self.distance,
             collision_pull_in: self.last_pull_in,
             collision_rotated: self.last_rotated,
@@ -257,6 +269,11 @@ impl ThirdPersonCameraState {
     /// Current orbit yaw.
     pub const fn yaw(&self) -> Angle {
         self.yaw
+    }
+
+    /// Current orbit pitch in signed Q0.12 units.
+    pub const fn pitch_q12(&self) -> i16 {
+        self.pitch_q12
     }
 
     /// Current camera position.
@@ -272,10 +289,8 @@ impl ThirdPersonCameraState {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct CollisionSolve {
-    yaw: Angle,
     distance: i32,
     pull_in: bool,
-    rotated: bool,
 }
 
 fn normalize_config(mut config: ThirdPersonCameraConfig) -> ThirdPersonCameraConfig {
@@ -285,14 +300,13 @@ fn normalize_config(mut config: ThirdPersonCameraConfig) -> ThirdPersonCameraCon
         .distance
         .clamp(config.min_distance, config.max_distance);
     config.collision_margin = config.collision_margin.max(0);
-    if config.whisker_stride == Angle::ZERO {
-        config.whisker_stride = Angle::from_q12(1);
+    if config.pitch_min_q12 > config.pitch_max_q12 {
+        let pitch = config.pitch_min_q12;
+        config.pitch_min_q12 = config.pitch_max_q12;
+        config.pitch_max_q12 = pitch;
     }
     if config.auto_align_step == Angle::ZERO {
         config.auto_align_step = Angle::from_q12(1);
-    }
-    if config.collision_yaw_step == Angle::ZERO {
-        config.collision_yaw_step = Angle::from_q12(1);
     }
     config.position_lag_shift = config.position_lag_shift.min(6);
     config.focus_lag_shift = config.focus_lag_shift.min(6);
@@ -321,22 +335,6 @@ fn camera_focus_goal(
     }
 }
 
-fn camera_height_goal(
-    focus: RoomPoint,
-    target: ThirdPersonCameraTarget,
-    config: ThirdPersonCameraConfig,
-) -> i32 {
-    if let Some(lock) = target.lock_target {
-        let span = abs_i32(lock.y.saturating_sub(target.player.y)).min(config.height);
-        focus
-            .y
-            .saturating_add(config.height)
-            .saturating_add(span / 2)
-    } else {
-        target.player.y.saturating_add(config.height)
-    }
-}
-
 fn midpoint_i32(a: i32, b: i32) -> i32 {
     a.saturating_add(b.saturating_sub(a) / 2)
 }
@@ -344,46 +342,23 @@ fn midpoint_i32(a: i32, b: i32) -> i32 {
 fn solve_camera_collision(
     collision: Option<RoomCollision<'_, '_>>,
     focus: RoomPoint,
-    camera_y: i32,
     yaw: Angle,
+    pitch_q12: i16,
     config: ThirdPersonCameraConfig,
 ) -> CollisionSolve {
     let Some(room) = collision else {
         return CollisionSolve {
-            yaw,
             distance: config.distance,
             pull_in: false,
-            rotated: false,
         };
     };
 
-    let stride = config.whisker_stride.as_q12() as i16;
-    let whiskers = [0i16, -stride, stride];
-    let mut best_yaw = yaw;
-    let mut best_distance = 0;
-    let mut center_distance = 0;
-
-    let mut i = 0;
-    while i < WHISKER_COUNT {
-        let candidate_yaw = yaw.add_signed_q12(whiskers[i]);
-        let candidate_pos = camera_position(focus, camera_y, config.distance, candidate_yaw);
-        let clear = probe_clear_distance(room, focus, candidate_pos, config.distance, config);
-        if i == 0 {
-            center_distance = clear;
-            best_distance = clear;
-        } else if clear > best_distance.saturating_add(config.collision_margin / 2) {
-            best_distance = clear;
-            best_yaw = candidate_yaw;
-        }
-        i += 1;
-    }
-
-    let distance = best_distance.clamp(config.min_distance, config.distance);
+    let desired = camera_position(focus, config.distance, yaw, pitch_q12);
+    let clear = probe_clear_distance(room, focus, desired, config.distance, config);
+    let distance = clear.clamp(config.min_distance, config.distance);
     CollisionSolve {
-        yaw: best_yaw,
         distance,
         pull_in: distance < config.distance,
-        rotated: best_yaw != yaw && best_distance > center_distance,
     }
 }
 
@@ -409,7 +384,14 @@ fn probe_clear_distance(
             nearest = ((max_distance * i) / steps).min(nearest);
             break;
         }
-        if let Some(hit) = nearest_wall_hit_around(room, sample, from, to, max_distance) {
+        if let Some(hit) = nearest_wall_hit_around(
+            room,
+            sample,
+            from,
+            to,
+            max_distance,
+            config.collision_margin,
+        ) {
             nearest = hit.min(nearest);
             break;
         }
@@ -443,6 +425,7 @@ fn nearest_wall_hit_around(
     from: RoomPoint,
     to: RoomPoint,
     ray_distance: i32,
+    vertical_margin: i32,
 ) -> Option<i32> {
     let s = room.sector_size();
     if s <= 0 || sample.x < 0 || sample.z < 0 {
@@ -471,6 +454,8 @@ fn nearest_wall_hit_around(
                                     cz,
                                     s,
                                     wall.direction(),
+                                    wall.heights(),
+                                    vertical_margin,
                                 ) {
                                     nearest = Some(match nearest {
                                         Some(prev) => prev.min(hit),
@@ -498,6 +483,8 @@ fn segment_wall_hit_distance(
     sz: i32,
     sector_size: i32,
     direction: u8,
+    heights: [i32; 4],
+    vertical_margin: i32,
 ) -> Option<i32> {
     let x0 = sx.saturating_mul(sector_size);
     let x1 = x0.saturating_add(sector_size);
@@ -520,19 +507,45 @@ fn segment_wall_hit_distance(
     }
     let t = Q12::from_raw(t_q12);
     let x_at = from.x.saturating_add(t.mul_i32(dx));
+    let y_at = from
+        .y
+        .saturating_add(t.mul_i32(to.y.saturating_sub(from.y)));
     let z_at = from.z.saturating_add(t.mul_i32(dz));
-    match direction {
+    let wall_axis_q12 = match direction {
         DIR_NORTH | DIR_SOUTH => {
             if x_at < x0 || x_at > x1 {
                 return None;
             }
+            (x_at.saturating_sub(x0))
+                .saturating_mul(Q12::SCALE)
+                .checked_div(sector_size.max(1))?
         }
         DIR_EAST | DIR_WEST => {
             if z_at < z0 || z_at > z1 {
                 return None;
             }
+            (z_at.saturating_sub(z0))
+                .saturating_mul(Q12::SCALE)
+                .checked_div(sector_size.max(1))?
         }
         _ => return None,
+    };
+    let axis = Q12::from_raw(wall_axis_q12.clamp(0, Q12::SCALE));
+    let (bottom, top) = match direction {
+        DIR_NORTH | DIR_EAST => (
+            lerp_i32(heights[0], heights[1], axis),
+            lerp_i32(heights[3], heights[2], axis),
+        ),
+        DIR_SOUTH | DIR_WEST => (
+            lerp_i32(heights[1], heights[0], axis),
+            lerp_i32(heights[2], heights[3], axis),
+        ),
+        _ => return None,
+    };
+    let min_y = bottom.min(top).saturating_sub(vertical_margin);
+    let max_y = bottom.max(top).saturating_add(vertical_margin);
+    if y_at < min_y || y_at > max_y {
+        return None;
     }
     Some(t.mul_i32(ray_distance))
 }
@@ -557,13 +570,17 @@ fn intersect_vertical_q12(from_x: i32, dx: i32, wall_x: i32) -> Option<i32> {
         .checked_div(dx)
 }
 
-fn camera_position(focus: RoomPoint, camera_y: i32, distance: i32, yaw: Angle) -> RoomPoint {
+fn camera_position(focus: RoomPoint, distance: i32, yaw: Angle, pitch_q12: i16) -> RoomPoint {
     let sin_yaw = yaw.sin();
     let cos_yaw = yaw.cos();
+    let pitch = signed_q12_angle(pitch_q12);
+    let sin_pitch = pitch.sin();
+    let cos_pitch = pitch.cos();
+    let horizontal = cos_pitch.mul_i32(distance);
     RoomPoint::new(
-        focus.x.saturating_add(sin_yaw.mul_i32(distance)),
-        camera_y,
-        focus.z.saturating_add(cos_yaw.mul_i32(distance)),
+        focus.x.saturating_add(sin_yaw.mul_i32(horizontal)),
+        focus.y.saturating_add(sin_pitch.mul_i32(distance)),
+        focus.z.saturating_add(cos_yaw.mul_i32(horizontal)),
     )
 }
 
@@ -592,6 +609,38 @@ fn camera_from_position_focus(
     }
 }
 
+fn default_pitch_q12(config: ThirdPersonCameraConfig) -> i16 {
+    pitch_from_vertical_distance(
+        config.height.saturating_sub(config.target_height),
+        config.distance,
+    )
+    .clamp(config.pitch_min_q12, config.pitch_max_q12)
+}
+
+fn pitch_from_vertical_distance(vertical: i32, horizontal: i32) -> i16 {
+    if vertical == 0 {
+        return 0;
+    }
+    let ay = abs_i32(vertical);
+    let ax = abs_i32(horizontal).max(1);
+    let base = if ay <= ax {
+        ay.saturating_mul(512) / ax
+    } else {
+        1024 - (ax.saturating_mul(512) / ay.max(1))
+    }
+    .min(1024);
+    let signed = if vertical < 0 { -base } else { base };
+    signed.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+fn signed_q12_angle(q12: i16) -> Angle {
+    Angle::from_q12(((q12 as i32) & 0x0FFF) as u16)
+}
+
+fn lerp_i32(a: i32, b: i32, t: Q12) -> i32 {
+    a.saturating_add(t.mul_i32(b.saturating_sub(a)))
+}
+
 fn yaw_to_point(from: RoomPoint, to: RoomPoint) -> Angle {
     let dx = to.x.saturating_sub(from.x);
     let dz = to.z.saturating_sub(from.z);
@@ -617,6 +666,18 @@ fn yaw_to_point(from: RoomPoint, to: RoomPoint) -> Angle {
         2048 + base
     };
     Angle::from_q12((angle & 0x0FFF) as u16)
+}
+
+fn approach_i16(current: i16, target: i16, step: i16) -> i16 {
+    let step = step.max(1);
+    let delta = target.saturating_sub(current);
+    if abs_i16(delta) <= step {
+        target
+    } else if delta > 0 {
+        current.saturating_add(step)
+    } else {
+        current.saturating_sub(step)
+    }
 }
 
 fn approach_i32_shift(current: i32, target: i32, shift: u8) -> i32 {
@@ -671,6 +732,16 @@ fn isqrt_i32(n: i32) -> i32 {
     root
 }
 
+fn abs_i16(value: i16) -> i16 {
+    if value == i16::MIN {
+        i16::MAX
+    } else if value < 0 {
+        -value
+    } else {
+        value
+    }
+}
+
 fn abs_i32(value: i32) -> i32 {
     if value == i32::MIN {
         i32::MAX
@@ -714,12 +785,25 @@ mod tests {
     fn segment_wall_hit_finds_cardinal_crossing() {
         let from = RoomPoint::new(512, 0, 512);
         let to = RoomPoint::new(1536, 0, 512);
+        let heights = [-512, -512, 512, 512];
         assert_eq!(
-            segment_wall_hit_distance(from, to, 1024, 0, 0, 1024, DIR_EAST),
+            segment_wall_hit_distance(from, to, 1024, 0, 0, 1024, DIR_EAST, heights, 0),
             Some(512)
         );
         assert_eq!(
-            segment_wall_hit_distance(from, to, 1024, 0, 0, 1024, DIR_NORTH),
+            segment_wall_hit_distance(from, to, 1024, 0, 0, 1024, DIR_NORTH, heights, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn segment_wall_hit_ignores_camera_ray_above_wall() {
+        let from = RoomPoint::new(512, 900, 512);
+        let to = RoomPoint::new(1536, 900, 512);
+        let heights = [0, 0, 512, 512];
+
+        assert_eq!(
+            segment_wall_hit_distance(from, to, 1024, 0, 0, 1024, DIR_EAST, heights, 0),
             None
         );
     }
@@ -740,11 +824,13 @@ mod tests {
             target,
             ThirdPersonCameraInput {
                 yaw_delta_q12: 128,
+                pitch_delta_q12: 0,
                 recenter: false,
             },
             config,
         );
         assert_eq!(frame.yaw, Angle::HALF.add_signed_q12(128));
+        assert_eq!(frame.pitch_q12, default_pitch_q12(config));
         let frame = camera.update(
             WorldProjection::new(160, 120, 320, 64),
             None,
@@ -769,6 +855,35 @@ mod tests {
         camera.snap_to_player(target, config);
 
         assert_eq!(camera.focus.y, target.player.y + config.target_height);
-        assert_eq!(camera.position.y, target.player.y + config.height);
+        assert!(camera.position.y > camera.focus.y);
+        assert_eq!(camera.pitch_q12, default_pitch_q12(config));
+    }
+
+    #[test]
+    fn manual_pitch_input_clamps_to_config_limits() {
+        let mut camera = ThirdPersonCameraState::new(Angle::HALF);
+        let mut config = ThirdPersonCameraConfig::character(1400, 700, 0);
+        config.pitch_min_q12 = -64;
+        config.pitch_max_q12 = 96;
+        let target = ThirdPersonCameraTarget {
+            player: RoomPoint::ZERO,
+            player_yaw: Angle::ZERO,
+            moving: false,
+            lock_target: None,
+        };
+
+        let frame = camera.update(
+            WorldProjection::new(160, 120, 320, 64),
+            None,
+            target,
+            ThirdPersonCameraInput {
+                yaw_delta_q12: 0,
+                pitch_delta_q12: 512,
+                recenter: false,
+            },
+            config,
+        );
+
+        assert_eq!(frame.pitch_q12, 96);
     }
 }

@@ -29,22 +29,33 @@
 
 extern crate psx_rt;
 
-use psx_asset::{Animation, Model, Texture, World as AssetWorld};
+use psx_asset::{Animation, Model, Texture};
+#[cfg(not(feature = "world-grid-visible"))]
+use psx_engine::draw_room_lit;
 use psx_engine::{
-    button, draw_room_lit, Angle, App, CharacterMotorAnim, CharacterMotorConfig,
-    CharacterMotorInput, CharacterMotorState, Config, Ctx, CullMode, DepthBand, DepthPolicy,
-    DepthRange, JointViewTransform, Mat3I16, MaterialTint, OtDepth, OtFrame, PointLightSample,
-    PrimitiveArena, ProjectedVertex, Rgb8, RoomPoint, RuntimeRoom, Scene, ThirdPersonCameraConfig,
+    button, compute_joint_world_transform, telemetry, Angle, App, CharacterMotorAnim,
+    CharacterMotorConfig, CharacterMotorInput, CharacterMotorState, Config, Ctx, CullMode,
+    DepthBand, DepthPolicy, DepthRange, JointViewTransform, JointWorldTransform, LocalToWorldScale,
+    Mat3I16, MaterialTint, OtFrame, PointLightSample, PrimitiveArena, ProjectedVertex, Rgb8,
+    RoomPoint, RuntimeRoom, Scene, TexturedModelRenderStats, ThirdPersonCameraConfig,
     ThirdPersonCameraInput, ThirdPersonCameraState, ThirdPersonCameraTarget, WorldCamera,
     WorldProjection, WorldRenderMaterial, WorldRenderPass, WorldSurfaceLighting,
     WorldSurfaceOptions, WorldSurfaceSample, WorldTriCommand, WorldVertex, Q8,
 };
+#[cfg(feature = "world-grid-visible")]
+use psx_engine::{draw_room_lit_grid_visible, GridVisibility};
 use psx_font::{fonts::BASIC, FontAtlas};
-use psx_gpu::{draw_quad_flat, material::TextureMaterial, ot::OrderingTable, prim::TriTextured};
+use psx_gpu::{
+    draw_quad_flat,
+    material::{TextureMaterial, TextureWindow},
+    ot::OrderingTable,
+    prim::TriTextured,
+};
 use psx_level::{
-    find_asset_of_kind, AssetId, AssetKind, EntityRecord, LevelCharacterRecord,
-    LevelMaterialRecord, LevelMaterialSidedness, LevelModelRecord, LevelRoomRecord, ModelClipIndex,
-    ModelClipTableIndex, ModelIndex, OptionalModelClipIndex, ResidencyManager, RoomIndex,
+    equipment_flags, find_asset_of_kind, room_flags, AssetId, AssetKind, EntityRecord,
+    LevelCharacterRecord, LevelMaterialRecord, LevelMaterialSidedness, LevelModelRecord,
+    LevelModelSocketRecord, LevelRoomRecord, ModelClipIndex, ModelClipTableIndex, ModelIndex,
+    ModelSocketIndex, OptionalModelClipIndex, ResidencyManager, RoomIndex, WeaponHitShapeRecord,
 };
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
@@ -64,18 +75,19 @@ mod generated {
 }
 
 use generated::{
-    ASSETS, CHARACTERS, ENTITIES, LIGHTS, MATERIALS, MODELS, MODEL_CLIPS, MODEL_INSTANCES,
-    PLAYER_CONTROLLER, PLAYER_SPAWN, ROOMS, ROOM_RESIDENCY,
+    ASSETS, CHARACTERS, ENTITIES, EQUIPMENT, LIGHTS, MATERIALS, MODELS, MODEL_CLIPS,
+    MODEL_INSTANCES, MODEL_SOCKETS, PLAYER_CONTROLLER, PLAYER_SPAWN, ROOMS, ROOM_RESIDENCY,
+    WEAPONS, WEAPON_HITBOXES,
 };
 
 // VRAM layout. Room materials and model atlases live in
 // disjoint regions so a model atlas upload never overwrites a
 // room texture (and vice versa).
 //
-// Room materials: 4bpp pages starting at (640, 0), one tpage per
-// material. `draw_room` v1 UVs always start at (0,0), so packing
-// multiple 64x64 textures side-by-side inside one tpage would make
-// every material sample the first texture with a different CLUT.
+// Room materials: 4bpp pages starting at (640, 0), packed as 64x64
+// tiles inside each tpage. Each material carries GP0(E2)
+// texture-window state so authored UV repetition samples only its tile
+// instead of requiring physically repeated texels.
 //
 // Model atlases: 8bpp tpage at (384, 256); stripe atlases
 // left-to-right (each atlas occupies its own halfword stride);
@@ -85,6 +97,11 @@ const SHARED_TPAGE: Tpage = Tpage::new(640, 0, TexDepth::Bit4);
 const TPAGE_WORD: u16 = SHARED_TPAGE.uv_tpage_word(0);
 const ROOM_TPAGE_STRIDE_HW: u16 = 64;
 const ROOM_TPAGE_LIMIT_X: u16 = 1024;
+const ROOM_TILE_TEXELS: u16 = 64;
+const ROOM_TILE_HALFWORDS: u16 = ROOM_TILE_TEXELS / 4;
+const ROOM_TILE_ROWS: u16 = 4;
+const ROOM_TILE_COLUMNS: u16 = 4;
+const ROOM_TILES_PER_PAGE: u16 = ROOM_TILE_ROWS * ROOM_TILE_COLUMNS;
 /// CLUT strip used by room material textures. Keep it outside the
 /// 320-pixel-wide double-buffered framebuffer (`x=0..319`,
 /// `y=0..479`) so frame clears cannot overwrite palettes.
@@ -122,10 +139,8 @@ const CAMERA_YAW_STEP: Angle = Angle::from_q12(12);
 const MOVE_STICK_DEADZONE: i16 = 18;
 const STICK_MAX: i16 = 127;
 const CAMERA_STICK_DEADZONE: i16 = 18;
-const CAMERA_STICK_YAW_STEP: i16 = 42;
-const CAMERA_HEIGHT_STICK_STEP: i32 = 18;
-const CAMERA_HEIGHT_OFFSET_MIN: i32 = -512;
-const CAMERA_HEIGHT_OFFSET_MAX: i32 = 768;
+const CAMERA_STICK_YAW_STEP: i16 = 64;
+const CAMERA_STICK_PITCH_STEP: i16 = 48;
 const CAMERA_SOFT_LOCK_BREAK_STICK: i16 = 72;
 const LOCK_RANGE: i32 = 4096;
 const LOCK_BREAK_RANGE: i32 = 5120;
@@ -146,9 +161,21 @@ const FALLBACK_PLAYER_YAW_STEP: Angle = Angle::from_q12(32);
 const FALLBACK_PLAYER_SPEED: i32 = 32;
 const RUN_BUTTON: u16 = button::CIRCLE;
 
+#[cfg(feature = "ot-2048")]
+const OT_DEPTH: usize = 2048;
+#[cfg(all(not(feature = "ot-2048"), feature = "ot-1024"))]
+const OT_DEPTH: usize = 1024;
+#[cfg(all(not(feature = "ot-2048"), not(feature = "ot-1024")))]
 const OT_DEPTH: usize = 512;
-const WORLD_BAND: DepthBand = OtDepth::<OT_DEPTH>::whole_band();
+/// Keep dynamic actors in the nearest ordering-table band so large
+/// split room quads cannot overpaint characters in the no-Z-buffer
+/// runtime. Room geometry starts after this reserved band.
+const ACTOR_BAND_BACK: usize = 63;
+const ROOM_BAND: DepthBand = DepthBand::new(ACTOR_BAND_BACK + 1, OT_DEPTH - 1);
+const ACTOR_BAND: DepthBand = DepthBand::new(0, ACTOR_BAND_BACK);
 const WORLD_DEPTH_RANGE: DepthRange = DepthRange::new(NEAR_Z, FAR_Z);
+#[cfg(feature = "world-grid-visible")]
+const ROOM_GRID_VISIBILITY_RADIUS: u16 = 4;
 
 const MAX_TEXTURED_TRIS: usize = 4096;
 
@@ -158,6 +185,10 @@ const MAX_TEXTURED_TRIS: usize = 4096;
 /// the runtime fails graceful (skips the over-cap material) and
 /// the cook report should also flag.
 const MAX_ROOM_MATERIALS: usize = 32;
+/// Current generated chunk plus the eight chunks touching it.
+/// Later visibility/portal logic can shrink this set; the first
+/// streaming pass keeps the active window deliberately simple.
+const MAX_ACTIVE_ROOMS: usize = 9;
 
 /// Capacity of the residency manager's RAM table. Holds room
 /// world + model meshes + animation clips.
@@ -175,6 +206,8 @@ const MODEL_VERTEX_CAP: usize = 1024;
 const JOINT_CAP: usize = 32;
 /// Cap on placed model instances rendered per frame.
 const MAX_MODEL_INSTANCES: usize = 16;
+/// Cap on attached weapon/equipment visuals rendered per frame.
+const MAX_EQUIPMENT_DRAWS: usize = 8;
 /// Runtime model cache capacity. The current playtest package only
 /// needs one player model, but this keeps a little headroom for
 /// lightweight NPC experiments without introducing heap allocation.
@@ -214,14 +247,15 @@ static mut RESIDENCY: ResidencyManager<MAX_RESIDENT_RAM_ASSETS, MAX_RESIDENT_VRA
     ResidencyManager::new();
 
 /// Per-asset upload bookkeeping. When a texture asset becomes
-/// VRAM-resident we record its CLUT word and tpage half-x stride
-/// so the per-frame material build can reconstruct its
+/// VRAM-resident we record its CLUT word, tpage word, and texture
+/// window so the per-frame material build can reconstruct its
 /// `TextureMaterial` without re-walking the upload code.
 #[derive(Copy, Clone)]
 struct VramSlot {
     asset: AssetId,
     clut_word: u16,
     tpage_word: u16,
+    texture_window: TextureWindow,
 }
 
 const VRAM_SLOT_EMPTY: Option<VramSlot> = None;
@@ -331,7 +365,10 @@ struct RuntimeModelAsset {
     clip_first: ModelClipTableIndex,
     clip_count: u16,
     default_clip: ModelClipIndex,
+    socket_first: ModelSocketIndex,
+    socket_count: u16,
     world_height: u16,
+    local_to_world: LocalToWorldScale,
 }
 
 impl RuntimeModelAsset {
@@ -351,7 +388,10 @@ impl RuntimeModelAsset {
             clip_first: record.clip_first,
             clip_count: record.clip_count,
             default_clip: record.default_clip,
+            socket_first: record.socket_first,
+            socket_count: record.socket_count,
             world_height: record.world_height,
+            local_to_world: LocalToWorldScale::from_q12(model.local_to_world_q12()),
         })
     }
 
@@ -368,11 +408,26 @@ impl RuntimeModelAsset {
     }
 }
 
+#[derive(Copy, Clone)]
+struct ActiveRuntimeRoom {
+    index: RoomIndex,
+    room: RuntimeRoom<'static>,
+    materials: [Option<WorldRenderMaterial>; MAX_ROOM_MATERIALS],
+    material_count: usize,
+    /// Offset from the current chunk's origin to this chunk's
+    /// origin, in engine units.
+    offset_x: i32,
+    offset_z: i32,
+}
+
 struct Playtest {
     /// Active room. `None` until `init` runs and only `Some`
     /// when the manifest had at least one room and its bytes
     /// parsed.
     room: Option<RuntimeRoom<'static>>,
+    /// Current generated chunk plus immediately touching chunks,
+    /// all expressed relative to `room_index`.
+    active_rooms: [Option<ActiveRuntimeRoom>; MAX_ACTIVE_ROOMS],
     /// Index in ROOMS the player is currently in. Used to scope
     /// model-instance + light queries.
     room_index: RoomIndex,
@@ -404,9 +459,6 @@ struct Playtest {
     /// Runtime third-person camera rig. Updated from render so it
     /// can consume the same room collision view used for drawing.
     camera: ThirdPersonCameraState,
-    /// Manual right-stick vertical offset layered on top of the
-    /// authored camera height.
-    camera_height_offset: i32,
     /// Index into `ENTITIES` for the current lock-on target. In this
     /// vertical-slice pass generic entity markers stand in for
     /// enemies until enemy records exist.
@@ -429,6 +481,7 @@ impl Playtest {
     const fn new() -> Self {
         Self {
             room: None,
+            active_rooms: [const { None }; MAX_ACTIVE_ROOMS],
             room_index: RoomIndex::ZERO,
             materials: [const { None }; MAX_ROOM_MATERIALS],
             material_count: 0,
@@ -440,7 +493,6 @@ impl Playtest {
             orbit_yaw: CAMERA_START_YAW,
             orbit_radius: CAMERA_START_RADIUS,
             camera: ThirdPersonCameraState::new(CAMERA_START_YAW),
-            camera_height_offset: 0,
             lock_target: None,
             soft_lock_target: None,
             soft_lock_suppressed: false,
@@ -457,40 +509,14 @@ impl Scene for Playtest {
         self.font = Some(FontAtlas::upload(&BASIC, FONT_TPAGE, FONT_CLUT));
 
         // Empty manifest? Boot to a clear-coloured screen.
-        let Some(room_record) = ROOMS.first() else {
+        if ROOMS.is_empty() {
             return;
         };
 
-        // Walk the residency contract for this room. Required
-        // RAM assets are logical-only (every asset is
-        // include_bytes!-resident from process start), but we
-        // still tick them through the manager so the change-set
-        // counts are honest. Required VRAM assets we'll need
-        // textures for -- actual uploads happen below.
-        let residency_record = ROOM_RESIDENCY
-            .iter()
-            .find(|r| r.room == RoomIndex::ZERO)
-            .expect("starter room has a residency record");
-        let _ = unsafe { RESIDENCY.ensure_room_resident(residency_record) };
-
-        // Resolve and parse the room's world bytes.
-        let world_asset = find_asset_of_kind(ASSETS, room_record.world_asset, AssetKind::RoomWorld);
-        if let Some(asset) = world_asset {
-            if let Ok(world) = AssetWorld::from_bytes(asset.bytes) {
-                self.room = Some(RuntimeRoom::from_world(world));
-            }
-        }
-
-        // Build the material table by walking this room's slice
-        // of MATERIALS. For each entry: ensure VRAM-resident
-        // (uploading on first sight), then build the
-        // TextureMaterial referencing the slot's CLUT/tpage.
-        self.material_count = build_room_materials(room_record, &mut self.materials);
-        self.load_runtime_models();
-
         // Player init: prefer PLAYER_CONTROLLER (cook output)
         // for spawn + character; fall back to the bare
-        // PLAYER_SPAWN for placeholder manifests.
+        // PLAYER_SPAWN for placeholder manifests. The spawn room
+        // may be a generated chunk rather than room zero.
         let (spawn, character) = match PLAYER_CONTROLLER {
             Some(pc) => {
                 let character = CHARACTERS
@@ -500,11 +526,16 @@ impl Scene for Playtest {
             }
             None => (PLAYER_SPAWN, None),
         };
+        if ROOMS.get(spawn.room.to_usize()).is_none() {
+            return;
+        };
+        self.load_runtime_models();
         self.spawn = RoomPoint::new(spawn.x, spawn.y, spawn.z);
         self.character = character;
         self.motor
             .snap_to(self.spawn, Angle::from_q12(spawn.yaw as u16));
         self.room_index = spawn.room;
+        self.load_active_room_window();
         self.anim_state = PlayerAnim::Idle;
         self.anim_start_tick = 0;
         self.camera
@@ -512,6 +543,14 @@ impl Scene for Playtest {
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
+        if ctx.just_pressed(button::R3) {
+            self.lock_target = match self.lock_target {
+                Some(_) => None,
+                None => self.find_best_lock_target(LOCK_RANGE),
+            };
+            self.soft_lock_target = None;
+        }
+
         if !ctx.pad.is_analog() {
             return;
         }
@@ -521,9 +560,11 @@ impl Scene for Playtest {
         }
         if self.free_orbit {
             let (right_x, right_y) = ctx.pad.sticks.right_centered();
-            self.orbit_yaw = self
-                .orbit_yaw
-                .add_signed_q12(stick_to_yaw_delta(psx_engine::InputAxis::new(right_x)));
+            self.orbit_yaw =
+                self.orbit_yaw
+                    .add_signed_q12(stick_to_yaw_delta(psx_engine::InputAxis::new(
+                        right_x.saturating_neg(),
+                    )));
             self.orbit_radius = (self.orbit_radius
                 + stick_to_radius_delta(psx_engine::InputAxis::new(right_y)))
             .clamp(CAMERA_RADIUS_MIN, CAMERA_RADIUS_MAX);
@@ -542,12 +583,15 @@ impl Scene for Playtest {
             return;
         }
 
-        self.update_camera_height_offset(ctx);
-
         let input = motor_input(ctx, self.camera.yaw());
         let config = self.motor_config();
-        let collision = self.room.as_ref().map(|room| room.collision());
+        let collision = if self.chunked_level() {
+            None
+        } else {
+            self.room.as_ref().map(|room| room.collision())
+        };
         let motor_frame = self.motor.update(collision, input, config);
+        self.update_current_room_from_player();
 
         // Animation state comes from the reusable motor, but the
         // playtest intentionally exposes only the core locomotion
@@ -558,13 +602,6 @@ impl Scene for Playtest {
             self.anim_start_tick = ctx.time.elapsed_vblanks();
         }
 
-        if ctx.just_pressed(button::R3) {
-            self.lock_target = match self.lock_target {
-                Some(_) => None,
-                None => self.find_best_lock_target(LOCK_RANGE),
-            };
-            self.soft_lock_target = None;
-        }
         if self.lock_target.is_some() {
             if !self.lock_target_valid(LOCK_BREAK_RANGE) {
                 self.lock_target = None;
@@ -590,6 +627,7 @@ impl Scene for Playtest {
             return;
         }
 
+        telemetry::stage_begin(telemetry::stage::CAMERA);
         let camera = if self.free_orbit {
             WorldCamera::orbit_yaw(
                 PROJECTION,
@@ -601,6 +639,7 @@ impl Scene for Playtest {
         } else {
             self.update_follow_camera(ctx)
         };
+        telemetry::stage_end(telemetry::stage::CAMERA);
 
         let mut ot = unsafe { OtFrame::begin(&mut OT) };
         let mut triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_TRIS) };
@@ -608,65 +647,140 @@ impl Scene for Playtest {
         // player in the same playable space. Coarse bucket ordering is
         // faster, but it produces visible doorway/wall artifacts when
         // character triangles land in the same OT slot as room faces.
-        let mut world =
-            unsafe { WorldRenderPass::new_deferred_sorted(&mut ot, &mut WORLD_COMMANDS) };
+        let mut world = unsafe { begin_world_render_pass(&mut ot, &mut WORLD_COMMANDS) };
 
-        if let Some(room) = self.room {
-            // Pack the materials slice down to a contiguous
-            // `&[WorldRenderMaterial]` indexed by local_slot. Slots
-            // that didn't resolve become a sentinel material --
-            // visually obvious without crashing the renderer.
-            let mut bound: [WorldRenderMaterial; MAX_ROOM_MATERIALS] = [WorldRenderMaterial::both(
-                TextureMaterial::opaque(0, TPAGE_WORD, (0x80, 0x80, 0x80)),
-            );
-                MAX_ROOM_MATERIALS];
-            for i in 0..self.material_count {
-                if let Some(m) = self.materials[i] {
-                    bound[i] = m;
+        if self.room.is_some() {
+            let room_options = WorldSurfaceOptions::new(ROOM_BAND, WORLD_DEPTH_RANGE);
+            let actor_options = WorldSurfaceOptions::new(ACTOR_BAND, WORLD_DEPTH_RANGE);
+            let mut total_instance_stats = ModelInstanceDrawStats::default();
+
+            for active in self.active_rooms.iter().flatten().copied() {
+                // Pack this chunk's material slice down to a
+                // contiguous `&[WorldRenderMaterial]` indexed by
+                // local_slot. Slots that didn't resolve become a
+                // sentinel material -- visually obvious without
+                // crashing the renderer.
+                let mut bound: [WorldRenderMaterial; MAX_ROOM_MATERIALS] =
+                    [WorldRenderMaterial::both(TextureMaterial::opaque(
+                        0,
+                        TPAGE_WORD,
+                        (0x80, 0x80, 0x80),
+                    )); MAX_ROOM_MATERIALS];
+                for i in 0..active.material_count {
+                    if let Some(m) = active.materials[i] {
+                        bound[i] = m;
+                    }
                 }
+                let materials = &bound[..active.material_count];
+                let Some(room_record) = ROOMS.get(active.index.to_usize()) else {
+                    continue;
+                };
+                let room_camera = camera_for_room(camera, active);
+                let lighting = RuntimeRoomLighting {
+                    room_index: active.index,
+                    ambient: Rgb8::from_array(active.room.render().ambient_color()),
+                    camera: room_camera,
+                    fog_enabled: room_record.flags & room_flags::FOG_ENABLED != 0,
+                    fog_rgb: Rgb8::from_array(room_record.fog_rgb),
+                    fog_near: room_record.fog_near,
+                    fog_far: room_record.fog_far,
+                };
+                telemetry::stage_begin(telemetry::stage::ROOM);
+                #[cfg(feature = "world-grid-visible")]
+                {
+                    let player = self.motor.position();
+                    let visibility_anchor = RoomPoint::new(
+                        player.x.saturating_sub(active.offset_x),
+                        player.y,
+                        player.z.saturating_sub(active.offset_z),
+                    );
+                    let stats = draw_room_lit_grid_visible(
+                        active.room.render(),
+                        materials,
+                        &lighting,
+                        &room_camera,
+                        room_options,
+                        GridVisibility::around(visibility_anchor, ROOM_GRID_VISIBILITY_RADIUS),
+                        &mut triangles,
+                        &mut world,
+                    );
+                    telemetry::counter(
+                        telemetry::counter::ROOM_CELLS_CONSIDERED,
+                        stats.cells_considered as u32,
+                    );
+                    telemetry::counter(
+                        telemetry::counter::ROOM_CELLS_DRAWN,
+                        stats.cells_drawn as u32,
+                    );
+                    telemetry::counter(
+                        telemetry::counter::ROOM_CELLS_CULLED,
+                        stats.cells_frustum_culled as u32,
+                    );
+                    telemetry::counter(
+                        telemetry::counter::ROOM_SURFACES_CONSIDERED,
+                        stats.surfaces_considered as u32,
+                    );
+                }
+                #[cfg(not(feature = "world-grid-visible"))]
+                {
+                    draw_room_lit(
+                        active.room.render(),
+                        materials,
+                        &lighting,
+                        &room_camera,
+                        room_options,
+                        &mut triangles,
+                        &mut world,
+                    );
+                }
+                telemetry::stage_end(telemetry::stage::ROOM);
+                telemetry::stage_begin(telemetry::stage::ENTITY_MARKERS);
+                draw_entity_markers(
+                    ENTITIES,
+                    active.index,
+                    materials,
+                    &room_camera,
+                    room_options,
+                    &mut triangles,
+                    &mut world,
+                );
+                telemetry::stage_end(telemetry::stage::ENTITY_MARKERS);
+                telemetry::stage_begin(telemetry::stage::MODEL_INSTANCES);
+                let instance_stats = draw_model_instances(
+                    active.index,
+                    ctx.time.elapsed_vblanks(),
+                    ctx.time.video_hz(),
+                    &room_camera,
+                    room_options,
+                    &self.models,
+                    &self.clips,
+                    &mut triangles,
+                    &mut world,
+                );
+                telemetry::stage_end(telemetry::stage::MODEL_INSTANCES);
+                total_instance_stats.draws = total_instance_stats
+                    .draws
+                    .saturating_add(instance_stats.draws);
+                accumulate_model_stats(&mut total_instance_stats.stats, instance_stats.stats);
             }
-            let materials = &bound[..self.material_count];
-            let options = WorldSurfaceOptions::new(WORLD_BAND, WORLD_DEPTH_RANGE);
-            let lighting = RuntimeRoomLighting {
-                room_index: self.room_index,
-                ambient: Rgb8::from_array(room.render().ambient_color()),
-            };
-            draw_room_lit(
-                room.render(),
-                materials,
-                &lighting,
-                &camera,
-                options,
-                &mut triangles,
-                &mut world,
+
+            telemetry::counter(
+                telemetry::counter::MODEL_INSTANCE_DRAWS,
+                total_instance_stats.draws as u32,
             );
-            draw_entity_markers(
-                ENTITIES,
-                self.room_index,
-                materials,
-                &camera,
-                options,
-                &mut triangles,
-                &mut world,
-            );
-            // Currently just room 0; future passes wire room
-            // switching to a level-graph traversal.
-            draw_model_instances(
-                self.room_index,
-                ctx.time.elapsed_vblanks(),
-                ctx.time.video_hz(),
-                &camera,
-                options,
-                &self.models,
-                &self.clips,
-                &mut triangles,
-                &mut world,
+            emit_model_counters(
+                total_instance_stats.stats,
+                telemetry::counter::MODEL_INSTANCE_PROJECTED_VERTICES,
+                telemetry::counter::MODEL_INSTANCE_SUBMITTED_TRIS,
+                telemetry::counter::MODEL_INSTANCE_CULLED_TRIS,
+                telemetry::counter::MODEL_INSTANCE_DROPPED_TRIS,
             );
             // Player draws through the same compact model path as
             // placed model instances.
             if let Some(character) = self.character {
                 let player = self.motor.position();
-                draw_player(
+                telemetry::stage_begin(telemetry::stage::PLAYER);
+                let player_stats = draw_player(
                     character,
                     &self.models,
                     &self.clips,
@@ -679,15 +793,114 @@ impl Scene for Playtest {
                     ctx.time.elapsed_vblanks(),
                     ctx.time.video_hz(),
                     &camera,
-                    options,
+                    actor_options,
                     &mut triangles,
                     &mut world,
+                );
+                telemetry::stage_end(telemetry::stage::PLAYER);
+                emit_model_counters(
+                    player_stats,
+                    telemetry::counter::PLAYER_PROJECTED_VERTICES,
+                    telemetry::counter::PLAYER_SUBMITTED_TRIS,
+                    telemetry::counter::PLAYER_CULLED_TRIS,
+                    telemetry::counter::PLAYER_DROPPED_TRIS,
+                );
+                telemetry::stage_begin(telemetry::stage::EQUIPMENT);
+                let equipment_stats = draw_player_equipment(
+                    self.room_index,
+                    character,
+                    &self.models,
+                    &self.clips,
+                    player.x,
+                    player.y,
+                    player.z,
+                    self.motor.yaw(),
+                    character.clip_for(self.anim_state),
+                    self.anim_start_tick,
+                    ctx.time.elapsed_vblanks(),
+                    ctx.time.video_hz(),
+                    &camera,
+                    actor_options,
+                    &mut triangles,
+                    &mut world,
+                );
+                telemetry::stage_end(telemetry::stage::EQUIPMENT);
+                telemetry::counter(
+                    telemetry::counter::EQUIPMENT_DRAWS,
+                    equipment_stats.draws as u32,
+                );
+                telemetry::counter(
+                    telemetry::counter::EQUIPMENT_ACTIVE_HITBOXES,
+                    equipment_stats.active_hitboxes as u32,
+                );
+                telemetry::counter(
+                    telemetry::counter::EQUIPMENT_TARGET_HITS,
+                    equipment_stats.target_hits as u32,
+                );
+                emit_model_counters(
+                    equipment_stats.stats,
+                    telemetry::counter::EQUIPMENT_PROJECTED_VERTICES,
+                    telemetry::counter::EQUIPMENT_SUBMITTED_TRIS,
+                    telemetry::counter::EQUIPMENT_CULLED_TRIS,
+                    telemetry::counter::EQUIPMENT_DROPPED_TRIS,
                 );
             }
         }
 
+        telemetry::counter(telemetry::counter::TRI_PRIMITIVES, triangles.len() as u32);
+        telemetry::counter(
+            telemetry::counter::WORLD_COMMANDS,
+            world.command_len() as u32,
+        );
+        telemetry::stage_begin(telemetry::stage::WORLD_FLUSH);
         world.flush();
+        telemetry::stage_end(telemetry::stage::WORLD_FLUSH);
+        telemetry::stage_begin(telemetry::stage::OT_SUBMIT);
         ot.submit();
+        telemetry::stage_end(telemetry::stage::OT_SUBMIT);
+    }
+}
+
+#[cfg(all(
+    feature = "world-order-global",
+    any(
+        feature = "world-order-slot",
+        feature = "world-order-linked",
+        feature = "world-order-bucketed"
+    )
+))]
+compile_error!("choose only one world-order-* feature");
+#[cfg(all(
+    feature = "world-order-slot",
+    any(feature = "world-order-linked", feature = "world-order-bucketed")
+))]
+compile_error!("choose only one world-order-* feature");
+#[cfg(all(feature = "world-order-linked", feature = "world-order-bucketed"))]
+compile_error!("choose only one world-order-* feature");
+
+fn begin_world_render_pass<'a, 'ot>(
+    ot: &'a mut OtFrame<'ot, OT_DEPTH>,
+    commands: &'a mut [WorldTriCommand],
+) -> WorldRenderPass<'a, 'ot, OT_DEPTH> {
+    #[cfg(feature = "world-order-slot")]
+    {
+        return WorldRenderPass::new_deferred_slot_sorted(ot, commands);
+    }
+    #[cfg(feature = "world-order-linked")]
+    {
+        return WorldRenderPass::new(ot, commands);
+    }
+    #[cfg(feature = "world-order-bucketed")]
+    {
+        return WorldRenderPass::new_bucketed(ot, commands);
+    }
+    #[cfg(not(any(
+        feature = "world-order-slot",
+        feature = "world-order-linked",
+        feature = "world-order-bucketed"
+    )))]
+    {
+        WorldRenderPass::new_deferred_sorted(ot, commands)
     }
 }
 
@@ -749,10 +962,7 @@ impl Playtest {
                 FOLLOW_TARGET_HEIGHT_DEFAULT,
             ),
         };
-        config.height = config
-            .height
-            .saturating_add(self.camera_height_offset)
-            .max(256);
+        config.height = config.height.max(256);
         config
     }
 
@@ -776,7 +986,7 @@ impl Playtest {
             .or_else(|| self.soft_lock_target_position());
         let target = self.camera_target(lock_target, self.anim_state != PlayerAnim::Idle);
         let config = self.camera_config();
-        let collision = if CAMERA_COLLISION_ENABLED {
+        let collision = if CAMERA_COLLISION_ENABLED && !self.chunked_level() {
             self.room.as_ref().map(|room| room.collision())
         } else {
             None
@@ -786,12 +996,71 @@ impl Playtest {
             .camera
     }
 
-    fn update_camera_height_offset(&mut self, ctx: &Ctx) {
-        let (_, right_y) = ctx.pad.sticks.right_centered();
-        self.camera_height_offset = self
-            .camera_height_offset
-            .saturating_add(stick_to_height_delta(psx_engine::InputAxis::new(right_y)))
-            .clamp(CAMERA_HEIGHT_OFFSET_MIN, CAMERA_HEIGHT_OFFSET_MAX);
+    fn chunked_level(&self) -> bool {
+        self.active_rooms
+            .iter()
+            .flatten()
+            .any(|room| room.index != self.room_index)
+    }
+
+    fn load_active_room_window(&mut self) {
+        self.room = None;
+        self.materials = [const { None }; MAX_ROOM_MATERIALS];
+        self.material_count = 0;
+        self.active_rooms = [const { None }; MAX_ACTIVE_ROOMS];
+
+        let current_index = self.room_index;
+        let Some(current_record) = ROOMS.get(current_index.to_usize()) else {
+            return;
+        };
+        let Some(current_room) = parse_runtime_room(current_record) else {
+            return;
+        };
+
+        let mut next_slot = 0usize;
+        if let Some(active) = build_active_room(current_index, current_record, current_record) {
+            self.room = Some(active.room);
+            self.materials = active.materials;
+            self.material_count = active.material_count;
+            self.active_rooms[next_slot] = Some(active);
+            next_slot += 1;
+        }
+
+        for (raw_index, record) in ROOMS.iter().enumerate() {
+            if raw_index == current_index.to_usize() || next_slot >= MAX_ACTIVE_ROOMS {
+                continue;
+            }
+            let Some(room) = parse_runtime_room(record) else {
+                continue;
+            };
+            if !rooms_touch(current_record, current_room, record, room) {
+                continue;
+            }
+            let index = RoomIndex::new(raw_index as u16);
+            if let Some(active) = build_active_room(index, record, current_record) {
+                self.active_rooms[next_slot] = Some(active);
+                next_slot += 1;
+            }
+        }
+    }
+
+    fn update_current_room_from_player(&mut self) {
+        if !self.chunked_level() {
+            return;
+        }
+        let global = local_to_global_room_point(self.room_index, self.motor.position());
+        let Some(next_room) = room_index_containing_global(global) else {
+            return;
+        };
+        if next_room == self.room_index {
+            return;
+        }
+        let local = global_to_local_room_point(next_room, global);
+        self.room_index = next_room;
+        self.motor.relocate(local);
+        self.lock_target = None;
+        self.soft_lock_target = None;
+        self.load_active_room_window();
     }
 
     fn lock_target_position(&self) -> Option<RoomPoint> {
@@ -965,9 +1234,9 @@ fn draw_player(
     options: WorldSurfaceOptions,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
-) {
+) -> TexturedModelRenderStats {
     let Some(runtime_model) = models.get(character.model.to_usize()).copied().flatten() else {
-        return;
+        return TexturedModelRenderStats::default();
     };
     let model_options = options
         .with_depth_policy(DepthPolicy::Average)
@@ -976,7 +1245,7 @@ fn draw_player(
         .with_textured_triangle_splitting(false);
 
     let Some(anim) = runtime_model.clip(clips, clip_local) else {
-        return;
+        return TexturedModelRenderStats::default();
     };
     // Phase the animation relative to the clip-start tick so
     // state changes don't pop into the middle of a new clip.
@@ -986,7 +1255,7 @@ fn draw_player(
     let origin = floor_anchored_model_origin(x, y, z, runtime_model.world_height);
     let instance_rotation = yaw_rotation_matrix(yaw);
 
-    let _ = world.submit_textured_model(
+    world.submit_textured_model(
         triangles,
         runtime_model.model,
         anim,
@@ -998,7 +1267,436 @@ fn draw_player(
         unsafe { &mut JOINT_VIEW_TRANSFORMS },
         runtime_model.material,
         model_options,
-    );
+    )
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct EquipmentDrawStats {
+    draws: u16,
+    active_hitboxes: u16,
+    target_hits: u16,
+    stats: TexturedModelRenderStats,
+}
+
+#[derive(Copy, Clone)]
+struct AttachmentPose {
+    origin: WorldVertex,
+    rotation: Mat3I16,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_player_equipment(
+    current_room: RoomIndex,
+    character: RuntimeCharacter,
+    models: &[Option<RuntimeModelAsset>; MAX_RUNTIME_MODELS],
+    clips: &[Option<Animation<'static>>; MAX_RUNTIME_MODEL_CLIPS],
+    x: i32,
+    y: i32,
+    z: i32,
+    yaw: Angle,
+    clip_local: ModelClipIndex,
+    anim_start_tick: u32,
+    elapsed_vblanks: u32,
+    video_hz: u16,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTextured>,
+    world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
+) -> EquipmentDrawStats {
+    let mut out = EquipmentDrawStats::default();
+    let Some(character_model) = models.get(character.model.to_usize()).copied().flatten() else {
+        return out;
+    };
+    let Some(character_anim) = character_model.clip(clips, clip_local) else {
+        return out;
+    };
+    let local_tick = elapsed_vblanks.saturating_sub(anim_start_tick);
+    let character_phase = character_anim.phase_at_tick_q12(local_tick, video_hz);
+    let character_frame = (character_phase >> 12) as u16;
+    let character_origin = floor_anchored_model_origin(x, y, z, character_model.world_height);
+    let character_rotation = yaw_rotation_matrix(yaw);
+
+    let mut drawn = 0usize;
+    for equipment in EQUIPMENT {
+        if equipment.room != current_room
+            || equipment.flags & equipment_flags::PLAYER == 0
+            || drawn >= MAX_EQUIPMENT_DRAWS
+        {
+            continue;
+        }
+        let Some(weapon) = WEAPONS.get(equipment.weapon.to_usize()) else {
+            continue;
+        };
+        let Some(socket) = find_model_socket(character_model, equipment.character_socket)
+            .or_else(|| find_model_socket(character_model, weapon.default_character_socket))
+        else {
+            continue;
+        };
+        let Some(socket_pose) = attachment_socket_pose(
+            character_model,
+            character_anim,
+            character_phase,
+            character_origin,
+            character_rotation,
+            socket,
+        ) else {
+            continue;
+        };
+        let weapon_rotation = socket_pose
+            .rotation
+            .mul(&euler_q12_rotation_inverse(weapon.grip_rotation_q12));
+
+        match weapon.model {
+            Some(model_index) => {
+                let Some(weapon_model) = models.get(model_index.to_usize()).copied().flatten()
+                else {
+                    continue;
+                };
+                let grip = scaled_offset(weapon_model.local_to_world, weapon.grip_translation);
+                let grip_world = rotate_offset_q12(&weapon_rotation, grip);
+                let origin = WorldVertex::new(
+                    socket_pose.origin.x.saturating_sub(grip_world[0]),
+                    socket_pose.origin.y.saturating_sub(grip_world[1]),
+                    socket_pose.origin.z.saturating_sub(grip_world[2]),
+                );
+                if let Some(anim) = weapon_model.clip(clips, weapon_model.default_clip) {
+                    let phase = anim.phase_at_tick_q12(elapsed_vblanks, video_hz);
+                    let model_options = options
+                        .with_depth_policy(DepthPolicy::Average)
+                        .with_cull_mode(CullMode::Back)
+                        .with_material_layer(weapon_model.material)
+                        .with_textured_triangle_splitting(false);
+                    let stats = world.submit_textured_model_primary_joints(
+                        triangles,
+                        weapon_model.model,
+                        anim,
+                        phase,
+                        *camera,
+                        origin,
+                        weapon_rotation,
+                        unsafe { &mut MODEL_VERTICES },
+                        unsafe { &mut JOINT_VIEW_TRANSFORMS },
+                        weapon_model.material,
+                        model_options,
+                    );
+                    accumulate_model_stats(&mut out.stats, stats);
+                    if stats.primitive_overflow || stats.command_overflow {
+                        out.draws = drawn as u16;
+                        return out;
+                    }
+                    drawn += 1;
+                    out.draws = drawn as u16;
+                }
+            }
+            None => {}
+        };
+
+        let (active, hits) = evaluate_weapon_hitboxes(
+            current_room,
+            weapon.hitbox_first.to_usize(),
+            weapon.hitbox_count,
+            character_frame,
+            socket_pose.origin,
+            socket_pose.rotation,
+        );
+        out.active_hitboxes = out.active_hitboxes.saturating_add(active);
+        out.target_hits = out.target_hits.saturating_add(hits);
+    }
+    out
+}
+
+fn find_model_socket(
+    model: RuntimeModelAsset,
+    name: &str,
+) -> Option<&'static LevelModelSocketRecord> {
+    let first = model.socket_first.to_usize();
+    let count = model.socket_count as usize;
+    let sockets = MODEL_SOCKETS.get(first..first.saturating_add(count))?;
+    sockets.iter().find(|socket| socket.name == name)
+}
+
+fn attachment_socket_pose(
+    model: RuntimeModelAsset,
+    animation: Animation<'static>,
+    phase_q12: u32,
+    origin: WorldVertex,
+    instance_rotation: Mat3I16,
+    socket: &LevelModelSocketRecord,
+) -> Option<AttachmentPose> {
+    let pose = animation.pose_looped_q12(phase_q12, socket.joint)?;
+    let joint =
+        compute_joint_world_transform(pose, instance_rotation, model.local_to_world, origin);
+    Some(compose_socket_pose(
+        joint,
+        socket.translation,
+        socket.rotation_q12,
+    ))
+}
+
+fn compose_socket_pose(
+    joint: JointWorldTransform,
+    translation: [i32; 3],
+    rotation_q12: [i16; 3],
+) -> AttachmentPose {
+    let offset = rotate_offset_q12(&joint.rotation, translation);
+    let local_rotation = euler_q12_rotation(rotation_q12);
+    AttachmentPose {
+        origin: WorldVertex::new(
+            joint.translation.x.saturating_add(offset[0]),
+            joint.translation.y.saturating_add(offset[1]),
+            joint.translation.z.saturating_add(offset[2]),
+        ),
+        rotation: joint.rotation.mul(&local_rotation),
+    }
+}
+
+fn evaluate_weapon_hitboxes(
+    current_room: RoomIndex,
+    first: usize,
+    count: u16,
+    frame: u16,
+    origin: WorldVertex,
+    rotation: Mat3I16,
+) -> (u16, u16) {
+    let mut active = 0u16;
+    let mut hits = 0u16;
+    let Some(hitboxes) = WEAPON_HITBOXES.get(first..first.saturating_add(count as usize)) else {
+        return (0, 0);
+    };
+    for hitbox in hitboxes {
+        if frame < hitbox.active_start_frame || frame > hitbox.active_end_frame {
+            continue;
+        }
+        active = active.saturating_add(1);
+        for entity in ENTITIES {
+            if entity.room != current_room {
+                continue;
+            }
+            if weapon_hit_shape_hits_point(hitbox.shape, origin, rotation, entity.x, entity.z) {
+                hits = hits.saturating_add(1);
+            }
+        }
+    }
+    (active, hits)
+}
+
+fn weapon_hit_shape_hits_point(
+    shape: WeaponHitShapeRecord,
+    origin: WorldVertex,
+    rotation: Mat3I16,
+    px: i32,
+    pz: i32,
+) -> bool {
+    match shape {
+        WeaponHitShapeRecord::Box {
+            center,
+            half_extents,
+        } => {
+            let c = transform_local_point(origin, rotation, center);
+            let radius = half_extents[0].max(half_extents[2]) as i32;
+            distance_xz_sq(RoomPoint::new(px, 0, pz), RoomPoint::new(c.x, 0, c.z))
+                <= square_i32_saturating(radius)
+        }
+        WeaponHitShapeRecord::Capsule { start, end, radius } => {
+            let a = transform_local_point(origin, rotation, start);
+            let b = transform_local_point(origin, rotation, end);
+            point_segment_xz_distance_sq(px, pz, a.x, a.z, b.x, b.z)
+                <= square_i32_saturating(radius as i32)
+        }
+    }
+}
+
+fn transform_local_point(origin: WorldVertex, rotation: Mat3I16, point: [i32; 3]) -> WorldVertex {
+    let offset = rotate_offset_q12(&rotation, point);
+    WorldVertex::new(
+        origin.x.saturating_add(offset[0]),
+        origin.y.saturating_add(offset[1]),
+        origin.z.saturating_add(offset[2]),
+    )
+}
+
+fn scaled_offset(scale: LocalToWorldScale, offset: [i32; 3]) -> [i32; 3] {
+    [
+        scale.apply(offset[0]),
+        scale.apply(offset[1]),
+        scale.apply(offset[2]),
+    ]
+}
+
+fn rotate_offset_q12(rotation: &Mat3I16, offset: [i32; 3]) -> [i32; 3] {
+    let row = |r: [i16; 3]| -> i32 {
+        let x = (r[0] as i32).saturating_mul(offset[0]);
+        let y = (r[1] as i32).saturating_mul(offset[1]);
+        let z = (r[2] as i32).saturating_mul(offset[2]);
+        x.saturating_add(y).saturating_add(z) >> 12
+    };
+    [row(rotation.m[0]), row(rotation.m[1]), row(rotation.m[2])]
+}
+
+fn euler_q12_rotation(rotation_q12: [i16; 3]) -> Mat3I16 {
+    let rx = Mat3I16::rotate_x(Angle::from_q12(rotation_q12[0] as u16).rotate_y_arg());
+    let ry = Mat3I16::rotate_y(Angle::from_q12(rotation_q12[1] as u16).rotate_y_arg());
+    let rz = Mat3I16::rotate_z(Angle::from_q12(rotation_q12[2] as u16).rotate_y_arg());
+    rz.mul(&ry).mul(&rx)
+}
+
+fn euler_q12_rotation_inverse(rotation_q12: [i16; 3]) -> Mat3I16 {
+    let inv_x = (-(rotation_q12[0] as i32)) as u16;
+    let inv_y = (-(rotation_q12[1] as i32)) as u16;
+    let inv_z = (-(rotation_q12[2] as i32)) as u16;
+    let rx = Mat3I16::rotate_x(Angle::from_q12(inv_x).rotate_y_arg());
+    let ry = Mat3I16::rotate_y(Angle::from_q12(inv_y).rotate_y_arg());
+    let rz = Mat3I16::rotate_z(Angle::from_q12(inv_z).rotate_y_arg());
+    rx.mul(&ry).mul(&rz)
+}
+
+fn point_segment_xz_distance_sq(px: i32, pz: i32, ax: i32, az: i32, bx: i32, bz: i32) -> i32 {
+    let abx = bx.saturating_sub(ax);
+    let abz = bz.saturating_sub(az);
+    let apx = px.saturating_sub(ax);
+    let apz = pz.saturating_sub(az);
+    let denom = square_i32_saturating(abx).saturating_add(square_i32_saturating(abz));
+    if denom <= 0 {
+        return square_i32_saturating(apx).saturating_add(square_i32_saturating(apz));
+    }
+    let dot = apx
+        .saturating_mul(abx)
+        .saturating_add(apz.saturating_mul(abz));
+    let t_q8 = ratio_q8_i32(dot.clamp(0, denom), denom);
+    let cx = ax.saturating_add((abx.saturating_mul(t_q8)) >> 8);
+    let cz = az.saturating_add((abz.saturating_mul(t_q8)) >> 8);
+    square_i32_saturating(px.saturating_sub(cx))
+        .saturating_add(square_i32_saturating(pz.saturating_sub(cz)))
+}
+
+fn emit_model_counters(
+    stats: TexturedModelRenderStats,
+    projected_counter: u16,
+    submitted_counter: u16,
+    culled_counter: u16,
+    dropped_counter: u16,
+) {
+    telemetry::counter(projected_counter, stats.projected_vertices as u32);
+    telemetry::counter(submitted_counter, stats.submitted_triangles as u32);
+    telemetry::counter(culled_counter, stats.culled_triangles as u32);
+    telemetry::counter(dropped_counter, stats.dropped_triangles as u32);
+
+    let mut overflow = 0u32;
+    if stats.vertex_overflow {
+        overflow |= 1;
+    }
+    if stats.primitive_overflow {
+        overflow |= 1 << 1;
+    }
+    if stats.command_overflow {
+        overflow |= 1 << 2;
+    }
+    if overflow != 0 {
+        telemetry::counter(telemetry::counter::MODEL_OVERFLOW_FLAGS, overflow);
+    }
+}
+
+fn parse_runtime_room(record: &LevelRoomRecord) -> Option<RuntimeRoom<'static>> {
+    let asset = find_asset_of_kind(ASSETS, record.world_asset, AssetKind::RoomWorld)?;
+    RuntimeRoom::from_bytes(asset.bytes).ok()
+}
+
+fn build_active_room(
+    index: RoomIndex,
+    record: &LevelRoomRecord,
+    current_record: &LevelRoomRecord,
+) -> Option<ActiveRuntimeRoom> {
+    if let Some(residency) = ROOM_RESIDENCY.iter().find(|r| r.room == index) {
+        let _ = unsafe { RESIDENCY.ensure_room_resident(residency) };
+    }
+    let room = parse_runtime_room(record)?;
+    let mut materials = [const { None }; MAX_ROOM_MATERIALS];
+    let material_count = build_room_materials(record, &mut materials);
+    Some(ActiveRuntimeRoom {
+        index,
+        room,
+        materials,
+        material_count,
+        offset_x: room_origin_x(record).saturating_sub(room_origin_x(current_record)),
+        offset_z: room_origin_z(record).saturating_sub(room_origin_z(current_record)),
+    })
+}
+
+fn room_origin_x(record: &LevelRoomRecord) -> i32 {
+    record.origin_x.saturating_mul(record.sector_size)
+}
+
+fn room_origin_z(record: &LevelRoomRecord) -> i32 {
+    record.origin_z.saturating_mul(record.sector_size)
+}
+
+fn room_bounds(record: &LevelRoomRecord, room: RuntimeRoom<'_>) -> (i32, i32, i32, i32) {
+    let x0 = room_origin_x(record);
+    let z0 = room_origin_z(record);
+    let x1 = x0.saturating_add((room.width() as i32).saturating_mul(record.sector_size));
+    let z1 = z0.saturating_add((room.depth() as i32).saturating_mul(record.sector_size));
+    (x0, x1, z0, z1)
+}
+
+fn rooms_touch(
+    a_record: &LevelRoomRecord,
+    a_room: RuntimeRoom<'_>,
+    b_record: &LevelRoomRecord,
+    b_room: RuntimeRoom<'_>,
+) -> bool {
+    let (ax0, ax1, az0, az1) = room_bounds(a_record, a_room);
+    let (bx0, bx1, bz0, bz1) = room_bounds(b_record, b_room);
+    bx0 <= ax1 && bx1 >= ax0 && bz0 <= az1 && bz1 >= az0
+}
+
+fn room_index_containing_global(point: RoomPoint) -> Option<RoomIndex> {
+    for (raw_index, record) in ROOMS.iter().enumerate() {
+        let Some(room) = parse_runtime_room(record) else {
+            continue;
+        };
+        let (x0, x1, z0, z1) = room_bounds(record, room);
+        if point.x >= x0 && point.x < x1 && point.z >= z0 && point.z < z1 {
+            return Some(RoomIndex::new(raw_index as u16));
+        }
+    }
+    None
+}
+
+fn local_to_global_room_point(room: RoomIndex, point: RoomPoint) -> RoomPoint {
+    let Some(record) = ROOMS.get(room.to_usize()) else {
+        return point;
+    };
+    RoomPoint::new(
+        point.x.saturating_add(room_origin_x(record)),
+        point.y,
+        point.z.saturating_add(room_origin_z(record)),
+    )
+}
+
+fn global_to_local_room_point(room: RoomIndex, point: RoomPoint) -> RoomPoint {
+    let Some(record) = ROOMS.get(room.to_usize()) else {
+        return point;
+    };
+    RoomPoint::new(
+        point.x.saturating_sub(room_origin_x(record)),
+        point.y,
+        point.z.saturating_sub(room_origin_z(record)),
+    )
+}
+
+fn camera_for_room(camera: WorldCamera, active: ActiveRuntimeRoom) -> WorldCamera {
+    WorldCamera::from_basis(
+        camera.projection,
+        WorldVertex::new(
+            camera.position.x.saturating_sub(active.offset_x),
+            camera.position.y,
+            camera.position.z.saturating_sub(active.offset_z),
+        ),
+        camera.sin_yaw,
+        camera.cos_yaw,
+        camera.sin_pitch,
+        camera.cos_pitch,
+    )
 }
 
 /// Walk `room.material_first..material_first + material_count`,
@@ -1035,7 +1733,8 @@ fn build_room_materials(
             slot_record.clut_word,
             slot_record.tpage_word,
             rgb_tuple(material.tint_rgb),
-        );
+        )
+        .with_texture_window(slot_record.texture_window);
         out[slot] = Some(match material.sidedness() {
             LevelMaterialSidedness::Front => WorldRenderMaterial::front(texture),
             LevelMaterialSidedness::Back => WorldRenderMaterial::back(texture),
@@ -1052,6 +1751,11 @@ fn build_room_materials(
 struct RuntimeRoomLighting {
     room_index: RoomIndex,
     ambient: Rgb8,
+    camera: WorldCamera,
+    fog_enabled: bool,
+    fog_rgb: Rgb8,
+    fog_near: i32,
+    fog_far: i32,
 }
 
 impl WorldSurfaceLighting for RuntimeRoomLighting {
@@ -1078,8 +1782,40 @@ impl WorldSurfaceLighting for RuntimeRoomLighting {
             lights,
         )
         .to_tuple();
-        material.with_tint(tint)
+        let depth = self.camera.view_vertex(sample.center.to_world_vertex()).z;
+        material.with_tint(apply_room_fog(
+            tint,
+            depth,
+            self.fog_enabled,
+            self.fog_rgb,
+            self.fog_near,
+            self.fog_far,
+        ))
     }
+}
+
+fn apply_room_fog(
+    tint: (u8, u8, u8),
+    depth: i32,
+    enabled: bool,
+    fog_rgb: Rgb8,
+    fog_near: i32,
+    fog_far: i32,
+) -> (u8, u8, u8) {
+    if !enabled || fog_far <= fog_near || depth <= fog_near {
+        return tint;
+    }
+    let weight = (((depth - fog_near).saturating_mul(256)) / (fog_far - fog_near)).clamp(0, 256);
+    let keep = 256 - weight;
+    (
+        blend_channel(tint.0, fog_rgb.r, keep, weight),
+        blend_channel(tint.1, fog_rgb.g, keep, weight),
+        blend_channel(tint.2, fog_rgb.b, keep, weight),
+    )
+}
+
+fn blend_channel(src: u8, fog: u8, keep: i32, weight: i32) -> u8 {
+    (((src as i32) * keep + (fog as i32) * weight) >> 8).clamp(0, 255) as u8
 }
 
 const fn rgb_tuple(rgb: [u8; 3]) -> (u8, u8, u8) {
@@ -1125,39 +1861,59 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
         return None;
     }
 
-    // Pick a full 4bpp tpage page per room material. v1 world UVs
-    // are page-relative and always start at u=0, so page isolation is
-    // the material selector; the CLUT only selects the palette.
+    if texture.width() > ROOM_TILE_TEXELS || texture.height() > ROOM_TILE_TEXELS {
+        return None;
+    }
+
+    // Pack room materials into 64x64 cells inside 4bpp tpages. The
+    // material's GP0(E2) texture window makes authored UV repetition
+    // wrap inside this cell.
     let room_index = u16::try_from(room_count).ok()?;
+    let page_index = room_index / ROOM_TILES_PER_PAGE;
+    let tile_index = room_index % ROOM_TILES_PER_PAGE;
+    let tile_x = tile_index % ROOM_TILE_COLUMNS;
+    let tile_y = tile_index / ROOM_TILE_COLUMNS;
     let tpage_x = SHARED_TPAGE
         .x()
-        .checked_add(room_index.checked_mul(ROOM_TPAGE_STRIDE_HW)?)?;
-    let end_x = tpage_x.checked_add(texture.halfwords_per_row())?;
+        .checked_add(page_index.checked_mul(ROOM_TPAGE_STRIDE_HW)?)?;
+    let end_x = tpage_x.checked_add(ROOM_TPAGE_STRIDE_HW)?;
     if end_x > ROOM_TPAGE_LIMIT_X {
         return None;
     }
+    let tile_x_hw = tile_x.checked_mul(ROOM_TILE_HALFWORDS)?;
+    let tile_y_px = tile_y.checked_mul(ROOM_TILE_TEXELS)?;
+    let tile_origin_u = u8::try_from(tile_x.checked_mul(ROOM_TILE_TEXELS)?).ok()?;
+    let tile_origin_v = u8::try_from(tile_y.checked_mul(ROOM_TILE_TEXELS)?).ok()?;
     let clut_x = ROOM_CLUT_BASE_X.checked_add(room_index.checked_mul(ROOM_CLUT_STRIDE)?)?;
     if clut_x.checked_add(texture.clut_entries())? > 1024 {
         return None;
     }
     let tpage = Tpage::new(tpage_x, SHARED_TPAGE.y(), TexDepth::Bit4);
 
-    let pix_rect = VramRect::new(
-        tpage_x,
-        SHARED_TPAGE.y(),
-        texture.halfwords_per_row(),
-        texture.height(),
-    );
-    upload_bytes(pix_rect, texture.pixel_bytes());
+    if !upload_4bpp_tile(
+        tpage_x.checked_add(tile_x_hw)?,
+        SHARED_TPAGE.y().checked_add(tile_y_px)?,
+        ROOM_TILE_HALFWORDS,
+        ROOM_TILE_TEXELS,
+        &texture,
+    ) {
+        return None;
+    }
 
     let clut_rect = VramRect::new(clut_x, ROOM_CLUT_Y, texture.clut_entries(), 1);
-    upload_clut(clut_rect, texture.clut_bytes());
+    upload_opaque_clut(clut_rect, texture.clut_bytes());
 
     let clut = Clut::new(clut_x, ROOM_CLUT_Y);
     let slot = VramSlot {
         asset: asset_id,
         clut_word: clut.uv_clut_word(),
         tpage_word: tpage.uv_tpage_word(0),
+        texture_window: room_texture_window(
+            tile_origin_u,
+            tile_origin_v,
+            texture.width(),
+            texture.height(),
+        )?,
     };
 
     unsafe {
@@ -1171,6 +1927,27 @@ fn ensure_texture_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<Vram
     }
 
     Some(slot)
+}
+
+fn room_texture_window(
+    origin_u: u8,
+    origin_v: u8,
+    width: u16,
+    height: u16,
+) -> Option<TextureWindow> {
+    Some(TextureWindow::power_of_two_tile(
+        origin_u,
+        origin_v,
+        room_texture_window_size(width)?,
+        room_texture_window_size(height)?,
+    ))
+}
+
+fn room_texture_window_size(size: u16) -> Option<u8> {
+    if size < 8 || size > ROOM_TILE_TEXELS || !size.is_power_of_two() || size % 8 != 0 {
+        return None;
+    }
+    u8::try_from(size).ok()
 }
 
 /// Upload an 8bpp model atlas to the dedicated model VRAM
@@ -1218,6 +1995,7 @@ fn ensure_model_atlas_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<
         asset: asset_id,
         clut_word: Clut::new(0, clut_y).uv_clut_word(),
         tpage_word: MODEL_TPAGE_WORD,
+        texture_window: TextureWindow::NONE,
     };
 
     unsafe {
@@ -1237,6 +2015,12 @@ fn ensure_model_atlas_uploaded(asset_id: AssetId, asset_bytes: &[u8]) -> Option<
 ///
 /// Errors (parse failure, missing asset) skip the instance
 /// rather than crashing.
+#[derive(Copy, Clone, Debug, Default)]
+struct ModelInstanceDrawStats {
+    draws: u16,
+    stats: TexturedModelRenderStats,
+}
+
 fn draw_model_instances(
     current_room: RoomIndex,
     elapsed_vblanks: u32,
@@ -1247,8 +2031,9 @@ fn draw_model_instances(
     clips: &[Option<Animation<'static>>; MAX_RUNTIME_MODEL_CLIPS],
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
-) {
+) -> ModelInstanceDrawStats {
     let mut drawn = 0usize;
+    let mut out = ModelInstanceDrawStats::default();
     for inst in MODEL_INSTANCES {
         if inst.room != current_room || drawn >= MAX_MODEL_INSTANCES {
             continue;
@@ -1293,11 +2078,35 @@ fn draw_model_instances(
             runtime_model.material,
             model_options,
         );
+        accumulate_model_stats(&mut out.stats, stats);
         if stats.primitive_overflow || stats.command_overflow {
-            return;
+            out.draws = drawn as u16;
+            return out;
         }
         drawn += 1;
+        out.draws = drawn as u16;
     }
+    out
+}
+
+fn accumulate_model_stats(total: &mut TexturedModelRenderStats, next: TexturedModelRenderStats) {
+    total.projected_vertices = total
+        .projected_vertices
+        .saturating_add(next.projected_vertices);
+    total.submitted_triangles = total
+        .submitted_triangles
+        .saturating_add(next.submitted_triangles);
+    total.culled_triangles = total.culled_triangles.saturating_add(next.culled_triangles);
+    total.split_triangles = total.split_triangles.saturating_add(next.split_triangles);
+    total.skipped_triangles = total
+        .skipped_triangles
+        .saturating_add(next.skipped_triangles);
+    total.dropped_triangles = total
+        .dropped_triangles
+        .saturating_add(next.dropped_triangles);
+    total.vertex_overflow |= next.vertex_overflow;
+    total.primitive_overflow |= next.primitive_overflow;
+    total.command_overflow |= next.command_overflow;
 }
 
 /// Rotation matrix around the world Y axis.
@@ -1340,8 +2149,7 @@ fn draw_entity_markers(
     // Reuse the room's first material so we don't need a
     // dedicated marker texture. Tint override picks up the
     // existing CLUT + tpage but recolours.
-    let base = materials[0].texture;
-    let material = TextureMaterial::opaque(base.clut_word(), base.tpage_word(), MARKER_TINT);
+    let material = materials[0].texture.with_tint(MARKER_TINT);
     let opts = options.with_material_layer(material);
     const UVS: [(u8, u8); 4] = [(0, 0), (64, 0), (64, 64), (0, 64)];
 

@@ -93,6 +93,8 @@ fn encode_sector_record(
     let mut ceiling_material = world::NO_MATERIAL;
     let mut floor_heights = [0; 4];
     let mut ceiling_heights = [0; 4];
+    let mut floor_uvs = world::FLOOR_UVS;
+    let mut ceiling_uvs = world::FLOOR_UVS;
 
     if let Some(sector) = sector {
         if let Some(floor) = sector.floor {
@@ -103,6 +105,7 @@ fn encode_sector_record(
             floor_split = split_id(floor.split);
             floor_material = floor.material;
             floor_heights = floor.heights;
+            floor_uvs = floor.uvs;
         }
         if let Some(ceiling) = sector.ceiling {
             flags |= world::sector_flags::HAS_CEILING;
@@ -112,6 +115,7 @@ fn encode_sector_record(
             ceiling_split = split_id(ceiling.split);
             ceiling_material = ceiling.material;
             ceiling_heights = ceiling.heights;
+            ceiling_uvs = ceiling.uvs;
         }
     }
 
@@ -129,6 +133,8 @@ fn encode_sector_record(
     for height in ceiling_heights {
         out.extend_from_slice(&height.to_le_bytes());
     }
+    encode_uvs(floor_uvs, out);
+    encode_uvs(ceiling_uvs, out);
 }
 
 fn encode_sector_walls(
@@ -167,9 +173,17 @@ fn encode_sector_walls(
             for height in wall.heights {
                 out.extend_from_slice(&height.to_le_bytes());
             }
+            encode_uvs(wall.uvs, out);
         }
     }
     Ok(())
+}
+
+fn encode_uvs(uvs: [(u8, u8); 4], out: &mut Vec<u8>) {
+    for (u, v) in uvs {
+        out.push(u);
+        out.push(v);
+    }
 }
 
 const fn split_id(split: GridSplit) -> u8 {

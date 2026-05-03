@@ -4,7 +4,7 @@
 //! [`HwRenderer`](psx_gpu_render::HwRenderer) the same way runtime
 //! PS1 code does:
 //!
-//! 1. Configure the GTE for an orbit camera (RT / TR / OFX / OFY / H).
+//! 1. Configure the GTE for the editor camera (RT / TR / OFX / OFY / H).
 //! 2. For every populated sector with a floor, project the four
 //!    corners through the host GTE shim ([`psx_gte::scene::project_vertex`]).
 //! 3. Emit two `TriFlat` packets per floor, coloured from the
@@ -14,13 +14,10 @@
 //! 5. Walk the OT via `iter_packets`, build a `GpuCmdLogEntry` log,
 //!    hand it to `psx-gpu-render::HwRenderer::render_frame`.
 //!
-//! That's the same path PS1 software follows (minus DMA) -- so the
-//! editor preview is bit-identical to the renderer the emulator runs
-//! against the actual cooked `.psxw`.
-//!
-//! Walls / ceilings / textures land in later phases. This phase is
-//! the smallest end-to-end loop that proves authored Room data
-//! drives the editor renderer.
+//! Scene geometry stays on the PSX-style path. Editor-only
+//! affordances such as bounds, selection, and paint previews are
+//! returned as host-drawn overlay lines so they can use fractional UI
+//! strokes without PSX integer-pixel limitations.
 
 use std::sync::Mutex;
 
@@ -31,9 +28,11 @@ use psx_gpu::prim::TriTextured;
 use psx_gte::math::{Mat3I16, Vec3I16, Vec3I32};
 use psx_gte::scene as gte_scene;
 
+use psxed_project::playtest::playtest_streaming_chunk_config;
+use psxed_project::streaming::plan_generated_chunks;
 use psxed_project::{
-    spatial, GridDirection, GridSplit, NodeKind, ProjectDocument, ResourceData, ResourceId,
-    WorldGrid,
+    spatial, GridDirection, GridSplit, GridUvTransform, NodeId, NodeKind, ProjectDocument,
+    ResourceData, ResourceId, Scene, SceneNode, Transform3, WorldGrid,
 };
 
 use crate::editor_textures::{EditorTextures, MaterialSlot};
@@ -60,6 +59,22 @@ const SCREEN_CY: i32 = SCREEN_H / 2;
 const PROJ_H: i32 = 320;
 const PREVIEW_PROJECTION: psx_engine::WorldProjection =
     psx_engine::WorldProjection::new(SCREEN_CX as i16, SCREEN_CY as i16, PROJ_H, 1);
+const GRID_TILE_UV: u8 = 64;
+const PREVIEW_FLOOR_UVS: [(u8, u8); 4] = [
+    (0, 0),
+    (GRID_TILE_UV, 0),
+    (GRID_TILE_UV, GRID_TILE_UV),
+    (0, GRID_TILE_UV),
+];
+const PREVIEW_WALL_UVS: [(u8, u8); 4] = [
+    (0, GRID_TILE_UV),
+    (GRID_TILE_UV, GRID_TILE_UV),
+    (GRID_TILE_UV, 0),
+    (0, 0),
+];
+const EDITOR_PREVIEW_HOVER_STROKE_WIDTH: f32 = 1.5;
+const EDITOR_PREVIEW_SELECTED_STROKE_WIDTH: f32 = 3.0;
+const EDITOR_PREVIEW_PAINT_STROKE_WIDTH: f32 = 2.0;
 
 /// Per-frame scratch -- primitives **and** OT must live in the same
 /// memory region. `OrderingTable` stores 24-bit chain pointers (the
@@ -78,6 +93,10 @@ struct PreviewScratch {
     /// `tex_used` = next free slot in `tex_tris`.
     used: usize,
     tex_used: usize,
+    /// Host-drawn overlay lines for editor affordances. These stay
+    /// outside the GP0 command log so the UI can draw fractional,
+    /// overlaid strokes that are not limited by PSX integer pixels.
+    overlay_lines: Vec<psxed_ui::EditorViewportOverlayLine>,
     /// GP0(02h) fill-rectangle packet: 1 tag word + 3 data words
     /// (`opcode|color`, `pack_xy(x, y)`, `pack_xy(w, h)`). Must live
     /// in the same static as the OT for the same reason the prim
@@ -103,42 +122,70 @@ static SCRATCH: Mutex<PreviewScratch> = Mutex::new(PreviewScratch {
     tex_tris: [EMPTY_TEX_TRI; TRI_CAP],
     used: 0,
     tex_used: 0,
+    overlay_lines: Vec::new(),
     clear_packet: [0; 4],
 });
 
-/// Build a fresh `cmd_log` rendering the project's first Room from
+/// Render data for one editable 3D preview frame.
+pub struct EditorPreviewFrame {
+    /// PSX-style command log for the scene itself.
+    pub cmd_log: Vec<GpuCmdLogEntry>,
+    /// Host UI overlay lines for editor-only affordances.
+    pub overlay_lines: Vec<psxed_ui::EditorViewportOverlayLine>,
+}
+
+/// Build a fresh preview frame rendering the project's first Room from
 /// `camera`'s orbit angles.
 ///
-/// Returns an empty log if the project has no Rooms -- the editor
+/// Returns an empty frame if the project has no Rooms -- the editor
 /// renderer will then paint a black panel, which is the correct "no
 /// scene to show" affordance.
 #[allow(clippy::too_many_arguments)]
-pub fn build_phase1_cmd_log(
+pub fn build_phase1_frame(
     project: &ProjectDocument,
     camera: ViewportCameraState,
+    preview_fog: bool,
     selected: psxed_project::NodeId,
     hovered_primitive: Option<psxed_ui::Selection>,
     selected_primitive: Option<psxed_ui::Selection>,
+    selected_primitives: &[psxed_ui::Selection],
+    validation_issue_primitives: &[psxed_ui::Selection],
+    selected_bounds: Option<([f32; 3], [f32; 3])>,
+    selected_sector_faces: &[psxed_ui::FaceRef],
     paint_target_preview: Option<psxed_ui::PaintTargetPreview>,
     entity_bounds: &[psxed_ui::EntityBounds],
     hovered_entity_node: Option<psxed_project::NodeId>,
     textures: &EditorTextures,
     assets: &crate::editor_assets::EditorAssets,
-) -> Vec<GpuCmdLogEntry> {
-    let Some((room_id, grid, target)) = first_room_grid(project) else {
-        return Vec::new();
+) -> EditorPreviewFrame {
+    let Some((room_id, grid)) = first_room_grid(project) else {
+        return EditorPreviewFrame {
+            cmd_log: Vec::new(),
+            overlay_lines: Vec::new(),
+        };
     };
 
     let mut scratch = SCRATCH.lock().expect("editor preview scratch mutex");
     scratch.used = 0;
     scratch.tex_used = 0;
+    scratch.overlay_lines.clear();
     scratch.ot.clear();
 
     push_clear(&mut scratch);
-    let world_camera = setup_gte_for_camera(camera, target);
-    walk_room(project, room_id, grid, textures, &mut scratch);
+    let world_camera = setup_gte_for_camera(camera);
+    let fog = PreviewFog::from_grid(grid, preview_fog);
+    walk_room(
+        project,
+        room_id,
+        grid,
+        textures,
+        world_camera,
+        fog,
+        &mut scratch,
+    );
+    push_streaming_chunk_boundaries(grid, &mut scratch);
     walk_entities(project, grid, selected, &mut scratch);
-    walk_light_gizmos(project, grid, selected, &mut scratch);
+    walk_light_gizmos(project, grid, selected, hovered_entity_node, &mut scratch);
 
     // Selection / hover / paint overlays drawn before models --
     // they project through the camera GTE matrix that
@@ -147,11 +194,20 @@ pub fn build_phase1_cmd_log(
     // camera state below before drawing entity bounds so they
     // pick up the same camera basis instead of the last
     // model joint matrix.
-    if let Some(selection) = selected_primitive {
-        push_selection_outline(grid, selection, OutlineRole::Selected, &mut scratch);
+    if selected_primitives.is_empty() {
+        if let Some(selection) = selected_primitive {
+            push_selection_outline(grid, selection, OutlineRole::Selected, &mut scratch);
+        }
+    } else {
+        for selection in selected_primitives {
+            push_selection_outline(grid, *selection, OutlineRole::Selected, &mut scratch);
+        }
+    }
+    for face in selected_sector_faces {
+        push_face_outline(grid, *face, FACE_OUTLINE_SELECTED, &mut scratch);
     }
     if let Some(selection) = hovered_primitive {
-        if Some(selection) != selected_primitive {
+        if Some(selection) != selected_primitive && !selected_primitives.contains(&selection) {
             push_selection_outline(grid, selection, OutlineRole::Hover, &mut scratch);
         }
     }
@@ -172,21 +228,29 @@ pub fn build_phase1_cmd_log(
     // Re-prime the GTE with the camera matrix -- model
     // rendering left it set to the last joint's view, which
     // would project entity bound lines into junk.
-    let _ = setup_gte_for_camera(camera, target);
+    let _ = setup_gte_for_camera(camera);
     walk_entity_bounds(entity_bounds, selected, hovered_entity_node, &mut scratch);
+    if let Some((center, half_extents)) = selected_bounds {
+        push_aabb_wireframe(&mut scratch, center, half_extents, ENTITY_BOUND_SELECTED);
+    }
+    for selection in validation_issue_primitives {
+        if selection.room() == room_id {
+            push_selection_outline(grid, *selection, OutlineRole::Error, &mut scratch);
+        }
+    }
 
     // SAFETY: `scratch.tris` lives until end of this function (the
     // mutex guard keeps it alive); the OT chain pointers reference
     // packets inside that vec and are stable while the lock is held.
-    unsafe { psx_gpu_render::build_cmd_log(&scratch.ot) }
+    let cmd_log = unsafe { psx_gpu_render::build_cmd_log(&scratch.ot) };
+    EditorPreviewFrame {
+        cmd_log,
+        overlay_lines: scratch.overlay_lines.clone(),
+    }
 }
 
-/// First Room node in the active scene plus the world-space point we
-/// want the orbit camera to look at (centre of the grid at floor
-/// height). `None` if no Room exists.
-fn first_room_grid(
-    project: &ProjectDocument,
-) -> Option<(psxed_project::NodeId, &WorldGrid, [i32; 3])> {
+/// First Room node in the active scene. `None` if no Room exists.
+fn first_room_grid(project: &ProjectDocument) -> Option<(psxed_project::NodeId, &WorldGrid)> {
     let scene = project.active_scene();
     let room = scene
         .nodes()
@@ -195,32 +259,24 @@ fn first_room_grid(
     let NodeKind::Room { grid } = &room.kind else {
         return None;
     };
-    // Geometric centre in world coords accounts for `origin` so the
-    // camera reframes naturally as the grid grows in any direction.
-    Some((room.id, grid, spatial::room_preview_center(grid)))
+    Some((room.id, grid))
 }
 
 /// Configure the host-side GTE so subsequent `project_vertex` /
 /// `project_triangle` calls produce screen-space coords for the
-/// requested orbit camera.
-fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) -> psx_engine::WorldCamera {
-    // Orbit camera world position: target offset by radius along the
-    // unit vector implied by yaw + pitch. Pitch positive = camera
-    // raised above the target, looking down.
-    let r = camera.radius;
+/// requested editor camera.
+fn setup_gte_for_camera(camera: ViewportCameraState) -> psx_engine::WorldCamera {
     let cos_p = psx_gte::transform::cos_1_3_12(camera.pitch_q12) as i32;
     let sin_p = psx_gte::transform::sin_1_3_12(camera.pitch_q12) as i32;
     let cos_y = psx_gte::transform::cos_1_3_12(camera.yaw_q12) as i32;
     let sin_y = psx_gte::transform::sin_1_3_12(camera.yaw_q12) as i32;
-    let horiz = (r * cos_p) >> 12;
-    let cam_x = target[0] + ((horiz * sin_y) >> 12);
-    let cam_y = target[1] - ((r * sin_p) >> 12);
-    let cam_z = target[2] + ((horiz * cos_y) >> 12);
+    let anchor = camera.anchor_i32();
+    let [cam_x, cam_y, cam_z] = camera.position_i32();
 
     // View rotation: world →camera. Built so that:
     //   row0 = right (= +X in camera space)
     //   row1 = -up   (PSX screen Y points down, so we flip)
-    //   row2 = forward (= +Z in camera space; camera looks toward target)
+    //   row2 = forward (= +Z in camera space; camera looks along view direction)
     // Matches `psx_engine::render3d::camera_gte_view_matrix`.
     let view = Mat3I16 {
         m: [
@@ -238,22 +294,21 @@ fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) -> psx_en
         ],
     };
 
-    // Vertex emit will subtract `target` from each world coord
+    // Vertex emit will subtract `anchor` from each world coord
     // (see `world_to_view`), so anything inside ±i16 of the
-    // camera target is safe to GTE-project. Compose the GTE
+    // camera anchor is safe to GTE-project. Compose the GTE
     // translation around that anchor: view·(anchor - cam_world)
     // = view·(-cam_local) where cam_local lives entirely within
-    // the (small) orbit-radius range. This is the fix for the
-    // 64×1024 = 65 536 > i16::MAX overflow the prior code's
-    // saturating clamp would silently corrupt.
-    let cam_local = [cam_x - target[0], cam_y - target[1], cam_z - target[2]];
+    // a small local range. Orbit anchors on its target; Free anchors
+    // on its position, which keeps large authored rooms camera-local.
+    let cam_local = [cam_x - anchor[0], cam_y - anchor[1], cam_z - anchor[2]];
     let tr = Vec3I32::new(
         -dot_view_world(view.m[0], cam_local),
         -dot_view_world(view.m[1], cam_local),
         -dot_view_world(view.m[2], cam_local),
     );
 
-    set_view_anchor(target);
+    set_view_anchor(anchor);
     gte_scene::load_rotation(&view);
     gte_scene::load_translation(tr);
     gte_scene::set_screen_offset(SCREEN_CX << 16, SCREEN_CY << 16);
@@ -274,7 +329,7 @@ fn setup_gte_for_camera(camera: ViewportCameraState, target: [i32; 3]) -> psx_en
 
 /// Shared anchor that `world_to_view` subtracts from each vertex
 /// before squashing to `i16`. Set per-frame by
-/// `setup_gte_for_camera` to the camera target so the emitted
+/// `setup_gte_for_camera` to the camera anchor so the emitted
 /// vertices stay anchor-relative -- the GTE absorbs the offset via
 /// its translation register. Without this, a single 32-sector
 /// room (32 × 1024 = 32 768) sits exactly on the i16 cliff.
@@ -315,6 +370,8 @@ fn walk_room(
     room_id: psxed_project::NodeId,
     grid: &WorldGrid,
     textures: &EditorTextures,
+    camera: psx_engine::WorldCamera,
+    fog: PreviewFog,
     scratch: &mut PreviewScratch,
 ) {
     let s = grid.sector_size;
@@ -342,12 +399,14 @@ fn walk_room(
                     &lights,
                     ambient,
                 );
+                let shade = fog.apply_shade(shade, face_depth(camera, center));
                 push_horizontal_face(
                     scratch,
                     [x0, x1, z0, z1],
                     floor.heights,
                     floor.split,
                     floor.dropped_corner,
+                    floor.uv,
                     shade,
                     /* flip_winding */ false,
                 );
@@ -360,12 +419,14 @@ fn walk_room(
                     &lights,
                     ambient,
                 );
+                let shade = fog.apply_shade(shade, face_depth(camera, center));
                 push_horizontal_face(
                     scratch,
                     [x0, x1, z0, z1],
                     ceiling.heights,
                     ceiling.split,
                     ceiling.dropped_corner,
+                    ceiling.uv,
                     shade,
                     // Ceiling normal points down; flipping the winding
                     // keeps backface-cullers happy and pins the inside
@@ -388,13 +449,16 @@ fn walk_room(
                         &lights,
                         ambient,
                     );
+                    let shade = fog.apply_shade(shade, face_depth(camera, center));
                     push_wall_face(
                         scratch,
                         [x0, x1, z0, z1],
                         edge,
                         face.heights,
                         face.dropped_corner,
+                        face.uv,
                         shade,
+                        [camera.position.x, camera.position.y, camera.position.z],
                     );
                 }
             }
@@ -428,6 +492,17 @@ impl FaceShade {
             Self::Flat { sidedness, .. } | Self::Textured { sidedness, .. } => sidedness,
         }
     }
+
+    fn with_sidedness(self, sidedness: psxed_project::MaterialFaceSidedness) -> Self {
+        match self {
+            Self::Flat { rgb, .. } => Self::Flat { rgb, sidedness },
+            Self::Textured { slot, tint, .. } => Self::Textured {
+                slot,
+                tint,
+                sidedness,
+            },
+        }
+    }
 }
 
 fn face_shade(
@@ -442,7 +517,7 @@ fn face_shade(
         if let Some(slot) = textures.slot(id) {
             return FaceShade::Textured {
                 slot,
-                tint,
+                tint: material_texture_tint(project, id),
                 sidedness,
             };
         }
@@ -453,11 +528,85 @@ fn face_shade(
     }
 }
 
-/// Walk every Light node in `project` whose enclosing room is
-/// the active grid and pre-multiply its colour×intensity_q8.
-/// Lights authored outside any Room (no enclosing parent) are
-/// skipped silently -- the cooker warns about those, the
-/// preview just doesn't render them.
+fn material_texture_tint(project: &ProjectDocument, material: ResourceId) -> (u8, u8, u8) {
+    project
+        .resource(material)
+        .and_then(|resource| match &resource.data {
+            ResourceData::Material(material) => Some(material.tint),
+            _ => None,
+        })
+        .map(|[r, g, b]| (r, g, b))
+        .unwrap_or((0x80, 0x80, 0x80))
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PreviewFog {
+    enabled: bool,
+    rgb: (u8, u8, u8),
+    near: i32,
+    far: i32,
+}
+
+impl PreviewFog {
+    fn from_grid(grid: &WorldGrid, preview_enabled: bool) -> Self {
+        Self {
+            enabled: preview_enabled && grid.fog_enabled,
+            rgb: (grid.fog_color[0], grid.fog_color[1], grid.fog_color[2]),
+            near: grid.fog_near,
+            far: grid.fog_far,
+        }
+    }
+
+    fn apply_shade(self, shade: FaceShade, depth: i32) -> FaceShade {
+        match shade {
+            FaceShade::Flat { rgb, sidedness } => FaceShade::Flat {
+                rgb: self.apply_rgb(rgb, depth),
+                sidedness,
+            },
+            FaceShade::Textured {
+                slot,
+                tint,
+                sidedness,
+            } => FaceShade::Textured {
+                slot,
+                tint: self.apply_rgb(tint, depth),
+                sidedness,
+            },
+        }
+    }
+
+    fn apply_rgb(self, rgb: (u8, u8, u8), depth: i32) -> (u8, u8, u8) {
+        if !self.enabled || self.far <= self.near || depth <= self.near {
+            return rgb;
+        }
+        let weight =
+            (((depth - self.near).saturating_mul(256)) / (self.far - self.near)).clamp(0, 256);
+        let keep = 256 - weight;
+        (
+            fog_blend_channel(rgb.0, self.rgb.0, keep, weight),
+            fog_blend_channel(rgb.1, self.rgb.1, keep, weight),
+            fog_blend_channel(rgb.2, self.rgb.2, keep, weight),
+        )
+    }
+}
+
+fn fog_blend_channel(src: u8, fog: u8, keep: i32, weight: i32) -> u8 {
+    (((src as i32) * keep + (fog as i32) * weight) / 256).clamp(0, 255) as u8
+}
+
+fn face_depth(camera: psx_engine::WorldCamera, center: [i32; 3]) -> i32 {
+    camera
+        .view_vertex(psx_engine::WorldVertex::new(
+            center[0], center[1], center[2],
+        ))
+        .z
+}
+
+/// Walk every legacy Light and component PointLight whose
+/// enclosing room is the active grid and pre-multiply its
+/// colour×intensity_q8. Lights authored outside any Room (no
+/// enclosing parent) are skipped silently -- the cooker warns
+/// about those, the preview just doesn't render them.
 fn collect_preview_lights(
     project: &ProjectDocument,
     room_id: psxed_project::NodeId,
@@ -465,40 +614,244 @@ fn collect_preview_lights(
 ) -> Vec<psx_engine::PointLightSample> {
     let scene = project.active_scene();
     let mut out = Vec::new();
-    for node in scene.nodes() {
-        let NodeKind::Light {
-            color,
-            intensity,
-            radius,
-        } = &node.kind
-        else {
-            continue;
-        };
-        if *radius <= 0.0 || !intensity.is_finite() || *intensity < 0.0 {
-            continue;
-        }
+    for light in preview_lights(scene) {
         // Filter by enclosing Room -- a light authored under
         // some other Room must not bleed into this one.
-        if !is_descendant_of_room(scene, node.id, room_id) {
+        if !is_descendant_of_room(scene, light.host_id, room_id) {
             continue;
         }
-        let world = node_room_local_origin(grid, &node.transform);
-        // Editor `radius` is in sector units; convert to
-        // engine units once here so the per-face attenuation
-        // math stays in world space.
-        let radius_engine = spatial::light_radius_engine_units(grid, *radius);
-        // Pre-multiply colour × intensity into u32 channels;
-        // intensity scaled by 256 (Q8.8) keeps the per-face
-        // accumulator in integer math.
-        let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u32;
-        out.push(psx_engine::PointLightSample::from_rgb_intensity(
-            [world.x, world.y, world.z],
-            radius_engine,
-            psx_engine::Rgb8::from_array(*color),
-            psx_engine::Q8::from_raw(intensity_q8),
-        ));
+        push_preview_light_sample(
+            &mut out,
+            grid,
+            &light.transform,
+            light.color,
+            light.intensity,
+            light.radius,
+        );
     }
     out
+}
+
+fn push_preview_light_sample(
+    out: &mut Vec<psx_engine::PointLightSample>,
+    grid: &WorldGrid,
+    transform: &Transform3,
+    color: [u8; 3],
+    intensity: f32,
+    radius: f32,
+) {
+    if radius <= 0.0 || !intensity.is_finite() || intensity < 0.0 {
+        return;
+    }
+    let world = node_room_local_origin(grid, transform);
+    // Editor `radius` is in sector units; convert to
+    // engine units once here so the per-face attenuation
+    // math stays in world space.
+    let radius_engine = spatial::light_radius_engine_units(grid, radius);
+    // Pre-multiply colour × intensity into u32 channels;
+    // intensity scaled by 256 (Q8.8) keeps the per-face
+    // accumulator in integer math.
+    let intensity_q8 = (intensity * 256.0).clamp(0.0, u16::MAX as f32) as u32;
+    out.push(psx_engine::PointLightSample::from_rgb_intensity(
+        [world.x, world.y, world.z],
+        radius_engine,
+        psx_engine::Rgb8::from_array(color),
+        psx_engine::Q8::from_raw(intensity_q8),
+    ));
+}
+
+#[derive(Clone, Copy)]
+struct PreviewLightMeta {
+    host_id: NodeId,
+    component_id: Option<NodeId>,
+    transform: Transform3,
+    color: [u8; 3],
+    intensity: f32,
+    radius: f32,
+}
+
+fn preview_lights(scene: &Scene) -> Vec<PreviewLightMeta> {
+    let mut out = Vec::new();
+    for node in scene.nodes() {
+        match &node.kind {
+            NodeKind::Light {
+                color,
+                intensity,
+                radius,
+            } => {
+                out.push(PreviewLightMeta {
+                    host_id: node.id,
+                    component_id: None,
+                    transform: node.transform,
+                    color: *color,
+                    intensity: *intensity,
+                    radius: *radius,
+                });
+            }
+            NodeKind::Entity => {
+                for child in component_children(scene, node) {
+                    let NodeKind::PointLight {
+                        color,
+                        intensity,
+                        radius,
+                    } = &child.kind
+                    else {
+                        continue;
+                    };
+                    out.push(PreviewLightMeta {
+                        host_id: node.id,
+                        component_id: Some(child.id),
+                        transform: node.transform,
+                        color: *color,
+                        intensity: *intensity,
+                        radius: *radius,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn component_children<'a>(
+    scene: &'a Scene,
+    host: &'a SceneNode,
+) -> impl Iterator<Item = &'a SceneNode> + 'a {
+    host.children.iter().filter_map(|id| scene.node(*id))
+}
+
+#[derive(Clone, Copy)]
+struct PreviewModelReference {
+    model_id: ResourceId,
+    clip_override: Option<u16>,
+    renderer_node: Option<NodeId>,
+    animator_node: Option<NodeId>,
+}
+
+fn preview_model_reference(scene: &Scene, node: &SceneNode) -> Option<PreviewModelReference> {
+    match &node.kind {
+        NodeKind::MeshInstance {
+            mesh: Some(model_id),
+            animation_clip,
+            ..
+        } => Some(PreviewModelReference {
+            model_id: *model_id,
+            clip_override: *animation_clip,
+            renderer_node: None,
+            animator_node: None,
+        }),
+        NodeKind::Entity => {
+            let mut renderer = None;
+            let mut animator = None;
+            for child in component_children(scene, node) {
+                match &child.kind {
+                    NodeKind::ModelRenderer {
+                        model: Some(model_id),
+                        ..
+                    } if renderer.is_none() => {
+                        renderer = Some((child.id, *model_id));
+                    }
+                    NodeKind::Animator { clip, .. } if animator.is_none() => {
+                        animator = Some((child.id, *clip));
+                    }
+                    _ => {}
+                }
+            }
+            renderer.map(|(renderer_node, model_id)| PreviewModelReference {
+                model_id,
+                clip_override: animator.and_then(|(_, clip)| clip),
+                renderer_node: Some(renderer_node),
+                animator_node: animator.map(|(node_id, _)| node_id),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn preview_static_model_reference(
+    scene: &Scene,
+    node: &SceneNode,
+) -> Option<PreviewModelReference> {
+    // Match the playtest cooker: a player-controlled Entity's
+    // ModelRenderer is consumed by the CharacterController path,
+    // not emitted as a second static model at the same transform.
+    if matches!(node.kind, NodeKind::Entity) && preview_player_reference(scene, node).is_some() {
+        return None;
+    }
+    preview_model_reference(scene, node)
+}
+
+#[derive(Clone, Copy)]
+struct PreviewPlayerReference {
+    character: Option<ResourceId>,
+    controller_node: Option<NodeId>,
+}
+
+fn preview_player_reference(scene: &Scene, node: &SceneNode) -> Option<PreviewPlayerReference> {
+    match &node.kind {
+        NodeKind::SpawnPoint {
+            player: true,
+            character,
+        } => Some(PreviewPlayerReference {
+            character: *character,
+            controller_node: None,
+        }),
+        NodeKind::Entity => component_children(scene, node).find_map(|child| {
+            let NodeKind::CharacterController {
+                character,
+                player: true,
+            } = &child.kind
+            else {
+                return None;
+            };
+            Some(PreviewPlayerReference {
+                character: *character,
+                controller_node: Some(child.id),
+            })
+        }),
+        _ => None,
+    }
+}
+
+fn preview_reference_selected(
+    selected: NodeId,
+    host_id: NodeId,
+    component_a: Option<NodeId>,
+    component_b: Option<NodeId>,
+) -> bool {
+    selected == host_id || component_a == Some(selected) || component_b == Some(selected)
+}
+
+fn host_renders_as_preview_model(
+    project: &ProjectDocument,
+    scene: &Scene,
+    node: &SceneNode,
+) -> bool {
+    if let Some(reference) = preview_static_model_reference(scene, node) {
+        return project
+            .resource(reference.model_id)
+            .is_some_and(|resource| matches!(&resource.data, ResourceData::Model(_)));
+    }
+    if let Some(reference) = preview_player_reference(scene, node) {
+        let Some(character_id) = resolve_player_spawn_character(project, reference.character)
+        else {
+            return false;
+        };
+        let Some(character_resource) = project.resource(character_id) else {
+            return false;
+        };
+        let ResourceData::Character(character) = &character_resource.data else {
+            return false;
+        };
+        let Some(model_id) = character.model else {
+            return false;
+        };
+        return project
+            .resource(model_id)
+            .is_some_and(|resource| matches!(&resource.data, ResourceData::Model(_)));
+    }
+    false
 }
 
 /// Walk parent links from `node_id` looking for `room_id`.
@@ -603,6 +956,7 @@ fn push_horizontal_face(
     heights: [i32; 4],
     split: GridSplit,
     dropped_corner: Option<psxed_project::Corner>,
+    uv_transform: GridUvTransform,
     shade: FaceShade,
     flip_winding: bool,
 ) {
@@ -612,26 +966,17 @@ fn push_horizontal_face(
     let p_ne = gte_scene::project_vertex(world_to_view([x1, heights[1], z1]));
     let p_se = gte_scene::project_vertex(world_to_view([x1, heights[2], z0]));
     let p_sw = gte_scene::project_vertex(world_to_view([x0, heights[3], z0]));
-    let (uv_nw, uv_ne, uv_se, uv_sw);
-    let max_u;
-    let max_v;
-    if let FaceShade::Textured { slot, .. } = shade {
-        max_u = slot.width.saturating_sub(1);
-        max_v = slot.height.saturating_sub(1);
-        uv_nw = (0u8, 0u8);
-        uv_ne = (max_u, 0);
-        uv_se = (max_u, max_v);
-        uv_sw = (0, max_v);
+    let (uv_nw, uv_ne, uv_se, uv_sw) = if let FaceShade::Textured { .. } = shade {
+        (
+            PREVIEW_FLOOR_UVS[0],
+            PREVIEW_FLOOR_UVS[1],
+            PREVIEW_FLOOR_UVS[2],
+            PREVIEW_FLOOR_UVS[3],
+        )
     } else {
-        max_u = 0;
-        max_v = 0;
-        uv_nw = (0, 0);
-        uv_ne = (0, 0);
-        uv_se = (0, 0);
-        uv_sw = (0, 0);
-    }
-    let _ = max_u;
-    let _ = max_v;
+        ((0, 0), (0, 0), (0, 0), (0, 0))
+    };
+    let [uv_nw, uv_ne, uv_se, uv_sw] = uv_transform.apply_to_quad([uv_nw, uv_ne, uv_se, uv_sw]);
 
     // Per split, pick the two triangles. Triangle A is the
     // perimeter walk's "first" half, B the "second" -- under
@@ -704,12 +1049,33 @@ fn push_horizontal_face(
 /// Which edge of the sector this wall sits on. The renderer needs
 /// the four corner positions in a consistent order so heights[bl,
 /// br, tr, tl] line up with the right world-space corners.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum WallEdge {
     North,
     East,
     South,
     West,
+}
+
+fn wall_side_visible(
+    sidedness: psxed_project::MaterialFaceSidedness,
+    bounds: [i32; 4],
+    edge: WallEdge,
+    camera_position: [i32; 3],
+) -> bool {
+    let [x0, x1, z0, z1] = bounds;
+    let [cam_x, _, cam_z] = camera_position;
+    let inside_distance = match edge {
+        WallEdge::North => z1.saturating_sub(cam_z),
+        WallEdge::East => x1.saturating_sub(cam_x),
+        WallEdge::South => cam_z.saturating_sub(z0),
+        WallEdge::West => cam_x.saturating_sub(x0),
+    };
+    match sidedness {
+        psxed_project::MaterialFaceSidedness::Both => true,
+        psxed_project::MaterialFaceSidedness::Back => inside_distance >= 0,
+        psxed_project::MaterialFaceSidedness::Front => inside_distance <= 0,
+    }
 }
 
 /// Build the four world-space corners of a wall face on `edge`
@@ -724,9 +1090,15 @@ fn push_wall_face(
     edge: WallEdge,
     heights: [i32; 4],
     dropped_corner: Option<psxed_project::WallCorner>,
+    uv_transform: GridUvTransform,
     shade: FaceShade,
+    camera_position: [i32; 3],
 ) {
     use psxed_project::WallCorner;
+    if !wall_side_visible(shade.sidedness(), bounds, edge, camera_position) {
+        return;
+    }
+    let render_shade = shade.with_sidedness(psxed_project::MaterialFaceSidedness::Both);
     let [x0, x1, z0, z1] = bounds;
     // For each cardinal edge, "left" and "right" are picked so an
     // observer standing inside the sector sees the wall the right
@@ -741,13 +1113,17 @@ fn push_wall_face(
     let p_br = gte_scene::project_vertex(world_to_view([br_xy.0, heights[1], br_xy.1]));
     let p_tr = gte_scene::project_vertex(world_to_view([tr_xy.0, heights[2], tr_xy.1]));
     let p_tl = gte_scene::project_vertex(world_to_view([tl_xy.0, heights[3], tl_xy.1]));
-    let (uv_bl, uv_br, uv_tr, uv_tl) = if let FaceShade::Textured { slot, .. } = shade {
-        let u_max = slot.width.saturating_sub(1);
-        let v_max = slot.height.saturating_sub(1);
-        ((0, v_max), (u_max, v_max), (u_max, 0), (0, 0))
+    let (uv_bl, uv_br, uv_tr, uv_tl) = if let FaceShade::Textured { .. } = shade {
+        (
+            PREVIEW_WALL_UVS[0],
+            PREVIEW_WALL_UVS[1],
+            PREVIEW_WALL_UVS[2],
+            PREVIEW_WALL_UVS[3],
+        )
     } else {
         ((0, 0), (0, 0), (0, 0), (0, 0))
     };
+    let [uv_bl, uv_br, uv_tr, uv_tl] = uv_transform.apply_to_quad([uv_bl, uv_br, uv_tr, uv_tl]);
 
     // Two diagonals to choose between. `BlTr` is the renderer's
     // legacy split; switch to `BrTl` only when BL or TR is the
@@ -787,11 +1163,33 @@ fn push_wall_face(
 
     let skip =
         |members: [WallCorner; 3]| -> bool { dropped_corner.is_some_and(|c| members.contains(&c)) };
+    // Endpoint order keeps wall UVs upright. Winding is the
+    // separate concern: the authored wall back side faces the
+    // owning cell/interior, matching runtime `world_render` and
+    // the default one-sided Brick material.
+    let flip_winding = !matches!(
+        shade.sidedness(),
+        psxed_project::MaterialFaceSidedness::Back
+    );
+    let emit_wall_triangle = |scratch: &mut PreviewScratch,
+                              verts: [psx_gte::scene::Projected; 3],
+                              uvs: [(u8, u8); 3]| {
+        if flip_winding {
+            emit_face_tri(
+                scratch,
+                [verts[0], verts[2], verts[1]],
+                [uvs[0], uvs[2], uvs[1]],
+                render_shade,
+            );
+        } else {
+            emit_face_tri(scratch, verts, uvs, render_shade);
+        }
+    };
     if !skip(tri_a.2) {
-        emit_face_tri(scratch, tri_a.0, tri_a.1, shade);
+        emit_wall_triangle(scratch, tri_a.0, tri_a.1);
     }
     if !skip(tri_b.2) {
-        emit_face_tri(scratch, tri_b.0, tri_b.1, shade);
+        emit_wall_triangle(scratch, tri_b.0, tri_b.1);
     }
 }
 
@@ -811,16 +1209,11 @@ fn walk_entities(
 ) {
     let scene = project.active_scene();
     for node in scene.nodes() {
-        // Skip Model-backed MeshInstances -- `walk_model_instances`
-        // renders them as real textured models. Without this guard
-        // they'd get *both* a marker square and the real model on
-        // top of each other.
-        if let NodeKind::MeshInstance { mesh: Some(id), .. } = &node.kind {
-            if let Some(resource) = project.resource(*id) {
-                if matches!(resource.data, ResourceData::Model(_)) {
-                    continue;
-                }
-            }
+        // Skip nodes that the model-preview pass renders as real
+        // textured characters/models. Without this guard they'd get
+        // both a marker square and the real model on top of each other.
+        if host_renders_as_preview_model(project, scene, node) {
+            continue;
         }
         let Some(kind_color) = entity_marker_color(&node.kind) else {
             continue;
@@ -876,10 +1269,10 @@ fn walk_entities(
     }
 }
 
-/// Cap on placed Model-backed MeshInstance nodes the editor
-/// preview will render in one frame. Excess instances skip
-/// silently (the manifest hasn't filtered them) -- keeps a
-/// runaway scene from busting the per-frame budget.
+/// Cap on placed model-rendering nodes the editor preview will
+/// render in one frame. Excess instances skip silently (the
+/// manifest hasn't filtered them) -- keeps a runaway scene from
+/// busting the per-frame budget.
 const MAX_PREVIEW_MODEL_INSTANCES: usize = 8;
 /// Cap on joints any one previewed model can carry. Matches
 /// the runtime `JOINT_CAP` so a model that renders in
@@ -888,7 +1281,7 @@ const PREVIEW_JOINT_CAP: usize = 32;
 
 /// Per-frame tick used to advance animation phase for the
 /// editor's looping model preview. Bumped once per
-/// `build_phase1_cmd_log` call. PSX angle / phase math needs
+/// `build_phase1_frame` call. PSX angle / phase math needs
 /// monotonic ticks rather than wall-clock, and the editor
 /// frame rate fluctuates on host -- so this is "preview
 /// frames", not real-time. Good enough for inspector preview.
@@ -914,12 +1307,13 @@ struct PreviewModelInstance<'a> {
     instance_rotation: Mat3I16,
 }
 
-/// Render every Model-backed `MeshInstance` in the scene as a
-/// real textured animated model. Mirrors the runtime path in
-/// `editor-playtest`: parse `.psxmdl` + `.psxt` + `.psxanim`,
-/// upload atlas (lazily -- done by `EditorTextures::refresh_models`),
-/// compose joint transforms via `compute_joint_view_transform`,
-/// project per-vertex, emit textured triangles into the OT.
+/// Render every Model-backed legacy `MeshInstance` or component
+/// `Entity` in the scene as a real textured animated model.
+/// Mirrors the runtime path in `editor-playtest`: parse `.psxmdl`
+/// + `.psxt` + `.psxanim`, upload atlas (lazily -- done by
+/// `EditorTextures::refresh_models`), compose joint transforms via
+/// `compute_joint_view_transform`, project per-vertex, emit textured
+/// triangles into the OT.
 ///
 /// Models with bad/missing data are skipped silently -- the
 /// editor inspector + cook validation surface those errors
@@ -950,15 +1344,10 @@ fn walk_model_instances(
         if instances_meta.len() >= MAX_PREVIEW_MODEL_INSTANCES {
             break;
         }
-        let NodeKind::MeshInstance {
-            mesh: Some(mesh_id),
-            animation_clip,
-            ..
-        } = &node.kind
-        else {
+        let Some(reference) = preview_static_model_reference(scene, node) else {
             continue;
         };
-        let Some(model_resource) = project.resource(*mesh_id) else {
+        let Some(model_resource) = project.resource(reference.model_id) else {
             continue;
         };
         let ResourceData::Model(model) = &model_resource.data else {
@@ -971,14 +1360,16 @@ fn walk_model_instances(
         // Atlas slot must already be uploaded (refresh_models
         // ran earlier in the frame). Skip if not -- lets the
         // user know visually that the atlas is broken.
-        let Some(atlas_slot) = textures.model_atlas_slot(*mesh_id) else {
+        let Some(atlas_slot) = textures.model_atlas_slot(reference.model_id) else {
             continue;
         };
 
         // Resolve clip: explicit instance override → preview clip → default.
-        let clip_local =
-            psxed_project::resolve::resolve_model_instance_preview_clip(model, *animation_clip)
-                .unwrap_or(0);
+        let clip_local = psxed_project::resolve::resolve_model_instance_preview_clip(
+            model,
+            reference.clip_override,
+        )
+        .unwrap_or(0);
         if (clip_local as usize) >= model.clips.len() {
             continue;
         }
@@ -991,12 +1382,17 @@ fn walk_model_instances(
         let instance_rotation = yaw_rotation_q12(yaw_q12);
 
         instances_meta.push(InstanceMeta {
-            mesh_id: *mesh_id,
+            mesh_id: reference.model_id,
             clip_local,
             origin,
             instance_rotation,
             atlas: atlas_slot,
-            is_selected: node.id == selected,
+            is_selected: preview_reference_selected(
+                selected,
+                node.id,
+                reference.renderer_node,
+                reference.animator_node,
+            ),
             yaw_q12,
             world_height: model.world_height as i32,
         });
@@ -1051,13 +1447,12 @@ fn walk_model_instances(
     }
 }
 
-/// For every Player Spawn (`SpawnPoint { player: true, .. }`),
-/// resolve its `character` link to a Model + idle clip and
-/// queue an `InstanceMeta` so the same render path placed
-/// model instances follow renders the character at the spawn.
-/// `(mesh_id, clip_local)` is the cache key -- different player
-/// idle clips and different placed-instance clips each resolve
-/// to their own animation entry.
+/// For every legacy Player Spawn or component player controller,
+/// resolve its `character` link to a Model + idle clip and queue
+/// an `InstanceMeta` so the same render path placed model instances
+/// follow renders the character at the spawn. `(mesh_id, clip_local)`
+/// is the cache key -- different player idle clips and different
+/// placed-instance clips each resolve to their own animation entry.
 ///
 /// Resolution rule mirrors the cooker:
 /// 1. Explicit `character` assignment wins.
@@ -1077,14 +1472,11 @@ fn walk_player_spawn_preview(
         if instances_meta.len() >= MAX_PREVIEW_MODEL_INSTANCES {
             break;
         }
-        let NodeKind::SpawnPoint {
-            player: true,
-            character,
-        } = &node.kind
-        else {
+        let Some(reference) = preview_player_reference(scene, node) else {
             continue;
         };
-        let Some(character_id) = resolve_player_spawn_character(project, *character) else {
+        let Some(character_id) = resolve_player_spawn_character(project, reference.character)
+        else {
             continue;
         };
         let Some(character_resource) = project.resource(character_id) else {
@@ -1132,10 +1524,15 @@ fn walk_player_spawn_preview(
             origin,
             instance_rotation,
             atlas: atlas_slot,
-            // Spawn node is selected, not the model -- but the
-            // preview gizmo still helps designers see *which*
-            // spawn they have selected.
-            is_selected: node.id == selected,
+            // Host/controller node is selected, not the model --
+            // but the preview gizmo still helps designers see
+            // which spawn/controller they have selected.
+            is_selected: preview_reference_selected(
+                selected,
+                node.id,
+                reference.controller_node,
+                None,
+            ),
             yaw_q12,
             world_height: model.world_height as i32,
         });
@@ -1215,11 +1612,11 @@ fn draw_model_selection_gizmo(meta: &InstanceMeta, scratch: &mut PreviewScratch)
 
     let cyan = FaceOutlineStyle {
         rgb: (0x40, 0xC8, 0xE8),
-        thickness_px: 3,
+        thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
     };
     let yellow = FaceOutlineStyle {
         rgb: (0xF0, 0xC8, 0x40),
-        thickness_px: 3,
+        thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
     };
     if origin_p.sz != 0 && top_p.sz != 0 {
         push_screen_line(scratch, origin_p, top_p, cyan);
@@ -1415,64 +1812,75 @@ fn projected_from_engine(projected: psx_engine::ProjectedVertex) -> psx_gte::sce
     }
 }
 
-/// Draw a horizontal radius ring at floor level for every
-/// `NodeKind::Light` in the scene. Selected lights get a
-/// thicker, brighter ring; unselected lights get a thin one
-/// in the light's own colour. Marker squares + selection
-/// gizmos are still drawn by `walk_entities` (the ring is
-/// additive).
+/// Draw a horizontal radius ring plus a host-side bulb icon for every
+/// legacy Light and component PointLight in the scene. The bulb
+/// replaces the old coloured square marker so lights read as editor
+/// light gizmos rather than generic entities.
 fn walk_light_gizmos(
     project: &ProjectDocument,
     grid: &WorldGrid,
     selected: psxed_project::NodeId,
+    hovered: Option<psxed_project::NodeId>,
     scratch: &mut PreviewScratch,
 ) {
     let scene = project.active_scene();
-    for node in scene.nodes() {
-        let NodeKind::Light {
-            color,
-            intensity: _,
-            radius,
-        } = &node.kind
-        else {
-            continue;
-        };
-        let center = node_room_local_origin(grid, &node.transform);
+    for light in preview_lights(scene) {
+        let center = node_room_local_origin(grid, &light.transform);
         let center_world = [center.x, center.y, center.z];
-        // Light radius is authored in *sector units*; scale to
-        // engine units so the ring matches the light's actual
-        // attenuation footprint.
-        let radius_engine = spatial::light_radius_engine_units(grid, *radius);
-        if radius_engine <= 0 {
-            continue;
-        }
-
-        let is_selected = node.id == selected;
+        let is_selected =
+            preview_reference_selected(selected, light.host_id, light.component_id, None);
+        let is_hovered = hovered.is_some_and(|id| {
+            preview_reference_selected(id, light.host_id, light.component_id, None)
+        });
         let style = if is_selected {
             FaceOutlineStyle {
                 rgb: (0xFF, 0xE0, 0x80),
-                thickness_px: 3,
+                thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
+            }
+        } else if is_hovered {
+            FaceOutlineStyle {
+                rgb: (0xFF, 0xF0, 0x90),
+                thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
             }
         } else {
             // Tint the unlit ring toward the authored colour
             // so multiple lights in a room read at a glance.
             FaceOutlineStyle {
-                rgb: (color[0].max(0x40), color[1].max(0x40), color[2].max(0x40)),
-                thickness_px: 1,
+                rgb: (
+                    light.color[0].max(0x40),
+                    light.color[1].max(0x40),
+                    light.color[2].max(0x40),
+                ),
+                thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
             }
         };
-        push_horizontal_ring(scratch, center_world, radius_engine, 16, style);
+        // Light radius is authored in *sector units*; scale to
+        // engine units so the ring matches the light's actual
+        // attenuation footprint. The bulb remains visible even
+        // for radius-zero lights.
+        let radius_engine = spatial::light_radius_engine_units(grid, light.radius);
+        if radius_engine > 0 {
+            push_horizontal_ring(scratch, center_world, radius_engine, 16, style);
+        }
+        push_light_bulb_icon(
+            scratch,
+            center_world,
+            (
+                light.color[0].max(0x40),
+                light.color[1].max(0x40),
+                light.color[2].max(0x40),
+            ),
+            is_selected || is_hovered,
+        );
     }
 }
 
 /// Wireframe AABB + facing arrow per selectable scene entity.
 /// Bounds are gathered by `EditorWorkspace::collect_entity_bounds`
-/// -- every entity-kind node (model, spawn, light, trigger,
-/// portal, audio source, legacy mesh) carries an AABB the user
-/// can click to select and drag to move. This pass renders the
-/// box wireframe so the user can *see* what they're picking;
-/// the picker itself runs in psxed-ui and never reads from the
-/// editor preview.
+/// -- every entity-kind node carries an AABB the user can click to
+/// select and drag to move. This pass renders the box wireframe for
+/// non-light markers; lights use the bulb/radius gizmo above instead
+/// of a generic cube.
 ///
 /// Idle bounds draw thin and muted so they don't dominate the
 /// viewport over the room they sit in. Hover and selected reuse
@@ -1485,6 +1893,9 @@ fn walk_entity_bounds(
     scratch: &mut PreviewScratch,
 ) {
     for b in bounds {
+        if matches!(b.kind, psxed_ui::EntityBoundKind::Light) {
+            continue;
+        }
         let is_selected = b.node == selected;
         let is_hovered = hovered == Some(b.node);
         let style = entity_bound_style(b.kind, is_selected, is_hovered);
@@ -1515,10 +1926,10 @@ fn entity_bound_style(
     hovered: bool,
 ) -> FaceOutlineStyle {
     if selected {
-        return FACE_OUTLINE_SELECTED;
+        return ENTITY_BOUND_SELECTED;
     }
     if hovered {
-        return FACE_OUTLINE_HOVER;
+        return ENTITY_BOUND_HOVER;
     }
     let rgb = match kind {
         psxed_ui::EntityBoundKind::Model => (0xC0, 0xC8, 0xD0),
@@ -1531,7 +1942,7 @@ fn entity_bound_style(
     };
     FaceOutlineStyle {
         rgb,
-        thickness_px: 1,
+        thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
     }
 }
 
@@ -1655,6 +2066,107 @@ fn push_horizontal_ring(
     let _ = prev_world; // silence the unused-final-assignment lint
 }
 
+fn push_light_bulb_icon(
+    scratch: &mut PreviewScratch,
+    center_world: [i32; 3],
+    rgb: (u8, u8, u8),
+    emphasized: bool,
+) {
+    let projected = gte_scene::project_vertex(world_to_view(center_world));
+    if projected.sz == 0 {
+        return;
+    }
+    let cx = projected.sx as f32;
+    let cy = projected.sy as f32;
+    let radius = if emphasized { 8.5 } else { 7.0 };
+    let icon = FaceOutlineStyle {
+        rgb,
+        thickness_px: if emphasized { 1.0 } else { 0.75 },
+    };
+    let glass = egui::pos2(cx, cy - radius * 0.28);
+    let segments = 16;
+    for i in 0..segments {
+        let a0 = i as f32 * std::f32::consts::TAU / segments as f32;
+        let a1 = (i + 1) as f32 * std::f32::consts::TAU / segments as f32;
+        push_overlay_line(
+            scratch,
+            egui::pos2(glass.x + a0.cos() * radius, glass.y + a0.sin() * radius),
+            egui::pos2(glass.x + a1.cos() * radius, glass.y + a1.sin() * radius),
+            icon,
+        );
+    }
+
+    let neck_y = glass.y + radius * 0.72;
+    let base_y = neck_y + radius * 0.62;
+    let neck_half = radius * 0.46;
+    let base_half = radius * 0.34;
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx - neck_half, neck_y),
+        egui::pos2(cx - base_half, base_y),
+        icon,
+    );
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx + neck_half, neck_y),
+        egui::pos2(cx + base_half, base_y),
+        icon,
+    );
+    for step in [0.0, 0.28, 0.56] {
+        let y = neck_y + radius * step;
+        push_overlay_line(
+            scratch,
+            egui::pos2(cx - base_half, y),
+            egui::pos2(cx + base_half, y),
+            icon,
+        );
+    }
+
+    let filament_y = glass.y + radius * 0.18;
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx - radius * 0.36, filament_y),
+        egui::pos2(cx - radius * 0.12, filament_y + radius * 0.2),
+        icon,
+    );
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx - radius * 0.12, filament_y + radius * 0.2),
+        egui::pos2(cx + radius * 0.12, filament_y + radius * 0.2),
+        icon,
+    );
+    push_overlay_line(
+        scratch,
+        egui::pos2(cx + radius * 0.12, filament_y + radius * 0.2),
+        egui::pos2(cx + radius * 0.36, filament_y),
+        icon,
+    );
+
+    if emphasized {
+        let halo = FaceOutlineStyle {
+            rgb: (0xFF, 0xFF, 0xFF),
+            thickness_px: 0.45,
+        };
+        let halo_radius = radius + 2.0;
+        for i in 0..segments {
+            let a0 = i as f32 * std::f32::consts::TAU / segments as f32;
+            let a1 = (i + 1) as f32 * std::f32::consts::TAU / segments as f32;
+            push_overlay_line(
+                scratch,
+                egui::pos2(
+                    glass.x + a0.cos() * halo_radius,
+                    glass.y + a0.sin() * halo_radius,
+                ),
+                egui::pos2(
+                    glass.x + a1.cos() * halo_radius,
+                    glass.y + a1.sin() * halo_radius,
+                ),
+                halo,
+            );
+        }
+    }
+}
+
 fn synth(sx: i16, sy: i16, sz: u16) -> psx_gte::scene::Projected {
     psx_gte::scene::Projected { sx, sy, sz }
 }
@@ -1667,11 +2179,27 @@ fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
         NodeKind::SpawnPoint { player: true, .. } => Some((0x60, 0xE0, 0x80)),
         NodeKind::SpawnPoint { player: false, .. } => Some((0x60, 0xB8, 0xF0)),
         NodeKind::MeshInstance { .. } => Some((0xC0, 0xC8, 0xD0)),
-        NodeKind::Light { color, .. } => Some((color[0], color[1], color[2])),
+        NodeKind::Entity => Some((0xA0, 0xB0, 0xC0)),
+        // Lights draw their own bulb icon + radius ring in
+        // `walk_light_gizmos`; using the generic billboard square
+        // makes them read like ordinary markers.
+        NodeKind::Light { .. } => None,
         NodeKind::Trigger { .. } => Some((0xC8, 0x80, 0xE0)),
         NodeKind::Portal { .. } => Some((0xFF, 0xB0, 0x60)),
         NodeKind::AudioSource { .. } => Some((0x70, 0xD8, 0xC0)),
-        NodeKind::Room { .. } | NodeKind::World | NodeKind::Node | NodeKind::Node3D => None,
+        NodeKind::ModelRenderer { .. }
+        | NodeKind::Animator { .. }
+        | NodeKind::Collider { .. }
+        | NodeKind::Interactable { .. }
+        | NodeKind::CharacterController { .. }
+        | NodeKind::AiController { .. }
+        | NodeKind::Combat { .. }
+        | NodeKind::Equipment { .. }
+        | NodeKind::PointLight { .. }
+        | NodeKind::Room { .. }
+        | NodeKind::World { .. }
+        | NodeKind::Node
+        | NodeKind::Node3D => None,
     }
 }
 
@@ -1808,7 +2336,12 @@ fn push_paint_preview(
             // outline ourselves -- `push_face_outline` short-
             // circuits when sx/sz are out of grid bounds.
             if sx == u16::MAX || sz == u16::MAX {
-                push_ghost_wall_outline(grid, world_cell_x, world_cell_z, dir, scratch);
+                let heights = grid.wall_heights_aligned_to_surfaces_for_world_cell(
+                    world_cell_x,
+                    world_cell_z,
+                    dir,
+                );
+                push_ghost_wall_outline(grid, world_cell_x, world_cell_z, dir, heights, scratch);
             } else {
                 push_face_outline(grid, face, FACE_OUTLINE_WALL_PAINT, scratch);
             }
@@ -1839,22 +2372,21 @@ fn push_cell_ghost_outline(grid: &WorldGrid, wcx: i32, wcz: i32, scratch: &mut P
     }
 }
 
-/// Outline a wall at world-cell `(wcx, wcz)` on edge `dir` with
-/// default heights `[0, 0, sector_size, sector_size]`. Used when
-/// `push_face_outline`'s array-bound check rejects an off-grid
+/// Outline a wall at world-cell `(wcx, wcz)` on edge `dir`. Used
+/// when `push_face_outline`'s array-bound check rejects an off-grid
 /// ghost so the user still sees where the wall will land.
 fn push_ghost_wall_outline(
     grid: &WorldGrid,
     wcx: i32,
     wcz: i32,
     dir: GridDirection,
+    heights: [i32; 4],
     scratch: &mut PreviewScratch,
 ) {
     let s = grid.sector_size;
     const LIFT: i32 = 4;
     let bounds = spatial::cell_bounds_from_world_cell(wcx, wcz, s);
-    let Some(corners) = spatial::editor_wall_outline_corners(bounds, dir, [0, 0, s, s], LIFT)
-    else {
+    let Some(corners) = spatial::editor_wall_outline_corners(bounds, dir, heights, LIFT) else {
         return;
     };
     let projected: [psx_gte::scene::Projected; 4] = [
@@ -1877,31 +2409,44 @@ fn push_ghost_wall_outline(
 }
 
 /// Hover and Selected outline styling. RGB plus screen-space line
-/// thickness in pixels; selected reads bolder so the user can spot
-/// it across a busy room. Thicknesses are at least 2 px because
-/// `push_screen_line` carries the line as two screen-space tris
-/// whose half-width gets truncated to integer pixels -- anything
-/// less collapses to a degenerate zero-width strip.
+/// thickness in pixels. Keep these light: they are editor affordances,
+/// not scene geometry, and thick strokes obscure PS1-scale surfaces.
 const FACE_OUTLINE_HOVER: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0xFF, 0xE0, 0x60),
-    thickness_px: 2,
+    thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
 };
 const FACE_OUTLINE_SELECTED: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0x60, 0xC8, 0xFF),
-    thickness_px: 4,
+    thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
+};
+const FACE_OUTLINE_ERROR: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0xFF, 0x40, 0x40),
+    thickness_px: 4.0,
+};
+const ENTITY_BOUND_HOVER: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0xFF, 0xE0, 0x60),
+    thickness_px: EDITOR_PREVIEW_HOVER_STROKE_WIDTH,
+};
+const ENTITY_BOUND_SELECTED: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0x60, 0xC8, 0xFF),
+    thickness_px: EDITOR_PREVIEW_SELECTED_STROKE_WIDTH,
 };
 /// PaintWall hover preview -- green for "this would be added /
-/// replaced". 3 px so it reads through the `FACE_OUTLINE_HOVER`
-/// yellow when both fire on the same face.
+/// replaced". Slightly stronger than hover, but still thin enough
+/// to leave the underlying face readable.
 const FACE_OUTLINE_WALL_PAINT: FaceOutlineStyle = FaceOutlineStyle {
     rgb: (0x60, 0xFF, 0x90),
-    thickness_px: 3,
+    thickness_px: EDITOR_PREVIEW_PAINT_STROKE_WIDTH,
+};
+const STREAMING_CHUNK_BOUNDARY: FaceOutlineStyle = FaceOutlineStyle {
+    rgb: (0x60, 0xFF, 0xC4),
+    thickness_px: 2.0,
 };
 
 #[derive(Copy, Clone)]
 struct FaceOutlineStyle {
     rgb: (u8, u8, u8),
-    thickness_px: i16,
+    thickness_px: f32,
 }
 
 /// Hover vs Selected -- outline style picker for the unified
@@ -1912,6 +2457,7 @@ struct FaceOutlineStyle {
 enum OutlineRole {
     Hover,
     Selected,
+    Error,
 }
 
 impl OutlineRole {
@@ -1919,6 +2465,7 @@ impl OutlineRole {
         match self {
             Self::Hover => FACE_OUTLINE_HOVER,
             Self::Selected => FACE_OUTLINE_SELECTED,
+            Self::Error => FACE_OUTLINE_ERROR,
         }
     }
 }
@@ -1941,6 +2488,38 @@ fn push_selection_outline(
         }
         psxed_ui::Selection::Vertex(vertex) => {
             push_vertex_outline(grid, vertex, role.face_style(), scratch);
+        }
+    }
+}
+
+fn push_streaming_chunk_boundaries(grid: &WorldGrid, scratch: &mut PreviewScratch) {
+    let plan = plan_generated_chunks(grid, playtest_streaming_chunk_config());
+    if plan.chunk_count() <= 1 {
+        return;
+    }
+    let s = grid.sector_size;
+    let y = 10;
+    for chunk in plan.chunks {
+        let x0 = chunk.world_origin[0] * s;
+        let z0 = chunk.world_origin[1] * s;
+        let x1 = x0 + chunk.size[0] as i32 * s;
+        let z1 = z0 + chunk.size[1] as i32 * s;
+        let projected: [psx_gte::scene::Projected; 4] = [
+            gte_scene::project_vertex(world_to_view([x0, y, z1])),
+            gte_scene::project_vertex(world_to_view([x1, y, z1])),
+            gte_scene::project_vertex(world_to_view([x1, y, z0])),
+            gte_scene::project_vertex(world_to_view([x0, y, z0])),
+        ];
+        if projected.iter().any(|p| p.sz == 0) {
+            continue;
+        }
+        for i in 0..4 {
+            push_screen_line(
+                scratch,
+                projected[i],
+                projected[(i + 1) % 4],
+                STREAMING_CHUNK_BOUNDARY,
+            );
         }
     }
 }
@@ -2151,14 +2730,10 @@ fn push_face_outline(
             ]
         }),
         psxed_ui::FaceKind::Wall { dir, stack } => {
-            // Default ghost heights span the full sector when the
-            // wall doesn't exist yet -- used by the PaintWall
-            // hover preview to outline where a brand-new wall
-            // would land.
             let h = sector
                 .and_then(|s| s.walls.get(dir).get(stack as usize))
                 .map(|wall| wall.heights)
-                .unwrap_or([0, 0, s, s]);
+                .unwrap_or_else(|| grid.wall_heights_aligned_to_surfaces(face.sx, face.sz, dir));
             // Inset along the wall's inward normal so the outline
             // sits inside the room rather than z-fighting the
             // wall surface when viewed from inside.
@@ -2190,84 +2765,52 @@ fn push_face_outline(
     }
 }
 
-/// Round-away-from-zero, clamped so any non-zero perpendicular is
-/// at least ±1 pixel. Keeps thin diagonal lines from collapsing to
-/// degenerate zero-width strips after `as i16` truncation.
-fn round_perp(value: f32) -> i16 {
-    if value > 0.0 {
-        (value + 0.5).max(1.0) as i16
-    } else if value < 0.0 {
-        (value - 0.5).min(-1.0) as i16
-    } else {
-        0
-    }
-}
-
-/// Emit two triangles forming a `thickness_px`-pixel-wide line
-/// between two screen-projected vertices. The OT slot is pinned at
-/// 0 so the line draws on top of everything.
+/// Queue one host-drawn overlay segment between two screen-projected
+/// vertices. Unlike the scene command log, this is painted by egui on
+/// top of the preview texture, so fractional widths and normal UI
+/// compositing work as expected.
 fn push_screen_line(
     scratch: &mut PreviewScratch,
     a: psx_gte::scene::Projected,
     b: psx_gte::scene::Projected,
     style: FaceOutlineStyle,
 ) {
-    // Perpendicular to (b - a) in screen space, normalised to
-    // `thickness_px / 2`. Width 0 (parallel a/b) collapses the line
-    // to a single screen point, which we just skip.
-    let dx = (b.sx as f32) - (a.sx as f32);
-    let dy = (b.sy as f32) - (a.sy as f32);
+    push_overlay_line(
+        scratch,
+        egui::pos2(a.sx as f32, a.sy as f32),
+        egui::pos2(b.sx as f32, b.sy as f32),
+        style,
+    );
+}
+
+fn push_overlay_line(
+    scratch: &mut PreviewScratch,
+    a: egui::Pos2,
+    b: egui::Pos2,
+    style: FaceOutlineStyle,
+) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
     let len = (dx * dx + dy * dy).sqrt();
     if len < 0.5 {
         return;
     }
-    let half = (style.thickness_px as f32) * 0.5;
-    // Round-away-from-zero on both components so a diagonal screen
-    // edge with a sub-pixel perpendicular doesn't collapse the line
-    // to zero width -- `0.707 as i16` truncates to 0, so a 2 px
-    // hover line on any tilted edge would otherwise disappear. We
-    // also clamp the magnitude to ≥ 1 px on the dominant axis so
-    // very thin slopes still render visibly.
-    let nx_f = -dy / len * half;
-    let ny_f = dx / len * half;
-    let nx = round_perp(nx_f);
-    let ny = round_perp(ny_f);
-    let a_lo = synth(a.sx.saturating_add(-nx), a.sy.saturating_add(-ny), a.sz);
-    let a_hi = synth(a.sx.saturating_add(nx), a.sy.saturating_add(ny), a.sz);
-    let b_lo = synth(b.sx.saturating_add(-nx), b.sy.saturating_add(-ny), b.sz);
-    let b_hi = synth(b.sx.saturating_add(nx), b.sy.saturating_add(ny), b.sz);
-    push_tri_at_slot(scratch, [a_lo, a_hi, b_lo], style.rgb, 0);
-    push_tri_at_slot(scratch, [b_lo, a_hi, b_hi], style.rgb, 0);
+    scratch
+        .overlay_lines
+        .push(psxed_ui::EditorViewportOverlayLine::new(
+            a,
+            b,
+            bright_overlay_color(style.rgb),
+            style.thickness_px,
+        ));
 }
 
-/// Lower-level [`push_tri`] that pins the OT slot rather than
-/// computing it from screen-space depth. Used for fixed-layer
-/// overlays (hover highlight, gizmos, …).
-fn push_tri_at_slot(
-    scratch: &mut PreviewScratch,
-    p: [psx_gte::scene::Projected; 3],
-    rgb: (u8, u8, u8),
-    slot: usize,
-) {
-    if scratch.used >= TRI_CAP {
-        return;
-    }
-    let idx = scratch.used;
-    scratch.tris[idx] = TriFlat::new(
-        [(p[0].sx, p[0].sy), (p[1].sx, p[1].sy), (p[2].sx, p[2].sy)],
-        rgb.0,
-        rgb.1,
-        rgb.2,
-    );
-    scratch.used = idx + 1;
-    let packet_ptr: *mut TriFlat = &mut scratch.tris[idx];
-    unsafe {
-        scratch.ot.insert(
-            slot.min(OT_DEPTH - 1),
-            packet_ptr.cast::<u32>(),
-            TriFlat::WORDS,
-        );
-    }
+fn bright_overlay_color(rgb: (u8, u8, u8)) -> egui::Color32 {
+    let lift = |channel: u8| -> u8 {
+        let c = channel as u16;
+        (c + ((255 - c) * 3 / 5)).min(255) as u8
+    };
+    egui::Color32::from_rgb(lift(rgb.0), lift(rgb.1), lift(rgb.2))
 }
 
 /// Stamp a GP0(02h) fill-rectangle into `scratch.clear_packet` and
@@ -2336,9 +2879,9 @@ fn projected_area(p: [psx_gte::scene::Projected; 3]) -> i32 {
 /// `tint` modulates the texel: PSX hardware computes
 /// `output = texel * tint / 0x80`, so `(0x80, 0x80, 0x80)` is a
 /// pass-through and `(0xFF, 0x60, 0x40)` saturates a grey texel
-/// toward terracotta. The editor uses the material-name keyword
-/// colour as the tint so a procedural-grey brick texture still
-/// reads as red until real cooked textures land.
+/// toward terracotta. Textured preview uses the authored material
+/// tint so it matches the cooked runtime path; flat fallback still
+/// uses material-name colours to keep untextured faces readable.
 fn push_tex_tri(
     scratch: &mut PreviewScratch,
     p: [psx_gte::scene::Projected; 3],
@@ -2402,17 +2945,30 @@ fn push_tri(scratch: &mut PreviewScratch, p: [psx_gte::scene::Projected; 3], rgb
 #[cfg(test)]
 mod tests {
     use super::{
-        face_side_visible, floor_anchored_model_origin, light_face, node_room_local_origin,
-        FaceShade,
+        face_side_visible, floor_anchored_model_origin, light_face, material_texture_tint,
+        node_room_local_origin, preview_lights, preview_model_reference, preview_player_reference,
+        preview_static_model_reference, push_wall_face, setup_gte_for_camera, FaceShade,
+        MaterialSlot, PreviewFog, WallEdge, PREVIEW_WALL_UVS, SCRATCH,
     };
     use psx_engine::{PointLightSample, WorldVertex};
     use psx_gte::scene::Projected;
-    use psxed_project::{MaterialFaceSidedness, WorldGrid};
+    use psxed_project::{
+        GridUvTransform, MaterialFaceSidedness, MaterialResource, NodeKind, ProjectDocument,
+        ResourceData, WorldGrid,
+    };
+    use psxed_ui::{ViewportCameraMode, ViewportCameraState};
 
     fn flat(r: u8, g: u8, b: u8) -> FaceShade {
         FaceShade::Flat {
             rgb: (r, g, b),
             sidedness: psxed_project::MaterialFaceSidedness::Front,
+        }
+    }
+
+    fn flat_sided(r: u8, g: u8, b: u8, sidedness: MaterialFaceSidedness) -> FaceShade {
+        FaceShade::Flat {
+            rgb: (r, g, b),
+            sidedness,
         }
     }
 
@@ -2423,8 +2979,187 @@ mod tests {
         }
     }
 
+    fn fog(rgb: (u8, u8, u8), near: i32, far: i32) -> PreviewFog {
+        PreviewFog {
+            enabled: true,
+            rgb,
+            near,
+            far,
+        }
+    }
+
     fn projected(sx: i16, sy: i16) -> Projected {
         Projected { sx, sy, sz: 100 }
+    }
+
+    #[test]
+    fn textured_preview_uses_authored_material_tint() {
+        let mut project = ProjectDocument::new("test");
+        let texture = project.add_resource(
+            "Brick Texture",
+            ResourceData::Texture {
+                psxt_path: "brick.psxt".to_string(),
+            },
+        );
+        let mut material = MaterialResource::opaque(Some(texture));
+        material.tint = [0x60, 0x70, 0x90];
+        let material = project.add_resource("Brick Wall", ResourceData::Material(material));
+
+        assert_eq!(
+            material_texture_tint(&project, material),
+            (0x60, 0x70, 0x90)
+        );
+    }
+
+    #[test]
+    fn wall_preview_uvs_use_runtime_grid_tile_span() {
+        let transform = GridUvTransform {
+            span: [0, 128],
+            ..GridUvTransform::IDENTITY
+        };
+
+        assert_eq!(
+            transform.apply_to_quad(PREVIEW_WALL_UVS),
+            [(0, 128), (64, 128), (64, 0), (0, 0)]
+        );
+    }
+
+    #[test]
+    fn component_model_reference_reads_renderer_and_animator_children() {
+        let mut project = ProjectDocument::new("test");
+        let model_id = project.add_resource(
+            "Dummy",
+            ResourceData::Texture {
+                psxt_path: "dummy.psxt".to_string(),
+            },
+        );
+        let scene = project.active_scene_mut();
+        let actor = scene.add_node(scene.root, "Enemy", NodeKind::Entity);
+        let renderer = scene.add_node(
+            actor,
+            "Model Renderer",
+            NodeKind::ModelRenderer {
+                model: Some(model_id),
+                material: None,
+            },
+        );
+        let animator = scene.add_node(
+            actor,
+            "Animator",
+            NodeKind::Animator {
+                clip: Some(3),
+                autoplay: true,
+            },
+        );
+
+        let scene = project.active_scene();
+        let reference = preview_model_reference(scene, scene.node(actor).unwrap()).unwrap();
+
+        assert_eq!(reference.model_id, model_id);
+        assert_eq!(reference.clip_override, Some(3));
+        assert_eq!(reference.renderer_node, Some(renderer));
+        assert_eq!(reference.animator_node, Some(animator));
+    }
+
+    #[test]
+    fn component_player_reference_reads_controller_child() {
+        let mut project = ProjectDocument::new("test");
+        let character_id = project.add_resource(
+            "Dummy",
+            ResourceData::Texture {
+                psxt_path: "dummy.psxt".to_string(),
+            },
+        );
+        let scene = project.active_scene_mut();
+        let actor = scene.add_node(scene.root, "Player", NodeKind::Entity);
+        let controller = scene.add_node(
+            actor,
+            "Character Controller",
+            NodeKind::CharacterController {
+                character: Some(character_id),
+                player: true,
+            },
+        );
+
+        let scene = project.active_scene();
+        let reference = preview_player_reference(scene, scene.node(actor).unwrap()).unwrap();
+
+        assert_eq!(reference.character, Some(character_id));
+        assert_eq!(reference.controller_node, Some(controller));
+    }
+
+    #[test]
+    fn player_controlled_entity_does_not_static_preview_model_renderer() {
+        let mut project = ProjectDocument::new("test");
+        let model_id = project.add_resource(
+            "Dummy Model",
+            ResourceData::Texture {
+                psxt_path: "dummy.psxt".to_string(),
+            },
+        );
+        let character_id = project.add_resource(
+            "Dummy Character",
+            ResourceData::Texture {
+                psxt_path: "dummy-character.psxt".to_string(),
+            },
+        );
+        let scene = project.active_scene_mut();
+        let actor = scene.add_node(scene.root, "Player", NodeKind::Entity);
+        scene.add_node(
+            actor,
+            "Model Renderer",
+            NodeKind::ModelRenderer {
+                model: Some(model_id),
+                material: None,
+            },
+        );
+        scene.add_node(
+            actor,
+            "Character Controller",
+            NodeKind::CharacterController {
+                character: Some(character_id),
+                player: true,
+            },
+        );
+
+        let scene = project.active_scene();
+        let actor_node = scene.node(actor).unwrap();
+        assert!(
+            preview_model_reference(scene, actor_node).is_some(),
+            "the raw renderer reference is still present"
+        );
+        assert!(
+            preview_static_model_reference(scene, actor_node).is_none(),
+            "player-controlled renderers are drawn by the player preview path"
+        );
+    }
+
+    #[test]
+    fn component_point_light_uses_host_transform() {
+        let mut project = ProjectDocument::new("test");
+        let scene = project.active_scene_mut();
+        let host = scene.add_node(scene.root, "Lamp", NodeKind::Entity);
+        scene.node_mut(host).unwrap().transform.translation = [2.0, 0.5, 3.0];
+        let light = scene.add_node(
+            host,
+            "Point Light",
+            NodeKind::PointLight {
+                color: [1, 2, 3],
+                intensity: 0.75,
+                radius: 4.0,
+            },
+        );
+        scene.node_mut(light).unwrap().transform.translation = [99.0, 99.0, 99.0];
+
+        let lights = preview_lights(project.active_scene());
+
+        assert_eq!(lights.len(), 1);
+        assert_eq!(lights[0].host_id, host);
+        assert_eq!(lights[0].component_id, Some(light));
+        assert_eq!(lights[0].transform.translation, [2.0, 0.5, 3.0]);
+        assert_eq!(lights[0].color, [1, 2, 3]);
+        assert_eq!(lights[0].intensity, 0.75);
+        assert_eq!(lights[0].radius, 4.0);
     }
 
     #[test]
@@ -2438,6 +3173,101 @@ mod tests {
         assert!(face_side_visible(MaterialFaceSidedness::Back, back));
         assert!(face_side_visible(MaterialFaceSidedness::Both, front));
         assert!(face_side_visible(MaterialFaceSidedness::Both, back));
+    }
+
+    #[test]
+    fn editor_cardinal_wall_backs_face_their_owning_cell() {
+        let cases = [
+            (WallEdge::North, [512, 512, 512], 2048, [512, 512, 1536], 0),
+            (
+                WallEdge::East,
+                [512, 512, 512],
+                3072,
+                [1536, 512, 512],
+                1024,
+            ),
+            (WallEdge::South, [512, 512, 512], 0, [512, 512, -512], 2048),
+            (
+                WallEdge::West,
+                [512, 512, 512],
+                1024,
+                [-512, 512, 512],
+                3072,
+            ),
+        ];
+
+        for (edge, inside_pos, inside_yaw, outside_pos, outside_yaw) in cases {
+            assert!(
+                wall_face_emits_from_camera(
+                    edge,
+                    inside_pos,
+                    inside_yaw,
+                    MaterialFaceSidedness::Back
+                ),
+                "{edge:?} wall back side should render from inside the owning cell"
+            );
+            assert!(
+                !wall_face_emits_from_camera(
+                    edge,
+                    inside_pos,
+                    inside_yaw,
+                    MaterialFaceSidedness::Front
+                ),
+                "{edge:?} wall front side should not render from inside the owning cell"
+            );
+            assert!(
+                !wall_face_emits_from_camera(
+                    edge,
+                    outside_pos,
+                    outside_yaw,
+                    MaterialFaceSidedness::Back
+                ),
+                "{edge:?} wall back side should not render from outside the owning cell"
+            );
+            assert!(
+                wall_face_emits_from_camera(
+                    edge,
+                    outside_pos,
+                    outside_yaw,
+                    MaterialFaceSidedness::Front
+                ),
+                "{edge:?} wall front side should render from outside the owning cell"
+            );
+        }
+    }
+
+    fn wall_face_emits_from_camera(
+        edge: WallEdge,
+        position: [i32; 3],
+        yaw_q12: u16,
+        sidedness: MaterialFaceSidedness,
+    ) -> bool {
+        let _camera = setup_gte_for_camera(ViewportCameraState {
+            mode: ViewportCameraMode::Free,
+            yaw_q12,
+            pitch_q12: 0,
+            radius: 1024,
+            target: [512, 512, 512],
+            position,
+        });
+        let mut scratch = SCRATCH.lock().expect("editor preview scratch mutex");
+        scratch.used = 0;
+        scratch.tex_used = 0;
+        scratch.overlay_lines.clear();
+        scratch.ot.clear();
+
+        push_wall_face(
+            &mut scratch,
+            [0, 1024, 0, 1024],
+            edge,
+            [0, 0, 1024, 1024],
+            None,
+            GridUvTransform::default(),
+            flat_sided(128, 128, 128, sidedness),
+            position,
+        );
+
+        scratch.used > 0 || scratch.tex_used > 0
     }
 
     #[test]
@@ -2476,6 +3306,36 @@ mod tests {
     fn floor_anchored_model_origin_ignores_negative_height() {
         let origin = floor_anchored_model_origin(WorldVertex::new(10, 32, 20), -128);
         assert_eq!(origin, WorldVertex::new(10, 32, 20));
+    }
+
+    #[test]
+    fn preview_fog_blends_after_near_plane() {
+        let fog = fog((10, 20, 30), 100, 300);
+
+        assert_eq!(fog.apply_rgb((110, 120, 130), 100), (110, 120, 130));
+        assert_eq!(fog.apply_rgb((110, 120, 130), 200), (60, 70, 80));
+        assert_eq!(fog.apply_rgb((110, 120, 130), 300), (10, 20, 30));
+        assert_eq!(fog.apply_rgb((110, 120, 130), 900), (10, 20, 30));
+    }
+
+    #[test]
+    fn preview_fog_applies_to_flat_and_textured_tints() {
+        let fog = fog((0, 0, 0), 0, 256);
+        let flat = fog.apply_shade(flat(128, 64, 32), 128);
+        let textured = fog.apply_shade(
+            FaceShade::Textured {
+                slot: MaterialSlot {
+                    tpage_word: 0,
+                    clut_word: 0,
+                },
+                tint: (128, 64, 32),
+                sidedness: psxed_project::MaterialFaceSidedness::Front,
+            },
+            128,
+        );
+
+        assert_eq!(unpack(flat), (64, 32, 16));
+        assert_eq!(unpack(textured), (64, 32, 16));
     }
 
     #[test]

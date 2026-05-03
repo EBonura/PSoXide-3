@@ -195,6 +195,10 @@ pub struct PortBindings {
     pub start: InputBinding,
     /// Select.
     pub select: InputBinding,
+    /// Right stick click (DualShock R3). Used by the embedded playtest
+    /// for lock-on / target toggling.
+    #[serde(default)]
+    pub r3: InputBinding,
     /// DualShock Analog button. This is not part of the normal
     /// button bitmask; it toggles whether the controller reports
     /// Digital (`0x41`) or Analog (`0x73`) poll IDs.
@@ -225,9 +229,14 @@ impl Default for PortBindings {
             r2: InputBinding::Character('3'),
             start: InputBinding::named("Enter"),
             select: InputBinding::named("Backspace"),
+            r3: default_port1_r3_binding(),
             analog: default_port1_analog_binding(),
         }
     }
+}
+
+fn default_port1_r3_binding() -> InputBinding {
+    InputBinding::Character('r')
 }
 
 fn default_port1_analog_binding() -> InputBinding {
@@ -264,6 +273,7 @@ impl Default for InputSettings {
                 r2: InputBinding::Unbound,
                 start: InputBinding::Unbound,
                 select: InputBinding::Unbound,
+                r3: InputBinding::Unbound,
                 analog: InputBinding::Unbound,
             },
         }
@@ -475,6 +485,10 @@ impl Settings {
             self.input.port1.analog = default_port1_analog_binding();
             self.input.port2.analog = InputBinding::Unbound;
         }
+        if self.version < 3 {
+            self.input.port1.r3 = default_port1_r3_binding();
+            self.input.port2.r3 = InputBinding::Unbound;
+        }
         self.version = SETTINGS_VERSION;
     }
 }
@@ -564,6 +578,7 @@ mod tests {
         assert_eq!(loaded.input.port1.circle, InputBinding::named("Space"));
         assert_eq!(loaded.input.port2.start, InputBinding::Unbound);
         assert_eq!(loaded.input.port1.analog, default_port1_analog_binding());
+        assert_eq!(loaded.input.port1.r3, default_port1_r3_binding());
     }
 
     #[test]
@@ -616,6 +631,8 @@ mod tests {
         assert_eq!(loaded.version, crate::SETTINGS_VERSION);
         assert_eq!(loaded.input.port1.analog, default_port1_analog_binding());
         assert_eq!(loaded.input.port2.analog, InputBinding::Unbound);
+        assert_eq!(loaded.input.port1.r3, default_port1_r3_binding());
+        assert_eq!(loaded.input.port2.r3, InputBinding::Unbound);
     }
 
     #[test]

@@ -158,6 +158,7 @@ impl MenuState {
         let categories = vec![
             build_games_category(&[]),
             build_examples_category(&[]),
+            build_projects_category(&[]),
             build_settings_category(),
             build_create_category(false),
             build_system_category(running),
@@ -183,12 +184,17 @@ impl MenuState {
         }
     }
 
-    /// Rebuild the Games + Examples categories from a library
+    /// Rebuild the Games + Examples + Projects categories from a library
     /// snapshot. Call after load, after a rescan, and whenever the
     /// library changes. Existing selection is preserved when
     /// possible (same category + in-range item) and clamped to the
     /// new bounds otherwise.
-    pub fn set_library(&mut self, games: &[LibraryItem], examples: &[LibraryItem]) {
+    pub fn set_library(
+        &mut self,
+        games: &[LibraryItem],
+        examples: &[LibraryItem],
+        projects: &[LibraryItem],
+    ) {
         // Snapshot the current selection's category NAME so we can
         // re-resolve after rebuilding (indices may change).
         let current_cat_name = self
@@ -202,6 +208,9 @@ impl MenuState {
         }
         if let Some(examples_cat) = self.categories.get_mut(1) {
             *examples_cat = build_examples_category(examples);
+        }
+        if let Some(projects_cat) = self.categories.get_mut(2) {
+            *projects_cat = build_projects_category(projects);
         }
 
         // Try to preserve the user's category if it still exists.
@@ -686,6 +695,42 @@ fn build_examples_category(examples: &[LibraryItem]) -> Category {
     }
 }
 
+/// Construct the Projects category. These are project-baked PSX EXEs
+/// discovered under `editor/projects`, separated from SDK examples so
+/// authored games have their own launch surface.
+fn build_projects_category(projects: &[LibraryItem]) -> Category {
+    let mut items = Vec::with_capacity(projects.len() + 1);
+    if projects.is_empty() {
+        items.push(MenuItem {
+            label: "No project builds found".into(),
+            action: MenuAction::RescanLibrary,
+            value: Some("Refresh".into()),
+        });
+    } else {
+        for p in projects {
+            items.push(MenuItem {
+                label: p.title.clone(),
+                action: MenuAction::LaunchGame(p.id.clone()),
+                value: if p.subtitle.is_empty() {
+                    None
+                } else {
+                    Some(p.subtitle.clone())
+                },
+            });
+        }
+        items.push(MenuItem {
+            label: "Refresh library".into(),
+            action: MenuAction::RescanLibrary,
+            value: Some("↻".into()),
+        });
+    }
+    Category {
+        name: "Projects",
+        icon: icons::LAYERS,
+        items,
+    }
+}
+
 /// Host-side creation tools.
 fn build_create_category(editor_open: bool) -> Category {
     Category {
@@ -786,14 +831,15 @@ mod tests {
     #[test]
     fn fresh_state_has_expected_categories() {
         let s = MenuState::new();
-        assert_eq!(s.categories.len(), 7);
+        assert_eq!(s.categories.len(), 8);
         assert_eq!(s.categories[0].name, "Games");
         assert_eq!(s.categories[1].name, "Examples");
-        assert_eq!(s.categories[2].name, "Settings");
-        assert_eq!(s.categories[3].name, "Create");
-        assert_eq!(s.categories[4].name, "System");
-        assert_eq!(s.categories[5].name, "Debug");
-        assert_eq!(s.categories[6].name, "Quit");
+        assert_eq!(s.categories[2].name, "Projects");
+        assert_eq!(s.categories[3].name, "Settings");
+        assert_eq!(s.categories[4].name, "Create");
+        assert_eq!(s.categories[5].name, "System");
+        assert_eq!(s.categories[6].name, "Debug");
+        assert_eq!(s.categories[7].name, "Quit");
     }
 
     #[test]
@@ -809,6 +855,7 @@ mod tests {
         s.set_library(
             &[dummy_item("g1", "Crash", "NTSC-U · 600 MiB")],
             &[dummy_item("e1", "hello-tri", "EXE")],
+            &[dummy_item("p1", "Stone Room", "Project")],
         );
         assert_eq!(s.categories[0].items[0].label, "Crash");
         assert_eq!(
@@ -821,31 +868,32 @@ mod tests {
             MenuAction::RescanLibrary
         );
         assert_eq!(s.categories[1].items[0].label, "hello-tri");
+        assert_eq!(s.categories[2].items[0].label, "Stone Room");
     }
 
     #[test]
     fn set_library_preserves_category_across_rebuild() {
         let mut s = MenuState::new();
         // Move to "System" category before rebuilding.
-        s.category_index = 4;
-        s.set_library(&[], &[]);
+        s.category_index = 5;
+        s.set_library(&[], &[], &[]);
         assert_eq!(s.current_category(), Some("System"));
     }
 
     #[test]
     fn sync_run_label_flips_system_run_item() {
         let mut s = MenuState::new();
-        assert_eq!(s.categories[4].items[0].label, "Run");
+        assert_eq!(s.categories[5].items[0].label, "Run");
         s.sync_run_label(true);
-        assert_eq!(s.categories[4].items[0].label, "Pause");
+        assert_eq!(s.categories[5].items[0].label, "Pause");
         s.sync_run_label(false);
-        assert_eq!(s.categories[4].items[0].label, "Run");
+        assert_eq!(s.categories[5].items[0].label, "Run");
     }
 
     #[test]
     fn sync_fast_boot_label_flips_system_value() {
         let mut s = MenuState::new();
-        let fast_boot = s.categories[4]
+        let fast_boot = s.categories[5]
             .items
             .iter()
             .find(|item| item.action == MenuAction::ToggleFastBoot)
@@ -853,7 +901,7 @@ mod tests {
         assert_eq!(fast_boot.value.as_deref(), Some("On"));
 
         s.sync_fast_boot_label(false);
-        let fast_boot = s.categories[4]
+        let fast_boot = s.categories[5]
             .items
             .iter()
             .find(|item| item.action == MenuAction::ToggleFastBoot)
@@ -861,7 +909,7 @@ mod tests {
         assert_eq!(fast_boot.value.as_deref(), Some("Off"));
 
         s.sync_fast_boot_label(true);
-        let fast_boot = s.categories[4]
+        let fast_boot = s.categories[5]
             .items
             .iter()
             .find(|item| item.action == MenuAction::ToggleFastBoot)
@@ -880,12 +928,14 @@ mod tests {
                 dummy_item("c", "C", ""),
             ],
             &[],
+            &[],
         );
         let right = MenuInput {
             right: true,
             ..Default::default()
         };
         s.update(&right); // Examples
+        s.update(&right); // Projects
         s.update(&right); // Settings
         s.update(&right); // Create
         s.update(&right); // System
@@ -912,6 +962,7 @@ mod tests {
                 dummy_item("b", "B", ""),
                 dummy_item("c", "C", ""),
             ],
+            &[],
             &[],
         );
 
@@ -945,10 +996,11 @@ mod tests {
     fn sync_settings_paths_updates_menu_values() {
         let mut s = MenuState::new();
         s.sync_settings_paths("SCPH1001.BIN", "ps1 games");
+        assert_eq!(s.categories[2].items[0].value.as_deref(), Some("Refresh"));
         assert_eq!(
-            s.categories[2].items[0].value.as_deref(),
+            s.categories[3].items[0].value.as_deref(),
             Some("SCPH1001.BIN")
         );
-        assert_eq!(s.categories[2].items[1].value.as_deref(), Some("ps1 games"));
+        assert_eq!(s.categories[3].items[1].value.as_deref(), Some("ps1 games"));
     }
 }

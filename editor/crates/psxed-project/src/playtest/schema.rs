@@ -81,6 +81,14 @@ pub struct PlaytestRoom {
     /// Number of material records in the slice. Matches the
     /// cooked `.psxw`'s material count exactly.
     pub material_count: u16,
+    /// Fog/depth-cue far colour.
+    pub fog_rgb: [u8; 3],
+    /// Fog start distance in engine units.
+    pub fog_near: i32,
+    /// Fog end distance in engine units.
+    pub fog_far: i32,
+    /// Room flags mirrored into the runtime manifest.
+    pub flags: u16,
 }
 
 /// One material slot binding. Lifted from
@@ -116,6 +124,21 @@ pub struct PlaytestModelClip {
     pub animation_asset_index: usize,
 }
 
+/// One named model attachment socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaytestModelSocket {
+    /// Owning model index.
+    pub model: u16,
+    /// Socket name used by Equipment records.
+    pub name: String,
+    /// Joint index in the cooked model skeleton.
+    pub joint: u16,
+    /// Local translation relative to the joint pose.
+    pub translation: [i32; 3],
+    /// Local Euler rotation in Q12 turns: X/Y/Z.
+    pub rotation_q12: [i16; 3],
+}
+
 /// One cooked PSX model included in the playtest package. A
 /// [`ResourceData::Model`] referenced by any placed instance is
 /// promoted into one `PlaytestModel`; multiple instances share
@@ -147,6 +170,10 @@ pub struct PlaytestModel {
     /// Cooker validation guarantees this is `< clip_count`,
     /// so the runtime always has a clip to play.
     pub default_clip: u16,
+    /// First index in [`PlaytestPackage::model_sockets`].
+    pub socket_first: u16,
+    /// Number of sockets on this model.
+    pub socket_count: u16,
     /// World-space height (engine units) -- propagated from the
     /// editor resource.
     pub world_height: u16,
@@ -179,6 +206,86 @@ pub struct PlaytestModelInstance {
 /// "inherit model default" -- same value as
 /// [`psx_level::MODEL_CLIP_INHERIT`].
 pub const MODEL_CLIP_INHERIT: u16 = 0xFFFF;
+
+/// Weapon-local hit shape, ready for manifest emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaytestWeaponHitShape {
+    /// Box hit volume.
+    Box {
+        /// Local center.
+        center: [i32; 3],
+        /// Half extents.
+        half_extents: [u16; 3],
+    },
+    /// Capsule hit volume.
+    Capsule {
+        /// Local start.
+        start: [i32; 3],
+        /// Local end.
+        end: [i32; 3],
+        /// Radius.
+        radius: u16,
+    },
+}
+
+/// One weapon hitbox and active animation-frame window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaytestWeaponHitbox {
+    /// Display name.
+    pub name: String,
+    /// Local shape.
+    pub shape: PlaytestWeaponHitShape,
+    /// First active frame.
+    pub active_start_frame: u16,
+    /// Last active frame.
+    pub active_end_frame: u16,
+}
+
+/// Cooked weapon resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaytestWeapon {
+    /// Display name.
+    pub name: String,
+    /// Source resource id.
+    pub source_resource: ResourceId,
+    /// Optional visual model index.
+    pub model: Option<u16>,
+    /// Character socket this weapon expects by default.
+    pub default_character_socket: String,
+    /// Weapon-local grip/pivot name.
+    pub grip_name: String,
+    /// Weapon-local grip translation.
+    pub grip_translation: [i32; 3],
+    /// Weapon-local grip rotation, Q12 turns.
+    pub grip_rotation_q12: [i16; 3],
+    /// First index in [`PlaytestPackage::weapon_hitboxes`].
+    pub hitbox_first: u16,
+    /// Number of hitboxes.
+    pub hitbox_count: u16,
+}
+
+/// Cooked Equipment component on an Entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaytestEquipment {
+    /// Owning room.
+    pub room: u16,
+    /// Weapon index.
+    pub weapon: u16,
+    /// Parent entity room-local X.
+    pub x: i32,
+    /// Parent entity room-local Y.
+    pub y: i32,
+    /// Parent entity room-local Z.
+    pub z: i32,
+    /// Parent entity yaw.
+    pub yaw: i16,
+    /// Character socket to follow.
+    pub character_socket: String,
+    /// Weapon grip/pivot to align.
+    pub weapon_grip: String,
+    /// Runtime flags. Bit 0 = follows the live player controller.
+    pub flags: u16,
+}
 
 /// One placed point light, room-local engine units. Mirrors
 /// [`psx_level::PointLightRecord`] one-for-one -- intensity is
@@ -322,8 +429,16 @@ pub struct PlaytestPackage {
     pub models: Vec<PlaytestModel>,
     /// Per-model clip records ordered as `(model, clip_index)`.
     pub model_clips: Vec<PlaytestModelClip>,
+    /// Per-model socket records ordered as `(model, socket_index)`.
+    pub model_sockets: Vec<PlaytestModelSocket>,
     /// Placed model instances, room-local coordinates.
     pub model_instances: Vec<PlaytestModelInstance>,
+    /// Weapon hitboxes, shared by [`Self::weapons`].
+    pub weapon_hitboxes: Vec<PlaytestWeaponHitbox>,
+    /// Cooked Weapon resources, deduplicated by source resource id.
+    pub weapons: Vec<PlaytestWeapon>,
+    /// Equipment components placed in rooms.
+    pub equipment: Vec<PlaytestEquipment>,
     /// Placed point lights, room-local coordinates.
     pub lights: Vec<PlaytestLight>,
     /// Single player spawn -- required.

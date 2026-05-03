@@ -72,6 +72,15 @@ impl Workspace {
     }
 }
 
+/// Work to perform after the shared editor-playtest MIPS build exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditorBuildCompletion {
+    /// Load the built EXE into the embedded editor viewport.
+    RunEmbedded,
+    /// Copy the built EXE into the active project's baked output folder.
+    ExportProject { dest_path: PathBuf },
+}
+
 /// Top-level app state. Owns the emulator state directly -- no Arc/Mutex,
 /// single-threaded, UI reads state in-place per frame.
 pub struct AppState {
@@ -82,6 +91,8 @@ pub struct AppState {
     pub editor: EditorWorkspace,
     /// In-process playtest launched from the editor viewport.
     pub embedded_playtest: EmbeddedPlaytestState,
+    /// Deferred action attached to the currently running editor build.
+    editor_build_completion: Option<EditorBuildCompletion>,
     pub panels: PanelVisibility,
     /// Framebuffer mode -- shared HW renderer at native scale vs
     /// window-fitted high resolution. Toggled via the debug toolbar.
@@ -240,6 +251,7 @@ impl AppState {
             workspace: Workspace::Emulator,
             editor,
             embedded_playtest: EmbeddedPlaytestState::default(),
+            editor_build_completion: None,
             panels: PanelVisibility::default(),
             scale_mode: ScaleMode::default(),
             framebuffer_present_size_px: (320, 240),
@@ -262,7 +274,7 @@ impl AppState {
             audio_volume: 1.0,
             audio_muted: false,
         };
-        // Startup auto-rescan: always run when the SDK-examples dir
+        // Startup auto-rescan: always run when a developer-facing build dir
         // exists so stale `library.ron` entries (e.g. cargo
         // `deps/<name>-<hash>.exe` intermediates picked up by an
         // earlier version of the scanner before the deps/ filter
@@ -271,13 +283,17 @@ impl AppState {
         // "number of files that changed since last scan" -- cheap
         // on every boot.
         //
-        // Scoped to "SDK dir exists" so an end-user install without
-        // the MIPS toolchain doesn't pay the cost every startup.
-        if let Some(sdk_dir) = out.resolve_sdk_examples_dir() {
-            if sdk_dir.exists() {
-                if let Err(e) = out.rescan_library() {
-                    eprintln!("[frontend] startup auto-rescan skipped: {e}");
-                }
+        // Scoped to "SDK/project dirs exist" so an end-user install
+        // without local builds doesn't pay the cost every startup.
+        let sdk_exists = out
+            .resolve_sdk_examples_dir()
+            .is_some_and(|sdk_dir| sdk_dir.exists());
+        let projects_exist = out
+            .resolve_editor_projects_dir()
+            .is_some_and(|projects_dir| projects_dir.exists());
+        if sdk_exists || projects_exist {
+            if let Err(e) = out.rescan_library() {
+                eprintln!("[frontend] startup auto-rescan skipped: {e}");
             }
         }
         // Seed the Menu's Games + Examples columns from the (now
@@ -426,12 +442,14 @@ impl AppState {
     }
 
     /// Walk the configured library root(s) and update the cache.
-    /// Scans TWO roots in one pass:
+    /// Scans roots in one pass:
     ///
     /// 1. `settings.paths.game_library` -- user's retail-disc folder.
     /// 2. `settings.paths.sdk_examples` (or auto-detected
     ///    `build/examples/mipsel-sony-psx/release/` under the repo
     ///    root) -- `.exe` homebrew built by `make examples`.
+    /// 3. Auto-detected `editor/projects/` under the repo root --
+    ///    project-baked `.exe`s surfaced in the Projects category.
     ///
     /// Either can be missing without erroring. If neither yields
     /// entries, the Menu's columns show the "No … found" placeholder
@@ -447,6 +465,7 @@ impl AppState {
             Some(PathBuf::from(game_library))
         };
         let sdk_root = self.resolve_sdk_examples_dir();
+        let projects_root = self.resolve_editor_projects_dir();
 
         // No roots → still not an error; the UI shows empty columns.
         // Matches the "fresh clone, user hasn't set a library yet"
@@ -465,6 +484,9 @@ impl AppState {
             // doesn't deserve an error. `scan_roots` silently skips
             // missing roots for exactly this reason.
             roots.push(s);
+        }
+        if let Some(p) = projects_root.clone() {
+            roots.push(p);
         }
 
         let root_refs: Vec<&std::path::Path> = roots.iter().map(|p| p.as_path()).collect();
@@ -508,8 +530,18 @@ impl AppState {
         Some(candidate)
     }
 
-    /// Project the current library into the Menu's Games + Examples
-    /// columns. Three passes:
+    /// Resolve the editor projects root used for launchable project
+    /// builds. The editor owns the project folders; the frontend only
+    /// scans them for `.exe` outputs so baked builds can be launched
+    /// without opening the editor first.
+    fn resolve_editor_projects_dir(&self) -> Option<PathBuf> {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest.parent()?.parent()?.parent()?;
+        Some(repo_root.join("editor/projects"))
+    }
+
+    /// Project the current library into the Menu's Games + Examples +
+    /// Projects columns. Three passes:
     ///
     /// 1. Walk every CUE entry and parse it to find its primary
     ///    (data-track) BIN. Build a map
@@ -547,8 +579,10 @@ impl AppState {
         // Pass 2: project entries, applying dedup + title overrides.
         let mut games: Vec<MenuLibraryItem> = Vec::new();
         let mut examples: Vec<MenuLibraryItem> = Vec::new();
+        let mut projects: Vec<MenuLibraryItem> = Vec::new();
         let mut cue_already_listed: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        let project_root = self.resolve_editor_projects_dir().filter(|p| p.exists());
 
         for e in &self.library.entries {
             let label = e
@@ -591,11 +625,21 @@ impl AppState {
                     });
                 }
                 GameKind::Exe if is_internal_example_exe(&e.path) => continue,
-                GameKind::Exe => examples.push(MenuLibraryItem {
-                    id: e.id.clone(),
-                    title: e.title.clone(),
-                    subtitle: format_subtitle(e),
-                }),
+                GameKind::Exe => {
+                    let item = MenuLibraryItem {
+                        id: e.id.clone(),
+                        title: e.title.clone(),
+                        subtitle: format_subtitle(e),
+                    };
+                    if project_root
+                        .as_ref()
+                        .is_some_and(|root| path_is_under(&e.path, root))
+                    {
+                        projects.push(item);
+                    } else {
+                        examples.push(item);
+                    }
+                }
                 GameKind::Unknown => {}
             }
         }
@@ -603,7 +647,8 @@ impl AppState {
         // Pass 3: stable alphabetical order per column.
         games.sort_by_key(|a| a.title.to_lowercase());
         examples.sort_by_key(|a| a.title.to_lowercase());
-        self.menu.set_library(&games, &examples);
+        projects.sort_by_key(|a| a.title.to_lowercase());
+        self.menu.set_library(&games, &examples, &projects);
     }
 
     /// Persist the current `Settings` to `settings.ron`. Called
@@ -810,13 +855,14 @@ impl AppState {
         self.embedded_playtest.input_captured()
     }
 
-    /// Cook the active editor project, then spawn the existing MIPS
-    /// build target. The build is asynchronous; call
+    /// Build and run the active editor project: cook assets, spawn
+    /// the existing MIPS build target, then side-load the EXE. The
+    /// build is asynchronous; call
     /// [`Self::poll_embedded_playtest_build`] once per frame to load
     /// the resulting EXE when it exits successfully.
     pub fn start_embedded_playtest(&mut self) {
         self.stop_embedded_playtest();
-        self.editor.set_status("Cooking embedded playtest...");
+        self.editor.set_status("Play: cooking assets...");
         if let Err(error) = self.save_editor_project() {
             let message = format!("Embedded Play failed: {error}");
             self.editor.set_status(message.clone());
@@ -826,15 +872,69 @@ impl AppState {
         let cook_status = match self.editor.cook_playtest_to_disk() {
             Ok(status) => status,
             Err(error) => {
-                let message = format!("Embedded Play cook failed: {error}");
+                let message = format!("Embedded Play failed while cooking assets: {error}");
                 self.editor.set_status(message.clone());
                 self.embedded_playtest.fail();
                 return;
             }
         };
         self.editor
-            .set_status(format!("{cook_status}; building editor-playtest..."));
+            .set_status(format!("{cook_status}; compiling runtime..."));
 
+        if let Err(error) = self.spawn_editor_playtest_build(
+            EditorBuildCompletion::RunEmbedded,
+            "Building embedded playtest",
+        ) {
+            let message = format!("Embedded Play build failed: {error}");
+            self.editor.set_status(message.clone());
+            self.embedded_playtest.fail();
+        }
+    }
+
+    /// Build the active project by cooking assets, compiling the runtime,
+    /// and copying the resulting PSX EXE into the project folder so the
+    /// launcher Projects category can run it without opening the editor.
+    pub fn build_current_project_for_launcher(&mut self) {
+        self.stop_embedded_playtest();
+        self.editor
+            .set_status("Building project: cooking assets...");
+        if let Err(error) = self.save_editor_project() {
+            let message = format!("Project build failed: {error}");
+            self.editor.set_status(message.clone());
+            self.embedded_playtest.fail();
+            return;
+        }
+        let dest_path =
+            project_baked_exe_path(self.editor.project_dir(), &self.editor.project().name);
+        let cook_status = match self.editor.cook_playtest_to_disk() {
+            Ok(status) => status,
+            Err(error) => {
+                let message = format!("Project build failed while cooking assets: {error}");
+                self.editor.set_status(message.clone());
+                self.embedded_playtest.fail();
+                return;
+            }
+        };
+        self.editor.set_status(format!(
+            "{cook_status}; compiling project EXE for {}...",
+            dest_path.display()
+        ));
+
+        if let Err(error) = self.spawn_editor_playtest_build(
+            EditorBuildCompletion::ExportProject { dest_path },
+            "Building project EXE",
+        ) {
+            let message = format!("Project build failed: {error}");
+            self.editor.set_status(message.clone());
+            self.embedded_playtest.fail();
+        }
+    }
+
+    fn spawn_editor_playtest_build(
+        &mut self,
+        completion: EditorBuildCompletion,
+        toast: &'static str,
+    ) -> Result<(), String> {
         let workspace_root = repo_root_dir();
         let mut command = Command::new("make");
         command
@@ -842,21 +942,17 @@ impl AppState {
             .current_dir(&workspace_root)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        match command.spawn() {
-            Ok(child) => {
-                self.embedded_playtest.start_building(child);
-                self.status_message_set("Building embedded playtest");
-            }
-            Err(error) => {
-                let message = format!("Embedded Play build failed: spawn make: {error}");
-                self.editor.set_status(message.clone());
-                self.embedded_playtest.fail();
-            }
-        }
+        let child = command
+            .spawn()
+            .map_err(|error| format!("spawn make: {error}"))?;
+        self.editor_build_completion = Some(completion);
+        self.embedded_playtest.start_building(child);
+        self.status_message_set(toast);
+        Ok(())
     }
 
-    /// Poll the background build child and side-load the resulting
-    /// editor-playtest EXE when the build succeeds.
+    /// Poll the background build child, then either side-load the
+    /// resulting editor-playtest EXE or export it as a project build.
     pub fn poll_embedded_playtest_build(&mut self) {
         let Some(child) = self.embedded_playtest.building_child_mut() else {
             return;
@@ -865,35 +961,64 @@ impl AppState {
             Ok(Some(status)) => status,
             Ok(None) => return,
             Err(error) => {
-                let message = format!("Embedded Play build poll failed: {error}");
+                let message = format!("{} poll failed: {error}", self.editor_build_label());
                 self.editor.set_status(message.clone());
+                self.editor_build_completion = None;
                 self.embedded_playtest.fail();
                 return;
             }
         };
 
         if !status.success() {
-            let message = format!("Embedded Play build failed: {status}");
+            let message = format!("{} failed: {status}", self.editor_build_label());
             self.editor.set_status(message.clone());
+            self.editor_build_completion = None;
             self.embedded_playtest.fail();
             return;
         }
 
-        match self.load_embedded_playtest_exe() {
-            Ok(()) => {
-                self.embedded_playtest.start_running(true);
-                self.running = true;
-                self.menu.open = false;
-                self.menu.sync_run_label(true);
-                self.editor
-                    .set_status("Embedded Play running in the 3D viewport");
-                self.status_message_set("Embedded Play running");
+        let completion = self
+            .editor_build_completion
+            .take()
+            .unwrap_or(EditorBuildCompletion::RunEmbedded);
+        match completion {
+            EditorBuildCompletion::RunEmbedded => match self.load_embedded_playtest_exe() {
+                Ok(()) => {
+                    self.embedded_playtest.start_running(true);
+                    self.running = true;
+                    self.menu.open = false;
+                    self.menu.sync_run_label(true);
+                    self.editor
+                        .set_status("Embedded Play running in the 3D viewport");
+                    self.status_message_set("Embedded Play running");
+                }
+                Err(error) => {
+                    let message = format!("Embedded Play load failed: {error}");
+                    self.editor.set_status(message.clone());
+                    self.embedded_playtest.fail();
+                }
+            },
+            EditorBuildCompletion::ExportProject { dest_path } => {
+                match self.export_project_build(dest_path) {
+                    Ok(message) => {
+                        self.embedded_playtest.stop();
+                        self.editor.set_status(message.clone());
+                        self.status_message_set(message);
+                    }
+                    Err(error) => {
+                        let message = format!("Project build export failed: {error}");
+                        self.editor.set_status(message.clone());
+                        self.embedded_playtest.fail();
+                    }
+                }
             }
-            Err(error) => {
-                let message = format!("Embedded Play load failed: {error}");
-                self.editor.set_status(message.clone());
-                self.embedded_playtest.fail();
-            }
+        }
+    }
+
+    fn editor_build_label(&self) -> &'static str {
+        match self.editor_build_completion.as_ref() {
+            Some(EditorBuildCompletion::ExportProject { .. }) => "Project build",
+            _ => "Embedded Play build",
         }
     }
 
@@ -904,6 +1029,7 @@ impl AppState {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.editor_build_completion = None;
         self.embedded_playtest.stop();
         self.running = false;
         self.menu.sync_run_label(false);
@@ -935,6 +1061,9 @@ impl AppState {
         match request {
             psxed_ui::EditorPlaytestRequest::Play | psxed_ui::EditorPlaytestRequest::Rebuild => {
                 self.start_embedded_playtest();
+            }
+            psxed_ui::EditorPlaytestRequest::BuildProject => {
+                self.build_current_project_for_launcher();
             }
             psxed_ui::EditorPlaytestRequest::Stop => {
                 self.stop_embedded_playtest();
@@ -969,6 +1098,33 @@ impl AppState {
         self.gpr_snapshot = None;
         self.current_game = None;
         Ok(())
+    }
+
+    fn export_project_build(&mut self, dest_path: PathBuf) -> Result<String, String> {
+        let source_path = editor_playtest_exe_path();
+        let dest_dir = dest_path
+            .parent()
+            .ok_or_else(|| format!("invalid build output path: {}", dest_path.display()))?;
+        std::fs::create_dir_all(dest_dir)
+            .map_err(|error| format!("mkdir {}: {error}", dest_dir.display()))?;
+        let bytes = std::fs::copy(&source_path, &dest_path).map_err(|error| {
+            format!(
+                "copy {} to {}: {error}",
+                source_path.display(),
+                dest_path.display()
+            )
+        })?;
+
+        let rescan_error = self.rescan_library().err();
+        let mut message = format!(
+            "Project build exported -> {} ({} KiB)",
+            dest_path.display(),
+            bytes / 1024
+        );
+        if let Some(error) = rescan_error {
+            message.push_str(&format!("; launcher rescan failed: {error}"));
+        }
+        Ok(message)
     }
 
     /// Flush any dirty memory-card state on port 1 back to its
@@ -1065,6 +1221,13 @@ fn is_internal_example_exe(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n == "editor-playtest.exe")
+}
+
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(path), Ok(root)) => path.starts_with(root),
+        _ => path.starts_with(root),
+    }
 }
 
 /// Pick the BIOS path the launcher should read, honouring
@@ -1319,6 +1482,16 @@ fn editor_playtest_exe_path() -> PathBuf {
         .join("editor-playtest.exe")
 }
 
+fn project_baked_exe_path(project_dir: &Path, project_name: &str) -> PathBuf {
+    project_dir
+        .join("baked")
+        .join(format!("{}.exe", safe_project_exe_stem(project_name)))
+}
+
+fn safe_project_exe_stem(name: &str) -> String {
+    psxed_project::project_file_stem(name)
+}
+
 /// Read `PSOXIDE_DISC` → disc image → `Disc`. Accepts raw BIN/ISO and
 /// CUE-backed multitrack images. Logs and returns `None` on any trouble
 /// so a misconfigured path doesn't wedge the frontend.
@@ -1401,5 +1574,20 @@ mod tests {
         assert!(!is_internal_example_exe(Path::new(
             "build/examples/mipsel-sony-psx/release/showcase-room.exe"
         )));
+    }
+
+    #[test]
+    fn project_build_exe_name_is_filesystem_safe() {
+        assert_eq!(
+            safe_project_exe_stem("Stone Room: Vertical Slice!"),
+            "stone_room_vertical_slice"
+        );
+        assert_eq!(safe_project_exe_stem("..."), "project");
+        assert_eq!(
+            project_baked_exe_path(Path::new("editor/projects/default"), "Demo Project"),
+            Path::new("editor/projects/default")
+                .join("baked")
+                .join("demo_project.exe")
+        );
     }
 }

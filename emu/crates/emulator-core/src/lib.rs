@@ -22,6 +22,7 @@ pub mod pad;
 pub mod scheduler;
 pub mod sio;
 pub mod spu;
+pub mod telemetry;
 pub mod timers;
 pub mod vram;
 
@@ -40,5 +41,6 @@ pub use pad::{button, ButtonState, DigitalPad, PortDevice};
 pub use psx_gte_core::{Gte, GteProfileSnapshot};
 pub use sio::Sio0;
 pub use spu::{Spu, XaDecoderState};
+pub use telemetry::{GuestTelemetry, GuestTelemetryEvent, GuestTelemetryKind};
 pub use timers::{Timer, Timers};
 pub use vram::{Vram, VRAM_HEIGHT, VRAM_WIDTH};

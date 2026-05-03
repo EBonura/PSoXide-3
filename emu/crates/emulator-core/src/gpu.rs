@@ -279,6 +279,15 @@ pub struct GpuCmdLogEntry {
     pub fifo: Vec<u32>,
 }
 
+/// Expected total word count for a GP0 command starting with `opcode`.
+///
+/// Host-side OT adapters use this to split one DMA packet containing
+/// multiple GP0 commands into the same command-log shape the emulator
+/// records while executing the FIFO normally.
+pub fn gp0_command_word_count(opcode: u8) -> usize {
+    commands::gp0_packet_size(opcode)
+}
+
 /// In-flight CPU→VRAM transfer state -- 2 pixels per incoming GP0 word,
 /// written in row-major order across the destination rect. Completes
 /// when `remaining == 0`, and then the GPU goes back to accepting

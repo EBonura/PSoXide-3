@@ -63,6 +63,7 @@ pub mod render;
 pub mod render3d;
 pub mod scene;
 pub mod sfx;
+pub mod telemetry;
 pub mod third_person_camera;
 pub mod time;
 pub mod transform;
@@ -90,8 +91,9 @@ pub use render::{
     CameraDepth, DepthBand, DepthRange, DepthSlot, GpuPacket, OtDepth, OtFrame, PrimitiveArena,
 };
 pub use render3d::{
-    compute_joint_view_transform, project_model_vertex_with_joint_transforms, CullMode,
-    DepthPolicy, GouraudMeshOptions, GouraudRenderPass, GouraudTriCommand, JointViewTransform,
+    compute_joint_view_transform, compute_joint_world_transform,
+    project_model_vertex_with_joint_transforms, CullMode, DepthPolicy, GouraudMeshOptions,
+    GouraudRenderPass, GouraudTriCommand, JointViewTransform, JointWorldTransform,
     LocalToWorldScale, MeshRenderStats, ProjectedTexturedVertex, ProjectedVertex,
     TexturedModelRenderStats, TexturedViewVertex, ViewVertex, WorldCamera, WorldProjection,
     WorldRenderLayer, WorldRenderPass, WorldRenderStats, WorldSurfaceOptions, WorldTriCommand,
@@ -113,8 +115,9 @@ pub use world::{
     SectorCollision, SectorRender, WallCollision, WallRender, WorldMaterialId, GRID_SECTOR_SIZE,
 };
 pub use world_render::{
-    draw_room, draw_room_lit, NoWorldSurfaceLighting, SurfaceSidedness, WorldRenderMaterial,
-    WorldSurfaceKind, WorldSurfaceLighting, WorldSurfaceSample,
+    draw_room, draw_room_lit, draw_room_lit_grid_visible, GridVisibility, GridVisibilityStats,
+    NoWorldSurfaceLighting, SurfaceSidedness, WorldRenderMaterial, WorldSurfaceKind,
+    WorldSurfaceLighting, WorldSurfaceSample,
 };
 
 /// Button-mask constants (UP, DOWN, CROSS, START, …) re-exported

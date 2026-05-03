@@ -209,8 +209,10 @@ impl Translator {
         let word = fifo[0];
         // Re-applying the tpage word also resets `tex_blend_mode`;
         // synthesise a "fake" UV1-high-half word that just carries
-        // the low 16 bits of E1 in its high half.
-        apply_primitive_tpage(&mut self.state, word << 16);
+        // the low 16 bits of E1 in its high half. E2 texture-window
+        // state is independent from the texture page and must survive
+        // this reset.
+        self.apply_primitive_tpage_preserving_window(word << 16);
         self.state.dither = (word >> 9) & 1 != 0;
         self.state.flip_x = (word >> 12) & 1 != 0;
         self.state.flip_y = (word >> 13) & 1 != 0;
@@ -328,6 +330,7 @@ impl Translator {
                     color,
                     uv: [0, 0],
                     flags: 0,
+                    tex_window: 0,
                 },
             );
         }
@@ -384,8 +387,9 @@ impl Translator {
     /// `0x24..=0x27` -- textured triangle. Packet:
     ///   `[cmd+tint, v0, uv0+clut, v1, uv1+tpage, v2, uv2]`
     /// uv1's high half is the active tpage word; consume it via
-    /// `apply_primitive_tpage` so subsequent primitives see the
-    /// updated tpage.
+    /// `apply_primitive_tpage_preserving_window` so subsequent
+    /// primitives see the updated tpage without losing GP0(E2)
+    /// texture-window state.
     fn emit_tex_tri(&mut self, fifo: &[u32]) {
         if fifo.len() < 7 {
             return;
@@ -396,7 +400,7 @@ impl Translator {
         let clut = decode_clut(fifo[2]);
         let v1 = decode_vertex(&self.state, fifo[3]);
         let uv1 = decode_uv(fifo[4]);
-        apply_primitive_tpage(&mut self.state, fifo[4]);
+        self.apply_primitive_tpage_preserving_window(fifo[4]);
         let v2 = decode_vertex(&self.state, fifo[5]);
         let uv2 = decode_uv(fifo[6]);
 
@@ -426,7 +430,7 @@ impl Translator {
         let clut = decode_clut(fifo[2]);
         let v1 = decode_vertex(&self.state, fifo[3]);
         let uv1 = decode_uv(fifo[4]);
-        apply_primitive_tpage(&mut self.state, fifo[4]);
+        self.apply_primitive_tpage_preserving_window(fifo[4]);
         let v2 = decode_vertex(&self.state, fifo[5]);
         let uv2 = decode_uv(fifo[6]);
         let v3 = decode_vertex(&self.state, fifo[7]);
@@ -465,6 +469,28 @@ impl Translator {
             flags |= fbits::SEMI_TRANS;
         }
         flags
+    }
+
+    fn tex_window_word(&self) -> u32 {
+        let tp = &self.state.tpage;
+        (tp.tex_window_mask_x & 0xFF)
+            | ((tp.tex_window_mask_y & 0xFF) << 8)
+            | ((tp.tex_window_off_x & 0xFF) << 16)
+            | ((tp.tex_window_off_y & 0xFF) << 24)
+    }
+
+    fn apply_primitive_tpage_preserving_window(&mut self, uv_word: u32) {
+        let tw = (
+            self.state.tpage.tex_window_mask_x,
+            self.state.tpage.tex_window_mask_y,
+            self.state.tpage.tex_window_off_x,
+            self.state.tpage.tex_window_off_y,
+        );
+        apply_primitive_tpage(&mut self.state, uv_word);
+        self.state.tpage.tex_window_mask_x = tw.0;
+        self.state.tpage.tex_window_mask_y = tw.1;
+        self.state.tpage.tex_window_off_x = tw.2;
+        self.state.tpage.tex_window_off_y = tw.3;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -527,11 +553,13 @@ impl Translator {
         kind: BlendKind,
     ) {
         let clip = self.current_clip();
+        let tex_window = self.tex_window_word();
         let make = |v: (i32, i32), uv: (u8, u8)| HwVertex {
             pos: [v.0 as i16, v.1 as i16],
             color,
             uv: [uv.0 as u16, uv.1 as u16],
             flags: prim_flags,
+            tex_window,
         };
         self.push_vertex(kind, clip, make(v0, uv0));
         self.push_vertex(kind, clip, make(v1, uv1));
@@ -602,7 +630,7 @@ impl Translator {
         let c1 = mono_color_rgba8(fifo[3]);
         let v1 = decode_vertex(&self.state, fifo[4]);
         let uv1 = decode_uv(fifo[5]);
-        apply_primitive_tpage(&mut self.state, fifo[5]);
+        self.apply_primitive_tpage_preserving_window(fifo[5]);
         let c2 = mono_color_rgba8(fifo[6]);
         let v2 = decode_vertex(&self.state, fifo[7]);
         let uv2 = decode_uv(fifo[8]);
@@ -631,7 +659,7 @@ impl Translator {
         let c1 = mono_color_rgba8(fifo[3]);
         let v1 = decode_vertex(&self.state, fifo[4]);
         let uv1 = decode_uv(fifo[5]);
-        apply_primitive_tpage(&mut self.state, fifo[5]);
+        self.apply_primitive_tpage_preserving_window(fifo[5]);
         let c2 = mono_color_rgba8(fifo[6]);
         let v2 = decode_vertex(&self.state, fifo[7]);
         let uv2 = decode_uv(fifo[8]);
@@ -668,6 +696,7 @@ impl Translator {
             color: c,
             uv: [0, 0],
             flags: prim_flags,
+            tex_window: 0,
         };
         self.push_vertex(kind, clip, make(v0, c0));
         self.push_vertex(kind, clip, make(v1, c1));
@@ -738,11 +767,13 @@ impl Translator {
         kind: BlendKind,
     ) {
         let clip = self.current_clip();
+        let tex_window = self.tex_window_word();
         let make = |v: (i32, i32), uv: (u8, u8), c: [u8; 4]| HwVertex {
             pos: [v.0 as i16, v.1 as i16],
             color: c,
             uv: [uv.0 as u16, uv.1 as u16],
             flags: prim_flags,
+            tex_window,
         };
         self.push_vertex(kind, clip, make(v0, uv0, c0));
         self.push_vertex(kind, clip, make(v1, uv1, c1));
@@ -836,6 +867,7 @@ impl Translator {
             color,
             uv: [0, 0],
             flags: 0,
+            tex_window: 0,
         };
         // Two tris covering [x..x+w] × [y..y+h]. Same winding as
         // push_mono_rect -- semi-trans / mask-bit behaviour stays
@@ -1008,6 +1040,59 @@ mod tests {
         for v in frame.vertices {
             assert_eq!(v.flags & fbits::TEX_OPAQUE_PASS, 0);
             assert_eq!(v.flags & fbits::TEX_SEMI_PASS, 0);
+        }
+    }
+
+    #[test]
+    fn textured_tri_carries_active_texture_window_to_vertices() {
+        let log = [
+            entry(0xE2, vec![0xE204_2318]),
+            entry(
+                0x24,
+                vec![
+                    0x2480_8080,
+                    xy(10, 10),
+                    uv(0, 0, 0),
+                    xy(20, 10),
+                    uv(64, 0, 0),
+                    xy(10, 20),
+                    uv(0, 128, 0),
+                ],
+            ),
+        ];
+        let mut translator = Translator::new();
+        let frame = translator.translate(&log);
+
+        assert_eq!(frame.total(), 3);
+        for v in frame.vertices {
+            assert_eq!(v.tex_window, 0x4040_C0C0);
+        }
+    }
+
+    #[test]
+    fn draw_mode_preserves_active_texture_window() {
+        let log = [
+            entry(0xE2, vec![0xE204_2318]),
+            entry(0xE1, vec![0xE100_0020]),
+            entry(
+                0x24,
+                vec![
+                    0x2480_8080,
+                    xy(10, 10),
+                    uv(0, 0, 0),
+                    xy(20, 10),
+                    uv(64, 0, 0),
+                    xy(10, 20),
+                    uv(0, 128, 0),
+                ],
+            ),
+        ];
+        let mut translator = Translator::new();
+        let frame = translator.translate(&log);
+
+        assert_eq!(frame.total(), 3);
+        for v in frame.vertices {
+            assert_eq!(v.tex_window, 0x4040_C0C0);
         }
     }
 

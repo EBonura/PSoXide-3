@@ -9,6 +9,7 @@
 use crate::{Angle, RoomCollision, RoomPoint, Q12};
 
 const DEFAULT_STAMINA_MAX_Q12: i32 = 4096;
+const MAX_MOTOR_CATCHUP_VBLANKS: u16 = 4;
 const SPLIT_NE_SW: u8 = 1;
 
 /// Tunables for [`CharacterMotorState`].
@@ -168,6 +169,13 @@ pub struct CharacterMotorState {
     action: CharacterMotorAction,
     action_frame: u8,
     action_yaw: Angle,
+    /// Sprint is latched while the button stays held so
+    /// `sprint_min_q12` means "minimum to start", not "minimum to
+    /// continue".
+    sprint_latched: bool,
+    /// Prevents held-sprint from pulsing Run/Walk every recovery
+    /// frame after stamina reaches zero.
+    sprint_exhausted: bool,
 }
 
 impl CharacterMotorState {
@@ -180,6 +188,8 @@ impl CharacterMotorState {
             action: CharacterMotorAction::Idle,
             action_frame: 0,
             action_yaw: yaw,
+            sprint_latched: false,
+            sprint_exhausted: false,
         }
     }
 
@@ -191,6 +201,16 @@ impl CharacterMotorState {
         self.action = CharacterMotorAction::Idle;
         self.action_frame = 0;
         self.action_yaw = yaw;
+        self.sprint_latched = false;
+        self.sprint_exhausted = false;
+    }
+
+    /// Move the motor to another coordinate space while preserving
+    /// yaw, stamina, and any in-progress action. Used by streaming
+    /// room transitions where the same physical player position is
+    /// re-expressed relative to a newly-current chunk.
+    pub fn relocate(&mut self, position: RoomPoint) {
+        self.position = position;
     }
 
     /// Advance the motor by one frame.
@@ -200,7 +220,70 @@ impl CharacterMotorState {
         input: CharacterMotorInput,
         config: CharacterMotorConfig,
     ) -> CharacterMotorFrame {
+        self.update_vblanks(collision, input, config, 1)
+    }
+
+    /// Advance the motor by elapsed display ticks.
+    ///
+    /// Heavy render paths can miss VBlanks. Animation already uses
+    /// display time, so the motor catches up with small fixed
+    /// substeps instead of scaling one large collision step. The cap
+    /// prevents a long pause from spending a whole frame in movement
+    /// catch-up.
+    pub fn update_vblanks(
+        &mut self,
+        collision: Option<RoomCollision<'_, '_>>,
+        input: CharacterMotorInput,
+        config: CharacterMotorConfig,
+        delta_vblanks: u16,
+    ) -> CharacterMotorFrame {
         let config = normalize_config(config);
+        let steps = delta_vblanks.max(1).min(MAX_MOTOR_CATCHUP_VBLANKS);
+        let mut final_frame: Option<CharacterMotorFrame> = None;
+
+        for step in 0..steps {
+            let mut step_input = input;
+            if step > 0 {
+                step_input.evade = false;
+            }
+            let frame = self.update_one_frame(collision, step_input, config);
+            final_frame = Some(match final_frame {
+                Some(mut aggregate) => {
+                    aggregate.position = frame.position;
+                    aggregate.yaw = frame.yaw;
+                    aggregate.anim = frame.anim;
+                    aggregate.action = frame.action;
+                    aggregate.moved |= frame.moved;
+                    aggregate.blocked |= frame.blocked;
+                    aggregate.sprinting = frame.sprinting;
+                    aggregate.invulnerable |= frame.invulnerable;
+                    aggregate.recovery |= frame.recovery;
+                    aggregate.stamina_q12 = frame.stamina_q12;
+                    aggregate
+                }
+                None => frame,
+            });
+        }
+
+        final_frame.unwrap_or_else(|| {
+            self.frame(
+                CharacterMotorAnim::Idle,
+                self.action,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+        })
+    }
+
+    fn update_one_frame(
+        &mut self,
+        collision: Option<RoomCollision<'_, '_>>,
+        input: CharacterMotorInput,
+        config: CharacterMotorConfig,
+    ) -> CharacterMotorFrame {
         self.stamina_q12 = self.stamina_q12.clamp(0, config.stamina_max_q12);
         self.snap_floor(collision, config.radius);
 
@@ -213,9 +296,10 @@ impl CharacterMotorState {
         }
 
         if let Some((move_x, move_z, move_mag)) = analog_move_vector(input) {
+            self.update_sprint_gate(input.sprint);
             self.yaw = yaw_from_vector(move_x, move_z);
             let wants_sprint = input.sprint;
-            let sprinting = wants_sprint && self.stamina_q12 >= config.sprint_min_q12;
+            let sprinting = self.can_sprint(wants_sprint, config);
             let base_speed = if sprinting {
                 config.run_speed
             } else {
@@ -226,10 +310,7 @@ impl CharacterMotorState {
                 self.try_move_vector(collision, move_x, move_z, speed, config.radius);
 
             if sprinting && moved {
-                self.stamina_q12 = self
-                    .stamina_q12
-                    .saturating_sub(config.sprint_drain_q12)
-                    .max(0);
+                self.spend_sprint_stamina(config);
             } else {
                 self.recover_stamina(config);
             }
@@ -260,9 +341,9 @@ impl CharacterMotorState {
         }
 
         let moving_intent = input.walk != 0;
+        self.update_sprint_gate(input.sprint);
         let wants_forward_sprint = input.sprint && input.walk > 0;
-        let sprinting =
-            moving_intent && wants_forward_sprint && self.stamina_q12 >= config.sprint_min_q12;
+        let sprinting = moving_intent && self.can_sprint(wants_forward_sprint, config);
         let speed = if sprinting {
             config.run_speed
         } else {
@@ -277,10 +358,7 @@ impl CharacterMotorState {
         };
 
         if sprinting && moved {
-            self.stamina_q12 = self
-                .stamina_q12
-                .saturating_sub(config.sprint_drain_q12)
-                .max(0);
+            self.spend_sprint_stamina(config);
         } else {
             self.recover_stamina(config);
         }
@@ -463,6 +541,40 @@ impl CharacterMotorState {
             .stamina_q12
             .saturating_add(config.stamina_recover_q12)
             .min(config.stamina_max_q12);
+    }
+
+    fn update_sprint_gate(&mut self, wants_sprint: bool) {
+        if !wants_sprint {
+            self.sprint_latched = false;
+            self.sprint_exhausted = false;
+        }
+    }
+
+    fn can_sprint(&mut self, wants_sprint: bool, config: CharacterMotorConfig) -> bool {
+        if !wants_sprint {
+            return false;
+        }
+        if self.sprint_exhausted || self.stamina_q12 <= 0 {
+            self.sprint_latched = false;
+            return false;
+        }
+        if self.sprint_latched || self.stamina_q12 >= config.sprint_min_q12 {
+            self.sprint_latched = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn spend_sprint_stamina(&mut self, config: CharacterMotorConfig) {
+        self.stamina_q12 = self
+            .stamina_q12
+            .saturating_sub(config.sprint_drain_q12)
+            .max(0);
+        if self.stamina_q12 == 0 {
+            self.sprint_latched = false;
+            self.sprint_exhausted = true;
+        }
     }
 
     fn snap_floor(&mut self, collision: Option<RoomCollision<'_, '_>>, radius: i32) {
@@ -836,6 +948,132 @@ mod tests {
         assert_eq!(frame.anim, CharacterMotorAnim::Run);
         assert!(frame.sprinting);
         assert!(frame.stamina_q12 < DEFAULT_STAMINA_MAX_Q12);
+    }
+
+    #[test]
+    fn held_sprint_stays_walk_after_exhaustion_until_released() {
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
+        let mut cfg = config();
+        cfg.stamina_max_q12 = 96;
+        cfg.sprint_min_q12 = 32;
+        cfg.sprint_drain_q12 = 64;
+        cfg.stamina_recover_q12 = 16;
+        motor.stamina_q12 = cfg.stamina_max_q12;
+
+        let held = CharacterMotorInput {
+            walk: 1,
+            sprint: true,
+            ..CharacterMotorInput::default()
+        };
+
+        let first = motor.update(None, held, cfg);
+        let second = motor.update(None, held, cfg);
+        assert_eq!(first.anim, CharacterMotorAnim::Run);
+        assert_eq!(second.anim, CharacterMotorAnim::Run);
+        assert_eq!(second.stamina_q12, 0);
+
+        for _ in 0..4 {
+            let frame = motor.update(None, held, cfg);
+            assert_eq!(frame.anim, CharacterMotorAnim::Walk);
+            assert!(!frame.sprinting);
+        }
+
+        let released = motor.update(
+            None,
+            CharacterMotorInput {
+                walk: 1,
+                sprint: false,
+                ..CharacterMotorInput::default()
+            },
+            cfg,
+        );
+        assert_eq!(released.anim, CharacterMotorAnim::Walk);
+
+        let restarted = motor.update(None, held, cfg);
+        assert_eq!(restarted.anim, CharacterMotorAnim::Run);
+        assert!(restarted.sprinting);
+    }
+
+    #[test]
+    fn held_sprint_survives_brief_direction_change_idle_gap() {
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
+        let mut cfg = config();
+        cfg.stamina_max_q12 = 512;
+        cfg.sprint_min_q12 = 384;
+        cfg.sprint_drain_q12 = 256;
+        cfg.stamina_recover_q12 = 0;
+        motor.stamina_q12 = cfg.stamina_max_q12;
+
+        let held_run = CharacterMotorInput {
+            walk: 1,
+            sprint: true,
+            ..CharacterMotorInput::default()
+        };
+        let held_idle = CharacterMotorInput {
+            sprint: true,
+            ..CharacterMotorInput::default()
+        };
+
+        let first = motor.update(None, held_run, cfg);
+        assert_eq!(first.anim, CharacterMotorAnim::Run);
+        assert_eq!(first.stamina_q12, 256);
+
+        let idle_gap = motor.update(None, held_idle, cfg);
+        assert_eq!(idle_gap.anim, CharacterMotorAnim::Idle);
+
+        let resumed = motor.update(None, held_run, cfg);
+        assert_eq!(resumed.anim, CharacterMotorAnim::Run);
+        assert!(resumed.sprinting);
+    }
+
+    #[test]
+    fn vblank_delta_matches_repeated_single_frame_updates() {
+        let cfg = config();
+        let input = CharacterMotorInput {
+            walk: 1,
+            sprint: true,
+            ..CharacterMotorInput::default()
+        };
+        let mut stepped = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
+        let mut caught_up = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
+
+        let _ = stepped.update(None, input, cfg);
+        let expected = stepped.update(None, input, cfg);
+        let actual = caught_up.update_vblanks(None, input, cfg, 2);
+
+        assert_eq!(actual.position, expected.position);
+        assert_eq!(actual.yaw, expected.yaw);
+        assert_eq!(actual.anim, expected.anim);
+        assert_eq!(actual.stamina_q12, expected.stamina_q12);
+        assert_eq!(caught_up.stamina_q12(), stepped.stamina_q12());
+    }
+
+    #[test]
+    fn vblank_delta_consumes_evade_edge_once() {
+        let mut motor = CharacterMotorState::new(RoomPoint::ZERO, Angle::ZERO);
+        let mut cfg = config();
+        cfg.roll_cost_q12 = 512;
+        cfg.roll_speed = 0;
+        cfg.roll_active_frames = 1;
+        cfg.roll_recovery_frames = 0;
+        cfg.roll_invulnerable_frames = 1;
+        cfg.stamina_recover_q12 = 0;
+        motor.stamina_q12 = 1024;
+
+        let frame = motor.update_vblanks(
+            None,
+            CharacterMotorInput {
+                walk: 1,
+                evade: true,
+                ..CharacterMotorInput::default()
+            },
+            cfg,
+            2,
+        );
+
+        assert_eq!(frame.anim, CharacterMotorAnim::Walk);
+        assert_eq!(frame.action, CharacterMotorAction::Idle);
+        assert_eq!(frame.stamina_q12, 512);
     }
 
     #[test]

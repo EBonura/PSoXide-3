@@ -2,17 +2,23 @@
 //!
 //! Each `.psxw` blob is a fixed-size grid room: a world header, one
 //! sector record per grid cell, then a compact wall table referenced
-//! by sectors. Only `VERSION = 1` is emitted by the cooker and
-//! accepted by the runtime parser -- every public record below is
-//! part of that single live contract.
+//! by sectors. Only `VERSION = 2` is emitted by the cooker; v1 is
+//! legacy parser compatibility only.
 //!
-//! # Active format (VERSION = 1)
+//! # Active format (VERSION = 2)
 //!
 //! - `[i32; 4]` heights per face -- 16 B per height set
-//! - 44 B sector record, 24 B wall record
+//! - `QuadUvRecord` per floor / ceiling / wall -- 8 B per face
+//! - 60 B sector record, 32 B wall record
 //! - No embedded material table; slot ids resolve via an external
 //!   bank that the caller (engine / playtest manifest) supplies
 //! - No sector logic stream, no portal records
+//!
+//! # Legacy format (VERSION = 1)
+//!
+//! - 44 B sector record, 24 B wall record
+//! - No UV records; readers synthesize the engine's default 64×64
+//!   tile UVs.
 //!
 //! # Future compact format
 //!
@@ -26,10 +32,13 @@
 /// ASCII magic for the `.psxw` grid-world format.
 pub const MAGIC: [u8; 4] = *b"PSXW";
 
-/// Current (and only) world format revision.
-pub const VERSION: u16 = 1;
+/// Legacy world format revision without per-face UV records.
+pub const VERSION_V1: u16 = 1;
 
-/// Engine units per grid sector.
+/// Current world format revision.
+pub const VERSION: u16 = 2;
+
+/// Canonical/default engine units per grid sector.
 pub const SECTOR_SIZE: i32 = 1024;
 
 /// Material sentinel used by missing optional floor/ceiling records.
@@ -122,6 +131,29 @@ pub mod wall_flags {
     pub const SOLID: u8 = 1 << 0;
 }
 
+/// Default texture-page UV span for grid tile faces.
+pub const TILE_UV: u8 = 64;
+
+/// Default floor / ceiling UVs in `[NW, NE, SE, SW]` order.
+pub const FLOOR_UVS: [(u8, u8); 4] = [(0, 0), (TILE_UV, 0), (TILE_UV, TILE_UV), (0, TILE_UV)];
+
+/// Default wall UVs in `[bottom-left, bottom-right, top-right, top-left]` order.
+pub const WALL_UVS: [(u8, u8); 4] = [(0, TILE_UV), (TILE_UV, TILE_UV), (TILE_UV, 0), (0, 0)];
+
+/// Four packed PS1 texture coordinates for one quad face.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug)]
+pub struct QuadUvRecord {
+    /// Per-corner `[u, v]` pairs in the same order as the face's
+    /// height / vertex corners.
+    pub corners: [[u8; 2]; 4],
+}
+
+impl QuadUvRecord {
+    /// Size of one UV record in bytes.
+    pub const SIZE: usize = core::mem::size_of::<Self>();
+}
+
 /// Payload header that follows the common `AssetHeader`.
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]
@@ -175,6 +207,10 @@ pub struct SectorRecord {
     pub floor_heights: [i32; 4],
     /// Ceiling heights `[NW, NE, SE, SW]`.
     pub ceiling_heights: [i32; 4],
+    /// Floor UVs `[NW, NE, SE, SW]`.
+    pub floor_uvs: QuadUvRecord,
+    /// Ceiling UVs `[NW, NE, SE, SW]`.
+    pub ceiling_uvs: QuadUvRecord,
 }
 
 impl SectorRecord {
@@ -198,6 +234,8 @@ pub struct WallRecord {
     pub _reserved: u16,
     /// Wall heights `[bottom-left, bottom-right, top-right, top-left]`.
     pub heights: [i32; 4],
+    /// Wall UVs `[bottom-left, bottom-right, top-right, top-left]`.
+    pub uvs: QuadUvRecord,
 }
 
 impl WallRecord {

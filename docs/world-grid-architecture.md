@@ -154,24 +154,25 @@ Authoring is bounded by the runtime's tolerance:
 | `MAX_ROOM_BYTES`   | 64 KiB    |
 
 `WorldGrid::budget()` rolls up populated cells, faces, walls, triangles, plus
-exact v1 wire size and a future-compact-format size estimate (see the
-roadmap). The editor inspector shows the rollup and tints any over-cap metric
-red. Cooker enforces the same caps so what the editor warns about also fails
-at cook time.
+exact active `.psxw` wire size and a future-compact-format size estimate (see
+the roadmap). The editor inspector shows the rollup and tints any over-cap
+metric red. Cooker enforces the same caps so what the editor warns about also
+fails at cook time.
 
 ## Binary Shape
 
-`.psxw` starts with the standard `AssetHeader` using magic `PSXW`. The v1
+`.psxw` starts with the standard `AssetHeader` using magic `PSXW`. The v2
 payload is:
 
 ```text
 WorldHeader        (20 B)
-SectorRecord[]     (44 B each, width * depth records)
-WallRecord[]       (24 B each, wall_count records)
+SectorRecord[]     (60 B each, width * depth records)
+WallRecord[]       (32 B each, wall_count records)
 ```
 
-Heights are `[i32; 4]` per face. Materials resolve via an external bank slot.
-No sector logic. No portals.
+Heights are `[i32; 4]` per face. UVs are four packed PS1 `[u, v]` byte pairs
+per face. Materials resolve via an external bank slot. No sector logic. No
+portals.
 
 A future compact format is sketched in `docs/world-format-roadmap.md`; it is
 **not** in `psxed-format` as Rust types. The format crate carries only the

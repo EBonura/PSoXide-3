@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use emulator_core::{
-    fast_boot_disc_with_hle, spu::SAMPLE_CYCLES, warm_bios_for_disc_fast_boot, Bus, Cpu,
+    fast_boot_disc_with_hle, spu::SAMPLE_CYCLES, telemetry, warm_bios_for_disc_fast_boot, Bus, Cpu,
     DISC_FAST_BOOT_WARMUP_STEPS,
 };
 use psoxide_settings::{
@@ -109,6 +109,10 @@ pub struct LaunchArgs {
     /// Number of CPU instructions to retire before stopping.
     #[arg(long, default_value_t = 100_000_000)]
     pub steps: u64,
+    /// Stop once instrumented homebrew has emitted this many guest
+    /// frame-begin telemetry markers. `--steps` still acts as a safety cap.
+    #[arg(long)]
+    pub guest_frames: Option<u64>,
     /// Force the real BIOS disc boot path instead of direct
     /// SYSTEM.CNF fast boot.
     #[arg(long)]
@@ -129,6 +133,9 @@ pub struct LaunchArgs {
     /// a window or screen-capture permission.
     #[arg(long)]
     pub dump_hw: Option<PathBuf>,
+    /// Print a guest-runtime telemetry summary captured out-of-band.
+    #[arg(long)]
+    pub dump_guest_profile: bool,
 }
 
 /// Entry point. Dispatches on `cli.command`; returns `Ok(())` on
@@ -378,6 +385,12 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
             bus.run_spu_samples(sample_count);
             let _ = bus.spu.drain_audio();
         }
+        if let Some(target) = args.guest_frames {
+            if target > 0 && bus.telemetry.frames_seen() >= target {
+                stopped_at = Some(i + 1);
+                break;
+            }
+        }
     }
 
     println!(
@@ -404,6 +417,12 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
         println!("display_fnv1a_64=0x{dh:016x}  w={dw}  h={dhi}");
     }
 
+    if args.dump_guest_profile {
+        let events = bus.telemetry.drain_events();
+        let summary = telemetry::GuestTelemetrySummary::from_events(&events);
+        print_guest_profile(&summary);
+    }
+
     if let Some(path) = args.dump_vram {
         dump_vram_ppm(&bus, &path)?;
         eprintln!("[cli] VRAM → {}", path.display());
@@ -426,6 +445,44 @@ fn cmd_launch(paths: &ConfigPaths, args: LaunchArgs) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn print_guest_profile(summary: &telemetry::GuestTelemetrySummary) {
+    if !summary.has_data() {
+        println!("guest_profile=empty");
+        return;
+    }
+
+    let frames = summary.frames.max(1) as f32;
+    println!("guest_profile_frames={}", summary.frames);
+    println!("guest_profile_stages:");
+    for id in 1..telemetry::STAGE_COUNT {
+        let cycles = summary.stage_cycles[id];
+        if cycles == 0 {
+            continue;
+        }
+        println!(
+            "  {:<18} total={:<10} per_frame={:.0} per_hit={:.0} hits={}",
+            telemetry::stage_name(id as u16),
+            cycles,
+            cycles as f32 / frames,
+            cycles as f32 / (summary.stage_hits[id].max(1) as f32),
+            summary.stage_hits[id],
+        );
+    }
+    println!("guest_profile_counters:");
+    for id in 1..telemetry::COUNTER_COUNT {
+        let value = summary.counters[id];
+        if value == 0 {
+            continue;
+        }
+        println!(
+            "  {:<18} total={:<10} per_frame={:.0}",
+            telemetry::counter_name(id as u16),
+            value,
+            value as f32 / frames,
+        );
+    }
 }
 
 fn maybe_fast_boot_disc(

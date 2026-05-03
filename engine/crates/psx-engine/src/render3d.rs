@@ -37,6 +37,7 @@ const GOURAUD_COMMAND_NONE: u16 = u16::MAX;
 enum WorldCommandOrdering {
     LinkedSorted,
     DeferredSorted,
+    DeferredSlotSorted,
     Bucketed,
 }
 
@@ -244,6 +245,27 @@ impl JointViewTransform {
     pub const ZERO: Self = Self {
         rotation: Mat3I16::ZERO,
         translation: Vec3I32::ZERO,
+    };
+}
+
+/// Per-joint room/world transform for gameplay attachment points.
+///
+/// Unlike [`JointViewTransform`], this is not camera-relative. It is
+/// the model instance's oriented joint pose in room-local world units,
+/// suitable for composing sockets, weapon grips, and hit volumes.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct JointWorldTransform {
+    /// Instance × joint rotation, Q12.
+    pub rotation: Mat3I16,
+    /// Joint origin in room-local world units.
+    pub translation: WorldVertex,
+}
+
+impl JointWorldTransform {
+    /// All-zero transform suitable for fallbacks/static scratch.
+    pub const ZERO: Self = Self {
+        rotation: Mat3I16::ZERO,
+        translation: WorldVertex::ZERO,
     };
 }
 
@@ -566,6 +588,11 @@ impl WorldTriCommand {
         order: 0,
         next: WORLD_COMMAND_NONE,
     };
+
+    #[cfg(test)]
+    pub(crate) const fn depth_raw(self) -> i32 {
+        self.depth
+    }
 }
 
 /// Per-submit counters and overflow flags for world surfaces.
@@ -666,6 +693,27 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         }
     }
 
+    /// Start a world render pass that appends commands into OT buckets and
+    /// sorts only within each occupied bucket at flush.
+    ///
+    /// This preserves the same exact same-slot depth/layer/order semantics as
+    /// the global deferred sorter, but avoids comparing triangles that already
+    /// landed in different ordering-table slots.
+    pub fn new_deferred_slot_sorted(
+        ot: &'a mut OtFrame<'ot, OT_DEPTH>,
+        commands: &'a mut [WorldTriCommand],
+    ) -> Self {
+        Self {
+            ot,
+            commands,
+            slot_heads: [WORLD_COMMAND_NONE; OT_DEPTH],
+            slot_tails: [WORLD_COMMAND_NONE; OT_DEPTH],
+            command_len: 0,
+            next_order: 0,
+            ordering: WorldCommandOrdering::DeferredSlotSorted,
+        }
+    }
+
     /// Start a world render pass that appends commands into coarse OT buckets.
     ///
     /// This is the fastest ordered mode: it preserves submission order within
@@ -685,6 +733,11 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             next_order: 0,
             ordering: WorldCommandOrdering::Bucketed,
         }
+    }
+
+    /// Number of world/model triangle commands queued in this pass.
+    pub const fn command_len(&self) -> usize {
+        self.command_len
     }
 
     /// Submit a projected textured triangle.
@@ -1455,6 +1508,7 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         match self.ordering {
             WorldCommandOrdering::LinkedSorted => self.insert_command_in_slot(command_index),
             WorldCommandOrdering::DeferredSorted => {}
+            WorldCommandOrdering::DeferredSlotSorted => self.append_command_in_slot(command_index),
             WorldCommandOrdering::Bucketed => self.append_command_in_slot(command_index),
         }
     }
@@ -1528,6 +1582,88 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
         }
     }
 
+    fn sort_slot_links(&mut self) {
+        let mut slot = 0;
+        while slot < OT_DEPTH {
+            self.slot_heads[slot] = self.merge_sort_slot_links(self.slot_heads[slot]);
+            self.slot_tails[slot] = WORLD_COMMAND_NONE;
+            slot += 1;
+        }
+    }
+
+    fn merge_sort_slot_links(&mut self, head: u16) -> u16 {
+        if head == WORLD_COMMAND_NONE {
+            return head;
+        }
+        let next = self.commands[head as usize].next;
+        if next == WORLD_COMMAND_NONE {
+            return head;
+        }
+
+        let mid = self.split_slot_links(head);
+        let left = self.merge_sort_slot_links(head);
+        let right = self.merge_sort_slot_links(mid);
+        self.merge_sorted_slot_links(left, right)
+    }
+
+    fn split_slot_links(&mut self, head: u16) -> u16 {
+        let mut slow = head;
+        let mut fast = self.commands[head as usize].next;
+        while fast != WORLD_COMMAND_NONE {
+            fast = self.commands[fast as usize].next;
+            if fast != WORLD_COMMAND_NONE {
+                slow = self.commands[slow as usize].next;
+                fast = self.commands[fast as usize].next;
+            }
+        }
+
+        let mid = self.commands[slow as usize].next;
+        self.commands[slow as usize].next = WORLD_COMMAND_NONE;
+        mid
+    }
+
+    fn merge_sorted_slot_links(&mut self, mut left: u16, mut right: u16) -> u16 {
+        let mut head = WORLD_COMMAND_NONE;
+        let mut tail = WORLD_COMMAND_NONE;
+
+        while left != WORLD_COMMAND_NONE && right != WORLD_COMMAND_NONE {
+            let take_left = !should_insert_world_before(
+                self.commands[right as usize],
+                self.commands[left as usize],
+            );
+            let link = if take_left {
+                let next = self.commands[left as usize].next;
+                let out = left;
+                left = next;
+                out
+            } else {
+                let next = self.commands[right as usize].next;
+                let out = right;
+                right = next;
+                out
+            };
+            self.commands[link as usize].next = WORLD_COMMAND_NONE;
+            if head == WORLD_COMMAND_NONE {
+                head = link;
+            } else {
+                self.commands[tail as usize].next = link;
+            }
+            tail = link;
+        }
+
+        let rest = if left != WORLD_COMMAND_NONE {
+            left
+        } else {
+            right
+        };
+        if head == WORLD_COMMAND_NONE {
+            rest
+        } else {
+            self.commands[tail as usize].next = rest;
+            head
+        }
+    }
+
     /// Sort and insert all submitted triangles into the ordering table.
     pub fn flush(mut self) {
         if self.ordering == WorldCommandOrdering::DeferredSorted {
@@ -1549,7 +1685,9 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             return;
         }
 
-        if self.ordering == WorldCommandOrdering::Bucketed {
+        if self.ordering == WorldCommandOrdering::DeferredSlotSorted {
+            self.sort_slot_links();
+        } else if self.ordering == WorldCommandOrdering::Bucketed {
             // OrderingTable::insert prepends packets. Bucketed mode appends
             // submissions so reversing each bucket once here makes the final
             // GPU DMA walk preserve same-slot submission order without doing
@@ -1960,6 +2098,37 @@ pub fn compute_joint_view_transform(
     origin: WorldVertex,
 ) -> (Mat3I16, Vec3I32) {
     textured_model_part_gte_transform(camera, pose, instance_rotation, local_to_world, origin)
+}
+
+/// Compose the world-space transform for one animated model joint.
+///
+/// This shares the same `instance × pose_model_to_world` math used by
+/// [`WorldRenderPass::submit_textured_model`], but stops before camera
+/// view composition so gameplay systems can attach child objects to
+/// animated joints.
+pub fn compute_joint_world_transform(
+    pose: JointPose,
+    instance_rotation: Mat3I16,
+    local_to_world: LocalToWorldScale,
+    origin: WorldVertex,
+) -> JointWorldTransform {
+    let model = scaled_pose_matrix(pose, local_to_world);
+    let rotation = mat3_mul_q12(&instance_rotation, &model);
+    let scaled_pose_translation = Vec3I32::new(
+        local_to_world.apply(pose.translation.x),
+        local_to_world.apply(pose.translation.y),
+        local_to_world.apply(pose.translation.z),
+    );
+    let rotated_pose_translation =
+        rotate_translation_q12(&instance_rotation, scaled_pose_translation);
+    JointWorldTransform {
+        rotation,
+        translation: WorldVertex::new(
+            origin.x.saturating_add(rotated_pose_translation.x),
+            origin.y.saturating_add(rotated_pose_translation.y),
+            origin.z.saturating_add(rotated_pose_translation.z),
+        ),
+    }
 }
 
 /// Project one model vertex using the same GTE/CPU-blend split as
@@ -2754,6 +2923,24 @@ mod tests {
         let identity = LocalToWorldScale::from_q12(0);
         assert_eq!(identity.q12(), 0x1000);
         assert_eq!(identity.apply(-12345), -12345);
+    }
+
+    #[test]
+    fn joint_world_transform_stops_before_camera_view() {
+        let pose = JointPose {
+            matrix: Mat3I16::IDENTITY.m,
+            translation: Vec3I32::new(256, 128, -64),
+        };
+        let origin = WorldVertex::new(1000, 2000, 3000);
+        let joint = compute_joint_world_transform(
+            pose,
+            Mat3I16::IDENTITY,
+            LocalToWorldScale::IDENTITY,
+            origin,
+        );
+
+        assert_eq!(joint.rotation, Mat3I16::IDENTITY);
+        assert_eq!(joint.translation, WorldVertex::new(1256, 2128, 2936));
     }
 
     #[test]

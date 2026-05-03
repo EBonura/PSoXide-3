@@ -477,6 +477,8 @@ pub fn register_cooked_model_bundle(
         default_clip,
         preview_clip: default_clip,
         world_height: 1024,
+        scale_q8: [crate::MODEL_SCALE_ONE_Q8; 3],
+        attachments: Vec::new(),
     };
 
     Ok(project.add_resource(display_name, ResourceData::Model(model_resource)))

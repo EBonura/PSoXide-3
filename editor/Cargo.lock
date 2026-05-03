@@ -619,6 +619,7 @@ dependencies = [
  "psx-level",
  "psxed-format",
  "psxed-gltf",
+ "psxed-tex",
  "ron",
  "serde",
 ]

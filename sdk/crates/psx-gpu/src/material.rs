@@ -27,6 +27,84 @@ pub enum BlendMode {
     AddQuarter,
 }
 
+/// GP0(E2) texture-window state.
+///
+/// Mask and offset values are stored in the hardware's 8-texel units.
+/// `TextureWindow::NONE` is a no-op window. Non-zero masks let a
+/// primitive repeat a sub-rectangle of the active tpage without
+/// physically duplicating texels in VRAM.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TextureWindow {
+    mask_x: u8,
+    mask_y: u8,
+    offset_x: u8,
+    offset_y: u8,
+}
+
+impl TextureWindow {
+    /// No texture window.
+    pub const NONE: Self = Self::new(0, 0, 0, 0);
+
+    /// Build from raw GP0(E2) fields. Each value must fit in 5 bits.
+    pub const fn new(mask_x: u8, mask_y: u8, offset_x: u8, offset_y: u8) -> Self {
+        assert!(mask_x < 32, "texture-window mask_x must be < 32");
+        assert!(mask_y < 32, "texture-window mask_y must be < 32");
+        assert!(offset_x < 32, "texture-window offset_x must be < 32");
+        assert!(offset_y < 32, "texture-window offset_y must be < 32");
+        Self {
+            mask_x,
+            mask_y,
+            offset_x,
+            offset_y,
+        }
+    }
+
+    /// Build a window for a power-of-two tile.
+    ///
+    /// `origin_*` and `size_*` are in texels. The origin and size must
+    /// be 8-texel aligned because GP0(E2) stores mask/offset in 8-texel
+    /// units.
+    pub const fn power_of_two_tile(origin_x: u8, origin_y: u8, size_x: u8, size_y: u8) -> Self {
+        assert!(
+            size_x >= 8 && size_x.is_power_of_two(),
+            "texture-window width must be a power of two >= 8"
+        );
+        assert!(
+            size_y >= 8 && size_y.is_power_of_two(),
+            "texture-window height must be a power of two >= 8"
+        );
+        assert!(
+            origin_x % 8 == 0,
+            "texture-window origin_x must align to 8 texels"
+        );
+        assert!(
+            origin_y % 8 == 0,
+            "texture-window origin_y must align to 8 texels"
+        );
+        assert!(size_x <= 128, "texture-window width must fit GP0(E2)");
+        assert!(size_y <= 128, "texture-window height must fit GP0(E2)");
+        let mask_x = ((!((size_x as u16) - 1)) & 0x00FF) as u8;
+        let mask_y = ((!((size_y as u16) - 1)) & 0x00FF) as u8;
+        Self::new(mask_x / 8, mask_y / 8, origin_x / 8, origin_y / 8)
+    }
+
+    /// Encoded GP0(E2) word.
+    pub const fn word(self) -> u32 {
+        gp0::tex_window(
+            self.mask_x as u32,
+            self.mask_y as u32,
+            self.offset_x as u32,
+            self.offset_y as u32,
+        )
+    }
+
+    /// Apply this texture window to the GPU state.
+    pub fn apply(self) {
+        wait_cmd_ready();
+        write_gp0(self.word());
+    }
+}
+
 impl BlendMode {
     /// Decode the two tpage semi-transparency bits.
     ///
@@ -73,6 +151,7 @@ impl BlendMode {
 pub struct TextureMaterial {
     clut_word: u16,
     tpage_word: u16,
+    texture_window: TextureWindow,
     tint: (u8, u8, u8),
     blend_mode: BlendMode,
     raw_texture: bool,
@@ -90,6 +169,7 @@ impl TextureMaterial {
         Self {
             clut_word,
             tpage_word,
+            texture_window: TextureWindow::NONE,
             tint,
             blend_mode: BlendMode::Opaque,
             raw_texture: false,
@@ -111,6 +191,7 @@ impl TextureMaterial {
         Self {
             clut_word,
             tpage_word,
+            texture_window: TextureWindow::NONE,
             tint,
             blend_mode,
             raw_texture: false,
@@ -127,6 +208,12 @@ impl TextureMaterial {
     /// Return a copy using `tint`.
     pub const fn with_tint(mut self, tint: (u8, u8, u8)) -> Self {
         self.tint = tint;
+        self
+    }
+
+    /// Return a copy using `texture_window`.
+    pub const fn with_texture_window(mut self, texture_window: TextureWindow) -> Self {
+        self.texture_window = texture_window;
         self
     }
 
@@ -158,6 +245,11 @@ impl TextureMaterial {
         let blend_bits = (self.blend_mode.tpage_bits() as u16) << 5;
         let dither_bit = (self.dither as u16) << 9;
         (self.tpage_word & !(0x0060 | 0x0200)) | blend_bits | dither_bit
+    }
+
+    /// GP0(E2) texture-window word for this material.
+    pub const fn texture_window_word(self) -> u32 {
+        self.texture_window.word()
     }
 
     /// Flat tint used by non-Gouraud textured primitives.
@@ -223,10 +315,11 @@ impl TextureMaterial {
         )
     }
 
-    /// Apply this material's tpage, blend, depth, and dither state.
+    /// Apply this material's tpage, blend, depth, dither, and texture-window state.
     pub fn apply_draw_mode(self) {
         wait_cmd_ready();
         write_gp0(self.draw_mode_word());
+        self.texture_window.apply();
     }
 }
 
@@ -247,12 +340,14 @@ mod tests {
     fn material_encodes_blend_dither_and_command_bits() {
         let material =
             TextureMaterial::blended(0x1234, 0x018F, (0x80, 0x40, 0x20), BlendMode::AddQuarter)
+                .with_texture_window(super::TextureWindow::power_of_two_tile(64, 64, 64, 64))
                 .with_raw_texture(true)
                 .with_dither(true);
 
         assert_eq!(material.clut_word(), 0x1234);
         assert_eq!((material.tpage_word() >> 5) & 0x3, 3);
         assert_eq!((material.tpage_word() >> 9) & 0x1, 1);
+        assert_eq!(material.texture_window_word(), 0xE204_2318);
         assert_eq!((material.textured_rect_header() >> 24) & 0xFF, 0x67);
         assert_eq!(
             (material.flat_textured_polygon_header(true) >> 24) & 0xFF,

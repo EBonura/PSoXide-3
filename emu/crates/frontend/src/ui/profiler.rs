@@ -10,6 +10,9 @@
 use std::collections::VecDeque;
 
 use egui::{Color32, RichText};
+use emulator_core::telemetry::{
+    counter_name, stage_name, GuestTelemetryEvent, COUNTER_COUNT, STAGE_COUNT,
+};
 
 use crate::theme;
 
@@ -18,6 +21,7 @@ const LOG_INTERVAL_MS: f32 = 1000.0;
 const BUDGET_60_MS: f32 = 1000.0 / 60.0;
 const BUDGET_30_MS: f32 = 1000.0 / 30.0;
 const PSX_MASTER_CLOCK_HZ: f32 = 33_868_800.0;
+const PSX_CYCLES_PER_MS: f32 = PSX_MASTER_CLOCK_HZ / 1000.0;
 
 /// Timing breakdown returned by [`crate::gfx::Graphics::render`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -42,6 +46,81 @@ pub struct EguiRenderProfile {
     pub submit_present_ms: f32,
     /// Full [`crate::gfx::Graphics::render`] wall time.
     pub total_ms: f32,
+}
+
+/// Guest-runtime profiler data emitted by instrumented homebrew.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GuestRuntimeProfile {
+    /// Number of guest frame-begin markers observed.
+    pub frames: f32,
+    /// Total cycle spans per guest stage id.
+    pub stage_cycles: [f32; STAGE_COUNT],
+    /// Completed span count per guest stage id.
+    pub stage_hits: [f32; STAGE_COUNT],
+    /// Summed counter values per guest counter id.
+    pub counters: [f32; COUNTER_COUNT],
+}
+
+impl GuestRuntimeProfile {
+    fn accumulate(&mut self, other: Self) {
+        self.frames += other.frames;
+        let mut i = 0;
+        while i < STAGE_COUNT {
+            self.stage_cycles[i] += other.stage_cycles[i];
+            self.stage_hits[i] += other.stage_hits[i];
+            i += 1;
+        }
+        let mut j = 0;
+        while j < COUNTER_COUNT {
+            self.counters[j] += other.counters[j];
+            j += 1;
+        }
+    }
+
+    fn divide(&mut self, n: f32) {
+        self.frames /= n;
+        let mut i = 0;
+        while i < STAGE_COUNT {
+            self.stage_cycles[i] /= n;
+            self.stage_hits[i] /= n;
+            i += 1;
+        }
+        let mut j = 0;
+        while j < COUNTER_COUNT {
+            self.counters[j] /= n;
+            j += 1;
+        }
+    }
+
+    fn has_data(self) -> bool {
+        self.frames > 0.0
+            || self.stage_cycles.iter().any(|&cycles| cycles > 0.0)
+            || self.counters.iter().any(|&value| value > 0.0)
+    }
+
+    fn cycle_budget_per_guest_frame(self) -> f32 {
+        if self.frames > 0.0 {
+            PSX_MASTER_CLOCK_HZ / 60.0
+        } else {
+            0.0
+        }
+    }
+
+    fn stage_cycles_per_guest_frame(self, stage_id: usize) -> f32 {
+        per_guest_frame(self.stage_cycles[stage_id], self.frames)
+    }
+
+    fn stage_cycles_per_hit(self, stage_id: usize) -> f32 {
+        if self.stage_hits[stage_id] > 0.0 {
+            self.stage_cycles[stage_id] / self.stage_hits[stage_id]
+        } else {
+            0.0
+        }
+    }
+
+    fn counter_per_guest_frame(self, counter_id: usize) -> f32 {
+        per_guest_frame(self.counters[counter_id], self.frames)
+    }
 }
 
 impl EguiRenderProfile {
@@ -129,6 +208,8 @@ pub struct FrameProfileSample {
     pub gpu_image_cmds: f32,
     /// Current hardware-renderer internal scale.
     pub hw_scale: f32,
+    /// Out-of-band guest runtime telemetry.
+    pub guest: GuestRuntimeProfile,
 }
 
 impl FrameProfileSample {
@@ -184,6 +265,7 @@ impl FrameProfileSample {
         self.gpu_draw_cmds += other.gpu_draw_cmds;
         self.gpu_image_cmds += other.gpu_image_cmds;
         self.hw_scale += other.hw_scale;
+        self.guest.accumulate(other.guest);
     }
 
     fn divide(&mut self, n: f32) {
@@ -214,6 +296,12 @@ impl FrameProfileSample {
         self.gpu_draw_cmds /= n;
         self.gpu_image_cmds /= n;
         self.hw_scale /= n;
+        self.guest.divide(n);
+    }
+
+    /// Add guest-runtime telemetry to this sample.
+    pub fn add_guest_profile(&mut self, guest: GuestRuntimeProfile) {
+        self.guest.accumulate(guest);
     }
 
     pub fn host_fps(self) -> f32 {
@@ -302,6 +390,7 @@ pub struct FrameProfiler {
     samples: VecDeque<FrameProfileSample>,
     log_mode: LogMode,
     log_accum_ms: f32,
+    guest_stage_starts: [Option<u64>; STAGE_COUNT],
 }
 
 impl Default for FrameProfiler {
@@ -315,6 +404,7 @@ impl Default for FrameProfiler {
             samples: VecDeque::with_capacity(HISTORY_CAP),
             log_mode,
             log_accum_ms: 0.0,
+            guest_stage_starts: [None; STAGE_COUNT],
         }
     }
 }
@@ -365,6 +455,43 @@ impl FrameProfiler {
     pub fn clear(&mut self) {
         self.samples.clear();
         self.log_accum_ms = 0.0;
+        self.guest_stage_starts = [None; STAGE_COUNT];
+    }
+
+    /// Fold raw guest events into one frontend-frame sample, preserving
+    /// open stage spans across samples when the guest misses a VBlank budget.
+    pub fn consume_guest_events(&mut self, events: &[GuestTelemetryEvent]) -> GuestRuntimeProfile {
+        let mut out = GuestRuntimeProfile::default();
+        for event in events {
+            match event.kind {
+                emulator_core::telemetry::GuestTelemetryKind::FrameBegin => {
+                    out.frames += 1.0;
+                }
+                emulator_core::telemetry::GuestTelemetryKind::StageBegin => {
+                    if let Some(slot) = self.guest_stage_starts.get_mut(event.id as usize) {
+                        *slot = Some(event.cycles);
+                    }
+                }
+                emulator_core::telemetry::GuestTelemetryKind::StageEnd => {
+                    let Some(slot) = self.guest_stage_starts.get_mut(event.id as usize) else {
+                        continue;
+                    };
+                    let Some(start) = slot.take() else {
+                        continue;
+                    };
+                    let idx = event.id as usize;
+                    out.stage_cycles[idx] += event.cycles.saturating_sub(start) as f32;
+                    out.stage_hits[idx] += 1.0;
+                }
+                emulator_core::telemetry::GuestTelemetryKind::Counter => {
+                    if let Some(counter) = out.counters.get_mut(event.id as usize) {
+                        *counter += event.value as f32;
+                    }
+                }
+                emulator_core::telemetry::GuestTelemetryKind::Unknown(_) => {}
+            }
+        }
+        out
     }
 }
 
@@ -452,6 +579,50 @@ pub fn draw(ctx: &egui::Context, profiler: &mut FrameProfiler) {
                     }
                 });
 
+            if avg.guest.has_data() {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Guest Runtime")
+                        .color(theme::ACCENT)
+                        .monospace()
+                        .size(theme::FONT_SIZE_SMALL),
+                );
+                ui.horizontal(|ui| {
+                    metric(ui, "GFR/R", format!("{:.1}", avg.guest.frames));
+                    metric(
+                        ui,
+                        "UPD/F",
+                        format!(
+                            "{:.0}",
+                            avg.guest.stage_cycles_per_guest_frame(
+                                emulator_core::telemetry::stage::UPDATE as usize
+                            )
+                        ),
+                    );
+                    metric(
+                        ui,
+                        "REN",
+                        format!(
+                            "{:.0}",
+                            avg.guest.stage_cycles_per_hit(
+                                emulator_core::telemetry::stage::RENDER as usize
+                            )
+                        ),
+                    );
+                    metric(
+                        ui,
+                        "MOD",
+                        format!(
+                            "{:.0}",
+                            avg.guest.stage_cycles_per_hit(
+                                emulator_core::telemetry::stage::MODEL_INSTANCES as usize
+                            )
+                        ),
+                    );
+                });
+                draw_guest_runtime(ui, avg.guest);
+            }
+
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.small_button("Log Snapshot").clicked() {
@@ -500,6 +671,94 @@ fn stage_row(ui: &mut egui::Ui, label: &str, ms: f32, max_ms: f32) {
 
     ui.label(
         RichText::new(format!("{ms:6.2}"))
+            .color(theme::TEXT)
+            .monospace()
+            .size(theme::FONT_SIZE_SMALL),
+    );
+    ui.end_row();
+}
+
+fn draw_guest_runtime(ui: &mut egui::Ui, guest: GuestRuntimeProfile) {
+    let max_cycles = (1..STAGE_COUNT)
+        .map(|id| guest.stage_cycles_per_hit(id))
+        .fold(guest.cycle_budget_per_guest_frame() / 4.0, f32::max)
+        .max(1.0);
+
+    egui::Grid::new("guest-runtime-stage-grid")
+        .num_columns(4)
+        .spacing(egui::vec2(8.0, 3.0))
+        .striped(false)
+        .show(ui, |ui| {
+            for id in 1..STAGE_COUNT {
+                let cycles = guest.stage_cycles_per_hit(id);
+                if cycles <= 0.0 {
+                    continue;
+                }
+                guest_stage_row(ui, stage_name(id as u16), cycles, max_cycles);
+            }
+        });
+
+    let has_counters = guest.counters.iter().any(|&value| value > 0.0);
+    if !has_counters {
+        return;
+    }
+
+    ui.add_space(4.0);
+    egui::Grid::new("guest-runtime-counter-grid")
+        .num_columns(2)
+        .spacing(egui::vec2(8.0, 3.0))
+        .striped(false)
+        .show(ui, |ui| {
+            for id in 1..COUNTER_COUNT {
+                let value = guest.counter_per_guest_frame(id);
+                if value <= 0.0 {
+                    continue;
+                }
+                counter_row(ui, counter_name(id as u16), value);
+            }
+        });
+}
+
+fn guest_stage_row(ui: &mut egui::Ui, label: &str, cycles: f32, max_cycles: f32) {
+    ui.label(
+        RichText::new(label)
+            .color(theme::TEXT)
+            .monospace()
+            .size(theme::FONT_SIZE_SMALL),
+    );
+
+    let width = ui.available_width().clamp(80.0, 240.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 9.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, theme::WIDGET_BG);
+    let fill_width = (rect.width() * (cycles / max_cycles).clamp(0.0, 1.0)).max(1.0);
+    let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_width, rect.height()));
+    painter.rect_filled(fill_rect, 2.0, theme::ACCENT_HOVER);
+
+    ui.label(
+        RichText::new(format!("{cycles:7.0} cyc"))
+            .color(theme::TEXT)
+            .monospace()
+            .size(theme::FONT_SIZE_SMALL),
+    );
+    ui.label(
+        RichText::new(format!("{:.3} ms", cycles / PSX_CYCLES_PER_MS))
+            .color(theme::TEXT_DIM)
+            .monospace()
+            .size(theme::FONT_SIZE_SMALL),
+    );
+    ui.end_row();
+}
+
+fn counter_row(ui: &mut egui::Ui, label: &str, value: f32) {
+    ui.label(
+        RichText::new(label)
+            .color(theme::TEXT_DIM)
+            .monospace()
+            .size(theme::FONT_SIZE_SMALL),
+    );
+    ui.label(
+        RichText::new(format!("{value:.0}"))
             .color(theme::TEXT)
             .monospace()
             .size(theme::FONT_SIZE_SMALL),
@@ -607,6 +866,8 @@ fn format_log_line(kind: &str, sample: FrameProfileSample) -> String {
          host_fps={:.1} emu_hz={:.1} draw_hz={:.1} step={:.1}% \
          cyc_f={:.0} budget_f={:.0} instr_f={:.0} vblanks={:.1} capmiss={:.0} \
          gte_f={:.0} gtecy_f={:.0} cmd_f={:.0} draw_f={:.0} image_f={:.0} words_f={:.0} \
+         guest_frames={:.1} guest_render_hit={:.0} guest_models_hit={:.0} guest_player_hit={:.0} \
+         guest_flush_hit={:.0} guest_prims_f={:.0} guest_cmds_f={:.0} \
          scale={:.0}x ticks={:.0} cycles={:.0}",
         sample.total_ms,
         sample.host_dt_ms,
@@ -632,6 +893,25 @@ fn format_log_line(kind: &str, sample: FrameProfileSample) -> String {
         sample.gpu_draw_cmds_per_guest_frame(),
         sample.gpu_image_cmds_per_guest_frame(),
         sample.gpu_words_per_guest_frame(),
+        sample.guest.frames,
+        sample
+            .guest
+            .stage_cycles_per_hit(emulator_core::telemetry::stage::RENDER as usize),
+        sample
+            .guest
+            .stage_cycles_per_hit(emulator_core::telemetry::stage::MODEL_INSTANCES as usize),
+        sample
+            .guest
+            .stage_cycles_per_hit(emulator_core::telemetry::stage::PLAYER as usize),
+        sample
+            .guest
+            .stage_cycles_per_hit(emulator_core::telemetry::stage::WORLD_FLUSH as usize),
+        sample
+            .guest
+            .counter_per_guest_frame(emulator_core::telemetry::counter::TRI_PRIMITIVES as usize),
+        sample
+            .guest
+            .counter_per_guest_frame(emulator_core::telemetry::counter::WORLD_COMMANDS as usize),
         sample.hw_scale.max(1.0),
         sample.cpu_ticks,
         sample.bus_cycles,
@@ -648,6 +928,7 @@ mod tests {
             samples: VecDeque::with_capacity(HISTORY_CAP),
             log_mode: LogMode::Off,
             log_accum_ms: 0.0,
+            guest_stage_starts: [None; STAGE_COUNT],
         };
         profiler.record(FrameProfileSample {
             total_ms: 10.0,
@@ -691,6 +972,35 @@ mod tests {
         assert_eq!(avg.cpu_ticks_per_guest_frame(), 15_000.0);
         assert_eq!(avg.gte_ops_per_guest_frame(), 6.0);
         assert_eq!(avg.gte_cycles_per_guest_frame(), 60.0);
+    }
+
+    #[test]
+    fn guest_stage_spans_can_cross_samples() {
+        let mut profiler = FrameProfiler::default();
+        let first = [GuestTelemetryEvent {
+            cycles: 100,
+            kind: emulator_core::telemetry::GuestTelemetryKind::StageBegin,
+            id: emulator_core::telemetry::stage::RENDER,
+            value: 0,
+        }];
+        let second = [GuestTelemetryEvent {
+            cycles: 250,
+            kind: emulator_core::telemetry::GuestTelemetryKind::StageEnd,
+            id: emulator_core::telemetry::stage::RENDER,
+            value: 0,
+        }];
+
+        let a = profiler.consume_guest_events(&first);
+        let b = profiler.consume_guest_events(&second);
+
+        assert_eq!(
+            a.stage_cycles[emulator_core::telemetry::stage::RENDER as usize],
+            0.0
+        );
+        assert_eq!(
+            b.stage_cycles[emulator_core::telemetry::stage::RENDER as usize],
+            150.0
+        );
     }
 
     #[test]
