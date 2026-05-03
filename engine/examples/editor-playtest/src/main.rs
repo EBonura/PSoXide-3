@@ -31,7 +31,7 @@ extern crate psx_rt;
 
 use psx_asset::{Animation, Model, Texture};
 #[cfg(not(feature = "world-grid-visible"))]
-use psx_engine::draw_room_lit;
+use psx_engine::draw_room_vertex_lit;
 use psx_engine::{
     button, compute_joint_world_transform, telemetry, Angle, App, CharacterMotorAnim,
     CharacterMotorConfig, CharacterMotorInput, CharacterMotorState, Config, Ctx, CullMode,
@@ -43,19 +43,20 @@ use psx_engine::{
     WorldSurfaceOptions, WorldSurfaceSample, WorldTriCommand, WorldVertex, Q8,
 };
 #[cfg(feature = "world-grid-visible")]
-use psx_engine::{draw_room_lit_grid_visible, GridVisibility};
+use psx_engine::{draw_room_vertex_lit_grid_visible, GridVisibility};
 use psx_font::{fonts::BASIC, FontAtlas};
 use psx_gpu::{
     draw_quad_flat,
     material::{TextureMaterial, TextureWindow},
     ot::OrderingTable,
-    prim::TriTextured,
+    prim::{TriTextured, TriTexturedGouraud},
 };
 use psx_level::{
-    equipment_flags, find_asset_of_kind, room_flags, AssetId, AssetKind, EntityRecord,
-    LevelCharacterRecord, LevelMaterialRecord, LevelMaterialSidedness, LevelModelRecord,
-    LevelModelSocketRecord, LevelRoomRecord, ModelClipIndex, ModelClipTableIndex, ModelIndex,
-    ModelSocketIndex, OptionalModelClipIndex, ResidencyManager, RoomIndex, WeaponHitShapeRecord,
+    equipment_flags, find_asset_of_kind, room_flags, surface_light_kind, AssetId, AssetKind,
+    EntityRecord, LevelCharacterRecord, LevelMaterialRecord, LevelMaterialSidedness,
+    LevelModelRecord, LevelModelSocketRecord, LevelRoomRecord, ModelClipIndex, ModelClipTableIndex,
+    ModelIndex, ModelSocketIndex, OptionalModelClipIndex, ResidencyManager, RoomIndex,
+    SurfaceLightRecord, WeaponHitShapeRecord,
 };
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
@@ -77,7 +78,7 @@ mod generated {
 use generated::{
     ASSETS, CHARACTERS, ENTITIES, EQUIPMENT, LIGHTS, MATERIALS, MODELS, MODEL_CLIPS,
     MODEL_INSTANCES, MODEL_SOCKETS, PLAYER_CONTROLLER, PLAYER_SPAWN, ROOMS, ROOM_RESIDENCY,
-    WEAPONS, WEAPON_HITBOXES,
+    SURFACE_LIGHTS, WEAPONS, WEAPON_HITBOXES,
 };
 
 // VRAM layout. Room materials and model atlases live in
@@ -229,10 +230,25 @@ const TRI_ZERO: TriTextured = TriTextured::new(
     0,
     (0, 0, 0),
 );
+const GOURAUD_TRI_ZERO: TriTexturedGouraud = TriTexturedGouraud {
+    tag: 0,
+    tex_window: 0,
+    color0_cmd: 0,
+    v0: 0,
+    uv0_clut: 0,
+    color1: 0,
+    v1: 0,
+    uv1_tpage: 0,
+    color2: 0,
+    v2: 0,
+    uv2: 0,
+};
 
 static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
 static mut TEXTURED_TRIS: [TriTextured; MAX_TEXTURED_TRIS] =
     [const { TRI_ZERO }; MAX_TEXTURED_TRIS];
+static mut TEXTURED_GOURAUD_TRIS: [TriTexturedGouraud; MAX_TEXTURED_TRIS] =
+    [const { GOURAUD_TRI_ZERO }; MAX_TEXTURED_TRIS];
 static mut WORLD_COMMANDS: [WorldTriCommand; MAX_TEXTURED_TRIS] =
     [WorldTriCommand::EMPTY; MAX_TEXTURED_TRIS];
 static mut MODEL_VERTICES: [ProjectedVertex; MODEL_VERTEX_CAP] =
@@ -643,6 +659,7 @@ impl Scene for Playtest {
 
         let mut ot = unsafe { OtFrame::begin(&mut OT) };
         let mut triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_TRIS) };
+        let mut gouraud_triangles = unsafe { PrimitiveArena::new(&mut TEXTURED_GOURAUD_TRIS) };
         // The vertical slice mixes room quads, model instances, and the
         // player in the same playable space. Coarse bucket ordering is
         // faster, but it produces visible doorway/wall artifacts when
@@ -694,14 +711,14 @@ impl Scene for Playtest {
                         player.y,
                         player.z.saturating_sub(active.offset_z),
                     );
-                    let stats = draw_room_lit_grid_visible(
+                    let stats = draw_room_vertex_lit_grid_visible(
                         active.room.render(),
                         materials,
                         &lighting,
                         &room_camera,
                         room_options,
                         GridVisibility::around(visibility_anchor, ROOM_GRID_VISIBILITY_RADIUS),
-                        &mut triangles,
+                        &mut gouraud_triangles,
                         &mut world,
                     );
                     telemetry::counter(
@@ -723,13 +740,13 @@ impl Scene for Playtest {
                 }
                 #[cfg(not(feature = "world-grid-visible"))]
                 {
-                    draw_room_lit(
+                    draw_room_vertex_lit(
                         active.room.render(),
                         materials,
                         &lighting,
                         &room_camera,
                         room_options,
-                        &mut triangles,
+                        &mut gouraud_triangles,
                         &mut world,
                     );
                 }
@@ -752,6 +769,7 @@ impl Scene for Playtest {
                     ctx.time.video_hz(),
                     &room_camera,
                     room_options,
+                    &lighting,
                     &self.models,
                     &self.clips,
                     &mut triangles,
@@ -779,24 +797,29 @@ impl Scene for Playtest {
             // placed model instances.
             if let Some(character) = self.character {
                 let player = self.motor.position();
+                let player_lighting = self.current_room_lighting(camera);
                 telemetry::stage_begin(telemetry::stage::PLAYER);
-                let player_stats = draw_player(
-                    character,
-                    &self.models,
-                    &self.clips,
-                    player.x,
-                    player.y,
-                    player.z,
-                    self.motor.yaw(),
-                    character.clip_for(self.anim_state),
-                    self.anim_start_tick,
-                    ctx.time.elapsed_vblanks(),
-                    ctx.time.video_hz(),
-                    &camera,
-                    actor_options,
-                    &mut triangles,
-                    &mut world,
-                );
+                let player_stats =
+                    player_lighting.map_or(TexturedModelRenderStats::default(), |lighting| {
+                        draw_player(
+                            character,
+                            &self.models,
+                            &self.clips,
+                            player.x,
+                            player.y,
+                            player.z,
+                            self.motor.yaw(),
+                            character.clip_for(self.anim_state),
+                            self.anim_start_tick,
+                            ctx.time.elapsed_vblanks(),
+                            ctx.time.video_hz(),
+                            &camera,
+                            actor_options,
+                            &lighting,
+                            &mut triangles,
+                            &mut world,
+                        )
+                    });
                 telemetry::stage_end(telemetry::stage::PLAYER);
                 emit_model_counters(
                     player_stats,
@@ -806,24 +829,28 @@ impl Scene for Playtest {
                     telemetry::counter::PLAYER_DROPPED_TRIS,
                 );
                 telemetry::stage_begin(telemetry::stage::EQUIPMENT);
-                let equipment_stats = draw_player_equipment(
-                    self.room_index,
-                    character,
-                    &self.models,
-                    &self.clips,
-                    player.x,
-                    player.y,
-                    player.z,
-                    self.motor.yaw(),
-                    character.clip_for(self.anim_state),
-                    self.anim_start_tick,
-                    ctx.time.elapsed_vblanks(),
-                    ctx.time.video_hz(),
-                    &camera,
-                    actor_options,
-                    &mut triangles,
-                    &mut world,
-                );
+                let equipment_stats =
+                    player_lighting.map_or(EquipmentDrawStats::default(), |lighting| {
+                        draw_player_equipment(
+                            self.room_index,
+                            character,
+                            &self.models,
+                            &self.clips,
+                            player.x,
+                            player.y,
+                            player.z,
+                            self.motor.yaw(),
+                            character.clip_for(self.anim_state),
+                            self.anim_start_tick,
+                            ctx.time.elapsed_vblanks(),
+                            ctx.time.video_hz(),
+                            &camera,
+                            actor_options,
+                            &lighting,
+                            &mut triangles,
+                            &mut world,
+                        )
+                    });
                 telemetry::stage_end(telemetry::stage::EQUIPMENT);
                 telemetry::counter(
                     telemetry::counter::EQUIPMENT_DRAWS,
@@ -847,7 +874,10 @@ impl Scene for Playtest {
             }
         }
 
-        telemetry::counter(telemetry::counter::TRI_PRIMITIVES, triangles.len() as u32);
+        telemetry::counter(
+            telemetry::counter::TRI_PRIMITIVES,
+            triangles.len().saturating_add(gouraud_triangles.len()) as u32,
+        );
         telemetry::counter(
             telemetry::counter::WORLD_COMMANDS,
             world.command_len() as u32,
@@ -977,6 +1007,20 @@ impl Playtest {
             moving,
             lock_target,
         }
+    }
+
+    fn current_room_lighting(&self, camera: WorldCamera) -> Option<RuntimeRoomLighting> {
+        let room = self.room?;
+        let room_record = ROOMS.get(self.room_index.to_usize())?;
+        Some(RuntimeRoomLighting {
+            room_index: self.room_index,
+            ambient: Rgb8::from_array(room.render().ambient_color()),
+            camera,
+            fog_enabled: room_record.flags & room_flags::FOG_ENABLED != 0,
+            fog_rgb: Rgb8::from_array(room_record.fog_rgb),
+            fog_near: room_record.fog_near,
+            fog_far: room_record.fog_far,
+        })
     }
 
     fn update_follow_camera(&mut self, ctx: &Ctx) -> WorldCamera {
@@ -1232,17 +1276,13 @@ fn draw_player(
     video_hz: u16,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
+    lighting: &RuntimeRoomLighting,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
 ) -> TexturedModelRenderStats {
     let Some(runtime_model) = models.get(character.model.to_usize()).copied().flatten() else {
         return TexturedModelRenderStats::default();
     };
-    let model_options = options
-        .with_depth_policy(DepthPolicy::Average)
-        .with_cull_mode(CullMode::Back)
-        .with_material_layer(runtime_model.material)
-        .with_textured_triangle_splitting(false);
 
     let Some(anim) = runtime_model.clip(clips, clip_local) else {
         return TexturedModelRenderStats::default();
@@ -1254,6 +1294,12 @@ fn draw_player(
 
     let origin = floor_anchored_model_origin(x, y, z, runtime_model.world_height);
     let instance_rotation = yaw_rotation_matrix(yaw);
+    let material = lighting.shade_model_material(origin, runtime_model.material);
+    let model_options = options
+        .with_depth_policy(DepthPolicy::Average)
+        .with_cull_mode(CullMode::Back)
+        .with_material_layer(material)
+        .with_textured_triangle_splitting(false);
 
     world.submit_textured_model(
         triangles,
@@ -1265,7 +1311,7 @@ fn draw_player(
         instance_rotation,
         unsafe { &mut MODEL_VERTICES },
         unsafe { &mut JOINT_VIEW_TRANSFORMS },
-        runtime_model.material,
+        material,
         model_options,
     )
 }
@@ -1300,6 +1346,7 @@ fn draw_player_equipment(
     video_hz: u16,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
+    lighting: &RuntimeRoomLighting,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
     world: &mut WorldRenderPass<'_, '_, OT_DEPTH>,
 ) -> EquipmentDrawStats {
@@ -1361,10 +1408,11 @@ fn draw_player_equipment(
                 );
                 if let Some(anim) = weapon_model.clip(clips, weapon_model.default_clip) {
                     let phase = anim.phase_at_tick_q12(elapsed_vblanks, video_hz);
+                    let material = lighting.shade_model_material(origin, weapon_model.material);
                     let model_options = options
                         .with_depth_policy(DepthPolicy::Average)
                         .with_cull_mode(CullMode::Back)
-                        .with_material_layer(weapon_model.material)
+                        .with_material_layer(material)
                         .with_textured_triangle_splitting(false);
                     let stats = world.submit_textured_model_primary_joints(
                         triangles,
@@ -1376,7 +1424,7 @@ fn draw_player_equipment(
                         weapon_rotation,
                         unsafe { &mut MODEL_VERTICES },
                         unsafe { &mut JOINT_VIEW_TRANSFORMS },
-                        weapon_model.material,
+                        material,
                         model_options,
                     );
                     accumulate_model_stats(&mut out.stats, stats);
@@ -1758,12 +1806,16 @@ struct RuntimeRoomLighting {
     fog_far: i32,
 }
 
-impl WorldSurfaceLighting for RuntimeRoomLighting {
-    fn shade(
+impl RuntimeRoomLighting {
+    fn shade_model_material(
         &self,
-        sample: WorldSurfaceSample,
-        material: WorldRenderMaterial,
-    ) -> WorldRenderMaterial {
+        point: WorldVertex,
+        material: TextureMaterial,
+    ) -> TextureMaterial {
+        material.with_tint(self.shade_tint_at(RoomPoint::from_world_vertex(point), material.tint()))
+    }
+
+    fn shade_tint_at(&self, point: RoomPoint, base: (u8, u8, u8)) -> (u8, u8, u8) {
         let lights = LIGHTS
             .iter()
             .filter(|light| light.room == self.room_index)
@@ -1776,21 +1828,92 @@ impl WorldSurfaceLighting for RuntimeRoomLighting {
                 )
             });
         let tint = psx_engine::shade_material_tint_with_lights(
-            MaterialTint::from_tuple(material.texture.tint()),
-            sample.center.to_array(),
+            MaterialTint::from_tuple(base),
+            point.to_array(),
             self.ambient,
             lights,
         )
         .to_tuple();
-        let depth = self.camera.view_vertex(sample.center.to_world_vertex()).z;
-        material.with_tint(apply_room_fog(
+        let depth = self.camera.view_vertex(point.to_world_vertex()).z;
+        apply_room_fog(
             tint,
             depth,
             self.fog_enabled,
             self.fog_rgb,
             self.fog_near,
             self.fog_far,
-        ))
+        )
+    }
+
+    fn baked_surface(&self, sample: WorldSurfaceSample) -> Option<&'static SurfaceLightRecord> {
+        let (kind, direction) = match sample.kind {
+            psx_engine::WorldSurfaceKind::Floor => (surface_light_kind::FLOOR, 0),
+            psx_engine::WorldSurfaceKind::Ceiling => (surface_light_kind::CEILING, 0),
+            psx_engine::WorldSurfaceKind::Wall { direction } => {
+                (surface_light_kind::WALL, direction)
+            }
+        };
+        SURFACE_LIGHTS.iter().find(|light| {
+            light.room == self.room_index
+                && light.sx == sample.sx
+                && light.sz == sample.sz
+                && light.kind == kind
+                && light.direction == direction
+                && light.ordinal == sample.ordinal
+        })
+    }
+
+    fn apply_vertex_fog(&self, rgb: [u8; 3], vertex: WorldVertex) -> (u8, u8, u8) {
+        let depth = self.camera.view_vertex(vertex).z;
+        apply_room_fog(
+            (rgb[0], rgb[1], rgb[2]),
+            depth,
+            self.fog_enabled,
+            self.fog_rgb,
+            self.fog_near,
+            self.fog_far,
+        )
+    }
+}
+
+impl WorldSurfaceLighting for RuntimeRoomLighting {
+    fn shade(
+        &self,
+        sample: WorldSurfaceSample,
+        material: WorldRenderMaterial,
+    ) -> WorldRenderMaterial {
+        material.with_tint(self.shade_tint_at(sample.center, material.texture.tint()))
+    }
+
+    fn shade_vertex(
+        &self,
+        _sample: WorldSurfaceSample,
+        vertex: RoomPoint,
+        material: WorldRenderMaterial,
+    ) -> (u8, u8, u8) {
+        self.shade_tint_at(vertex, material.texture.tint())
+    }
+
+    fn shade_vertices(
+        &self,
+        sample: WorldSurfaceSample,
+        vertices: [WorldVertex; 4],
+        material: WorldRenderMaterial,
+    ) -> [(u8, u8, u8); 4] {
+        if let Some(surface) = self.baked_surface(sample) {
+            return [
+                self.apply_vertex_fog(surface.vertex_rgb[0], vertices[0]),
+                self.apply_vertex_fog(surface.vertex_rgb[1], vertices[1]),
+                self.apply_vertex_fog(surface.vertex_rgb[2], vertices[2]),
+                self.apply_vertex_fog(surface.vertex_rgb[3], vertices[3]),
+            ];
+        }
+        [
+            self.shade_vertex(sample, RoomPoint::from_world_vertex(vertices[0]), material),
+            self.shade_vertex(sample, RoomPoint::from_world_vertex(vertices[1]), material),
+            self.shade_vertex(sample, RoomPoint::from_world_vertex(vertices[2]), material),
+            self.shade_vertex(sample, RoomPoint::from_world_vertex(vertices[3]), material),
+        ]
     }
 }
 
@@ -2027,6 +2150,7 @@ fn draw_model_instances(
     video_hz: u16,
     camera: &WorldCamera,
     options: WorldSurfaceOptions,
+    lighting: &RuntimeRoomLighting,
     models: &[Option<RuntimeModelAsset>; MAX_RUNTIME_MODELS],
     clips: &[Option<Animation<'static>>; MAX_RUNTIME_MODEL_CLIPS],
     triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -2041,11 +2165,6 @@ fn draw_model_instances(
         let Some(runtime_model) = models.get(inst.model.to_usize()).copied().flatten() else {
             continue;
         };
-        let model_options = options
-            .with_depth_policy(DepthPolicy::Average)
-            .with_cull_mode(CullMode::Back)
-            .with_material_layer(runtime_model.material)
-            .with_textured_triangle_splitting(false);
 
         // Clip resolution: per-instance override → model default.
         // The cooker validates that both end up `< clip_count`,
@@ -2060,6 +2179,12 @@ fn draw_model_instances(
         // model vertices are centred around their bounds.
         let origin =
             floor_anchored_model_origin(inst.x, inst.y, inst.z, runtime_model.world_height);
+        let material = lighting.shade_model_material(origin, runtime_model.material);
+        let model_options = options
+            .with_depth_policy(DepthPolicy::Average)
+            .with_cull_mode(CullMode::Back)
+            .with_material_layer(material)
+            .with_textured_triangle_splitting(false);
         // Instance Y-axis rotation from authored yaw. PSX angle
         // units (4096 per turn) → Q12 sin/cos via the existing
         // GTE shim, then composed into a rotation matrix.
@@ -2075,7 +2200,7 @@ fn draw_model_instances(
             instance_rotation,
             unsafe { &mut MODEL_VERTICES },
             unsafe { &mut JOINT_VIEW_TRANSFORMS },
-            runtime_model.material,
+            material,
             model_options,
         );
         accumulate_model_stats(&mut out.stats, stats);

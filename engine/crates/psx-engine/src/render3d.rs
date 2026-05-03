@@ -17,7 +17,7 @@ use crate::{Angle, WorldVertex, Q12};
 use psx_asset::{Animation, JointPose, Mesh, Model, ModelFaceCorner, ModelVertex};
 use psx_gpu::{
     material::TextureMaterial,
-    prim::{TriGouraud, TriTextured},
+    prim::{TriGouraud, TriTextured, TriTexturedGouraud},
 };
 use psx_gte::{
     lighting::{project_lit, ProjectedLit},
@@ -224,6 +224,29 @@ impl ProjectedTexturedVertex {
     /// Build a projected textured vertex.
     pub const fn new(projected: ProjectedVertex, u: i32, v: i32) -> Self {
         Self { projected, u, v }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct ProjectedTexturedGouraudVertex {
+    projected: ProjectedVertex,
+    u: i32,
+    v: i32,
+    color: (u8, u8, u8),
+}
+
+impl ProjectedTexturedGouraudVertex {
+    const fn new(projected: ProjectedVertex, u: i32, v: i32, color: (u8, u8, u8)) -> Self {
+        Self {
+            projected,
+            u,
+            v,
+            color,
+        }
+    }
+
+    const fn textured(self) -> ProjectedTexturedVertex {
+        ProjectedTexturedVertex::new(self.projected, self.u, self.v)
     }
 }
 
@@ -984,6 +1007,202 @@ impl<'a, 'ot, const OT_DEPTH: usize> WorldRenderPass<'a, 'ot, OT_DEPTH> {
             .saturating_add(second.culled_triangles);
         stats.primitive_overflow |= second.primitive_overflow;
         stats.command_overflow |= second.command_overflow;
+        stats
+    }
+
+    /// Submit a projected textured Gouraud triangle.
+    ///
+    /// This is the room/static-light path: callers CPU-project the
+    /// world vertices once, compute one tint per vertex, then let the
+    /// GPU interpolate that tint across the textured triangle.
+    pub fn submit_textured_gouraud_triangle(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+        verts: [ProjectedVertex; 3],
+        uvs: [(u8, u8); 3],
+        colors: [(u8, u8, u8); 3],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+    ) -> WorldRenderStats {
+        let mut stats = WorldRenderStats::default();
+        if options.cull_mode == CullMode::Back && projected_back_facing(verts) {
+            stats.culled_triangles = 1;
+            return stats;
+        }
+
+        let textured = [
+            ProjectedTexturedGouraudVertex::new(
+                verts[0],
+                uvs[0].0 as i32,
+                uvs[0].1 as i32,
+                colors[0],
+            ),
+            ProjectedTexturedGouraudVertex::new(
+                verts[1],
+                uvs[1].0 as i32,
+                uvs[1].1 as i32,
+                colors[1],
+            ),
+            ProjectedTexturedGouraudVertex::new(
+                verts[2],
+                uvs[2].0 as i32,
+                uvs[2].1 as i32,
+                colors[2],
+            ),
+        ];
+        merge_world_stats(
+            &mut stats,
+            self.submit_textured_gouraud_triangle_split(triangles, textured, material, options, 0),
+        );
+        stats
+    }
+
+    fn submit_textured_gouraud_triangle_split(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+        verts: [ProjectedTexturedGouraudVertex; 3],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+        split_depth: u8,
+    ) -> WorldRenderStats {
+        if !options.split_textured_triangles {
+            return self.submit_textured_gouraud_triangle_leaf(triangles, verts, material, options);
+        }
+
+        let verts = [
+            clamp_projected_textured_gouraud_vertex(verts[0]),
+            clamp_projected_textured_gouraud_vertex(verts[1]),
+            clamp_projected_textured_gouraud_vertex(verts[2]),
+        ];
+
+        if projected_textured_gouraud_exceeds_hw_extent(verts)
+            && split_depth < MAX_TEXTURED_HW_SPLIT_DEPTH
+        {
+            return self.submit_split_textured_gouraud_triangle(
+                triangles,
+                verts,
+                material,
+                options,
+                split_depth,
+            );
+        }
+        if projected_textured_gouraud_exceeds_hw_extent(verts) {
+            return WorldRenderStats {
+                dropped_triangles: 1,
+                ..WorldRenderStats::default()
+            };
+        }
+
+        self.submit_textured_gouraud_triangle_leaf(triangles, verts, material, options)
+    }
+
+    fn submit_split_textured_gouraud_triangle(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+        verts: [ProjectedTexturedGouraudVertex; 3],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+        split_depth: u8,
+    ) -> WorldRenderStats {
+        let edge = largest_projected_gouraud_edge(verts);
+        let mut stats = WorldRenderStats {
+            split_triangles: 1,
+            ..WorldRenderStats::default()
+        };
+
+        let (first, second) = match edge {
+            0 => {
+                let mid = midpoint_projected_textured_gouraud(verts[0], verts[1]);
+                ([verts[0], mid, verts[2]], [mid, verts[1], verts[2]])
+            }
+            1 => {
+                let mid = midpoint_projected_textured_gouraud(verts[1], verts[2]);
+                ([verts[0], verts[1], mid], [verts[0], mid, verts[2]])
+            }
+            _ => {
+                let mid = midpoint_projected_textured_gouraud(verts[2], verts[0]);
+                ([verts[0], verts[1], mid], [mid, verts[1], verts[2]])
+            }
+        };
+
+        let first_stats = self.submit_textured_gouraud_triangle_split(
+            triangles,
+            first,
+            material,
+            options,
+            split_depth + 1,
+        );
+        merge_world_stats(&mut stats, first_stats);
+        if stats.primitive_overflow || stats.command_overflow {
+            return stats;
+        }
+
+        let second_stats = self.submit_textured_gouraud_triangle_split(
+            triangles,
+            second,
+            material,
+            options,
+            split_depth + 1,
+        );
+        merge_world_stats(&mut stats, second_stats);
+        stats
+    }
+
+    fn submit_textured_gouraud_triangle_leaf(
+        &mut self,
+        triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+        verts: [ProjectedTexturedGouraudVertex; 3],
+        material: TextureMaterial,
+        options: WorldSurfaceOptions,
+    ) -> WorldRenderStats {
+        let mut stats = WorldRenderStats::default();
+        if self.command_len >= self.commands.len() {
+            stats.command_overflow = true;
+            return stats;
+        }
+
+        let Some(tri) = triangles.push(TriTexturedGouraud::with_material(
+            [
+                (verts[0].projected.sx, verts[0].projected.sy),
+                (verts[1].projected.sx, verts[1].projected.sy),
+                (verts[2].projected.sx, verts[2].projected.sy),
+            ],
+            [
+                (clamp_u8(verts[0].u), clamp_u8(verts[0].v)),
+                (clamp_u8(verts[1].u), clamp_u8(verts[1].v)),
+                (clamp_u8(verts[2].u), clamp_u8(verts[2].v)),
+            ],
+            [verts[0].color, verts[1].color, verts[2].color],
+            material,
+        )) else {
+            stats.primitive_overflow = true;
+            return stats;
+        };
+
+        let depth = CameraDepth::new(
+            options
+                .depth_policy
+                .depth_values(
+                    verts[0].projected.sz,
+                    verts[1].projected.sz,
+                    verts[2].projected.sz,
+                )
+                .saturating_add(options.depth_bias),
+        );
+        self.push_command(
+            options
+                .depth_band
+                .slot_depth::<OT_DEPTH>(options.depth_range, depth),
+            depth.raw(),
+            if material.is_translucent() {
+                WorldRenderLayer::Transparent
+            } else {
+                options.render_layer
+            },
+            tri as *mut TriTexturedGouraud as *mut u32,
+            TriTexturedGouraud::WORDS,
+        );
+        stats.submitted_triangles = 1;
         stats
     }
 
@@ -2406,10 +2625,33 @@ fn clamp_projected_textured_vertex(vertex: ProjectedTexturedVertex) -> Projected
     )
 }
 
+fn clamp_projected_textured_gouraud_vertex(
+    vertex: ProjectedTexturedGouraudVertex,
+) -> ProjectedTexturedGouraudVertex {
+    ProjectedTexturedGouraudVertex::new(
+        ProjectedVertex::new(
+            clamp_i16_range(vertex.projected.sx, PSX_VERTEX_MIN, PSX_VERTEX_MAX),
+            clamp_i16_range(vertex.projected.sy, PSX_VERTEX_MIN, PSX_VERTEX_MAX),
+            vertex.projected.sz,
+        ),
+        vertex.u,
+        vertex.v,
+        vertex.color,
+    )
+}
+
 fn projected_textured_exceeds_hw_extent(verts: [ProjectedTexturedVertex; 3]) -> bool {
     projected_edge_exceeds_hw_extent(verts[0], verts[1])
         || projected_edge_exceeds_hw_extent(verts[1], verts[2])
         || projected_edge_exceeds_hw_extent(verts[2], verts[0])
+}
+
+fn projected_textured_gouraud_exceeds_hw_extent(
+    verts: [ProjectedTexturedGouraudVertex; 3],
+) -> bool {
+    projected_edge_exceeds_hw_extent(verts[0].textured(), verts[1].textured())
+        || projected_edge_exceeds_hw_extent(verts[1].textured(), verts[2].textured())
+        || projected_edge_exceeds_hw_extent(verts[2].textured(), verts[0].textured())
 }
 
 fn projected_edge_exceeds_hw_extent(
@@ -2436,6 +2678,15 @@ fn largest_projected_edge(verts: [ProjectedTexturedVertex; 3]) -> usize {
     edge
 }
 
+fn largest_projected_gouraud_edge(verts: [ProjectedTexturedGouraudVertex; 3]) -> usize {
+    let textured = [
+        verts[0].textured(),
+        verts[1].textured(),
+        verts[2].textured(),
+    ];
+    largest_projected_edge(textured)
+}
+
 fn projected_edge_split_score(a: ProjectedTexturedVertex, b: ProjectedTexturedVertex) -> i32 {
     let dx = ((a.projected.sx as i32) - (b.projected.sx as i32)).abs();
     let dy = ((a.projected.sy as i32) - (b.projected.sy as i32)).abs();
@@ -2457,12 +2708,32 @@ fn midpoint_projected_textured(
     )
 }
 
+fn midpoint_projected_textured_gouraud(
+    a: ProjectedTexturedGouraudVertex,
+    b: ProjectedTexturedGouraudVertex,
+) -> ProjectedTexturedGouraudVertex {
+    ProjectedTexturedGouraudVertex::new(
+        midpoint_projected_textured(a.textured(), b.textured()).projected,
+        midpoint_i32(a.u, b.u),
+        midpoint_i32(a.v, b.v),
+        (
+            midpoint_u8(a.color.0, b.color.0),
+            midpoint_u8(a.color.1, b.color.1),
+            midpoint_u8(a.color.2, b.color.2),
+        ),
+    )
+}
+
 fn midpoint_i16(a: i16, b: i16) -> i16 {
     midpoint_i32(a as i32, b as i32) as i16
 }
 
 fn midpoint_i32(a: i32, b: i32) -> i32 {
     a + (b - a) / 2
+}
+
+fn midpoint_u8(a: u8, b: u8) -> u8 {
+    (((a as u16) + (b as u16)) / 2) as u8
 }
 
 fn clip_textured_triangle_to_near(

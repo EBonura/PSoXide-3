@@ -1,6 +1,8 @@
 //! Shared editor/cooker resource resolution rules.
 
-use crate::{CharacterResource, ModelResource, ProjectDocument, ResourceData, ResourceId};
+use crate::{
+    AnimationRole, CharacterResource, ModelResource, ProjectDocument, ResourceData, ResourceId,
+};
 
 /// A player spawn's resolved Character resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +96,30 @@ pub fn resolve_character_idle_preview_clip(
         .idle_clip
         .or(model.effective_preview_clip())
         .or_else(|| (!model.clips.is_empty()).then_some(0))
+}
+
+/// Clip shown for a player spawn's Character in the editor preview
+/// when the project has standalone Animation Set resources.
+pub fn resolve_character_idle_preview_clip_for_model(
+    project: &ProjectDocument,
+    character: &CharacterResource,
+    model_id: ResourceId,
+    model: &ModelResource,
+) -> Option<u16> {
+    if let Some(animation_id) = character.animation_set.and_then(|set_id| {
+        project
+            .resource(set_id)
+            .and_then(|resource| match &resource.data {
+                ResourceData::AnimationSet(set) => set.role_clip(AnimationRole::Idle),
+                _ => None,
+            })
+    }) {
+        if let Some(index) = project.resolved_model_animation_index(model_id, animation_id) {
+            return Some(index);
+        }
+    }
+    resolve_character_idle_preview_clip(character, model)
+        .or_else(|| (!project.resolved_model_animation_clips(model_id).is_empty()).then_some(0))
 }
 
 #[cfg(test)]

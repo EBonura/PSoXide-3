@@ -2010,6 +2010,231 @@ pub struct ModelAnimationClip {
     pub psxanim_path: String,
 }
 
+/// Skeleton compatibility contract for skinned models and animation
+/// clips.
+///
+/// The cooked `.psxanim` format only stores a joint count, so the
+/// editor keeps the stronger authoring-side contract here: joint
+/// count plus the cooked model parent table. Source importers can
+/// extend this later with joint names and bind-pose hashes without
+/// changing the runtime record layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkeletonResource {
+    /// Number of joints in the skeleton.
+    pub joint_count: u16,
+    /// Parent index for each joint, or `None` for root joints.
+    #[serde(default)]
+    pub parents: Vec<Option<u16>>,
+    /// Deterministic compatibility key. Current cooked assets use a
+    /// parent-table signature; future importers should include joint
+    /// names and bind pose in this value.
+    #[serde(default)]
+    pub signature: String,
+    /// Human-readable note/source hint.
+    #[serde(default)]
+    pub note: String,
+}
+
+impl SkeletonResource {
+    /// Build a skeleton descriptor from a cooked model.
+    pub fn from_model(model: &psx_asset::Model<'_>) -> Self {
+        let mut parents = Vec::with_capacity(model.joint_count() as usize);
+        for index in 0..model.joint_count() {
+            parents.push(model.joint(index).and_then(|joint| joint.parent()));
+        }
+        let signature = skeleton_signature(model.joint_count(), &parents);
+        Self {
+            joint_count: model.joint_count(),
+            parents,
+            signature,
+            note: String::new(),
+        }
+    }
+
+    /// True when an animation with `joint_count` can at least be
+    /// safely sampled against this skeleton. This is the minimum
+    /// cooked-format guarantee; exact skeleton signatures are checked
+    /// when another skeleton resource is available.
+    pub const fn accepts_joint_count(&self, joint_count: u16) -> bool {
+        self.joint_count == joint_count
+    }
+}
+
+fn skeleton_signature(joint_count: u16, parents: &[Option<u16>]) -> String {
+    let mut out = format!("psx-parent-v1:{joint_count}:");
+    for (index, parent) in parents.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        match parent {
+            Some(parent) => out.push_str(&parent.to_string()),
+            None => out.push_str("root"),
+        }
+    }
+    out
+}
+
+/// Semantic role for an animation clip. This is editor metadata:
+/// runtime still receives concrete clip indices after cooking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnimationRole {
+    /// No specific gameplay meaning yet.
+    #[default]
+    Generic,
+    Idle,
+    Walk,
+    Run,
+    Turn,
+    Attack,
+    Hit,
+    Death,
+}
+
+impl AnimationRole {
+    pub const ALL: [Self; 8] = [
+        Self::Generic,
+        Self::Idle,
+        Self::Walk,
+        Self::Run,
+        Self::Turn,
+        Self::Attack,
+        Self::Hit,
+        Self::Death,
+    ];
+
+    /// User-facing label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Generic => "Generic",
+            Self::Idle => "Idle",
+            Self::Walk => "Walk",
+            Self::Run => "Run",
+            Self::Turn => "Turn",
+            Self::Attack => "Attack",
+            Self::Hit => "Hit",
+            Self::Death => "Death",
+        }
+    }
+
+    /// Guess a role from a clip/resource name.
+    pub fn guess_from_name(name: &str) -> Self {
+        let name = name.to_ascii_lowercase();
+        if name.contains("idle") {
+            Self::Idle
+        } else if name.contains("run") {
+            Self::Run
+        } else if name.contains("walk") {
+            Self::Walk
+        } else if name.contains("turn") {
+            Self::Turn
+        } else if name.contains("attack") || name.contains("combo") || name.contains("melee") {
+            Self::Attack
+        } else if name.contains("hit") || name.contains("reaction") {
+            Self::Hit
+        } else if name.contains("death") || name.contains("dead") {
+            Self::Death
+        } else {
+            Self::Generic
+        }
+    }
+}
+
+/// Standalone cooked animation clip. A clip belongs to a skeleton,
+/// not to a model, so any model with a compatible skeleton can use it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnimationClipResource {
+    /// Path to the cooked `.psxanim` artifact.
+    pub psxanim_path: String,
+    /// Skeleton this clip targets.
+    #[serde(default)]
+    pub skeleton: Option<ResourceId>,
+    /// Semantic role used by auto-assignment and animation sets.
+    #[serde(default)]
+    pub role: AnimationRole,
+    /// Whether gameplay should loop this clip by default.
+    #[serde(default = "default_true")]
+    pub looping: bool,
+    /// Searchable editor tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+impl AnimationClipResource {
+    /// Mirror this resource into the legacy model-local clip shape.
+    pub fn as_model_clip(&self, name: impl Into<String>) -> ModelAnimationClip {
+        ModelAnimationClip {
+            name: name.into(),
+            psxanim_path: self.psxanim_path.clone(),
+        }
+    }
+}
+
+/// Reusable role mapping for one skeleton. Characters combine a
+/// visual model with an Animation Set rather than raw clip indices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnimationSetResource {
+    /// Skeleton every assigned clip must target.
+    #[serde(default)]
+    pub skeleton: Option<ResourceId>,
+    #[serde(default)]
+    pub idle_clip: Option<ResourceId>,
+    #[serde(default)]
+    pub walk_clip: Option<ResourceId>,
+    #[serde(default)]
+    pub run_clip: Option<ResourceId>,
+    #[serde(default)]
+    pub turn_clip: Option<ResourceId>,
+    /// Extra clips included with the set, such as attacks, hit
+    /// reactions, death clips, emotes, and experiments.
+    #[serde(default)]
+    pub clips: Vec<ResourceId>,
+}
+
+impl AnimationSetResource {
+    pub const fn defaults() -> Self {
+        Self {
+            skeleton: None,
+            idle_clip: None,
+            walk_clip: None,
+            run_clip: None,
+            turn_clip: None,
+            clips: Vec::new(),
+        }
+    }
+
+    pub fn role_clip(&self, role: AnimationRole) -> Option<ResourceId> {
+        match role {
+            AnimationRole::Idle => self.idle_clip,
+            AnimationRole::Walk => self.walk_clip,
+            AnimationRole::Run => self.run_clip,
+            AnimationRole::Turn => self.turn_clip,
+            AnimationRole::Generic
+            | AnimationRole::Attack
+            | AnimationRole::Hit
+            | AnimationRole::Death => None,
+        }
+    }
+
+    pub fn role_clip_mut(&mut self, role: AnimationRole) -> Option<&mut Option<ResourceId>> {
+        match role {
+            AnimationRole::Idle => Some(&mut self.idle_clip),
+            AnimationRole::Walk => Some(&mut self.walk_clip),
+            AnimationRole::Run => Some(&mut self.run_clip),
+            AnimationRole::Turn => Some(&mut self.turn_clip),
+            AnimationRole::Generic
+            | AnimationRole::Attack
+            | AnimationRole::Hit
+            | AnimationRole::Death => None,
+        }
+    }
+}
+
+impl Default for AnimationSetResource {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
 /// Named model attachment point, usually bound to a skeleton
 /// joint. Runtime composition is:
 /// `entity transform × joint pose × socket local transform`.
@@ -2185,6 +2410,11 @@ pub struct ModelResource {
     /// omitting is allowed for placeholder / debug bundles.
     #[serde(default)]
     pub texture_path: Option<String>,
+    /// Skeleton this model was cooked against. Models can still
+    /// carry legacy local clips for compatibility, but shared
+    /// animation matching should use this resource id.
+    #[serde(default)]
+    pub skeleton: Option<ResourceId>,
     /// Cooked animation clips, sorted by file name. Empty for
     /// static models (rendered in bind pose).
     #[serde(default)]
@@ -2262,6 +2492,11 @@ pub struct CharacterResource {
     /// validated at cook time when assigned to the player.
     #[serde(default)]
     pub model: Option<ResourceId>,
+    /// Preferred reusable animation set. When present, cook/preview
+    /// resolve role clips from this set and fall back to the legacy
+    /// per-model clip indices only for unset roles.
+    #[serde(default)]
+    pub animation_set: Option<ResourceId>,
     /// Index into the model's clip list -- played when the
     /// character has no movement input. Required for the player.
     #[serde(default)]
@@ -2303,6 +2538,7 @@ impl CharacterResource {
     pub const fn defaults() -> Self {
         Self {
             model: None,
+            animation_set: None,
             idle_clip: None,
             walk_clip: None,
             run_clip: None,
@@ -2352,6 +2588,13 @@ pub enum ResourceData {
     /// [`NodeKind::Entity`] with a [`NodeKind::ModelRenderer`]
     /// component referencing this resource id.
     Model(ModelResource),
+    /// Skeleton compatibility contract shared by models and
+    /// standalone animation clips.
+    Skeleton(SkeletonResource),
+    /// Standalone cooked animation clip bound to a skeleton.
+    AnimationClip(AnimationClipResource),
+    /// Reusable role mapping for characters on one skeleton.
+    AnimationSet(AnimationSetResource),
     /// Legacy / generic source mesh path. Kept for backward
     /// compatibility; new authoring should use [`ResourceData::Model`].
     Mesh {
@@ -2390,6 +2633,9 @@ impl ResourceData {
             Self::Texture { .. } => "Texture",
             Self::Material(_) => "Material",
             Self::Model(_) => "Model",
+            Self::Skeleton(_) => "Skeleton",
+            Self::AnimationClip(_) => "Animation Clip",
+            Self::AnimationSet(_) => "Animation Set",
             Self::Mesh { .. } => "Mesh",
             Self::Scene { .. } => "Scene",
             Self::Script { .. } => "Script",
@@ -2409,6 +2655,20 @@ pub struct Resource {
     pub name: String,
     /// Payload.
     pub data: ResourceData,
+}
+
+/// One animation clip that a model can play after resolving both
+/// legacy model-local clips and standalone animation resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelAnimationClip {
+    /// Display name for dropdowns/runtime manifests.
+    pub name: String,
+    /// Cooked `.psxanim` path.
+    pub psxanim_path: String,
+    /// Standalone animation resource id when this row came from the
+    /// animation library. `None` means it came from
+    /// `ModelResource::clips`.
+    pub animation_resource: Option<ResourceId>,
 }
 
 /// One backing-file move performed by a resource rename.
@@ -2664,17 +2924,7 @@ pub enum NodeKind {
         #[serde(default = "default_weapon_grip")]
         weapon_grip: String,
     },
-    /// Simple authoring light.
-    Light {
-        /// RGB light colour.
-        #[serde(default = "default_light_color")]
-        color: [u8; 3],
-        /// Light intensity multiplier.
-        intensity: f32,
-        /// Approximate editor/runtime radius.
-        radius: f32,
-    },
-    /// Point-light component form of [`Light`](Self::Light).
+    /// Static point light.
     PointLight {
         /// RGB light colour.
         #[serde(default = "default_light_color")]
@@ -2744,7 +2994,6 @@ impl NodeKind {
             Self::AiController { .. } => "AI Controller",
             Self::Combat { .. } => "Combat",
             Self::Equipment { .. } => "Equipment",
-            Self::Light { .. } => "Light",
             Self::PointLight { .. } => "Point Light",
             Self::SpawnPoint { .. } => "Spawn Point",
             Self::Trigger { .. } => "Trigger",
@@ -2767,7 +3016,6 @@ impl NodeKind {
                 | Self::AiController { .. }
                 | Self::Combat { .. }
                 | Self::Equipment { .. }
-                | Self::PointLight { .. }
         )
     }
 }
@@ -3115,6 +3363,82 @@ impl ProjectDocument {
         self.resource(id).map(|resource| resource.name.as_str())
     }
 
+    /// Resolve every animation a model can play. Legacy model-local
+    /// clips are listed first so existing clip indices remain stable;
+    /// compatible standalone `AnimationClip` resources are appended
+    /// in resource order, de-duplicated by path.
+    pub fn resolved_model_animation_clips(
+        &self,
+        model_id: ResourceId,
+    ) -> Vec<ResolvedModelAnimationClip> {
+        let Some(model) = self
+            .resource(model_id)
+            .and_then(|resource| match &resource.data {
+                ResourceData::Model(model) => Some(model),
+                _ => None,
+            })
+        else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        let mut seen_paths = HashSet::new();
+        for clip in &model.clips {
+            if seen_paths.insert(clip.psxanim_path.clone()) {
+                out.push(ResolvedModelAnimationClip {
+                    name: clip.name.clone(),
+                    psxanim_path: clip.psxanim_path.clone(),
+                    animation_resource: None,
+                });
+            }
+        }
+
+        for resource in &self.resources {
+            let ResourceData::AnimationClip(clip) = &resource.data else {
+                continue;
+            };
+            if model.skeleton.is_none() || clip.skeleton != model.skeleton {
+                continue;
+            }
+            if seen_paths.insert(clip.psxanim_path.clone()) {
+                out.push(ResolvedModelAnimationClip {
+                    name: resource.name.clone(),
+                    psxanim_path: clip.psxanim_path.clone(),
+                    animation_resource: Some(resource.id),
+                });
+            }
+        }
+        out
+    }
+
+    /// Resolve the model-local runtime index for a standalone
+    /// animation resource after [`Self::resolved_model_animation_clips`]
+    /// has appended compatible library clips.
+    pub fn resolved_model_animation_index(
+        &self,
+        model_id: ResourceId,
+        animation_id: ResourceId,
+    ) -> Option<u16> {
+        let resolved = self.resolved_model_animation_clips(model_id);
+        if let Some(index) = resolved
+            .iter()
+            .position(|clip| clip.animation_resource == Some(animation_id))
+        {
+            return u16::try_from(index).ok();
+        }
+
+        let animation_path =
+            self.resource(animation_id)
+                .and_then(|resource| match &resource.data {
+                    ResourceData::AnimationClip(clip) => Some(clip.psxanim_path.as_str()),
+                    _ => None,
+                })?;
+        resolved
+            .iter()
+            .position(|clip| clip.psxanim_path == animation_path)
+            .and_then(|index| u16::try_from(index).ok())
+    }
+
     /// Count project references to `id` from scenes and from other
     /// resources. Backing-file paths are counted separately by the
     /// delete plan because they are owned by the resource itself.
@@ -3213,6 +3537,15 @@ impl ProjectDocument {
             ResourceData::Model(model) => {
                 plan_model_resource_rename(model, &safe_stem, project_root, &mut plan);
             }
+            ResourceData::AnimationClip(clip) => {
+                plan_path_rename(
+                    &mut clip.psxanim_path,
+                    &safe_stem,
+                    "psxanim",
+                    project_root,
+                    &mut plan,
+                );
+            }
             ResourceData::Mesh { source_path }
             | ResourceData::Scene { source_path }
             | ResourceData::Script { source_path }
@@ -3226,7 +3559,11 @@ impl ProjectDocument {
                     &mut plan,
                 );
             }
-            ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => {}
+            ResourceData::Material(_)
+            | ResourceData::Skeleton(_)
+            | ResourceData::AnimationSet(_)
+            | ResourceData::Character(_)
+            | ResourceData::Weapon(_) => {}
         }
 
         execute_resource_rename_plan(&plan)?;
@@ -3398,10 +3735,23 @@ impl ProjectDocument {
 fn resource_data_reference_count(data: &ResourceData, id: ResourceId) -> usize {
     match data {
         ResourceData::Material(material) => option_resource_reference_count(material.texture, id),
-        ResourceData::Character(character) => option_resource_reference_count(character.model, id),
+        ResourceData::Model(model) => option_resource_reference_count(model.skeleton, id),
+        ResourceData::AnimationClip(clip) => option_resource_reference_count(clip.skeleton, id),
+        ResourceData::AnimationSet(set) => {
+            option_resource_reference_count(set.skeleton, id)
+                + option_resource_reference_count(set.idle_clip, id)
+                + option_resource_reference_count(set.walk_clip, id)
+                + option_resource_reference_count(set.run_clip, id)
+                + option_resource_reference_count(set.turn_clip, id)
+                + set.clips.iter().filter(|clip_id| **clip_id == id).count()
+        }
+        ResourceData::Character(character) => {
+            option_resource_reference_count(character.model, id)
+                + option_resource_reference_count(character.animation_set, id)
+        }
         ResourceData::Weapon(weapon) => option_resource_reference_count(weapon.model, id),
         ResourceData::Texture { .. }
-        | ResourceData::Model(_)
+        | ResourceData::Skeleton(_)
         | ResourceData::Mesh { .. }
         | ResourceData::Scene { .. }
         | ResourceData::Script { .. }
@@ -3412,19 +3762,33 @@ fn resource_data_reference_count(data: &ResourceData, id: ResourceId) -> usize {
 fn clear_resource_data_references(data: &mut ResourceData, id: ResourceId) -> usize {
     match data {
         ResourceData::Material(material) => clear_option_resource(&mut material.texture, id),
+        ResourceData::Model(model) => clear_option_resource(&mut model.skeleton, id),
+        ResourceData::AnimationClip(clip) => clear_option_resource(&mut clip.skeleton, id),
+        ResourceData::AnimationSet(set) => {
+            let mut cleared = clear_option_resource(&mut set.skeleton, id)
+                + clear_option_resource(&mut set.idle_clip, id)
+                + clear_option_resource(&mut set.walk_clip, id)
+                + clear_option_resource(&mut set.run_clip, id)
+                + clear_option_resource(&mut set.turn_clip, id);
+            let before = set.clips.len();
+            set.clips.retain(|clip_id| *clip_id != id);
+            cleared += before - set.clips.len();
+            cleared
+        }
         ResourceData::Character(character) => {
-            let cleared = clear_option_resource(&mut character.model, id);
-            if cleared > 0 {
+            let cleared_model = clear_option_resource(&mut character.model, id);
+            let cleared_set = clear_option_resource(&mut character.animation_set, id);
+            if cleared_model > 0 {
                 character.idle_clip = None;
                 character.walk_clip = None;
                 character.run_clip = None;
                 character.turn_clip = None;
             }
-            cleared
+            cleared_model + cleared_set
         }
         ResourceData::Weapon(weapon) => clear_option_resource(&mut weapon.model, id),
         ResourceData::Texture { .. }
-        | ResourceData::Model(_)
+        | ResourceData::Skeleton(_)
         | ResourceData::Mesh { .. }
         | ResourceData::Scene { .. }
         | ResourceData::Script { .. }
@@ -3458,7 +3822,6 @@ fn node_kind_reference_count(kind: &NodeKind, id: ResourceId) -> usize {
         | NodeKind::Interactable { .. }
         | NodeKind::AiController { .. }
         | NodeKind::Combat { .. }
-        | NodeKind::Light { .. }
         | NodeKind::PointLight { .. }
         | NodeKind::Trigger { .. }
         | NodeKind::Portal { .. } => 0,
@@ -3487,7 +3850,6 @@ fn clear_node_kind_references(kind: &mut NodeKind, id: ResourceId) -> usize {
         | NodeKind::Interactable { .. }
         | NodeKind::AiController { .. }
         | NodeKind::Combat { .. }
-        | NodeKind::Light { .. }
         | NodeKind::PointLight { .. }
         | NodeKind::Trigger { .. }
         | NodeKind::Portal { .. } => 0,
@@ -3642,13 +4004,20 @@ fn plan_resource_file_deletes(resource: &Resource, project_root: &Path) -> Resou
                 plan_path_delete(&clip.psxanim_path, project_root, &mut plan);
             }
         }
+        ResourceData::AnimationClip(clip) => {
+            plan_path_delete(&clip.psxanim_path, project_root, &mut plan);
+        }
         ResourceData::Mesh { source_path }
         | ResourceData::Scene { source_path }
         | ResourceData::Script { source_path }
         | ResourceData::Audio { source_path } => {
             plan_path_delete(source_path, project_root, &mut plan);
         }
-        ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => {}
+        ResourceData::Material(_)
+        | ResourceData::Skeleton(_)
+        | ResourceData::AnimationSet(_)
+        | ResourceData::Character(_)
+        | ResourceData::Weapon(_) => {}
     }
     plan
 }
@@ -3946,6 +4315,9 @@ const fn resource_default_stem(data: &ResourceData) -> &'static str {
         ResourceData::Texture { .. } => "texture",
         ResourceData::Material(_) => "material",
         ResourceData::Model(_) => "model",
+        ResourceData::Skeleton(_) => "skeleton",
+        ResourceData::AnimationClip(_) => "animation",
+        ResourceData::AnimationSet(_) => "animation_set",
         ResourceData::Weapon(_) => "weapon",
         ResourceData::Mesh { .. } => "mesh",
         ResourceData::Scene { .. } => "scene",
@@ -3960,6 +4332,9 @@ const fn resource_default_extension(data: &ResourceData) -> &'static str {
         ResourceData::Texture { .. } => "psxt",
         ResourceData::Material(_) => "mat",
         ResourceData::Model(_) => "psxmdl",
+        ResourceData::Skeleton(_) => "skeleton",
+        ResourceData::AnimationClip(_) => "psxanim",
+        ResourceData::AnimationSet(_) => "animset",
         ResourceData::Weapon(_) => "weapon",
         ResourceData::Mesh { .. } => "psxmesh",
         ResourceData::Scene { .. } => "room",
@@ -4653,19 +5028,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_project_missing_light_color_and_room_ambient_uses_defaults() {
+    fn project_missing_point_light_color_and_room_ambient_uses_defaults() {
         let starter = ProjectDocument::from_ron_str(DEFAULT_PROJECT_RON).unwrap();
         let light = starter
             .active_scene()
             .nodes()
             .iter()
             .find_map(|node| match &node.kind {
-                NodeKind::Light {
-                    color,
-                    intensity,
-                    radius,
-                }
-                | NodeKind::PointLight {
+                NodeKind::PointLight {
                     color,
                     intensity,
                     radius,
@@ -4685,10 +5055,13 @@ mod tests {
         let source = DEFAULT_PROJECT_RON
             .replace(
                 &format!(
-                    "kind: Light(color: ({}, {}, {}), intensity: {}, radius: {})",
+                    "kind: PointLight(color: ({}, {}, {}), intensity: {}, radius: {})",
                     light.0[0], light.0[1], light.0[2], light.1, light.2
                 ),
-                &format!("kind: Light(intensity: {}, radius: {})", light.1, light.2),
+                &format!(
+                    "kind: PointLight(intensity: {}, radius: {})",
+                    light.1, light.2
+                ),
             )
             .replace(
                 &format!(
@@ -4708,7 +5081,6 @@ mod tests {
             .nodes()
             .iter()
             .find_map(|node| match &node.kind {
-                NodeKind::Light { color, .. } => Some(*color),
                 NodeKind::PointLight { color, .. } => Some(*color),
                 _ => None,
             })
@@ -4830,6 +5202,7 @@ mod tests {
             ResourceData::Model(ModelResource {
                 model_path: "assets/models/x/x.psxmdl".to_string(),
                 texture_path: Some("assets/models/x/x.psxt".to_string()),
+                skeleton: None,
                 clips: vec![
                     ModelAnimationClip {
                         name: "idle".to_string(),
@@ -4882,6 +5255,78 @@ mod tests {
             }
             _ => panic!("expected Model"),
         }
+    }
+
+    #[test]
+    fn animation_library_resources_roundtrip_and_resolve_by_path() {
+        let mut project = ProjectDocument::new("Animation Test");
+        let skeleton = project.add_resource(
+            "Humanoid Skeleton",
+            ResourceData::Skeleton(SkeletonResource {
+                joint_count: 2,
+                parents: vec![None, Some(0)],
+                signature: "psx-parent-v1:2:root,0".to_string(),
+                note: "test skeleton".to_string(),
+            }),
+        );
+        let idle_animation = project.add_resource(
+            "Idle",
+            ResourceData::AnimationClip(AnimationClipResource {
+                psxanim_path: "assets/animations/idle.psxanim".to_string(),
+                skeleton: Some(skeleton),
+                role: AnimationRole::Idle,
+                looping: true,
+                tags: vec!["idle".to_string()],
+            }),
+        );
+        let set = project.add_resource(
+            "Humanoid Set",
+            ResourceData::AnimationSet(AnimationSetResource {
+                skeleton: Some(skeleton),
+                idle_clip: Some(idle_animation),
+                walk_clip: None,
+                run_clip: None,
+                turn_clip: None,
+                clips: Vec::new(),
+            }),
+        );
+        let model = project.add_resource(
+            "Humanoid Model",
+            ResourceData::Model(ModelResource {
+                model_path: "assets/models/humanoid.psxmdl".to_string(),
+                texture_path: Some("assets/models/humanoid.psxt".to_string()),
+                skeleton: Some(skeleton),
+                clips: vec![ModelAnimationClip {
+                    name: "legacy idle".to_string(),
+                    psxanim_path: "assets/animations/idle.psxanim".to_string(),
+                }],
+                default_clip: Some(0),
+                preview_clip: Some(0),
+                world_height: 1024,
+                scale_q8: [MODEL_SCALE_ONE_Q8; 3],
+                attachments: Vec::new(),
+            }),
+        );
+        project.add_resource(
+            "Character",
+            ResourceData::Character(CharacterResource {
+                model: Some(model),
+                animation_set: Some(set),
+                idle_clip: None,
+                walk_clip: None,
+                run_clip: None,
+                turn_clip: None,
+                ..CharacterResource::default()
+            }),
+        );
+
+        let restored = ProjectDocument::from_ron_str(&project.to_ron_string().unwrap()).unwrap();
+        assert_eq!(restored, project);
+        assert_eq!(
+            restored.resolved_model_animation_index(model, idle_animation),
+            Some(0),
+            "standalone clips matching legacy model-local paths resolve to the stable legacy index",
+        );
     }
 
     #[test]
@@ -5061,6 +5506,7 @@ mod tests {
                 texture_path: Some(
                     "assets/models/obsidian_wraith/obsidian_wraith.psxt".to_string(),
                 ),
+                skeleton: None,
                 clips: vec![
                     ModelAnimationClip {
                         name: "idle".to_string(),

@@ -6,7 +6,7 @@ use psx_level::{
     EntityRecord, EquipmentRecord, LevelAssetRecord, LevelCharacterRecord, LevelMaterialRecord,
     LevelModelClipRecord, LevelModelInstanceRecord, LevelModelRecord, LevelModelSocketRecord,
     LevelRoomRecord, LevelWeaponRecord, PlayerControllerRecord, PlayerSpawnRecord,
-    PointLightRecord, RoomIndex, RoomResidencyRecord, WeaponHitboxRecord,
+    PointLightRecord, RoomIndex, RoomResidencyRecord, SurfaceLightRecord, WeaponHitboxRecord,
 };
 
 pub static ASSETS: &[LevelAssetRecord] = &[];
@@ -31,6 +31,7 @@ pub static WEAPON_HITBOXES: &[WeaponHitboxRecord] = &[];
 pub static WEAPONS: &[LevelWeaponRecord] = &[];
 pub static EQUIPMENT: &[EquipmentRecord] = &[];
 pub static LIGHTS: &[PointLightRecord] = &[];
+pub static SURFACE_LIGHTS: &[SurfaceLightRecord] = &[];
 pub static CHARACTERS: &[LevelCharacterRecord] = &[];
 pub static PLAYER_CONTROLLER: Option<PlayerControllerRecord> = None;
 pub static ENTITIES: &[EntityRecord] = &[];

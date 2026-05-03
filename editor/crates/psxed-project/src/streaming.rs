@@ -360,7 +360,7 @@ fn collect_resource_use(
             }
             NodeKind::Collider { .. } => use_set.colliders += 1,
             NodeKind::Interactable { .. } => use_set.interactables += 1,
-            NodeKind::Light { .. } | NodeKind::PointLight { .. } => use_set.lights += 1,
+            NodeKind::PointLight { .. } => use_set.lights += 1,
             NodeKind::Trigger { .. } => use_set.triggers += 1,
             NodeKind::Portal { .. } => use_set.portals += 1,
             _ => {}
@@ -524,6 +524,7 @@ mod tests {
             ResourceData::Model(crate::ModelResource {
                 model_path: "model.psxmdl".to_string(),
                 texture_path: None,
+                skeleton: None,
                 clips: Vec::new(),
                 default_clip: None,
                 preview_clip: None,

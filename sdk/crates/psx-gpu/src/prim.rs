@@ -296,18 +296,22 @@ impl TriTextured {
     }
 }
 
-/// Textured **Gouraud-shaded** triangle. 10 words (tag + 9 data).
+/// Textured **Gouraud-shaded** triangle. 11 words (tag + 10 data).
 ///
 /// Per-vertex tint: the GPU multiplies each texel by the
 /// interpolated vertex colour, so GTE-lit-and-fogged per-vertex
-/// colours from `NCDT` drive the final shade smoothly across the
-/// triangle. Same CLUT + tpage embedding as [`TriTextured`]: CLUT
-/// rides in v0's UV high word, tpage in v1's UV high word (PSX-SPX
-/// convention for GP0 0x34).
+/// colours drive the final shade smoothly across the triangle.
+/// The first data word is GP0(E2) texture-window state, matching
+/// [`TriTextured`] so windowed/tiled world materials do not leak
+/// state across ordering-table interleaving. CLUT rides in v0's
+/// UV high word, tpage in v1's UV high word (PSX-SPX convention
+/// for GP0 0x34).
 #[repr(C, align(4))]
 pub struct TriTexturedGouraud {
     /// OT linkage.
     pub tag: u32,
+    /// GP0(E2) texture-window command.
+    pub tex_window: u32,
     /// `0x34000000 | color0` header -- v0's RGB is packed into the
     /// same word as the polygon opcode.
     pub color0_cmd: u32,
@@ -331,7 +335,7 @@ pub struct TriTexturedGouraud {
 
 impl TriTexturedGouraud {
     /// Data-word count.
-    pub const WORDS: u8 = 9;
+    pub const WORDS: u8 = 10;
 
     /// Build a textured Gouraud triangle. Each vertex carries its
     /// own RGB (the NCDT-lit-and-fogged colour in the typical
@@ -358,6 +362,7 @@ impl TriTexturedGouraud {
         let (r2, g2, b2) = colors[2];
         Self {
             tag: 0,
+            tex_window: material.texture_window_word(),
             color0_cmd: material.textured_polygon_command(true, false) | pack_color(r0, g0, b0),
             v0: pack_vertex(verts[0].0, verts[0].1),
             uv0_clut: pack_texcoord(uvs[0].0, uvs[0].1, material.clut_word()),

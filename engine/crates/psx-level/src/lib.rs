@@ -106,6 +106,16 @@ pub mod equipment_flags {
     pub const PLAYER: u16 = 1 << 0;
 }
 
+/// Static surface-light record kinds.
+pub mod surface_light_kind {
+    /// Sector floor.
+    pub const FLOOR: u8 = 0;
+    /// Sector ceiling.
+    pub const CEILING: u8 = 1;
+    /// Sector wall.
+    pub const WALL: u8 = 2;
+}
+
 typed_index! {
     /// Clip index local to one model's clip slice.
     pub struct ModelClipIndex;
@@ -581,11 +591,10 @@ pub struct EquipmentRecord {
 }
 
 /// One placed point light. Coordinates are room-local engine
-/// units (same convention as model instances and player
-/// spawn). Lighting model is dynamic point-light only -- no
-/// shadows, no baked lightmaps. Both editor and runtime
-/// accumulate per-surface contribution from every record in
-/// the same room and clamp to 8-bit RGB.
+/// units (same convention as model instances and player spawn).
+/// Static room geometry may be pre-baked into
+/// [`SurfaceLightRecord`]s; dynamic/model lighting can still
+/// sample these point-light records at runtime.
 ///
 /// `intensity_q8` is the multiplier in Q8.8 fixed-point
 /// (256 = 1.0, 512 = 2.0, ...); the cooker derives it from
@@ -611,6 +620,34 @@ pub struct PointLightRecord {
     /// 8-bit RGB tint applied before the per-surface
     /// attenuation weight.
     pub color: [u8; 3],
+    /// Reserved.
+    pub flags: u16,
+}
+
+/// Per-surface static lighting baked by the editor.
+///
+/// Records are keyed to the cooked room traversal contract:
+/// `(room, sx, sz, kind, direction, ordinal)`. Floors and
+/// ceilings use `direction = 0` and `ordinal = 0`; walls use the
+/// runtime wall direction id and the wall's local ordinal in that
+/// sector's cooked wall list. `vertex_rgb` follows the exact
+/// emitted quad vertex order consumed by the room renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceLightRecord {
+    /// Owning room index.
+    pub room: RoomIndex,
+    /// Sector X coordinate.
+    pub sx: u16,
+    /// Sector Z coordinate.
+    pub sz: u16,
+    /// One of [`surface_light_kind`].
+    pub kind: u8,
+    /// Runtime wall direction id for walls, `0` otherwise.
+    pub direction: u8,
+    /// Surface ordinal within `(sx, sz, kind, direction)`.
+    pub ordinal: u16,
+    /// Baked RGB tint for the emitted quad's four vertices.
+    pub vertex_rgb: [[u8; 3]; 4],
     /// Reserved.
     pub flags: u16,
 }

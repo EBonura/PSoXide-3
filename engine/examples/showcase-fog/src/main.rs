@@ -38,7 +38,7 @@
 //! # Triangle budget
 //!
 //! 15 ring-gaps × 4 walls × 2 tris = **120 triangles / frame** --
-//! each a `TriTexturedGouraud` (9 data words per primitive).
+//! each a `TriTexturedGouraud` (10 data words per primitive).
 //!
 //! Ported to `psx-engine` in Phase 3e. The `Scene` struct (renamed
 //! to `Corridor` to avoid collision with the engine trait) now
@@ -289,6 +289,7 @@ static mut OT: OrderingTable<OT_DEPTH> = OrderingTable::new();
 
 const TRI_ZERO: TriTexturedGouraud = TriTexturedGouraud {
     tag: 0,
+    tex_window: 0,
     color0_cmd: 0,
     v0: 0,
     uv0_clut: 0,

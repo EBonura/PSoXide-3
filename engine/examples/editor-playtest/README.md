@@ -117,12 +117,13 @@ What it *does* render:
   `.psxmdl` + `.psxt` + `.psxanim`, uploads the atlas, and
   draws the textured animated model. See
   [`docs/editor-model-authoring.md`](../../../docs/editor-model-authoring.md).
-- **Room-level lighting** -- every `Light` node cooks into a
-  `PointLightRecord`; the runtime accumulates contributions
-  at the room centre and modulates each room material's tint.
-  Linear falloff, no shadows, models are not lit yet. The
-  editor preview applies per-face lighting for spatial
-  authoring feedback. See
+- **Static lighting** -- every `PointLight` node cooks into a
+  `PointLightRecord`; room surfaces also cook into
+  `SurfaceLightRecord` per-vertex RGB, so embedded play can render
+  textured Gouraud-lit rooms without re-accumulating every light per
+  surface at runtime. Player, model instances, and equipment still
+  sample point lights dynamically at their current origin. Linear
+  falloff, no shadows. See
   [`docs/editor-lighting.md`](../../../docs/editor-lighting.md).
 - **Entity markers** for legacy `MeshInstance` nodes that
   don't reference a Model (debug cubes, same as before).

@@ -402,6 +402,35 @@ pub fn render_manifest_source(package: &PlaytestPackage) -> String {
     }
     out.push_str("];\n\n");
 
+    out.push_str("/// Baked static per-vertex room lighting.\n");
+    out.push_str("pub static SURFACE_LIGHTS: &[SurfaceLightRecord] = &[\n");
+    for light in &package.surface_lights {
+        let rgb = light.vertex_rgb;
+        let _ = writeln!(
+            out,
+            "    SurfaceLightRecord {{ room: RoomIndex({}), sx: {}, sz: {}, kind: {}, direction: {}, ordinal: {}, vertex_rgb: [[{}, {}, {}], [{}, {}, {}], [{}, {}, {}], [{}, {}, {}]], flags: 0 }},",
+            light.room,
+            light.sx,
+            light.sz,
+            light.kind,
+            light.direction,
+            light.ordinal,
+            rgb[0][0],
+            rgb[0][1],
+            rgb[0][2],
+            rgb[1][0],
+            rgb[1][1],
+            rgb[1][2],
+            rgb[2][0],
+            rgb[2][1],
+            rgb[2][2],
+            rgb[3][0],
+            rgb[3][1],
+            rgb[3][2],
+        );
+    }
+    out.push_str("];\n\n");
+
     out.push_str("/// Cooked Character resources — gameplay metadata layered on top of MODELS.\n");
     out.push_str("pub static CHARACTERS: &[LevelCharacterRecord] = &[\n");
     for character in &package.characters {
@@ -698,6 +727,7 @@ use psx_level::{
     ResourceSlot,
     RoomIndex,
     RoomResidencyRecord,
+    SurfaceLightRecord,
     WeaponHitboxIndex,
     WeaponHitboxRecord,
     WeaponHitShapeRecord,

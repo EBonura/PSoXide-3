@@ -7,7 +7,10 @@
 //! See `docs/world-format-roadmap.md` for the future compact
 //! format that will let this helper resolve materials itself.
 
-use psx_gpu::{material::TextureMaterial, prim::TriTextured};
+use psx_gpu::{
+    material::TextureMaterial,
+    prim::{TriTextured, TriTexturedGouraud},
+};
 
 use crate::{
     render3d::{CullMode, DepthPolicy},
@@ -100,6 +103,11 @@ pub struct WorldSurfaceSample {
     /// Surface centre in the same room-local world coordinates as
     /// the emitted vertices.
     pub center: RoomPoint,
+    /// Surface ordinal inside the cooked sector. Floors and
+    /// ceilings are always `0`; walls use their local wall-table
+    /// index so baked lighting can distinguish stacked wall
+    /// segments on the same edge.
+    pub ordinal: u16,
 }
 
 /// Coarse grid visibility settings for room rendering.
@@ -160,6 +168,35 @@ pub trait WorldSurfaceLighting {
         sample: WorldSurfaceSample,
         material: WorldRenderMaterial,
     ) -> WorldRenderMaterial;
+
+    /// Shade one vertex of one room surface. The default keeps
+    /// legacy face-centre lighting behaviour; static-light passes can
+    /// override this to feed textured Gouraud room packets.
+    fn shade_vertex(
+        &self,
+        sample: WorldSurfaceSample,
+        _vertex: RoomPoint,
+        material: WorldRenderMaterial,
+    ) -> (u8, u8, u8) {
+        self.shade(sample, material).texture.tint()
+    }
+
+    /// Shade all four vertices of one emitted room quad. The
+    /// default calls [`Self::shade_vertex`] for each vertex; baked
+    /// static-light passes can override this for direct table lookup.
+    fn shade_vertices(
+        &self,
+        sample: WorldSurfaceSample,
+        vertices: [WorldVertex; 4],
+        material: WorldRenderMaterial,
+    ) -> [(u8, u8, u8); 4] {
+        [
+            self.shade_vertex(sample, RoomPoint::from_world_vertex(vertices[0]), material),
+            self.shade_vertex(sample, RoomPoint::from_world_vertex(vertices[1]), material),
+            self.shade_vertex(sample, RoomPoint::from_world_vertex(vertices[2]), material),
+            self.shade_vertex(sample, RoomPoint::from_world_vertex(vertices[3]), material),
+        ]
+    }
 }
 
 /// No-op surface lighting.
@@ -374,6 +411,118 @@ pub fn draw_room_lit_grid_visible<const OT: usize, L: WorldSurfaceLighting>(
     stats
 }
 
+/// Draw a room using one textured Gouraud triangle per emitted
+/// triangle. The lighting hook is evaluated at every surface corner,
+/// which gives static point lights a smooth per-vertex falloff while
+/// preserving authored texture windows/UV tiling.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_room_vertex_lit<const OT: usize, L: WorldSurfaceLighting>(
+    room: RoomRender<'_, '_>,
+    materials: &[WorldRenderMaterial],
+    lighting: &L,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) {
+    for sx in 0..room.width() {
+        for sz in 0..room.depth() {
+            let Some(sector) = room.sector(sx, sz) else {
+                continue;
+            };
+            let _ = draw_sector_vertex_lit(
+                room, sx, sz, sector, materials, lighting, camera, options, triangles, world,
+            );
+        }
+    }
+}
+
+/// Draw a vertex-lit room through the same coarse grid visibility pass
+/// used by [`draw_room_lit_grid_visible`].
+#[allow(clippy::too_many_arguments)]
+pub fn draw_room_vertex_lit_grid_visible<const OT: usize, L: WorldSurfaceLighting>(
+    room: RoomRender<'_, '_>,
+    materials: &[WorldRenderMaterial],
+    lighting: &L,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    visibility: GridVisibility,
+    triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) -> GridVisibilityStats {
+    let mut stats = GridVisibilityStats::default();
+    let width = room.width();
+    let depth = room.depth();
+    if width == 0 || depth == 0 {
+        return stats;
+    }
+
+    let sector_size = room.sector_size().max(1);
+    let anchor_x = grid_cell_for_world(visibility.anchor.x, sector_size).clamp(0, width as i32 - 1);
+    let anchor_z = grid_cell_for_world(visibility.anchor.z, sector_size).clamp(0, depth as i32 - 1);
+    let radius = visibility.radius_cells as i32;
+    let min_x = (anchor_x - radius).max(0) as u16;
+    let max_x = (anchor_x + radius).min(width as i32 - 1) as u16;
+    let min_z = (anchor_z - radius).max(0) as u16;
+    let max_z = (anchor_z + radius).min(depth as i32 - 1) as u16;
+
+    let max_ring_x = (anchor_x - min_x as i32).max(max_x as i32 - anchor_x);
+    let max_ring_z = (anchor_z - min_z as i32).max(max_z as i32 - anchor_z);
+    let mut ring = max_ring_x.max(max_ring_z);
+    loop {
+        let mut sx = min_x;
+        while sx <= max_x {
+            let mut sz = min_z;
+            while sz <= max_z {
+                let dx = ((sx as i32) - anchor_x).abs();
+                let dz = ((sz as i32) - anchor_z).abs();
+                if dx.max(dz) == ring {
+                    if let Some(sector) = room.sector(sx, sz) {
+                        stats.cells_considered = stats.cells_considered.saturating_add(1);
+                        let (min_y, max_y) = sector_y_bounds(room, sector);
+                        if !cell_visible_to_camera(
+                            camera,
+                            options,
+                            sx,
+                            sz,
+                            sector_size,
+                            min_y,
+                            max_y,
+                            visibility.screen_margin,
+                        ) {
+                            stats.cells_frustum_culled =
+                                stats.cells_frustum_culled.saturating_add(1);
+                        } else {
+                            stats.cells_drawn = stats.cells_drawn.saturating_add(1);
+                            stats.surfaces_considered =
+                                stats
+                                    .surfaces_considered
+                                    .saturating_add(draw_sector_vertex_lit(
+                                        room, sx, sz, sector, materials, lighting, camera, options,
+                                        triangles, world,
+                                    ));
+                        }
+                    }
+                }
+                if sz == max_z {
+                    break;
+                }
+                sz += 1;
+            }
+            if sx == max_x {
+                break;
+            }
+            sx += 1;
+        }
+        if ring == 0 {
+            break;
+        }
+        ring -= 1;
+    }
+
+    stats
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
     room: RoomRender<'_, '_>,
@@ -399,6 +548,7 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                         sx,
                         sz,
                         center: horizontal_face_center(sx, sz, sector_size, sector.floor_heights()),
+                        ordinal: 0,
                     },
                     base_material,
                 );
@@ -434,6 +584,7 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                             sector_size,
                             sector.ceiling_heights(),
                         ),
+                        ordinal: 0,
                     },
                     base_material,
                 );
@@ -473,6 +624,7 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                         sx,
                         sz,
                         center,
+                        ordinal: i,
                     },
                     base_material,
                 );
@@ -485,6 +637,125 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                     wall.heights(),
                     wall.uvs(),
                     material,
+                    camera,
+                    options,
+                    triangles,
+                    world,
+                );
+            }
+        }
+        i += 1;
+    }
+
+    surfaces
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_sector_vertex_lit<const OT: usize, L: WorldSurfaceLighting>(
+    room: RoomRender<'_, '_>,
+    sx: u16,
+    sz: u16,
+    sector: crate::SectorRender,
+    materials: &[WorldRenderMaterial],
+    lighting: &L,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) -> u16 {
+    let sector_size = room.sector_size();
+    let mut surfaces = 0u16;
+
+    if sector.has_floor() {
+        if let Some(slot) = sector.floor_material() {
+            if let Some(&material) = materials.get(slot as usize) {
+                let sample = WorldSurfaceSample {
+                    kind: WorldSurfaceKind::Floor,
+                    sx,
+                    sz,
+                    center: horizontal_face_center(sx, sz, sector_size, sector.floor_heights()),
+                    ordinal: 0,
+                };
+                surfaces = surfaces.saturating_add(1);
+                emit_floor_vertex_lit(
+                    sx,
+                    sz,
+                    sector_size,
+                    sector.floor_heights(),
+                    sector.floor_split(),
+                    sector.floor_uvs(),
+                    material,
+                    sample,
+                    lighting,
+                    camera,
+                    options,
+                    triangles,
+                    world,
+                );
+            }
+        }
+    }
+
+    if sector.has_ceiling() {
+        if let Some(slot) = sector.ceiling_material() {
+            if let Some(&material) = materials.get(slot as usize) {
+                let sample = WorldSurfaceSample {
+                    kind: WorldSurfaceKind::Ceiling,
+                    sx,
+                    sz,
+                    center: horizontal_face_center(sx, sz, sector_size, sector.ceiling_heights()),
+                    ordinal: 0,
+                };
+                surfaces = surfaces.saturating_add(1);
+                emit_ceiling_vertex_lit(
+                    sx,
+                    sz,
+                    sector_size,
+                    sector.ceiling_heights(),
+                    sector.ceiling_split(),
+                    sector.ceiling_uvs(),
+                    material,
+                    sample,
+                    lighting,
+                    camera,
+                    options,
+                    triangles,
+                    world,
+                );
+            }
+        }
+    }
+
+    let mut i = 0;
+    while i < sector.wall_count() {
+        if let Some(wall) = room.sector_wall(sector, i) {
+            if let Some(&material) = materials.get(wall.material() as usize) {
+                let Some(center) =
+                    wall_face_center(sx, sz, sector_size, wall.direction(), wall.heights())
+                else {
+                    i += 1;
+                    continue;
+                };
+                let sample = WorldSurfaceSample {
+                    kind: WorldSurfaceKind::Wall {
+                        direction: wall.direction(),
+                    },
+                    sx,
+                    sz,
+                    center,
+                    ordinal: i,
+                };
+                surfaces = surfaces.saturating_add(1);
+                emit_wall_vertex_lit(
+                    sx,
+                    sz,
+                    sector_size,
+                    wall.direction(),
+                    wall.heights(),
+                    wall.uvs(),
+                    material,
+                    sample,
+                    lighting,
                     camera,
                     options,
                     triangles,
@@ -683,6 +954,124 @@ fn emit_wall<const OT: usize>(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_floor_vertex_lit<const OT: usize, L: WorldSurfaceLighting>(
+    sx: u16,
+    sz: u16,
+    sector_size: i32,
+    heights: [i32; 4],
+    split: u8,
+    uvs: [(u8, u8); 4],
+    material: WorldRenderMaterial,
+    sample: WorldSurfaceSample,
+    lighting: &L,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) {
+    let (x0, x1, z0, z1) = cell_bounds(sx, sz, sector_size);
+    let verts = [
+        WorldVertex::new(x0, heights[0], z0),
+        WorldVertex::new(x1, heights[1], z0),
+        WorldVertex::new(x1, heights[2], z1),
+        WorldVertex::new(x0, heights[3], z1),
+    ];
+    let colors = vertex_lighting_colors(lighting, sample, material, verts);
+    submit_split_quad_vertex_lit(
+        camera,
+        options.with_depth_policy(DepthPolicy::Farthest),
+        CullMode::Back,
+        material,
+        verts,
+        uvs,
+        colors,
+        split,
+        triangles,
+        world,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ceiling_vertex_lit<const OT: usize, L: WorldSurfaceLighting>(
+    sx: u16,
+    sz: u16,
+    sector_size: i32,
+    heights: [i32; 4],
+    split: u8,
+    uvs: [(u8, u8); 4],
+    material: WorldRenderMaterial,
+    sample: WorldSurfaceSample,
+    lighting: &L,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) {
+    let (x0, x1, z0, z1) = cell_bounds(sx, sz, sector_size);
+    let verts = reverse_quad_winding([
+        WorldVertex::new(x0, heights[0], z0),
+        WorldVertex::new(x1, heights[1], z0),
+        WorldVertex::new(x1, heights[2], z1),
+        WorldVertex::new(x0, heights[3], z1),
+    ]);
+    let colors = vertex_lighting_colors(lighting, sample, material, verts);
+    submit_split_quad_vertex_lit(
+        camera,
+        options.with_depth_policy(DepthPolicy::Farthest),
+        CullMode::Back,
+        material,
+        verts,
+        reverse_quad_winding(uvs),
+        colors,
+        split,
+        triangles,
+        world,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_wall_vertex_lit<const OT: usize, L: WorldSurfaceLighting>(
+    sx: u16,
+    sz: u16,
+    sector_size: i32,
+    direction: u8,
+    heights: [i32; 4],
+    uvs: [(u8, u8); 4],
+    material: WorldRenderMaterial,
+    sample: WorldSurfaceSample,
+    lighting: &L,
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) {
+    let Some(verts) = wall_vertices(sx, sz, sector_size, direction, heights) else {
+        return;
+    };
+    let colors = vertex_lighting_colors(lighting, sample, material, verts);
+    submit_quad_vertex_lit(
+        camera,
+        options,
+        CullMode::Back,
+        material,
+        verts,
+        uvs,
+        colors,
+        triangles,
+        world,
+    );
+}
+
+fn vertex_lighting_colors<L: WorldSurfaceLighting>(
+    lighting: &L,
+    sample: WorldSurfaceSample,
+    material: WorldRenderMaterial,
+    verts: [WorldVertex; 4],
+) -> [(u8, u8, u8); 4] {
+    lighting.shade_vertices(sample, verts, material)
+}
+
 /// Project + submit one textured quad along the standard
 /// `submit_textured_quad` 0–2 diagonal. Walls always use this
 /// path because their geometry is rectangular and carries no
@@ -761,6 +1150,113 @@ fn submit_split_quad<const OT: usize>(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn submit_quad_vertex_lit<const OT: usize>(
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    cull: CullMode,
+    material: WorldRenderMaterial,
+    verts: [WorldVertex; 4],
+    uvs: [(u8, u8); 4],
+    colors: [(u8, u8, u8); 4],
+    triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) {
+    let Some(projected) = camera.project_world_quad(verts) else {
+        return;
+    };
+    submit_sided_projected_gouraud_quad(
+        world,
+        triangles,
+        projected,
+        uvs,
+        colors,
+        material,
+        options,
+        cull,
+        SPLIT_NW_SE_TRIANGLES,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_split_quad_vertex_lit<const OT: usize>(
+    camera: &WorldCamera,
+    options: WorldSurfaceOptions,
+    cull: CullMode,
+    material: WorldRenderMaterial,
+    verts: [WorldVertex; 4],
+    uvs: [(u8, u8); 4],
+    colors: [(u8, u8, u8); 4],
+    split: u8,
+    triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+    world: &mut WorldRenderPass<'_, '_, OT>,
+) {
+    let Some(projected) = camera.project_world_quad(verts) else {
+        return;
+    };
+    let split_triangles = if split == SPLIT_NE_SW {
+        SPLIT_NE_SW_TRIANGLES
+    } else {
+        SPLIT_NW_SE_TRIANGLES
+    };
+    submit_sided_projected_gouraud_quad(
+        world,
+        triangles,
+        projected,
+        uvs,
+        colors,
+        material,
+        options,
+        cull,
+        split_triangles,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_sided_projected_gouraud_quad<const OT: usize>(
+    world: &mut WorldRenderPass<'_, '_, OT>,
+    triangles: &mut PrimitiveArena<'_, TriTexturedGouraud>,
+    verts: [crate::render3d::ProjectedVertex; 4],
+    uvs: [(u8, u8); 4],
+    colors: [(u8, u8, u8); 4],
+    material: WorldRenderMaterial,
+    options: WorldSurfaceOptions,
+    base_cull: CullMode,
+    split_triangles: [(usize, usize, usize); 2],
+) {
+    let (verts, uvs, colors) = match material.sidedness {
+        SurfaceSidedness::Back => (
+            reverse_quad_winding(verts),
+            reverse_quad_winding(uvs),
+            reverse_quad_winding(colors),
+        ),
+        SurfaceSidedness::Front | SurfaceSidedness::Both => (verts, uvs, colors),
+    };
+    let opts = options
+        .with_cull_mode(cull_for_sidedness(material.sidedness, base_cull))
+        .with_material_layer(material.texture);
+    let [(a, b, c), (d, e, f)] = split_triangles;
+    let stats = world.submit_textured_gouraud_triangle(
+        triangles,
+        [verts[a], verts[b], verts[c]],
+        [uvs[a], uvs[b], uvs[c]],
+        [colors[a], colors[b], colors[c]],
+        material.texture,
+        opts,
+    );
+    if stats.primitive_overflow || stats.command_overflow {
+        return;
+    }
+    let _ = world.submit_textured_gouraud_triangle(
+        triangles,
+        [verts[d], verts[e], verts[f]],
+        [uvs[d], uvs[e], uvs[f]],
+        [colors[d], colors[e], colors[f]],
+        material.texture,
+        opts,
+    );
+}
+
 fn submit_sided_projected_quad<const OT: usize>(
     world: &mut WorldRenderPass<'_, '_, OT>,
     triangles: &mut PrimitiveArena<'_, TriTextured>,
@@ -802,7 +1298,6 @@ const SPLIT_NE_SW_TRIANGLES: [(usize, usize, usize); 2] = [(0, 1, 3), (1, 2, 3)]
 /// Public for tests + parity assertions; runtime emission goes
 /// through `submit_textured_quad`'s internal indices, which the
 /// `split_triangles_match_psx_engine` test pins to this table.
-#[cfg(test)]
 const SPLIT_NW_SE_TRIANGLES: [(usize, usize, usize); 2] = [(0, 1, 2), (0, 2, 3)];
 
 /// Resolve the per-split triangulation. Default split (0) and

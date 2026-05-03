@@ -164,7 +164,11 @@ impl EditorAssets {
             // Clips. Each clip is independently keyed +
             // signed; two clips on the same model resolve to
             // distinct entries even if they share a path.
-            for (idx, clip) in model.clips.iter().enumerate() {
+            for (idx, clip) in project
+                .resolved_model_animation_clips(resource.id)
+                .iter()
+                .enumerate()
+            {
                 let key = AnimKey {
                     model: resource.id,
                     clip: idx as u16,
@@ -307,6 +311,7 @@ mod tests {
             ResourceData::Model(ModelResource {
                 model_path: mesh_rel,
                 texture_path: None,
+                skeleton: None,
                 clips: vec![
                     ModelAnimationClip {
                         name: "a".into(),
@@ -437,6 +442,7 @@ mod tests {
             ResourceData::Model(ModelResource {
                 model_path: "missing.psxmdl".into(),
                 texture_path: None,
+                skeleton: None,
                 clips: vec![],
                 default_clip: None,
                 preview_clip: None,

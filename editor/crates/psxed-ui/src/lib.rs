@@ -740,10 +740,10 @@ pub enum EntityBoundKind {
     MeshFallback,
     /// `SpawnPoint` (player or non-player).
     SpawnPoint,
-    /// `Light`. Marker box only -- radius ring is drawn
+    /// `PointLight`. Marker box only -- radius ring is drawn
     /// separately so a wide-radius light doesn't intercept
     /// every click in the room.
-    Light,
+    PointLight,
     /// `Trigger`.
     Trigger,
     /// `Portal`.
@@ -1243,8 +1243,8 @@ enum PlaceKind {
     /// resource if set, auto-picks the only Model resource if exactly
     /// one exists, or refuses with an actionable error otherwise.
     ModelInstance,
-    /// `Light` with default color / intensity / radius.
-    LightMarker,
+    /// `PointLight` with default color / intensity / radius.
+    PointLightMarker,
 }
 
 impl PlaceKind {
@@ -1253,7 +1253,7 @@ impl PlaceKind {
             Self::PlayerSpawn => "Player Spawn",
             Self::SpawnMarker => "Spawn",
             Self::ModelInstance => "Prop",
-            Self::LightMarker => "Light",
+            Self::PointLightMarker => "Point Light",
         }
     }
 }
@@ -1276,6 +1276,7 @@ enum ResourceFilter {
     Texture,
     Material,
     Model,
+    Animation,
     Character,
     Weapon,
     Mesh,
@@ -1290,6 +1291,7 @@ impl ResourceFilter {
             Self::Texture => "Texture",
             Self::Material => "Material",
             Self::Model => "Model",
+            Self::Animation => "Animation",
             Self::Character => "Character Profiles",
             Self::Weapon => "Weapon",
             Self::Mesh => "Mesh",
@@ -1304,6 +1306,7 @@ impl ResourceFilter {
             Self::Texture => icons::PALETTE,
             Self::Material => icons::BLEND,
             Self::Model => icons::BOX,
+            Self::Animation => icons::PLAY,
             Self::Character => icons::MAP_PIN,
             Self::Weapon => icons::WAYPOINT,
             Self::Mesh => icons::BOX,
@@ -1318,6 +1321,12 @@ impl ResourceFilter {
             Self::Texture => matches!(data, ResourceData::Texture { .. }),
             Self::Material => matches!(data, ResourceData::Material(_)),
             Self::Model => matches!(data, ResourceData::Model(_)),
+            Self::Animation => matches!(
+                data,
+                ResourceData::Skeleton(_)
+                    | ResourceData::AnimationClip(_)
+                    | ResourceData::AnimationSet(_)
+            ),
             Self::Character => matches!(data, ResourceData::Character(_)),
             Self::Weapon => matches!(data, ResourceData::Weapon(_)),
             Self::Mesh => matches!(data, ResourceData::Mesh { .. }),
@@ -4670,9 +4679,9 @@ impl EditorWorkspace {
                         }
                     }
                 }
-                PlaceKind::LightMarker => (
-                    "Light".to_string(),
-                    NodeKind::Light {
+                PlaceKind::PointLightMarker => (
+                    "Point Light".to_string(),
+                    NodeKind::PointLight {
                         color: [255, 240, 200],
                         intensity: 1.0,
                         // Sectors. Matches the Add Child default
@@ -5937,7 +5946,7 @@ impl EditorWorkspace {
             icons::SUN,
             "Lights",
             count_nodes(&self.project, |kind| {
-                matches!(kind, NodeKind::Light { .. } | NodeKind::PointLight { .. })
+                matches!(kind, NodeKind::PointLight { .. })
             }),
         );
     }
@@ -6769,6 +6778,8 @@ impl EditorWorkspace {
         // borrow on `resource_mut` is live.
         let character_ctx = build_character_editor_context(&self.project);
         let model_options = collect_model_options(&self.project);
+        let skeleton_options = collect_skeleton_options(&self.project);
+        let animation_clip_options = collect_animation_clip_options(&self.project);
         let attachment_socket_names = collect_attachment_socket_names(&self.project);
 
         // Build the breadcrumb before the mutable borrow on
@@ -6912,7 +6923,28 @@ impl EditorWorkspace {
                 }
             }
             ResourceData::Model(model) => {
-                changed |= draw_model_resource_editor(ui, model, &project_root, preview_thumb);
+                changed |= draw_model_resource_editor(
+                    ui,
+                    model,
+                    &project_root,
+                    preview_thumb,
+                    &skeleton_options,
+                );
+            }
+            ResourceData::Skeleton(skeleton) => {
+                changed |= draw_skeleton_resource_editor(ui, skeleton);
+            }
+            ResourceData::AnimationClip(clip) => {
+                changed |=
+                    draw_animation_clip_resource_editor(ui, clip, &project_root, &skeleton_options);
+            }
+            ResourceData::AnimationSet(set) => {
+                changed |= draw_animation_set_resource_editor(
+                    ui,
+                    set,
+                    &skeleton_options,
+                    &animation_clip_options,
+                );
             }
             ResourceData::Character(character) => {
                 changed |= draw_character_resource_editor(ui, character, &character_ctx);
@@ -7026,6 +7058,47 @@ impl EditorWorkspace {
             self.clear_sector_selection();
             self.status = "Added character profile".to_string();
             self.mark_dirty();
+        }
+        if ui
+            .button(icons::label(icons::PLUS, "Animation Set"))
+            .on_hover_text("Add a reusable model-independent animation role set.")
+            .clicked()
+        {
+            let id = self.project.add_resource(
+                "New Animation Set",
+                ResourceData::AnimationSet(psxed_project::AnimationSetResource::default()),
+            );
+            self.replace_resource_selection(id);
+            self.clear_node_selection_state();
+            self.clear_primitive_selection_state();
+            self.clear_sector_selection();
+            self.status = "Added animation set".to_string();
+            self.mark_dirty();
+        }
+        if ui
+            .button(icons::label(icons::SCAN, "Catalogue Animations"))
+            .on_hover_text(
+                "Build Skeleton, Animation Clip, and Animation Set resources from existing Model clip lists.",
+            )
+            .clicked()
+        {
+            match catalogue_animation_library(&mut self.project, &self.project_dir) {
+                Ok(report) => {
+                    self.status = format!(
+                        "Catalogued animations: {} skeleton(s), {} clip(s), {} set(s), {} updated",
+                        report.skeletons_added,
+                        report.clips_added,
+                        report.sets_added,
+                        report.sets_updated + report.models_updated + report.characters_updated
+                    );
+                    if report.changed() {
+                        self.mark_dirty();
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("Animation catalogue failed: {error}");
+                }
+            }
         }
         if ui
             .button(icons::label(icons::FILE_PLUS, "Import Model"))
@@ -7669,7 +7742,7 @@ impl EditorWorkspace {
             PlaceKind::PlayerSpawn,
             PlaceKind::SpawnMarker,
             PlaceKind::ModelInstance,
-            PlaceKind::LightMarker,
+            PlaceKind::PointLightMarker,
         ] {
             ui.selectable_value(&mut self.place_kind, kind, kind.label());
         }
@@ -9619,7 +9692,7 @@ fn draw_transform_policy_editor(
                 });
             changed
         }
-        NodeKind::Light { .. } => {
+        NodeKind::PointLight { .. } => {
             let mut changed = false;
             egui::CollapsingHeader::new(icons::label(icons::MOVE, "Transform"))
                 .default_open(true)
@@ -10206,11 +10279,12 @@ fn draw_node_kind_editor(
                 changed |= ui.text_edit_singleline(weapon_grip).changed();
             });
         }
-        NodeKind::Light {
+        NodeKind::PointLight {
             color,
             intensity,
             radius,
         } => {
+            ui.weak("Static point light emitted from this node transform.");
             changed |= color_editor(ui, "Color", color);
             changed |= ui
                 .add(
@@ -10242,32 +10316,6 @@ fn draw_node_kind_editor(
                 ui.colored_label(
                     Color32::from_rgb(220, 160, 80),
                     "Intensity above 4.0 saturates almost every surface",
-                );
-            }
-        }
-        NodeKind::PointLight {
-            color,
-            intensity,
-            radius,
-        } => {
-            ui.weak("Component: point light emitted from the parent Entity transform.");
-            changed |= color_editor(ui, "Color", color);
-            changed |= ui
-                .add(
-                    egui::Slider::new(intensity, 0.0..=4.0)
-                        .text(icons::label(icons::SUN, "Intensity (× 1.0)")),
-                )
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(radius, 0.0..=8.0)
-                        .text(icons::label(icons::WAYPOINT, "Radius (sectors)")),
-                )
-                .changed();
-            if *radius <= 0.0 {
-                ui.colored_label(
-                    Color32::from_rgb(220, 120, 100),
-                    "Radius must be > 0 (cook will fail)",
                 );
             }
         }
@@ -10963,6 +11011,7 @@ fn draw_model_resource_editor(
     model: &mut psxed_project::ModelResource,
     project_root: &Path,
     preview_thumb: Option<(egui::TextureId, PsxtStats)>,
+    skeleton_options: &[(ResourceId, String)],
 ) -> bool {
     let mut changed = false;
 
@@ -11063,6 +11112,15 @@ fn draw_model_resource_editor(
                 model.texture_path = if atlas.is_empty() { None } else { Some(atlas) };
                 changed = true;
             }
+
+            ui.add_space(4.0);
+            changed |= resource_id_picker(
+                ui,
+                "Skeleton",
+                "model-skeleton-picker",
+                &mut model.skeleton,
+                skeleton_options,
+            );
 
             ui.add_space(4.0);
             ui.label("World height (engine units)");
@@ -11282,7 +11340,13 @@ fn register_bundle_into_model(
         return Err("scratch resource is not a Model".to_string());
     };
     let clip_count = model.clips.len();
-    *target = model.clone();
+    let mut model = model.clone();
+    // The scratch helper creates Skeleton / AnimationClip /
+    // AnimationSet resources in the scratch project. Do not copy
+    // its ResourceIds into the real project; the Catalogue action
+    // can create matching library resources there.
+    model.skeleton = None;
+    *target = model;
     Ok(clip_count)
 }
 
@@ -11513,6 +11577,337 @@ fn clip_picker(
     changed
 }
 
+fn resource_id_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    id_salt: &str,
+    current: &mut Option<ResourceId>,
+    options: &[(ResourceId, String)],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let preview = current
+            .and_then(|id| {
+                options
+                    .iter()
+                    .find(|(rid, _)| *rid == id)
+                    .map(|(_, name)| name.as_str())
+            })
+            .unwrap_or("(none)");
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "(none)").clicked() {
+                    *current = None;
+                    changed = true;
+                }
+                for (id, name) in options {
+                    if ui.selectable_label(*current == Some(*id), name).clicked() {
+                        *current = Some(*id);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    if let Some(id) = *current {
+        if !options.iter().any(|(rid, _)| *rid == id) {
+            ui.colored_label(
+                Color32::from_rgb(220, 120, 100),
+                "Referenced resource is missing.",
+            );
+        }
+    }
+    changed
+}
+
+fn draw_skeleton_resource_editor(
+    ui: &mut egui::Ui,
+    skeleton: &mut psxed_project::SkeletonResource,
+) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new(icons::label(icons::WAYPOINT, "Skeleton"))
+        .default_open(true)
+        .show(ui, |ui| {
+            changed |= drag_u16(ui, "Joint count", &mut skeleton.joint_count, 0, 512);
+            ui.label("Signature");
+            changed |= ui.text_edit_singleline(&mut skeleton.signature).changed();
+            ui.label("Note");
+            changed |= ui.text_edit_multiline(&mut skeleton.note).changed();
+            ui.label(
+                RichText::new(format!("Parent records: {}", skeleton.parents.len()))
+                    .color(STUDIO_TEXT_WEAK)
+                    .small(),
+            );
+        });
+    changed
+}
+
+fn draw_animation_clip_resource_editor(
+    ui: &mut egui::Ui,
+    clip: &mut psxed_project::AnimationClipResource,
+    project_root: &Path,
+    skeleton_options: &[(ResourceId, String)],
+) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new(icons::label(icons::PLAY, "Animation Clip"))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label("Cooked .psxanim path");
+            changed |= ui.text_edit_singleline(&mut clip.psxanim_path).changed();
+            changed |= resource_id_picker(
+                ui,
+                "Skeleton",
+                "animation-clip-skeleton-picker",
+                &mut clip.skeleton,
+                skeleton_options,
+            );
+
+            ui.horizontal(|ui| {
+                ui.label("Role");
+                let before = clip.role;
+                egui::ComboBox::from_id_salt("animation-clip-role")
+                    .selected_text(clip.role.label())
+                    .show_ui(ui, |ui| {
+                        for role in psxed_project::AnimationRole::ALL {
+                            ui.selectable_value(&mut clip.role, role, role.label());
+                        }
+                    });
+                if clip.role != before {
+                    changed = true;
+                }
+            });
+            changed |= ui.checkbox(&mut clip.looping, "Looping").changed();
+
+            let mut tags = clip.tags.join(", ");
+            ui.horizontal(|ui| {
+                ui.label("Tags");
+                if ui.text_edit_singleline(&mut tags).changed() {
+                    clip.tags = tags
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|tag| !tag.is_empty())
+                        .map(ToString::to_string)
+                        .collect();
+                    changed = true;
+                }
+            });
+        });
+
+    let path = psxed_project::model_import::resolve_path(&clip.psxanim_path, Some(project_root));
+    if !clip.psxanim_path.trim().is_empty() {
+        match std::fs::read(&path) {
+            Ok(bytes) => match psx_asset::Animation::from_bytes(&bytes) {
+                Ok(anim) => {
+                    egui::CollapsingHeader::new(icons::label(icons::SCAN, "Stats"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} frames @ {} Hz, {} joints, {} bytes",
+                                    anim.frame_count(),
+                                    anim.sample_rate_hz(),
+                                    anim.joint_count(),
+                                    bytes.len()
+                                ))
+                                .color(STUDIO_TEXT_WEAK),
+                            );
+                        });
+                }
+                Err(_) => {
+                    ui.colored_label(
+                        Color32::from_rgb(220, 120, 100),
+                        format!("Failed to parse animation at {}", path.display()),
+                    );
+                }
+            },
+            Err(_) => {
+                ui.colored_label(
+                    Color32::from_rgb(220, 120, 100),
+                    format!("Failed to parse animation at {}", path.display()),
+                );
+            }
+        }
+    }
+    changed
+}
+
+fn draw_animation_set_resource_editor(
+    ui: &mut egui::Ui,
+    set: &mut psxed_project::AnimationSetResource,
+    skeleton_options: &[(ResourceId, String)],
+    clip_options: &[AnimationClipOption],
+) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new(icons::label(icons::LAYERS, "Animation Set"))
+        .default_open(true)
+        .show(ui, |ui| {
+            changed |= resource_id_picker(
+                ui,
+                "Skeleton",
+                "animation-set-skeleton-picker",
+                &mut set.skeleton,
+                skeleton_options,
+            );
+            changed |= animation_resource_picker(
+                ui,
+                "Idle",
+                "animation-set-idle",
+                &mut set.idle_clip,
+                set.skeleton,
+                clip_options,
+                Some(psxed_project::AnimationRole::Idle),
+            );
+            changed |= animation_resource_picker(
+                ui,
+                "Walk",
+                "animation-set-walk",
+                &mut set.walk_clip,
+                set.skeleton,
+                clip_options,
+                Some(psxed_project::AnimationRole::Walk),
+            );
+            changed |= animation_resource_picker(
+                ui,
+                "Run",
+                "animation-set-run",
+                &mut set.run_clip,
+                set.skeleton,
+                clip_options,
+                Some(psxed_project::AnimationRole::Run),
+            );
+            changed |= animation_resource_picker(
+                ui,
+                "Turn",
+                "animation-set-turn",
+                &mut set.turn_clip,
+                set.skeleton,
+                clip_options,
+                Some(psxed_project::AnimationRole::Turn),
+            );
+        });
+
+    egui::CollapsingHeader::new(icons::label(icons::PLAY, "Extra Clips"))
+        .default_open(false)
+        .show(ui, |ui| {
+            let mut remove: Option<usize> = None;
+            for (index, clip_id) in set.clips.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    let mut current = Some(*clip_id);
+                    changed |= animation_resource_picker(
+                        ui,
+                        &format!("Clip {index}"),
+                        &format!("animation-set-extra-{index}"),
+                        &mut current,
+                        set.skeleton,
+                        clip_options,
+                        None,
+                    );
+                    if let Some(new_id) = current {
+                        if *clip_id != new_id {
+                            *clip_id = new_id;
+                            changed = true;
+                        }
+                    }
+                    if ui.small_button(icons::label(icons::TRASH, "")).clicked() {
+                        remove = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove {
+                set.clips.remove(index);
+                changed = true;
+            }
+            if ui.button(icons::label(icons::PLUS, "Add Clip")).clicked() {
+                if let Some(option) = clip_options
+                    .iter()
+                    .find(|option| animation_option_matches_skeleton(option, set.skeleton))
+                {
+                    set.clips.push(option.id);
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
+#[derive(Clone, Debug)]
+struct AnimationClipOption {
+    id: ResourceId,
+    name: String,
+    skeleton: Option<ResourceId>,
+    role: psxed_project::AnimationRole,
+}
+
+fn animation_resource_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    id_salt: &str,
+    current: &mut Option<ResourceId>,
+    skeleton: Option<ResourceId>,
+    options: &[AnimationClipOption],
+    role_hint: Option<psxed_project::AnimationRole>,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let preview = current
+            .and_then(|id| {
+                options
+                    .iter()
+                    .find(|option| option.id == id)
+                    .map(|option| option.name.as_str())
+            })
+            .unwrap_or("(none)");
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(preview)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "(none)").clicked() {
+                    *current = None;
+                    changed = true;
+                }
+                for option in options.iter().filter(|option| {
+                    animation_option_matches_skeleton(option, skeleton)
+                        && role_hint
+                            .map(|role| {
+                                option.role == role
+                                    || matches!(option.role, psxed_project::AnimationRole::Generic)
+                            })
+                            .unwrap_or(true)
+                }) {
+                    let label = if matches!(option.role, psxed_project::AnimationRole::Generic) {
+                        option.name.clone()
+                    } else {
+                        format!("{} ({})", option.name, option.role.label())
+                    };
+                    if ui
+                        .selectable_label(*current == Some(option.id), label)
+                        .clicked()
+                    {
+                        *current = Some(option.id);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    if let Some(id) = *current {
+        if !options.iter().any(|option| option.id == id) {
+            ui.colored_label(
+                Color32::from_rgb(220, 120, 100),
+                "Animation clip resource is missing.",
+            );
+        }
+    }
+    changed
+}
+
+fn animation_option_matches_skeleton(
+    option: &AnimationClipOption,
+    skeleton: Option<ResourceId>,
+) -> bool {
+    skeleton.is_none() || option.skeleton == skeleton
+}
+
 /// Combo-box picker for a Material's linked texture. `current` is
 /// the live `material.texture` field; `options` is every Texture
 /// resource in the project. Returns true when the selection moved
@@ -11614,11 +12009,14 @@ fn material_texture_picker(
 struct CharacterEditorContext {
     /// `(model id, model display name, clip names in order)`.
     models: Vec<(ResourceId, String, Vec<String>)>,
+    /// `(animation set id, display name, skeleton id)`.
+    animation_sets: Vec<(ResourceId, String, Option<ResourceId>)>,
 }
 
 fn build_character_editor_context(project: &ProjectDocument) -> CharacterEditorContext {
     CharacterEditorContext {
         models: collect_model_options(project),
+        animation_sets: collect_animation_set_options(project),
     }
 }
 
@@ -11675,12 +12073,31 @@ fn draw_character_resource_editor(
                     "Bound model resource is missing.",
                 );
             }
+            changed |= resource_id_picker(
+                ui,
+                "Animation Set",
+                "character-animation-set-picker",
+                &mut character.animation_set,
+                &ctx.animation_sets
+                    .iter()
+                    .map(|(id, name, _)| (*id, name.clone()))
+                    .collect::<Vec<_>>(),
+            );
         });
 
     egui::CollapsingHeader::new(icons::label(icons::PALETTE, "Animation roles"))
         .default_open(true)
         .show(ui, |ui| {
             let clips: &[String] = bound.map(|(_, _, c)| c.as_slice()).unwrap_or(&[]);
+            if character.animation_set.is_some() {
+                ui.label(
+                    RichText::new(
+                        "Animation Set roles are used first; legacy clip indices below are fallbacks.",
+                    )
+                    .color(STUDIO_TEXT_WEAK)
+                    .small(),
+                );
+            }
             if bound.is_none() {
                 ui.colored_label(
                     STUDIO_TEXT_WEAK,
@@ -12973,7 +13390,7 @@ fn label_for_drag(row: &NodeRow) -> String {
 
 /// Default `(menu label, kind template)` pairs for "Add Child" menus.
 /// Each menu entry uses the label as the new node's display name.
-fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
+fn default_addable_kinds() -> [(&'static str, NodeKind); 17] {
     [
         (
             "World",
@@ -13062,17 +13479,6 @@ fn default_addable_kinds() -> [(&'static str, NodeKind); 18] {
             },
         ),
         (
-            "Light",
-            NodeKind::Light {
-                color: [255, 240, 200],
-                intensity: 1.0,
-                // Sectors. Matches the Place tool default; historically
-                // this was 4096.0 (4096 sectors!) which lit every room
-                // from across the world.
-                radius: 4.0,
-            },
-        ),
-        (
             "Spawn Point",
             NodeKind::SpawnPoint {
                 player: false,
@@ -13153,14 +13559,6 @@ fn component_templates_for_host(host_kind: &NodeKind) -> Vec<(&'static str, Node
             },
         ),
         (
-            "Point Light",
-            NodeKind::PointLight {
-                color: [255, 240, 200],
-                intensity: 1.0,
-                radius: 4.0,
-            },
-        ),
-        (
             "Character Controller",
             NodeKind::CharacterController {
                 character: None,
@@ -13232,10 +13630,7 @@ fn component_can_be_added(candidate: &NodeKind, existing: &[&NodeKind]) -> bool 
 }
 
 const fn component_allows_multiple(kind: &NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::Collider { .. } | NodeKind::PointLight { .. }
-    )
+    matches!(kind, NodeKind::Collider { .. })
 }
 
 const fn component_slot(kind: &NodeKind) -> Option<&'static str> {
@@ -13248,7 +13643,6 @@ const fn component_slot(kind: &NodeKind) -> Option<&'static str> {
         NodeKind::AiController { .. } => Some("AiController"),
         NodeKind::Combat { .. } => Some("Combat"),
         NodeKind::Equipment { .. } => Some("Equipment"),
-        NodeKind::PointLight { .. } => Some("PointLight"),
         _ => None,
     }
 }
@@ -13267,8 +13661,7 @@ fn node_draw_mode(kind: &NodeKind) -> &'static str {
         NodeKind::World { .. } => "Streaming Region",
         NodeKind::Entity => "Entity Host",
         NodeKind::Room { .. } => "Sector Grid",
-        NodeKind::Light { .. } => "Editor Gizmo",
-        NodeKind::PointLight { .. } => "Light Component",
+        NodeKind::PointLight { .. } => "Static Light",
         NodeKind::SpawnPoint { .. } => "Spawn Marker",
         NodeKind::Trigger { .. } => "Trigger Volume",
         NodeKind::AudioSource { .. } => "Audio Marker",
@@ -13330,6 +13723,7 @@ fn project_filesystem_rows(project: &ProjectDocument) -> Vec<ProjectFileRow> {
     push_resource_folder(project, &mut rows, "materials", ResourceFilter::Material);
     push_resource_folder(project, &mut rows, "textures", ResourceFilter::Texture);
     push_resource_folder(project, &mut rows, "models", ResourceFilter::Model);
+    push_resource_folder(project, &mut rows, "animations", ResourceFilter::Animation);
     push_resource_folder(project, &mut rows, "characters", ResourceFilter::Character);
     push_resource_folder(project, &mut rows, "weapons", ResourceFilter::Weapon);
     push_resource_folder(project, &mut rows, "meshes", ResourceFilter::Mesh);
@@ -13414,6 +13808,11 @@ fn resource_file_name(resource: &Resource) -> String {
         ResourceData::Texture { psxt_path } => cooked_name(&resource.name, psxt_path, "psxt"),
         ResourceData::Material(_) => cooked_name(&resource.name, "", "mat"),
         ResourceData::Model(model) => cooked_name(&resource.name, &model.model_path, "psxmdl"),
+        ResourceData::Skeleton(_) => cooked_name(&resource.name, "", "skeleton"),
+        ResourceData::AnimationClip(clip) => {
+            cooked_name(&resource.name, &clip.psxanim_path, "psxanim")
+        }
+        ResourceData::AnimationSet(_) => cooked_name(&resource.name, "", "animset"),
         ResourceData::Character(_) => cooked_name(&resource.name, "", "profile"),
         ResourceData::Weapon(_) => cooked_name(&resource.name, "", "weapon"),
         ResourceData::Mesh { source_path } => cooked_name(&resource.name, source_path, "psxmesh"),
@@ -13447,10 +13846,11 @@ fn snake_name(name: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
-fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize); 8] {
+fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize); 9] {
     let mut texture = 0;
     let mut material = 0;
     let mut model = 0;
+    let mut animation = 0;
     let mut character = 0;
     let mut weapon = 0;
     let mut mesh = 0;
@@ -13461,6 +13861,9 @@ fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize)
             ResourceData::Texture { .. } => texture += 1,
             ResourceData::Material(_) => material += 1,
             ResourceData::Model(_) => model += 1,
+            ResourceData::Skeleton(_)
+            | ResourceData::AnimationClip(_)
+            | ResourceData::AnimationSet(_) => animation += 1,
             ResourceData::Character(_) => character += 1,
             ResourceData::Weapon(_) => weapon += 1,
             ResourceData::Mesh { .. } => mesh += 1,
@@ -13472,6 +13875,7 @@ fn resource_filter_counts(project: &ProjectDocument) -> [(ResourceFilter, usize)
         (ResourceFilter::Texture, texture),
         (ResourceFilter::Material, material),
         (ResourceFilter::Model, model),
+        (ResourceFilter::Animation, animation),
         (ResourceFilter::Character, character),
         (ResourceFilter::Weapon, weapon),
         (ResourceFilter::Mesh, mesh),
@@ -13497,11 +13901,16 @@ fn resource_source_path(resource: &Resource) -> Option<&str> {
     match &resource.data {
         ResourceData::Texture { psxt_path } => Some(psxt_path.as_str()),
         ResourceData::Model(model) => Some(model.model_path.as_str()),
+        ResourceData::AnimationClip(clip) => Some(clip.psxanim_path.as_str()),
         ResourceData::Mesh { source_path }
         | ResourceData::Scene { source_path }
         | ResourceData::Script { source_path }
         | ResourceData::Audio { source_path } => Some(source_path.as_str()),
-        ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => None,
+        ResourceData::Material(_)
+        | ResourceData::Skeleton(_)
+        | ResourceData::AnimationSet(_)
+        | ResourceData::Character(_)
+        | ResourceData::Weapon(_) => None,
     }
 }
 
@@ -13510,6 +13919,9 @@ fn resource_lucide_icon(data: &ResourceData) -> char {
         ResourceData::Texture { .. } => icons::PALETTE,
         ResourceData::Material(_) => icons::BLEND,
         ResourceData::Model(_) => icons::BOX,
+        ResourceData::Skeleton(_) => icons::WAYPOINT,
+        ResourceData::AnimationClip(_) => icons::PLAY,
+        ResourceData::AnimationSet(_) => icons::LAYERS,
         ResourceData::Character(_) => icons::MAP_PIN,
         ResourceData::Weapon(_) => icons::WAYPOINT,
         ResourceData::Mesh { .. } => icons::BOX,
@@ -13528,6 +13940,9 @@ fn resource_lucide_color(data: &ResourceData, selected: bool) -> Color32 {
         ResourceData::Texture { .. } => Color32::from_rgb(163, 182, 198),
         ResourceData::Material(_) => Color32::from_rgb(208, 112, 162),
         ResourceData::Model(_) => Color32::from_rgb(186, 178, 124),
+        ResourceData::Skeleton(_) => Color32::from_rgb(144, 180, 216),
+        ResourceData::AnimationClip(_) => Color32::from_rgb(126, 164, 220),
+        ResourceData::AnimationSet(_) => Color32::from_rgb(142, 190, 154),
         ResourceData::Character(_) => Color32::from_rgb(120, 220, 148),
         ResourceData::Weapon(_) => Color32::from_rgb(222, 196, 112),
         ResourceData::Mesh { .. } => Color32::from_rgb(156, 174, 190),
@@ -13931,6 +14346,9 @@ fn resource_preview_color(resource: &Resource) -> Color32 {
             ResourceData::Texture { .. } => Color32::from_rgb(92, 116, 140),
             ResourceData::Material(_) => Color32::from_rgb(120, 92, 135),
             ResourceData::Model(_) => Color32::from_rgb(140, 124, 96),
+            ResourceData::Skeleton(_) => Color32::from_rgb(82, 112, 145),
+            ResourceData::AnimationClip(_) => Color32::from_rgb(76, 108, 170),
+            ResourceData::AnimationSet(_) => Color32::from_rgb(82, 136, 100),
             ResourceData::Character(_) => Color32::from_rgb(96, 144, 110),
             ResourceData::Weapon(_) => Color32::from_rgb(150, 132, 76),
             ResourceData::Mesh { .. } => Color32::from_rgb(110, 120, 130),
@@ -13946,6 +14364,9 @@ fn resource_detail(resource: &Resource) -> &'static str {
         ResourceData::Texture { .. } => "Texture - 4bpp",
         ResourceData::Material(_) => "Material - 4bpp",
         ResourceData::Model(_) => "Model",
+        ResourceData::Skeleton(_) => "Skeleton",
+        ResourceData::AnimationClip(_) => "Animation Clip",
+        ResourceData::AnimationSet(_) => "Animation Set",
         ResourceData::Character(_) => "Character Profile",
         ResourceData::Weapon(_) => "Weapon",
         ResourceData::Mesh { .. } => "Mesh",
@@ -14199,7 +14620,7 @@ fn draw_scene_viewport(
                     &mut hits,
                 );
             }
-            NodeKind::Light {
+            NodeKind::PointLight {
                 color,
                 intensity,
                 radius,
@@ -16201,8 +16622,7 @@ fn entity_bound_kind_and_size(
         | NodeKind::CharacterController { .. }
         | NodeKind::AiController { .. }
         | NodeKind::Combat { .. }
-        | NodeKind::Equipment { .. }
-        | NodeKind::PointLight { .. } => None,
+        | NodeKind::Equipment { .. } => None,
         NodeKind::Entity => {
             if let Some(model) = entity_model_resource(workspace, node) {
                 let h = (model.world_height as f32).max(256.0);
@@ -16234,7 +16654,7 @@ fn entity_bound_kind_and_size(
             Some((EntityBoundKind::MeshFallback, [256.0, 256.0, 256.0]))
         }
         NodeKind::SpawnPoint { .. } => Some((EntityBoundKind::SpawnPoint, [128.0, 256.0, 128.0])),
-        NodeKind::Light { .. } => Some((EntityBoundKind::Light, [128.0, 128.0, 128.0])),
+        NodeKind::PointLight { .. } => Some((EntityBoundKind::PointLight, [128.0, 128.0, 128.0])),
         NodeKind::Trigger { .. } => Some((EntityBoundKind::Trigger, [256.0, 256.0, 256.0])),
         NodeKind::Portal { .. } => Some((EntityBoundKind::Portal, [256.0, 256.0, 64.0])),
         NodeKind::AudioSource { .. } => Some((EntityBoundKind::AudioSource, [128.0, 128.0, 128.0])),
@@ -16299,14 +16719,323 @@ fn collect_model_options(project: &ProjectDocument) -> Vec<(ResourceId, String, 
         .resources
         .iter()
         .filter_map(|r| match &r.data {
-            ResourceData::Model(m) => Some((
+            ResourceData::Model(_) => Some((
                 r.id,
                 r.name.clone(),
-                m.clips.iter().map(|c| c.name.clone()).collect(),
+                project
+                    .resolved_model_animation_clips(r.id)
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect(),
             )),
             _ => None,
         })
         .collect()
+}
+
+fn collect_skeleton_options(project: &ProjectDocument) -> Vec<(ResourceId, String)> {
+    project
+        .resources
+        .iter()
+        .filter_map(|resource| match &resource.data {
+            ResourceData::Skeleton(_) => Some((resource.id, resource.name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_animation_clip_options(project: &ProjectDocument) -> Vec<AnimationClipOption> {
+    project
+        .resources
+        .iter()
+        .filter_map(|resource| match &resource.data {
+            ResourceData::AnimationClip(clip) => Some(AnimationClipOption {
+                id: resource.id,
+                name: resource.name.clone(),
+                skeleton: clip.skeleton,
+                role: clip.role,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_animation_set_options(
+    project: &ProjectDocument,
+) -> Vec<(ResourceId, String, Option<ResourceId>)> {
+    project
+        .resources
+        .iter()
+        .filter_map(|resource| match &resource.data {
+            ResourceData::AnimationSet(set) => {
+                Some((resource.id, resource.name.clone(), set.skeleton))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct AnimationCatalogueReport {
+    skeletons_added: usize,
+    clips_added: usize,
+    sets_added: usize,
+    sets_updated: usize,
+    models_updated: usize,
+    characters_updated: usize,
+}
+
+impl AnimationCatalogueReport {
+    const fn changed(&self) -> bool {
+        self.skeletons_added > 0
+            || self.clips_added > 0
+            || self.sets_added > 0
+            || self.sets_updated > 0
+            || self.models_updated > 0
+            || self.characters_updated > 0
+    }
+}
+
+#[derive(Clone)]
+struct ModelCatalogueInput {
+    id: ResourceId,
+    name: String,
+    model_path: String,
+    clips: Vec<psxed_project::ModelAnimationClip>,
+}
+
+fn catalogue_animation_library(
+    project: &mut ProjectDocument,
+    project_root: &Path,
+) -> Result<AnimationCatalogueReport, String> {
+    let models: Vec<ModelCatalogueInput> = project
+        .resources
+        .iter()
+        .filter_map(|resource| match &resource.data {
+            ResourceData::Model(model) if !model.clips.is_empty() => Some(ModelCatalogueInput {
+                id: resource.id,
+                name: resource.name.clone(),
+                model_path: model.model_path.clone(),
+                clips: model.clips.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let mut report = AnimationCatalogueReport::default();
+    for model in models {
+        let abs = psxed_project::model_import::resolve_path(&model.model_path, Some(project_root));
+        let bytes = std::fs::read(&abs).map_err(|error| format!("{}: {error}", abs.display()))?;
+        let parsed = psx_asset::Model::from_bytes(&bytes)
+            .map_err(|error| format!("{}: {error:?}", abs.display()))?;
+        let skeleton = psxed_project::SkeletonResource::from_model(&parsed);
+        let skeleton_id = match find_skeleton_by_signature(project, &skeleton.signature) {
+            Some(id) => id,
+            None => {
+                let id = project.add_resource(
+                    format!("{} Skeleton", model.name),
+                    ResourceData::Skeleton(psxed_project::SkeletonResource {
+                        note: format!("Catalogued from {}", model.name),
+                        ..skeleton
+                    }),
+                );
+                report.skeletons_added += 1;
+                id
+            }
+        };
+
+        if let Some(resource) = project.resource_mut(model.id) {
+            if let ResourceData::Model(model_resource) = &mut resource.data {
+                if model_resource.skeleton != Some(skeleton_id) {
+                    model_resource.skeleton = Some(skeleton_id);
+                    report.models_updated += 1;
+                }
+            }
+        }
+
+        let mut animation_ids = Vec::new();
+        for clip in &model.clips {
+            let role = psxed_project::AnimationRole::guess_from_name(&clip.name);
+            let clip_id =
+                match find_animation_clip_by_path(project, skeleton_id, &clip.psxanim_path) {
+                    Some(id) => id,
+                    None => {
+                        let id = project.add_resource(
+                            clip.name.clone(),
+                            ResourceData::AnimationClip(psxed_project::AnimationClipResource {
+                                psxanim_path: clip.psxanim_path.clone(),
+                                skeleton: Some(skeleton_id),
+                                role,
+                                looping: !matches!(
+                                    role,
+                                    psxed_project::AnimationRole::Attack
+                                        | psxed_project::AnimationRole::Hit
+                                        | psxed_project::AnimationRole::Death
+                                ),
+                                tags: if matches!(role, psxed_project::AnimationRole::Generic) {
+                                    Vec::new()
+                                } else {
+                                    vec![role.label().to_ascii_lowercase()]
+                                },
+                            }),
+                        );
+                        report.clips_added += 1;
+                        id
+                    }
+                };
+            animation_ids.push(clip_id);
+        }
+
+        let set_name = format!("{} Animation Set", model.name);
+        let catalogued_set = build_animation_set_from_clips(project, skeleton_id, &animation_ids);
+        let set_id = match find_animation_set_by_name(project, skeleton_id, &set_name) {
+            Some(id) => {
+                if let Some(resource) = project.resource_mut(id) {
+                    if let ResourceData::AnimationSet(existing) = &mut resource.data {
+                        if merge_animation_set(existing, &catalogued_set) {
+                            report.sets_updated += 1;
+                        }
+                    }
+                }
+                id
+            }
+            None => {
+                let id = project.add_resource(set_name, ResourceData::AnimationSet(catalogued_set));
+                report.sets_added += 1;
+                id
+            }
+        };
+
+        for resource in &mut project.resources {
+            let ResourceData::Character(character) = &mut resource.data else {
+                continue;
+            };
+            if character.model == Some(model.id) && character.animation_set.is_none() {
+                character.animation_set = Some(set_id);
+                report.characters_updated += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn find_skeleton_by_signature(project: &ProjectDocument, signature: &str) -> Option<ResourceId> {
+    project
+        .resources
+        .iter()
+        .find_map(|resource| match &resource.data {
+            ResourceData::Skeleton(skeleton) if skeleton.signature == signature => {
+                Some(resource.id)
+            }
+            _ => None,
+        })
+}
+
+fn find_animation_clip_by_path(
+    project: &ProjectDocument,
+    skeleton: ResourceId,
+    path: &str,
+) -> Option<ResourceId> {
+    project
+        .resources
+        .iter()
+        .find_map(|resource| match &resource.data {
+            ResourceData::AnimationClip(clip)
+                if clip.skeleton == Some(skeleton) && clip.psxanim_path == path =>
+            {
+                Some(resource.id)
+            }
+            _ => None,
+        })
+}
+
+fn find_animation_set_by_name(
+    project: &ProjectDocument,
+    skeleton: ResourceId,
+    name: &str,
+) -> Option<ResourceId> {
+    project
+        .resources
+        .iter()
+        .find_map(|resource| match &resource.data {
+            ResourceData::AnimationSet(set)
+                if set.skeleton == Some(skeleton) && resource.name == name =>
+            {
+                Some(resource.id)
+            }
+            _ => None,
+        })
+}
+
+fn build_animation_set_from_clips(
+    project: &ProjectDocument,
+    skeleton: ResourceId,
+    animation_ids: &[ResourceId],
+) -> psxed_project::AnimationSetResource {
+    let mut set = psxed_project::AnimationSetResource {
+        skeleton: Some(skeleton),
+        ..psxed_project::AnimationSetResource::default()
+    };
+    for id in animation_ids {
+        let Some(resource) = project.resource(*id) else {
+            continue;
+        };
+        let ResourceData::AnimationClip(clip) = &resource.data else {
+            continue;
+        };
+        match clip.role {
+            psxed_project::AnimationRole::Idle if set.idle_clip.is_none() => {
+                set.idle_clip = Some(*id)
+            }
+            psxed_project::AnimationRole::Walk if set.walk_clip.is_none() => {
+                set.walk_clip = Some(*id)
+            }
+            psxed_project::AnimationRole::Run if set.run_clip.is_none() => set.run_clip = Some(*id),
+            psxed_project::AnimationRole::Turn if set.turn_clip.is_none() => {
+                set.turn_clip = Some(*id)
+            }
+            _ => {
+                if !set.clips.contains(id) {
+                    set.clips.push(*id);
+                }
+            }
+        }
+    }
+    set
+}
+
+fn merge_animation_set(
+    target: &mut psxed_project::AnimationSetResource,
+    source: &psxed_project::AnimationSetResource,
+) -> bool {
+    let mut changed = false;
+    if target.skeleton.is_none() && source.skeleton.is_some() {
+        target.skeleton = source.skeleton;
+        changed = true;
+    }
+    for role in [
+        psxed_project::AnimationRole::Idle,
+        psxed_project::AnimationRole::Walk,
+        psxed_project::AnimationRole::Run,
+        psxed_project::AnimationRole::Turn,
+    ] {
+        let source_clip = source.role_clip(role);
+        if source_clip.is_some() {
+            if let Some(target_slot) = target.role_clip_mut(role) {
+                if target_slot.is_none() {
+                    *target_slot = source_clip;
+                    changed = true;
+                }
+            }
+        }
+    }
+    for clip in &source.clips {
+        if !target.clips.contains(clip) {
+            target.clips.push(*clip);
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn collect_attachment_socket_names(project: &ProjectDocument) -> Vec<String> {
@@ -16566,7 +17295,14 @@ fn resource_file_budget(
             | ResourceData::Audio { source_path } => {
                 add_resource_file(project_root, source_path, &mut budget, &mut seen);
             }
-            ResourceData::Material(_) | ResourceData::Character(_) | ResourceData::Weapon(_) => {}
+            ResourceData::AnimationClip(clip) => {
+                add_resource_file(project_root, &clip.psxanim_path, &mut budget, &mut seen);
+            }
+            ResourceData::Material(_)
+            | ResourceData::Skeleton(_)
+            | ResourceData::AnimationSet(_)
+            | ResourceData::Character(_)
+            | ResourceData::Weapon(_) => {}
         }
     }
     budget
@@ -17677,8 +18413,8 @@ mod tests {
         let mut project = ProjectDocument::new("light-rotate");
         let light = project.active_scene_mut().add_node(
             NodeId::ROOT,
-            "Light",
-            NodeKind::Light {
+            "Point Light",
+            NodeKind::PointLight {
                 color: [255, 240, 200],
                 intensity: 1.0,
                 radius: 4.0,
@@ -18143,6 +18879,7 @@ mod tests {
                 texture_path: Some(
                     "assets/models/obsidian_wraith/obsidian_wraith_128x128_8bpp.psxt".to_string(),
                 ),
+                skeleton: None,
                 clips: Vec::new(),
                 default_clip: None,
                 preview_clip: None,

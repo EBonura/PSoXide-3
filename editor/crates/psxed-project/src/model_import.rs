@@ -20,7 +20,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{ModelAnimationClip, ModelResource, ProjectDocument, ResourceData, ResourceId};
+use crate::{
+    AnimationClipResource, AnimationRole, AnimationSetResource, ModelAnimationClip, ModelResource,
+    ProjectDocument, ResourceData, ResourceId, SkeletonResource,
+};
 
 pub use psxed_format::texture::Depth as TextureDepth;
 pub use psxed_gltf::{RigidModelConfig, RigidModelPackage, RigidModelReport};
@@ -423,6 +426,8 @@ pub fn register_cooked_model_bundle(
             detail: format!("{:?}", e),
         })?;
     let model_joint_count = model.joint_count();
+    let skeleton = SkeletonResource::from_model(&model);
+    let skeleton_id = find_or_add_skeleton(project, display_name, skeleton);
 
     if let Some(tex) = &texture_path {
         let bytes = std::fs::read(tex).map_err(|e| ModelImportError::Io {
@@ -469,6 +474,7 @@ pub fn register_cooked_model_bundle(
     let model_resource = ModelResource {
         model_path: relativise(&model_path, project_root),
         texture_path: texture_path.as_ref().map(|p| relativise(p, project_root)),
+        skeleton: Some(skeleton_id),
         clips,
         // Prefer an authored idle clip for first preview/runtime
         // playback. Alphabetical bundle order often puts one-shot
@@ -481,7 +487,12 @@ pub fn register_cooked_model_bundle(
         attachments: Vec::new(),
     };
 
-    Ok(project.add_resource(display_name, ResourceData::Model(model_resource)))
+    let model_id = project.add_resource(display_name, ResourceData::Model(model_resource.clone()));
+    let animation_ids = register_animation_clip_resources(project, skeleton_id, &model_resource);
+    if !animation_ids.is_empty() {
+        register_animation_set_resource(project, display_name, skeleton_id, &animation_ids);
+    }
+    Ok(model_id)
 }
 
 /// Convert a `.glb` (or `.gltf`) source through the rigid-model
@@ -615,6 +626,166 @@ fn default_clip_index(clips: &[ModelAnimationClip]) -> u16 {
         return index as u16;
     }
     0
+}
+
+fn find_or_add_skeleton(
+    project: &mut ProjectDocument,
+    display_name: &str,
+    skeleton: SkeletonResource,
+) -> ResourceId {
+    if let Some(existing) = project
+        .resources
+        .iter()
+        .find_map(|resource| match &resource.data {
+            ResourceData::Skeleton(existing)
+                if !existing.signature.is_empty() && existing.signature == skeleton.signature =>
+            {
+                Some(resource.id)
+            }
+            _ => None,
+        })
+    {
+        return existing;
+    }
+
+    let mut skeleton = skeleton;
+    if skeleton.note.trim().is_empty() {
+        skeleton.note = format!("Imported from {display_name}");
+    }
+    project.add_resource(
+        format!("{display_name} Skeleton"),
+        ResourceData::Skeleton(skeleton),
+    )
+}
+
+fn register_animation_clip_resources(
+    project: &mut ProjectDocument,
+    skeleton_id: ResourceId,
+    model: &ModelResource,
+) -> Vec<ResourceId> {
+    let mut ids = Vec::new();
+    for clip in &model.clips {
+        let existing = project
+            .resources
+            .iter()
+            .find_map(|resource| match &resource.data {
+                ResourceData::AnimationClip(existing)
+                    if existing.psxanim_path == clip.psxanim_path
+                        && existing.skeleton == Some(skeleton_id) =>
+                {
+                    Some(resource.id)
+                }
+                _ => None,
+            });
+        if let Some(id) = existing {
+            ids.push(id);
+            continue;
+        }
+        let role = AnimationRole::guess_from_name(&clip.name);
+        let id = project.add_resource(
+            clip.name.clone(),
+            ResourceData::AnimationClip(AnimationClipResource {
+                psxanim_path: clip.psxanim_path.clone(),
+                skeleton: Some(skeleton_id),
+                role,
+                looping: !matches!(
+                    role,
+                    AnimationRole::Attack | AnimationRole::Hit | AnimationRole::Death
+                ),
+                tags: role_tag_list(role),
+            }),
+        );
+        ids.push(id);
+    }
+    ids
+}
+
+fn register_animation_set_resource(
+    project: &mut ProjectDocument,
+    display_name: &str,
+    skeleton_id: ResourceId,
+    animation_ids: &[ResourceId],
+) -> ResourceId {
+    let mut set = AnimationSetResource {
+        skeleton: Some(skeleton_id),
+        ..AnimationSetResource::default()
+    };
+    for id in animation_ids {
+        let Some(resource) = project.resource(*id) else {
+            continue;
+        };
+        let ResourceData::AnimationClip(clip) = &resource.data else {
+            continue;
+        };
+        match clip.role {
+            AnimationRole::Idle if set.idle_clip.is_none() => set.idle_clip = Some(*id),
+            AnimationRole::Walk if set.walk_clip.is_none() => set.walk_clip = Some(*id),
+            AnimationRole::Run if set.run_clip.is_none() => set.run_clip = Some(*id),
+            AnimationRole::Turn if set.turn_clip.is_none() => set.turn_clip = Some(*id),
+            AnimationRole::Generic
+            | AnimationRole::Attack
+            | AnimationRole::Hit
+            | AnimationRole::Death
+            | AnimationRole::Idle
+            | AnimationRole::Walk
+            | AnimationRole::Run
+            | AnimationRole::Turn => {
+                if !set.clips.contains(id) {
+                    set.clips.push(*id);
+                }
+            }
+        }
+    }
+    let set_name = format!("{display_name} Animation Set");
+    if let Some(existing_id) = project.resources.iter().find_map(|resource| {
+        let ResourceData::AnimationSet(existing) = &resource.data else {
+            return None;
+        };
+        (resource.name == set_name && existing.skeleton == Some(skeleton_id)).then_some(resource.id)
+    }) {
+        if let Some(resource) = project.resource_mut(existing_id) {
+            if let ResourceData::AnimationSet(existing) = &mut resource.data {
+                merge_animation_set(existing, &set);
+            }
+        }
+        existing_id
+    } else {
+        project.add_resource(set_name, ResourceData::AnimationSet(set))
+    }
+}
+
+fn merge_animation_set(target: &mut AnimationSetResource, source: &AnimationSetResource) {
+    if target.skeleton.is_none() {
+        target.skeleton = source.skeleton;
+    }
+    for role in [
+        AnimationRole::Idle,
+        AnimationRole::Walk,
+        AnimationRole::Run,
+        AnimationRole::Turn,
+    ] {
+        let source_clip = source.role_clip(role);
+        if source_clip.is_some() {
+            if let Some(target_slot) = target.role_clip_mut(role) {
+                if target_slot.is_none() {
+                    *target_slot = source_clip;
+                }
+            }
+        }
+    }
+    for clip in &source.clips {
+        if !target.clips.contains(clip) {
+            target.clips.push(*clip);
+        }
+    }
+}
+
+fn role_tag_list(role: AnimationRole) -> Vec<String> {
+    if matches!(role, AnimationRole::Generic) {
+        Vec::new()
+    } else {
+        vec![role.label().to_ascii_lowercase()]
+    }
 }
 
 /// Convert `path` into a relative-to-project string when

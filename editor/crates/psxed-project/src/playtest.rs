@@ -31,10 +31,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use psxed_format::world as psxw;
+
 use crate::streaming::{plan_generated_chunks, StreamingChunkConfig};
-use crate::world_cook::{cook_world_grid, CookedWorldMaterial, WorldGridCookError};
+use crate::world_cook::{
+    cook_world_grid, CookedWorldGrid, CookedWorldMaterial, WorldGridCookError,
+};
 use crate::{
-    spatial, NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId, SceneNode, WorldGrid,
+    spatial, AnimationRole, NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId, SceneNode,
+    WorldGrid,
 };
 
 mod assets;
@@ -62,6 +67,12 @@ struct AuthoredRoomChunk {
     array_origin: [u16; 2],
     world_origin: [i32; 2],
     size: [u16; 2],
+}
+
+#[derive(Debug, Clone)]
+struct CookedRoomBakeInput {
+    room_index: u16,
+    cooked: CookedWorldGrid,
 }
 
 /// Chunking policy used by Embedded Play. Authored Rooms may grow
@@ -115,6 +126,7 @@ pub fn build_package(
     let mut texture_asset_for_resource: std::collections::HashMap<ResourceId, usize> =
         std::collections::HashMap::new();
     let mut room_chunks_by_node: HashMap<NodeId, Vec<AuthoredRoomChunk>> = HashMap::new();
+    let mut room_bake_inputs: Vec<CookedRoomBakeInput> = Vec::new();
 
     for room_node in &room_nodes {
         let NodeKind::Room { grid } = &room_node.kind else {
@@ -271,6 +283,7 @@ pub fn build_package(
                     0
                 },
             });
+            room_bake_inputs.push(CookedRoomBakeInput { room_index, cooked });
         }
     }
 
@@ -377,22 +390,6 @@ pub fn build_package(
                         ) {
                             return (None, report);
                         }
-                    }
-                }
-
-                for light in component_point_lights(scene, node) {
-                    if !push_point_light(
-                        node.name.as_str(),
-                        grid,
-                        room_index,
-                        pos,
-                        light.color,
-                        light.intensity,
-                        light.radius,
-                        &mut lights,
-                        &mut report,
-                    ) {
-                        return (None, report);
                     }
                 }
 
@@ -527,7 +524,7 @@ pub fn build_package(
                     });
                 }
             }
-            NodeKind::Light {
+            NodeKind::PointLight {
                 color,
                 intensity,
                 radius,
@@ -572,8 +569,7 @@ pub fn build_package(
             | NodeKind::CharacterController { .. }
             | NodeKind::AiController { .. }
             | NodeKind::Combat { .. }
-            | NodeKind::Equipment { .. }
-            | NodeKind::PointLight { .. } => {}
+            | NodeKind::Equipment { .. } => {}
         }
     }
 
@@ -695,6 +691,8 @@ pub fn build_package(
         return (None, report);
     }
 
+    let surface_lights = bake_static_surface_lights(&room_bake_inputs, &lights);
+
     (
         Some(PlaytestPackage {
             assets,
@@ -708,6 +706,7 @@ pub fn build_package(
             weapons,
             equipment,
             lights,
+            surface_lights,
             spawn,
             characters,
             player_controller,
@@ -782,44 +781,109 @@ fn cook_player_character(
     let model = &models[model_index as usize];
 
     let clip_count = model.clip_count;
-    let validate_required =
-        |role: &str, slot: Option<u16>, report: &mut PlaytestValidationReport| -> Option<u16> {
-            match slot {
-                Some(idx) if idx < clip_count => Some(idx),
-                Some(idx) => {
-                    report.error(format!(
-                    "Character '{}' {role} clip {idx} out of range ({clip_count} clips on model)",
-                    resource.name
-                ));
-                    None
-                }
-                None => {
-                    report.error(format!(
-                        "Character '{}' has no {role} clip assigned",
-                        resource.name
-                    ));
-                    None
+    let model_skeleton =
+        project
+            .resource(model_resource_id)
+            .and_then(|resource| match &resource.data {
+                ResourceData::Model(model) => model.skeleton,
+                _ => None,
+            });
+    let animation_set = character.animation_set.and_then(|id| {
+        let resource = project.resource(id)?;
+        match &resource.data {
+            ResourceData::AnimationSet(set) => Some((id, resource.name.as_str(), set)),
+            _ => None,
+        }
+    });
+    if let Some((_, set_name, set)) = animation_set {
+        if set.skeleton.is_some() && model_skeleton.is_some() && set.skeleton != model_skeleton {
+            report.error(format!(
+                "Character '{}' animation set '{}' targets a different skeleton than its model",
+                resource.name, set_name
+            ));
+            return None;
+        }
+    }
+
+    let resolve_role = |role: AnimationRole,
+                        legacy_slot: Option<u16>,
+                        required: bool,
+                        project: &ProjectDocument,
+                        report: &mut PlaytestValidationReport|
+     -> Option<u16> {
+        let role_label = role.label().to_ascii_lowercase();
+        if let Some((_, set_name, set)) = animation_set {
+            if let Some(animation_id) = set.role_clip(role) {
+                match project.resolved_model_animation_index(model_resource_id, animation_id) {
+                    Some(index) if index < clip_count => return Some(index),
+                    Some(index) => {
+                        report.error(format!(
+                            "Character '{}' {role_label} clip resolves to {index}, out of range ({clip_count} clips on model)",
+                            resource.name
+                        ));
+                        return None;
+                    }
+                    None => {
+                        report.error(format!(
+                            "Character '{}' animation set '{}' {role_label} clip is not compatible with model '{}'",
+                            resource.name, set_name, model.name
+                        ));
+                        return None;
+                    }
                 }
             }
-        };
-    let validate_optional =
-        |role: &str, slot: Option<u16>, report: &mut PlaytestValidationReport| -> u16 {
-            match slot {
-                Some(idx) if idx < clip_count => idx,
-                Some(idx) => {
-                    report.error(format!(
-                    "Character '{}' {role} clip {idx} out of range ({clip_count} clips on model)",
+        }
+
+        match legacy_slot {
+            Some(idx) if idx < clip_count => Some(idx),
+            Some(idx) => {
+                report.error(format!(
+                    "Character '{}' {role_label} clip {idx} out of range ({clip_count} clips on model)",
                     resource.name
                 ));
-                    CHARACTER_CLIP_NONE
-                }
-                None => CHARACTER_CLIP_NONE,
+                None
             }
-        };
-    let idle_clip = validate_required("idle", character.idle_clip, report)?;
-    let walk_clip = validate_required("walk", character.walk_clip, report)?;
-    let run_clip = validate_optional("run", character.run_clip, report);
-    let turn_clip = validate_optional("turn", character.turn_clip, report);
+            None if required => {
+                report.error(format!(
+                    "Character '{}' has no {role_label} clip assigned",
+                    resource.name
+                ));
+                None
+            }
+            None => Some(CHARACTER_CLIP_NONE),
+        }
+    };
+
+    let idle_clip = resolve_role(
+        AnimationRole::Idle,
+        character.idle_clip,
+        true,
+        project,
+        report,
+    )?;
+    let walk_clip = resolve_role(
+        AnimationRole::Walk,
+        character.walk_clip,
+        true,
+        project,
+        report,
+    )?;
+    let run_clip = resolve_role(
+        AnimationRole::Run,
+        character.run_clip,
+        false,
+        project,
+        report,
+    )
+    .unwrap_or(CHARACTER_CLIP_NONE);
+    let turn_clip = resolve_role(
+        AnimationRole::Turn,
+        character.turn_clip,
+        false,
+        project,
+        report,
+    )
+    .unwrap_or(CHARACTER_CLIP_NONE);
 
     if character.radius == 0 {
         report.error(format!("Character '{}' radius must be > 0", resource.name));
@@ -932,7 +996,8 @@ fn register_model_for_instance(
         ));
         return None;
     }
-    if model.clips.is_empty() {
+    let resolved_clips = project.resolved_model_animation_clips(model_resource_id);
+    if resolved_clips.is_empty() {
         report.error(format!(
             "Model '{}' has no animation clips; the runtime requires at least one clip",
             resource.name
@@ -1024,10 +1089,12 @@ fn register_model_for_instance(
         None
     };
 
-    // Clip assets -- one .psxanim per clip, validated for joint
-    // parity. Clips ordered as authored in the resource.
+    // Clip assets -- one .psxanim per resolved clip, validated for
+    // joint parity. Legacy model-local clips stay first so existing
+    // clip indices keep working; compatible AnimationClip resources
+    // are appended for the new shared animation library path.
     let clip_first = u16::try_from(model_clips.len()).unwrap_or(u16::MAX);
-    for (i, clip) in model.clips.iter().enumerate() {
+    for (i, clip) in resolved_clips.iter().enumerate() {
         let abs = resolve_path(&clip.psxanim_path, project_root);
         let bytes = match std::fs::read(&abs) {
             Ok(b) => b,
@@ -1319,13 +1386,6 @@ struct EquipmentComponent<'a> {
     weapon_grip: &'a str,
 }
 
-#[derive(Clone, Copy)]
-struct PointLightComponent {
-    color: [u8; 3],
-    intensity: f32,
-    radius: f32,
-}
-
 fn component_model_renderer(
     scene: &crate::Scene,
     host: &SceneNode,
@@ -1372,23 +1432,6 @@ fn component_equipment<'a>(
         }),
         _ => None,
     })
-}
-
-fn component_point_lights(scene: &crate::Scene, host: &SceneNode) -> Vec<PointLightComponent> {
-    component_children(scene, host)
-        .filter_map(|node| match &node.kind {
-            NodeKind::PointLight {
-                color,
-                intensity,
-                radius,
-            } => Some(PointLightComponent {
-                color: *color,
-                intensity: *intensity,
-                radius: *radius,
-            }),
-            _ => None,
-        })
-        .collect()
 }
 
 fn component_children<'a>(
@@ -1442,6 +1485,251 @@ fn push_point_light(
         color,
     });
     true
+}
+
+fn bake_static_surface_lights(
+    rooms: &[CookedRoomBakeInput],
+    lights: &[PlaytestLight],
+) -> Vec<PlaytestSurfaceLight> {
+    let mut out = Vec::new();
+    for room in rooms {
+        let room_lights: Vec<&PlaytestLight> = lights
+            .iter()
+            .filter(|light| light.room == room.room_index)
+            .collect();
+        let depth = room.cooked.depth as usize;
+        for (idx, sector) in room.cooked.sectors.iter().enumerate() {
+            let Some(sector) = sector else {
+                continue;
+            };
+            let sx = (idx / depth) as u16;
+            let sz = (idx % depth) as u16;
+            if let Some(face) = sector.floor {
+                let verts = horizontal_vertices(sx, sz, room.cooked.sector_size, face.heights);
+                out.push(bake_surface_light_record(
+                    room,
+                    sx,
+                    sz,
+                    psx_level::surface_light_kind::FLOOR,
+                    0,
+                    0,
+                    verts,
+                    face.material,
+                    &room_lights,
+                ));
+            }
+            if let Some(face) = sector.ceiling {
+                let verts = reverse_quad_vertices(horizontal_vertices(
+                    sx,
+                    sz,
+                    room.cooked.sector_size,
+                    face.heights,
+                ));
+                out.push(bake_surface_light_record(
+                    room,
+                    sx,
+                    sz,
+                    psx_level::surface_light_kind::CEILING,
+                    0,
+                    0,
+                    verts,
+                    face.material,
+                    &room_lights,
+                ));
+            }
+
+            let mut ordinal = 0u16;
+            for (direction, walls) in [
+                (psxw::direction::NORTH, sector.walls.north.as_slice()),
+                (psxw::direction::EAST, sector.walls.east.as_slice()),
+                (psxw::direction::SOUTH, sector.walls.south.as_slice()),
+                (psxw::direction::WEST, sector.walls.west.as_slice()),
+            ] {
+                for wall in walls {
+                    if let Some(verts) =
+                        wall_vertices(sx, sz, room.cooked.sector_size, direction, wall.heights)
+                    {
+                        out.push(bake_surface_light_record(
+                            room,
+                            sx,
+                            sz,
+                            psx_level::surface_light_kind::WALL,
+                            direction,
+                            ordinal,
+                            verts,
+                            wall.material,
+                            &room_lights,
+                        ));
+                    }
+                    ordinal = ordinal.saturating_add(1);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bake_surface_light_record(
+    room: &CookedRoomBakeInput,
+    sx: u16,
+    sz: u16,
+    kind: u8,
+    direction: u8,
+    ordinal: u16,
+    vertices: [[i32; 3]; 4],
+    material_slot: u16,
+    lights: &[&PlaytestLight],
+) -> PlaytestSurfaceLight {
+    let base = cooked_material_tint(&room.cooked, material_slot);
+    PlaytestSurfaceLight {
+        room: room.room_index,
+        sx,
+        sz,
+        kind,
+        direction,
+        ordinal,
+        vertex_rgb: [
+            bake_static_vertex_rgb(vertices[0], base, room.cooked.ambient_color, lights),
+            bake_static_vertex_rgb(vertices[1], base, room.cooked.ambient_color, lights),
+            bake_static_vertex_rgb(vertices[2], base, room.cooked.ambient_color, lights),
+            bake_static_vertex_rgb(vertices[3], base, room.cooked.ambient_color, lights),
+        ],
+    }
+}
+
+fn cooked_material_tint(cooked: &CookedWorldGrid, slot: u16) -> [u8; 3] {
+    cooked
+        .materials
+        .iter()
+        .find(|material| material.slot == slot)
+        .map(|material| material.tint)
+        .unwrap_or([128, 128, 128])
+}
+
+fn horizontal_vertices(sx: u16, sz: u16, sector_size: i32, heights: [i32; 4]) -> [[i32; 3]; 4] {
+    let x0 = (sx as i32) * sector_size;
+    let x1 = ((sx as i32) + 1) * sector_size;
+    let z0 = (sz as i32) * sector_size;
+    let z1 = ((sz as i32) + 1) * sector_size;
+    [
+        [x0, heights[0], z0],
+        [x1, heights[1], z0],
+        [x1, heights[2], z1],
+        [x0, heights[3], z1],
+    ]
+}
+
+fn reverse_quad_vertices(vertices: [[i32; 3]; 4]) -> [[i32; 3]; 4] {
+    [vertices[3], vertices[2], vertices[1], vertices[0]]
+}
+
+fn wall_vertices(
+    sx: u16,
+    sz: u16,
+    sector_size: i32,
+    direction: u8,
+    heights: [i32; 4],
+) -> Option<[[i32; 3]; 4]> {
+    let x0 = (sx as i32) * sector_size;
+    let x1 = ((sx as i32) + 1) * sector_size;
+    let z0 = (sz as i32) * sector_size;
+    let z1 = ((sz as i32) + 1) * sector_size;
+    match direction {
+        psxw::direction::NORTH => Some([
+            [x0, heights[0], z0],
+            [x1, heights[1], z0],
+            [x1, heights[2], z0],
+            [x0, heights[3], z0],
+        ]),
+        psxw::direction::EAST => Some([
+            [x1, heights[0], z0],
+            [x1, heights[1], z1],
+            [x1, heights[2], z1],
+            [x1, heights[3], z0],
+        ]),
+        psxw::direction::SOUTH => Some([
+            [x1, heights[0], z1],
+            [x0, heights[1], z1],
+            [x0, heights[2], z1],
+            [x1, heights[3], z1],
+        ]),
+        psxw::direction::WEST => Some([
+            [x0, heights[0], z1],
+            [x0, heights[1], z0],
+            [x0, heights[2], z0],
+            [x0, heights[3], z1],
+        ]),
+        _ => None,
+    }
+}
+
+fn bake_static_vertex_rgb(
+    point: [i32; 3],
+    base: [u8; 3],
+    ambient: [u8; 3],
+    lights: &[&PlaytestLight],
+) -> [u8; 3] {
+    const LIGHTING_NEUTRAL: u32 = 128;
+    const LIGHTING_MAX: u32 = 255;
+    let mut accum = [ambient[0] as u32, ambient[1] as u32, ambient[2] as u32];
+    for light in lights {
+        let Some(weight_q8) =
+            point_light_weight_q8(point, [light.x, light.y, light.z], light.radius)
+        else {
+            continue;
+        };
+        for (channel, color) in accum.iter_mut().zip(light.color) {
+            let weighted = (color as u32).saturating_mul(light.intensity_q8 as u32);
+            *channel = channel.saturating_add(weighted.saturating_mul(weight_q8) >> 16);
+        }
+    }
+    [
+        ((base[0] as u32 * accum[0].min(LIGHTING_MAX)) / LIGHTING_NEUTRAL).min(255) as u8,
+        ((base[1] as u32 * accum[1].min(LIGHTING_MAX)) / LIGHTING_NEUTRAL).min(255) as u8,
+        ((base[2] as u32 * accum[2].min(LIGHTING_MAX)) / LIGHTING_NEUTRAL).min(255) as u8,
+    ]
+}
+
+fn point_light_weight_q8(point: [i32; 3], light_position: [i32; 3], radius: u16) -> Option<u32> {
+    let radius = radius as u32;
+    if radius == 0 {
+        return None;
+    }
+    let dx = point[0].abs_diff(light_position[0]);
+    let dy = point[1].abs_diff(light_position[1]);
+    let dz = point[2].abs_diff(light_position[2]);
+    if dx >= radius || dy >= radius || dz >= radius {
+        return None;
+    }
+    let d2 = dx
+        .checked_mul(dx)?
+        .checked_add(dy.checked_mul(dy)?)?
+        .checked_add(dz.checked_mul(dz)?)?;
+    let r2 = radius.checked_mul(radius)?;
+    if d2 >= r2 {
+        return None;
+    }
+    Some((radius - isqrt_u32(d2)).saturating_mul(256) / radius)
+}
+
+fn isqrt_u32(value: u32) -> u32 {
+    let mut x = value;
+    let mut r = 0u32;
+    let mut bit = 1u32 << 30;
+    while bit > x {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if x >= r + bit {
+            x -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    r
 }
 
 fn grid_rect(grid: &WorldGrid, origin: [u16; 2], size: [u16; 2]) -> Option<WorldGrid> {
@@ -1648,7 +1936,6 @@ mod tests {
             .nodes()
             .iter()
             .find_map(|node| match &node.kind {
-                NodeKind::Light { color, .. } => Some(*color),
                 NodeKind::PointLight { color, .. } => Some(*color),
                 _ => None,
             })
@@ -1661,7 +1948,6 @@ mod tests {
             .nodes()
             .iter()
             .find_map(|node| match &node.kind {
-                NodeKind::Light { intensity, .. } => Some(*intensity),
                 NodeKind::PointLight { intensity, .. } => Some(*intensity),
                 _ => None,
             })
@@ -1674,7 +1960,7 @@ mod tests {
             .active_scene()
             .nodes()
             .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Light { .. } | NodeKind::PointLight { .. }))
+            .filter(|n| matches!(n.kind, NodeKind::PointLight { .. }))
             .map(|n| n.id)
             .collect()
     }
@@ -2069,6 +2355,7 @@ mod tests {
             "Test Character",
             crate::ResourceData::Character(CharacterResource {
                 model: None,
+                animation_set: None,
                 idle_clip: Some(0),
                 walk_clip: Some(1),
                 run_clip: None,
@@ -2535,6 +2822,23 @@ mod tests {
     }
 
     #[test]
+    fn starter_project_bakes_static_surface_lights() {
+        let project = ProjectDocument::starter();
+        let (package, report) = build_package(&project, &starter_project_root());
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        let package = package.expect("starter cooks");
+        assert!(!package.surface_lights.is_empty());
+        assert!(package
+            .surface_lights
+            .iter()
+            .all(|surface| surface.room < package.rooms.len() as u16));
+        assert!(package
+            .surface_lights
+            .iter()
+            .any(|surface| { surface.vertex_rgb.iter().any(|rgb| *rgb != [0, 0, 0]) }));
+    }
+
+    #[test]
     fn light_with_zero_radius_fails() {
         let mut project = ProjectDocument::starter();
         let ids = starter_light_ids(&project);
@@ -2542,9 +2846,7 @@ mod tests {
         for id in ids {
             if let Some(node) = scene.node_mut(id) {
                 match &mut node.kind {
-                    NodeKind::Light { radius, .. } | NodeKind::PointLight { radius, .. } => {
-                        *radius = 0.0;
-                    }
+                    NodeKind::PointLight { radius, .. } => *radius = 0.0,
                     _ => {}
                 }
             }
@@ -2566,9 +2868,7 @@ mod tests {
         for id in ids {
             if let Some(node) = scene.node_mut(id) {
                 match &mut node.kind {
-                    NodeKind::Light { intensity, .. } | NodeKind::PointLight { intensity, .. } => {
-                        *intensity = -0.5;
-                    }
+                    NodeKind::PointLight { intensity, .. } => *intensity = -0.5,
                     _ => {}
                 }
             }
@@ -2601,9 +2901,7 @@ mod tests {
         for id in ids {
             if let Some(node) = scene.node_mut(id) {
                 match &mut node.kind {
-                    NodeKind::Light { radius, .. } | NodeKind::PointLight { radius, .. } => {
-                        *radius = 4.0;
-                    }
+                    NodeKind::PointLight { radius, .. } => *radius = 4.0,
                     _ => {}
                 }
             }
@@ -2623,6 +2921,8 @@ mod tests {
         let src = render_manifest_source(&package);
         assert!(src.contains("PointLightRecord"));
         assert!(src.contains("pub static LIGHTS"));
+        assert!(src.contains("SurfaceLightRecord"));
+        assert!(src.contains("pub static SURFACE_LIGHTS"));
         assert!(src.contains("intensity_q8"));
         assert!(src.contains(&format!(
             "color: [{}, {}, {}]",

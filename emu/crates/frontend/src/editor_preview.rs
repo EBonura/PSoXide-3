@@ -602,8 +602,8 @@ fn face_depth(camera: psx_engine::WorldCamera, center: [i32; 3]) -> i32 {
         .z
 }
 
-/// Walk every legacy Light and component PointLight whose
-/// enclosing room is the active grid and pre-multiply its
+/// Walk every PointLight whose enclosing room is the active grid
+/// and pre-multiply its
 /// colour×intensity_q8. Lights authored outside any Room (no
 /// enclosing parent) are skipped silently -- the cooker warns
 /// about those, the preview just doesn't render them.
@@ -663,7 +663,6 @@ fn push_preview_light_sample(
 #[derive(Clone, Copy)]
 struct PreviewLightMeta {
     host_id: NodeId,
-    component_id: Option<NodeId>,
     transform: Transform3,
     color: [u8; 3],
     intensity: f32,
@@ -673,43 +672,21 @@ struct PreviewLightMeta {
 fn preview_lights(scene: &Scene) -> Vec<PreviewLightMeta> {
     let mut out = Vec::new();
     for node in scene.nodes() {
-        match &node.kind {
-            NodeKind::Light {
-                color,
-                intensity,
-                radius,
-            } => {
-                out.push(PreviewLightMeta {
-                    host_id: node.id,
-                    component_id: None,
-                    transform: node.transform,
-                    color: *color,
-                    intensity: *intensity,
-                    radius: *radius,
-                });
-            }
-            NodeKind::Entity => {
-                for child in component_children(scene, node) {
-                    let NodeKind::PointLight {
-                        color,
-                        intensity,
-                        radius,
-                    } = &child.kind
-                    else {
-                        continue;
-                    };
-                    out.push(PreviewLightMeta {
-                        host_id: node.id,
-                        component_id: Some(child.id),
-                        transform: node.transform,
-                        color: *color,
-                        intensity: *intensity,
-                        radius: *radius,
-                    });
-                }
-            }
-            _ => {}
-        }
+        let NodeKind::PointLight {
+            color,
+            intensity,
+            radius,
+        } = &node.kind
+        else {
+            continue;
+        };
+        out.push(PreviewLightMeta {
+            host_id: node.id,
+            transform: node.transform,
+            color: *color,
+            intensity: *intensity,
+            radius: *radius,
+        });
     }
     out
 }
@@ -1370,7 +1347,11 @@ fn walk_model_instances(
             reference.clip_override,
         )
         .unwrap_or(0);
-        if (clip_local as usize) >= model.clips.len() {
+        if (clip_local as usize)
+            >= project
+                .resolved_model_animation_clips(reference.model_id)
+                .len()
+        {
             continue;
         }
 
@@ -1507,10 +1488,14 @@ fn walk_player_spawn_preview(
         // preview / default clip if the Character has no idle
         // assigned, so the surface still renders even when the
         // Character is mid-author.
-        let clip_local =
-            psxed_project::resolve::resolve_character_idle_preview_clip(char_resource, model)
-                .unwrap_or(0);
-        if (clip_local as usize) >= model.clips.len() {
+        let clip_local = psxed_project::resolve::resolve_character_idle_preview_clip_for_model(
+            project,
+            char_resource,
+            model_id,
+            model,
+        )
+        .unwrap_or(0);
+        if (clip_local as usize) >= project.resolved_model_animation_clips(model_id).len() {
             continue;
         }
 
@@ -1812,8 +1797,8 @@ fn projected_from_engine(projected: psx_engine::ProjectedVertex) -> psx_gte::sce
     }
 }
 
-/// Draw a horizontal radius ring plus a host-side bulb icon for every
-/// legacy Light and component PointLight in the scene. The bulb
+/// Draw a horizontal radius ring plus a bulb icon for every
+/// PointLight in the scene. The bulb
 /// replaces the old coloured square marker so lights read as editor
 /// light gizmos rather than generic entities.
 fn walk_light_gizmos(
@@ -1827,11 +1812,9 @@ fn walk_light_gizmos(
     for light in preview_lights(scene) {
         let center = node_room_local_origin(grid, &light.transform);
         let center_world = [center.x, center.y, center.z];
-        let is_selected =
-            preview_reference_selected(selected, light.host_id, light.component_id, None);
-        let is_hovered = hovered.is_some_and(|id| {
-            preview_reference_selected(id, light.host_id, light.component_id, None)
-        });
+        let is_selected = preview_reference_selected(selected, light.host_id, None, None);
+        let is_hovered =
+            hovered.is_some_and(|id| preview_reference_selected(id, light.host_id, None, None));
         let style = if is_selected {
             FaceOutlineStyle {
                 rgb: (0xFF, 0xE0, 0x80),
@@ -1893,7 +1876,7 @@ fn walk_entity_bounds(
     scratch: &mut PreviewScratch,
 ) {
     for b in bounds {
-        if matches!(b.kind, psxed_ui::EntityBoundKind::Light) {
+        if matches!(b.kind, psxed_ui::EntityBoundKind::PointLight) {
             continue;
         }
         let is_selected = b.node == selected;
@@ -1935,7 +1918,7 @@ fn entity_bound_style(
         psxed_ui::EntityBoundKind::Model => (0xC0, 0xC8, 0xD0),
         psxed_ui::EntityBoundKind::MeshFallback => (0x90, 0x98, 0xA0),
         psxed_ui::EntityBoundKind::SpawnPoint => (0x60, 0xE0, 0x80),
-        psxed_ui::EntityBoundKind::Light => (0xFF, 0xD8, 0x70),
+        psxed_ui::EntityBoundKind::PointLight => (0xFF, 0xD8, 0x70),
         psxed_ui::EntityBoundKind::Trigger => (0xC8, 0x80, 0xE0),
         psxed_ui::EntityBoundKind::Portal => (0xFF, 0xB0, 0x60),
         psxed_ui::EntityBoundKind::AudioSource => (0x70, 0xD8, 0xC0),
@@ -2183,7 +2166,7 @@ fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
         // Lights draw their own bulb icon + radius ring in
         // `walk_light_gizmos`; using the generic billboard square
         // makes them read like ordinary markers.
-        NodeKind::Light { .. } => None,
+        NodeKind::PointLight { .. } => None,
         NodeKind::Trigger { .. } => Some((0xC8, 0x80, 0xE0)),
         NodeKind::Portal { .. } => Some((0xFF, 0xB0, 0x60)),
         NodeKind::AudioSource { .. } => Some((0x70, 0xD8, 0xC0)),
@@ -2195,7 +2178,6 @@ fn entity_marker_color(kind: &NodeKind) -> Option<(u8, u8, u8)> {
         | NodeKind::AiController { .. }
         | NodeKind::Combat { .. }
         | NodeKind::Equipment { .. }
-        | NodeKind::PointLight { .. }
         | NodeKind::Room { .. }
         | NodeKind::World { .. }
         | NodeKind::Node
@@ -3135,13 +3117,13 @@ mod tests {
     }
 
     #[test]
-    fn component_point_light_uses_host_transform() {
+    fn point_light_uses_own_transform() {
         let mut project = ProjectDocument::new("test");
         let scene = project.active_scene_mut();
         let host = scene.add_node(scene.root, "Lamp", NodeKind::Entity);
         scene.node_mut(host).unwrap().transform.translation = [2.0, 0.5, 3.0];
         let light = scene.add_node(
-            host,
+            scene.root,
             "Point Light",
             NodeKind::PointLight {
                 color: [1, 2, 3],
@@ -3154,9 +3136,8 @@ mod tests {
         let lights = preview_lights(project.active_scene());
 
         assert_eq!(lights.len(), 1);
-        assert_eq!(lights[0].host_id, host);
-        assert_eq!(lights[0].component_id, Some(light));
-        assert_eq!(lights[0].transform.translation, [2.0, 0.5, 3.0]);
+        assert_eq!(lights[0].host_id, light);
+        assert_eq!(lights[0].transform.translation, [99.0, 99.0, 99.0]);
         assert_eq!(lights[0].color, [1, 2, 3]);
         assert_eq!(lights[0].intensity, 0.75);
         assert_eq!(lights[0].radius, 4.0);
