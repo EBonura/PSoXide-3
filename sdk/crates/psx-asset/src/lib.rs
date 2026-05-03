@@ -1048,6 +1048,7 @@ impl<'a> Texture<'a> {
 pub struct World<'a> {
     sectors: &'a [u8],
     walls: &'a [u8],
+    surface_lights: &'a [u8],
     sector_record_size: usize,
     wall_record_size: usize,
     width: u16,
@@ -1055,8 +1056,10 @@ pub struct World<'a> {
     sector_size: i32,
     material_count: u16,
     wall_count: u16,
+    surface_light_count: u16,
     ambient_color: [u8; 3],
     flags: u8,
+    static_vertex_lighting: bool,
 }
 
 /// Four PS1 UV coordinates for one world quad.
@@ -1077,13 +1080,40 @@ impl WorldQuadUvs {
     }
 }
 
+/// Four RGB vertex colours for one world quad.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WorldSurfaceLight {
+    vertex_rgb: [[u8; 3]; 4],
+}
+
+impl WorldSurfaceLight {
+    /// Full-bright neutral lighting for legacy/unlit rooms.
+    pub const fn white() -> Self {
+        Self {
+            vertex_rgb: [[255, 255, 255]; 4],
+        }
+    }
+
+    /// Build from per-corner RGB values.
+    pub const fn new(vertex_rgb: [[u8; 3]; 4]) -> Self {
+        Self { vertex_rgb }
+    }
+
+    /// Return RGB values in face-corner order.
+    pub const fn vertex_rgb(self) -> [[u8; 3]; 4] {
+        self.vertex_rgb
+    }
+}
+
 const WORLD_V1_SECTOR_RECORD_SIZE: usize = 44;
 const WORLD_V1_WALL_RECORD_SIZE: usize = 24;
+const WORLD_V2_SECTOR_RECORD_SIZE: usize = 60;
+const WORLD_V2_WALL_RECORD_SIZE: usize = 32;
 
 impl<'a> World<'a> {
     /// Parse a cooked `.psxw` blob.
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, ParseError> {
-        use psxed_format::world::{WorldHeader, MAGIC, VERSION, VERSION_V1};
+        use psxed_format::world::{WorldHeader, MAGIC, VERSION, VERSION_V1, VERSION_V2};
 
         if bytes.len() < psxed_format::AssetHeader::SIZE {
             return Err(ParseError::Truncated);
@@ -1093,16 +1123,16 @@ impl<'a> World<'a> {
             return Err(ParseError::WrongMagic);
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != VERSION && version != VERSION_V1 {
+        if version != VERSION && version != VERSION_V2 && version != VERSION_V1 {
             return Err(ParseError::UnsupportedVersion(version));
         }
-        let (sector_record_size, wall_record_size) = if version == VERSION_V1 {
-            (WORLD_V1_SECTOR_RECORD_SIZE, WORLD_V1_WALL_RECORD_SIZE)
-        } else {
-            (
+        let (sector_record_size, wall_record_size) = match version {
+            VERSION_V1 => (WORLD_V1_SECTOR_RECORD_SIZE, WORLD_V1_WALL_RECORD_SIZE),
+            VERSION_V2 => (WORLD_V2_SECTOR_RECORD_SIZE, WORLD_V2_WALL_RECORD_SIZE),
+            _ => (
                 psxed_format::world::SectorRecord::SIZE,
                 psxed_format::world::WallRecord::SIZE,
-            )
+            ),
         };
         let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let payload_start = psxed_format::AssetHeader::SIZE;
@@ -1126,11 +1156,29 @@ impl<'a> World<'a> {
         let wall_count = read_u16(wh, 12);
         let ambient_color = [wh[14], wh[15], wh[16]];
         let flags = wh[17];
+        let surface_light_count = if version == VERSION {
+            read_u16(wh, 18)
+        } else {
+            0
+        };
+        let static_vertex_lighting = version == VERSION
+            && flags & psxed_format::world::world_flags::STATIC_VERTEX_LIGHTING != 0;
 
         let expected_sectors = (width as usize)
             .checked_mul(depth as usize)
             .ok_or(ParseError::InvalidWorldLayout)?;
         if sector_count as usize != expected_sectors {
+            return Err(ParseError::InvalidWorldLayout);
+        }
+        if static_vertex_lighting {
+            let expected_surface_lights = sector_count
+                .checked_mul(2)
+                .and_then(|count| count.checked_add(wall_count))
+                .ok_or(ParseError::InvalidWorldLayout)?;
+            if surface_light_count != expected_surface_lights {
+                return Err(ParseError::InvalidWorldLayout);
+            }
+        } else if surface_light_count != 0 {
             return Err(ParseError::InvalidWorldLayout);
         }
 
@@ -1152,6 +1200,14 @@ impl<'a> World<'a> {
         }
         let walls = &bytes[off..off + wall_bytes];
         off += wall_bytes;
+        let surface_light_bytes = (surface_light_count as usize)
+            .checked_mul(psxed_format::world::SurfaceLightRecord::SIZE)
+            .ok_or(ParseError::TableOverflow)?;
+        if off + surface_light_bytes > bytes.len() {
+            return Err(ParseError::TableOverflow);
+        }
+        let surface_lights = &bytes[off..off + surface_light_bytes];
+        off += surface_light_bytes;
         if off != bytes.len() {
             return Err(ParseError::InvalidWorldLayout);
         }
@@ -1161,6 +1217,7 @@ impl<'a> World<'a> {
         Ok(Self {
             sectors,
             walls,
+            surface_lights,
             sector_record_size,
             wall_record_size,
             width,
@@ -1168,8 +1225,10 @@ impl<'a> World<'a> {
             sector_size,
             material_count,
             wall_count,
+            surface_light_count,
             ambient_color,
             flags,
+            static_vertex_lighting,
         })
     }
 
@@ -1203,6 +1262,12 @@ impl<'a> World<'a> {
         self.wall_count
     }
 
+    /// Number of appended static surface-light records.
+    #[inline]
+    pub fn surface_light_count(&self) -> u16 {
+        self.surface_light_count
+    }
+
     /// Ambient RGB color.
     #[inline]
     pub fn ambient_color(&self) -> [u8; 3] {
@@ -1213,6 +1278,12 @@ impl<'a> World<'a> {
     #[inline]
     pub fn fog_enabled(&self) -> bool {
         self.flags & psxed_format::world::world_flags::FOG_ENABLED != 0
+    }
+
+    /// Whether face records carry baked static vertex lighting.
+    #[inline]
+    pub fn static_vertex_lighting(&self) -> bool {
+        self.static_vertex_lighting
     }
 
     /// Sector at a coordinate, returning `None` for empty cells or out of range.
@@ -1257,6 +1328,18 @@ impl<'a> World<'a> {
         }
         self.wall(sector.first_wall.checked_add(local_index)?)
     }
+
+    /// Static surface-light record by direct table index.
+    pub fn surface_light(&self, index: u16) -> Option<WorldSurfaceLight> {
+        if !self.static_vertex_lighting || index >= self.surface_light_count {
+            return None;
+        }
+        let size = psxed_format::world::SurfaceLightRecord::SIZE;
+        let base = index as usize * size;
+        let end = base.checked_add(size)?;
+        let bytes = self.surface_lights.get(base..end)?;
+        Some(read_world_surface_light(bytes, 0))
+    }
 }
 
 /// One decoded world sector record.
@@ -1277,7 +1360,7 @@ pub struct WorldSector {
 
 impl WorldSector {
     fn decode(bytes: &[u8]) -> Self {
-        let has_v2_uvs = bytes.len() >= psxed_format::world::SectorRecord::SIZE;
+        let has_v2_uvs = bytes.len() >= WORLD_V2_SECTOR_RECORD_SIZE;
         Self {
             flags: bytes[0],
             floor_split: bytes[1],
@@ -1398,7 +1481,7 @@ pub struct WorldWall {
 
 impl WorldWall {
     fn decode(bytes: &[u8]) -> Self {
-        let has_v2_uvs = bytes.len() >= psxed_format::world::WallRecord::SIZE;
+        let has_v2_uvs = bytes.len() >= WORLD_V2_WALL_RECORD_SIZE;
         Self {
             direction: bytes[0],
             flags: bytes[1],
@@ -1563,6 +1646,16 @@ fn read_world_uvs(bytes: &[u8], offset: usize) -> WorldQuadUvs {
     ])
 }
 
+#[inline]
+fn read_world_surface_light(bytes: &[u8], offset: usize) -> WorldSurfaceLight {
+    WorldSurfaceLight::new([
+        [bytes[offset], bytes[offset + 1], bytes[offset + 2]],
+        [bytes[offset + 3], bytes[offset + 4], bytes[offset + 5]],
+        [bytes[offset + 6], bytes[offset + 7], bytes[offset + 8]],
+        [bytes[offset + 9], bytes[offset + 10], bytes[offset + 11]],
+    ])
+}
+
 fn validate_sector_wall_ranges(
     sectors: &[u8],
     sector_record_size: usize,
@@ -1624,25 +1717,28 @@ mod tests {
     /// supports. v1 is legacy compatibility and v2 is current; any
     /// newer blob must be rejected.
     #[test]
-    fn world_rejects_version_three() {
+    fn world_rejects_unknown_version() {
         let mut bad = [0u8; 12];
         bad[0..4].copy_from_slice(&psxed_format::world::MAGIC);
-        bad[4..6].copy_from_slice(&3u16.to_le_bytes());
+        bad[4..6].copy_from_slice(&4u16.to_le_bytes());
         // Payload length 0 -- won't matter; version check fires first.
         bad[8..12].copy_from_slice(&0u32.to_le_bytes());
         assert!(matches!(
             World::from_bytes(&bad),
-            Err(ParseError::UnsupportedVersion(3))
+            Err(ParseError::UnsupportedVersion(4))
         ));
     }
 
-    /// Sizes the cooker / runtime have agreed on for VERSION 2.
+    /// Sizes the cooker / runtime have agreed on for world formats.
     /// Drift would invalidate every committed `.psxw` blob, so
     /// pin them at the format crate's records, not the wire.
     #[test]
-    fn world_v2_record_sizes_match_contract() {
+    fn world_record_sizes_match_contract() {
         assert_eq!(psxed_format::world::WorldHeader::SIZE, 20);
         assert_eq!(psxed_format::world::QuadUvRecord::SIZE, 8);
+        assert_eq!(psxed_format::world::SurfaceLightRecord::SIZE, 12);
+        assert_eq!(WORLD_V2_SECTOR_RECORD_SIZE, 60);
+        assert_eq!(WORLD_V2_WALL_RECORD_SIZE, 32);
         assert_eq!(psxed_format::world::SectorRecord::SIZE, 60);
         assert_eq!(psxed_format::world::WallRecord::SIZE, 32);
     }
@@ -1875,12 +1971,16 @@ mod tests {
     fn world_round_trip_1x1_with_wall() {
         use psxed_format::world;
 
+        const SURFACE_LIGHTS: usize = 3;
         const WORLD_ROUND_TRIP_LEN: usize = psxed_format::AssetHeader::SIZE
             + psxed_format::world::WorldHeader::SIZE
             + psxed_format::world::SectorRecord::SIZE
-            + psxed_format::world::WallRecord::SIZE;
-        let payload_len =
-            (world::WorldHeader::SIZE + world::SectorRecord::SIZE + world::WallRecord::SIZE) as u32;
+            + psxed_format::world::WallRecord::SIZE
+            + SURFACE_LIGHTS * psxed_format::world::SurfaceLightRecord::SIZE;
+        let payload_len = (world::WorldHeader::SIZE
+            + world::SectorRecord::SIZE
+            + world::WallRecord::SIZE
+            + SURFACE_LIGHTS * world::SurfaceLightRecord::SIZE) as u32;
         let mut buf = [0u8; WORLD_ROUND_TRIP_LEN];
         buf[0..4].copy_from_slice(&world::MAGIC);
         buf[4..6].copy_from_slice(&world::VERSION.to_le_bytes());
@@ -1894,7 +1994,8 @@ mod tests {
         buf[22..24].copy_from_slice(&2u16.to_le_bytes()); // materials
         buf[24..26].copy_from_slice(&1u16.to_le_bytes()); // walls
         buf[26..29].copy_from_slice(&[32, 32, 40]);
-        buf[29] = world::world_flags::FOG_ENABLED;
+        buf[29] = world::world_flags::FOG_ENABLED | world::world_flags::STATIC_VERTEX_LIGHTING;
+        buf[30..32].copy_from_slice(&(SURFACE_LIGHTS as u16).to_le_bytes());
 
         let sector = 12 + world::WorldHeader::SIZE;
         buf[sector] = world::sector_flags::HAS_FLOOR | world::sector_flags::FLOOR_WALKABLE;
@@ -1907,7 +2008,6 @@ mod tests {
             buf[sector + 44 + i * 2] = u;
             buf[sector + 45 + i * 2] = v;
         }
-
         let wall = sector + world::SectorRecord::SIZE;
         buf[wall] = world::direction::NORTH;
         buf[wall + 1] = world::wall_flags::SOLID;
@@ -1920,6 +2020,17 @@ mod tests {
             buf[wall + 24 + i * 2] = u;
             buf[wall + 25 + i * 2] = v;
         }
+        let floor_light = [[10, 20, 30], [40, 50, 60], [70, 80, 90], [100, 110, 120]];
+        let ceiling_light = [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]];
+        let wall_light = [[12, 22, 32], [42, 52, 62], [72, 82, 92], [102, 112, 122]];
+        let lights = wall + world::WallRecord::SIZE;
+        for (record_index, light) in [floor_light, ceiling_light, wall_light].iter().enumerate() {
+            for (corner_index, rgb) in light.iter().enumerate() {
+                let off =
+                    lights + record_index * world::SurfaceLightRecord::SIZE + corner_index * 3;
+                buf[off..off + 3].copy_from_slice(rgb);
+            }
+        }
 
         let world = World::from_bytes(&buf).expect("parse world");
         assert_eq!(world.width(), 1);
@@ -1927,8 +2038,10 @@ mod tests {
         assert_eq!(world.sector_size(), psxed_format::world::SECTOR_SIZE);
         assert_eq!(world.material_count(), 2);
         assert_eq!(world.wall_count(), 1);
+        assert_eq!(world.surface_light_count(), SURFACE_LIGHTS as u16);
         assert_eq!(world.ambient_color(), [32, 32, 40]);
         assert!(world.fog_enabled());
+        assert!(world.static_vertex_lighting());
 
         let sector = world.sector(0, 0).unwrap();
         assert!(sector.has_floor());
@@ -1937,6 +2050,8 @@ mod tests {
         assert_eq!(sector.ceiling_material(), None);
         assert_eq!(sector.wall_count(), 1);
         assert_eq!(sector.floor_uvs().corners(), world::FLOOR_UVS);
+        assert_eq!(world.surface_light(0).unwrap().vertex_rgb(), floor_light);
+        assert_eq!(world.surface_light(1).unwrap().vertex_rgb(), ceiling_light);
 
         let wall = world.sector_wall(sector, 0).unwrap();
         assert_eq!(wall.direction(), psxed_format::world::direction::NORTH);
@@ -1944,6 +2059,7 @@ mod tests {
         assert_eq!(wall.material(), 1);
         assert_eq!(wall.heights(), [0, 0, 1024, 1024]);
         assert_eq!(wall.uvs().corners(), world::WALL_UVS);
+        assert_eq!(world.surface_light(2).unwrap().vertex_rgb(), wall_light);
     }
 
     #[test]

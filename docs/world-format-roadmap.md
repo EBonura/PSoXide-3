@@ -1,10 +1,11 @@
 # `.psxw` Format Roadmap
 
-The active world wire format is **VERSION = 2**. It's the shape
+The active world wire format is **VERSION = 3**. It's the shape
 `psxed-project` cooks and the main shape `psx_asset::World::from_bytes`
-accepts; the parser also keeps v1 compatibility for older blobs. The compact
-format sketched below is **not in `psxed-format`** as Rust types -- it lives
-here, in docs, until both producer and consumer support it together.
+accepts; the parser also keeps v1/v2 compatibility for older blobs. The
+compact format sketched below is **not in `psxed-format`** as Rust types
+-- it lives here, in docs, until both producer and consumer support it
+together.
 
 ## The rule
 
@@ -20,13 +21,14 @@ runtime. Speculative records that meet none of those points
 clutter that contract and trick callers into thinking a future
 format already works. They go in this doc instead.
 
-## Active format -- VERSION 2
+## Active format -- VERSION 3
 
 ```
 AssetHeader               12 B
 WorldHeader               20 B
 SectorRecord[]            60 B each, width * depth records (dense)
 WallRecord[]              32 B each, wall_count records
+SurfaceLightRecord[]      12 B each, optional static-light table
 ```
 
 Properties:
@@ -35,6 +37,9 @@ Properties:
   per height set.
 - Floor / ceiling / wall UVs are four packed PS1 `[u, v]` byte pairs
   per face -- 8 B per face.
+- If static vertex lighting is enabled, an appended direct-indexed
+  light table stores two records per sector (floor, ceiling) plus one
+  record per wall. The table is absent for unlit/non-baked rooms.
 - A sector record exists for **every** cell, populated or not.
   The runtime parser rejects a blob when
   `sector_count != width * depth`.
@@ -44,8 +49,9 @@ Properties:
 - Diagonal walls and cells outside the 32×32 / 2048-tri / 64
   KiB caps are rejected at cook time.
 
-The `WorldGridBudget::psxw_bytes` figure is exact for this
-format.
+The `WorldGridBudget::psxw_bytes` figure is exact for the base
+geometry payload. Static-light bake size is additive and should be
+surfaced separately in editor budget UI.
 
 ## Future compact format
 
@@ -68,6 +74,7 @@ The reduction targets give roughly:
 | WorldHeader  |  20 B  |  20 B  |   --     |
 | Sector       |  60 B  |  28 B  | 53 %    |
 | Wall         |  32 B  |  12 B  | 62 %    |
+| SurfaceLight |  12 B  | TBD    | TBD     |
 
 `WorldGridBudget::future_compact_estimated_bytes` shows the
 compact estimate **as a planning aid**. No live `.psxw` is ever

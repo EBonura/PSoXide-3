@@ -20,6 +20,11 @@ mod encode;
 mod materials;
 mod validation;
 
+/// Neutral baked light used when static vertex lighting is not
+/// enabled for a cooked grid. Runtime ignores these bytes unless
+/// the `.psxw` world flag opts in.
+pub const DEFAULT_BAKED_VERTEX_RGB: [[u8; 3]; 4] = [[255, 255, 255]; 4];
+
 use coords::{
     runtime_horizontal_heights, runtime_horizontal_split, runtime_horizontal_uvs,
     runtime_wall_direction, runtime_wall_heights, runtime_wall_uvs,
@@ -381,6 +386,8 @@ pub struct CookedGridHorizontalFace {
     pub material: u16,
     /// Runtime UVs `[NW, NE, SE, SW]`.
     pub uvs: [(u8, u8); 4],
+    /// Baked RGB tint for the face's four vertices.
+    pub baked_vertex_rgb: [[u8; 3]; 4],
     /// Whether collision treats this face as walkable.
     pub walkable: bool,
 }
@@ -394,6 +401,8 @@ pub struct CookedGridVerticalFace {
     pub material: u16,
     /// Runtime UVs `[bottom-left, bottom-right, top-right, top-left]`.
     pub uvs: [(u8, u8); 4],
+    /// Baked RGB tint for the wall's four vertices.
+    pub baked_vertex_rgb: [[u8; 3]; 4],
     /// Whether collision treats this wall as blocking.
     pub solid: bool,
 }
@@ -454,6 +463,9 @@ pub struct CookedWorldGrid {
     pub materials: Vec<CookedWorldMaterial>,
     /// Room ambient color.
     pub ambient_color: [u8; 3],
+    /// Whether baked per-face vertex lighting should be consumed
+    /// by the runtime.
+    pub static_vertex_lighting: bool,
     /// Whether PS1 depth cue/fog should be enabled.
     pub fog_enabled: bool,
     /// Authored depth-cue far color. Kept in the cook model even
@@ -535,6 +547,7 @@ pub fn cook_world_grid(
         sectors,
         materials,
         ambient_color: grid.ambient_color,
+        static_vertex_lighting: false,
         fog_enabled: grid.fog_enabled,
         fog_color: grid.fog_color,
         fog_near: grid.fog_near,
@@ -659,6 +672,7 @@ fn cook_horizontal_face(
             material_slots,
         )?,
         uvs: runtime_horizontal_uvs(face.uv.apply_to_quad(world::FLOOR_UVS)),
+        baked_vertex_rgb: DEFAULT_BAKED_VERTEX_RGB,
         walkable: face.walkable,
     })
 }
@@ -720,6 +734,7 @@ fn cook_walls(
                         heights: runtime_wall_heights(segment.heights),
                         material,
                         uvs: runtime_wall_uvs(segment.uv.apply_to_quad(world::WALL_UVS)),
+                        baked_vertex_rgb: DEFAULT_BAKED_VERTEX_RGB,
                         solid: segment.solid,
                     });
             }

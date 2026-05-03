@@ -592,9 +592,9 @@ pub struct EquipmentRecord {
 
 /// One placed point light. Coordinates are room-local engine
 /// units (same convention as model instances and player spawn).
-/// Static room geometry may be pre-baked into
-/// [`SurfaceLightRecord`]s; dynamic/model lighting can still
-/// sample these point-light records at runtime.
+/// Static room geometry is pre-baked into the `.psxw` room blob;
+/// dynamic/model lighting can still sample these point-light
+/// records at runtime.
 ///
 /// `intensity_q8` is the multiplier in Q8.8 fixed-point
 /// (256 = 1.0, 512 = 2.0, ...); the cooker derives it from
@@ -624,14 +624,11 @@ pub struct PointLightRecord {
     pub flags: u16,
 }
 
-/// Per-surface static lighting baked by the editor.
+/// Legacy manifest-side per-surface static lighting.
 ///
-/// Records are keyed to the cooked room traversal contract:
-/// `(room, sx, sz, kind, direction, ordinal)`. Floors and
-/// ceilings use `direction = 0` and `ordinal = 0`; walls use the
-/// runtime wall direction id and the wall's local ordinal in that
-/// sector's cooked wall list. `vertex_rgb` follows the exact
-/// emitted quad vertex order consumed by the room renderer.
+/// Current room geometry stores static vertex lighting inside
+/// `.psxw` v3. This record stays in the manifest schema as an
+/// empty compatibility hook for older generated code paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceLightRecord {
     /// Owning room index.

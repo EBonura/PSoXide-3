@@ -2,17 +2,26 @@
 //!
 //! Each `.psxw` blob is a fixed-size grid room: a world header, one
 //! sector record per grid cell, then a compact wall table referenced
-//! by sectors. Only `VERSION = 2` is emitted by the cooker; v1 is
+//! by sectors. Only `VERSION = 3` is emitted by the cooker; v1/v2 are
 //! legacy parser compatibility only.
 //!
-//! # Active format (VERSION = 2)
+//! # Active format (VERSION = 3)
 //!
 //! - `[i32; 4]` heights per face -- 16 B per height set
 //! - `QuadUvRecord` per floor / ceiling / wall -- 8 B per face
 //! - 60 B sector record, 32 B wall record
+//! - Optional appended `SurfaceLightRecord` table when
+//!   [`world_flags::STATIC_VERTEX_LIGHTING`] is set. The table is
+//!   direct-indexed as `sector_count * 2` floor/ceiling slots,
+//!   followed by one slot per wall record.
 //! - No embedded material table; slot ids resolve via an external
 //!   bank that the caller (engine / playtest manifest) supplies
 //! - No sector logic stream, no portal records
+//!
+//! # Legacy format (VERSION = 2)
+//!
+//! - 60 B sector record, 32 B wall record
+//! - Per-face UVs, but no embedded vertex lighting.
 //!
 //! # Legacy format (VERSION = 1)
 //!
@@ -35,8 +44,12 @@ pub const MAGIC: [u8; 4] = *b"PSXW";
 /// Legacy world format revision without per-face UV records.
 pub const VERSION_V1: u16 = 1;
 
+/// Legacy world format revision with per-face UV records but no
+/// embedded static vertex lighting.
+pub const VERSION_V2: u16 = 2;
+
 /// Current world format revision.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// Canonical/default engine units per grid sector.
 pub const SECTOR_SIZE: i32 = 1024;
@@ -108,6 +121,9 @@ pub mod flags {
 pub mod world_flags {
     /// PS1 depth cue/fog is enabled for this grid.
     pub const FOG_ENABLED: u8 = 1 << 0;
+
+    /// Face records carry baked static per-vertex room lighting.
+    pub const STATIC_VERTEX_LIGHTING: u8 = 1 << 1;
 }
 
 /// Sector flags stored in [`SectorRecord::flags`].
@@ -154,6 +170,20 @@ impl QuadUvRecord {
     pub const SIZE: usize = core::mem::size_of::<Self>();
 }
 
+/// Four RGB vertex colours for one world quad face.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug)]
+pub struct SurfaceLightRecord {
+    /// Per-corner RGB values in the same order as the face's
+    /// height / UV corners.
+    pub vertex_rgb: [[u8; 3]; 4],
+}
+
+impl SurfaceLightRecord {
+    /// Size of one surface-light record in bytes.
+    pub const SIZE: usize = core::mem::size_of::<Self>();
+}
+
 /// Payload header that follows the common `AssetHeader`.
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]
@@ -174,8 +204,9 @@ pub struct WorldHeader {
     pub ambient_color: [u8; 3],
     /// World payload flags, see [`world_flags`].
     pub flags: u8,
-    /// Reserved. Writers store zero; readers ignore.
-    pub _reserved: u16,
+    /// Number of appended [`SurfaceLightRecord`]s. Zero when
+    /// [`world_flags::STATIC_VERTEX_LIGHTING`] is not set.
+    pub surface_light_count: u16,
 }
 
 impl WorldHeader {

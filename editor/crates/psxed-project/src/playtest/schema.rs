@@ -314,25 +314,6 @@ pub struct PlaytestLight {
     pub color: [u8; 3],
 }
 
-/// One baked static-light sample for a cooked room surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaytestSurfaceLight {
-    /// Room index in [`PlaytestPackage::rooms`].
-    pub room: u16,
-    /// Sector X coordinate.
-    pub sx: u16,
-    /// Sector Z coordinate.
-    pub sz: u16,
-    /// One of [`psx_level::surface_light_kind`].
-    pub kind: u8,
-    /// Runtime wall direction id for walls, `0` otherwise.
-    pub direction: u8,
-    /// Surface ordinal inside the cooked sector.
-    pub ordinal: u16,
-    /// Baked RGB tint for the emitted quad's four vertices.
-    pub vertex_rgb: [[u8; 3]; 4],
-}
-
 /// Player spawn record. Coordinates are room-local engine units
 /// (the same space the cooked `.psxw` lives in -- array-rooted at
 /// world `(0, 0)`).
@@ -464,8 +445,6 @@ pub struct PlaytestPackage {
     pub equipment: Vec<PlaytestEquipment>,
     /// Placed point lights, room-local coordinates.
     pub lights: Vec<PlaytestLight>,
-    /// Static per-vertex room lighting baked from [`Self::lights`].
-    pub surface_lights: Vec<PlaytestSurfaceLight>,
     /// Single player spawn -- required.
     pub spawn: Option<PlaytestSpawn>,
     /// Cooked Character resources used by player / future

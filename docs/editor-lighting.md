@@ -49,25 +49,24 @@ pub struct PointLightRecord {
 }
 ```
 
-Room geometry also cooks into static per-surface vertex lighting:
+Room geometry also cooks into static per-surface vertex lighting inside
+the `.psxw` room blob. Version 3 keeps the compact v2 sector/wall
+records and appends a direct-indexed `SurfaceLightRecord` table:
 
 ```rust
 pub struct SurfaceLightRecord {
-    pub room: RoomIndex,
-    pub sx: u16,
-    pub sz: u16,
-    pub kind: u8,
-    pub direction: u8,
-    pub ordinal: u16,
     pub vertex_rgb: [[u8; 3]; 4],
-    pub flags: u16,
 }
 ```
 
-`SurfaceLightRecord` is keyed to the cooked room traversal contract:
-floor and ceiling records use ordinal `0`; wall records use the wall's
-local ordinal in the cooked sector wall list. `vertex_rgb` follows the
-same quad vertex order emitted by `psx-engine`.
+The table is indexed without a search:
+
+- floor: `(sx * depth + sz) * 2`
+- ceiling: `(sx * depth + sz) * 2 + 1`
+- wall: `sector_count * 2 + global_wall_index`
+
+`vertex_rgb` follows the same quad vertex order emitted by
+`psx-engine`.
 
 ## Units
 
@@ -121,8 +120,8 @@ feedback without requiring a runtime cook.
 `editor-playtest` uses the generated manifest in two ways:
 
 1. Room floors, ceilings, and walls render through textured Gouraud
-   packets using `SURFACE_LIGHTS` per-vertex RGB. Runtime fog is still
-   applied per vertex.
+   packets using per-vertex RGB embedded in the `.psxw` static-light
+   table. Runtime fog is still applied per vertex.
 2. Player, model instances, and attached equipment sample `LIGHTS` at
    their current origin and modulate their material tint dynamically.
 

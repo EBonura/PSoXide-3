@@ -42,8 +42,22 @@ pub(super) fn encode_cooked_world_grid_psxw(
     }
 
     let wall_record_count = wall_records.len() / world::WallRecord::SIZE;
+    let surface_light_records = if cooked.static_vertex_lighting {
+        encode_surface_lights(cooked)
+    } else {
+        Vec::new()
+    };
+    let surface_light_count = checked_u16(
+        surface_light_records.len() / world::SurfaceLightRecord::SIZE,
+        WorldGridCookError::EncodedWorldTooLarge {
+            bytes: surface_light_records.len(),
+        },
+    )?;
 
-    let payload_len = world::WorldHeader::SIZE + sector_records.len() + wall_records.len();
+    let payload_len = world::WorldHeader::SIZE
+        + sector_records.len()
+        + wall_records.len()
+        + surface_light_records.len();
     if payload_len > u32::MAX as usize {
         return Err(WorldGridCookError::EncodedWorldTooLarge { bytes: payload_len });
     }
@@ -61,14 +75,18 @@ pub(super) fn encode_cooked_world_grid_psxw(
     out.extend_from_slice(&(cooked.materials.len() as u16).to_le_bytes());
     out.extend_from_slice(&(wall_record_count as u16).to_le_bytes());
     out.extend_from_slice(&cooked.ambient_color);
-    out.push(if cooked.fog_enabled {
-        world::world_flags::FOG_ENABLED
-    } else {
-        0
-    });
-    out.extend_from_slice(&0u16.to_le_bytes());
+    let mut world_flags = 0u8;
+    if cooked.fog_enabled {
+        world_flags |= world::world_flags::FOG_ENABLED;
+    }
+    if cooked.static_vertex_lighting {
+        world_flags |= world::world_flags::STATIC_VERTEX_LIGHTING;
+    }
+    out.push(world_flags);
+    out.extend_from_slice(&surface_light_count.to_le_bytes());
     out.extend_from_slice(&sector_records);
     out.extend_from_slice(&wall_records);
+    out.extend_from_slice(&surface_light_records);
     Ok(out)
 }
 
@@ -179,10 +197,53 @@ fn encode_sector_walls(
     Ok(())
 }
 
+fn encode_surface_lights(cooked: &CookedWorldGrid) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        (cooked.sectors.len() * 2 + cooked.wall_count() as usize) * world::SurfaceLightRecord::SIZE,
+    );
+    for sector in &cooked.sectors {
+        encode_light(
+            sector
+                .as_ref()
+                .and_then(|sector| sector.floor.map(|face| face.baked_vertex_rgb))
+                .unwrap_or(DEFAULT_BAKED_VERTEX_RGB),
+            &mut out,
+        );
+        encode_light(
+            sector
+                .as_ref()
+                .and_then(|sector| sector.ceiling.map(|face| face.baked_vertex_rgb))
+                .unwrap_or(DEFAULT_BAKED_VERTEX_RGB),
+            &mut out,
+        );
+    }
+    for sector in cooked.sectors.iter().flatten() {
+        for walls in [
+            sector.walls.north.as_slice(),
+            sector.walls.east.as_slice(),
+            sector.walls.south.as_slice(),
+            sector.walls.west.as_slice(),
+            sector.walls.north_west_south_east.as_slice(),
+            sector.walls.north_east_south_west.as_slice(),
+        ] {
+            for wall in walls {
+                encode_light(wall.baked_vertex_rgb, &mut out);
+            }
+        }
+    }
+    out
+}
+
 fn encode_uvs(uvs: [(u8, u8); 4], out: &mut Vec<u8>) {
     for (u, v) in uvs {
         out.push(u);
         out.push(v);
+    }
+}
+
+fn encode_light(vertex_rgb: [[u8; 3]; 4], out: &mut Vec<u8>) {
+    for rgb in vertex_rgb {
+        out.extend_from_slice(&rgb);
     }
 }
 

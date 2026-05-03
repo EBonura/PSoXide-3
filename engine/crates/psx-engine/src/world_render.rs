@@ -103,6 +103,9 @@ pub struct WorldSurfaceSample {
     /// Surface centre in the same room-local world coordinates as
     /// the emitted vertices.
     pub center: RoomPoint,
+    /// Baked vertex RGB from `.psxw` static lighting, when the
+    /// room carries it. Corner order matches emitted quad order.
+    pub baked_vertex_rgb: Option<[[u8; 3]; 4]>,
     /// Surface ordinal inside the cooked sector. Floors and
     /// ceilings are always `0`; walls use their local wall-table
     /// index so baked lighting can distinguish stacked wall
@@ -548,6 +551,7 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                         sx,
                         sz,
                         center: horizontal_face_center(sx, sz, sector_size, sector.floor_heights()),
+                        baked_vertex_rgb: room.floor_light(sx, sz),
                         ordinal: 0,
                     },
                     base_material,
@@ -584,6 +588,7 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                             sector_size,
                             sector.ceiling_heights(),
                         ),
+                        baked_vertex_rgb: room.ceiling_light(sx, sz),
                         ordinal: 0,
                     },
                     base_material,
@@ -624,6 +629,7 @@ fn draw_sector_lit<const OT: usize, L: WorldSurfaceLighting>(
                         sx,
                         sz,
                         center,
+                        baked_vertex_rgb: room.wall_light(sector, i),
                         ordinal: i,
                     },
                     base_material,
@@ -674,6 +680,7 @@ fn draw_sector_vertex_lit<const OT: usize, L: WorldSurfaceLighting>(
                     sx,
                     sz,
                     center: horizontal_face_center(sx, sz, sector_size, sector.floor_heights()),
+                    baked_vertex_rgb: room.floor_light(sx, sz),
                     ordinal: 0,
                 };
                 surfaces = surfaces.saturating_add(1);
@@ -704,6 +711,7 @@ fn draw_sector_vertex_lit<const OT: usize, L: WorldSurfaceLighting>(
                     sx,
                     sz,
                     center: horizontal_face_center(sx, sz, sector_size, sector.ceiling_heights()),
+                    baked_vertex_rgb: room.ceiling_light(sx, sz),
                     ordinal: 0,
                 };
                 surfaces = surfaces.saturating_add(1);
@@ -743,6 +751,7 @@ fn draw_sector_vertex_lit<const OT: usize, L: WorldSurfaceLighting>(
                     sx,
                     sz,
                     center,
+                    baked_vertex_rgb: room.wall_light(sector, i),
                     ordinal: i,
                 };
                 surfaces = surfaces.saturating_add(1);

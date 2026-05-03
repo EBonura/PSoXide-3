@@ -126,12 +126,12 @@ What it *does* render:
   draws the textured animated model. See
   [`docs/editor-model-authoring.md`](../../../docs/editor-model-authoring.md).
 - **Static lighting** -- every `PointLight` node cooks into a
-  `PointLightRecord`; room surfaces also cook into
-  `SurfaceLightRecord` per-vertex RGB, so embedded play can render
-  textured Gouraud-lit rooms without re-accumulating every light per
-  surface at runtime. Player, model instances, and equipment still
-  sample point lights dynamically at their current origin. Linear
-  falloff, no shadows. See
+  `PointLightRecord`; room surfaces also cook into the `.psxw` v3
+  static-light table, so embedded play can render textured
+  Gouraud-lit rooms without re-accumulating every light per surface
+  at runtime. Player, model instances, and equipment still sample
+  point lights dynamically at their current origin. Linear falloff,
+  no shadows. See
   [`docs/editor-lighting.md`](../../../docs/editor-lighting.md).
 - **Entity markers** for legacy `MeshInstance` nodes that
   don't reference a Model (debug cubes, same as before).

@@ -53,11 +53,10 @@ use psx_gpu::{
     prim::{TriTextured, TriTexturedGouraud},
 };
 use psx_level::{
-    equipment_flags, find_asset_of_kind, room_flags, surface_light_kind, AssetId, AssetKind,
-    EntityRecord, LevelCharacterRecord, LevelMaterialRecord, LevelMaterialSidedness,
-    LevelModelRecord, LevelModelSocketRecord, LevelRoomRecord, ModelClipIndex, ModelClipTableIndex,
-    ModelIndex, ModelSocketIndex, OptionalModelClipIndex, ResidencyManager, RoomIndex,
-    SurfaceLightRecord, WeaponHitShapeRecord,
+    equipment_flags, find_asset_of_kind, room_flags, AssetId, AssetKind, EntityRecord,
+    LevelCharacterRecord, LevelMaterialRecord, LevelMaterialSidedness, LevelModelRecord,
+    LevelModelSocketRecord, LevelRoomRecord, ModelClipIndex, ModelClipTableIndex, ModelIndex,
+    ModelSocketIndex, OptionalModelClipIndex, ResidencyManager, RoomIndex, WeaponHitShapeRecord,
 };
 use psx_vram::{upload_bytes, Clut, TexDepth, Tpage, VramRect};
 
@@ -79,7 +78,7 @@ mod generated {
 use generated::{
     ASSETS, CHARACTERS, ENTITIES, EQUIPMENT, LIGHTS, MATERIALS, MODELS, MODEL_CLIPS,
     MODEL_INSTANCES, MODEL_SOCKETS, PLAYER_CONTROLLER, PLAYER_SPAWN, ROOMS, ROOM_RESIDENCY,
-    SURFACE_LIGHTS, WEAPONS, WEAPON_HITBOXES,
+    WEAPONS, WEAPON_HITBOXES,
 };
 
 // VRAM layout. Room materials and model atlases live in
@@ -1846,24 +1845,6 @@ impl RuntimeRoomLighting {
         )
     }
 
-    fn baked_surface(&self, sample: WorldSurfaceSample) -> Option<&'static SurfaceLightRecord> {
-        let (kind, direction) = match sample.kind {
-            psx_engine::WorldSurfaceKind::Floor => (surface_light_kind::FLOOR, 0),
-            psx_engine::WorldSurfaceKind::Ceiling => (surface_light_kind::CEILING, 0),
-            psx_engine::WorldSurfaceKind::Wall { direction } => {
-                (surface_light_kind::WALL, direction)
-            }
-        };
-        SURFACE_LIGHTS.iter().find(|light| {
-            light.room == self.room_index
-                && light.sx == sample.sx
-                && light.sz == sample.sz
-                && light.kind == kind
-                && light.direction == direction
-                && light.ordinal == sample.ordinal
-        })
-    }
-
     fn apply_vertex_fog(&self, rgb: [u8; 3], vertex: WorldVertex) -> (u8, u8, u8) {
         let depth = self.camera.view_vertex(vertex).z;
         apply_room_fog(
@@ -1901,12 +1882,12 @@ impl WorldSurfaceLighting for RuntimeRoomLighting {
         vertices: [WorldVertex; 4],
         material: WorldRenderMaterial,
     ) -> [(u8, u8, u8); 4] {
-        if let Some(surface) = self.baked_surface(sample) {
+        if let Some(vertex_rgb) = sample.baked_vertex_rgb {
             return [
-                self.apply_vertex_fog(surface.vertex_rgb[0], vertices[0]),
-                self.apply_vertex_fog(surface.vertex_rgb[1], vertices[1]),
-                self.apply_vertex_fog(surface.vertex_rgb[2], vertices[2]),
-                self.apply_vertex_fog(surface.vertex_rgb[3], vertices[3]),
+                self.apply_vertex_fog(vertex_rgb[0], vertices[0]),
+                self.apply_vertex_fog(vertex_rgb[1], vertices[1]),
+                self.apply_vertex_fog(vertex_rgb[2], vertices[2]),
+                self.apply_vertex_fog(vertex_rgb[3], vertices[3]),
             ];
         }
         [

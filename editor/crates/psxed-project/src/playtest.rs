@@ -39,7 +39,7 @@ use crate::world_cook::{
 };
 use crate::{
     spatial, AnimationRole, NodeId, NodeKind, ProjectDocument, ResourceData, ResourceId, SceneNode,
-    WorldGrid,
+    WorldGrid, MAX_ROOM_BYTES,
 };
 
 mod assets;
@@ -72,6 +72,7 @@ struct AuthoredRoomChunk {
 #[derive(Debug, Clone)]
 struct CookedRoomBakeInput {
     room_index: u16,
+    world_asset_index: usize,
     cooked: CookedWorldGrid,
 }
 
@@ -155,14 +156,6 @@ pub fn build_package(
                     return (None, report);
                 }
             };
-            let bytes = match cooked.to_psxw_bytes() {
-                Ok(b) => b,
-                Err(e) => {
-                    report.error(cook_error_for_node(&room_node.name, e));
-                    return (None, report);
-                }
-            };
-
             let room_index = u16::try_from(rooms.len()).unwrap_or(u16::MAX);
             room_chunks_by_node
                 .entry(room_node.id)
@@ -179,7 +172,7 @@ pub fn build_package(
             let world_asset_index = assets.len();
             assets.push(PlaytestAsset {
                 kind: PlaytestAssetKind::RoomWorld,
-                bytes,
+                bytes: Vec::new(),
                 filename: format!("room_{:03}.psxw", room_index),
                 source_label: chunk_room_name(&room_node.name, chunk_count, chunk.index),
             });
@@ -283,7 +276,11 @@ pub fn build_package(
                     0
                 },
             });
-            room_bake_inputs.push(CookedRoomBakeInput { room_index, cooked });
+            room_bake_inputs.push(CookedRoomBakeInput {
+                room_index,
+                world_asset_index,
+                cooked,
+            });
         }
     }
 
@@ -691,7 +688,37 @@ pub fn build_package(
         return (None, report);
     }
 
-    let surface_lights = bake_static_surface_lights(&room_bake_inputs, &lights);
+    bake_static_surface_lights(&mut room_bake_inputs, &lights);
+    for room in &room_bake_inputs {
+        let bytes = match room.cooked.to_psxw_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                report.error(cook_error_for_node(
+                    rooms
+                        .get(room.room_index as usize)
+                        .map(|room| room.name.as_str())
+                        .unwrap_or("<room>"),
+                    e,
+                ));
+                return (None, report);
+            }
+        };
+        if bytes.len() > MAX_ROOM_BYTES {
+            let room_name = rooms
+                .get(room.room_index as usize)
+                .map(|room| room.name.as_str())
+                .unwrap_or("<room>");
+            report.error(format!(
+                "Room '{room_name}' static-lit .psxw is {} bytes; cap is {}",
+                bytes.len(),
+                MAX_ROOM_BYTES,
+            ));
+            return (None, report);
+        }
+        if let Some(asset) = assets.get_mut(room.world_asset_index) {
+            asset.bytes = bytes;
+        }
+    }
 
     (
         Some(PlaytestPackage {
@@ -706,7 +733,6 @@ pub fn build_package(
             weapons,
             equipment,
             lights,
-            surface_lights,
             spawn,
             characters,
             player_controller,
@@ -1487,120 +1513,87 @@ fn push_point_light(
     true
 }
 
-fn bake_static_surface_lights(
-    rooms: &[CookedRoomBakeInput],
-    lights: &[PlaytestLight],
-) -> Vec<PlaytestSurfaceLight> {
-    let mut out = Vec::new();
+fn bake_static_surface_lights(rooms: &mut [CookedRoomBakeInput], lights: &[PlaytestLight]) {
     for room in rooms {
+        room.cooked.static_vertex_lighting = true;
         let room_lights: Vec<&PlaytestLight> = lights
             .iter()
             .filter(|light| light.room == room.room_index)
             .collect();
         let depth = room.cooked.depth as usize;
-        for (idx, sector) in room.cooked.sectors.iter().enumerate() {
+        let sector_size = room.cooked.sector_size;
+        let ambient = room.cooked.ambient_color;
+        let materials = room.cooked.materials.clone();
+        for (idx, sector) in room.cooked.sectors.iter_mut().enumerate() {
             let Some(sector) = sector else {
                 continue;
             };
             let sx = (idx / depth) as u16;
             let sz = (idx % depth) as u16;
-            if let Some(face) = sector.floor {
-                let verts = horizontal_vertices(sx, sz, room.cooked.sector_size, face.heights);
-                out.push(bake_surface_light_record(
-                    room,
-                    sx,
-                    sz,
-                    psx_level::surface_light_kind::FLOOR,
-                    0,
-                    0,
+            if let Some(face) = &mut sector.floor {
+                let verts = horizontal_vertices(sx, sz, sector_size, face.heights);
+                face.baked_vertex_rgb = bake_surface_vertex_rgb(
+                    &materials,
+                    ambient,
                     verts,
                     face.material,
                     &room_lights,
-                ));
+                );
             }
-            if let Some(face) = sector.ceiling {
-                let verts = reverse_quad_vertices(horizontal_vertices(
-                    sx,
-                    sz,
-                    room.cooked.sector_size,
-                    face.heights,
-                ));
-                out.push(bake_surface_light_record(
-                    room,
-                    sx,
-                    sz,
-                    psx_level::surface_light_kind::CEILING,
-                    0,
-                    0,
+            if let Some(face) = &mut sector.ceiling {
+                let verts =
+                    reverse_quad_vertices(horizontal_vertices(sx, sz, sector_size, face.heights));
+                face.baked_vertex_rgb = bake_surface_vertex_rgb(
+                    &materials,
+                    ambient,
                     verts,
                     face.material,
                     &room_lights,
-                ));
+                );
             }
 
-            let mut ordinal = 0u16;
             for (direction, walls) in [
-                (psxw::direction::NORTH, sector.walls.north.as_slice()),
-                (psxw::direction::EAST, sector.walls.east.as_slice()),
-                (psxw::direction::SOUTH, sector.walls.south.as_slice()),
-                (psxw::direction::WEST, sector.walls.west.as_slice()),
+                (psxw::direction::NORTH, sector.walls.north.as_mut_slice()),
+                (psxw::direction::EAST, sector.walls.east.as_mut_slice()),
+                (psxw::direction::SOUTH, sector.walls.south.as_mut_slice()),
+                (psxw::direction::WEST, sector.walls.west.as_mut_slice()),
             ] {
                 for wall in walls {
-                    if let Some(verts) =
-                        wall_vertices(sx, sz, room.cooked.sector_size, direction, wall.heights)
+                    if let Some(verts) = wall_vertices(sx, sz, sector_size, direction, wall.heights)
                     {
-                        out.push(bake_surface_light_record(
-                            room,
-                            sx,
-                            sz,
-                            psx_level::surface_light_kind::WALL,
-                            direction,
-                            ordinal,
+                        wall.baked_vertex_rgb = bake_surface_vertex_rgb(
+                            &materials,
+                            ambient,
                             verts,
                             wall.material,
                             &room_lights,
-                        ));
+                        );
                     }
-                    ordinal = ordinal.saturating_add(1);
                 }
             }
         }
     }
-    out
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bake_surface_light_record(
-    room: &CookedRoomBakeInput,
-    sx: u16,
-    sz: u16,
-    kind: u8,
-    direction: u8,
-    ordinal: u16,
+fn bake_surface_vertex_rgb(
+    materials: &[CookedWorldMaterial],
+    ambient: [u8; 3],
     vertices: [[i32; 3]; 4],
     material_slot: u16,
     lights: &[&PlaytestLight],
-) -> PlaytestSurfaceLight {
-    let base = cooked_material_tint(&room.cooked, material_slot);
-    PlaytestSurfaceLight {
-        room: room.room_index,
-        sx,
-        sz,
-        kind,
-        direction,
-        ordinal,
-        vertex_rgb: [
-            bake_static_vertex_rgb(vertices[0], base, room.cooked.ambient_color, lights),
-            bake_static_vertex_rgb(vertices[1], base, room.cooked.ambient_color, lights),
-            bake_static_vertex_rgb(vertices[2], base, room.cooked.ambient_color, lights),
-            bake_static_vertex_rgb(vertices[3], base, room.cooked.ambient_color, lights),
-        ],
-    }
+) -> [[u8; 3]; 4] {
+    let base = cooked_material_tint(materials, material_slot);
+    [
+        bake_static_vertex_rgb(vertices[0], base, ambient, lights),
+        bake_static_vertex_rgb(vertices[1], base, ambient, lights),
+        bake_static_vertex_rgb(vertices[2], base, ambient, lights),
+        bake_static_vertex_rgb(vertices[3], base, ambient, lights),
+    ]
 }
 
-fn cooked_material_tint(cooked: &CookedWorldGrid, slot: u16) -> [u8; 3] {
-    cooked
-        .materials
+fn cooked_material_tint(materials: &[CookedWorldMaterial], slot: u16) -> [u8; 3] {
+    materials
         .iter()
         .find(|material| material.slot == slot)
         .map(|material| material.tint)
@@ -2896,15 +2889,13 @@ mod tests {
         let (package, report) = build_package(&project, &starter_project_root());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
         let package = package.expect("starter cooks");
-        assert!(!package.surface_lights.is_empty());
-        assert!(package
-            .surface_lights
-            .iter()
-            .all(|surface| surface.room < package.rooms.len() as u16));
-        assert!(package
-            .surface_lights
-            .iter()
-            .any(|surface| { surface.vertex_rgb.iter().any(|rgb| *rgb != [0, 0, 0]) }));
+        let room = &package.rooms[0];
+        let asset = &package.assets[room.world_asset_index];
+        let world = psx_asset::World::from_bytes(&asset.bytes).expect("room psxw parses");
+        assert!(world.static_vertex_lighting());
+        assert!((0..world.surface_light_count())
+            .filter_map(|index| world.surface_light(index))
+            .any(|light| light.vertex_rgb().iter().any(|rgb| *rgb != [0, 0, 0])));
     }
 
     #[test]
@@ -2991,7 +2982,7 @@ mod tests {
         assert!(src.contains("PointLightRecord"));
         assert!(src.contains("pub static LIGHTS"));
         assert!(src.contains("SurfaceLightRecord"));
-        assert!(src.contains("pub static SURFACE_LIGHTS"));
+        assert!(src.contains("pub static SURFACE_LIGHTS: &[SurfaceLightRecord] = &[];"));
         assert!(src.contains("intensity_q8"));
         assert!(src.contains(&format!(
             "color: [{}, {}, {}]",

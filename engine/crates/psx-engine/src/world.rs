@@ -514,6 +514,13 @@ impl<'a> RuntimeRoom<'a> {
         self.inner.sector_wall(sector, local_index)
     }
 
+    /// Static surface-light record by direct table index.
+    pub fn surface_light(&self, index: u16) -> Option<[[u8; 3]; 4]> {
+        self.inner
+            .surface_light(index)
+            .map(|light| light.vertex_rgb())
+    }
+
     /// Render-side facade, see [`RoomRender`].
     pub const fn render(&self) -> RoomRender<'a, '_> {
         RoomRender { room: self }
@@ -584,6 +591,12 @@ impl<'a, 'b> RoomRender<'a, 'b> {
         self.room.world().fog_enabled()
     }
 
+    /// Whether this room carries baked static vertex lighting in
+    /// its `.psxw` face records.
+    pub fn static_vertex_lighting(self) -> bool {
+        self.room.world().static_vertex_lighting()
+    }
+
     /// Sector at `(x, z)` for render purposes, or `None` for
     /// empty cells.
     pub fn sector(self, x: u16, z: u16) -> Option<SectorRender> {
@@ -593,6 +606,30 @@ impl<'a, 'b> RoomRender<'a, 'b> {
     /// Wall record by sector-local index, render view.
     pub fn sector_wall(self, sector: SectorRender, local_index: u16) -> Option<WallRender> {
         self.room.sector_wall(sector.0, local_index).map(WallRender)
+    }
+
+    /// Baked floor vertex lighting for a sector, if this room
+    /// carries static lighting.
+    pub fn floor_light(self, sx: u16, sz: u16) -> Option<[[u8; 3]; 4]> {
+        let index = surface_light_sector_index(self.depth(), sx, sz)?;
+        self.room.surface_light(index.checked_mul(2)?)
+    }
+
+    /// Baked ceiling vertex lighting for a sector, if this room
+    /// carries static lighting.
+    pub fn ceiling_light(self, sx: u16, sz: u16) -> Option<[[u8; 3]; 4]> {
+        let index = surface_light_sector_index(self.depth(), sx, sz)?;
+        self.room
+            .surface_light(index.checked_mul(2)?.checked_add(1)?)
+    }
+
+    /// Baked wall vertex lighting for a sector-local wall, if
+    /// this room carries static lighting.
+    pub fn wall_light(self, sector: SectorRender, local_index: u16) -> Option<[[u8; 3]; 4]> {
+        let wall_index = sector.first_wall().checked_add(local_index)?;
+        let first_wall_light = self.width().checked_mul(self.depth())?.checked_mul(2)?;
+        self.room
+            .surface_light(first_wall_light.checked_add(wall_index)?)
     }
 }
 
@@ -781,6 +818,10 @@ impl WallRender {
     pub fn uvs(self) -> [(u8, u8); 4] {
         self.0.uvs().corners()
     }
+}
+
+fn surface_light_sector_index(depth: u16, sx: u16, sz: u16) -> Option<u16> {
+    sx.checked_mul(depth)?.checked_add(sz)
 }
 
 /// Collision-side projection of one decoded wall.
